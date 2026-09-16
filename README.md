@@ -433,6 +433,22 @@ Common CLI behavior:
 | non-zero exit | command failure |
 | secret-safe output | commands should not print credentials |
 
+Stopping `vtopctl run`: SIGINT (Ctrl-C) and SIGTERM (`docker stop`, a
+Kubernetes pod termination, `systemctl stop`) are both orderly stops. The
+engine finishes the source pass in progress (it never cuts a batch off
+mid-way, and skips the rest of that cycle), force-flushes every buffered batch
+through upload, verification and source commit, logs
+`shutdown flush complete`, and exits 0. Send the signal once and wait: a
+SECOND signal while that flush runs abandons it and exits 1. That is the way
+out of a flush stuck on an unreachable object store, and it is no worse than
+SIGKILL — source progress is only committed after a batch verifies, so the
+next start recovers or re-reads whatever the flush did not finish. Only a
+signal sent after the flush begins counts as the second: any signals already
+queued when the engine observes the first, of either kind, count as that one
+stop. A signal that arrives during startup recovery is honoured before any
+processing starts. Give the engine's termination grace period enough time for
+one source pass plus one flush.
+
 PostgreSQL schema changes are never run by normal engine startup. Use a
 separate migration identity for `vtopctl migrate`, then give the runtime role
 only schema `USAGE` and `SELECT, INSERT, UPDATE` on `batches`. See

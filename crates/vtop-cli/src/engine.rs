@@ -2264,21 +2264,80 @@ impl Engine {
         }
     }
 
+    /// Run the engine until the process is asked to stop (#526).
+    ///
+    /// SIGINT and, on Unix, SIGTERM are both orderly stops: the source pass in
+    /// progress finishes, every buffered-but-unsealed batch is force-flushed,
+    /// and `run` returns `Ok` (exit 0). A SECOND signal while that flush runs
+    /// abandons it and returns an error (exit 1); [`Engine::run_until`] says
+    /// why that is safe.
+    ///
+    /// The listeners are registered HERE, once, before recovery, and live for
+    /// the whole run. The shape this replaced created a fresh `ctrl_c()`
+    /// future on every loop turn, which lost any signal that landed while a
+    /// cycle was busy: tokio's process-wide handler had already replaced the
+    /// default disposition, and no listener existed to receive it. A loaded
+    /// engine ignored Ctrl-C indefinitely, and SIGTERM had no handler at all,
+    /// so `docker stop` and pod termination skipped the flush.
     pub async fn run(&mut self) -> Result<(), VtopError> {
+        let shutdown = OsShutdownSignals::install();
+        self.run_until(shutdown).await
+    }
+
+    /// [`Engine::run`] with stop requests taken from `shutdown` instead of
+    /// the process's signals, so a test can ask for a stop at an exact point
+    /// in a cycle without signalling the test process.
+    ///
+    /// A request is observed between source passes, never inside one:
+    /// `run_source` carries a batch through read, upload, verify and commit,
+    /// and cutting it off half-way would make every orderly stop a crash
+    /// stop. A request that arrives mid-pass stays pending in `shutdown` and
+    /// is taken before the next pass starts. That check runs before EVERY
+    /// source type's pass, not once per cycle, for two reasons. A request
+    /// that arrived during `recover()` must not buy a whole processing cycle
+    /// first; and an engine with several adapters (a Kafka poll wait among
+    /// them) stops after the pass in progress rather than after all of them.
+    /// Skipping the rest of a cycle loses nothing: the shutdown flush runs
+    /// every source type's pass anyway. After the cycle, the backoff
+    /// `select!` is `biased` toward a stop so a productive loop's zero
+    /// backoff cannot outrun it, and an idle engine's sleep is interrupted
+    /// at once.
+    ///
+    /// A second request during the shutdown flush abandons the flush and
+    /// returns an error. It is the operator's way out when the flush itself
+    /// is stuck (an unreachable object store, retrying), and it is no worse
+    /// than the SIGKILL they would reach for instead: no source progress is
+    /// committed before its batch verifies, so a batch cut off mid-flush is
+    /// recovered or re-read on the next start exactly as after a crash.
+    /// Only a request sent after the shutdown began counts as the second:
+    /// every request already pending when the first is observed is drained
+    /// first. Without that, a SIGINT and a SIGTERM that both land during a
+    /// busy pass (separate streams, so they do not coalesce) would have the
+    /// second abandon the flush before it started.
+    pub async fn run_until(
+        &mut self,
+        mut shutdown: impl ShutdownRequests,
+    ) -> Result<(), VtopError> {
         self.recover().await?;
         let types: Vec<SourceType> = self.adapters.keys().cloned().collect();
         let idle = Duration::from_millis(self.config.batching.idle_poll_interval_ms);
-        loop {
+        let cause = 'run: loop {
             // Accumulate across cycles; only threshold-tripped buffers flush.
             self.cycle_had_data = false;
             for st in &types {
+                // A stop already pending ends the run before this pass, not
+                // after the whole cycle; see the doc comment for why that is
+                // safe and why it also covers a stop sent during recovery.
+                if let Some(cause) = shutdown.pending_request() {
+                    break 'run cause;
+                }
                 if let Err(e) = self.run_source(st.clone(), false).await {
                     tracing::error!(error = %e, source_type = %st, "process cycle error");
                 }
             }
             // Productive cycle: loop again immediately. Idle cycle: back off.
             // `Duration::ZERO` still yields to the runtime through `select!`,
-            // so Ctrl-C stays responsive and this never starves the executor.
+            // so this never starves the executor.
             let backoff = if self.cycle_had_data {
                 Duration::ZERO
             } else {
@@ -2286,19 +2345,195 @@ impl Engine {
                 idle
             };
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("shutdown signal received; flushing and exiting");
-                    // Force-flush any buffered-but-unsealed data so it is not
-                    // left for the next start to re-read.
-                    for st in &types {
-                        if let Err(e) = self.run_source(st.clone(), true).await {
-                            tracing::error!(error = %e, source_type = %st, "shutdown flush error");
-                        }
-                    }
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(backoff) => {}
+                biased;
+                cause = shutdown.next_request() => break cause,
+                () = tokio::time::sleep(backoff) => {}
             }
+        };
+
+        // Everything already queued when the stop was observed belongs to
+        // that same stop — the other signal kind landing in the same busy
+        // pass, or an impatient repeat. Only a request sent from here on may
+        // abandon the flush.
+        shutdown.drain_pending();
+        tracing::info!(
+            signal = cause,
+            "shutdown signal received; flushing and exiting"
+        );
+        // Force-flush any buffered-but-unsealed data so it is not left for
+        // the next start to re-read.
+        let flush = async {
+            for st in &types {
+                if let Err(e) = self.run_source(st.clone(), true).await {
+                    tracing::error!(error = %e, source_type = %st, "shutdown flush error");
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            second = shutdown.next_request() => {
+                tracing::error!(
+                    signal = second,
+                    "second shutdown signal during the shutdown flush; abandoning the flush \
+                     (unflushed data is recovered or re-read on the next start)"
+                );
+                Err(VtopError::Other(format!(
+                    "shutdown flush abandoned by a second signal ({second})"
+                )))
+            }
+            () = flush => {
+                tracing::info!("shutdown flush complete; exiting");
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Where [`Engine::run_until`] learns it has been asked to stop (#526).
+///
+/// The contract a stop depends on: a request that arrives while nobody is
+/// awaiting `next_request` is NOT lost, it resolves the next call (or the
+/// next `pending_request`) at once. Requests that pile up before a call may
+/// coalesce into one.
+#[async_trait::async_trait]
+pub trait ShutdownRequests: Send {
+    /// Resolve with a short name for what asked (e.g. `"SIGTERM"`) once a
+    /// stop is requested. A source that can no longer deliver requests must
+    /// park here forever: a closed channel is not an operator's stop.
+    async fn next_request(&mut self) -> &'static str;
+
+    /// Take a request that is already pending, without waiting: `None` means
+    /// nothing has been asked yet. The same closed-is-not-a-stop rule holds.
+    fn pending_request(&mut self) -> Option<&'static str>;
+
+    /// Discard every request already pending, without waiting, so the next
+    /// `next_request` resolves only for one sent after this call.
+    fn drain_pending(&mut self) {
+        while self.pending_request().is_some() {}
+    }
+}
+
+/// The process's own stop signals: SIGINT and SIGTERM on Unix, Ctrl-C on
+/// Windows.
+///
+/// Each is a persistent tokio signal stream registered once by
+/// [`OsShutdownSignals::install`]. A stream records a delivery that lands
+/// between polls and yields it on the next `recv`, which is the "not lost
+/// while busy" half of the [`ShutdownRequests`] contract. Repeats of ONE kind
+/// coalesce inside tokio: its handler only sets a per-signal pending flag,
+/// and the driver turns that into a `watch` send, whose receiver reports
+/// "changed" once however many sends it missed. SIGINT and SIGTERM are two
+/// streams, though, so one of each is two requests; `run_until` drains both
+/// when it observes the first.
+pub struct OsShutdownSignals {
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+    #[cfg(windows)]
+    ctrl_c: Option<tokio::signal::windows::CtrlC>,
+}
+
+impl OsShutdownSignals {
+    /// Register the handlers. One that cannot be registered is logged and
+    /// left out rather than failing `run`: that signal keeps its default
+    /// disposition, which still stops the process, only without the flush.
+    /// `vtop-node` degrades the same way (#280).
+    pub fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let register = |kind: SignalKind, name: &'static str| match signal(kind) {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        signal = name,
+                        "shutdown handler unavailable; this signal stops the engine without a flush"
+                    );
+                    None
+                }
+            };
+            Self {
+                interrupt: register(SignalKind::interrupt(), "SIGINT"),
+                terminate: register(SignalKind::terminate(), "SIGTERM"),
+            }
+        }
+        #[cfg(windows)]
+        {
+            let ctrl_c = match tokio::signal::windows::ctrl_c() {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Ctrl-C handler unavailable; Ctrl-C stops the engine without a flush"
+                    );
+                    None
+                }
+            };
+            Self { ctrl_c }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ShutdownRequests for OsShutdownSignals {
+    async fn next_request(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            // A handler that was never registered, or a stream that reports
+            // closed, parks instead of reading as a stop.
+            async fn delivered(stream: &mut Option<tokio::signal::unix::Signal>) {
+                if let Some(stream) = stream {
+                    if stream.recv().await.is_some() {
+                        return;
+                    }
+                }
+                std::future::pending().await
+            }
+            tokio::select! {
+                () = delivered(&mut self.interrupt) => "SIGINT",
+                () = delivered(&mut self.terminate) => "SIGTERM",
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Some(stream) = &mut self.ctrl_c {
+                if stream.recv().await.is_some() {
+                    return "Ctrl-C";
+                }
+            }
+            std::future::pending().await
+        }
+    }
+
+    fn pending_request(&mut self) -> Option<&'static str> {
+        use futures::FutureExt;
+        #[cfg(unix)]
+        {
+            // One poll with a no-op waker: `recv` is cancel-safe (the stream
+            // keeps its notification state), so a `Pending` here loses
+            // nothing and a later `recv().await` re-registers a real waker.
+            fn delivered_now(stream: &mut Option<tokio::signal::unix::Signal>) -> bool {
+                stream
+                    .as_mut()
+                    .is_some_and(|stream| stream.recv().now_or_never() == Some(Some(())))
+            }
+            if delivered_now(&mut self.interrupt) {
+                return Some("SIGINT");
+            }
+            if delivered_now(&mut self.terminate) {
+                return Some("SIGTERM");
+            }
+            None
+        }
+        #[cfg(windows)]
+        {
+            let delivered = self
+                .ctrl_c
+                .as_mut()
+                .is_some_and(|stream| stream.recv().now_or_never() == Some(Some(())));
+            delivered.then_some("Ctrl-C")
         }
     }
 }
@@ -3208,6 +3443,374 @@ mod tests {
             "two concurrent first batches must provision their shared bucket \
              exactly once: width-many CreateBucket calls against the measured \
              store is the race the awaited guard exists to close"
+        );
+    }
+
+    /// A stop request fed by the test instead of the process's signals, so
+    /// shutdown can be asked for at an exact point in a cycle. Like the OS
+    /// streams, a request sent while the engine is busy waits in the channel
+    /// for the next `next_request`.
+    struct ChannelShutdown(tokio::sync::mpsc::UnboundedReceiver<&'static str>);
+
+    #[async_trait::async_trait]
+    impl ShutdownRequests for ChannelShutdown {
+        async fn next_request(&mut self) -> &'static str {
+            match self.0.recv().await {
+                Some(cause) => cause,
+                // The test dropped its sender: park, as the contract requires.
+                None => std::future::pending().await,
+            }
+        }
+
+        fn pending_request(&mut self) -> Option<&'static str> {
+            // Empty and disconnected both read as "nothing asked": a dropped
+            // sender is not a stop.
+            self.0.try_recv().ok()
+        }
+    }
+
+    /// Wraps the engine's real adapter and holds every cycle at its start
+    /// (`discover_sources`) until the test hands out a permit, announcing
+    /// each arrival first. A cycle — the normal loop's or the shutdown
+    /// flush's — is therefore "mid-flight" for exactly as long as the test
+    /// says, and the count of arrivals says how many cycles ran.
+    struct GatedAdapter {
+        inner: Box<dyn SourceAdapter>,
+        arrived: tokio::sync::mpsc::UnboundedSender<()>,
+        permits: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl SourceAdapter for GatedAdapter {
+        async fn discover_sources(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
+            let _ = self.arrived.send(());
+            self.permits
+                .acquire()
+                .await
+                .expect("the gate is never closed")
+                .forget();
+            self.inner.discover_sources().await
+        }
+        async fn read_batch_candidates(
+            &mut self,
+            source: &DiscoveredSource,
+            max_records: usize,
+            max_bytes: usize,
+            max_wait: Duration,
+        ) -> Result<Vec<ReadResult>, VtopError> {
+            self.inner
+                .read_batch_candidates(source, max_records, max_bytes, max_wait)
+                .await
+        }
+        async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            self.inner.commit_progress(marker).await
+        }
+        async fn replay_from_marker(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            self.inner.replay_from_marker(marker).await
+        }
+        fn source_type(&self) -> SourceType {
+            self.inner.source_type()
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            // Recovery downcasts to the concrete adapter to seed cursors.
+            self.inner.as_any_mut()
+        }
+    }
+
+    /// An engine over one file holding `lines`, with thresholds no test here
+    /// trips (so data is only ever sealed by the shutdown flush), its file
+    /// adapter behind a [`GatedAdapter`], and a mock backend.
+    async fn gated_engine(
+        dir: &std::path::Path,
+        lines: &[&str],
+        idle_poll_interval_ms: u64,
+    ) -> (
+        Engine,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        Arc<tokio::sync::Semaphore>,
+    ) {
+        let input = dir.join("in.log");
+        let mut body = String::new();
+        for line in lines {
+            body.push_str(line);
+            body.push('\n');
+        }
+        std::fs::write(&input, body).unwrap();
+        let mut cfg = file_config(
+            dir.join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_records = 10_000;
+        cfg.batching.max_bytes = 104_857_600;
+        cfg.batching.max_batch_age_seconds = 3_600;
+        cfg.batching.idle_poll_interval_ms = idle_poll_interval_ms;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        engine.backend = Arc::new(vtop_upload::MockBackend::new());
+        let inner = engine.adapters.remove(&SourceType::File).unwrap();
+        let (arrived, arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        engine.adapters.insert(
+            SourceType::File,
+            Box::new(GatedAdapter {
+                inner,
+                arrived,
+                permits: permits.clone(),
+            }),
+        );
+        (engine, arrivals, permits)
+    }
+
+    /// REGRESSION (#526): `run` used to create a fresh `ctrl_c()` listener on
+    /// every loop turn, so a SIGINT that arrived while a cycle was busy had
+    /// no listener, was swallowed by tokio's handler, and the loaded engine
+    /// kept running indefinitely. Here the stop is requested while a
+    /// productive cycle is held open; the engine must finish that cycle, run
+    /// the shutdown flush as the very next thing, and return `Ok`.
+    #[tokio::test]
+    async fn a_stop_requested_mid_cycle_is_honoured_after_that_cycle_with_the_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        // A long idle interval: if the stop were missed, nothing but another
+        // cycle or a minute's sleep could follow, and the timeout would fire.
+        let (mut engine, mut arrivals, permits) = gated_engine(
+            dir.path(),
+            &["buffered, never sealed by a threshold"],
+            60_000,
+        )
+        .await;
+        let (stop, requests) = tokio::sync::mpsc::unbounded_channel();
+
+        let driver = async {
+            arrivals.recv().await.expect("the first cycle starts");
+            // The cycle is mid-flight: this is the moment the old loop had
+            // no listener for.
+            stop.send("test-stop").unwrap();
+            permits.add_permits(1);
+            arrivals
+                .recv()
+                .await
+                .expect("the shutdown flush starts its own pass");
+            permits.add_permits(1);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(engine.run_until(ChannelShutdown(requests)), driver)
+        })
+        .await
+        .expect(
+            "a stop requested mid-cycle must end the run after that cycle; a lost \
+             request leaves `vtopctl run` running until SIGKILL (#526)",
+        );
+
+        assert!(
+            result.is_ok(),
+            "an orderly stop is a successful exit, not an error: {result:?}"
+        );
+        assert!(
+            permits.available_permits() == 0 && arrivals.try_recv().is_err(),
+            "exactly two passes must run — the held cycle and the flush; another \
+             normal cycle in between means the stop was not observed at the next \
+             select, the window a busy engine kept missing (#526)"
+        );
+        let batches = engine.store.list_batches().await.unwrap();
+        assert_eq!(
+            batches.len(),
+            1,
+            "the shutdown flush must seal the buffered record into one batch; \
+             none means the stop skipped the flush and left the data for the \
+             next start to re-read"
+        );
+        assert_eq!(batches[0].state, BatchState::SourceCommitted);
+        assert_eq!(batches[0].record_count, Some(1));
+    }
+
+    /// An idle engine is asleep in the backoff between cycles; a stop must
+    /// interrupt that sleep rather than wait out the idle interval.
+    #[tokio::test]
+    async fn an_idle_engine_stops_promptly_without_waiting_out_its_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        // Ten minutes of backoff: only an interrupted sleep ends this test
+        // inside its timeout.
+        let (mut engine, mut arrivals, permits) = gated_engine(dir.path(), &[], 600_000).await;
+        let (stop, requests) = tokio::sync::mpsc::unbounded_channel();
+
+        let driver = async {
+            arrivals.recv().await.expect("the first cycle starts");
+            permits.add_permits(1);
+            // Let the empty cycle finish and the engine settle into its
+            // backoff before asking it to stop.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            stop.send("test-stop").unwrap();
+            arrivals.recv().await.expect("the shutdown flush starts");
+            permits.add_permits(1);
+        };
+        let started = Instant::now();
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(engine.run_until(ChannelShutdown(requests)), driver)
+        })
+        .await
+        .expect(
+            "an idle engine must stop when asked, not after its idle interval; a \
+             stop that waits out the backoff turns every orderly stop into a \
+             grace-period SIGKILL",
+        );
+
+        assert!(
+            result.is_ok(),
+            "an orderly idle stop exits cleanly: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the stop must interrupt the ten-minute backoff, not wait it out"
+        );
+        assert!(
+            engine.store.list_batches().await.unwrap().is_empty(),
+            "an idle engine has nothing to flush"
+        );
+    }
+
+    /// A second stop while the shutdown flush is running abandons the flush
+    /// and reports an error (#526): it is how an operator ends a flush that is
+    /// itself stuck without reaching for SIGKILL. Abandoning must commit
+    /// nothing — the held data stays for the next start to re-read.
+    #[tokio::test]
+    async fn a_second_stop_during_the_shutdown_flush_abandons_it_with_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, mut arrivals, permits) =
+            gated_engine(dir.path(), &["held when the flush is abandoned"], 60_000).await;
+        let (stop, requests) = tokio::sync::mpsc::unbounded_channel();
+
+        let driver = async {
+            arrivals.recv().await.expect("the first cycle starts");
+            stop.send("first-stop").unwrap();
+            permits.add_permits(1);
+            // The flush is now held at its start, as a flush stuck on an
+            // unreachable store would be. No permit is ever granted for it.
+            arrivals.recv().await.expect("the shutdown flush starts");
+            stop.send("second-stop").unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(engine.run_until(ChannelShutdown(requests)), driver)
+        })
+        .await
+        .expect(
+            "a second stop must end a stuck shutdown flush promptly; otherwise the \
+             only way out of a hung flush is SIGKILL",
+        );
+
+        let error = result.expect_err(
+            "an abandoned flush is not an orderly stop: exiting 0 would tell a \
+             supervisor the data was flushed when it was not",
+        );
+        assert!(
+            error.to_string().contains("second-stop"),
+            "the error must name the request that abandoned the flush, got: {error}"
+        );
+        assert!(
+            engine.store.list_batches().await.unwrap().is_empty(),
+            "the abandoned flush must not have sealed or committed anything"
+        );
+    }
+
+    /// REGRESSION (#532 review): SIGINT and SIGTERM are separate streams, so
+    /// both landing while a pass is busy leaves TWO requests pending. The
+    /// first ended the loop and the second then resolved the flush's
+    /// abandon branch at once: the engine exited 1 without flushing, though
+    /// nothing was sent after the shutdown began. Requests queued before the
+    /// stop is observed belong to that stop and must be drained.
+    #[tokio::test]
+    async fn stops_queued_before_the_first_is_observed_do_not_abandon_the_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, mut arrivals, permits) =
+            gated_engine(dir.path(), &["flushed despite two queued stops"], 60_000).await;
+        let (stop, requests) = tokio::sync::mpsc::unbounded_channel();
+
+        // Grant every pass; the run's own return ends the race, so an
+        // abandoned flush surfaces as the `Err` asserted below, not a hang.
+        let driver = async {
+            arrivals.recv().await.expect("the first cycle starts");
+            // Both kinds arrive while the pass is held open, as a Ctrl-C
+            // followed by a supervisor's SIGTERM would.
+            stop.send("SIGINT").unwrap();
+            stop.send("SIGTERM").unwrap();
+            permits.add_permits(1);
+            while arrivals.recv().await.is_some() {
+                permits.add_permits(1);
+            }
+            std::future::pending::<()>().await
+        };
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::select! {
+                result = engine.run_until(ChannelShutdown(requests)) => result,
+                () = driver => unreachable!("the driver never finishes"),
+            }
+        })
+        .await
+        .expect("two queued stops must end the run");
+
+        assert!(
+            result.is_ok(),
+            "a stop request queued BEFORE the shutdown began is not a second signal; \
+             reading it as one abandons the flush and exits 1 for an orderly stop: \
+             {result:?}"
+        );
+        let batches = engine.store.list_batches().await.unwrap();
+        assert_eq!(
+            batches.len(),
+            1,
+            "the flush must have run to completion and sealed the buffered record"
+        );
+        assert_eq!(batches[0].state, BatchState::SourceCommitted);
+    }
+
+    /// REGRESSION (#532 review): the loop only looked for a stop after a full
+    /// cycle, so a signal that arrived during `recover()` — kept pending by
+    /// the persistent stream — still bought one normal processing pass over
+    /// every adapter first. A stop pending when the loop starts must go
+    /// straight to the shutdown flush.
+    #[tokio::test]
+    async fn a_stop_pending_when_the_run_starts_goes_straight_to_the_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, mut arrivals, permits) =
+            gated_engine(dir.path(), &["sealed only by the flush"], 60_000).await;
+        let (stop, requests) = tokio::sync::mpsc::unbounded_channel();
+        // Sent before `run_until` is even called: from the loop's point of
+        // view it arrived during recovery.
+        stop.send("during-recovery").unwrap();
+
+        // Grant every pass that arrives and count them; this never finishes,
+        // so the run's own return ends the race.
+        let passes = std::sync::atomic::AtomicUsize::new(0);
+        let driver = async {
+            while arrivals.recv().await.is_some() {
+                passes.fetch_add(1, Ordering::SeqCst);
+                permits.add_permits(1);
+            }
+            std::future::pending::<()>().await
+        };
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::select! {
+                result = engine.run_until(ChannelShutdown(requests)) => result,
+                () = driver => unreachable!("the driver never finishes"),
+            }
+        })
+        .await
+        .expect("a stop pending at start must end the run");
+
+        assert!(result.is_ok(), "an orderly stop exits cleanly: {result:?}");
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            1,
+            "only the shutdown flush may run; a second pass means a normal cycle \
+             ran first, delaying a stop sent during recovery by a whole cycle over \
+             every adapter"
+        );
+        assert_eq!(
+            engine.store.list_batches().await.unwrap().len(),
+            1,
+            "the one pass must have been the flush, sealing the buffered record"
         );
     }
 }
