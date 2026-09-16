@@ -11,6 +11,7 @@ these tests read.
 """
 
 import json
+import os
 
 import pytest
 
@@ -957,3 +958,110 @@ def test_the_delay_line_limit_clears_twice_its_worst_case_at_every_awkward_rate_
                 tbf = [c for c in qdiscs_on(shape.tc_program(), IFB_DEV) if "tbf" in c][0]
                 assert int(arg_after(tbf, "limit")) == shape.buffer_bytes(), (
                     "while the congestion queue stays exactly the configured buffer, in bytes")
+
+
+# --------------------------------------------------------------------------
+# No netem qdisc runs on a depth nobody chose (#516)
+# --------------------------------------------------------------------------
+
+
+def _every_shape_the_program_accepts():
+    """The cross product of every knob NetemShape takes, built directly so the
+    combinations a scenario validator would refuse are covered too: a future
+    caller that builds a shape by hand gets the same guarantee."""
+    for latency in (0, 101):
+        for jitter in (0, 21):
+            for loss in (0.0, 1.0):
+                for bottleneck, buffer in ((0, 0.0), (10_000, 1.0)):
+                    for policer in (0, 5_000):
+                        if not (latency or jitter or loss or bottleneck or policer):
+                            continue
+                        yield NetemShape(latency_ms=latency, jitter_ms=jitter, loss_pct=loss,
+                                         loss_model="random", bottleneck_kbps=bottleneck,
+                                         buffer_bdp=buffer, policer_kbps=policer, run_token="t")
+
+
+def test_every_netem_qdisc_in_every_shape_carries_an_explicit_limit():
+    for shape in _every_shape_the_program_accepts():
+        for cmd in shape.tc_program("eth0"):
+            if "netem" not in cmd:
+                continue
+            assert "limit" in cmd, (
+                f"{shape} installs `{' '.join(cmd)}` without a limit, so netem's default of "
+                f"{netem.NETEM_DEFAULT_LIMIT_PACKETS} packets decides that queue's depth — a "
+                "depth no column records and nobody chose")
+            assert int(arg_after(cmd, "limit")) >= netem.NETEM_DEFAULT_LIMIT_PACKETS, (
+                f"{shape}: a chosen limit must never be SHALLOWER than the one it replaced")
+
+
+def test_a_limit_never_installs_a_qdisc_the_shape_did_not_ask_for():
+    # The limit is sizing for a qdisc that exists, never a reason for one to:
+    # a pure-loss shape has no download delay line, a policer-only shape no
+    # upload netem, and the teardown must still mirror the install.
+    for shape in _every_shape_the_program_accepts():
+        program = shape.tc_program("eth0")
+        download = [c for c in program if c[:4] == ["tc", "qdisc", "add", "dev"]
+                    and c[4] == "eth0" and "netem" in c]
+        wants_download = bool(shape.download_delay_ms() or shape.jitter_ms // 2)
+        assert bool(download) == wants_download, (
+            f"{shape}: a download netem is installed={bool(download)} but the shape asks for "
+            f"one={wants_download}")
+        upload_netem = [c for c in program if IFB_DEV in c and "netem" in c]
+        wants_upload = bool(shape.upload_delay_ms() or shape.jitter_ms or shape.loss_pct)
+        assert bool(upload_netem) == wants_upload, (
+            f"{shape}: an upload netem is installed={bool(upload_netem)} but the shape asks "
+            f"for one={wants_upload}")
+        removes_download = ["tc", "qdisc", "del", "dev", "eth0", "root"] in \
+            shape.teardown_program("eth0")
+        assert removes_download == bool(download), (
+            f"{shape}: the teardown removes a download root={removes_download} while the "
+            f"install created one={bool(download)}")
+
+
+def test_the_download_delay_line_is_sized_for_the_reference_rate_it_documents():
+    shape = full_shape()
+    held_ms = shape.download_delay_ms() + netem.JITTER_HEADROOM_SIGMAS * (shape.jitter_ms // 2)
+    in_flight = netem.DELAY_LINE_REFERENCE_KBPS * held_ms / 8
+    limit = shape.download_delay_line_limit_packets()
+    assert limit * netem.MTU_BYTES >= 2 * in_flight, (
+        f"the unshaped return path's delay line holds {in_flight:.0f} bytes at the "
+        f"{netem.DELAY_LINE_REFERENCE_KBPS} kbit/s reference; a limit of {limit} packets is "
+        "within a factor of two of that and would drop what the emulated link never lost")
+    policed = NetemShape(latency_ms=100, policer_kbps=5_000, run_token="t")
+    assert policed.upload_delay_line_limit_packets() == netem.delay_line_limit_packets(
+        5_000, policed.upload_delay_ms(), 0), (
+        "an unbottlenecked upload behind a policer is sized for the policer's rate, the "
+        "fastest thing that can enter its delay line")
+
+
+def test_a_changed_mtu_moves_the_buffer_floor_and_the_packet_conversion_together(monkeypatch):
+    monkeypatch.setattr(netem, "MTU_BYTES", 9000)
+    tiny = NetemShape(latency_ms=2, bottleneck_kbps=64, buffer_bdp=0.1, run_token="t")
+    assert tiny.buffer_bytes() == 9000, (
+        "the buffer floor is one full-size packet; a literal 1500 would leave a jumbo-frame "
+        "link with a queue that cannot hold a single segment")
+    big = NetemShape(latency_ms=100, jitter_ms=0, run_token="t")
+    expected = max(netem.NETEM_DEFAULT_LIMIT_PACKETS,
+                   -(-netem.DELAY_LINE_HEADROOM
+                     * -(-netem.DELAY_LINE_REFERENCE_KBPS * big.download_delay_ms() // 8) // 9000))
+    assert big.download_delay_line_limit_packets() == expected, (
+        "the delay lines' packet limits convert at the same MTU the floor uses")
+
+
+def test_the_bundled_scenarios_congestion_queues_and_upload_lines_did_not_move():
+    # #516 gives the UNCHOSEN depths a value; it must not move the chosen ones.
+    # Pinned from the install programs before the change.
+    from lib.scenario import load_scenario
+    from lib.shaping import shape_from_scenario
+    expected = {
+        "14-lossy-wan.yaml": ("1000", "125000"),
+        "16-contended-bottleneck.yaml": ("1500", "500000"),
+    }
+    for name, (netem_limit, tbf_limit) in expected.items():
+        program = shape_from_scenario(load_scenario(
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "scenarios", name))).tc_program("eth0")
+        upload = [c for c in program if IFB_DEV in c and "netem" in c][0]
+        tbf = [c for c in program if "tbf" in c][0]
+        assert (arg_after(upload, "limit"), arg_after(tbf, "limit")) == (netem_limit, tbf_limit), (
+            f"{name}: the upload delay line and congestion queue must be what they were")
