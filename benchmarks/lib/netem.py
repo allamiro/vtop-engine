@@ -35,9 +35,9 @@ without inspecting a single packet:
 
   * packets ARRIVING on the engine-side interface are the upload, and only
     the upload — the store's replies arrive on the other interface. They are
-    redirected with `act_mirred` onto an `ifb` device, where the bottleneck
-    (tbf: rate and buffer depth) and the impairment (netem: half the delay,
-    all of the loss) are applied. A `tc police` action on the same ingress
+    redirected with `act_mirred` onto an `ifb` device, where the impairment
+    (netem: half the delay, all of the loss) and the bottleneck (tbf: rate and
+    buffer depth, as netem's child) are applied. A `tc police` action on the same ingress
     hook, ahead of the redirect, is the policer: it drops above its rate and
     holds no queue, so it emits no queueing-delay signal at all.
   * packets LEAVING on the engine-side interface are the download, and only
@@ -55,11 +55,13 @@ injectable, so the tests never need a container or a capability.
 from __future__ import annotations
 
 import json
+import math
 import shlex
 import subprocess
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -117,9 +119,27 @@ GEMODEL_MEAN_BURST_PACKETS = 2.0
 TBF_BURST_DIVISOR = 250
 TBF_MIN_BURST_BYTES = 1600
 
-# The ethernet MTU the buffer depth is converted at, tbf's bytes into netem's
-# packets. See `netem_limit_packets`.
+# The ethernet MTU the delay line's byte estimate is converted at, into the
+# packets netem's `limit` counts. See `netem_limit_packets`.
 MTU_BYTES = 1500
+
+# How deep into the jitter distribution the delay line is sized for, in
+# standard deviations. netem's `distribution normal` draws the delay around
+# the configured mean with the jitter as its sigma, so half of every draw is
+# above the mean and the delay line holds more than the mean says. Three
+# sigma covers all but roughly one draw in a thousand.
+JITTER_HEADROOM_SIGMAS = 3
+
+# How far out of reach the delay line's limit is set, as a multiple of what it
+# can legitimately hold. See `netem_limit_packets`: the multiple is what covers
+# the arrivals ABOVE the bottleneck rate that a filling or dropping queue lets
+# into the delay line, measured at twice the rate on the lab's 8-flow link.
+DELAY_LINE_HEADROOM = 4
+
+# netem's own default limit, in packets. The delay line's limit never goes
+# below it: a shape that asks for a bottleneck must not get a SHALLOWER delay
+# line than one that asks for none.
+NETEM_DEFAULT_LIMIT_PACKETS = 1000
 
 COMMAND_TIMEOUT_SECONDS = 40.0
 # The calibration probe: long enough for the bottleneck's queue to fill and
@@ -265,30 +285,91 @@ class NetemShape:
     def rate_calibration_twin(self) -> NetemShape:
         """This shape with the impairments removed, for the rate gate.
 
-        Same bottleneck, same buffer, same delay — the link whose RATE is being
-        calibrated — with loss and the policer dropped, because both suppress
-        TCP goodput far below the configured rate by design, and a gate that
-        measured through them would refuse every correctly built lossy link.
+        Same bottleneck, same buffer, same mean delay — the link whose RATE is
+        being calibrated — with loss, the policer and the JITTER dropped,
+        because each suppresses TCP goodput below the configured rate by
+        design, and a gate that measured through them would refuse a correctly
+        built link.
+
+        Jitter joined the list with the layout that made the buffer honest
+        (review). netem's normally distributed delay reorders packets, TCP
+        reads the reordering as loss, and on a queue that is really one BDP deep
+        the flow backs off: measured live at 10 Mbit/s, 100 ms and 20 ms of
+        jitter, a single flow received 8.91-9.15 Mbit/s at 1 BDP against
+        9.34-9.62 at 3.5-4 BDP and 9.51-9.61 with no jitter — the bucket
+        delivering its rate every time, and the gate's 9.0 floor sitting inside
+        the spread. The old layout never showed it because its real queue, at
+        GSO-sized packets, was several times the one it recorded.
         """
-        return replace(self, loss_pct=0.0, loss_model="random", policer_kbps=0)
+        return replace(self, loss_pct=0.0, loss_model="random", policer_kbps=0, jitter_ms=0)
 
     def netem_limit_packets(self) -> int:
-        """The child netem's queue limit, in packets.
+        """The delay line's packet limit — deliberately NOT the bottleneck
+        buffer, which is tbf's byte `limit` and nothing else.
 
-        Attaching a classless netem under tbf REPLACES tbf's internal bfifo —
-        the queue where tbf's byte `limit` is enforced — with netem's own, whose
-        default is 1000 packets (review; confirmed against a live `tc`, which
-        reports `netem 10: parent 1:1 limit 1000`). The configured buffer depth
-        then applies to nothing, and the one-BDP and four-BDP scenarios both run
-        on the same accidental queue while recording different depths.
+        WHY THE TWO QUEUES ARE SEPARATE QDISCS (review, the fourth round on this
+        one number). The upload used to be tbf with netem as its child. A
+        classless child REPLACES tbf's internal bfifo, so netem's packet `limit`
+        became the only queue limit there was — and it bounded everything netem
+        held: the congestion backlog, and every packet still riding out its
+        delay. So the limit had to be the buffer PLUS a reserve for the delay
+        line, and a reserve is sized for the worst case. Whenever the line held
+        less than that — below saturation, at the start of a flow, on every
+        jitter draw short of three sigma — congestion backlog spent the slack:
+        at 10 Mbit/s, 100 ms, 1 BDP and 20 ms of jitter, 37.5 kB (0.3 BDP) of
+        queue no column records. No reserve can fix that, because the mean
+        occupancy has the same slack in smaller form. And it was not a byte
+        limit at all: measured live on the lab's own path, the skbs arriving
+        from a TSO sender are GSO aggregates of ~3 kB, so a limit of 125
+        "MTU-sized" packets held 381 kB.
 
-        So the leaf carries the limit explicitly. netem counts PACKETS where tbf
-        counts bytes, so the depth is converted at the MTU: approximate for a
-        mixed-size flow, exact for the full-size segments a bulk upload is made
-        of, and stated here rather than discovered from a result nobody could
-        explain.
+        So the upload is now netem at the ROOT, with tbf as its child. netem
+        holds each packet in its time-ordered delay line until it is due and
+        only then hands it to tbf, whose own bfifo keeps tbf's byte `limit`:
+        the congestion queue is enforced by itself, in bytes, and jitter cannot
+        lend it anything. The packet timing is unchanged — in both layouts a
+        packet's delay starts when it arrives and its wait for tokens starts
+        when the delay has run out — and so is where loss applies: on netem's
+        enqueue, before either queue.
+
+        THIS limit therefore bounds only the delay line, which on a real link is
+        a length of wire and has no capacity to exceed. It is not a queue the
+        emulated link has, so it is set out of reach rather than to a value:
+        `DELAY_LINE_HEADROOM` times what the line and the congestion queue could
+        hold together at the MTU, floored at netem's own default. The buffer is
+        in the sum for two reasons: a queue that is filling admits arrivals
+        above the bottleneck rate into the delay line — measured at about twice
+        `rate x delay` at peak — and some kernels count the child's packets
+        against the parent's limit. A limit this far out of reach costs only
+        memory the traffic never uses; the one that is too small drops packets
+        the emulated link never lost.
+
+        Measured on a live middlebox rig (8 TCP flows through the ingress, ifb
+        and qdiscs this program installs, 10 Mbit/s, 100 ms): tbf's backlog
+        peaked at 124,214 bytes of a 125,000-byte limit at 1 BDP and 499,950 of
+        500,000 at 4 BDP, with 0 and 20 ms of jitter alike; every drop was
+        tbf's, none netem's; and the delay line peaked at 48 packets (130 kB)
+        under limits of 1000-1600.
         """
-        return max(1, self.buffer_bytes() // MTU_BYTES)
+        reachable = self.delay_occupancy_bytes() + self.buffer_bytes()
+        return max(NETEM_DEFAULT_LIMIT_PACKETS,
+                   -(-DELAY_LINE_HEADROOM * reachable // MTU_BYTES))
+
+    def delay_occupancy_bytes(self) -> int:
+        """Bytes in flight inside the upload delay line at the bottleneck rate,
+        at the deep end of its jitter: `rate x (upload delay + 3 sigma)`.
+
+        Not buffer: this is data the link is carrying, not data queued behind a
+        full link. It sizes the delay line's limit, and nothing about the
+        congestion queue depends on it any more — tbf's byte limit is the
+        buffer, whatever the delay line holds. Rounded up and computed exactly
+        (`kbps x held_ms / 8` bytes, the kilo and the milli cancelling) because
+        that is the harmless direction for a limit, and because an earlier
+        round's rounding error is not one worth reintroducing where it can no
+        longer bite.
+        """
+        held_ms = self.upload_delay_ms() + JITTER_HEADROOM_SIGMAS * self._upload_jitter_ms()
+        return math.ceil(Fraction(self.bottleneck_kbps * held_ms) / 8)
 
     def _netem_args(self, delay_ms: int, jitter_ms: int, with_loss: bool,
                     limit_packets: int | None = None) -> list[str]:
@@ -338,26 +419,30 @@ class NetemShape:
             ["ip", "link", "set", IFB_DEV, "up"],
         ]
 
-        # UPLOAD: tbf (the bottleneck and its buffer) with netem (the delay
-        # and the loss) as its child, so packets are rate-limited into the
-        # queue first and impaired second — the order a real bottleneck link
-        # applies them.
-        # The leaf under tbf carries the buffer depth explicitly; without a tbf
-        # there is no configured buffer to hold, so netem keeps its own default.
+        # UPLOAD: netem (the delay and the loss) at the root, with tbf (the
+        # bottleneck and its buffer) as its child. Two qdiscs, two queues: the
+        # delay line is netem's and the congestion queue is tbf's own byte-limited
+        # bfifo, so `shaping_buffer_bdp` is enforced exactly and nothing the delay
+        # line leaves unused can be borrowed by it — see `netem_limit_packets`.
+        # Without a tbf there is no configured buffer to hold, so netem keeps its
+        # own default (#516 is that gap).
         upload_netem = self._netem_args(
             self.upload_delay_ms(), self._upload_jitter_ms(), with_loss=True,
             limit_packets=self.netem_limit_packets() if self.bottleneck_kbps else None)
-        if self.bottleneck_kbps:
-            cmds.append(["tc", "qdisc", "add", "dev", IFB_DEV, "root", "handle", "1:",
-                         "tbf", "rate", f"{self.bottleneck_kbps}kbit",
-                         "burst", str(self.burst_bytes()),
-                         "limit", str(self.buffer_bytes())])
-            if len(upload_netem) > 1:
-                cmds.append(["tc", "qdisc", "add", "dev", IFB_DEV, "parent", "1:1",
-                             "handle", "10:"] + upload_netem)
-        elif len(upload_netem) > 1:
+        bottleneck = ["tbf", "rate", f"{self.bottleneck_kbps}kbit",
+                      "burst", str(self.burst_bytes()), "limit", str(self.buffer_bytes())]
+        if len(upload_netem) > 1:
             cmds.append(["tc", "qdisc", "add", "dev", IFB_DEV, "root", "handle", "1:"]
                         + upload_netem)
+            if self.bottleneck_kbps:
+                cmds.append(["tc", "qdisc", "add", "dev", IFB_DEV, "parent", "1:1",
+                             "handle", "10:"] + bottleneck)
+        elif self.bottleneck_kbps:
+            # Unreachable from a validated scenario — a bottleneck needs a buffer
+            # and a buffer needs a latency — but a shape built directly still
+            # gets its bottleneck rather than silently none.
+            cmds.append(["tc", "qdisc", "add", "dev", IFB_DEV, "root", "handle", "1:"]
+                        + bottleneck)
 
         # The ingress hook on the engine-facing interface: the policer first
         # (it drops above its rate and queues nothing), then the redirect onto

@@ -29,7 +29,8 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from lib.shaping import SHAPING_COLUMNS  # noqa: E402
+from lib.scenario import load_scenario  # noqa: E402
+from lib.shaping import SHAPING_COLUMNS, selected_driver  # noqa: E402
 
 COMPARE_COLS = [
     "scenario_name", "run_id", "format", "file_size", "volume", "compression",
@@ -142,6 +143,92 @@ def run_one(scenario_path, results_dir):
     return run_dir
 
 
+def declared_driver(path: str) -> str:
+    """The shaping driver a scenario FILE asks for; "" when it asks for none or
+    cannot be read.
+
+    Used for one thing only: deciding which scenario runs NEXT (see
+    `collect_rows`). It never decides whether a matrix is refused, so a wrong
+    answer here can move the moment a conflict is found and can do nothing
+    else — which is the property that lets it stay this simple.
+
+    Normalised through `selected_driver`, the reading the runner itself uses: a
+    scenario carrying `shaping_driver: " netem "` runs as netem, and scheduling
+    it as unshaped would put it behind every other scenario in the list.
+    """
+    try:
+        scenario = load_scenario(path)
+        driver = selected_driver(scenario)
+    except Exception:  # noqa: BLE001 - an unreadable file is the runner's to report
+        return ""
+    if not str(scenario.get("shaping_api_url", "") or "").strip() and driver != "netem":
+        return ""
+    return driver
+
+
+def collect_rows(paths: list, load_row) -> list:
+    """Run every scenario and return their rows in LIST order, refusing the
+    moment the rows that exist span two shaping drivers.
+
+    WHY NOTHING IS PREDICTED (review, seven rounds of it). The refusal used to
+    fire only after every scenario had run, which made a conflict readable from
+    the scenario files cost the whole matrix. The first fix judged it up front
+    from what the files DECLARE — and a declared driver is not a row: a
+    scenario that cannot run produces none, and counting its driver aborted
+    matrices that had always succeeded. So the preflight grew a prediction of
+    whether each scenario would produce a row, and every round of review found
+    another rule it did not mirror: runner_mode, the endpoint check, concurrent
+    whole-file seeding, the seed interval, a zero or non-integer pipeline width,
+    a fractional duration read as an int, a compression name the engine cannot
+    deserialize, a zero batch limit. None of those was the last one. Half of
+    them are the ENGINE's rules, which Python can only copy, and no copy at all
+    can foresee the other way a scenario fails to produce a row: a lab that is
+    not up. A prediction of a run is a second implementation of the run.
+
+    So the decision reads only what the runner actually produced. `load_row`
+    runs one scenario and returns its row, or None when it produced none —
+    exactly the judgement `run_one` has always made — and the moment the rows
+    in hand span two drivers the matrix is refused, before another scenario
+    starts. A scenario that cannot run contributes no driver because it
+    contributes no row; nothing has to know why.
+
+    WHAT THAT COSTS, and how it is kept small: a real conflict is found only
+    once both drivers have produced a row. The declared driver buys the order
+    that makes that as early as possible — while some shaped driver is declared
+    but has no row yet, the next scenario run is the first one in the list
+    declaring such a driver; otherwise the next in list order. A real conflict
+    therefore costs one successful run per driver (plus whatever declared runs
+    failed on the way), not the matrix. And because the declaration only
+    ORDERS, a misread of it can make a refusal later, never wrong: it cannot
+    abort a matrix that would have succeeded, and it cannot let a mixed table be
+    written.
+    """
+    declared = [declared_driver(path) for path in paths]
+    pending = list(range(len(paths)))
+    produced: list = []  # (index, row)
+    while pending:
+        seen = {str(row.get("shaping_driver", "") or "").strip() for _i, row in produced}
+        index = next((i for i in pending if declared[i] and declared[i] not in seen),
+                     pending[0])
+        pending.remove(index)
+        row = load_row(paths[index])
+        if row is None:
+            continue
+        produced.append((index, row))
+        try:
+            refuse_mixed_drivers([row for _i, row in produced])
+        except IncomparableRuns as exc:
+            ran = [os.path.basename(paths[i]) for i, _row in produced]
+            skipped = [os.path.basename(paths[i]) for i in sorted(pending)]
+            raise IncomparableRuns(
+                f"{exc}. Refused as soon as the rows in hand spanned both, after "
+                f"{len(ran)} scenario(s) produced rows ({', '.join(ran)}); "
+                f"{len(skipped)} were not run"
+                + (f" ({', '.join(skipped)})" if skipped else "")
+                + ". Their run directories are kept; no matrix was written") from None
+    return [row for _i, row in sorted(produced, key=lambda pair: pair[0])]
+
+
 def matrix_row(summary: dict) -> dict:
     """One summary flattened into one comparison row.
 
@@ -235,18 +322,28 @@ def main() -> int:
         print("no scenarios found", file=sys.stderr)
         return 2
 
-    rows = []
-    for sc in scenarios:
+    # Said up front when the files declare more than one shaped driver, and
+    # ONLY said: whether the matrix is refused is decided by the rows the runs
+    # produce, not by what the files ask for (see collect_rows). `--all` spans
+    # toxiproxy and netem today, so this is the ordinary path.
+    drivers = sorted({driver for driver in map(declared_driver, scenarios) if driver})
+    if len(drivers) > 1:
+        print(f"[matrix] these scenarios declare {len(drivers)} shaping drivers "
+              f"({', '.join(drivers)}); one scenario of each runs first, and the matrix is "
+              "refused as soon as two of them produce rows", file=sys.stderr)
+
+    def load_row(sc):
         print(f"\n=== {os.path.basename(sc)} ===")
         run_dir = run_one(sc, args.results_dir)
         if not run_dir:
-            continue
+            return None
         summ_path = os.path.join(run_dir, "summary.json")
         if not os.path.exists(summ_path):
-            continue
+            return None
         with open(summ_path) as fh:
-            summ = json.load(fh)
-        rows.append(matrix_row(summ))
+            return matrix_row(json.load(fh))
+
+    rows = collect_rows(scenarios, load_row)
 
     # Before a single row is written (#477): a table that exists is a table
     # somebody reads, so the refusal has to land before the file does.

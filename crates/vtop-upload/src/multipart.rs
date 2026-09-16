@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::sync::Semaphore;
+use vtop_core::config::MAX_SEMAPHORE_PERMITS;
 use vtop_core::errors::VtopError;
 
 /// Tunables for one resumable upload run.
@@ -244,6 +245,29 @@ pub async fn upload_resumable(
         return Err(VtopError::Config(
             "multipart part size and parallelism must be > 0".into(),
         ));
+    }
+    // The other end of the same knob, guarded in the same place and for the
+    // sharper failure (review). Zero degrades — the wave below would carry no
+    // parts — and is refused above; a count above tokio's ceiling does not
+    // degrade at all: `Semaphore::new` PANICS, so an operator's typo aborts the
+    // process mid-copy instead of failing one upload.
+    //
+    // `UploadConfig::validate_multipart_limits` bounds the same value at config
+    // load, which is where an operator would rather hear about it, but that is
+    // not the last word: `vtopctl tier copy` applies
+    // --multipart-max-parallelism to the DERIVED MultipartUploadConfig after
+    // build_backend has validated the UploadConfig, so the number that becomes
+    // the permit count was never the number that check saw. This function is
+    // the one door every caller — the engine, a tier copy, a flag nobody has
+    // written yet — passes through on the way to that semaphore, so the bound
+    // it cannot be routed around lives here.
+    if cfg.max_parallelism > MAX_SEMAPHORE_PERMITS {
+        return Err(VtopError::Config(format!(
+            "multipart parallelism {} exceeds the maximum permits a semaphore can hold \
+             ({MAX_SEMAPHORE_PERMITS}); the value becomes a permit count and an oversized \
+             one panics rather than degrading",
+            cfg.max_parallelism
+        )));
     }
     if fence.byte_length == 0 {
         return Err(VtopError::Upload(
@@ -1009,6 +1033,46 @@ mod tests {
             "{mismatch}"
         );
         let _ = err;
+    }
+
+    #[tokio::test]
+    async fn a_parallelism_above_tokios_ceiling_is_refused_before_the_semaphore_is_built() {
+        // `vtopctl tier copy` applies --multipart-max-parallelism to the
+        // DERIVED MultipartUploadConfig, after build_backend has already
+        // validated the UploadConfig it was handed — so the number that
+        // becomes the permit count below was never the number the config
+        // check saw (review). Above tokio's ceiling `Semaphore::new` does not
+        // degrade, it panics, and a tier copy would take the process down on
+        // the first eligible object rather than refuse a typo'd flag.
+        //
+        // The guard belongs here, beside the zero guard and for the same
+        // reason: this is the one door every caller reaches the semaphore
+        // through, so a flag nobody has written yet cannot go around it.
+        let data = vec![7_u8; 4_000];
+        let (file, digest) = tmp_file(&data);
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new();
+        let mut cfg = cfg(state.path(), 2_000);
+        cfg.max_parallelism = usize::MAX;
+        let err = upload_resumable(
+            &backend,
+            &cfg,
+            file.path(),
+            "s3://bucket/oversized-parallelism.segment",
+            Some(ObjectChecksum::new("blake3", &digest)),
+            fence(&digest, data.len() as u64, 1),
+        )
+        .await
+        .expect_err(
+            "an oversized parallelism must be refused as a config error; reaching \
+             Semaphore::new with it aborts the whole process mid-copy",
+        );
+        assert!(
+            err.to_string().contains("semaphore")
+                && err.to_string().contains(&usize::MAX.to_string()),
+            "the refusal must name the ceiling it enforces AND the value it saw, or an \
+             operator cannot tell which flag to fix: {err}"
+        );
     }
 
     #[tokio::test]
