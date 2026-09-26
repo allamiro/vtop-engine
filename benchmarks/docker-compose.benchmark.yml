@@ -286,7 +286,7 @@ services:
     # broke `compose up` in its pull phase, and Dependabot's docker-compose
     # ecosystem cannot bump a tag that never changes name. Every lab image in
     # this file is pinned for the same reason.
-    image: nginx:1.29.3-alpine
+    image: nginx:1.31.0-alpine
     container_name: vtop-bench-h3-proxy
     profiles: ["h3"]
     ports:
