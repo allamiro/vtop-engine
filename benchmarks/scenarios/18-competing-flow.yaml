@@ -1,0 +1,116 @@
+name: competing-flow
+description: >-
+  The same 10 Mbit/s, 100 ms bottleneck as scenario 14 with its loss
+  removed, and a SECOND FLOW in the queue (#478). The engine uploads at
+  the shipped default width of eight concurrent batches while a plain-TCP
+  bulk flow crosses the same tbf, and the flow's goodput is measured three
+  times: alone before the run, beside VTOP, and alone again afterwards.
+  What this scenario produces is not VTOP's throughput. It is the
+  NEIGHBOUR'S — because loss-based TCP divides a bottleneck per connection,
+  so eight upload connections take roughly eight times one flow's share,
+  and that is the mechanism by which a concurrency knob buys throughput.
+  The engine cannot see the cost: its width controller only backs off on a
+  429, a 503 or a SlowDown, and a shaped WAN link produces none of those —
+  a thin pipe is a rate, not a refusal — so under exactly these conditions
+  the controller grows the width back on every clean cycle. The two solo
+  windows bracket the contended one so that a bottleneck which drifted
+  mid-run is visible rather than absorbed into the fairness claim; they
+  must agree within 10% or the run is refused naming both numbers. Jain's
+  index is recorded beside both per-flow goodputs and never instead of
+  them: an index alone is symmetric and does not say which flow won. There
+  is deliberately NO threshold here — this scenario builds the instrument,
+  and what VTOP may do to a neighbour becomes a shipping gate in the
+  egress-ceiling issue, where a knob is actually added. Requires the netem
+  stack, docker compose -f benchmarks/docker-compose.benchmark.yml
+  --profile netem --profile containerized up -d, and unshapes the
+  middlebox when it ends.
+volume: 150
+file_size: small
+format: jsonl
+compression: gzip
+checksum: sha256
+backend: s3_native
+bucket: "vtop-bench-soak"
+# As in scenarios 14, 15 and 16: the engine dials the middlebox and it
+# forwards at L3 to MinIO. Container mode is not a preference — tc shapes
+# the interfaces of the namespace it runs in, and a host process reaching a
+# published port never crosses them.
+runner_mode: container
+endpoint_url: http://netem:9200
+shaping_driver: netem
+# The same continental round trip as scenarios 13-16.
+shaping_latency_ms: 100
+# No jitter: the competitor's share must move because of the engine beside
+# it, not because netem reordered packets under both flows.
+shaping_jitter_ms: 0
+# The 10 Mbit/s pipe of the acceptance criterion, at ONE BDP — scenario 14's
+# zero-loss link exactly, so the contended row can be read against it and
+# the only new variable is the second flow.
+shaping_bottleneck_kbps: 10000
+shaping_buffer_bdp: 1.0
+# No loss keys: a fairness measurement over a lossy link measures the loss
+# as well, and two variables in one comparison measure neither. Scenario 14
+# holds the loss end of the axis.
+#
+# THE COMPETING FLOW: a plain-TCP bulk flow for 60 s per phase, three
+# phases, run from the probe container across the same ingress hook, the
+# same policer and the same tbf as the upload. 60 s because the window has
+# to outlast slow start (iperf3 omits the first 3 s of each phase) and the
+# batch cadence below by enough that neither dominates the average, and
+# because three of them plus the ramps cost about three and a half minutes
+# of a five-minute run. The engine's own duration_seconds must exceed one
+# window, or the tail of the contended phase would have no VTOP in it; the
+# runner refuses that before it seeds a byte.
+shaping_competitor: "bulk:60"
+batch_max_records: 5000
+batch_max_bytes: 8388608
+batch_max_age_seconds: 5
+# EIGHT uploads in flight: the shipped default of batching.max_concurrent_
+# batches, and the number the acceptance criterion names. This is the knob
+# whose cost the scenario exists to price, so it runs at the value an
+# operator gets without choosing one.
+max_concurrent_batches: 8
+# Scenario 13's seeding: the competitor only meets a busy engine if the
+# offered load exceeds what the link drains, and an engine that is caught up
+# would leave the flow measuring an empty pipe under a contended name.
+# NO SUSTAINED BACKLOG, and this is the one place this milestone's scenarios
+# deliberately differ from scenario 13's shape. Measured on the lab before
+# committing it: with seed_concurrently and backlog_multiplier 1.5 on a
+# 10 Mbit/s link, the seeder outruns the engine so far that a process_once
+# never finishes draining — the second cycle of a trial run took 479 seconds
+# against a 60-second competitor window, and every cycle after it is longer
+# than the last.
+#
+# That is fatal HERE specifically. VTOP's share of the contended window is
+# attributed only from engine cycles the window WHOLLY CONTAINS, because the
+# committed-byte total moves only when a cycle returns and a straddling cycle
+# carries bytes from outside the window that cannot be separated from the ones
+# inside. A scenario whose cycles are longer than the window therefore has no
+# attributable share at all, and the run refuses rather than reporting one — as
+# it should, and as it did.
+#
+# So the load here is a steady drain rather than a deficit: each cycle uploads
+# the volume below and returns, several cycles fall inside the window, and the
+# fairness number has something to be computed from. What VTOP does under
+# SUSTAINED backpressure is scenarios 11-13's subject; what it does to a
+# neighbour is this one's, and it needs the engine actually uploading rather
+# than accumulating.
+backlog_multiplier: 0.5
+seed_concurrently: false
+# THE CYCLE MUST FIT INSIDE THE WINDOW, and these three knobs are what make it.
+# Measured on the lab, not reasoned about: with this scenario's original
+# batching (50 records, 1 MiB) each process_once ran a steady ~40s — five
+# cycles at 39.3, 42.6, 37.4, 40.4 and 42.9 seconds — because a 10 Mbit/s link
+# with a 100 ms round trip spends most of a cycle on per-batch round trips
+# rather than on bytes. A 40-second cycle fits inside a 60-second window only
+# if it happens to start in the first 20 seconds of it, so the run refused
+# roughly as often as it succeeded, and refused three times out of three here.
+#
+# Fewer, larger objects fixes it at the source: the same bytes move in a
+# fraction of the round trips, the cycle drops to about ten seconds, and four
+# of them land wholly inside the window. That is also the more representative
+# shape for THIS measurement — a bulk uploader competing with a bulk flow — so
+# it costs nothing to be honest about.
+duration_seconds: 150
+fault: none
+sys_sample_interval: 2.0
