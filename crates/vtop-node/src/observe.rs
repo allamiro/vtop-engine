@@ -328,10 +328,23 @@ impl RetentionGauges {
         ]
     }
 
-    /// `None` leaves the gauges as they were: no pass has run on this role
-    /// yet, which is not news that retention stopped.
+    /// `None` - no pass has run on the role holding the range - removes the
+    /// series rather than leaving them standing. A candidate keeps this
+    /// collector across promotion and demotion, but each new role starts with
+    /// empty stats: holding the old role's values would keep a `blocked` or
+    /// `last_pass_failed` alert firing on an idle range for as long as no
+    /// append arrives, about a role that no longer exists (review on #572).
+    /// Each collector owns one range, so a reset clears exactly that range.
     fn refresh(&self, range: &[&str; 2], snapshot: Option<RetentionSnapshot>) {
         let Some(snapshot) = snapshot else {
+            for vec in [
+                &self.retained_bytes,
+                &self.bound_bytes,
+                &self.blocked,
+                &self.failing,
+            ] {
+                vec.reset();
+            }
             return;
         };
         self.retained_bytes
@@ -2091,7 +2104,8 @@ mod tests {
 
     /// #561: a range whose retention is blocked used to look exactly like one
     /// under its bound. The state is exported under one name whichever role
-    /// holds the range, and nothing is exported before a pass has run.
+    /// holds the range, nothing is exported before a pass has run, and a role
+    /// change clears what the previous role reported.
     #[test]
     fn a_candidate_exports_whether_retention_is_blocked_and_why() {
         use std::sync::Mutex;
@@ -2192,6 +2206,22 @@ mod tests {
                 .is_some_and(|l| l.ends_with(" 1")),
             "{text}"
         );
+
+        // A role change installs a role with no passes yet. The failed pass
+        // belonged to the role that was dropped: it must not keep alerting.
+        *view.snapshot.lock().unwrap() = None;
+        let text = scrape(&registry);
+        for prefix in [
+            "vtop_broker_retention_last_pass_failed{",
+            "vtop_broker_retention_blocked{",
+            "vtop_broker_retention_retained_bytes{",
+            "vtop_broker_retention_bound_bytes{",
+        ] {
+            assert!(
+                line(&text, prefix).is_none(),
+                "the new role has not run a pass; {prefix} still reports the old one: {text}"
+            );
+        }
     }
 
     #[test]
