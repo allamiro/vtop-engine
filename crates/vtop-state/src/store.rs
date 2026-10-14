@@ -25,24 +25,40 @@ use vtop_core::types::SourceType;
 /// - `sqlite://path`, `sqlite:path`, `sqlite::memory:`, or a bare path → SQLite
 /// - `postgres://…` / `postgresql://…` → Postgres (Phase 3, behind the
 ///   `postgres` feature; an unhelpful build without it returns a clear error)
+///
+/// Every request on the returned store is bounded by
+/// [`crate::deadline::DEFAULT_REQUEST_DEADLINE`] (#556); use
+/// [`connect_state_store_with_deadline`] to choose the bound.
 pub async fn connect_state_store(conn_str: &str) -> Result<Box<dyn StateStore>, VtopError> {
-    if conn_str.starts_with("postgres://") || conn_str.starts_with("postgresql://") {
-        #[cfg(feature = "postgres")]
-        {
-            let store = crate::pg_store::PgStateStore::connect(conn_str).await?;
-            return Ok(Box::new(store));
-        }
-        #[cfg(not(feature = "postgres"))]
-        {
-            return Err(VtopError::State(
-                "postgres:// state store requires a build with --features postgres".to_string(),
-            ));
-        }
-    }
-    // Everything else is treated as SQLite (including a bare filesystem path),
-    // matching the existing single-node default.
-    let store = SqliteStateStore::connect(conn_str).await?;
-    Ok(Box::new(store))
+    connect_state_store_with_deadline(conn_str, crate::deadline::DEFAULT_REQUEST_DEADLINE).await
+}
+
+/// [`connect_state_store`] with an explicit bound on every request: `point`
+/// for single-row operations, ten times it for whole-ledger scans. A store
+/// that stops answering then fails its request instead of blocking the caller
+/// (see [`crate::deadline`]).
+pub async fn connect_state_store_with_deadline(
+    conn_str: &str,
+    point: std::time::Duration,
+) -> Result<Box<dyn StateStore>, VtopError> {
+    let inner: Box<dyn StateStore> =
+        if conn_str.starts_with("postgres://") || conn_str.starts_with("postgresql://") {
+            #[cfg(feature = "postgres")]
+            {
+                Box::new(crate::pg_store::PgStateStore::connect(conn_str).await?)
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                return Err(VtopError::State(
+                    "postgres:// state store requires a build with --features postgres".to_string(),
+                ));
+            }
+        } else {
+            // Everything else is treated as SQLite (including a bare filesystem
+            // path), matching the existing single-node default.
+            Box::new(SqliteStateStore::connect(conn_str).await?)
+        };
+    Ok(Box::new(crate::deadline::DeadlineStore::new(inner, point)))
 }
 
 /// Apply state-store schema migrations explicitly.

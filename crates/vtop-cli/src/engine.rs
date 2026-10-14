@@ -34,7 +34,7 @@ use vtop_core::state_machine::BatchState;
 use vtop_core::telemetry;
 use vtop_core::types::{ChecksumAlgorithm, ProgressMarker, SourceType};
 use vtop_core::work_dir::cleanup_work_dir;
-use vtop_state::{connect_state_store, BatchPatch, BatchRecord, StateStore};
+use vtop_state::{connect_state_store_with_deadline, BatchPatch, BatchRecord, StateStore};
 use vtop_upload::multipart::{self, MultipartFence, MultipartUploadConfig};
 use vtop_upload::{ObjectChecksum, UploadBackend};
 
@@ -1373,7 +1373,11 @@ impl Engine {
         }
 
         let manifest_mac_key = config.resolve_manifest_mac_key()?;
-        let store = connect_state_store(state_store.expose_secret()).await?;
+        let store = connect_state_store_with_deadline(
+            state_store.expose_secret(),
+            Duration::from_secs(config.engine.state_store_timeout_seconds),
+        )
+        .await?;
         let backend = vtop_upload::build_backend(&config.upload).await?;
 
         let mut adapters: HashMap<SourceType, Box<dyn SourceAdapter>> = HashMap::new();
