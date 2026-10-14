@@ -13,7 +13,7 @@
 //! [`run_all`] assumes it is handed a FRESH, empty store; each check uses
 //! uniquely-prefixed `batch_id`s so they remain independent on a shared store.
 
-use crate::{BatchPatch, BatchRecord, StateStore};
+use crate::{BatchPatch, BatchRecord, CommittedCursor, StateStore};
 use vtop_core::errors::VtopError;
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
@@ -75,6 +75,7 @@ pub async fn run_all(store: &dyn StateStore) {
     mark_failed_from_any_state(store).await;
     lists_incomplete_and_failed(store).await;
     max_committed_end_bytes_aggregates_in_store(store).await;
+    committed_cursors_never_mix_the_offsets_of_two_files(store).await;
     claims_respect_live_leases_and_take_over_expired_ones(store).await;
 }
 
@@ -276,6 +277,85 @@ async fn max_committed_end_bytes_aggregates_in_store(store: &dyn StateStore) {
             .all(|(p, _)| !p.is_empty()),
         "kafka markers have no path field; the aggregate must not fabricate one"
     );
+}
+
+/// #558: a restart seeds each file's cursor from the ledger. The ledger's
+/// per-path MAX(end_byte) mixes every file that has ever lived at the path, so
+/// after a rotation it handed the NEW file the OLD file's high-water mark.
+/// `committed_cursors` names the inode of the most recent committed batch and
+/// takes the maximum over that inode alone.
+async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateStore) {
+    let marker = |path: &str, inode: Option<u64>, end: u64| ProgressMarker::File {
+        path: path.into(),
+        inode,
+        start_byte: 0,
+        end_byte: end,
+        file_size: end,
+        mtime: String::new(),
+    };
+    let mk = |id: &str, path: &str, inode: Option<u64>, end: u64| {
+        let mut r = sample_record(id);
+        r.source_type = SourceType::File;
+        r.source_name = path.to_string();
+        r.progress_start = marker(path, inode, 0);
+        r.progress_end = marker(path, inode, end);
+        r
+    };
+    // /rot.log: inode 11 reached byte 900, then the file was rotated and the
+    // new one (inode 22) reached byte 60. /same.log never rotated. /legacy.log
+    // predates inode tracking. The newest row's inode must win, and the
+    // maximum is taken over that inode only.
+    for (id, path, inode, end) in [
+        ("cur-1", "/rot.log", Some(11), 400),
+        ("cur-2", "/rot.log", Some(11), 900),
+        ("cur-3", "/rot.log", Some(22), 20),
+        ("cur-4", "/rot.log", Some(22), 60),
+        ("cur-5", "/same.log", Some(5), 70),
+        ("cur-6", "/same.log", Some(5), 30),
+        ("cur-7", "/legacy.log", None, 15),
+    ] {
+        store
+            .save_batch_state(&mk(id, path, inode, end))
+            .await
+            .unwrap();
+        let p = BatchPatch::default();
+        for st in LEGAL_WALK {
+            store.update_batch_state(id, st, &p).await.unwrap();
+        }
+        // `updated_at` orders "most recent": make each commit strictly later.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // An UNCOMMITTED row on the new inode with a bigger end must not count.
+    store
+        .save_batch_state(&mk("cur-8", "/rot.log", Some(22), 5_000))
+        .await
+        .unwrap();
+
+    let mut got = store.committed_cursors(SourceType::File).await.unwrap();
+    got.retain(|c| ["/rot.log", "/same.log", "/legacy.log"].contains(&c.path.as_str()));
+    got.sort_by(|a, b| a.path.cmp(&b.path));
+    let want = |path: &str, inode: Option<u64>, end_byte: u64| CommittedCursor {
+        path: path.into(),
+        inode,
+        end_byte,
+    };
+    assert_eq!(
+        got,
+        vec![
+            want("/legacy.log", None, 15),
+            // The rotated path resumes at the NEW file's 60, not the old 900.
+            want("/rot.log", Some(22), 60),
+            // Within one inode it is still the maximum, not the latest row.
+            want("/same.log", Some(5), 70),
+        ]
+    );
+    // Rows of another source type never appear.
+    assert!(store
+        .committed_cursors(SourceType::SyslogSpool)
+        .await
+        .unwrap()
+        .iter()
+        .all(|c| !["/rot.log", "/same.log", "/legacy.log"].contains(&c.path.as_str())));
 }
 
 /// #93: the claim primitive is what makes N engines safe over one store. A

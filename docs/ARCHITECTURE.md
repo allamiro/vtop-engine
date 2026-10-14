@@ -24,6 +24,7 @@
 6. [Data-flow diagram](#6-data-flow-diagram)
 7. [Source adapters](#7-source-adapters)
    - [7.1 What the commit rule does not cover](#71-what-the-commit-rule-does-not-cover)
+   - [7.2 Rotation and truncation of file and spool sources](#72-rotation-and-truncation-of-file-and-spool-sources)
 8. [Upload backends](#8-upload-backends)
 9. [Checksum subsystem](#9-checksum-subsystem)
 10. [Compression subsystem](#10-compression-subsystem)
@@ -259,6 +260,60 @@ commit-after-verification design can assert. Every guarantee in this document
 about replay safety, manifests and verification applies to a record once the
 engine has seen it. **Size retention above worst-case lag, and monitor consumer
 lag independently of VTOP**, because VTOP will not tell you.
+
+### 7.2 Rotation and truncation of file and spool sources
+
+The file and syslog-spool adapters keep one read position per **path**, and a
+position is only meaningful for the file it was taken from. Two things break
+that, and the adapters now check for both on every read, against the open
+descriptor (`fstat`) rather than a second path lookup:
+
+- **Rotation** (rename or replace): the inode at the path differs from the one
+  the cursor last read.
+- **Truncation** (`copytruncate`, an in-place truncate): the same inode, now
+  shorter than the read position.
+
+In either case the new content is read from **byte 0**, and the cursor's
+committed point returns to 0 with it. Before this was handled, a read position
+from the old file was applied to the new one: a new file shorter than the
+position produced nothing until it outgrew it and then started mid-line, and a
+longer one silently lost its first bytes (#558).
+
+What follows from that, in the engine:
+
+- **A buffered window is sealed at the discontinuity.** A read that does not
+  start where the buffered window ended (a different inode, or a start that is
+  not the previous end) is not merged into it; the old window becomes its own
+  batch. A merged batch carried a start from one file and an end from the
+  other, a range nothing could re-read or reconcile.
+- **A late commit cannot move the restarted cursor.** A batch read before the
+  rotation commits after the cursor has restarted; its offset names a place in
+  a file that is no longer there. Its ledger row commits (the archive has it),
+  but the cursor stays on the current file.
+- **Replay refuses a range from a file that has changed.** The old bytes are
+  not at those offsets any more, and rewinding the new file there would archive
+  its middle as though it were the lost range. The adapter returns an error and
+  the engine reports that the range will not be re-read.
+- **A restart seeds the cursor with the inode** the offset came from
+  (`StateStore::committed_cursors`: the inode of the most recent committed
+  batch, and the highest committed offset among that inode's batches only). A
+  file replaced while the engine was down is read from its first byte instead
+  of from the old file's high-water mark.
+
+Limits, stated plainly:
+
+- The **unread tail of a rotated-away file** is not read through the old path.
+  If the rotated name (`app.log.1`) also matches a configured pattern it is
+  discovered as its own source, with a fresh cursor, and is archived again from
+  byte 0 — a duplicate, never a hole. Archiving the unread tail without the
+  duplicate would need cursors keyed by inode rather than path.
+- `copytruncate` is racy by nature: lines written between the copy and the
+  truncate are lost by the rotation tool before the engine can see them. If the
+  file also regrows beyond the old read position before the next read, the
+  truncation is invisible to the adapter.
+- History pruning keeps one row per path, so a file untouched for longer than
+  the retention window can lose the rows that name its inode. The restart then
+  reads it from byte 0 again: duplicates, bounded by the file.
 
 Tracked as #361, which also carries the question of whether the adapter should
 refuse rather than resume when it detects the jump — a refusal is only useful

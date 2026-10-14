@@ -8,6 +8,7 @@
 use crate::base::{
     AdapterReadReport, DiscoveredSource, ReadResult, SourceAdapter, SourceReadOutcome,
 };
+use crate::continuity::{self, Discontinuity};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
@@ -54,6 +55,53 @@ impl SyslogSpoolSource {
         let c = self.cursors.entry(path.to_string()).or_default();
         c.committed_byte = committed_byte;
         c.read_byte = committed_byte;
+    }
+
+    /// Seed a committed offset AND the inode of the spool it was taken from,
+    /// so the first read can tell a rotated spool from the one the offset
+    /// belongs to and restart it at byte 0 (#558). `None` behaves as
+    /// [`Self::seed_committed`].
+    pub fn seed_committed_from(&mut self, path: &str, committed_byte: u64, inode: Option<u64>) {
+        self.seed_committed(path, committed_byte);
+        if inode.is_some() {
+            // A zero size and an empty mtime can never satisfy `can_skip`.
+            self.cursors.get_mut(path).expect("seeded above").seen = Some(SpoolSeen {
+                inode,
+                file_size: 0,
+                mtime: String::new(),
+            });
+        }
+    }
+
+    /// Fold a completed read into the spool's cursor and build its result. A
+    /// discontinuity restarts the cursor on the new content, including the
+    /// committed point (see `FileSource::apply_slice`).
+    fn apply_slice(&mut self, path: &str, slice: SpoolSlice) -> ReadResult {
+        let SpoolSlice {
+            records,
+            start,
+            end,
+            seen,
+            discontinuity,
+        } = slice;
+        let inode = seen.inode;
+        let cursor = self.cursors.entry(path.to_string()).or_default();
+        if let Some(why) = discontinuity {
+            tracing::warn!(path, previous_read_byte = cursor.read_byte, "{why}");
+            cursor.committed_byte = 0;
+        }
+        cursor.read_byte = end;
+        // What the read ACTUALLY observed, not what a stat saw before it.
+        cursor.seen = Some(seen);
+        ReadResult {
+            progress_start: Self::marker(path, inode, start, start),
+            progress_end: Self::marker(path, inode, start, end),
+            records,
+            first_timestamp: None,
+            last_timestamp: None,
+            // Spool lines are re-framed with newlines on serialization.
+            verbatim: false,
+        }
     }
 
     /// Whether this cycle can skip opening `path` entirely (#101 — the
@@ -143,13 +191,22 @@ impl SyslogSpoolSource {
     /// many spool files can be read CONCURRENTLY in one pass (#96 B2). Only
     /// complete (newline-terminated) lines are accepted — a partial line still
     /// being written by rsyslog is left for the next pass.
+    ///
+    /// `expected_inode` is the identity the cursor last read; the open
+    /// descriptor is judged against it before any byte is read, and a rotated
+    /// or truncated spool restarts at byte 0 (#558).
     async fn read_slice(
         path: String,
         start: u64,
         max_records: usize,
         max_bytes: usize,
-    ) -> Result<(Vec<Vec<u8>>, u64, SpoolSeen), VtopError> {
+        expected_inode: Option<u64>,
+    ) -> Result<SpoolSlice, VtopError> {
         let mut file = tokio::fs::File::open(&path).await?;
+        let opened = Self::seen_of(&file.metadata().await?);
+        let discontinuity =
+            continuity::check(expected_inode, opened.inode, opened.file_size, start);
+        let start = if discontinuity.is_some() { 0 } else { start };
         file.seek(std::io::SeekFrom::Start(start)).await?;
         // Put the whole-call byte limiter BELOW BufReader. If Take wrapped the
         // BufReader instead, its default 8 KiB fill could read far beyond a
@@ -199,8 +256,25 @@ impl SyslogSpoolSource {
         // not only the inode: what the read OBSERVED is what the next
         // cycle's skip decision must compare against (#101).
         let seen = Self::seen_of(&reader.get_ref().get_ref().metadata().await?);
-        Ok((records, pos, seen))
+        Ok(SpoolSlice {
+            records,
+            start,
+            end: pos,
+            seen,
+            discontinuity,
+        })
     }
+}
+
+/// What a completed spool read hands back.
+struct SpoolSlice {
+    records: Vec<Vec<u8>>,
+    /// Where the read STARTED: the cursor's position, or byte 0 after a
+    /// rotation or truncation.
+    start: u64,
+    end: u64,
+    seen: SpoolSeen,
+    discontinuity: Option<Discontinuity>,
 }
 
 /// How many spool files are read concurrently in one pass.
@@ -251,22 +325,14 @@ impl SourceAdapter for SyslogSpoolSource {
                 }]);
             }
         }
-        let (records, pos, seen) =
-            Self::read_slice(path.clone(), start, max_records, max_bytes).await?;
-        let inode = seen.inode;
-        let cursor = self.cursors.get_mut(&path).unwrap();
-        cursor.read_byte = pos;
-        cursor.seen = Some(seen);
-
-        Ok(vec![ReadResult {
-            progress_start: Self::marker(&path, inode, start, start),
-            progress_end: Self::marker(&path, inode, start, pos),
-            records,
-            first_timestamp: None,
-            last_timestamp: None,
-            // Spool lines are re-framed with newlines on serialization.
-            verbatim: false,
-        }])
+        let expected_inode = self
+            .cursors
+            .get(&path)
+            .and_then(|c| c.seen.as_ref())
+            .and_then(|seen| seen.inode);
+        let slice =
+            Self::read_slice(path.clone(), start, max_records, max_bytes, expected_inode).await?;
+        Ok(vec![self.apply_slice(&path, slice)])
     }
 
     /// Read every spool file CONCURRENTLY (#96 B2): independent handles and
@@ -286,7 +352,7 @@ impl SourceAdapter for SyslogSpoolSource {
         // identity unchanged since the read that caught it up — are
         // separated out here and never opened; what is left is the work the
         // pass actually has to do.
-        let mut jobs: Vec<(usize, String, u64)> = Vec::new();
+        let mut jobs: Vec<(usize, String, u64, Option<u64>)> = Vec::new();
         let mut skipped: Vec<(usize, String, u64, SpoolSeen)> = Vec::new();
         for (i, s) in sources.iter().enumerate() {
             let path = s.source_name.clone();
@@ -296,7 +362,10 @@ impl SourceAdapter for SyslogSpoolSource {
                 Some(current) if Self::can_skip(cursor, &current) => {
                     skipped.push((i, path, start, current));
                 }
-                _ => jobs.push((i, path, start)),
+                _ => {
+                    let expected_inode = cursor.seen.as_ref().and_then(|seen| seen.inode);
+                    jobs.push((i, path, start, expected_inode));
+                }
             }
         }
         // COUNTED, not silent — the #100 visibility rule holds here too: a
@@ -311,18 +380,23 @@ impl SourceAdapter for SyslogSpoolSource {
             );
         }
 
-        let mut results: Vec<(
-            usize,
-            String,
-            u64,
-            Result<(Vec<Vec<u8>>, u64, SpoolSeen), VtopError>,
-        )> = futures::stream::iter(jobs.into_iter().map(|(i, path, start)| async move {
-            let res = Self::read_slice(path.clone(), start, max_records, max_bytes).await;
-            (i, path, start, res)
-        }))
-        .buffer_unordered(SPOOL_READ_CONCURRENCY)
-        .collect()
-        .await;
+        let mut results: Vec<(usize, String, Result<SpoolSlice, VtopError>)> =
+            futures::stream::iter(jobs.into_iter().map(
+                |(i, path, start, expected_inode)| async move {
+                    let res = Self::read_slice(
+                        path.clone(),
+                        start,
+                        max_records,
+                        max_bytes,
+                        expected_inode,
+                    )
+                    .await;
+                    (i, path, res)
+                },
+            ))
+            .buffer_unordered(SPOOL_READ_CONCURRENCY)
+            .collect()
+            .await;
         results.sort_by_key(|(i, ..)| *i);
 
         let mut report = AdapterReadReport {
@@ -350,26 +424,11 @@ impl SourceAdapter for SyslogSpoolSource {
                 }]),
             });
         }
-        for (source_index, path, start, res) in results {
+        for (source_index, path, res) in results {
             let result = match res {
-                Ok((records, pos, seen)) => {
-                    let inode = seen.inode;
-                    let cursor = self.cursors.get_mut(&path).unwrap();
-                    cursor.read_byte = pos;
-                    // What the read ACTUALLY observed, not what the stat saw
-                    // before it: the spool can grow between the two, and
-                    // recording the earlier identity would let the next
-                    // cycle skip bytes this one never read.
-                    cursor.seen = Some(seen);
-                    any_records |= !records.is_empty();
-                    Ok(vec![ReadResult {
-                        progress_start: Self::marker(&path, inode, start, start),
-                        progress_end: Self::marker(&path, inode, start, pos),
-                        records,
-                        first_timestamp: None,
-                        last_timestamp: None,
-                        verbatim: false,
-                    }])
+                Ok(slice) => {
+                    any_records |= !slice.records.is_empty();
+                    Ok(vec![self.apply_slice(&path, slice)])
                 }
                 Err(e) => {
                     any_failed = true;
@@ -398,17 +457,39 @@ impl SourceAdapter for SyslogSpoolSource {
     }
 
     async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
-        let ProgressMarker::SyslogSpool { path, end_byte, .. } = marker else {
+        let ProgressMarker::SyslogSpool {
+            path,
+            end_byte,
+            inode: marker_inode,
+            ..
+        } = marker
+        else {
             return Err(VtopError::Source(
                 "spool adapter given non-spool marker".into(),
             ));
         };
-        let c = self.cursors.entry(path.clone()).or_default();
-        c.committed_byte = *end_byte;
-        if c.read_byte < *end_byte {
-            c.read_byte = *end_byte;
+        // See `FileSource::commit_progress`: a batch read before a rotation or
+        // truncation must not carry the restarted cursor to an offset in a
+        // spool that is no longer there (#558).
+        let (current_inode, current_size) = match std::fs::metadata(path) {
+            Ok(md) => (inode_of(&md), md.len()),
+            Err(_) => (None, 0),
+        };
+        if continuity::commit_is_current(*marker_inode, current_inode, current_size, *end_byte) {
+            let c = self.cursors.entry(path.clone()).or_default();
+            c.committed_byte = *end_byte;
+            if c.read_byte < *end_byte {
+                c.read_byte = *end_byte;
+            }
+            tracing::info!(path, end_byte, "syslog spool progress committed");
+        } else {
+            tracing::warn!(
+                path,
+                end_byte,
+                "committed batch belongs to a spool that was rotated or truncated since it was read; \
+                 the archive has it, the read position is left on the current spool"
+            );
         }
-        tracing::info!(path, end_byte, "syslog spool progress committed");
         Ok(())
     }
 
@@ -916,5 +997,121 @@ mod tests {
              skipped its cold neighbour"
         );
         assert_eq!(hot_reads[0].records[0], b"<13>hot two");
+    }
+
+    // ---- rotation and truncation (#558) -------------------------------------
+
+    fn spool_source(path: &str) -> DiscoveredSource {
+        DiscoveredSource {
+            source_type: SourceType::SyslogSpool,
+            source_name: path.to_string(),
+            format: TelemetryFormat::Syslog,
+        }
+    }
+
+    /// The new spool is longer than the old read position — the case that used
+    /// to skip its first bytes without a word.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotated_spool_is_read_from_byte_zero_even_when_it_outgrows_the_old_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "old one\nold two\n").unwrap();
+        let mut spool = SyslogSpoolSource::new(vec![path.clone()]);
+        let first = spool
+            .read_batch_candidates(&spool_source(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        spool.commit_progress(&first[0].progress_end).await.unwrap();
+
+        std::fs::rename(&path, format!("{path}.1")).unwrap();
+        let fresh: String = (0..40).map(|i| format!("new message {i}\n")).collect();
+        std::fs::write(&path, &fresh).unwrap();
+
+        let after = spool
+            .read_batch_candidates(&spool_source(&path), 1000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            after[0].records.len(),
+            40,
+            "every line, not the tail after the old offset"
+        );
+        let ProgressMarker::SyslogSpool { start_byte, .. } = after[0].progress_start else {
+            panic!("a spool marker");
+        };
+        assert_eq!(start_byte, 0);
+    }
+
+    #[tokio::test]
+    async fn a_truncated_spool_is_read_from_byte_zero_and_a_late_commit_cannot_skip_its_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap(); // 14 bytes
+        let mut spool = SyslogSpoolSource::new(vec![path.clone()]);
+        let old = spool
+            .read_batch_candidates(&spool_source(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let old_end = old[0].progress_end.clone();
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"zz\n")
+            .unwrap();
+        let fresh = spool
+            .read_batch_candidates(&spool_source(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(fresh[0].records, vec![b"zz".to_vec()]);
+
+        // The batch read before the truncation commits late: its offset (14)
+        // is beyond the new spool, so the cursor must stay put.
+        spool.commit_progress(&old_end).await.unwrap();
+        assert_eq!(spool.cursors[&path].read_byte, 3);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"yy\n")
+            .unwrap();
+        let next = spool
+            .read_batch_candidates(&spool_source(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(next[0].records, vec![b"yy".to_vec()]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_seed_resumes_the_same_spool_and_restarts_a_replaced_one() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+
+        let mut same = SyslogSpoolSource::new(vec![path.clone()]);
+        same.seed_committed_from(&path, 8, Some(inode));
+        let got = same
+            .read_batch_candidates(&spool_source(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(got[0].records, vec![b"three".to_vec()]);
+
+        let mut replaced = SyslogSpoolSource::new(vec![path.clone()]);
+        replaced.seed_committed_from(&path, 8, Some(inode + 1_000_000));
+        let got = replaced
+            .read_batch_candidates(&spool_source(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            got[0].records.len(),
+            3,
+            "the replaced spool is read from byte 0"
+        );
     }
 }

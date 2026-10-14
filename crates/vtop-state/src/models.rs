@@ -48,6 +48,26 @@ impl BatchRecord {
     }
 }
 
+/// Where a byte-offset source (file, syslog spool) stood after its most recent
+/// committed batch: the cursor a restart resumes from.
+///
+/// The offset alone is a position in a file the ledger cannot name. After a
+/// rotation it describes the OLD file; seeding it blindly resumed the NEW one
+/// at the old one's high-water mark, so its first bytes were never archived
+/// (#558). The inode lets the adapter tell the two apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedCursor {
+    /// The source path the markers carry.
+    pub path: String,
+    /// The inode of the file the MOST RECENT committed batch was read from.
+    /// `None` for a legacy marker that predates inode tracking, or on a
+    /// platform that has none.
+    pub inode: Option<u64>,
+    /// The highest committed `end_byte` among the batches read from that
+    /// inode — not across inodes, which is the mistake being corrected.
+    pub end_byte: u64,
+}
+
 /// Patch applied when advancing a batch's state. Fields set to `Some` are
 /// written; `None` fields are left unchanged.
 #[derive(Debug, Clone, Default)]

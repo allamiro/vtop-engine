@@ -25,7 +25,7 @@
 //!
 //! Compiled only with `--features postgres`.
 
-use crate::models::{BatchPatch, BatchRecord};
+use crate::models::{BatchPatch, BatchRecord, CommittedCursor};
 use crate::store::StateStore;
 use async_trait::async_trait;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
@@ -449,6 +449,54 @@ impl StateStore for PgStateStore {
                 let path: Option<String> = r.get("path");
                 let end: Option<i64> = r.get("end_byte");
                 Some((path?, end?.max(0) as u64))
+            })
+            .collect())
+    }
+
+    async fn committed_cursors(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<CommittedCursor>, VtopError> {
+        // See the SQLite implementation and #77. The column is TEXT, so cast to
+        // jsonb; markers are internally tagged (fields at top level). The inode
+        // is read as text and parsed here so a u64 above i64::MAX stays exact.
+        let rows = sqlx::query(
+            "WITH committed AS ( \
+                 SELECT progress_end_json::jsonb ->> 'path' AS path, \
+                        progress_end_json::jsonb ->> 'inode' AS inode, \
+                        (progress_end_json::jsonb ->> 'end_byte')::bigint AS end_byte, \
+                        updated_at, batch_id \
+                 FROM batches WHERE state = $1 AND source_type = $2 \
+             ), latest AS ( \
+                 SELECT path, inode, ROW_NUMBER() OVER ( \
+                            PARTITION BY path ORDER BY updated_at DESC, batch_id DESC) AS rn \
+                 FROM committed \
+             ), per_inode AS ( \
+                 SELECT path, inode, MAX(end_byte) AS end_byte \
+                 FROM committed GROUP BY path, inode \
+             ) \
+             SELECT l.path AS path, l.inode AS inode, p.end_byte AS end_byte \
+             FROM latest l \
+             JOIN per_inode p ON p.path IS NOT DISTINCT FROM l.path \
+                             AND p.inode IS NOT DISTINCT FROM l.inode \
+             WHERE l.rn = 1",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(source_type.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let path: Option<String> = r.get("path");
+                let inode: Option<String> = r.get("inode");
+                let end: Option<i64> = r.get("end_byte");
+                Some(CommittedCursor {
+                    path: path?,
+                    inode: inode.and_then(|i| i.parse().ok()),
+                    end_byte: end?.max(0) as u64,
+                })
             })
             .collect())
     }
