@@ -856,11 +856,14 @@ Short procedures now; expand into a full ops runbook before go-live.
   a writer that holds an older one is refused instead of overwriting the
   engine that took the row over (for the batches this process created or
   claimed; a row it holds no claim on is written as before). That makes a
-  recovery *handover* safe at the ledger. It does **not** make two engines
+  recovery *handover* safe at the ledger - between engines that all run a
+  build with the fence: an older build neither bumps nor checks the
+  generation, so drain older engines before relying on it. It does **not** make two engines
   safe to run side by side: sources are not divided between engines (two
   reading the same file, or the same Kafka partitions, archive the same ranges
   twice under distinct ledger rows); engine names must be unique per instance
-  (a shared name no longer lets one engine write over another's claim, but two
+  (a shared name can still reclaim another engine's live row and bump its
+  generation; only the stale writer's later transitions are fenced, so two
   recoveries still contend for the same rows); and the lease is timed against
   the claimant's wall clock, so skew moves when a takeover happens — the fence
   bounds the damage, it does not remove the skew. The work-dir lock CANNOT see

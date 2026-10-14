@@ -20,6 +20,10 @@ use vtop_core::errors::VtopError;
 use vtop_core::state_machine::{transition, BatchState};
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 
+/// How many times a write that lost a race to another writer is re-validated
+/// and retried before giving up.
+const MAX_CONFLICT_RETRIES: u32 = 5;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS batches (
     batch_id TEXT PRIMARY KEY,
@@ -167,33 +171,25 @@ impl SqliteStateStore {
         BatchState::from_str(&s)
     }
 
-    /// Why a conditional write matched no row: the claim moved on, or the row
-    /// changed state under us. Distinguished so the caller can tell "another
-    /// engine owns this batch now" from "retry".
-    async fn refused_write(
+    /// Whether a conditional write matched no row because the claim moved on
+    /// (another engine owns this batch now) - as opposed to the row changing
+    /// state under us, which a retry can resolve. `Ok(None)` when the claim is
+    /// still the one held.
+    async fn lost_claim(
         &self,
         batch_id: &str,
         held: Option<i64>,
-        expected: BatchState,
-    ) -> VtopError {
-        let row = sqlx::query("SELECT state, claim_gen FROM batches WHERE batch_id = ?")
+    ) -> Result<Option<VtopError>, VtopError> {
+        let row = sqlx::query("SELECT claim_gen FROM batches WHERE batch_id = ?")
             .bind(batch_id)
             .fetch_optional(&self.pool)
-            .await;
-        match row {
-            Ok(Some(row)) => {
-                let actual: i64 = row.get("claim_gen");
-                if let Some(held) = held.filter(|held| *held != actual) {
-                    return crate::fence::claim_lost(batch_id, held, actual);
-                }
-                let state: String = row.get("state");
-                VtopError::State(format!(
-                    "batch {batch_id} changed state concurrently (expected {expected}, found {state})"
-                ))
-            }
-            Ok(None) => VtopError::NotFound(format!("batch {batch_id}")),
-            Err(e) => map_sqlx(e),
-        }
+            .await
+            .map_err(map_sqlx)?
+            .ok_or_else(|| VtopError::NotFound(format!("batch {batch_id}")))?;
+        let actual: i64 = row.get("claim_gen");
+        Ok(held
+            .filter(|held| *held != actual)
+            .map(|held| crate::fence::claim_lost(batch_id, held, actual)))
     }
 
     /// Shared read helper for the `list_*` queries. `sql` is `'static` because
@@ -266,55 +262,73 @@ impl StateStore for SqliteStateStore {
         to: BatchState,
         patch: &BatchPatch,
     ) -> Result<(), VtopError> {
+        // Another writer can advance the row between the read and the write
+        // (a second process on the file, or a concurrent handle). Re-validate:
+        // a transition that is still legal from the row's new state is
+        // retried, so a `mark_failed` is not lost to an unrelated update; an
+        // illegal one fails on the next pass. A LOST CLAIM is not a lost
+        // update - retrying cannot help - so it is reported at once (#557).
         let held = self.fence.held(batch_id);
-        let current = self.get_state(batch_id).await?;
-        let validated = transition(current, to)?; // enforces the core invariant
+        let mut attempt = 0;
+        loop {
+            let current = self.get_state(batch_id).await?;
+            let validated = transition(current, to)?; // enforces the core invariant
 
-        let now = chrono::Utc::now().to_rfc3339();
-        // Conditional on the state we validated against AND, for a row this
-        // process holds a claim on, on the claim still being the one it holds
-        // (#557). Unconditional, a write could land on a row another engine
-        // claimed and moved on; state names recur, so the state guard alone
-        // does not stop it.
-        let rows = sqlx::query(
-            r#"UPDATE batches SET
-                 state = ?,
-                 object_uri = COALESCE(?, object_uri),
-                 manifest_uri = COALESCE(?, manifest_uri),
-                 object_sha256 = COALESCE(?, object_sha256),
-                 manifest_sha256 = COALESCE(?, manifest_sha256),
-                 manifest_version_id = COALESCE(?, manifest_version_id),
-                 object_size_bytes = COALESCE(?, object_size_bytes),
-                 record_count = COALESCE(?, record_count),
-                 error_message = COALESCE(?, error_message),
-                 updated_at = ?
-               WHERE batch_id = ? AND state = ? AND (? IS NULL OR claim_gen = ?)"#,
-        )
-        .bind(validated.as_str())
-        .bind(&patch.object_uri)
-        .bind(&patch.manifest_uri)
-        .bind(&patch.object_sha256)
-        .bind(&patch.manifest_sha256)
-        .bind(&patch.manifest_version_id)
-        .bind(patch.object_size_bytes)
-        .bind(patch.record_count)
-        .bind(&patch.error_message)
-        .bind(now)
-        .bind(batch_id)
-        .bind(current.as_str())
-        .bind(held)
-        .bind(held)
-        .execute(&self.pool)
-        .await
-        .map_err(map_sqlx)?
-        .rows_affected();
-        if rows == 0 {
-            return Err(self.refused_write(batch_id, held, current).await);
+            let now = chrono::Utc::now().to_rfc3339();
+            // Conditional on the state we validated against AND, for a row this
+            // process holds a claim on, on the claim still being the one it
+            // holds. Unconditional, a write could land on a row another engine
+            // claimed and moved on; state names recur, so the state guard alone
+            // does not stop it.
+            let rows = sqlx::query(
+                r#"UPDATE batches SET
+                     state = ?,
+                     object_uri = COALESCE(?, object_uri),
+                     manifest_uri = COALESCE(?, manifest_uri),
+                     object_sha256 = COALESCE(?, object_sha256),
+                     manifest_sha256 = COALESCE(?, manifest_sha256),
+                     manifest_version_id = COALESCE(?, manifest_version_id),
+                     object_size_bytes = COALESCE(?, object_size_bytes),
+                     record_count = COALESCE(?, record_count),
+                     error_message = COALESCE(?, error_message),
+                     updated_at = ?
+                   WHERE batch_id = ? AND state = ? AND (? IS NULL OR claim_gen = ?)"#,
+            )
+            .bind(validated.as_str())
+            .bind(&patch.object_uri)
+            .bind(&patch.manifest_uri)
+            .bind(&patch.object_sha256)
+            .bind(&patch.manifest_sha256)
+            .bind(&patch.manifest_version_id)
+            .bind(patch.object_size_bytes)
+            .bind(patch.record_count)
+            .bind(&patch.error_message)
+            .bind(now)
+            .bind(batch_id)
+            .bind(current.as_str())
+            .bind(held)
+            .bind(held)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .rows_affected();
+            if rows >= 1 {
+                if crate::fence::ends_work(validated) {
+                    self.fence.release(batch_id);
+                }
+                return Ok(());
+            }
+            if let Some(lost) = self.lost_claim(batch_id, held).await? {
+                return Err(lost);
+            }
+            attempt += 1;
+            if attempt > MAX_CONFLICT_RETRIES {
+                return Err(VtopError::State(format!(
+                    "persistent concurrent state change for batch {batch_id} after {attempt} attempts"
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5 * u64::from(attempt))).await;
         }
-        if validated == BatchState::SourceCommitted {
-            self.fence.release(batch_id);
-        }
-        Ok(())
     }
 
     async fn get_batch(&self, batch_id: &str) -> Result<Option<BatchRecord>, VtopError> {
@@ -343,16 +357,18 @@ impl StateStore for SqliteStateStore {
         let now = crate::store::normalize_rfc3339_utc("now", now)?;
         let lease_until = crate::store::normalize_rfc3339_utc("lease_until", lease_until)?;
         let (now, lease_until) = (now.as_str(), lease_until.as_str());
-        // RETURNING gives the generation THIS statement set, exactly: a second
-        // claim by an engine that shares this `owner` string cannot slip in
-        // between an UPDATE and a follow-up read and leave both holding the
-        // same generation.
+        // RETURNING gives exactly the rows THIS statement claimed, with the
+        // generation it set: a second claim by an engine that shares this
+        // `owner` string cannot slip in between an UPDATE and a follow-up read
+        // and leave both holding the same generation, and a batch inserted
+        // under the same owner name afterwards is not returned without a
+        // fence (review of #569).
         let claimed = sqlx::query(
             "UPDATE batches SET owner = ?1, lease_expires_at = ?2, updated_at = ?3, \
                     claim_gen = claim_gen + 1 \
              WHERE state != ?4 \
                AND (owner IS NULL OR owner = ?1 OR lease_expires_at IS NULL OR lease_expires_at <= ?3) \
-             RETURNING batch_id, claim_gen",
+             RETURNING *",
         )
         .bind(owner)
         .bind(lease_until)
@@ -365,15 +381,12 @@ impl StateStore for SqliteStateStore {
             let batch_id: String = row.get("batch_id");
             self.fence.claimed(&batch_id, row.get("claim_gen"));
         }
-        let rows = sqlx::query(
-            "SELECT * FROM batches WHERE state != ? AND owner = ? ORDER BY created_at ASC",
-        )
-        .bind(BatchState::SourceCommitted.as_str())
-        .bind(owner)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
-        rows.into_iter().map(row_to_record).collect()
+        let mut records = claimed
+            .into_iter()
+            .map(row_to_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        records.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(records)
     }
 
     async fn max_committed_end_bytes(
@@ -544,6 +557,62 @@ mod tests {
         let a = SqliteStateStore::connect(&url).await.unwrap();
         let b = SqliteStateStore::connect(&url).await.unwrap();
         test_battery::run_fencing_battery(&a, &b).await;
+    }
+
+    /// A process holds a fence token only for work in flight (review of #569):
+    /// a batch that ends in FAILED, or is handed back for replay, no longer
+    /// pins an entry for the life of the engine - but a token whose claim was
+    /// LOST stays, because it is what keeps the stalled writer fenced.
+    #[tokio::test]
+    async fn fence_tokens_are_released_when_work_ends_and_kept_when_the_claim_is_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("tokens.db").display());
+        let a = SqliteStateStore::connect(&url).await.unwrap();
+        let b = SqliteStateStore::connect(&url).await.unwrap();
+        let patch = BatchPatch::default();
+        let record = |id: &str| {
+            let mut rec = test_battery::sample_record(id);
+            rec.owner = Some("engine-a".into());
+            rec.lease_expires_at = Some("2000-01-01T00:00:00+00:00".into());
+            rec
+        };
+
+        // Failed: the work on this process ended.
+        a.save_batch_state(&record("tok-failed")).await.unwrap();
+        assert_eq!(a.fence.held("tok-failed"), Some(0));
+        a.mark_failed("tok-failed", "upload failed").await.unwrap();
+        assert_eq!(a.fence.held("tok-failed"), None);
+
+        // Handed back for replay: the recovery pass is done with it.
+        a.update_batch_state("tok-failed", BatchState::ReplayRequired, &patch)
+            .await
+            .unwrap();
+        assert_eq!(a.fence.held("tok-failed"), None);
+
+        // A lost claim keeps its token: the stale writer stays fenced.
+        a.save_batch_state(&record("tok-lost")).await.unwrap();
+        let claimed = b
+            .claim_incomplete_batches(
+                "engine-b",
+                "2050-01-01T00:00:00+00:00",
+                "2100-01-01T00:00:00+00:00",
+            )
+            .await
+            .unwrap();
+        assert!(claimed.iter().any(|r| r.batch_id == "tok-lost"));
+        assert!(a
+            .update_batch_state("tok-lost", BatchState::Sealed, &patch)
+            .await
+            .is_err());
+        assert_eq!(
+            a.fence.held("tok-lost"),
+            Some(0),
+            "retired, the stale writer's next attempt would be unfenced"
+        );
+        assert!(a
+            .update_batch_state("tok-lost", BatchState::Sealed, &patch)
+            .await
+            .is_err());
     }
 
     /// A database created before the fence existed gains the column and keeps

@@ -381,7 +381,7 @@ impl StateStore for PgStateStore {
             .rows_affected();
 
             if rows >= 1 {
-                if validated == BatchState::SourceCommitted {
+                if crate::fence::ends_work(validated) {
                     self.fence.release(batch_id);
                 }
                 return Ok(());
@@ -436,15 +436,15 @@ impl StateStore for PgStateStore {
         let now = crate::store::normalize_rfc3339_utc("now", now)?;
         let lease_until = crate::store::normalize_rfc3339_utc("lease_until", lease_until)?;
         let (now, lease_until) = (now.as_str(), lease_until.as_str());
-        // RETURNING gives the generation THIS statement set, exactly (see the
-        // SQLite implementation and #557).
+        // RETURNING gives exactly the rows THIS statement claimed, with the
+        // generation it set (see the SQLite implementation and #557).
         let claimed = with_retry(|| {
             sqlx::query(
                 "UPDATE batches SET owner = $1, lease_expires_at = $2, updated_at = $3, \
                         claim_gen = claim_gen + 1 \
                  WHERE state != $4 \
                    AND (owner IS NULL OR owner = $1 OR lease_expires_at IS NULL OR lease_expires_at <= $3) \
-                 RETURNING batch_id, claim_gen",
+                 RETURNING *",
             )
             .bind(owner)
             .bind(lease_until)
@@ -457,15 +457,12 @@ impl StateStore for PgStateStore {
             let batch_id: String = row.get("batch_id");
             self.fence.claimed(&batch_id, row.get("claim_gen"));
         }
-        let rows = sqlx::query(
-            "SELECT * FROM batches WHERE state != $1 AND owner = $2 ORDER BY created_at ASC",
-        )
-        .bind(BatchState::SourceCommitted.as_str())
-        .bind(owner)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
-        rows.into_iter().map(row_to_record).collect()
+        let mut records = claimed
+            .into_iter()
+            .map(row_to_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        records.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(records)
     }
 
     async fn max_committed_end_bytes(

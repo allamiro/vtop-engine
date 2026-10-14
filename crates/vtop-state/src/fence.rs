@@ -21,14 +21,28 @@
 //! generation for — one an operator tool touches, or one an older build
 //! created — is written without a generation check, exactly as before.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use vtop_core::errors::VtopError;
+
+/// The most batches tracked at once. A batch is released when its work ends
+/// (committed, failed, handed back for replay), so the map normally holds only
+/// work in flight; this bounds the leftovers - a batch whose claim was LOST
+/// keeps its token on purpose (see [`ClaimFence::release`]) and is never
+/// written again. The oldest are dropped first.
+const MAX_TRACKED: usize = 65_536;
+
+#[derive(Default)]
+struct Held {
+    generation: HashMap<String, i64>,
+    /// Insertion order, for eviction. May name batches already released.
+    order: VecDeque<String>,
+}
 
 /// The claim generation this process holds, per batch.
 #[derive(Clone, Default)]
 pub(crate) struct ClaimFence {
-    held: Arc<Mutex<HashMap<String, i64>>>,
+    held: Arc<Mutex<Held>>,
 }
 
 impl ClaimFence {
@@ -38,30 +52,65 @@ impl ClaimFence {
     }
 
     /// A row this process just claimed, at the generation the claim returned.
+    /// The highest generation seen wins: two same-process claims can return in
+    /// either order, and a delayed older result must not replace the token the
+    /// latest claimant holds (it would then have its valid writes refused).
     pub(crate) fn claimed(&self, batch_id: &str, generation: i64) {
         self.set(batch_id, generation);
     }
 
     /// The generation held for `batch_id`, if any.
     pub(crate) fn held(&self, batch_id: &str) -> Option<i64> {
-        self.lock().get(batch_id).copied()
+        self.lock().generation.get(batch_id).copied()
     }
 
-    /// Stop tracking a batch that reached its terminal state, so the map holds
-    /// only work in flight.
+    /// Stop tracking a batch whose work ended on this process: committed,
+    /// failed, or handed back for replay. NOT called when a write is refused
+    /// because the claim moved on - that token is what keeps the stalled
+    /// writer fenced if it tries again, so it stays until the bound evicts it.
     pub(crate) fn release(&self, batch_id: &str) {
-        self.lock().remove(batch_id);
+        let mut held = self.lock();
+        held.generation.remove(batch_id);
+        // Keep the order list proportional to what is tracked.
+        if held.order.len() > 2 * MAX_TRACKED {
+            let Held { generation, order } = &mut *held;
+            order.retain(|id| generation.contains_key(id));
+        }
     }
 
     fn set(&self, batch_id: &str, generation: i64) {
-        self.lock().insert(batch_id.to_owned(), generation);
+        let mut held = self.lock();
+        match held.generation.get_mut(batch_id) {
+            Some(current) => *current = (*current).max(generation),
+            None => {
+                held.generation.insert(batch_id.to_owned(), generation);
+                held.order.push_back(batch_id.to_owned());
+            }
+        }
+        while held.generation.len() > MAX_TRACKED {
+            let Some(oldest) = held.order.pop_front() else {
+                break;
+            };
+            held.generation.remove(&oldest);
+        }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, i64>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Held> {
         self.held
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// Whether a transition ends this process's work on a batch, so its token can
+/// go: it is committed, failed, or handed back for replay. A failed batch is
+/// picked up again only by a recovery claim, which sets a fresh token.
+pub(crate) fn ends_work(to: vtop_core::state_machine::BatchState) -> bool {
+    use vtop_core::state_machine::BatchState;
+    matches!(
+        to,
+        BatchState::SourceCommitted | BatchState::Failed | BatchState::ReplayRequired
+    )
 }
 
 /// The error for a write refused because the claim moved on.
@@ -90,6 +139,38 @@ mod tests {
         assert_eq!(fence.held("b"), Some(4));
         fence.release("b");
         assert_eq!(other.held("b"), None);
+    }
+
+    /// Two claims by one process can return out of order; the latest claimant
+    /// must keep the highest generation (review of #569).
+    #[test]
+    fn a_delayed_older_claim_cannot_replace_the_latest_token() {
+        let fence = ClaimFence::default();
+        fence.claimed("b", 5);
+        fence.claimed("b", 4);
+        assert_eq!(fence.held("b"), Some(5));
+        fence.claimed("b", 6);
+        assert_eq!(fence.held("b"), Some(6));
+    }
+
+    /// Tokens that are never released (a lost claim keeps its token) must not
+    /// grow without bound; the oldest go first and recent work stays fenced.
+    #[test]
+    fn the_map_is_bounded_and_evicts_the_oldest() {
+        let fence = ClaimFence::default();
+        for i in 0..(MAX_TRACKED + 10) {
+            fence.claimed(&format!("b{i}"), 1);
+        }
+        assert_eq!(fence.lock().generation.len(), MAX_TRACKED);
+        assert_eq!(fence.held("b0"), None, "the oldest was evicted");
+        assert_eq!(fence.held(&format!("b{}", MAX_TRACKED + 9)), Some(1));
+        // Releasing then re-adding does not let the order list grow unbounded.
+        for i in 0..(3 * MAX_TRACKED) {
+            let id = format!("churn{i}");
+            fence.created(&id);
+            fence.release(&id);
+        }
+        assert!(fence.lock().order.len() <= 2 * MAX_TRACKED + MAX_TRACKED);
     }
 
     #[test]
