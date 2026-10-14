@@ -72,6 +72,19 @@ pub enum ConsensusError {
         None => "; no leader is known yet".to_owned(),
     })]
     NotLeader { leader: Option<MetaNodeId> },
+    /// A lease request was refused because its proposer's clock is further
+    /// from the metadata leader's than the leader tolerates (#555).
+    ///
+    /// TYPED so a caller can say what is wrong (fix the proposer's NTP) rather
+    /// than retry as though the leader were merely busy. Nothing was
+    /// replicated: the request never reached the log.
+    #[error(
+        "lease request refused: this node's clock is {} ms {} the metadata leader's, more than the \
+         {bound_ms} ms tolerated for this lease; fix the node's clock (NTP) before it can hold a range",
+        .skew_ms.unsigned_abs(),
+        if *.skew_ms >= 0 { "ahead of" } else { "behind" }
+    )]
+    ClockSkew { skew_ms: i64, bound_ms: u64 },
 }
 
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
@@ -150,7 +163,7 @@ pub struct OpenraftConsensus {
     /// MAC, never as a MAC of nothing. Installed after construction because
     /// the node resolves it from its environment once the store is open.
     transition_mac_key: std::sync::RwLock<Option<[u8; 32]>>,
-    /// The clock a lease command is stamped with before it is replicated
+    /// The leader's clock a lease request's `issued_at_ms` is checked against
     /// (#555). `None` reads the wall clock; tests install a fixed one.
     leader_clock: std::sync::RwLock<Option<LeaderClock>>,
 }
@@ -176,8 +189,8 @@ impl OpenraftConsensus {
         }
     }
 
-    /// Stamp lease commands with `clock` instead of the wall clock. For tests
-    /// that need a leader whose time they control.
+    /// Check lease requests against `clock` instead of the wall clock. For
+    /// tests that need a leader whose time they control.
     pub fn set_leader_clock(&self, clock: impl Fn() -> i64 + Send + Sync + 'static) {
         *self
             .leader_clock
@@ -688,11 +701,20 @@ pub trait AdminReadSegmentPlacement: Send + Sync {
 #[async_trait]
 impl Consensus for OpenraftConsensus {
     async fn propose(&self, command: MetadataCommand) -> ConsensusResult<CommitReceipt> {
-        // Only the leader gets as far as replicating: a follower's
-        // `client_write` is refused with a redirect, and the client retries at
-        // the leader, which stamps. So the clock that sets a lease deadline is
-        // always the one clock of the node that is leading (#555).
-        let command = command.stamped_by_leader(self.leader_now_ms());
+        // A lease deadline is built from the proposer's clock, and the lease
+        // agent compares it with its own: a proposer whose clock is far from
+        // the leader's would steal or poison a lease. Refuse it BEFORE it is
+        // replicated, so it never reaches the log (#555). A follower's
+        // `client_write` is refused with a redirect anyway; the client retries
+        // at the leader, which is the node that checks.
+        if let Some(skew) = command.lease_clock_skew(self.leader_now_ms()) {
+            if !skew.is_within_bound() {
+                return Err(ConsensusError::ClockSkew {
+                    skew_ms: skew.skew_ms,
+                    bound_ms: skew.bound_ms,
+                });
+            }
+        }
         let response = self
             .raft
             .client_write(command)

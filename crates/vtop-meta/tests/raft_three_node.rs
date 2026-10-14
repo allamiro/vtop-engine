@@ -950,19 +950,22 @@ async fn lease_fencing_epochs_are_strictly_monotonic_across_the_cluster() {
 }
 
 /// #555: a lease deadline used to be the PROPOSER's wall clock plus the lease
-/// length. A data node with a fast clock then saw every incumbent's lease as
-/// expired and stole it, and one holding a lease stamped its own deadline an
-/// hour into the future, so after it died nobody could take over until that
-/// hour passed. The leader now stamps both commands with its own clock, so one
-/// clock sets the deadline AND judges liveness, and a proposer's skew moves
-/// neither.
+/// length, trusted without limit. A data node with a fast clock then saw every
+/// incumbent's lease as expired and stole it, and one holding a lease stamped
+/// its own deadline an hour into the future, so after it died nobody could take
+/// over until that hour passed. The leader now refuses a lease request whose
+/// clock is further from its own than a quarter of the lease, before it is
+/// replicated; within the bound the proposer's value is kept (the lease agent
+/// compares the recorded deadline with its own clock, so silently moving it
+/// into the leader's clock domain would make a skewed holder re-acquire its
+/// own fresh lease every round).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn the_leader_stamps_lease_time_so_a_skewed_proposer_cannot_steal_or_poison_a_lease() {
-    use vtop_meta::{Consensus, MetadataError, OpenraftConsensus};
+async fn the_leader_refuses_a_skewed_lease_proposer_so_it_cannot_steal_or_poison_a_lease() {
+    use vtop_meta::{Consensus, ConsensusError, MetadataError, OpenraftConsensus};
 
     const LEADER_NOW: i64 = 1_750_000_100_000;
     const HOUR_MS: i64 = 3_600_000;
-    const LEASE_MS: u64 = 15_000;
+    const LEASE_MS: u64 = 15_000; // tolerance: a quarter, 3 750 ms
 
     let seed = SEED ^ 0x555;
     let mut cluster = Cluster::boot(seed).await;
@@ -990,7 +993,7 @@ async fn the_leader_stamps_lease_time_so_a_skewed_proposer_cannot_steal_or_poiso
     // The consensus façade over the LEADER's raft, with a clock we control.
     let consensus = OpenraftConsensus::new(cluster.leader().raft.clone());
     consensus.set_leader_clock(|| LEADER_NOW);
-    let read_lease = |cluster: &Cluster| {
+    let read_range = |cluster: &Cluster| {
         let range_key = MetaKey::Range {
             topic_uuid,
             range_uuid,
@@ -1007,20 +1010,44 @@ async fn the_leader_stamps_lease_time_so_a_skewed_proposer_cannot_steal_or_poiso
         issued_at_ms,
         ..cluster.envelope()
     };
-
-    // 1. A holder whose clock runs an hour FAST asks for a 15 s lease. The
-    //    deadline must be the leader's time plus 15 s, not an hour later.
-    let generation = read_lease(&cluster).generation;
-    let env = envelope(&mut cluster, LEADER_NOW + HOUR_MS);
-    let receipt = consensus
-        .propose(MetadataCommand::AcquireRangeLease {
+    let acquire =
+        |env, holder_node_uuid, expected_range_generation| MetadataCommand::AcquireRangeLease {
             env,
             topic_uuid,
             range_uuid,
-            holder_node_uuid: holder,
-            expected_range_generation: generation,
+            holder_node_uuid,
+            expected_range_generation,
             lease_duration_ms: LEASE_MS,
-        })
+        };
+
+    // 1. A candidate an hour FAST is refused outright: nothing is replicated,
+    //    the range keeps no lease. (Before, it won, with a deadline an hour out.)
+    let generation = read_range(&cluster).generation;
+    let env = envelope(&mut cluster, LEADER_NOW + HOUR_MS);
+    match consensus.propose(acquire(env, holder, generation)).await {
+        Err(ConsensusError::ClockSkew { skew_ms, bound_ms }) => {
+            assert_eq!((skew_ms, bound_ms), (HOUR_MS, 3_750), "seed={seed:#x}");
+        }
+        other => panic!("a fast-clocked candidate was not refused (seed={seed:#x}): {other:?}"),
+    }
+    assert!(
+        read_range(&cluster).lease.is_none(),
+        "nothing was replicated"
+    );
+
+    // 2. So is one an hour SLOW — the bound is symmetric.
+    let env = envelope(&mut cluster, LEADER_NOW - HOUR_MS);
+    assert!(matches!(
+        consensus.propose(acquire(env, holder, generation)).await,
+        Err(ConsensusError::ClockSkew { skew_ms, .. }) if skew_ms == -HOUR_MS
+    ));
+
+    // 3. A candidate whose clock is merely a little off (2 s) wins, and its
+    //    value is KEPT: the deadline is the proposer's time plus the lease, so
+    //    the agent that holds it compares like with like.
+    let env = envelope(&mut cluster, LEADER_NOW + 2_000);
+    let receipt = consensus
+        .propose(acquire(env, holder, generation))
         .await
         .unwrap();
     assert!(
@@ -1028,73 +1055,60 @@ async fn the_leader_stamps_lease_time_so_a_skewed_proposer_cannot_steal_or_poiso
         "seed={seed:#x}: {:?}",
         receipt.response
     );
-    // Heartbeats are off in this harness; `Cluster::write` pushes the commit
-    // to the followers the same way.
     let _ = cluster.leader().raft.trigger().heartbeat().await;
     cluster
         .wait_applied_at_least(receipt.log_id.index - 1)
         .await; // meta index is 1-based
-    let lease = read_lease(&cluster).lease.expect("a lease");
+    let lease = read_range(&cluster).lease.expect("a lease");
     assert_eq!(
         lease.expires_at_ms,
-        Some(LEADER_NOW + LEASE_MS as i64),
-        "the deadline is the LEADER's clock plus the duration; the holder's fast clock \
-         must not have pushed it an hour out (seed={seed:#x})"
+        Some(LEADER_NOW + 2_000 + LEASE_MS as i64),
+        "within the bound the proposer's clock is kept (seed={seed:#x})"
     );
 
-    // 2. A rival whose clock is an hour fast would have seen that lease as long
-    //    expired and taken it. Judged on the leader's clock it is live.
-    let generation = read_lease(&cluster).generation;
+    // 4. A fast-clocked rival can no longer see that live lease as expired:
+    //    it is refused before it can try. (Before: it took the range.)
+    let generation = read_range(&cluster).generation;
     let env = envelope(&mut cluster, LEADER_NOW + HOUR_MS);
+    assert!(matches!(
+        consensus.propose(acquire(env, rival, generation)).await,
+        Err(ConsensusError::ClockSkew { .. })
+    ));
+    // ...and a rival with a good clock is rejected by the state machine, as
+    // before, because the incumbent is live.
+    let env = envelope(&mut cluster, LEADER_NOW + 500);
     let receipt = consensus
-        .propose(MetadataCommand::AcquireRangeLease {
-            env,
-            topic_uuid,
-            range_uuid,
-            holder_node_uuid: rival,
-            expected_range_generation: generation,
-            lease_duration_ms: LEASE_MS,
-        })
+        .propose(acquire(env, rival, generation))
         .await
         .unwrap();
     match receipt.response {
         MetadataResponse::Rejected(MetadataError::InvalidTransition(why)) => {
             assert!(why.contains("still live"), "seed={seed:#x}: {why}")
         }
-        other => panic!("a fast-clocked rival stole a live lease (seed={seed:#x}): {other:?}"),
+        other => panic!("a live lease was taken (seed={seed:#x}): {other:?}"),
     }
 
-    // 3. A renewal by the holder, again with an hour-fast clock, extends the
-    //    deadline from the leader's time too.
-    let epoch = read_lease(&cluster).fencing_epoch;
+    // 5. A holder that drifts out of the bound cannot renew its way to a
+    //    deadline in the future either.
+    let epoch = read_range(&cluster).fencing_epoch;
     let env = envelope(&mut cluster, LEADER_NOW + HOUR_MS);
-    let receipt = consensus
-        .propose(MetadataCommand::RenewRangeLease {
-            env,
-            topic_uuid,
-            range_uuid,
-            holder_node_uuid: holder,
-            expected_fencing_epoch: epoch,
-            lease_duration_ms: LEASE_MS,
-        })
-        .await
-        .unwrap();
-    assert!(
-        matches!(
-            receipt.response,
-            MetadataResponse::LeaseGranted { fencing_epoch } if fencing_epoch == epoch
-        ),
-        "a renewal keeps the epoch (seed={seed:#x}): {:?}",
-        receipt.response
-    );
-    let _ = cluster.leader().raft.trigger().heartbeat().await;
-    cluster
-        .wait_applied_at_least(receipt.log_id.index - 1)
-        .await; // meta index is 1-based
+    assert!(matches!(
+        consensus
+            .propose(MetadataCommand::RenewRangeLease {
+                env,
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: holder,
+                expected_fencing_epoch: epoch,
+                lease_duration_ms: LEASE_MS,
+            })
+            .await,
+        Err(ConsensusError::ClockSkew { .. })
+    ));
     assert_eq!(
-        read_lease(&cluster).lease.expect("a lease").expires_at_ms,
-        Some(LEADER_NOW + LEASE_MS as i64),
-        "renewal is stamped by the leader as well (seed={seed:#x})"
+        read_range(&cluster).lease.expect("a lease").expires_at_ms,
+        Some(LEADER_NOW + 2_000 + LEASE_MS as i64),
+        "the refused renewal left the deadline alone (seed={seed:#x})"
     );
 }
 
