@@ -13,7 +13,7 @@
 //! [`run_all`] assumes it is handed a FRESH, empty store; each check uses
 //! uniquely-prefixed `batch_id`s so they remain independent on a shared store.
 
-use crate::{BatchPatch, BatchRecord, StateStore};
+use crate::{BatchPatch, BatchRecord, CommittedCursor, StateStore};
 use vtop_core::errors::VtopError;
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
@@ -75,6 +75,7 @@ pub async fn run_all(store: &dyn StateStore) {
     mark_failed_from_any_state(store).await;
     lists_incomplete_and_failed(store).await;
     max_committed_end_bytes_aggregates_in_store(store).await;
+    committed_cursors_never_mix_the_offsets_of_two_files(store).await;
     claims_respect_live_leases_and_take_over_expired_ones(store).await;
 }
 
@@ -276,6 +277,179 @@ async fn max_committed_end_bytes_aggregates_in_store(store: &dyn StateStore) {
             .all(|(p, _)| !p.is_empty()),
         "kafka markers have no path field; the aggregate must not fabricate one"
     );
+}
+
+/// #558: a restart seeds each file's cursor from the ledger. The ledger's
+/// per-path MAX(end_byte) mixes every file that has ever lived at the path, so
+/// after a rotation it handed the NEW file the OLD file's high-water mark.
+/// `committed_cursors` names the inode of the most recent committed batch and
+/// takes the maximum over that inode alone.
+async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateStore) {
+    // `file_size` is deliberately NOT the end byte: a bounded read leaves the
+    // cursor behind the file's end, and the size the batch observed is what a
+    // restart compares a shrunken file against.
+    let marker = |path: &str, inode: Option<u64>, end: u64| ProgressMarker::File {
+        path: path.into(),
+        inode,
+        start_byte: 0,
+        end_byte: end,
+        file_size: end * 10,
+        mtime: String::new(),
+    };
+    let mk = |id: &str, path: &str, inode: Option<u64>, end: u64| {
+        let mut r = sample_record(id);
+        r.source_type = SourceType::File;
+        r.source_name = path.to_string();
+        r.progress_start = marker(path, inode, 0);
+        r.progress_end = marker(path, inode, end);
+        r
+    };
+    // /rot.log: inode 11 reached byte 900, then the file was rotated and the
+    // new one (inode 22) reached byte 60. /same.log never rotated. /legacy.log
+    // predates inode tracking. The newest row's inode must win, and the
+    // maximum is taken over that inode only.
+    for (id, path, inode, end) in [
+        ("cur-1", "/rot.log", Some(11), 400),
+        ("cur-2", "/rot.log", Some(11), 900),
+        ("cur-3", "/rot.log", Some(22), 20),
+        ("cur-4", "/rot.log", Some(22), 60),
+        ("cur-5", "/same.log", Some(5), 70),
+        ("cur-6", "/same.log", Some(5), 30),
+        ("cur-7", "/legacy.log", None, 15),
+    ] {
+        store
+            .save_batch_state(&mk(id, path, inode, end))
+            .await
+            .unwrap();
+        let p = BatchPatch::default();
+        for st in LEGAL_WALK {
+            store.update_batch_state(id, st, &p).await.unwrap();
+        }
+        // `updated_at` orders "most recent": make each commit strictly later.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // The restart cursor is the window READ last, not the one COMMITTED last:
+    // recovery can commit an older VERIFIED window after a newer one (review of
+    // #564). L1 (inode 41) was read first, L2 (inode 42) second; L2 commits
+    // first and L1 last, so `updated_at` would name the older file.
+    for (id, inode, end) in [("cur-l1", 41, 100), ("cur-l2", 42, 20)] {
+        store
+            .save_batch_state(&mk(id, "/late.log", Some(inode), end))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let p = BatchPatch::default();
+    for id in ["cur-l2", "cur-l1"] {
+        for st in LEGAL_WALK {
+            store.update_batch_state(id, st, &p).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // An inode above i64::MAX must survive the round trip exactly: a lossy
+    // conversion would read as a different (or unknown) identity.
+    let huge = u64::MAX - 1;
+    store
+        .save_batch_state(&mk("cur-huge", "/huge.log", Some(huge), 7))
+        .await
+        .unwrap();
+    for st in LEGAL_WALK {
+        store.update_batch_state("cur-huge", st, &p).await.unwrap();
+    }
+    // An UNCOMMITTED row on the new inode with a bigger end must not count.
+    store
+        .save_batch_state(&mk("cur-8", "/rot.log", Some(22), 5_000))
+        .await
+        .unwrap();
+
+    let mut got = store.committed_cursors(SourceType::File).await.unwrap();
+    got.retain(|c| {
+        [
+            "/rot.log",
+            "/same.log",
+            "/legacy.log",
+            "/late.log",
+            "/huge.log",
+        ]
+        .contains(&c.path.as_str())
+    });
+    got.sort_by(|a, b| a.path.cmp(&b.path));
+    let want = |path: &str, inode: Option<u64>, end_byte: u64| CommittedCursor {
+        path: path.into(),
+        inode,
+        end_byte,
+        // The NEWEST committed row's observed size, not a maximum: /same.log's
+        // newest row ended at 30 (file_size 300) though an earlier one ended at
+        // 70, and /rot.log's old inode (9000) must not leak into the new one.
+        observed_size: Some(match (path, end_byte) {
+            ("/same.log", _) => 300,
+            (_, end) => end * 10,
+        }),
+    };
+    assert_eq!(
+        got,
+        vec![
+            want("/huge.log", Some(huge), 7),
+            // Read last, committed first: still the restart cursor.
+            want("/late.log", Some(42), 20),
+            want("/legacy.log", None, 15),
+            // The rotated path resumes at the NEW file's 60, not the old 900.
+            want("/rot.log", Some(22), 60),
+            // Within one inode it is still the maximum, not the latest row.
+            want("/same.log", Some(5), 70),
+        ]
+    );
+    // Rows of another source type never appear in a File answer, and a
+    // SyslogSpool row is answered for SyslogSpool alone — with its own inode.
+    let spool_marker = |path: &str, inode: Option<u64>, end: u64| ProgressMarker::SyslogSpool {
+        spool_id: "s".into(),
+        path: path.into(),
+        inode,
+        start_byte: 0,
+        end_byte: end,
+        received_time_start: None,
+        received_time_end: None,
+    };
+    for (id, inode, end) in [("cur-s1", Some(31), 500), ("cur-s2", Some(32), 20)] {
+        let mut r = sample_record(id);
+        r.source_type = SourceType::SyslogSpool;
+        r.source_name = "/rot-spool.log".to_string();
+        r.progress_start = spool_marker("/rot-spool.log", inode, 0);
+        r.progress_end = spool_marker("/rot-spool.log", inode, end);
+        store.save_batch_state(&r).await.unwrap();
+        let p = BatchPatch::default();
+        for st in LEGAL_WALK {
+            store.update_batch_state(id, st, &p).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let spool = store
+        .committed_cursors(SourceType::SyslogSpool)
+        .await
+        .unwrap();
+    assert_eq!(
+        spool
+            .iter()
+            .filter(|c| c.path == "/rot-spool.log")
+            .collect::<Vec<_>>(),
+        vec![&CommittedCursor {
+            path: "/rot-spool.log".into(),
+            inode: Some(32),
+            end_byte: 20,
+            // A spool marker records no file length.
+            observed_size: None,
+        }],
+        "the spool answers with the newest inode and that inode's maximum"
+    );
+    assert!(spool
+        .iter()
+        .all(|c| !["/rot.log", "/same.log", "/legacy.log"].contains(&c.path.as_str())));
+    assert!(store
+        .committed_cursors(SourceType::File)
+        .await
+        .unwrap()
+        .iter()
+        .all(|c| c.path != "/rot-spool.log"));
 }
 
 /// #93: the claim primitive is what makes N engines safe over one store. A

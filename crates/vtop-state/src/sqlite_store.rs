@@ -10,7 +10,7 @@
 //! trait (Phase 1 of the HA plan). The Postgres implementation (Phase 3) lives
 //! behind a Cargo feature and implements the same trait.
 
-use crate::models::{BatchPatch, BatchRecord};
+use crate::models::{BatchPatch, BatchRecord, CommittedCursor};
 use crate::store::StateStore;
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -336,6 +336,64 @@ impl StateStore for SqliteStateStore {
                 let path: Option<String> = r.get("path");
                 let end: Option<i64> = r.get("end_byte");
                 Some((path?, end?.max(0) as u64))
+            })
+            .collect())
+    }
+
+    async fn committed_cursors(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<CommittedCursor>, VtopError> {
+        // Aggregated in SQL (#77): the inode of the newest committed row per
+        // path, joined to the MAX(end_byte) over that inode's rows. The inode
+        // is read as the JSON token (`->`) and parsed here: `json_extract`
+        // turns a u64 above i64::MAX into a lossy REAL, and an unparseable
+        // value must read as "unknown", not as a wrong identity.
+        //
+        // "Newest" is the batch CREATED last - the order the windows were read
+        // - not the one whose state changed last: recovery can commit an older
+        // VERIFIED window after a newer one, and ordering by `updated_at` would
+        // then name the older file as the restart cursor (review of #564).
+        let rows = sqlx::query(
+            "WITH committed AS ( \
+                 SELECT json_extract(progress_end_json, '$.path') AS path, \
+                        CAST(progress_end_json -> '$.inode' AS TEXT) AS inode, \
+                        CAST(json_extract(progress_end_json, '$.end_byte') AS INTEGER) AS end_byte, \
+                        CAST(json_extract(progress_end_json, '$.file_size') AS INTEGER) AS file_size, \
+                        created_at, batch_id \
+                 FROM batches WHERE state = ? AND source_type = ? \
+             ), latest AS ( \
+                 SELECT path, inode, file_size, ROW_NUMBER() OVER ( \
+                            PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
+                 FROM committed \
+             ), per_inode AS ( \
+                 SELECT path, inode, MAX(end_byte) AS end_byte \
+                 FROM committed GROUP BY path, inode \
+             ) \
+             SELECT l.path AS path, l.inode AS inode, p.end_byte AS end_byte, \
+                    l.file_size AS file_size \
+             FROM latest l \
+             JOIN per_inode p ON p.path IS l.path AND p.inode IS l.inode \
+             WHERE l.rn = 1",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(source_type.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let path: Option<String> = r.get("path");
+                let inode: Option<String> = r.get("inode");
+                let end: Option<i64> = r.get("end_byte");
+                let size: Option<i64> = r.get("file_size");
+                Some(CommittedCursor {
+                    path: path?,
+                    inode: inode.and_then(|i| i.parse().ok()),
+                    end_byte: end?.max(0) as u64,
+                    observed_size: size.map(|s| s.max(0) as u64),
+                })
             })
             .collect())
     }

@@ -11,7 +11,7 @@
 //! engine holds a `Box<dyn StateStore>`. Postgres arrives in Phase 3 behind a
 //! Cargo feature and implements the exact same trait.
 
-use crate::models::{BatchPatch, BatchRecord};
+use crate::models::{BatchPatch, BatchRecord, CommittedCursor};
 use crate::sqlite_store::SqliteStateStore;
 use async_trait::async_trait;
 use vtop_core::errors::VtopError;
@@ -136,6 +136,25 @@ pub trait StateStore: Send + Sync {
         &self,
         source_type: SourceType,
     ) -> Result<Vec<(String, u64)>, VtopError>;
+
+    /// The cursor each byte-offset source path resumes from, computed IN THE
+    /// STORE like [`StateStore::max_committed_end_bytes`] (#77).
+    ///
+    /// Per path: the inode of the most recently committed batch (latest
+    /// `updated_at`, ties by `batch_id`) and the highest committed `end_byte`
+    /// among the batches read from THAT inode. Unlike
+    /// `max_committed_end_bytes` it never mixes the offsets of two files that
+    /// have lived at one path (#558).
+    ///
+    /// History pruning keeps the highest-`end_byte` row per path and removes
+    /// committed rows older than its cutoff. If every row of the current
+    /// inode has been pruned (the file untouched for longer than retention)
+    /// this answers with the surviving older inode, and the adapter restarts
+    /// the file at byte 0: duplicates, bounded by the file, never a hole.
+    async fn committed_cursors(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<CommittedCursor>, VtopError>;
 
     /// All batches, newest first.
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError>;

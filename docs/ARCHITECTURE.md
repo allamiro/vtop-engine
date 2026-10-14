@@ -24,6 +24,7 @@
 6. [Data-flow diagram](#6-data-flow-diagram)
 7. [Source adapters](#7-source-adapters)
    - [7.1 What the commit rule does not cover](#71-what-the-commit-rule-does-not-cover)
+   - [7.2 Rotation and truncation of file and spool sources](#72-rotation-and-truncation-of-file-and-spool-sources)
 8. [Upload backends](#8-upload-backends)
 9. [Checksum subsystem](#9-checksum-subsystem)
 10. [Compression subsystem](#10-compression-subsystem)
@@ -259,6 +260,99 @@ commit-after-verification design can assert. Every guarantee in this document
 about replay safety, manifests and verification applies to a record once the
 engine has seen it. **Size retention above worst-case lag, and monitor consumer
 lag independently of VTOP**, because VTOP will not tell you.
+
+### 7.2 Rotation and truncation of file and spool sources
+
+The file and syslog-spool adapters keep one read position per **path**, and a
+position is only meaningful for the file it was taken from. Two things break
+that, and the adapters now check for both on every read, against the open
+descriptor (`fstat`) rather than a second path lookup:
+
+- **Rotation** (rename or replace): the inode at the path differs from the one
+  the cursor last read.
+- **Truncation** (`copytruncate`, an in-place truncate): the same inode, now
+  shorter than the read position.
+
+In either case the new content is read from **byte 0**, and the cursor's
+committed point returns to 0 with it. Before this was handled, a read position
+from the old file was applied to the new one: a new file shorter than the
+position produced nothing until it outgrew it and then started mid-line, and a
+longer one silently lost its first bytes (#558).
+
+What follows from that, in the engine:
+
+- **A buffered window is sealed at the discontinuity.** A read that does not
+  start where the buffered window ended (a different inode, or a start that is
+  not the previous end) is not merged into it; the old window becomes its own
+  batch. A merged batch carried a start from one file and an end from the
+  other, a range nothing could re-read or reconcile.
+- **A late commit cannot move the restarted cursor.** A batch read before the
+  rotation commits after the cursor has restarted; its offset names a place in
+  a file that is no longer there. Its ledger row commits (the archive has it),
+  but the cursor stays on the current file.
+- **Replay refuses a range from a file that has changed.** The old bytes are
+  not at those offsets any more, and rewinding the new file there would archive
+  its middle as though it were the lost range. The adapters return an error
+  when the inode differs from the marker's, when the file is shorter than the
+  range's start, or (file sources, whose markers record the length at read
+  time) when it is shorter than it was when the range was read. A spool marker
+  without an inode keeps the older size-only check, and a spool truncated and
+  regrown past the range's start cannot be told from the original. How the
+  engine reports a refused rewind is described in section 13.
+- **Commits are applied in the order the windows were read**, not the order
+  their uploads finish. A rotation seals the old file's window and starts a new
+  one in the same cycle, so both are in flight at once; committing the new
+  window first would leave the old file as the most recent commit and make the
+  restart seed name a file that is gone.
+- **A late commit is settled against the generation its range was read in.**
+  The adapter starts a new generation each time it restarts a cursor on a
+  rotated or truncated file, and remembers which generation every range it
+  handed out was read in. A range from an older generation never moves the
+  cursor, however the file looks by the time its commit lands - a
+  `copytruncate`d file that has regrown past the old range's end is otherwise
+  indistinguishable, by inode and length, from the file the range was read
+  from. The record is in-process: after a restart a commit falls back to the
+  inode and length test.
+- **A restart seeds the cursor with the inode** the offset came from
+  (`StateStore::committed_cursors`: the inode of the most recent committed
+  batch, and the highest committed offset among that inode's batches only). A
+  file replaced while the engine was down is read from its first byte instead
+  of from the old file's high-water mark. The seed also carries the length the
+  most recent committed batch saw its file at (`file_size` in the marker), so a
+  `copytruncate` while the engine was down is caught even when the file is
+  still longer than the committed offset. A syslog-spool marker records no
+  length, so a spool seed has the inode and the offset only.
+
+Limits, stated plainly:
+
+- The **unread tail of a rotated-away file** is not read through the old path.
+  If the rotated name (`app.log.1`) also matches a configured pattern it is
+  discovered as its own source, with a fresh cursor, and is archived again from
+  byte 0 — a duplicate, never a hole. Archiving the unread tail without the
+  duplicate would need cursors keyed by inode rather than path.
+- `copytruncate` is racy by nature: lines written between the copy and the
+  truncate are lost by the rotation tool before the engine can see them. If the
+  file also regrows beyond the old read position before the next read, the
+  truncation is invisible to the adapter.
+- A file is identified by its **inode number alone**, and a number can be
+  reused. On a *different* filesystem a replacement that happens to carry the
+  number is not seen as a rotation (markers do not record the device). On the
+  *same* filesystem the number of a file that was **unlinked** is free to be
+  handed to the next file created, so a path that is deleted and recreated
+  (rather than renamed and recreated, which keeps the old inode alive) can
+  present a new file under the old number; if that file is also longer than
+  the old read position it looks like a continuation. The engine's own
+  `delete_after_commit` removes the cursor with the file for exactly this
+  reason, so the common route to reuse is closed; a file removed by anything
+  else is not. Rotation by rename, which is what log rotation does, is
+  detected.
+- Late commits are judged against the file as it is NOW (another inode, or an
+  end beyond its length). A `copytruncate` followed by a regrow past the old
+  end before the late commit lands cannot be told from the original; that is
+  the same invisible case as a regrow before the next read, above.
+- History pruning keeps one row per path, so a file untouched for longer than
+  the retention window can lose the rows that name its inode. The restart then
+  reads it from byte 0 again: duplicates, bounded by the file.
 
 Tracked as #361, which also carries the question of whether the adapter should
 refuse rather than resume when it detects the jump — a refusal is only useful

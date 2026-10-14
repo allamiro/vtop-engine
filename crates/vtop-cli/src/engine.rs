@@ -1034,6 +1034,48 @@ impl PendingBuffer {
         self.batcher.is_empty()
     }
 
+    /// Whether a read starting at `start` picks up exactly where the buffered
+    /// window ends. Byte-offset sources are continuous by construction until
+    /// a rotation or truncation restarts the file at byte 0, or a different
+    /// file takes the path (#558). Kafka partitions are not judged here.
+    fn continues(&self, start: &ProgressMarker) -> bool {
+        let Some(end) = self.latest_end.as_ref() else {
+            return true;
+        };
+        // An unknown inode on either side cannot prove a change of file.
+        let same_file = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+        match (end, start) {
+            (
+                ProgressMarker::File {
+                    inode: end_inode,
+                    end_byte,
+                    ..
+                },
+                ProgressMarker::File {
+                    inode: start_inode,
+                    start_byte,
+                    ..
+                },
+            )
+            | (
+                ProgressMarker::SyslogSpool {
+                    inode: end_inode,
+                    end_byte,
+                    ..
+                },
+                ProgressMarker::SyslogSpool {
+                    inode: start_inode,
+                    start_byte,
+                    ..
+                },
+            ) => same_file(*end_inode, *start_inode) && end_byte == start_byte,
+            _ => true,
+        }
+    }
+
     /// Append a non-empty read into the buffer. The first read's
     /// `progress_start` becomes the window start (the replayable position); the
     /// latest read's `progress_end` becomes the candidate commit point.
@@ -1605,6 +1647,10 @@ impl Engine {
         // the whole topic set instead of one per topic (#96 A1). The adapter
         // reports how the pass's wall-clock divided between the buckets; the
         // per-source outcomes drive the counts and the buffer routing.
+        //
+        // Buffers sealed early because the next read did not continue them
+        // (a rotated or truncated file): flushed this cycle, below.
+        let mut discontinued: Vec<PendingBuffer> = Vec::new();
         let read_started = Instant::now();
         match adapter
             .read_all_batch_candidates(
@@ -1717,6 +1763,25 @@ impl Engine {
                         // from different partitions into one batch.
                         let key = buffer_key(source, &read.progress_start);
                         let buf_source = source_for_marker(source, &read.progress_start);
+                        // A read that does not pick up where the buffered
+                        // window ended — a rotated or truncated file restarted
+                        // at byte 0 — cannot join it. Merged, the batch would
+                        // carry a start from one file and an end from another:
+                        // a range no rewind can re-read and no audit can
+                        // reconcile. Seal what is buffered and start afresh.
+                        if self
+                            .pending
+                            .get(&key)
+                            .is_some_and(|buf| !buf.continues(&read.progress_start))
+                        {
+                            if let Some(old) = self.pending.remove(&key) {
+                                tracing::warn!(
+                                    source = %old.source.source_name,
+                                    "read does not continue the buffered window; sealing it before the new content"
+                                );
+                                discontinued.push(old);
+                            }
+                        }
                         self.pending
                             .entry(key)
                             .or_insert_with(|| PendingBuffer::new(&tenant, buf_source, limits))
@@ -1788,10 +1853,10 @@ impl Engine {
         // only after IT reached VERIFIED. Concurrency is strictly across
         // batches.
         let mut work = Vec::new();
-        for key in flush_keys {
-            let Some(mut buf) = self.pending.remove(&key) else {
-                continue;
-            };
+        let sealed_early = discontinued.into_iter().map(Some);
+        let flushed = flush_keys.into_iter().map(|key| self.pending.remove(&key));
+        for buf in sealed_early.chain(flushed).collect::<Vec<_>>() {
+            let Some(mut buf) = buf else { continue };
             let Some(read) = buf.drain() else { continue };
             let stream = self.streams.lookup(&buf.source.source_name).cloned();
             work.push((buf.source.clone(), read, stream));
@@ -1823,20 +1888,30 @@ impl Engine {
         // that does not reach VERIFIED must hand its range back to the source
         // (see the rewind below), and by then the `ReadResult` that held the
         // marker has been consumed.
-        let verified: Vec<(ProgressMarker, Result<VerifyStep, VtopError>)> =
-            futures::stream::iter(work.into_iter().map(|(source, read, stream)| {
-                let pipeline = &pipeline;
-                let started_at = read.progress_start.clone();
-                async move {
-                    let step = pipeline
-                        .process_until_verified(&source, read, stream.as_ref())
-                        .await;
-                    (started_at, step)
-                }
-            }))
+        let mut verified: Vec<(usize, ProgressMarker, Result<VerifyStep, VtopError>)> =
+            futures::stream::iter(work.into_iter().enumerate().map(
+                |(order, (source, read, stream))| {
+                    let pipeline = &pipeline;
+                    let started_at = read.progress_start.clone();
+                    async move {
+                        let step = pipeline
+                            .process_until_verified(&source, read, stream.as_ref())
+                            .await;
+                        (order, started_at, step)
+                    }
+                },
+            ))
             .buffer_unordered(limit)
             .collect()
             .await;
+        // Verification finishes in whatever order the store answers, but the
+        // commits are applied in the order the windows were READ. When a
+        // rotation seals the old file's window and starts a new one in the
+        // same cycle, both are in flight at once; committing the new file's
+        // window first would leave the OLD one as the most recent commit, and
+        // the restart seed (the newest committed row's inode) would then name a
+        // file that is no longer there and re-read the live one from byte 0.
+        verified.sort_by_key(|(order, _, _)| *order);
 
         // The cycle's verdict for the width controller (#102): any throttle
         // in it halves the next width; none grows it by one.
@@ -1879,7 +1954,7 @@ impl Engine {
         let mut outcomes = Vec::new();
         let mut first_err: Option<VtopError> = None;
         let mut rewinds: Vec<ProgressMarker> = Vec::new();
-        for (started_at, step) in verified {
+        for (_, started_at, step) in verified {
             match step {
                 Ok(VerifyStep::Finished(outcome)) => {
                     if outcome.final_state == BatchState::Failed {
@@ -2380,27 +2455,31 @@ impl Engine {
     }
 
     async fn seed_committed_offsets(&mut self) -> Result<(), VtopError> {
-        // The per-path MAX(end_byte) is computed IN THE STORE. This runs at
-        // every startup and the ledger grows without bound, so materialising
-        // every row here made recovery memory scale with history (#77).
+        // The per-path cursor is computed IN THE STORE. This runs at every
+        // startup and the ledger grows without bound, so materialising every
+        // row here made recovery memory scale with history (#77).
         // (Kafka needs no seeding: it resumes from the broker-side committed
         // offset.)
-        let file_max = self.store.max_committed_end_bytes(SourceType::File).await?;
-        let spool_max = self
+        //
+        // Each cursor names the inode its offset was read from, so a file
+        // that was rotated while the engine was down is started at byte 0
+        // instead of at the old file's high-water mark (#558).
+        let file_cursors = self.store.committed_cursors(SourceType::File).await?;
+        let spool_cursors = self
             .store
-            .max_committed_end_bytes(SourceType::SyslogSpool)
+            .committed_cursors(SourceType::SyslogSpool)
             .await?;
         if let Some(a) = self.adapters.get_mut(&SourceType::File) {
             if let Some(fs) = a.as_any_mut().downcast_mut::<FileSource>() {
-                for (p, b) in file_max {
-                    fs.seed_committed(&p, b);
+                for c in file_cursors {
+                    fs.seed_committed_from(&c.path, c.end_byte, c.inode, c.observed_size);
                 }
             }
         }
         if let Some(a) = self.adapters.get_mut(&SourceType::SyslogSpool) {
             if let Some(ss) = a.as_any_mut().downcast_mut::<SyslogSpoolSource>() {
-                for (p, b) in spool_max {
-                    ss.seed_committed(&p, b);
+                for c in spool_cursors {
+                    ss.seed_committed_from(&c.path, c.end_byte, c.inode);
                 }
             }
         }
@@ -3789,6 +3868,174 @@ mod tests {
         // A zero streak (no failure yet) and a zero base cannot divide or panic.
         assert_eq!(failure_backoff(base, 0, 0), Duration::from_secs(2));
         assert_eq!(failure_backoff(Duration::ZERO, 3, 7), Duration::ZERO);
+    }
+
+    /// #558: a file rotated while a batch is still buffered. The buffered
+    /// window belongs to the old file; the next read restarts the path at byte
+    /// 0. Merged into one batch it carried a start from one file and an end
+    /// from the other. It must be sealed as its own batch first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotation_seals_the_buffered_window_instead_of_merging_two_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        std::fs::write(&input, "old 1\nold 2\n").unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        // Nothing seals on its own: the first cycle only buffers.
+        cfg.batching.max_records = 10_000;
+        cfg.batching.max_bytes = 104_857_600;
+        cfg.batching.max_batch_age_seconds = 3_600;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+
+        let held = engine.run_source(SourceType::File, false).await.unwrap();
+        assert!(held.is_empty(), "buffered, not flushed");
+
+        // Rotate: the old file keeps its inode under another name.
+        std::fs::rename(&input, dir.path().join("app.log.1")).unwrap();
+        let fresh: String = (0..30).map(|i| format!("new {i}\n")).collect();
+        std::fs::write(&input, &fresh).unwrap();
+
+        let outcomes = engine.run_source(SourceType::File, true).await.unwrap();
+        assert!(
+            outcomes.iter().all(|o| o.committed),
+            "both windows commit: {outcomes:?}"
+        );
+        let mut committed: Vec<_> = engine
+            .store
+            .list_batches()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.state == BatchState::SourceCommitted)
+            .collect();
+        committed.sort_by_key(|b| b.record_count);
+        assert_eq!(committed.len(), 2, "two files, two batches: {committed:?}");
+        assert_eq!(committed[0].record_count, Some(2), "the old file's window");
+        assert_eq!(committed[1].record_count, Some(30), "the new file, whole");
+        for b in &committed {
+            let (
+                ProgressMarker::File {
+                    inode: si,
+                    start_byte,
+                    ..
+                },
+                ProgressMarker::File { inode: ei, .. },
+            ) = (&b.progress_start, &b.progress_end)
+            else {
+                panic!("file markers");
+            };
+            assert_eq!(si, ei, "one batch describes ONE file");
+            assert_eq!(*start_byte, 0);
+        }
+        assert_ne!(
+            committed[0].progress_end, committed[1].progress_end,
+            "and the two are different files"
+        );
+    }
+
+    /// #558: the engine restarts after the file was rotated while it was down.
+    /// The ledger remembers the OLD file's high-water mark; the cursor must be
+    /// seeded with the inode that mark belongs to, so the new file is read from
+    /// its first byte rather than from the old file's offset.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_rotated_while_the_engine_was_down_is_read_from_its_first_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        std::fs::write(&input, "old 1\nold 2\n").unwrap(); // 12 bytes
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let config = |work: &str| {
+            let mut cfg = file_config(
+                dir.path().join(work).to_str().unwrap(),
+                &url,
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            cfg.batching.max_batch_age_seconds = 3_600;
+            cfg
+        };
+
+        {
+            let mut first = Engine::new(config("work-1"), StreamsConfig { streams: vec![] })
+                .await
+                .unwrap();
+            let done = first.process_once(SourceType::File).await.unwrap();
+            assert!(done[0].committed);
+        } // the engine stops
+
+        std::fs::rename(&input, dir.path().join("app.log.1")).unwrap();
+        let fresh: String = (0..40).map(|i| format!("new {i}\n")).collect();
+        assert!(fresh.len() > 12, "longer than the old high-water mark");
+        std::fs::write(&input, &fresh).unwrap();
+
+        let mut second = Engine::new(config("work-2"), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        second.recover().await.unwrap();
+        let done = second.process_once(SourceType::File).await.unwrap();
+        assert!(done[0].committed);
+        assert_eq!(
+            done[0].record_count, 40,
+            "all 40 lines of the new file; the old mark (byte 12) must not skip its start"
+        );
+    }
+
+    #[test]
+    fn a_buffer_continues_only_a_read_that_starts_where_it_ended_in_the_same_file() {
+        let file = |inode: Option<u64>, start: u64, end: u64| ProgressMarker::File {
+            path: "/a".into(),
+            inode,
+            start_byte: start,
+            end_byte: end,
+            file_size: 0,
+            mtime: String::new(),
+        };
+        let limits = BatchLimits::default();
+        let src = DiscoveredSource {
+            source_type: SourceType::File,
+            source_name: "/a".into(),
+            format: vtop_core::types::TelemetryFormat::Raw,
+        };
+        let mut buf = PendingBuffer::new("t", src, limits);
+        assert!(
+            buf.continues(&file(Some(1), 0, 5)),
+            "an empty buffer takes anything"
+        );
+        buf.append(ReadResult {
+            records: vec![b"x".to_vec()],
+            progress_start: file(Some(1), 0, 0),
+            progress_end: file(Some(1), 0, 10),
+            first_timestamp: None,
+            last_timestamp: None,
+            verbatim: false,
+        });
+        assert!(
+            buf.continues(&file(Some(1), 10, 10)),
+            "picks up at byte 10, same inode"
+        );
+        assert!(
+            buf.continues(&file(None, 10, 10)),
+            "an unknown inode proves nothing"
+        );
+        assert!(
+            !buf.continues(&file(Some(1), 0, 0)),
+            "restarted at 0: truncation"
+        );
+        assert!(
+            !buf.continues(&file(Some(1), 4, 4)),
+            "a gap or overlap is not a continuation"
+        );
+        assert!(
+            !buf.continues(&file(Some(2), 10, 10)),
+            "another file took the path"
+        );
     }
 
     /// #102 (review on #391): with `create_bucket` set, provisioning ran
