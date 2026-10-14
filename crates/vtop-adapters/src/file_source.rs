@@ -987,7 +987,11 @@ impl SourceAdapter for FileSource {
                 // reads are buffered, not because it is stale.
                 c.read_byte = *end_byte;
                 c.seen = Some(FileIdentity {
-                    inode: *marker_inode,
+                    // A legacy marker names no inode; the commit was judged
+                    // current against the file at the path, so that file's
+                    // inode stands - dropping it would blind the next read
+                    // to a rotation (review of #564).
+                    inode: (*marker_inode).or(current_inode),
                     file_size: *marker_file_size,
                     mtime: String::new(),
                 });
@@ -2479,6 +2483,50 @@ mod tests {
             "resumed somewhere other than byte 21, the end of the recovered batch"
         );
         assert_eq!(next[0].records.len(), 9);
+    }
+
+    /// Review of #564: the recovered batch is a LEGACY marker with no inode.
+    /// Restarting the head must not forget the inode the seed knew - the
+    /// commit was judged current against that file - or a rotation to a file
+    /// at least as long as the batch goes unseen and the new file is read
+    /// from byte 21, skipping its first lines.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_legacy_recovered_commit_keeps_the_inode_so_a_rotation_is_still_seen() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let content: String = (0..12).map(|i| format!("old-{i:02}\n")).collect(); // 84 bytes
+        std::fs::write(&path, &content).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        fs.seed_committed_from(&path, 60, Some(inode), Some(60));
+        let recovered = ProgressMarker::File {
+            path: path.clone(),
+            inode: None,
+            start_byte: 0,
+            end_byte: 21,
+            file_size: 21,
+            mtime: String::new(),
+        };
+        fs.commit_progress(&recovered).await.unwrap();
+
+        // Rotated: a new file, longer than the batch, at the same path.
+        std::fs::rename(&path, format!("{path}.1")).unwrap();
+        let fresh: String = (0..12).map(|i| format!("new-{i:02}\n")).collect();
+        std::fs::write(&path, &fresh).unwrap();
+
+        let next = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            next[0].records.first().map(Vec::as_slice),
+            Some(b"new-00".as_slice()),
+            "the rotated file must be read from byte 0"
+        );
+        assert_eq!(next[0].records.len(), 12);
     }
 
     /// The restart seed names the file its offset came from. A cursor seeded

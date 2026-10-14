@@ -565,7 +565,9 @@ impl SourceAdapter for SyslogSpoolSource {
                 // length the seed observed (a spool marker records none).
                 c.read_byte = *end_byte;
                 c.seen = Some(SpoolSeen {
-                    inode: *marker_inode,
+                    // A legacy marker names no inode; keep the current one,
+                    // or the next rotation goes unseen (review of #564).
+                    inode: (*marker_inode).or(current_inode),
                     file_size: 0,
                     mtime: String::new(),
                 });
@@ -1098,6 +1100,49 @@ mod tests {
             source_name: path.to_string(),
             format: TelemetryFormat::Syslog,
         }
+    }
+
+    /// Review of #564, for the spool: a LEGACY recovered marker (no inode)
+    /// that restarts the head below the seed must keep the inode the spool
+    /// had, or a rotation to a longer spool goes unseen and its first lines
+    /// are skipped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_legacy_recovered_commit_keeps_the_spool_inode_so_a_rotation_is_still_seen() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.log").to_string_lossy().into_owned();
+        let old: String = (0..12).map(|i| format!("old-{i:02}\n")).collect(); // 84 bytes
+        std::fs::write(&path, &old).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+
+        let mut spool = SyslogSpoolSource::new(vec![path.clone()]);
+        spool.seed_committed_from(&path, 60, Some(inode));
+        let recovered = ProgressMarker::SyslogSpool {
+            spool_id: SyslogSpoolSource::spool_id(&path),
+            path: path.clone(),
+            inode: None,
+            start_byte: 0,
+            end_byte: 21,
+            received_time_start: None,
+            received_time_end: None,
+        };
+        spool.commit_progress(&recovered).await.unwrap();
+
+        std::fs::rename(&path, format!("{path}.1")).unwrap();
+        let fresh: String = (0..12).map(|i| format!("new-{i:02}\n")).collect();
+        std::fs::write(&path, &fresh).unwrap();
+
+        let after = spool
+            .read_batch_candidates(&spool_source(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            after[0].records.first().map(Vec::as_slice),
+            Some(b"new-00".as_slice()),
+            "the rotated spool must be read from byte 0"
+        );
+        assert_eq!(after[0].records.len(), 12);
     }
 
     /// The new spool is longer than the old read position — the case that used

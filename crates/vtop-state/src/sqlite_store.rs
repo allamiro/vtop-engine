@@ -47,8 +47,16 @@ CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
 CREATE INDEX IF NOT EXISTS idx_batches_source ON batches(source_type, source_name);
 -- Bounds the successor probe in prune_committed_history: each candidate row
 -- finds a newer committed row for its path by a range seek on created_at.
--- Replaces idx_batches_commit_cursor, which ordered by end_byte (#564).
-DROP INDEX IF EXISTS idx_batches_commit_cursor;
+-- Supersedes idx_batches_commit_cursor, which ordered by end_byte (#564).
+-- The old index is KEPT for a runtime rolled back past #564, whose prune
+-- query seeks through it (review). Drop it once that rollback is
+-- unsupported.
+CREATE INDEX IF NOT EXISTS idx_batches_commit_cursor ON batches(
+    state,
+    source_type,
+    COALESCE(json_extract(progress_end_json, '$.path'), source_name),
+    COALESCE(CAST(json_extract(progress_end_json, '$.end_byte') AS INTEGER), -1)
+);
 CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
     state,
     source_type,
