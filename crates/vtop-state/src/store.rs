@@ -56,8 +56,8 @@ pub async fn connect_state_store_with_deadline(
                         .await
                         .map_err(|_| {
                             VtopError::State(format!(
-                                "state store connect did not complete within {point:?}: the \
-                                 server accepted the connection and did not answer"
+                                "state store connect did not complete within {point:?} \
+                                 (dialing the server, the handshake, or the schema check)"
                             ))
                         })??;
                 Box::new(opened)

@@ -25,12 +25,22 @@ async fn a_silent_postgres_server_fails_the_connect_instead_of_hanging_it() {
     let url = format!("postgres://vtop:vtop@127.0.0.1:{port}/vtop?sslmode=disable");
     let limit = Duration::from_millis(400);
     // The outer bound makes a regression fail the test, not hang it.
+    let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(
         Duration::from_secs(10),
         connect_state_store_with_deadline(&url, limit),
     )
     .await
     .expect("the connect must give up within its own bound, not hang");
+    let elapsed = started.elapsed();
+    // Not just "did not hang": a connect that ignored `limit` and gave up on
+    // some longer timer of its own would pass the outer bound (review of
+    // #568). The slack is for a loaded CI runner, and is well under the
+    // shortest other timer on the path (the 10 s connect timeout).
+    assert!(
+        elapsed >= limit && elapsed < limit + Duration::from_millis(1600),
+        "gave up after {elapsed:?}; the deadline was {limit:?}"
+    );
     let message = match outcome {
         Ok(_) => panic!("a server that never answers cannot have produced a store"),
         Err(error) => error.to_string(),
