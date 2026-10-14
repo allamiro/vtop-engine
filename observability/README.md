@@ -116,15 +116,18 @@ how you notice it.
 ### Retention blocked
 
 The native broker reclaims a range's oldest sealed segments once the range is
-over its byte bound - but never past the committed floor, the offset every
-replica has acknowledged. A follower that falls behind therefore holds
-retention back, and disk grows past the bound. The pass used to report that
-exactly as it reported a range comfortably under its bound: silently.
-`vtop_broker_retention_blocked{reason}` now says which: `committed_floor` (fix
-the follower; `vtop_broker_follower_lag_records` names it) or `active_segment`
-(the bound is smaller than one segment). The node logs the change once, not
-every append. The rule **Range retention blocked** fires after 15 minutes, and
-**Range retention failing** after 10 minutes of failed passes.
+over its byte bound - but never past the committed floor: the quorum-committed
+high-water mark (and, on a replica, its own durable offset). A follower whose
+acknowledgement the quorum needs can hold that floor back, and disk then grows
+past the bound; a lagging follower the quorum can do without does not. The
+pass used to report that exactly as it reported a range comfortably under its
+bound: silently. `vtop_broker_retention_blocked{reason}` now says which:
+`committed_floor` (the quorum mark is behind; `vtop_broker_follower_lag_records`
+shows which followers are) or `active_segment` (the bound is smaller than one
+segment). The node logs the change once, not every append. The rule **Range
+retention blocked** fires after 15 minutes, and **Range retention failing**
+when the latest pass failed and none has succeeded for 10 minutes (a pass runs
+after each append, so on an idle range one failure is enough).
 
 ### Replication health
 

@@ -349,6 +349,12 @@ impl InProcessFollower {
             policy.map(|policy| policy.max_total_bytes).unwrap_or(0),
             std::sync::atomic::Ordering::SeqCst,
         );
+        if policy.is_none() {
+            // Nothing will record over the last pass's state now; left in
+            // place it would keep exporting a stale bound, size and blocked
+            // reason (review of #572).
+            self.retention_stats.clear();
+        }
     }
 
     /// One retention pass under the held state lock; failures reported, not
@@ -363,8 +369,14 @@ impl InProcessFollower {
         }
         let floor = self.cluster_committed.get().min(segment.committed_offset());
         let result = segment.retain(&vtop_log::RetentionPolicy { max_total_bytes }, floor);
-        self.retention_stats
-            .record("follower range", max_total_bytes, &result);
+        self.retention_stats.record(
+            &format!(
+                "follower {} range {}/{}",
+                self.node_id, self.range.topic, self.range.range_id
+            ),
+            max_total_bytes,
+            &result,
+        );
     }
 
     /// What retention has been doing on this replica (#561).

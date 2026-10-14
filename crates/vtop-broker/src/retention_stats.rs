@@ -22,13 +22,18 @@ pub struct RetentionStats {
     /// 0 = not blocked; otherwise 1 + the index of the reason in `ALL`.
     blocked_now: AtomicU8,
     last_pass_failed: AtomicBool,
+    /// A pass has SUCCEEDED, so `retained_bytes` and `blocked_now` are
+    /// measurements. A first pass that failed measured nothing, and its zero
+    /// must not be exported as a size (review of #572).
+    measured: AtomicBool,
 }
 
 /// One reading of [`RetentionStats`] for an exporter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionSnapshot {
-    /// Content bytes after the latest successful pass.
-    pub retained_bytes: u64,
+    /// Content bytes after the latest successful pass; `None` while no pass
+    /// has succeeded (only failures so far).
+    pub retained_bytes: Option<u64>,
     /// The bound the latest pass ran against.
     pub bound_bytes: u64,
     /// Whether the latest successful pass ended above the bound, and why.
@@ -65,6 +70,7 @@ impl RetentionStats {
             }
         };
         self.last_pass_failed.store(false, Ordering::Relaxed);
+        self.measured.store(true, Ordering::Relaxed);
         self.retained_bytes
             .store(outcome.retained_bytes, Ordering::Relaxed);
         self.reclaimed_bytes
@@ -107,12 +113,25 @@ impl RetentionStats {
     /// exports nothing rather than a misleading bound of zero.
     pub fn snapshot(&self) -> Option<RetentionSnapshot> {
         let bound_bytes = self.bound_bytes();
+        let measured = self.measured.load(Ordering::Relaxed);
         (bound_bytes > 0).then(|| RetentionSnapshot {
-            retained_bytes: self.retained_bytes(),
+            retained_bytes: measured.then(|| self.retained_bytes()),
             bound_bytes,
             blocked: self.blocked_now(),
             last_pass_failed: self.last_pass_failed.load(Ordering::Relaxed),
         })
+    }
+
+    /// Retention was turned off: no pass will run to replace what was last
+    /// recorded, so it is forgotten and the snapshot is `None` again - the
+    /// exporter removes the series instead of reporting a bound, a size and
+    /// a blocked reason that no longer apply (review of #572). The counters
+    /// stay; they count what happened.
+    pub fn clear(&self) {
+        self.bound_bytes.store(0, Ordering::Relaxed);
+        self.measured.store(false, Ordering::Relaxed);
+        self.blocked_now.store(0, Ordering::Relaxed);
+        self.last_pass_failed.store(false, Ordering::Relaxed);
     }
 
     /// Content bytes the range held after the latest pass.
@@ -212,5 +231,41 @@ mod tests {
     #[test]
     fn nothing_is_exported_before_a_pass_has_run() {
         assert_eq!(RetentionStats::default().snapshot(), None);
+    }
+
+    /// Review of #572: a first pass that failed measured nothing. Its failure
+    /// is exported; a retained size of zero is not.
+    #[test]
+    fn a_failed_first_pass_reports_the_failure_and_no_size() {
+        let stats = RetentionStats::default();
+        stats.record(
+            "t",
+            100,
+            &Err(LogError::TruncateBeyondTail {
+                requested: 1,
+                next_offset: 0,
+            }),
+        );
+        let snapshot = stats.snapshot().expect("the failure is reported");
+        assert!(snapshot.last_pass_failed);
+        assert_eq!(snapshot.retained_bytes, None, "a size nothing measured");
+        stats.record("t", 100, &Ok(outcome(0, 70, None)));
+        assert_eq!(stats.snapshot().unwrap().retained_bytes, Some(70));
+    }
+
+    /// Review of #572: once retention is turned off no pass replaces the last
+    /// one's state, so clearing is what stops a stale bound or blocked reason
+    /// being exported.
+    #[test]
+    fn clearing_forgets_the_state_and_keeps_the_counts() {
+        let stats = RetentionStats::default();
+        stats.record(
+            "t",
+            100,
+            &Ok(outcome(0, 400, Some(RetentionBlocked::CommittedFloor))),
+        );
+        stats.clear();
+        assert_eq!(stats.snapshot(), None);
+        assert_eq!(stats.passes_blocked(RetentionBlocked::CommittedFloor), 1);
     }
 }
