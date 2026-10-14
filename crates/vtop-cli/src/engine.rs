@@ -1289,6 +1289,21 @@ fn acquire_instance_locks(
     Ok(locks)
 }
 
+/// The state store, every request bounded by `engine.state_store_timeout_seconds`
+/// (#556). One function for every path that opens the ledger - the engine and
+/// `vtopctl prune-ledger` alike - so none can fall back to the default bound
+/// while the operator configured another (review of #568).
+pub(crate) async fn connect_configured_store(
+    engine: &vtop_core::config::EngineConfig,
+    state_store: &vtop_core::config::ResolvedStateStore,
+) -> Result<Box<dyn StateStore>, VtopError> {
+    connect_state_store_with_deadline(
+        state_store.expose_secret(),
+        Duration::from_secs(engine.state_store_timeout_seconds),
+    )
+    .await
+}
+
 impl Engine {
     /// Build an engine for MUTATING use (`run`, `process-once`, `replay`):
     /// refuses to start while another engine holds the same state store or
@@ -1373,11 +1388,7 @@ impl Engine {
         }
 
         let manifest_mac_key = config.resolve_manifest_mac_key()?;
-        let store = connect_state_store_with_deadline(
-            state_store.expose_secret(),
-            Duration::from_secs(config.engine.state_store_timeout_seconds),
-        )
-        .await?;
+        let store = connect_configured_store(&config.engine, &state_store).await?;
         let backend = vtop_upload::build_backend(&config.upload).await?;
 
         let mut adapters: HashMap<SourceType, Box<dyn SourceAdapter>> = HashMap::new();
