@@ -330,11 +330,20 @@ groups:
               instant: true
               # The epoch's RISE, not its number of changes (review of #572):
               # several leadership changes between two scrapes are one
-              # change of the gauge but several epochs. Zeros (a replica that
+              # change of the gauge but several epochs. The low end is the
+              # highest epoch any replica knew as the window OPENED (review
+              # of #574): a replica (re)started inside the window has no
+              # sample there, so it cannot pull the low end up to today's
+              # epoch and hide the churn, and a replica whose view lags
+              # cannot pull it down. A range with no sample that old falls
+              # back to its lowest epoch in the window. Zeros (a replica that
               # has not read metadata yet) are left out of the low end.
               expr: >-
                 max by (topic, range) (max_over_time(vtop_broker_meta_fencing_epoch[30m]))
-                - max by (topic, range) (min_over_time((vtop_broker_meta_fencing_epoch > 0)[30m:1m]))
+                - (
+                  max by (topic, range) (max_over_time((vtop_broker_meta_fencing_epoch > 0)[5m:1m] offset 30m))
+                  or max by (topic, range) (min_over_time((vtop_broker_meta_fencing_epoch > 0)[30m:1m]))
+                )
               intervalMs: 1000
               maxDataPoints: 43200
           - refId: C

@@ -144,7 +144,7 @@ each add the same delta and leave the export permanently above its source.
 | `vtop_meta_raft_peer_matched_index{peer}` | gauge | Highest index each peer acknowledged, or `-1` for a peer that has acknowledged nothing. Leader only. |
 | `vtop_meta_raft_peer_lag_entries{peer}` | gauge | Entries each peer trails the leader by; `-1` when the peer has never acknowledged, since its lag is unknown rather than total. |
 | `vtop_meta_group_cursor_offset{topic,range,group}` | gauge | Next offset each consumer group will read on each range, from this node's applied state (#571). `topic` is the name and `range` the UUID, as on the data nodes, so lag and time to eviction are PromQL joins against `vtop_broker_log_start_offset`. Only the metadata leader exports it (a follower's copy can stand above a cursor committed backwards); the others export none. A busy state machine leaves the last values standing; a removed cursor disappears. `group` is the group name, or its UUID when the group record is gone. |
-| `vtop_meta_group_cursor_series_truncated` | gauge | 1 when some cursors were not exported: more than the 10,000-series bound exist, or an offset is beyond what a gauge carries. |
+| `vtop_meta_group_cursor_series_truncated` | gauge | 1 when some cursors were not exported: more than the 10,000-series bound exist, or an offset is beyond what a gauge carries. A cursor whose topic has been deleted is not exported either, and does NOT set it: there is no log left for it to lag behind, and it would hold the flag at 1 after every topic deletion. |
 
 Absent values report `-1`, never `0`: a Raft node with no log has no last
 index, and `0` is a real value in the neighbouring series. The same rule covers

@@ -157,7 +157,9 @@ warned before it happened (#571). Two series meet in PromQL:
   leader: a cursor can be committed backwards, so a lagging follower's copy may
   stand above where the group really is, and no aggregate across nodes could
   tell. At most 10,000 series; `vtop_meta_group_cursor_series_truncated` is 1
-  when some were left out;
+  when some were left out over that bound or an offset too large for a gauge
+  (a cursor whose topic was deleted is dropped without setting it - it has
+  no log left to lag behind);
 - every data node exports `vtop_broker_log_start_offset{topic,range}`, the first
   offset its replica still holds (removed while a candidate has no role).
 

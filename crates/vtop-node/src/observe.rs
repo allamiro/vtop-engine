@@ -369,7 +369,10 @@ impl MetaGroupCursorCollector {
         self.offset.reset();
         for position in &positions {
             let Some(topic) = position.topic_name.as_deref() else {
-                continue; // the cursor outlived its topic; nothing to join it to
+                // The cursor outlived its topic: nothing to join it to and no
+                // log for it to lag behind. Not `truncated` - that would pin
+                // the flag at 1 after every topic deletion (review of #574).
+                continue;
             };
             let range = position.range_uuid.to_string();
             let group = position
