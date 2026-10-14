@@ -177,3 +177,77 @@ async fn a_body_that_drips_after_the_headers_fails_the_read_instead_of_hanging()
         started.elapsed()
     );
 }
+
+/// Headers that arrive late, then a body that drips: the store spends most
+/// of an attempt before answering at all.
+async fn slow_then_dripping_store(header_delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                tokio::time::sleep(header_delay).await;
+                let headers = "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\
+                               Content-Type: application/octet-stream\r\n\r\n";
+                if socket.write_all(headers.as_bytes()).await.is_err() {
+                    return;
+                }
+                loop {
+                    if socket.write_all(b"x").await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            });
+        }
+    });
+    (endpoint, task)
+}
+
+/// Review of #568, second round: the body's deadline used to start when the
+/// headers arrived, so headers that took most of an attempt bought the body
+/// a fresh full allowance - nearly twice the operation's limit in all. The
+/// deadline now counts from before the request: with 2 s attempts (a 6 s
+/// allowance) and headers at 1.8 s, the read must fail at about 6 s, not 7.8.
+#[tokio::test]
+async fn slow_headers_come_out_of_the_bodys_allowance() {
+    std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+
+    let (endpoint, _store) = slow_then_dripping_store(Duration::from_millis(1_800)).await;
+    let backend = S3NativeBackend::new(&S3NativeConfig {
+        region: "us-east-1".into(),
+        endpoint_url: Some(endpoint),
+        force_path_style: true,
+        verify_tls: false,
+        transport: "tcp_tls".into(),
+        tuning: Default::default(),
+        request_timeout_seconds: 2,
+    })
+    .await
+    .expect("the backend builds against a plaintext lab endpoint");
+
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        backend.get_object("s3://telemetry-raw/some/key.bin"),
+    )
+    .await
+    .expect("the body read was still going after 60 s: nothing bounds it");
+    let error = outcome.expect_err("a body that never finishes cannot have been read");
+    assert!(
+        error.to_string().contains("did not finish within"),
+        "the failure must name the deadline: {error}"
+    );
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(5_500) && took < Duration::from_millis(7_000),
+        "a 6 s operation allowance, headers at 1.8 s: the read ended after {took:?}"
+    );
+}

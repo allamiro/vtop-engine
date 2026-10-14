@@ -126,8 +126,9 @@ pub struct S3NativeBackend {
     /// that is outside them, and the SDK's stalled-stream protection only
     /// catches a stream that stops, not one that drips a byte at a time. The
     /// whole-operation allowance (the SDK's attempts times
-    /// `request_timeout_seconds`), so an object a slow link can still deliver
-    /// in that time is not cut off.
+    /// `request_timeout_seconds`), measured from before `send()`, so the
+    /// headers and the body share it - and an object a slow link can still
+    /// deliver in that time is not cut off.
     body_deadline: std::time::Duration,
 }
 
@@ -662,6 +663,9 @@ impl S3NativeBackend {
         max_bytes: u64,
     ) -> Result<(String, u64), VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
+        // The body's deadline counts from HERE (review of #568): the time
+        // `send()` spends on the headers comes out of the same allowance.
+        let started = tokio::time::Instant::now();
         let out = self
             .client
             .get_object()
@@ -679,6 +683,7 @@ impl S3NativeBackend {
         self.within_body_deadline(
             "get_object",
             object_uri,
+            started,
             digest_reader(algo, out.body.into_async_read().take(max_bytes)),
         )
         .await?
@@ -687,21 +692,27 @@ impl S3NativeBackend {
 }
 
 impl S3NativeBackend {
-    /// Read a response body within [`Self::body_deadline`]: a store that sent
-    /// the headers and then stalls, or drips, fails the read instead of
-    /// holding verification or recovery open indefinitely.
+    /// Read a response body so the WHOLE operation - the request sent at
+    /// `started`, then its body - finishes within [`Self::body_deadline`]: a
+    /// store that sent the headers and then stalls, or drips, fails the read
+    /// instead of holding verification or recovery open indefinitely. The
+    /// deadline is measured from before `send()`, not from the headers
+    /// (review of #568): a fresh allowance after headers that took most of
+    /// one would let the operation run for nearly twice its limit.
     async fn within_body_deadline<T>(
         &self,
         what: &str,
         uri: &str,
+        started: tokio::time::Instant,
         read: impl std::future::Future<Output = Result<T, VtopError>>,
     ) -> Result<T, VtopError> {
-        tokio::time::timeout(self.body_deadline, read)
+        tokio::time::timeout_at(started + self.body_deadline, read)
             .await
             .map_err(|_| {
                 VtopError::Upload(format!(
-                    "{what} {uri}: the response body did not finish within {:?} (the store \
-                     sent its headers and then stalled)",
+                    "{what} {uri}: the operation did not finish within {:?}, its whole \
+                     allowance: the response body did not finish (the store sent its \
+                     headers and then stalled)",
                     self.body_deadline
                 ))
             })?
@@ -797,6 +808,9 @@ impl UploadBackend for S3NativeBackend {
         max_bytes: usize,
     ) -> Result<Vec<u8>, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
+        // The body's deadline counts from HERE (review of #568): the time
+        // `send()` spends on the headers comes out of the same allowance.
+        let started = tokio::time::Instant::now();
         let out = self
             .client
             .get_object()
@@ -823,6 +837,7 @@ impl UploadBackend for S3NativeBackend {
         self.within_body_deadline(
             "get_object",
             object_uri,
+            started,
             read_bounded(out.body.into_async_read(), max_bytes, object_uri),
         )
         .await
@@ -851,6 +866,9 @@ impl UploadBackend for S3NativeBackend {
 
     async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
+        // The body's deadline counts from HERE (review of #568): the time
+        // `send()` spends on the headers comes out of the same allowance.
+        let started = tokio::time::Instant::now();
         let out = self
             .client
             .get_object()
@@ -860,7 +878,7 @@ impl UploadBackend for S3NativeBackend {
             .await
             .map_err(|e| sdk_failure("get_object", object_uri, e))?;
         let bytes = self
-            .within_body_deadline("get_object", object_uri, async {
+            .within_body_deadline("get_object", object_uri, started, async {
                 out.body
                     .collect()
                     .await
@@ -876,6 +894,9 @@ impl UploadBackend for S3NativeBackend {
         max_bytes: usize,
     ) -> Result<Vec<u8>, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
+        // The body's deadline counts from HERE (review of #568): the time
+        // `send()` spends on the headers comes out of the same allowance.
+        let started = tokio::time::Instant::now();
         let out = self
             .client
             .get_object()
@@ -895,6 +916,7 @@ impl UploadBackend for S3NativeBackend {
         self.within_body_deadline(
             "get_object",
             object_uri,
+            started,
             read_bounded(out.body.into_async_read(), max_bytes, object_uri),
         )
         .await
