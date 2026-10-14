@@ -1491,6 +1491,37 @@ mod tests {
         assert_eq!(reads2[0].records, vec![b"two".to_vec(), b"three".to_vec()]);
     }
 
+    /// The batch rewind returns one result per marker, in order, and one that
+    /// cannot be applied does not hide or reorder the others.
+    #[tokio::test]
+    async fn a_batch_rewind_answers_each_marker_in_order() {
+        let f = write_log(&["one", "two", "three"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let good = read[0].progress_start.clone();
+        let wrong_kind = ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition: 0,
+            start_offset: 0,
+            end_offset: 0,
+            consumer_group: "g".into(),
+        };
+        let results = fs
+            .replay_from_markers(&[good.clone(), wrong_kind, good])
+            .await;
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok());
+        assert!(
+            results[1].is_err(),
+            "a marker of another source type is refused"
+        );
+        assert!(results[2].is_ok(), "and does not stop the one after it");
+    }
+
     #[tokio::test]
     async fn replay_rewinds_uncommitted_read() {
         let f = write_log(&["x", "y", "z"]);

@@ -177,6 +177,24 @@ pub trait SourceAdapter: Send + Sync {
     /// Rewind the read position to a marker so uncommitted data is replayed.
     async fn replay_from_marker(&mut self, marker: &ProgressMarker) -> Result<(), VtopError>;
 
+    /// Rewind several ranges at once, one result per marker in the same order.
+    ///
+    /// The default rewinds one at a time. An adapter whose rewind consults an
+    /// external system overrides it to ask once for the whole batch: recovery
+    /// and the engine's failure path rewind every affected range together, and
+    /// a rewind that costs a round trip each would stall startup in proportion
+    /// to the number of partitions when that system is slow or down.
+    async fn replay_from_markers(
+        &mut self,
+        markers: &[ProgressMarker],
+    ) -> Vec<Result<(), VtopError>> {
+        let mut results = Vec::with_capacity(markers.len());
+        for marker in markers {
+            results.push(self.replay_from_marker(marker).await);
+        }
+        results
+    }
+
     fn source_type(&self) -> SourceType;
 
     /// Downcast hook so the engine can seed concrete adapters (e.g. file /

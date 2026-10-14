@@ -1912,8 +1912,11 @@ impl Engine {
         if !rewinds.is_empty() {
             self.cycle_had_failure = true;
         }
-        for marker in rewinds {
-            match adapter.replay_from_marker(&marker).await {
+        for (marker, result) in rewinds
+            .iter()
+            .zip(adapter.replay_from_markers(&rewinds).await)
+        {
+            match result {
                 Ok(()) => tracing::warn!(
                     source_type = %source_type,
                     start = ?marker,
@@ -2249,27 +2252,45 @@ impl Engine {
             }
             self.commit_recovered(&rec, &mut summary).await?;
         }
+        // Group by source type so each adapter rewinds its whole batch in one
+        // call (see `SourceAdapter::replay_from_markers`).
+        let mut by_source: Vec<(SourceType, Vec<ProgressMarker>)> = Vec::new();
         for marker in rewinds.into_markers() {
-            let Some(adapter) = self.adapters.get_mut(&marker.source_type()) else {
+            match by_source
+                .iter_mut()
+                .find(|(source_type, _)| *source_type == marker.source_type())
+            {
+                Some((_, markers)) => markers.push(marker),
+                None => by_source.push((marker.source_type(), vec![marker])),
+            }
+        }
+        for (source_type, markers) in by_source {
+            let Some(adapter) = self.adapters.get_mut(&source_type) else {
                 // The decision to replay is durable, but there is nothing to
                 // rewind: this process has no adapter for that source type.
                 tracing::error!(
-                    start = ?marker,
+                    %source_type,
+                    ranges = markers.len(),
                     "recovery has no adapter for an incomplete range's source; it will not be re-read"
                 );
-                summary.still_pending += 1;
+                summary.still_pending += markers.len();
                 continue;
             };
-            if let Err(e) = adapter.replay_from_marker(&marker).await {
-                // The decision to replay is already durable; what failed is the
-                // rewind itself. Swallowing this made recovery report success
-                // for a range that was never going to be re-read.
-                tracing::error!(
-                    start = ?marker,
-                    error = %e,
-                    "recovery could not hand an incomplete range back to its source; it will not be re-read"
-                );
-                summary.still_pending += 1;
+            for (marker, result) in markers
+                .iter()
+                .zip(adapter.replay_from_markers(&markers).await)
+            {
+                if let Err(e) = result {
+                    // The decision to replay is already durable; what failed is
+                    // the rewind itself. Swallowing this made recovery report
+                    // success for a range that was never going to be re-read.
+                    tracing::error!(
+                        start = ?marker,
+                        error = %e,
+                        "recovery could not hand an incomplete range back to its source; it will not be re-read"
+                    );
+                    summary.still_pending += 1;
+                }
             }
         }
         Ok(summary)

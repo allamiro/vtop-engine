@@ -60,19 +60,6 @@ const WATERMARK_TIMEOUT_SECONDS: u64 = 5;
 /// a minute is free and keeps a broker round trip off the per-pass path.
 const RETENTION_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Records that retention removed between where this cursor wanted to resume
-/// and the oldest offset the broker still holds (#361).
-///
-/// The comparison is against the partition's LOW WATERMARK, read from the
-/// broker, and not against anything inferred from delivered offsets. A jump in
-/// what arrives is not evidence: compaction produces one, a recreated topic
-/// produces one, and a first assignment produces one — none of them is data
-/// lost, and a heuristic that cannot tell them apart would cry wolf until it
-/// was ignored.
-///
-/// `None` for a partition with no committed cursor. Nothing has been read, so
-/// nothing can have been missed, and reporting a "gap" the size of the whole
-/// topic on first assignment is the fastest way to make this signal useless.
 /// Where a rewind to `start_offset` should actually land.
 ///
 /// The consumer group's committed offset is the frontier everything below which
@@ -87,6 +74,19 @@ fn clamp_rewind(start_offset: i64, group_committed: Option<i64>) -> i64 {
     group_committed.map_or(start_offset, |committed| start_offset.max(committed))
 }
 
+/// Records that retention removed between where this cursor wanted to resume
+/// and the oldest offset the broker still holds (#361).
+///
+/// The comparison is against the partition's LOW WATERMARK, read from the
+/// broker, and not against anything inferred from delivered offsets. A jump in
+/// what arrives is not evidence: compaction produces one, a recreated topic
+/// produces one, and a first assignment produces one — none of them is data
+/// lost, and a heuristic that cannot tell them apart would cry wolf until it
+/// was ignored.
+///
+/// `None` for a partition with no committed cursor. Nothing has been read, so
+/// nothing can have been missed, and reporting a "gap" the size of the whole
+/// topic on first assignment is the fastest way to make this signal useless.
 fn retention_gap(desired_offset: Option<i64>, low_watermark: i64) -> Option<u64> {
     let desired = desired_offset?;
     // A NEGATIVE OFFSET IS A SENTINEL, NOT A POSITION. librdkafka spells
@@ -547,23 +547,42 @@ impl KafkaSource {
             .collect()
     }
 
-    /// The group's committed "next offset" for one partition, from the broker.
-    /// `None` when nothing is committed or the broker cannot be asked within
-    /// the bound; callers then fall back to what they already know.
-    fn group_committed_offset(&mut self, topic: &str, partition: i32) -> Option<i64> {
-        let consumer = self.consumer().ok()?;
-        let mut wanted = TopicPartitionList::new();
-        wanted.add_partition(topic, partition);
-        let committed = consumer
-            .committed_offsets(
-                wanted,
-                std::time::Duration::from_secs(WATERMARK_TIMEOUT_SECONDS),
-            )
-            .ok()?;
-        match committed.find_partition(topic, partition)?.offset() {
-            Offset::Offset(at) => Some(at),
-            _ => None,
+    /// The group's committed "next offset" for each of `partitions`, from the
+    /// broker, in ONE request. A partition with nothing committed, or every
+    /// partition when the broker cannot answer within the bound, is simply
+    /// absent; callers then fall back to what they already know.
+    fn group_committed_offsets(
+        &mut self,
+        partitions: &[(String, i32)],
+    ) -> HashMap<(String, i32), i64> {
+        let mut answers = HashMap::new();
+        if partitions.is_empty() {
+            return answers;
         }
+        let Ok(consumer) = self.consumer() else {
+            return answers;
+        };
+        let mut wanted = TopicPartitionList::new();
+        let mut seen = std::collections::HashSet::new();
+        for (topic, partition) in partitions {
+            if seen.insert((topic.as_str(), *partition)) {
+                wanted.add_partition(topic, *partition);
+            }
+        }
+        let Ok(committed) = consumer.committed_offsets(
+            wanted,
+            std::time::Duration::from_secs(WATERMARK_TIMEOUT_SECONDS),
+        ) else {
+            return answers;
+        };
+        for (topic, partition) in partitions {
+            if let Some(element) = committed.find_partition(topic, *partition) {
+                if let Offset::Offset(at) = element.offset() {
+                    answers.insert((topic.clone(), *partition), at);
+                }
+            }
+        }
+        answers
     }
 
     fn consumer(&mut self) -> Result<&BaseConsumer, VtopError> {
@@ -1134,49 +1153,76 @@ impl SourceAdapter for KafkaSource {
     }
 
     async fn replay_from_marker(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
-        let ProgressMarker::Kafka {
-            topic,
-            partition,
-            start_offset,
-            ..
-        } = marker
-        else {
-            return Err(VtopError::Source(
-                "kafka adapter given non-kafka marker".into(),
-            ));
-        };
-        // Reads assign() from the cursor, so rewinding means resetting the
-        // cursor: clear the in-memory read head and pin the resume position to
-        // start_offset. The next read assigns the partition at that offset.
-        //
-        // Never below the group's committed offset: see `clamp_rewind`. The
-        // broker is asked because after a restart this process holds no
-        // committed offset of its own, and the in-memory one is only a lower
-        // bound of it.
-        let broker = self.group_committed_offset(topic, *partition);
-        let in_memory = self
-            .cursors
-            .get(&(topic.clone(), *partition))
-            .and_then(|cur| cur.committed_offset);
-        let frontier = match (broker, in_memory) {
-            (Some(b), Some(m)) => Some(b.max(m)),
-            (b, m) => b.or(m),
-        };
-        let resume_at = clamp_rewind(*start_offset, frontier);
-        let cur = self.cursors.entry((topic.clone(), *partition)).or_default();
-        cur.last_read_offset = None;
-        cur.committed_offset = Some(resume_at);
-        if resume_at != *start_offset {
-            tracing::info!(
-                topic,
-                partition,
-                requested = start_offset,
-                committed = resume_at,
-                "kafka rewind clamped to the group's committed offset: the range is already archived"
-            );
-        }
-        tracing::warn!(topic, partition, resume_at, "kafka rewound for replay");
-        Ok(())
+        self.replay_from_markers(std::slice::from_ref(marker))
+            .await
+            .pop()
+            .unwrap_or_else(|| Err(VtopError::Source("kafka rewind produced no result".into())))
+    }
+
+    /// One broker round trip for the whole batch, however many partitions it
+    /// names: each rewind is clamped to the group's committed offset (see
+    /// `clamp_rewind`), and asking per partition would cost a bounded wait each
+    /// when the broker is slow or down, stalling startup in proportion to the
+    /// number of partitions being replayed.
+    async fn replay_from_markers(
+        &mut self,
+        markers: &[ProgressMarker],
+    ) -> Vec<Result<(), VtopError>> {
+        let partitions: Vec<(String, i32)> = markers
+            .iter()
+            .filter_map(|m| match m {
+                ProgressMarker::Kafka {
+                    topic, partition, ..
+                } => Some((topic.clone(), *partition)),
+                _ => None,
+            })
+            .collect();
+        let broker = self.group_committed_offsets(&partitions);
+        markers
+            .iter()
+            .map(|marker| {
+                let ProgressMarker::Kafka {
+                    topic,
+                    partition,
+                    start_offset,
+                    ..
+                } = marker
+                else {
+                    return Err(VtopError::Source(
+                        "kafka adapter given non-kafka marker".into(),
+                    ));
+                };
+                // Reads assign() from the cursor, so rewinding means resetting
+                // the cursor: clear the in-memory read head and pin the resume
+                // position. The next read assigns the partition at that offset.
+                //
+                // Never below the group's committed offset: see
+                // `clamp_rewind`. The in-memory committed offset is only a
+                // lower bound of the broker's, and after a restart this
+                // process holds none of its own.
+                let key = (topic.clone(), *partition);
+                let in_memory = self.cursors.get(&key).and_then(|cur| cur.committed_offset);
+                let frontier = match (broker.get(&key).copied(), in_memory) {
+                    (Some(b), Some(m)) => Some(b.max(m)),
+                    (b, m) => b.or(m),
+                };
+                let resume_at = clamp_rewind(*start_offset, frontier);
+                let cur = self.cursors.entry(key).or_default();
+                cur.last_read_offset = None;
+                cur.committed_offset = Some(resume_at);
+                if resume_at != *start_offset {
+                    tracing::info!(
+                        topic,
+                        partition,
+                        requested = start_offset,
+                        committed = resume_at,
+                        "kafka rewind clamped to the group's committed offset: the range is already archived"
+                    );
+                }
+                tracing::warn!(topic, partition, resume_at, "kafka rewound for replay");
+                Ok(())
+            })
+            .collect()
     }
 
     fn source_type(&self) -> SourceType {
