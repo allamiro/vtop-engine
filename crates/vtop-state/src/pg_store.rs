@@ -457,7 +457,8 @@ impl StateStore for PgStateStore {
         &self,
         source_type: SourceType,
     ) -> Result<Vec<CommittedCursor>, VtopError> {
-        // See the SQLite implementation and #77. The column is TEXT, so cast to
+        // See the SQLite implementation and #77 (including why "newest" is the
+        // batch created last, not the one updated last). The column is TEXT, so cast to
         // jsonb; markers are internally tagged (fields at top level). The inode
         // is read as text and parsed here so a u64 above i64::MAX stays exact.
         let rows = sqlx::query(
@@ -466,11 +467,11 @@ impl StateStore for PgStateStore {
                         progress_end_json::jsonb ->> 'inode' AS inode, \
                         (progress_end_json::jsonb ->> 'end_byte')::bigint AS end_byte, \
                         (progress_end_json::jsonb ->> 'file_size')::bigint AS file_size, \
-                        updated_at, batch_id \
+                        created_at, batch_id \
                  FROM batches WHERE state = $1 AND source_type = $2 \
              ), latest AS ( \
                  SELECT path, inode, file_size, ROW_NUMBER() OVER ( \
-                            PARTITION BY path ORDER BY updated_at DESC, batch_id DESC) AS rn \
+                            PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ), per_inode AS ( \
                  SELECT path, inode, MAX(end_byte) AS end_byte \

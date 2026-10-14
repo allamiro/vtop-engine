@@ -126,6 +126,97 @@ pub fn commit_is_current(
     end_byte <= current_size
 }
 
+/// Which read each handed-out byte range came from, by cursor generation.
+///
+/// `commit_is_current` judges a commit by the inode and the length of the file
+/// NOW, and cannot tell a pre-truncation range from a post-truncation one: a
+/// `copytruncate`d file that has regrown past an old range's end looks the same
+/// as it did before. A batch read before the truncation that finishes
+/// uploading after the regrowth would then carry the restarted cursor to its
+/// old offset, silently skipping the bytes in between (review of #564).
+///
+/// Every discontinuity the adapter acts on starts a new generation, and every
+/// range handed out is remembered with the generation it was read in. A commit
+/// is settled against that record: a range from an older generation is stale
+/// however the file looks now. The record is in-process: after a restart there
+/// is none, and `commit_is_current` is the fallback.
+#[derive(Debug, Clone, Default)]
+pub struct Generations {
+    current: u64,
+    issued: std::collections::VecDeque<Issued>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Issued {
+    start: u64,
+    end: u64,
+    generation: u64,
+}
+
+/// More than this many uncommitted ranges per file means the engine is not
+/// committing at all; the oldest records are dropped and their commits fall
+/// back to the length test.
+const MAX_ISSUED: usize = 256;
+
+/// What a commit's range turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settled {
+    /// Read in the current generation.
+    Current,
+    /// Read before the latest discontinuity: never move the cursor for it.
+    Stale,
+    /// Not on record (read before a restart, or evicted).
+    Unknown,
+}
+
+impl Generations {
+    /// The file under the cursor was replaced or truncated and the cursor
+    /// restarted on the new content.
+    pub fn discontinuity(&mut self) {
+        self.current += 1;
+    }
+
+    /// A range was handed to the engine, read in the current generation.
+    pub fn issue(&mut self, start: u64, end: u64) {
+        if end <= start {
+            return;
+        }
+        if self.issued.len() >= MAX_ISSUED {
+            self.issued.pop_front();
+        }
+        self.issued.push_back(Issued {
+            start,
+            end,
+            generation: self.current,
+        });
+    }
+
+    /// A rewind will hand these bytes out again: forget the earlier issue.
+    pub fn reissue_from(&mut self, start: u64) {
+        self.issued.retain(|issued| issued.start < start);
+    }
+
+    /// Settle a commit for `start..end`. Commits arrive in the order the
+    /// windows were read, so the OLDEST matching record is the one being
+    /// committed; if the same range exists in two generations, the older one
+    /// is taken first, which errs towards a duplicate rather than a skip.
+    pub fn settle(&mut self, start: u64, end: u64) -> Settled {
+        let Some(at) = self
+            .issued
+            .iter()
+            .position(|issued| issued.start == start && issued.end == end)
+        else {
+            return Settled::Unknown;
+        };
+        let issued = self.issued.remove(at).expect("position found above");
+        if issued.generation == self.current {
+            Settled::Current
+        } else {
+            Settled::Stale
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +327,53 @@ mod tests {
             "ends beyond the file as it is now: truncated since it was read"
         );
         assert!(!commit_is_current(Some(7), None, 0, 1), "the file is gone");
+    }
+
+    #[test]
+    fn a_range_from_before_a_truncation_is_stale_however_the_file_looks_now() {
+        let mut generations = Generations::default();
+        generations.issue(0, 100);
+        // copytruncate: the cursor restarts on the new content.
+        generations.discontinuity();
+        generations.issue(0, 40);
+        // The old range finishes uploading after the file has regrown past it.
+        // It is commit_is_current by inode and length; the record says stale.
+        assert!(commit_is_current(Some(7), Some(7), 5_000, 100));
+        assert_eq!(generations.settle(0, 100), Settled::Stale);
+        // The new content's range is current.
+        assert_eq!(generations.settle(0, 40), Settled::Current);
+        // Settled once: a repeat is unknown, not current.
+        assert_eq!(generations.settle(0, 40), Settled::Unknown);
+    }
+
+    #[test]
+    fn the_same_range_in_two_generations_settles_oldest_first() {
+        let mut generations = Generations::default();
+        generations.issue(0, 50);
+        generations.discontinuity();
+        generations.issue(0, 50);
+        assert_eq!(generations.settle(0, 50), Settled::Stale);
+        assert_eq!(generations.settle(0, 50), Settled::Current);
+    }
+
+    #[test]
+    fn a_replayed_range_is_forgotten_and_the_record_is_bounded() {
+        let mut generations = Generations::default();
+        generations.issue(0, 10);
+        generations.issue(10, 20);
+        generations.reissue_from(10);
+        assert_eq!(generations.settle(10, 20), Settled::Unknown);
+        assert_eq!(generations.settle(0, 10), Settled::Current);
+        for i in 0..(MAX_ISSUED as u64 + 10) {
+            generations.issue(i * 10, i * 10 + 5);
+        }
+        assert_eq!(generations.settle(0, 5), Settled::Unknown, "evicted");
+        assert_eq!(
+            generations.settle(
+                (MAX_ISSUED as u64 + 9) * 10,
+                (MAX_ISSUED as u64 + 9) * 10 + 5
+            ),
+            Settled::Current
+        );
     }
 }

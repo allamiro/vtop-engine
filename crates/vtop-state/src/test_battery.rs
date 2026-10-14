@@ -328,6 +328,34 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
         // `updated_at` orders "most recent": make each commit strictly later.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+    // The restart cursor is the window READ last, not the one COMMITTED last:
+    // recovery can commit an older VERIFIED window after a newer one (review of
+    // #564). L1 (inode 41) was read first, L2 (inode 42) second; L2 commits
+    // first and L1 last, so `updated_at` would name the older file.
+    for (id, inode, end) in [("cur-l1", 41, 100), ("cur-l2", 42, 20)] {
+        store
+            .save_batch_state(&mk(id, "/late.log", Some(inode), end))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let p = BatchPatch::default();
+    for id in ["cur-l2", "cur-l1"] {
+        for st in LEGAL_WALK {
+            store.update_batch_state(id, st, &p).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // An inode above i64::MAX must survive the round trip exactly: a lossy
+    // conversion would read as a different (or unknown) identity.
+    let huge = u64::MAX - 1;
+    store
+        .save_batch_state(&mk("cur-huge", "/huge.log", Some(huge), 7))
+        .await
+        .unwrap();
+    for st in LEGAL_WALK {
+        store.update_batch_state("cur-huge", st, &p).await.unwrap();
+    }
     // An UNCOMMITTED row on the new inode with a bigger end must not count.
     store
         .save_batch_state(&mk("cur-8", "/rot.log", Some(22), 5_000))
@@ -335,7 +363,16 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
         .unwrap();
 
     let mut got = store.committed_cursors(SourceType::File).await.unwrap();
-    got.retain(|c| ["/rot.log", "/same.log", "/legacy.log"].contains(&c.path.as_str()));
+    got.retain(|c| {
+        [
+            "/rot.log",
+            "/same.log",
+            "/legacy.log",
+            "/late.log",
+            "/huge.log",
+        ]
+        .contains(&c.path.as_str())
+    });
     got.sort_by(|a, b| a.path.cmp(&b.path));
     let want = |path: &str, inode: Option<u64>, end_byte: u64| CommittedCursor {
         path: path.into(),
@@ -352,6 +389,9 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
     assert_eq!(
         got,
         vec![
+            want("/huge.log", Some(huge), 7),
+            // Read last, committed first: still the restart cursor.
+            want("/late.log", Some(42), 20),
             want("/legacy.log", None, 15),
             // The rotated path resumes at the NEW file's 60, not the old 900.
             want("/rot.log", Some(22), 60),

@@ -27,6 +27,8 @@ struct SpoolCursor {
     /// until a read has actually observed the file, so an unseen spool is
     /// always read rather than skipped on an assumption.
     seen: Option<SpoolSeen>,
+    /// Which generation of the spool each handed-out range was read in.
+    generations: continuity::Generations,
 }
 
 /// Identity of a spool file as a read last observed it: enough to prove,
@@ -89,7 +91,9 @@ impl SyslogSpoolSource {
         if let Some(why) = discontinuity {
             tracing::warn!(path, previous_read_byte = cursor.read_byte, "{why}");
             cursor.committed_byte = 0;
+            cursor.generations.discontinuity();
         }
+        cursor.generations.issue(start, end);
         cursor.read_byte = end;
         // What the read ACTUALLY observed, not what a stat saw before it.
         cursor.seen = Some(seen);
@@ -465,6 +469,7 @@ impl SourceAdapter for SyslogSpoolSource {
     async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
         let ProgressMarker::SyslogSpool {
             path,
+            start_byte,
             end_byte,
             inode: marker_inode,
             ..
@@ -481,7 +486,15 @@ impl SourceAdapter for SyslogSpoolSource {
             Ok(md) => (inode_of(&md), md.len()),
             Err(_) => (None, 0),
         };
-        if continuity::commit_is_current(*marker_inode, current_inode, current_size, *end_byte) {
+        let generation = self
+            .cursors
+            .entry(path.clone())
+            .or_default()
+            .generations
+            .settle(*start_byte, *end_byte);
+        if generation != continuity::Settled::Stale
+            && continuity::commit_is_current(*marker_inode, current_inode, current_size, *end_byte)
+        {
             let c = self.cursors.entry(path.clone()).or_default();
             c.committed_byte = *end_byte;
             if c.read_byte < *end_byte {
@@ -532,6 +545,7 @@ impl SourceAdapter for SyslogSpoolSource {
             )));
         }
         c.read_byte = replay_byte;
+        c.generations.reissue_from(replay_byte);
         Ok(())
     }
 
@@ -806,6 +820,7 @@ mod tests {
             read_byte: at,
             committed_byte: at,
             seen: Some(identity),
+            ..SpoolCursor::default()
         }
     }
 
@@ -1089,6 +1104,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next[0].records, vec![b"yy".to_vec()]);
+    }
+
+    /// The same pre-truncation commit, but the spool has regrown past the old
+    /// range's end before it lands: by inode and length it looks current (see
+    /// `FileSource`'s test of the same shape; review of #564).
+    #[tokio::test]
+    async fn a_pre_truncation_commit_cannot_move_the_cursor_after_the_spool_regrows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap(); // 14 bytes
+        let mut spool = SyslogSpoolSource::new(vec![path.clone()]);
+        let old = spool
+            .read_batch_candidates(&spool_source(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let old_end = old[0].progress_end.clone();
+
+        std::fs::write(&path, "zz\n").unwrap();
+        let fresh = spool
+            .read_batch_candidates(&spool_source(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(fresh[0].records, vec![b"zz".to_vec()]);
+
+        // Regrown to 20 bytes, past the old range's end (14).
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"aa\nbb\ncc\ndd\nee\nff\n")
+            .unwrap();
+        spool.commit_progress(&old_end).await.unwrap();
+        assert_eq!(
+            spool.cursors[&path].read_byte, 3,
+            "the stale commit must leave the cursor where the restart put it"
+        );
     }
 
     #[cfg(unix)]

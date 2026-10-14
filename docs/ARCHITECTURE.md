@@ -304,6 +304,15 @@ What follows from that, in the engine:
   one in the same cycle, so both are in flight at once; committing the new
   window first would leave the old file as the most recent commit and make the
   restart seed name a file that is gone.
+- **A late commit is settled against the generation its range was read in.**
+  The adapter starts a new generation each time it restarts a cursor on a
+  rotated or truncated file, and remembers which generation every range it
+  handed out was read in. A range from an older generation never moves the
+  cursor, however the file looks by the time its commit lands - a
+  `copytruncate`d file that has regrown past the old range's end is otherwise
+  indistinguishable, by inode and length, from the file the range was read
+  from. The record is in-process: after a restart a commit falls back to the
+  inode and length test.
 - **A restart seeds the cursor with the inode** the offset came from
   (`StateStore::committed_cursors`: the inode of the most recent committed
   batch, and the highest committed offset among that inode's batches only). A

@@ -30,6 +30,8 @@ struct FileCursor {
     /// until a read has actually observed the file, so an unseen file is
     /// always read rather than skipped on an assumption.
     seen: Option<FileIdentity>,
+    /// Which generation of the file each handed-out range was read in.
+    generations: continuity::Generations,
 }
 
 pub struct FileSource {
@@ -243,7 +245,9 @@ impl FileSource {
         if let Some(why) = discontinuity {
             tracing::warn!(path, previous_read_byte = cursor.read_byte, "{why}");
             cursor.committed_byte = 0;
+            cursor.generations.discontinuity();
         }
+        cursor.generations.issue(start, end);
         cursor.read_byte = end;
         // What the read ACTUALLY observed, not what a stat saw before it: the
         // file can grow between the two, and recording the earlier identity
@@ -866,6 +870,7 @@ impl SourceAdapter for FileSource {
     async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
         let ProgressMarker::File {
             path,
+            start_byte,
             end_byte,
             inode: marker_inode,
             ..
@@ -881,8 +886,16 @@ impl SourceAdapter for FileSource {
         // read. The batch is archived and its ledger row commits; only the
         // cursor stays put (#558).
         let (current_inode, current_size, _) = Self::file_identity(Path::new(path));
-        let still_current =
-            continuity::commit_is_current(*marker_inode, current_inode, current_size, *end_byte);
+        // The length test cannot see a truncation that has since regrown past
+        // this range; the record of which generation it was read in can.
+        let generation = self
+            .cursors
+            .entry(path.clone())
+            .or_default()
+            .generations
+            .settle(*start_byte, *end_byte);
+        let still_current = generation != continuity::Settled::Stale
+            && continuity::commit_is_current(*marker_inode, current_inode, current_size, *end_byte);
         if still_current {
             let c = self.cursors.entry(path.clone()).or_default();
             c.committed_byte = *end_byte;
@@ -977,6 +990,8 @@ impl SourceAdapter for FileSource {
         }
         let c = self.cursors.entry(path.clone()).or_default();
         c.read_byte = (*start_byte).max(c.committed_byte);
+        // These bytes will be handed out again, with fresh records.
+        c.generations.reissue_from(c.read_byte);
         tracing::warn!(
             path,
             read_byte = c.read_byte,
@@ -1589,6 +1604,7 @@ mod tests {
             read_byte: 7,
             committed_byte: 7,
             seen: Some(identity.clone()),
+            ..FileCursor::default()
         };
         assert!(
             !FileSource::can_skip(&cursor, &identity),
@@ -2085,6 +2101,58 @@ mod tests {
             "all of the new content, not the tail after byte 12"
         );
         assert_eq!(after[0].records[0], b"new-0".to_vec());
+    }
+
+    /// A `copytruncate`d file that has REGROWN past an old range's end looks,
+    /// by inode and length, exactly as it did when that range was read. The
+    /// batch read before the truncation then finishes uploading, and a commit
+    /// judged by the file as it is now carries the restarted cursor to the old
+    /// offset, skipping the bytes in between (review of #564). The record of
+    /// which generation each range was read in catches it.
+    #[tokio::test]
+    async fn a_pre_truncation_commit_cannot_move_the_cursor_after_the_file_regrows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let old: String = (0..10).map(|i| format!("old-{i}\n")).collect(); // 60 bytes
+        std::fs::write(&path, &old).unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let old_end = first[0].progress_end.clone();
+
+        // Truncated in place and rewritten: the cursor restarts at byte 0.
+        let fresh: String = (0..5).map(|i| format!("new-{i}\n")).collect(); // 30 bytes
+        std::fs::write(&path, &fresh).unwrap();
+        let second = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(second[0].records.len(), 5);
+
+        // The file regrows to MORE than the old range's end before the old
+        // batch's commit lands: by inode and length it now looks current.
+        let more: String = (5..12).map(|i| format!("new-{i}\n")).collect(); // +42 bytes
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(more.as_bytes())
+            .unwrap();
+        fs.commit_progress(&old_end).await.unwrap();
+
+        let third = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            third[0].records.len(),
+            7,
+            "the bytes appended since the restart are read; the stale commit \
+             must not have moved the cursor to byte 60 and skipped them"
+        );
+        assert_eq!(third[0].records[0], b"new-5".to_vec());
     }
 
     /// `delete_after_commit` removes a source file once a batch reaching its

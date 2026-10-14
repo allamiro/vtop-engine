@@ -346,20 +346,25 @@ impl StateStore for SqliteStateStore {
     ) -> Result<Vec<CommittedCursor>, VtopError> {
         // Aggregated in SQL (#77): the inode of the newest committed row per
         // path, joined to the MAX(end_byte) over that inode's rows. The inode
-        // is read as TEXT and parsed here: a u64 above i64::MAX would come back
-        // from json_extract as a lossy REAL, and an unparseable value must
-        // read as "unknown", not as a wrong identity.
+        // is read as the JSON token (`->`) and parsed here: `json_extract`
+        // turns a u64 above i64::MAX into a lossy REAL, and an unparseable
+        // value must read as "unknown", not as a wrong identity.
+        //
+        // "Newest" is the batch CREATED last - the order the windows were read
+        // - not the one whose state changed last: recovery can commit an older
+        // VERIFIED window after a newer one, and ordering by `updated_at` would
+        // then name the older file as the restart cursor (review of #564).
         let rows = sqlx::query(
             "WITH committed AS ( \
                  SELECT json_extract(progress_end_json, '$.path') AS path, \
-                        CAST(json_extract(progress_end_json, '$.inode') AS TEXT) AS inode, \
+                        CAST(progress_end_json -> '$.inode' AS TEXT) AS inode, \
                         CAST(json_extract(progress_end_json, '$.end_byte') AS INTEGER) AS end_byte, \
                         CAST(json_extract(progress_end_json, '$.file_size') AS INTEGER) AS file_size, \
-                        updated_at, batch_id \
+                        created_at, batch_id \
                  FROM batches WHERE state = ? AND source_type = ? \
              ), latest AS ( \
                  SELECT path, inode, file_size, ROW_NUMBER() OVER ( \
-                            PARTITION BY path ORDER BY updated_at DESC, batch_id DESC) AS rn \
+                            PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ), per_inode AS ( \
                  SELECT path, inode, MAX(end_byte) AS end_byte \
