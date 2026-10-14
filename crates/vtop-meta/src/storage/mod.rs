@@ -95,6 +95,7 @@ pub(crate) fn is_newer_format(error: &CodecError) -> bool {
         error,
         CodecError::UnknownTag {
             what: "command kind"
+                | "log entry kind"
                 | "record value tag"
                 | "meta key category"
                 | "snapshot payload version",

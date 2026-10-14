@@ -166,8 +166,11 @@ reopen quietly.
   old voters unable to append anything more, and an old node restarted on the
   newer log called it corrupt. Now each command kind carries a **feature
   level** (the release that introduced it), and the cluster's level lives in
-  replicated state (absent means v0.6.0's level). The leader refuses, before
-  replication, any command above the cluster's level, saying how to proceed;
+  replicated state (absent means v0.6.0's level). Every node refuses, before
+  replication, any command above the level it has applied - a leader with a
+  reason saying how to proceed, a follower by sending the caller to the
+  leader - except the level-setting command itself, which is how the level
+  rises;
   `vtopctl meta enable-features --level N` raises it - monotonically, never
   down - once every voter runs a release that knows N. A checksum-valid entry
   or record of an unknown kind is reported as written by a newer release, not

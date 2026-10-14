@@ -180,17 +180,24 @@ fn tracing_peer_error(peer: SocketAddr, error: TransportError) {
     // fail without a word while the leader saw only an unreachable peer. It
     // is said on stderr, at most once per interval - the leader retries
     // continuously.
-    let newer = match &error {
-        TransportError::Codec(codec) => crate::storage::is_newer_format(codec),
-        TransportError::BadVersion(_) => true,
-        _ => false,
-    };
-    if newer && peer_newer_warning_due() {
+    if from_newer_release(&error) && peer_newer_warning_due() {
         eprintln!(
             "metadata peer {peer} sent a frame this build cannot decode ({error}): it runs a \
              newer release. This voter can append nothing more until it is upgraded too; \
              finish the rollout of the metadata tier"
         );
+    }
+}
+
+/// Whether a peer error is the signature of a NEWER release: a checksum-valid
+/// frame of a kind or tag this build does not know, or a higher frame
+/// version. Only a higher version qualifies - a lower or garbage one is not
+/// something an upgrade fixes (review).
+fn from_newer_release(error: &TransportError) -> bool {
+    match error {
+        TransportError::Codec(codec) => crate::storage::is_newer_format(codec),
+        TransportError::BadVersion(version) => *version > super::wire::VTPM_VERSION,
+        _ => false,
     }
 }
 
@@ -492,6 +499,24 @@ mod tests {
     use std::time::Duration;
 
     struct EchoHandler;
+
+    /// #554: what the newer-release warning fires on. An unknown log
+    /// entry kind and a higher frame version are a newer peer; a lower
+    /// version, or an unknown tag that is not a kind a newer release adds,
+    /// is not (review).
+    #[test]
+    fn only_a_newer_peers_frames_are_called_newer() {
+        use crate::wire::CodecError;
+        let unknown = |what| TransportError::Codec(CodecError::UnknownTag { what, tag: 99 });
+        assert!(from_newer_release(&unknown("log entry kind")));
+        assert!(from_newer_release(&unknown("command kind")));
+        assert!(!from_newer_release(&unknown("append response kind")));
+        assert!(from_newer_release(&TransportError::BadVersion(
+            super::super::wire::VTPM_VERSION + 1
+        )));
+        assert!(!from_newer_release(&TransportError::BadVersion(0)));
+        assert!(!from_newer_release(&TransportError::ChecksumMismatch));
+    }
 
     #[async_trait]
     impl PeerRpcHandler for EchoHandler {

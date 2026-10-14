@@ -831,11 +831,18 @@ Short procedures now; expand into a full ops runbook before go-live.
   cursors → validate → keep the old store until validation passes.
 - **Prune the PostgreSQL ledger:** run `vtopctl prune-ledger --older-than-days N`
   on a schedule under the maintenance identity (§6.6).
-- **Upgrade the metadata tier (#554):** roll the voters one at a time - the
-  chart's `RollingUpdate` with the tier's PodDisruptionBudget (`maxUnavailable:
-  1`) does exactly this - waiting for each to be ready and caught up before
-  the next. Upgrade from the immediately preceding release only, and never
-  downgrade. Mixed releases are safe while they run: the leader refuses any
+- **Upgrade the metadata tier (#554):** roll the voters one at a time, and
+  confirm each has CAUGHT UP before the next. The chart's `RollingUpdate`
+  replaces one pod at a time, but it waits only for `/readyz`, which on a
+  metadata pod says its listeners are bound, not that the voter has caught
+  up; and a PodDisruptionBudget limits evictions, not the StatefulSet's own
+  rollout. So step it: set `spec.updateStrategy.rollingUpdate.partition` to
+  the replica count, upgrade the release, then lower the partition one
+  ordinal at a time (`kubectl patch statefulset <meta> -p
+  '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":N}}}}'`), and
+  before each step check with `vtopctl meta status` against the replaced
+  voter that its `last_applied` index has reached the leader's. Upgrade from
+  the immediately preceding release only, and never downgrade. Mixed releases are safe while they run: the leader refuses any
   command kind above the cluster's metadata feature level, so nothing an
   older voter cannot decode enters the log. Once EVERY voter runs the new
   release, run `vtopctl meta enable-features --level N` for the level the

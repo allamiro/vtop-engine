@@ -50,18 +50,25 @@ commit_write() { # <label> <uuid-suffix (2 hex)>
     || fail "$label: a write did not commit within ${PROGRESS_TIMEOUT_SECONDS}s (leader $leader): the tier stopped committing"
 }
 
-applied_on() { # <node-id>
-  meta_status_field "$1" "['last_applied']['index']"
+# A node's applied index, asked for within <seconds>: a status request a
+# stalled node never answers must not hold the loop past its deadline
+# (review), so the call is killed when its budget runs out.
+applied_on() { # <node-id> <seconds>
+  local budget=$(($2 > 0 ? $2 : 1))
+  timeout --kill-after=1 "$budget" \
+    "$VTOPCTL" --json meta status --config "$(emit_admin_config "$1")" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["last_applied"]["index"])'
 }
 
 # Every voter reaches the leader's applied index, within the progress deadline.
 await_converged() { # <label>
   local label="$1" target id deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
-  target="$(applied_on "$(wait_meta_leader 1 2 3)")"
+  target="$(applied_on "$(wait_meta_leader 1 2 3)" "$PROGRESS_TIMEOUT_SECONDS")" \
+    || fail "$label: the leader did not report its applied index"
   for id in 1 2 3; do
     while true; do
       local applied
-      applied="$(applied_on "$id" 2>/dev/null || echo 0)"
+      applied="$(applied_on "$id" $((deadline - SECONDS)) 2>/dev/null || echo 0)"
       [[ "$applied" -ge "$target" ]] && break
       [[ $SECONDS -lt $deadline ]] \
         || fail "$label: node $id applied $applied, the leader $target - a voter stopped appending"

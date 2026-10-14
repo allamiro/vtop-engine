@@ -713,18 +713,39 @@ pub trait AdminReadSegmentPlacement: Send + Sync {
 #[async_trait]
 impl Consensus for OpenraftConsensus {
     async fn propose(&self, command: MetadataCommand) -> ConsensusResult<CommitReceipt> {
-        // The feature gate (#554), judged by the leader against its applied
-        // state before the command is replicated. A follower lets
-        // `client_write` redirect as always; `SetFeatureLevel` is the one
-        // command not held back, because it is how the gate opens.
+        // The feature gate (#554), judged before the command is replicated.
+        // `SetFeatureLevel` is the one command not held back, because it is
+        // how the gate opens.
+        //
+        // Judged in EVERY role, not only the leader's (review): a role read
+        // before `client_write` is a race - a follower that skipped the gate
+        // can be elected before the write lands and append the command
+        // unchecked. What makes any role safe is that the level only rises,
+        // so every applied view is a lower bound on it: a view at or above
+        // `needed` proves the command enabled whoever this node is by the
+        // time it writes, and nothing short of that reaches `client_write`.
+        // Below it, a leader refuses; a follower, whose view may simply lag,
+        // sends the caller to the leader to be judged there.
         if !matches!(command, MetadataCommand::SetFeatureLevel { .. }) {
-            if let Some(store) = self.store.as_ref() {
-                if self.raft.metrics().borrow().state == ServerState::Leader {
-                    let enabled = store.with_storage(|storage| storage.state().feature_level());
-                    let needed = command.feature_level();
-                    if needed > enabled {
+            let needed = command.feature_level();
+            if needed > crate::command::BASELINE_FEATURE_LEVEL {
+                // A façade without applied state cannot see the level, and
+                // a gate it cannot judge is closed (review).
+                let Some(store) = self.store.as_ref() else {
+                    return Err(ConsensusError::Message(format!(
+                        "this node was built without applied state, so it cannot tell whether \
+                         feature level {needed} is enabled; the command is refused"
+                    )));
+                };
+                let enabled = store.with_storage(|storage| storage.state().feature_level());
+                if needed > enabled {
+                    let metrics = self.raft.metrics().borrow().clone();
+                    if metrics.state == ServerState::Leader {
                         return Err(ConsensusError::FeatureNotEnabled { needed, enabled });
                     }
+                    return Err(ConsensusError::NotLeader {
+                        leader: metrics.current_leader.map(MetaNodeId),
+                    });
                 }
             }
         }

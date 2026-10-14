@@ -18,8 +18,6 @@ use vtop_meta::{
 const ROOT: &str = "/meta";
 const SEED: u64 = 0x5eed_0093;
 
-/// The pinned SplitRange command (#473): request ...ee02, barrier 0x280,
-/// CAS 1, holder bbbbbbbb…31 at epoch 1.
 /// SetFeatureLevel (#554), derived by hand from the layout rather than taken
 /// from the encoder: kind 36, the envelope (request id, issued-at), the level.
 const GOLDEN_SET_FEATURE_LEVEL_HEX: &str = concat!(
@@ -44,6 +42,8 @@ const GOLDEN_SET_RANGE_REPLICA_SET_HEX: &str = concat!(
     "0000000000000003",                 // expected generation 3
 );
 
+/// The pinned SplitRange command (#473): request ...ee02, barrier 0x280,
+/// CAS 1, holder bbbbbbbb…31 at epoch 1.
 const GOLDEN_SPLIT_COMMAND_HEX: &str = concat!(
     "002300112233445566778899aabbccddee020102030405060708ffeeddccbbaa99887766",
     "5544332211000f1e2d3c4b5a69788796a5b4c3d2e1f0aaaaaaaa00000000000000000000",
