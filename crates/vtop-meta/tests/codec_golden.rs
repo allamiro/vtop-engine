@@ -29,6 +29,21 @@ const GOLDEN_SET_FEATURE_LEVEL_HEX: &str = concat!(
     "00000004",                         // feature level 4
 );
 
+/// SetRangeReplicaSet (#553), derived by hand from the layout: kind 37, the
+/// envelope, topic, range, the member count and members, the expected
+/// generation.
+const GOLDEN_SET_RANGE_REPLICA_SET_HEX: &str = concat!(
+    "0025",                             // kind 37
+    "00112233445566778899aabbccddee05", // request id
+    "0102030405060708",                 // issued_at_ms
+    "ffeeddccbbaa99887766554433221100", // topic
+    "0f1e2d3c4b5a69788796a5b4c3d2e1f0", // range
+    "0002",                             // two members
+    "bbbbbbbb000000000000000000000031", // member
+    "bbbbbbbb000000000000000000000032", // member
+    "0000000000000003",                 // expected generation 3
+);
+
 const GOLDEN_SPLIT_COMMAND_HEX: &str = concat!(
     "002300112233445566778899aabbccddee020102030405060708ffeeddccbbaa99887766",
     "5544332211000f1e2d3c4b5a69788796a5b4c3d2e1f0aaaaaaaa00000000000000000000",
@@ -266,6 +281,31 @@ fn set_feature_level_command_matches_golden_vector() {
     let encoded = command.encode().unwrap();
     assert_eq!(to_hex(&encoded), GOLDEN_SET_FEATURE_LEVEL_HEX);
     assert_eq!(MetadataCommand::decode(&encoded).unwrap(), command);
+}
+
+#[test]
+fn set_range_replica_set_command_matches_golden_vector() {
+    let command = MetadataCommand::SetRangeReplicaSet {
+        env: CommandEnvelope {
+            request_id: Uuid::parse_str("00112233-4455-6677-8899-aabbccddee05").unwrap(),
+            issued_at_ms: 0x0102_0304_0506_0708,
+        },
+        topic_uuid: Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap(),
+        range_uuid: Uuid::parse_str("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0").unwrap(),
+        members: vec![
+            Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000031").unwrap(),
+            Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000032").unwrap(),
+        ],
+        expected_generation: 3,
+    };
+    let encoded = command.encode().unwrap();
+    assert_eq!(to_hex(&encoded), GOLDEN_SET_RANGE_REPLICA_SET_HEX);
+    assert_eq!(MetadataCommand::decode(&encoded).unwrap(), command);
+    assert_eq!(
+        command.feature_level(),
+        5,
+        "gated: older voters cannot decode it"
+    );
 }
 
 #[test]

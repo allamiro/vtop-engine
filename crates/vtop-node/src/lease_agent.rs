@@ -87,6 +87,13 @@ pub trait QuorumProbe: Send + Sync {
     async fn probe(&self, fencing_epoch: u64) -> Vec<crate::promotion::ReplicaProbe>;
     /// The CONFIGURED replica-set size, not the number that answered.
     fn replication_factor(&self) -> usize;
+    /// The configured replica set, this node included, sorted: what the
+    /// quorum is counted over, checked against the set metadata recorded for
+    /// the range (#553). `None` when the probe cannot say, which a recorded
+    /// set refuses.
+    fn members(&self) -> Option<Vec<Uuid>> {
+        None
+    }
     /// The candidate's own sealed-prefix end at promotion, for the
     /// transition record (#240 item 5); `None` when unknown.
     fn sealed_prefix_end(&self) -> Option<u64> {
@@ -412,6 +419,14 @@ impl QuorumProbe for ReplicaPlaneProbe {
     fn replication_factor(&self) -> usize {
         // The leader plus its configured followers.
         self.followers.len() + 1
+    }
+
+    fn members(&self) -> Option<Vec<Uuid>> {
+        let mut members: Vec<Uuid> = std::iter::once(self.node_uuid)
+            .chain(self.followers.iter().map(|follower| follower.node_uuid))
+            .collect();
+        members.sort_unstable();
+        Some(members)
     }
 
     fn sealed_prefix_end(&self) -> Option<u64> {
@@ -989,6 +1004,10 @@ struct Promoter {
     /// read from metadata's transition chain before each verification
     /// (#449): the boundary established here must not fall below it.
     published_floor: Option<u64>,
+    /// The replica set metadata recorded for this range, read before each
+    /// verification (#553); `None` when none was ever recorded, and then the
+    /// configured set is counted as it always was.
+    recorded_replica_set: Option<Vec<Uuid>>,
 }
 
 impl Promoter {
@@ -997,6 +1016,45 @@ impl Promoter {
     async fn ensure(&mut self, fencing_epoch: u64) -> bool {
         if self.verified_epoch == Some(fencing_epoch) {
             return true;
+        }
+        // THE QUORUM IS COUNTED OVER THE RECORDED SET, OR NOT AT ALL (#553).
+        // A majority of this node's configured set proves nothing if the
+        // range's other replicas count a different set: grow 3 to 5 by
+        // rolling configs and a node on the new config can promote on 3 of
+        // {A..E} while one on the old config promotes on 2 of {A,B,C} - two
+        // majorities with no node in common, and records acknowledged under
+        // one overwritten by the other. Checked before anything is fenced:
+        // a candidate that may not count this quorum has no business
+        // stopping the replicas' logs to count it.
+        if let Some(recorded) = &self.recorded_replica_set {
+            let configured = match &self.probe {
+                Some(probe) => probe.members().map(|mut members| {
+                    members.sort_unstable();
+                    members
+                }),
+                // A standalone range's set is this node alone.
+                None => Some(vec![self.node_uuid]),
+            };
+            if configured.as_ref() != Some(recorded) {
+                tracing::warn!(
+                    range = %self.range_uuid,
+                    fencing_epoch,
+                    ?recorded,
+                    ?configured,
+                    "refusing promotion: this node's configured replica set is not the one \
+                     metadata recorded for the range (#553), so a majority of it need not \
+                     intersect the majority that acknowledged the range's records; standing \
+                     aside for a replica configured with the recorded set. Configure this node \
+                     with the recorded set, or change the record with `vtopctl meta \
+                     set-replica-set`"
+                );
+                // An eligibility verdict, not a quorum miss: retrying will
+                // not change this node's configuration, and a replica whose
+                // configuration matches can take the range.
+                self.stand_aside = true;
+                self.suspended(fencing_epoch);
+                return false;
+            }
         }
         let committed_offset = match self.probe.as_ref() {
             // A standalone range has no quorum to establish against and
@@ -1669,6 +1727,7 @@ impl LeaseAgent {
                 range_uuid,
                 stand_aside: false,
                 published_floor: None,
+                recorded_replica_set: None,
             },
             state: LeaseState::NotHeld,
             ready: None,
@@ -2392,6 +2451,22 @@ impl LeaseAgent {
         }
     }
 
+    /// The replica set metadata recorded for this range (#553), `None` when
+    /// none was ever recorded - or when the metadata node answering predates
+    /// the read, which cannot hold one (see `AdminClient::read_range_replica_set`).
+    async fn read_recorded_replica_set(&self) -> Result<Option<Vec<Uuid>>, String> {
+        let read = self
+            .bounded(
+                "read range replica set",
+                self.admin
+                    .read_range_replica_set(self.topic_uuid, self.range_uuid),
+            )
+            .await?;
+        Ok(read
+            .and_then(|response| response.replica_set)
+            .map(|set| set.members))
+    }
+
     async fn publish_held(&mut self, fencing_epoch: u64, held_until_ms: Option<i64>) -> Promoted {
         // The published watermark first (#449): read before a verification,
         // so the boundary about to be established is held to it. A floor
@@ -2408,6 +2483,26 @@ impl LeaseAgent {
                         %error,
                         "refusing promotion this round: the published watermark could not be \
                          read from metadata, so the boundary cannot be held to it (#449)"
+                    );
+                    self.promoter.suspended(fencing_epoch);
+                    self.state = LeaseState::NotHeld;
+                    self.held_until_ms = None;
+                    return Promoted::QuorumMissed;
+                }
+            }
+            // The recorded replica set the same way (#553): a set that
+            // cannot be read is not "none recorded", or a metadata outage
+            // would be the one moment a node counts a set the range left.
+            match self.read_recorded_replica_set().await {
+                Ok(set) => self.promoter.recorded_replica_set = set,
+                Err(error) => {
+                    tracing::warn!(
+                        range = %self.range_uuid,
+                        fencing_epoch,
+                        %error,
+                        "refusing promotion this round: the range's recorded replica set could \
+                         not be read from metadata, so this node cannot tell whether its \
+                         configured set is the one the quorum is counted over (#553)"
                     );
                     self.promoter.suspended(fencing_epoch);
                     self.state = LeaseState::NotHeld;
@@ -3502,6 +3597,7 @@ mod tests {
             node_uuid: Uuid::from_u128(1),
             range_uuid: Uuid::from_u128(21),
             published_floor: None,
+            recorded_replica_set: None,
         }
     }
 
@@ -3565,6 +3661,7 @@ mod tests {
     struct FixedProbe {
         probes: std::sync::Mutex<Vec<crate::promotion::ReplicaProbe>>,
         factor: usize,
+        members: Option<Vec<Uuid>>,
         calls: std::sync::atomic::AtomicUsize,
         /// Every epoch the probe was asked to fence at, in order. A probe taken
         /// at the wrong epoch would fence nothing that matters, so the value
@@ -3582,15 +3679,120 @@ mod tests {
         fn replication_factor(&self) -> usize {
             self.factor
         }
+        fn members(&self) -> Option<Vec<Uuid>> {
+            self.members.clone()
+        }
     }
 
     fn fixed(probes: Vec<crate::promotion::ReplicaProbe>, factor: usize) -> Arc<FixedProbe> {
         Arc::new(FixedProbe {
             probes: std::sync::Mutex::new(probes),
             factor,
+            members: None,
             calls: std::sync::atomic::AtomicUsize::new(0),
             fenced_at: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// A probe configured with `members` (`u128`s, this node is 1).
+    fn configured(
+        probes: Vec<crate::promotion::ReplicaProbe>,
+        members: &[u128],
+    ) -> Arc<FixedProbe> {
+        Arc::new(FixedProbe {
+            probes: std::sync::Mutex::new(probes),
+            factor: members.len(),
+            members: Some(members.iter().copied().map(Uuid::from_u128).collect()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fenced_at: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn uuids(nodes: &[u128]) -> Vec<Uuid> {
+        nodes.iter().copied().map(Uuid::from_u128).collect()
+    }
+
+    /// #553, the scenario itself: the range's set is recorded as {1,2,3},
+    /// and node 1 has been reconfigured for five replicas ahead of the
+    /// record. {1,4,5} answering is a majority of what node 1 is configured
+    /// with, and shares no node with {2,3}, a majority of the recorded set
+    /// that may hold acknowledged records node 1's quorum never saw. It must
+    /// refuse before fencing anyone, stand aside, and report nothing (the
+    /// epoch stays Pending: granted, never served under).
+    #[tokio::test]
+    async fn a_candidate_configured_off_the_recorded_replica_set_refuses_to_promote() {
+        let recorder = Arc::new(Recorder::default());
+        let probe = configured(
+            vec![at(1, Some(50)), at(4, Some(50)), at(5, Some(50))],
+            &[1, 2, 3, 4, 5],
+        );
+        let mut verifier = promoter(recorder.clone(), Some(probe.clone()));
+        verifier.recorded_replica_set = Some(uuids(&[1, 2, 3]));
+        assert!(!verifier.ensure(7).await);
+        assert!(verifier.take_stand_aside(), "an eligibility verdict");
+        assert!(!verifier.take_quorum_miss(), "not a quorum miss");
+        assert_eq!(
+            probe.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no replica is fenced to count a quorum this node may not count"
+        );
+        assert_eq!(recorder.suspended.lock().unwrap().as_slice(), &[7]);
+        assert!(recorder.promoted.lock().unwrap().is_empty());
+        assert_eq!(recorder.last_reported(), None);
+
+        // Configured with the recorded set (in any order), the same node
+        // promotes.
+        let probe = configured(
+            vec![at(1, Some(50)), at(2, Some(50)), at(3, Some(40))],
+            &[3, 1, 2],
+        );
+        let mut verifier = promoter(recorder.clone(), Some(probe));
+        verifier.recorded_replica_set = Some(uuids(&[1, 2, 3]));
+        assert!(verifier.ensure(8).await);
+        assert_eq!(
+            recorder.promoted.lock().unwrap().last(),
+            Some(&(8, Some(50)))
+        );
+    }
+
+    /// Without a recorded set, the configured set is counted as before
+    /// #553; a probe that cannot name its set is refused only once a set
+    /// is recorded; and a standalone range's set is the node alone.
+    #[tokio::test]
+    async fn the_recorded_replica_set_check_covers_unrecorded_unnamed_and_standalone_ranges() {
+        let recorder = Arc::new(Recorder::default());
+        let probe = configured(
+            vec![at(1, Some(10)), at(2, Some(10)), at(3, Some(10))],
+            &[1, 2, 3],
+        );
+        let mut verifier = promoter(recorder.clone(), Some(probe));
+        assert!(verifier.ensure(1).await, "no record: counted as configured");
+
+        let unnamed = fixed(vec![at(1, Some(10)), at(2, Some(10)), at(3, Some(10))], 3);
+        let mut verifier = promoter(recorder.clone(), Some(unnamed.clone()));
+        assert!(
+            verifier.ensure(2).await,
+            "no record: a probe need not name its set"
+        );
+        let mut verifier = promoter(recorder.clone(), Some(unnamed));
+        verifier.recorded_replica_set = Some(uuids(&[1, 2, 3]));
+        assert!(
+            !verifier.ensure(3).await,
+            "a set it cannot name is not the recorded one"
+        );
+
+        let mut standalone = promoter(recorder.clone(), None);
+        standalone.recorded_replica_set = Some(uuids(&[1]));
+        assert!(
+            standalone.ensure(4).await,
+            "a standalone range recorded as itself"
+        );
+        let mut standalone = promoter(recorder.clone(), None);
+        standalone.recorded_replica_set = Some(uuids(&[1, 2, 3]));
+        assert!(
+            !standalone.ensure(5).await,
+            "a node configured standalone may not lead a range recorded with replicas"
+        );
     }
 
     fn at(node: u128, offset: Option<u64>) -> crate::promotion::ReplicaProbe {

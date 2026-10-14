@@ -176,6 +176,23 @@ reopen quietly.
   previous release to this one, one at a time, requiring a commit through the
   mixed tier and every voter to converge at each step, then raises the level
   and restarts a voter on it; CI runs it against the newest release tag.
+- **#553** - a range's quorum was sized from each data node's own
+  configuration (`followers` + 1), and metadata held no member set, so
+  growing a set by rolling configs could leave two nodes counting majorities
+  of different sets with no node in common: from {A,B,C} to {A..E}, a node
+  on the new config could promote on {A,D,E} over records acknowledged on
+  {B,C}. Metadata now records a range's replica set (`vtopctl meta
+  set-replica-set`, feature level 5), and a candidate whose configured set
+  differs refuses to promote and stands aside. A change adds or removes ONE
+  member - consecutive sets' majorities then always intersect - clears the
+  lease so the range is re-won under the new set, and is refused until a
+  promotion under the set it replaces shows, from its recorded quorum, the
+  leader's whole log on a majority of that set: the election restriction
+  makes the new leader hold everything acknowledged under the set before,
+  but promotion truncates nothing and the part above the boundary may still
+  sit on that older majority alone. A range with no record behaves as
+  before, and a metadata node that predates the read reads as "none
+  recorded", so data nodes may be upgraded ahead of the metadata tier.
 
 One observation rode along without becoming a fix: scenario 09 once left a
 promotion unacquired within its deadline (#318). The flake has not recurred —

@@ -11,14 +11,15 @@ use super::wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
     AdminInitRequest, AdminMembershipResponse, AdminProposeRequest, AdminProposeResponse,
     AdminReadGroupCursorRequest, AdminReadGroupCursorResponse, AdminReadRangeLeaseRequest,
-    AdminReadRangeLeaseResponse, AdminReadRangeTransitionsRequest,
-    AdminReadRangeTransitionsResponse, AdminReadSegmentPlacementRequest,
-    AdminReadSegmentPlacementResponse, AdminStatusRequest, AdminStatusResponse, NotLeaderHint,
-    TransportError, TransportResult, VtpmFrame, KIND_ADMIN_ADD_LEARNER_REQ,
-    KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR, KIND_ADMIN_INIT_REQ,
-    KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ, KIND_ADMIN_PROPOSE_RESP,
-    KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+    AdminReadRangeLeaseResponse, AdminReadRangeReplicaSetRequest, AdminReadRangeReplicaSetResponse,
+    AdminReadRangeTransitionsRequest, AdminReadRangeTransitionsResponse,
+    AdminReadSegmentPlacementRequest, AdminReadSegmentPlacementResponse, AdminStatusRequest,
+    AdminStatusResponse, NotLeaderHint, TransportError, TransportResult, VtpmFrame,
+    KIND_ADMIN_ADD_LEARNER_REQ, KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR,
+    KIND_ADMIN_INIT_REQ, KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ,
+    KIND_ADMIN_PROPOSE_RESP, KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
     KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP,
+    KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ, KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP,
     KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ, KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP,
     KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ, KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP,
     KIND_ADMIN_STATUS_REQ, KIND_ADMIN_STATUS_RESP,
@@ -82,6 +83,16 @@ pub trait AdminHandler: Send + Sync {
     ) -> TransportResult<AdminReadGroupCursorResponse> {
         Err(TransportError::Protocol(
             "this admin handler does not serve group cursor reads".to_owned(),
+        ))
+    }
+    /// Linearizable read of a range's recorded replica set (#553). Defaulted
+    /// to a refusal, as the transition read is.
+    async fn read_range_replica_set(
+        &self,
+        _request: AdminReadRangeReplicaSetRequest,
+    ) -> TransportResult<AdminReadRangeReplicaSetResponse> {
+        Err(TransportError::Protocol(
+            "this admin handler does not serve replica set reads".to_owned(),
         ))
     }
 }
@@ -302,6 +313,12 @@ async fn serve_admin_connection(
     }
 }
 
+/// What a metadata node that predates the replica-set read answers it with:
+/// its dispatcher's unknown-kind refusal, from the same Display.
+fn predates_replica_set_read() -> String {
+    TransportError::UnexpectedKind(KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ).to_string()
+}
+
 fn truncate_error(message: &str) -> String {
     let max = crate::command::MAX_ERROR_DETAIL_BYTES;
     if message.len() <= max {
@@ -387,6 +404,17 @@ async fn dispatch_admin(
             let response = handler.read_group_cursor(request).await?;
             Ok(VtpmFrame {
                 kind: KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+                payload: response.encode()?,
+            })
+        }
+        KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ => {
+            let request = AdminReadRangeReplicaSetRequest::decode(&frame.payload)?;
+            // A read, like the others: which nodes a range's quorum is
+            // counted over is for anybody entitled to look at the cluster.
+            authorize(authorizer.authorize_read(identity))?;
+            let response = handler.read_range_replica_set(request).await?;
+            Ok(VtpmFrame {
+                kind: KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP,
                 payload: response.encode()?,
             })
         }
@@ -789,6 +817,45 @@ impl AdminClient {
             }
             KIND_ADMIN_ERROR => {
                 let error = AdminError::decode(&frame.payload)?;
+                Err(TransportError::Protocol(error.message))
+            }
+            other => Err(TransportError::UnexpectedKind(other)),
+        }
+    }
+
+    /// Linearizable read of a range's recorded replica set (#553).
+    ///
+    /// `Ok(None)` when the metadata node answering PREDATES the read: it
+    /// refuses the request kind itself, before any leadership check, so the
+    /// refusal is unambiguous. Such a node cannot hold a recorded set - a
+    /// set is recorded only at feature level 5, which an older node cannot
+    /// apply and which is raised only once every voter runs a release that
+    /// serves this read (#554) - so to the caller it means "none recorded",
+    /// which keeps a data node upgraded ahead of its metadata tier leadable.
+    pub async fn read_range_replica_set(
+        &self,
+        topic_uuid: uuid::Uuid,
+        range_uuid: uuid::Uuid,
+    ) -> TransportResult<Option<AdminReadRangeReplicaSetResponse>> {
+        let frame = self
+            .round_trip(VtpmFrame {
+                kind: KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ,
+                payload: AdminReadRangeReplicaSetRequest {
+                    topic_uuid,
+                    range_uuid,
+                }
+                .encode(),
+            })
+            .await?;
+        match frame.kind {
+            KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP => Ok(Some(
+                AdminReadRangeReplicaSetResponse::decode(&frame.payload)?,
+            )),
+            KIND_ADMIN_ERROR => {
+                let error = AdminError::decode(&frame.payload)?;
+                if error.message == predates_replica_set_read() {
+                    return Ok(None);
+                }
                 Err(TransportError::Protocol(error.message))
             }
             other => Err(TransportError::UnexpectedKind(other)),
@@ -1246,6 +1313,16 @@ mod tests {
     /// error — an error could equally come from a handler that ran and then
     /// failed. It is that the handler is never entered at all, which is the
     /// difference between a gate and a warning.
+    /// The refusal a metadata node that predates the replica-set read sends
+    /// for it (#553), pinned to the bytes released servers emit: their
+    /// dispatcher answers an unknown request kind with this Display, and a
+    /// client that stopped recognizing it would read an older tier as an
+    /// error and leave every range unleadable mid-upgrade.
+    #[test]
+    fn an_older_servers_refusal_of_the_replica_set_read_is_recognized() {
+        assert_eq!(predates_replica_set_read(), "unexpected response kind 27");
+    }
+
     #[derive(Default)]
     struct CountingHandler {
         proposals: AtomicUsize,
@@ -1408,6 +1485,75 @@ mod tests {
         client.propose(acquire(NODE_A)).await.unwrap_err();
         assert_eq!(handler.proposals.load(Ordering::SeqCst), 1);
 
+        task.abort();
+    }
+
+    /// #553 across a mixed upgrade: a metadata node that predates the
+    /// replica-set read answers it with its unknown-kind refusal, and the
+    /// client reads that as "none recorded" - so a data node upgraded ahead
+    /// of its metadata tier still promotes. A CURRENT server that does not
+    /// serve the read is an error, never "none": only the old refusal means
+    /// a set cannot have been recorded.
+    #[tokio::test]
+    async fn an_older_metadata_node_reads_as_no_recorded_replica_set() {
+        let plaintext_client = |endpoint| {
+            AdminClient::plaintext(vec![AdminCandidate {
+                node_id: Some(MetaNodeId(1)),
+                endpoint,
+                host: None,
+                server_name: String::new(),
+                plaintext: true,
+            }])
+            .unwrap()
+        };
+
+        // The old server: its dispatcher's answer to a kind it does not know,
+        // built the way a released server builds it.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let old = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_frame(&mut stream).await.unwrap();
+            let refusal = AdminError {
+                message: TransportError::UnexpectedKind(request.kind).to_string(),
+                not_leader: None,
+            };
+            write_frame(
+                &mut stream,
+                &VtpmFrame {
+                    kind: KIND_ADMIN_ERROR,
+                    payload: refusal.encode().unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let read = plaintext_client(old)
+            .read_range_replica_set(Uuid::from_u128(1), Uuid::from_u128(2))
+            .await
+            .expect("an older server's refusal is an answer, not an error");
+        assert_eq!(read, None);
+        task.await.unwrap();
+
+        // A current server whose handler does not serve the read.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let current = listener.local_addr().unwrap();
+        let server = AdminServer::plaintext(
+            Arc::new(CountingHandler::default()) as Arc<dyn AdminHandler>,
+            AdminAuthorizer::permissive(),
+        )
+        .unwrap();
+        let task = tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let refused = plaintext_client(current)
+            .read_range_replica_set(Uuid::from_u128(1), Uuid::from_u128(2))
+            .await;
+        assert!(
+            matches!(&refused, Err(TransportError::Protocol(message)) if message.contains("does not serve replica set reads")),
+            "{refused:?}"
+        );
         task.abort();
     }
 

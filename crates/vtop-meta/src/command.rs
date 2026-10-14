@@ -94,6 +94,7 @@ const COMMAND_KIND_COMMIT_GROUP_CURSOR_COORDINATED: u16 = 33;
 const COMMAND_KIND_ENSURE_GROUP_MEMBER_COORDINATED: u16 = 34;
 const COMMAND_KIND_SPLIT_RANGE: u16 = 35;
 const COMMAND_KIND_SET_FEATURE_LEVEL: u16 = 36;
+const COMMAND_KIND_SET_RANGE_REPLICA_SET: u16 = 37;
 
 /// The metadata feature level of a cluster that has never recorded one: the
 /// command set of v0.6.0, the last release before levels existed (#554).
@@ -115,7 +116,7 @@ pub const BASELINE_FEATURE_LEVEL: u32 = 3;
 /// behaviour on the recorded level, so every replica applies the same
 /// thing). `every_kind_newer_than_the_baseline_release_is_gated` catches a
 /// kind that forgets; the other two are on the author.
-pub const SUPPORTED_FEATURE_LEVEL: u32 = 4;
+pub const SUPPORTED_FEATURE_LEVEL: u32 = 5;
 
 /// Why a fenced cursor commit is refused (#457 slice 2b): the commit did not
 /// come from the range's current leaseholder at its current fencing epoch. A
@@ -895,6 +896,26 @@ pub enum MetadataCommand {
         env: CommandEnvelope,
         feature_level: u32,
     },
+    /// Record the replica set a range's quorum is counted over (#553).
+    ///
+    /// Each data node used to size its quorum from its own configuration, so
+    /// growing a set by rolling nodes could leave a node counting a majority
+    /// of a set the others never shared - two majorities with no node in
+    /// common, and acknowledged records overwritten. With a recorded set, a
+    /// candidate whose configured set differs refuses to promote. A change
+    /// adds or removes exactly ONE member (consecutive sets' majorities then
+    /// always intersect), clears the range's lease so it is re-won under the
+    /// new set, and is refused until a promotion under the set it replaces
+    /// shows the leader's whole log on a majority of that set (see
+    /// `MetaStateMachine::established_under`). CAS'd on the record's
+    /// generation (0: none yet).
+    SetRangeReplicaSet {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        members: Vec<Uuid>,
+        expected_generation: u64,
+    },
 }
 
 impl MetadataCommand {
@@ -911,6 +932,8 @@ impl MetadataCommand {
             | MetadataCommand::EnsureGroupMemberCoordinated { .. } => 3,
             // After v0.6.0: the split (#473) and the gate itself.
             MetadataCommand::SplitRange { .. } | MetadataCommand::SetFeatureLevel { .. } => 4,
+            // The recorded replica set (#553).
+            MetadataCommand::SetRangeReplicaSet { .. } => 5,
             // Everything v0.4.0 already knew.
             _ => 1,
         }
@@ -953,7 +976,8 @@ impl MetadataCommand {
             | MetadataCommand::PlanRetention { env, .. }
             | MetadataCommand::ConfirmRetentionExpired { env, .. }
             | MetadataCommand::CancelRetention { env, .. }
-            | MetadataCommand::SetFeatureLevel { env, .. } => env,
+            | MetadataCommand::SetFeatureLevel { env, .. }
+            | MetadataCommand::SetRangeReplicaSet { env, .. } => env,
         }
     }
 
@@ -1098,6 +1122,20 @@ impl MetadataCommand {
                 put_u16(&mut out, COMMAND_KIND_SET_FEATURE_LEVEL);
                 encode_envelope(&mut out, env);
                 put_u32(&mut out, *feature_level);
+            }
+            MetadataCommand::SetRangeReplicaSet {
+                env,
+                topic_uuid,
+                range_uuid,
+                members,
+                expected_generation,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_SET_RANGE_REPLICA_SET);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                encode_uuid_list(&mut out, members, MAX_REPLICAS, "replica set members")?;
+                put_u64(&mut out, *expected_generation);
             }
             MetadataCommand::RegisterSealedSegment {
                 env,
@@ -1735,6 +1773,13 @@ impl MetadataCommand {
             COMMAND_KIND_SET_FEATURE_LEVEL => Ok(MetadataCommand::SetFeatureLevel {
                 env: decode_envelope(reader)?,
                 feature_level: reader.u32("feature level")?,
+            }),
+            COMMAND_KIND_SET_RANGE_REPLICA_SET => Ok(MetadataCommand::SetRangeReplicaSet {
+                env: decode_envelope(reader)?,
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                members: decode_uuid_list(reader, MAX_REPLICAS, "replica set members")?,
+                expected_generation: reader.u64("expected replica set generation")?,
             }),
             COMMAND_KIND_REGISTER_SEALED_SEGMENT => Ok(MetadataCommand::RegisterSealedSegment {
                 env: decode_envelope(reader)?,
@@ -2801,6 +2846,17 @@ mod tests {
             MetadataCommand::SetFeatureLevel {
                 env: envelope(36),
                 feature_level: SUPPORTED_FEATURE_LEVEL,
+            },
+            MetadataCommand::SetRangeReplicaSet {
+                env: envelope(37),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                members: vec![
+                    Uuid::from_u128(10),
+                    Uuid::from_u128(11),
+                    Uuid::from_u128(12),
+                ],
+                expected_generation: 0,
             },
             MetadataCommand::AcquireRangeLease {
                 env: envelope(31),

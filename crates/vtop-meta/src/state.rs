@@ -69,6 +69,23 @@ const VALUE_TAG_LINEAGE_TRANSITION: u8 = 21;
 /// raises the feature level, so a cluster that never does carries no record
 /// a v0.6 node cannot read.
 const VALUE_TAG_CLUSTER_CONFIG: u8 = 22;
+/// A range's recorded replica set (#553); written only by a command gated at
+/// feature level 5, so a cluster that never records one carries no tag an
+/// older node cannot read.
+const VALUE_TAG_RANGE_REPLICA_SET: u8 = 23;
+
+/// The replica set a range's quorum is counted over (#553).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeReplicaSetRecord {
+    /// Bumped by every change; the next change names it.
+    pub generation: u64,
+    /// Sorted, distinct.
+    pub members: Vec<Uuid>,
+    /// The range's fencing epoch when this set was recorded. The change
+    /// cleared the lease, so the next grant is above it: a promotion
+    /// established at a later epoch was proven under this set.
+    pub recorded_at_epoch: u64,
+}
 
 /// The durable cluster configuration (#554): today, the metadata feature
 /// level the cluster runs at. Absent means
@@ -519,6 +536,7 @@ pub enum MetaValue {
     RangeTransition(RangeTransitionRecord),
     LineageTransition(LineageTransitionRecord),
     ClusterConfig(ClusterConfigRecord),
+    RangeReplicaSet(RangeReplicaSetRecord),
 }
 
 impl MetaValue {
@@ -820,6 +838,12 @@ impl MetaValue {
             MetaValue::ClusterConfig(config) => {
                 put_u8(&mut out, VALUE_TAG_CLUSTER_CONFIG);
                 put_u32(&mut out, config.feature_level);
+            }
+            MetaValue::RangeReplicaSet(set) => {
+                put_u8(&mut out, VALUE_TAG_RANGE_REPLICA_SET);
+                put_u64(&mut out, set.generation);
+                put_u64(&mut out, set.recorded_at_epoch);
+                encode_replica_nodes(&mut out, &set.members)?;
             }
         }
         Ok(out)
@@ -1178,6 +1202,11 @@ impl MetaValue {
             VALUE_TAG_CLUSTER_CONFIG => MetaValue::ClusterConfig(ClusterConfigRecord {
                 feature_level: reader.u32("feature level")?,
             }),
+            VALUE_TAG_RANGE_REPLICA_SET => MetaValue::RangeReplicaSet(RangeReplicaSetRecord {
+                generation: reader.u64("replica set generation")?,
+                recorded_at_epoch: reader.u64("replica set recorded-at epoch")?,
+                members: decode_replica_nodes(&mut reader)?,
+            }),
             other => {
                 return Err(CodecError::UnknownTag {
                     what: "record value tag",
@@ -1217,6 +1246,202 @@ impl MetaStateMachine {
             Some(MetaValue::ClusterConfig(config)) => config.feature_level,
             _ => crate::command::BASELINE_FEATURE_LEVEL,
         }
+    }
+
+    /// The range's recorded replica set, if one was ever recorded (#553).
+    pub fn range_replica_set(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> Option<&RangeReplicaSetRecord> {
+        match self.record(&MetaKey::RangeReplicaSet {
+            topic_uuid,
+            range_uuid,
+        }) {
+            Some(MetaValue::RangeReplicaSet(set)) => Some(set),
+            _ => None,
+        }
+    }
+
+    fn set_range_replica_set(
+        &mut self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        members: &[Uuid],
+        expected_generation: u64,
+    ) -> MetadataResponse {
+        let range_key = MetaKey::Range {
+            topic_uuid,
+            range_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Range(range)) = self.records.get(&range_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        let fencing_epoch = range.fencing_epoch;
+        let mut sorted = members.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.is_empty() || sorted.len() != members.len() {
+            return reject(MetadataError::invalid_transition(
+                "a replica set names one or more distinct nodes",
+            ));
+        }
+        if let Some(missing) = sorted
+            .iter()
+            .find(|node| self.record(&MetaKey::Node { node_uuid: **node }).is_none())
+        {
+            return reject(MetadataError::invalid_transition(format!(
+                "replica set member {missing} is not a registered node"
+            )));
+        }
+        let current = self.range_replica_set(topic_uuid, range_uuid).cloned();
+        let actual_generation = current.as_ref().map_or(0, |set| set.generation);
+        if expected_generation != actual_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_generation,
+                actual: actual_generation,
+            });
+        }
+        if let Some(current) = &current {
+            if current.members == sorted {
+                return MetadataResponse::Ack {
+                    generation: current.generation,
+                };
+            }
+            // ONE member at a time: any majority of a set and any majority
+            // of the set one member away share a node, so whatever a quorum
+            // of the old set acknowledged, a quorum of the new set includes
+            // a holder of it. Two members at once can split them.
+            let changed = sorted
+                .iter()
+                .filter(|node| !current.members.contains(node))
+                .count()
+                + current
+                    .members
+                    .iter()
+                    .filter(|node| !sorted.contains(node))
+                    .count();
+            if changed != 1 {
+                return reject(MetadataError::invalid_transition(format!(
+                    "a replica set changes by one member at a time; this change adds or \
+                     removes {changed}"
+                )));
+            }
+            // ...and only once the range has been led under the current set
+            // with its whole log on a majority of it: until then, records
+            // acknowledged under the set before it may sit on that older
+            // set's majority alone, which the next set need not intersect.
+            if !self.established_under(topic_uuid, range_uuid, current) {
+                return reject(MetadataError::invalid_transition(format!(
+                    "the range has not been led under the current replica set (recorded at \
+                     fencing epoch {}) with its leader's whole log on a majority of it; wait \
+                     for a promotion under it, and if one was established while its leader \
+                     was ahead of the replicas, restart that leader once it has caught them \
+                     up so the next promotion proves it, then retry",
+                    current.recorded_at_epoch
+                )));
+            }
+        }
+        // The lease is cleared, as a release clears it: the range is re-won,
+        // and the winner promotes under the set recorded here.
+        let Some(MetaValue::Range(range)) = self.records.get_mut(&range_key) else {
+            unreachable!("the range was read above and apply is single-threaded");
+        };
+        if range.lease.take().is_some() {
+            range.generation += 1;
+        }
+        let generation = actual_generation + 1;
+        self.records.insert(
+            MetaKey::RangeReplicaSet {
+                topic_uuid,
+                range_uuid,
+            }
+            .encode(),
+            MetaValue::RangeReplicaSet(RangeReplicaSetRecord {
+                generation,
+                members: sorted,
+                recorded_at_epoch: fencing_epoch,
+            }),
+        );
+        MetadataResponse::Ack { generation }
+    }
+
+    /// Whether the range has been led under `set` with its WHOLE log on a
+    /// majority of `set` - the condition for the set to be replaced.
+    ///
+    /// Read from a promotion's evidence rather than trusted to the reporter:
+    /// an Established transition at an epoch above the one `set` was
+    /// recorded at, in which a majority of `set`'s members answered the
+    /// fence at or above the holder's own offset. Why the holder's offset and
+    /// not the boundary: promotion truncates nothing, and the election
+    /// restriction makes the holder hold every record acknowledged under the
+    /// set BEFORE this one - one member away, so their majorities intersect -
+    /// but until its marker is proven, the part of its log above the boundary
+    /// may sit on that older set's majority alone. The next set is one member
+    /// away from `set`, not from the one before it, so only a log already on
+    /// a majority of `set` is safe to carry into it. And because the evidence
+    /// is checked here, a data node that predates the recorded set - and
+    /// counted whatever it was configured with - cannot vouch for a set it
+    /// never counted. A standalone promotion (no quorum) counts only for a
+    /// set of its holder alone. Transition keys end in the big-endian epoch,
+    /// so a range's chain is one contiguous key range.
+    fn established_under(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        set: &RangeReplicaSetRecord,
+    ) -> bool {
+        let Some(from) = set.recorded_at_epoch.checked_add(1) else {
+            return false;
+        };
+        let majority = set.members.len() / 2 + 1;
+        let start = MetaKey::RangeTransition {
+            topic_uuid,
+            range_uuid,
+            fencing_epoch: from,
+        }
+        .encode();
+        let end = MetaKey::RangeTransition {
+            topic_uuid,
+            range_uuid,
+            fencing_epoch: u64::MAX,
+        }
+        .encode();
+        self.records.range(start..=end).any(|(_, value)| {
+            let MetaValue::RangeTransition(RangeTransitionRecord {
+                holder_to,
+                outcome:
+                    TransitionOutcome::Reported {
+                        outcome: crate::command::PromotionOutcome::Established { quorum, .. },
+                        ..
+                    },
+                ..
+            }) = value
+            else {
+                return false;
+            };
+            if quorum.is_empty() {
+                return set.members.as_slice() == [*holder_to];
+            }
+            let Some(own) = quorum
+                .iter()
+                .find(|answer| answer.node_uuid == *holder_to)
+                .map(|answer| answer.offset)
+            else {
+                return false;
+            };
+            let holding = set
+                .members
+                .iter()
+                .filter(|member| {
+                    quorum
+                        .iter()
+                        .any(|answer| answer.node_uuid == **member && answer.offset >= own)
+                })
+                .count();
+            holding >= majority
+        })
     }
 
     fn set_feature_level(&mut self, requested: u32) -> MetadataResponse {
@@ -1370,6 +1595,15 @@ impl MetaStateMachine {
             } => self.release_range_lease(*topic_uuid, *range_uuid, *expected_fencing_epoch),
             MetadataCommand::SetFeatureLevel { feature_level, .. } => {
                 self.set_feature_level(*feature_level)
+            }
+            MetadataCommand::SetRangeReplicaSet {
+                topic_uuid,
+                range_uuid,
+                members,
+                expected_generation,
+                ..
+            } => {
+                self.set_range_replica_set(*topic_uuid, *range_uuid, members, *expected_generation)
             }
             MetadataCommand::SplitRange {
                 env,
@@ -5180,6 +5414,10 @@ fn key_matches_value(key: &MetaKey, value: &MetaValue) -> bool {
                 MetaValue::RangeTransition(_)
             )
             | (MetaKey::ClusterConfig, MetaValue::ClusterConfig(_))
+            | (
+                MetaKey::RangeReplicaSet { .. },
+                MetaValue::RangeReplicaSet(_)
+            )
     )
 }
 
@@ -5410,6 +5648,358 @@ mod tests {
         let restored =
             MetaStateMachine::decode_snapshot(&machine.encode_snapshot().unwrap()).unwrap();
         assert_eq!(restored.feature_level(), SUPPORTED_FEATURE_LEVEL);
+    }
+
+    fn set_replica_set(
+        machine: &mut MetaStateMachine,
+        index: u64,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        members: &[u128],
+        expected_generation: u64,
+    ) -> MetadataResponse {
+        machine.apply(
+            index,
+            &MetadataCommand::SetRangeReplicaSet {
+                env: envelope(u128::from(index) + 1_000),
+                topic_uuid,
+                range_uuid,
+                members: members.iter().copied().map(Uuid::from_u128).collect(),
+                expected_generation,
+            },
+        )
+    }
+
+    fn is_rejected(response: &MetadataResponse) -> bool {
+        matches!(response, MetadataResponse::Rejected { .. })
+    }
+
+    /// #553: a range's replica set is recorded, CAS'd on its generation,
+    /// over registered and distinct nodes; it changes one member at a time
+    /// and only once a promotion has been established under the set it
+    /// replaces - with a majority of that set in the promotion's quorum, read
+    /// from the evidence rather than trusted - and every change clears the
+    /// lease so the range is re-won under the new set. The record survives a
+    /// snapshot.
+    #[test]
+    fn a_range_replica_set_changes_one_member_at_a_time_after_an_established_promotion() {
+        let (mut machine, first, topic, range) = leaseable_range(1);
+        for (index, node) in (3..).zip(2..=6u128) {
+            machine.apply(
+                index,
+                &MetadataCommand::RegisterNode {
+                    env: envelope(u128::from(index)),
+                    node_uuid: Uuid::from_u128(node),
+                    addr: format!("n{node}:9200"),
+                    expected_generation: None,
+                },
+            );
+        }
+        let mut index = 10;
+        let mut next = || {
+            index += 1;
+            index
+        };
+
+        // Shapes that are never a replica set.
+        assert!(is_rejected(&set_replica_set(
+            &mut machine,
+            next(),
+            topic,
+            Uuid::from_u128(99),
+            &[1],
+            0
+        )));
+        assert!(is_rejected(&set_replica_set(
+            &mut machine,
+            next(),
+            topic,
+            range,
+            &[],
+            0
+        )));
+        assert!(is_rejected(&set_replica_set(
+            &mut machine,
+            next(),
+            topic,
+            range,
+            &[1, 2, 2],
+            0
+        )));
+        assert!(is_rejected(&set_replica_set(
+            &mut machine,
+            next(),
+            topic,
+            range,
+            &[1, 2, 77],
+            0
+        )));
+        assert!(machine.range_replica_set(topic, range).is_none());
+
+        // The first record, at whatever the range's epoch is; it clears a
+        // standing lease so the holder re-verifies against it.
+        let generation = range_of(&machine, topic, range).generation;
+        acquire(
+            &mut machine,
+            next(),
+            500,
+            1_000,
+            first,
+            topic,
+            range,
+            generation,
+            10_000,
+        );
+        let leased = range_of(&machine, topic, range);
+        assert!(leased.lease.is_some());
+        assert_eq!(
+            set_replica_set(&mut machine, next(), topic, range, &[3, 1, 2], 0),
+            MetadataResponse::Ack { generation: 1 }
+        );
+        let recorded = machine.range_replica_set(topic, range).unwrap().clone();
+        assert_eq!(
+            recorded.members,
+            vec![Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)]
+        );
+        assert_eq!(recorded.recorded_at_epoch, leased.fencing_epoch);
+        let cleared = range_of(&machine, topic, range);
+        assert!(cleared.lease.is_none());
+        assert_eq!(cleared.generation, leased.generation + 1);
+
+        // CAS: a writer that read no record loses to the one that wrote it;
+        // the same set again is a no-op, not a new generation.
+        assert!(matches!(
+            set_replica_set(&mut machine, next(), topic, range, &[1, 2, 3, 4], 0),
+            MetadataResponse::Rejected(MetadataError::GenerationMismatch {
+                expected: 0,
+                actual: 1
+            })
+        ));
+        assert_eq!(
+            set_replica_set(&mut machine, next(), topic, range, &[1, 2, 3], 1),
+            MetadataResponse::Ack { generation: 1 }
+        );
+
+        // No promotion under {1,2,3} yet: no change.
+        assert!(is_rejected(&set_replica_set(
+            &mut machine,
+            next(),
+            topic,
+            range,
+            &[1, 2, 3, 4],
+            1
+        )));
+
+        // A promotion whose quorum held only ONE of {1,2,3} - what a data
+        // node configured with {1,4,5} would report - does not count.
+        let generation = range_of(&machine, topic, range).generation;
+        acquire(
+            &mut machine,
+            next(),
+            501,
+            2_000,
+            first,
+            topic,
+            range,
+            generation,
+            10_000,
+        );
+        let epoch = range_of(&machine, topic, range).fencing_epoch;
+        assert!(epoch > recorded.recorded_at_epoch);
+        assert!(!is_rejected(&report(
+            &mut machine,
+            next(),
+            502,
+            2_100,
+            first,
+            topic,
+            range,
+            epoch,
+            established(50, &[(1, 50), (4, 50), (5, 50)], 3, 3)
+        )));
+        assert!(is_rejected(&set_replica_set(
+            &mut machine,
+            next(),
+            topic,
+            range,
+            &[1, 2, 3, 4],
+            1
+        )));
+
+        // Nor does one whose leader was AHEAD of the replicas: its tail
+        // above 60 may hold records acknowledged under the set before
+        // {1,2,3}, on that set's majority alone, until its marker is proven.
+        release_and_reacquire(&mut machine, &mut next, first, topic, range);
+        let epoch = range_of(&machine, topic, range).fencing_epoch;
+        assert!(!is_rejected(&report(
+            &mut machine,
+            next(),
+            504,
+            2_600,
+            first,
+            topic,
+            range,
+            epoch,
+            established(60, &[(1, 70), (2, 60), (3, 60)], 3, 2)
+        )));
+        assert!(is_rejected(&set_replica_set(
+            &mut machine,
+            next(),
+            topic,
+            range,
+            &[1, 2, 3, 4],
+            1
+        )));
+
+        // One under {1,2,3} with the leader's whole log on a majority of it
+        // does.
+        release_and_reacquire(&mut machine, &mut next, first, topic, range);
+        let epoch = range_of(&machine, topic, range).fencing_epoch;
+        assert!(!is_rejected(&report(
+            &mut machine,
+            next(),
+            503,
+            3_100,
+            first,
+            topic,
+            range,
+            epoch,
+            established(60, &[(1, 60), (2, 60)], 2, 2)
+        )));
+        // Two members at once: refused, whatever the evidence.
+        assert!(is_rejected(&set_replica_set(
+            &mut machine,
+            next(),
+            topic,
+            range,
+            &[1, 2, 3, 4, 5],
+            1
+        )));
+        assert!(is_rejected(&set_replica_set(
+            &mut machine,
+            next(),
+            topic,
+            range,
+            &[1, 4, 5],
+            1
+        )));
+        // One member: accepted, and the lease is cleared again.
+        assert_eq!(
+            set_replica_set(&mut machine, next(), topic, range, &[1, 2, 3, 4], 1),
+            MetadataResponse::Ack { generation: 2 }
+        );
+        assert!(range_of(&machine, topic, range).lease.is_none());
+        let grown = machine.range_replica_set(topic, range).unwrap().clone();
+        assert_eq!(grown.recorded_at_epoch, epoch);
+        // ...and the next change waits for a promotion under {1,2,3,4}: the
+        // one under {1,2,3} is at the epoch the record was taken at.
+        assert!(is_rejected(&set_replica_set(
+            &mut machine,
+            next(),
+            topic,
+            range,
+            &[1, 2, 3, 4, 5],
+            2
+        )));
+
+        let restored =
+            MetaStateMachine::decode_snapshot(&machine.encode_snapshot().unwrap()).unwrap();
+        assert_eq!(restored.range_replica_set(topic, range), Some(&grown));
+    }
+
+    /// Release the range's lease and take it again, for a fresh epoch.
+    fn release_and_reacquire(
+        machine: &mut MetaStateMachine,
+        next: &mut impl FnMut() -> u64,
+        holder: Uuid,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) {
+        let range = range_of(machine, topic_uuid, range_uuid);
+        let index = next();
+        let released = machine.apply(
+            index,
+            &MetadataCommand::ReleaseRangeLease {
+                env: envelope(u128::from(index) + 2_000),
+                topic_uuid,
+                range_uuid,
+                expected_fencing_epoch: range.fencing_epoch,
+            },
+        );
+        assert!(!is_rejected(&released), "{released:?}");
+        let generation = range_of(machine, topic_uuid, range_uuid).generation;
+        let index = next();
+        let acquired = acquire(
+            machine,
+            index,
+            u128::from(index) + 3_000,
+            3_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            10_000,
+        );
+        assert!(!is_rejected(&acquired), "{acquired:?}");
+    }
+
+    /// A standalone promotion vouches only for a set of its holder alone.
+    #[test]
+    fn a_standalone_promotion_counts_only_for_a_set_of_its_holder() {
+        let (mut machine, first, topic, range) = leaseable_range(1);
+        machine.apply(
+            3,
+            &MetadataCommand::RegisterNode {
+                env: envelope(3),
+                node_uuid: Uuid::from_u128(2),
+                addr: "n2:9200".to_owned(),
+                expected_generation: None,
+            },
+        );
+        let mut index = 10;
+        let mut next = || {
+            index += 1;
+            index
+        };
+        assert_eq!(
+            set_replica_set(&mut machine, next(), topic, range, &[1], 0),
+            MetadataResponse::Ack { generation: 1 }
+        );
+        let generation = range_of(&machine, topic, range).generation;
+        acquire(
+            &mut machine,
+            next(),
+            600,
+            1_000,
+            first,
+            topic,
+            range,
+            generation,
+            10_000,
+        );
+        let epoch = range_of(&machine, topic, range).fencing_epoch;
+        let standalone = PromotionOutcome::Established {
+            boundary_offset: None,
+            sealed_prefix_end: None,
+            quorum: Vec::new(),
+            votes: 0,
+            required: 0,
+        };
+        assert!(!is_rejected(&report(
+            &mut machine,
+            next(),
+            601,
+            1_100,
+            first,
+            topic,
+            range,
+            epoch,
+            standalone
+        )));
+        assert_eq!(
+            set_replica_set(&mut machine, next(), topic, range, &[1, 2], 1),
+            MetadataResponse::Ack { generation: 2 }
+        );
     }
 
     fn envelope_at(request: u128, issued_at_ms: i64) -> CommandEnvelope {
