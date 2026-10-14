@@ -33,7 +33,7 @@ scripts/check-naming.sh           # naming rule
 scripts/check-egress-claims.sh    # only if docs/EGRESS_TRANSPORT_RESEARCH.md changed
 ```
 
-- Shell changes: lint with the pinned shellcheck command in CONTRIBUTING.md (use the full file list; a shorter one gives a false green).
+- Shell changes: run **both** shellcheck steps of the `shellcheck + bats` job in `.github/workflows/ci.yml` with the same pinned image and file lists — one for `docker/*.sh` and the named `scripts/*.sh`, one for the live-chaos harness (`-x -P scripts/live-chaos/scenarios`, `lib.sh`, `run-all.sh`, `gen-certs.sh`, `scenarios/*.sh`) — and the bats tests (`docker/tests/`, `scripts/tests/`). A shorter list gives a false green.
 - Helm changes: run `helm lint helm/vtop -f <file>` and `helm template vtop helm/vtop -f <file>` for **every** values file in `helm/vtop/ci/` (`default-values.yaml`, `separated-values.yaml`, `plaintext-values.yaml`, `replicated-values.yaml`), then read the Helm jobs in `.github/workflows/ci.yml` — they assert on the rendered output (TLS shapes, tier wiring, refusals), not just the exit code.
 - CI path-filters jobs, so a green docs-only PR proves little about Rust. Say what you actually ran.
 

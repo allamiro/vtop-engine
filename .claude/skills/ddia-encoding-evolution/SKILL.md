@@ -19,7 +19,7 @@ Book lens: chapter 4 — formats for encoding data, schema evolution, and datafl
 - Version markers in `vtop-log`: `FORMAT_VERSION_V2`, `RECORD_SCHEMA_VERSION_V2`, `CHUNK_TREE_SCHEME_V1`, `COMMIT_SCHEME_*`, `SegmentManifestV2`.
 - `scripts/upgrade-compat.sh`: an old release writes a data dir, the new binary must open it, quarantine nothing, and serve every record byte-exactly.
 - **Downgrade is neither tested nor supported**; `docs/ROADMAP.md` says so. Do not imply otherwise.
-- Config: older releases refuse unknown keys — that is the compatibility contract, so new keys need a release-gating note.
+- Config splits in two, and a new key behaves differently in each. The cluster-plane role configs in `crates/vtop-node/src/config.rs` (`MetaNodeConfig`, `DataNodeConfig`, `LeaseConfig`, ...) carry `deny_unknown_fields`: an older node **refuses to start** on a key it does not know, so a new key there needs a release-gating note. The engine configuration in `crates/vtop-core/src/config.rs` (`VtopConfig`, `EngineConfig`, `UploadConfig`, `SourcesConfig`, ...) does **not**: an older engine silently ignores a new key, so an operator who sets a safety knob (a deadline, a limit) on a fleet that has not been upgraded gets no error and no protection. State that in the release note and, when the knob matters for safety, make the new behaviour's default safe so ignoring the key is harmless.
 
 ## Rules
 
