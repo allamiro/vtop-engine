@@ -72,6 +72,19 @@ pub enum ConsensusError {
         None => "; no leader is known yet".to_owned(),
     })]
     NotLeader { leader: Option<MetaNodeId> },
+    /// A lease request was refused because its proposer's clock is further
+    /// from the metadata leader's than the leader tolerates (#555).
+    ///
+    /// TYPED so a caller can say what is wrong (fix the proposer's NTP) rather
+    /// than retry as though the leader were merely busy. Nothing was
+    /// replicated: the request never reached the log.
+    #[error(
+        "lease request refused: this node's clock is {} ms {} the metadata leader's, more than the \
+         {bound_ms} ms tolerated for this lease; fix the node's clock (NTP) before it can hold a range",
+        .skew_ms.unsigned_abs(),
+        if *.skew_ms >= 0 { "ahead of" } else { "behind" }
+    )]
+    ClockSkew { skew_ms: i64, bound_ms: u64 },
 }
 
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
@@ -150,6 +163,20 @@ pub struct OpenraftConsensus {
     /// MAC, never as a MAC of nothing. Installed after construction because
     /// the node resolves it from its environment once the store is open.
     transition_mac_key: std::sync::RwLock<Option<[u8; 32]>>,
+    /// The leader's clock a lease request's `issued_at_ms` is checked against
+    /// (#555). `None` reads the wall clock; tests install a fixed one.
+    leader_clock: std::sync::RwLock<Option<LeaderClock>>,
+}
+
+/// Milliseconds since the Unix epoch, as the metadata leader sees them.
+type LeaderClock = std::sync::Arc<dyn Fn() -> i64 + Send + Sync>;
+
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 impl OpenraftConsensus {
@@ -158,6 +185,37 @@ impl OpenraftConsensus {
             raft,
             store: None,
             transition_mac_key: std::sync::RwLock::new(None),
+            leader_clock: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Check lease requests against `clock` instead of the wall clock. For
+    /// tests that need a leader whose time they control.
+    pub fn set_leader_clock(&self, clock: impl Fn() -> i64 + Send + Sync + 'static) {
+        *self
+            .leader_clock
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::sync::Arc::new(clock));
+    }
+
+    /// Whether a request with this id was already applied on this node. False
+    /// when the node has no applied state to ask (a bare-Raft harness): the
+    /// check then errs towards judging the request.
+    fn already_applied(&self, request_id: uuid::Uuid) -> bool {
+        self.store.as_ref().is_some_and(|store| {
+            store.with_storage(|storage| storage.state().has_applied_request(request_id))
+        })
+    }
+
+    fn leader_now_ms(&self) -> i64 {
+        match self
+            .leader_clock
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            Some(clock) => clock(),
+            None => wall_clock_ms(),
         }
     }
 
@@ -652,6 +710,31 @@ pub trait AdminReadSegmentPlacement: Send + Sync {
 #[async_trait]
 impl Consensus for OpenraftConsensus {
     async fn propose(&self, command: MetadataCommand) -> ConsensusResult<CommitReceipt> {
+        // A lease deadline is built from the proposer's clock, and the lease
+        // agent compares it with its own: a proposer whose clock is far from
+        // the leader's would steal or poison a lease. Refuse it BEFORE it is
+        // replicated, so it never reaches the log (#555).
+        //
+        // Only the LEADER judges. A follower's clock may differ from the
+        // proposer's by more than the bound while the leader's does not, and a
+        // `ClockSkew` from a follower is not a redirect: the client would keep
+        // retrying the follower instead of reaching the leader. A follower
+        // lets `client_write` answer with `NotLeader`, as it always has.
+        //
+        // And only a NEW request is judged. One that already committed is
+        // answered from the dedup table by `client_write`; a retry whose
+        // timestamp has aged past the bound since the original must still get
+        // that answer, not a skew error about a request that succeeded.
+        if self.raft.metrics().borrow().state == ServerState::Leader {
+            if let Some(skew) = command.lease_clock_skew(self.leader_now_ms()) {
+                if !skew.is_within_bound() && !self.already_applied(skew.request_id) {
+                    return Err(ConsensusError::ClockSkew {
+                        skew_ms: skew.skew_ms,
+                        bound_ms: skew.bound_ms,
+                    });
+                }
+            }
+        }
         let response = self
             .raft
             .client_write(command)

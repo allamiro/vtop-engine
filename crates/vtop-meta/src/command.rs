@@ -12,15 +12,31 @@
 //! `issued_at_ms` is advisory for every command EXCEPT the lease-election pair
 //! ([`MetadataCommand::AcquireRangeLease`] and
 //! [`MetadataCommand::RenewRangeLease`], #223), where it is the time the
-//! deadline is computed from. Apply stays deterministic either way — the value
-//! is data in the replicated log, so every replica derives the same expiry —
-//! but wall-clock skew on a PROPOSER does affect lease liveness, and pretending
-//! otherwise would be the kind of comment that costs someone an afternoon.
+//! deadline is computed from AND the time an incumbent's lease is judged live
+//! against. Apply stays deterministic either way — the value is data in the
+//! replicated log, so every replica derives the same expiry.
+//!
+//! That value comes from the PROPOSER's wall clock, which used to be trusted
+//! without limit: one data node with a bad clock could steal live leases
+//! (clock ahead: every rival looked expired) or poison its own (clock ahead
+//! while holding: the deadline sat in the future, and after it died nobody
+//! could take over until the skew elapsed) (#555). The metadata leader now
+//! REFUSES a lease request whose clock is further from its own than a bound
+//! ([`MetadataCommand::lease_clock_skew`]), before the command is replicated.
+//! A node with a bad clock cannot acquire or renew at all — loudly, with the
+//! skew in the error — instead of silently moving a deadline.
+//!
+//! It is refused, not overwritten, on purpose: the lease agent compares the
+//! recorded deadline with its own clock to decide whether to renew, so a
+//! deadline silently moved into the leader's clock domain would make a
+//! fast-clocked holder see its fresh lease as lapsed and re-acquire it, minting
+//! epochs every round. Within the bound the proposer's value is kept, so the
+//! error either side can make is at most the bound.
 //!
 //! Skew is bounded in consequence, not prevented: acquisition always mints a
-//! higher fencing epoch, so a skewed candidate can take a range early and be
-//! disruptive, but can never produce two holders that both believe they may
-//! write. Expiry is liveness; the epoch is safety.
+//! higher fencing epoch, so a skewed clock can make a range change hands
+//! earlier or later than intended, but can never produce two holders that both
+//! believe they may write. Expiry is liveness; the epoch is safety.
 
 use crate::keys::{MAX_GROUP_NAME_BYTES, MAX_TOPIC_NAME_BYTES};
 use crate::placement::{MAX_FAILURE_DOMAIN_BYTES, MAX_REPLICAS, MIN_PLACEMENT_WEIGHT};
@@ -126,14 +142,80 @@ const ERROR_KIND_LINEAGE_MISMATCH: u16 = 7;
 /// Common prefix of every command. `request_id` keys the exactly-once dedup
 /// table.
 ///
-/// `issued_at_ms` comes from the proposer's clock. It is advisory for every
-/// command except the lease-election pair (#223), which derives a lease
-/// deadline from it — see the module docs for what that does and does not
-/// expose to clock skew.
+/// `issued_at_ms` is advisory for every command except the lease-election pair
+/// (#223), which derives a lease deadline from it. For that pair the metadata
+/// leader refuses a value too far from its own clock before the command is
+/// replicated (#555) — see the module docs.
+///
+/// Every other command keeps the proposer's value as an audit timestamp: no
+/// decision in the state machine reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandEnvelope {
     pub request_id: Uuid,
     pub issued_at_ms: i64,
+}
+
+/// The smallest clock error between a lease proposer and the metadata leader
+/// that is always tolerated, whatever the lease length. A request spends
+/// time on the wire and in a queue, and NTP-synchronised hosts agree to
+/// milliseconds; one second is far above both and far below any lease.
+pub const MIN_LEASE_SKEW_BOUND_MS: u64 = 1_000;
+
+/// How far a lease proposer's clock was from the metadata leader's, against
+/// what the leader tolerates for that request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeaseClockSkew {
+    /// The request this was measured for, so a caller can tell a request that
+    /// already committed (answered from the dedup table) from a new one.
+    pub request_id: Uuid,
+    /// Proposer's `issued_at_ms` minus the leader's clock. Positive: the
+    /// proposer is ahead.
+    pub skew_ms: i64,
+    /// The largest error tolerated for this request.
+    pub bound_ms: u64,
+}
+
+impl LeaseClockSkew {
+    pub fn is_within_bound(&self) -> bool {
+        self.skew_ms.unsigned_abs() <= self.bound_ms
+    }
+}
+
+impl MetadataCommand {
+    /// For the lease-election pair, how far the proposer's clock is from
+    /// `leader_now_ms` and how much the leader tolerates; `None` for every
+    /// other command, whose outcome never reads `issued_at_ms`.
+    ///
+    /// The tolerance is a quarter of the requested lease, never less than
+    /// [`MIN_LEASE_SKEW_BOUND_MS`] - and never more than half the lease, so a
+    /// lease shorter than the floor cannot be given an allowance larger than
+    /// itself (a rival 900 ms fast against a 500 ms lease would otherwise see a
+    /// live incumbent as already expired). A proposer's error then moves a
+    /// deadline by at most a quarter of the lease it asked for (half, for a
+    /// lease under four seconds), which the renewal pacing (a third of the
+    /// lease) already absorbs for the usual lengths.
+    pub fn lease_clock_skew(&self, leader_now_ms: i64) -> Option<LeaseClockSkew> {
+        let (env, lease_duration_ms) = match self {
+            MetadataCommand::AcquireRangeLease {
+                env,
+                lease_duration_ms,
+                ..
+            }
+            | MetadataCommand::RenewRangeLease {
+                env,
+                lease_duration_ms,
+                ..
+            } => (env, *lease_duration_ms),
+            _ => return None,
+        };
+        Some(LeaseClockSkew {
+            request_id: env.request_id,
+            skew_ms: env.issued_at_ms.saturating_sub(leader_now_ms),
+            bound_ms: (lease_duration_ms / 4)
+                .max(MIN_LEASE_SKEW_BOUND_MS)
+                .min(lease_duration_ms / 2),
+        })
+    }
 }
 
 /// Lifecycle state of a registered node.
@@ -2465,6 +2547,86 @@ mod tests {
             request_id: Uuid::from_u128(request),
             issued_at_ms: 1_750_000_000_000,
         }
+    }
+
+    /// #555: only the lease-election pair has a clock to check, and the bound
+    /// is a quarter of the requested lease, never less than the floor.
+    #[test]
+    fn only_the_lease_election_pair_has_a_clock_skew_to_check() {
+        const LEADER_NOW: i64 = 1_750_000_000_000;
+        let mut checked = 0;
+        for command in every_command() {
+            let skew = command.lease_clock_skew(LEADER_NOW);
+            match &command {
+                MetadataCommand::AcquireRangeLease {
+                    env,
+                    lease_duration_ms,
+                    ..
+                }
+                | MetadataCommand::RenewRangeLease {
+                    env,
+                    lease_duration_ms,
+                    ..
+                } => {
+                    checked += 1;
+                    let skew = skew.expect("the lease pair is checked");
+                    assert_eq!(skew.skew_ms, env.issued_at_ms - LEADER_NOW);
+                    assert_eq!(
+                        skew.bound_ms,
+                        (lease_duration_ms / 4)
+                            .max(MIN_LEASE_SKEW_BOUND_MS)
+                            .min(lease_duration_ms / 2)
+                    );
+                }
+                _ => assert_eq!(skew, None, "{command:?} never reads issued_at_ms"),
+            }
+        }
+        assert_eq!(
+            checked, 2,
+            "both lease-election commands are in the fixture"
+        );
+    }
+
+    #[test]
+    fn the_skew_bound_is_a_quarter_of_the_lease_with_a_floor_and_is_symmetric() {
+        let acquire =
+            |issued_at_ms: i64, lease_duration_ms: u64| MetadataCommand::AcquireRangeLease {
+                env: CommandEnvelope {
+                    request_id: Uuid::from_u128(1),
+                    issued_at_ms,
+                },
+                topic_uuid: Uuid::from_u128(2),
+                range_uuid: Uuid::from_u128(3),
+                holder_node_uuid: Uuid::from_u128(4),
+                expected_range_generation: 0,
+                lease_duration_ms,
+            };
+        let within = |issued_at_ms: i64, lease_ms: u64| {
+            acquire(issued_at_ms, lease_ms)
+                .lease_clock_skew(1_000_000)
+                .unwrap()
+                .is_within_bound()
+        };
+        // 15 s lease: 3.75 s either way.
+        assert!(within(1_000_000, 15_000));
+        assert!(within(1_003_750, 15_000));
+        assert!(within(996_250, 15_000));
+        assert!(!within(1_003_751, 15_000), "just ahead of the bound");
+        assert!(!within(996_249, 15_000), "just behind it");
+        // A lease between 2 s and 4 s tolerates the floor: latency is not skew.
+        assert!(within(1_001_000, 3_000));
+        assert!(!within(1_001_001, 3_000));
+        // A lease shorter than the floor is capped at half of itself: the
+        // allowance can never exceed the lease it applies to. A rival 900 ms
+        // fast against a 500 ms lease is refused (review of #566).
+        assert!(within(1_000_250, 500));
+        assert!(!within(1_000_251, 500));
+        assert!(!within(1_000_900, 500));
+        assert!(within(1_000_200, 400));
+        assert!(!within(1_000_201, 400));
+        // Extremes cannot overflow.
+        assert!(!within(i64::MAX, 15_000));
+        assert!(!within(i64::MIN, 15_000));
     }
 
     fn every_command() -> Vec<MetadataCommand> {
