@@ -436,6 +436,28 @@ s3://{bucket}/{prefix}/tenant={tenant}/source={source}/format={format}/year={yyy
 
 The bound manifest is stored at the same prefix as `{batch_id}.manifest.json`.
 
+**Which clock picks the time partition** (`partitioning.time_source`, #559):
+
+- `seal` (default): the instant the batch was sealed — taken as it leaves the
+  engine's buffer, before it waits for an upload slot, its ledger writes,
+  compression, checksumming and upload, and recorded as its `sealed_at`. A
+  saturated upload queue, a slow upload or a retry within the batch does not
+  move it. Late data, a backlog drain and a replay land in the hour they were
+  **sealed** in — a replay of yesterday's range is a new batch and is filed
+  under today. Partitions used to come from the wall clock at upload, so a
+  batch sealed at 12:59 and uploaded at 13:00 was filed under hour 13.
+- `event`: the earliest record time the source reported. Only the Kafka source
+  reports one (the message timestamp — producer `CreateTime` or broker
+  `LogAppendTime`, whichever the topic uses); a batch from a source that reports
+  none falls back to its seal time. Late data lands in the hour it **happened**
+  in, which can be a partition a downstream reader has already processed:
+  readers that need completeness must look back, or use the manifests.
+
+Either way the manifest's `first_timestamp` / `last_timestamp` are the batch's
+earliest and latest record times when the source reports them (Kafka), and
+absent otherwise. They are a minimum and a maximum, not the first and last
+record's times: producer timestamps arrive out of order.
+
 - **Extensible fields:** the path **may** be extended with `environment`, `facility`, `severity`, `retention_class`, `region`, `site`.
 - **Per-format buckets:** bucket names may be templated, e.g. `bucket: "telemetry-{format}"`, with optional on-demand bucket creation via `ensure_bucket`. The fully resolved bucket and key are recorded in the manifest.
 
@@ -468,7 +490,7 @@ On startup, the `replay` module inspects `vtop-state` and maps each incomplete b
    A `VERIFIED` row is committed only after that, and not at all while a range of the same source unit that **starts below it** is about to be re-read: a commit moves the unit's committed point to the end of the committed range, the file adapters clamp a rewind to the committed point, and a `VERIFIED` range archives only its own bytes — so pending bytes below its start would be skipped. Such a row stays `VERIFIED` (its object is in the archive) until a later pass commits it. A `VERIFIED` row that starts where the pending range starts — the object that replaced a stale row for the same bytes — commits normally. A marker with no inode (a legacy row) is compared against every inode at its path.
 
    **A rewind never goes below what the source has already committed.** The file and spool adapters have always clamped to their committed byte; the Kafka adapter now clamps to the consumer group's committed offset, asked of the broker, so a stale `FAILED` row left behind by a failure that has since been repaired no longer rewinds the group to its start and re-archives everything since on each restart. The stale rows themselves stay in the ledger and are re-visited at every restart (a no-op rewind and a ledger write each); retiring them needs a new durable state and is tracked in #567.
-3. Replay currently produces a **new** object key: the `batch_id` and the `year/…/hour` path components are derived from wall-clock time plus a random suffix, so a replayed batch writes a duplicate object (at-least-once, no data loss). Protocol §14/§15.1/§16 specify deterministic naming so that replay is idempotent — this is the open gap tracked as [PRODUCTION_HA.md](PRODUCTION_HA.md) Phase 4.
+3. Replay currently produces a **new** object key: the `batch_id` is derived from wall-clock time plus a random suffix, and the `year/…/hour` path components from the replayed batch's own partition time (§11, `partitioning.time_source`) - under `seal`, the hour the replay was sealed in, so a replay of yesterday's range is filed under today; under `event`, the earliest record time, so a Kafka replay usually lands in the original hour but under a new key. Either way a replayed batch writes a duplicate object (at-least-once, no data loss). Protocol §14/§15.1/§16 specify deterministic naming so that replay is idempotent — this is the open gap tracked as [PRODUCTION_HA.md](PRODUCTION_HA.md) Phase 4.
 4. A state/storage mismatch (e.g., an object present but unverified) is resolved by re-verifying or re-uploading **before** any commit.
 5. **The same rule holds while the engine is running.** Adapters advance their read position when they *read*, not when a batch commits, so a batch that fails (or errors before `VERIFIED`) is handed back to its source at the end of the cycle that failed it, not at the next restart. Otherwise the next cycle reads on from the end of the failed range and the first later range to verify commits past it, leaving those bytes unarchived (#552). A cycle in which a batch failed waits before reading again — the idle interval, doubling per consecutive failing cycle up to a minute, plus jitter — because the failed range is now read again and a tight loop would hammer a store that is down.
 
