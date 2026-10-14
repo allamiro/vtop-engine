@@ -547,10 +547,6 @@ impl KafkaSource {
             .collect()
     }
 
-    /// The group's committed "next offset" for each of `partitions`, from the
-    /// broker, in ONE request. A partition with nothing committed, or every
-    /// partition when the broker cannot answer within the bound, is simply
-    /// absent; callers then fall back to what they already know.
     /// The marker's consumer group, when it is not the one this adapter
     /// consumes as.
     fn foreign_group<'m>(&self, marker: &'m ProgressMarker) -> Option<&'m str> {
@@ -564,6 +560,10 @@ impl KafkaSource {
         }
     }
 
+    /// The group's committed "next offset" for each of `partitions`, from the
+    /// broker, in ONE request. A partition with nothing committed, or every
+    /// partition when the broker cannot answer within the bound, is simply
+    /// absent; callers then fall back to what they already know.
     fn group_committed_offsets(
         &mut self,
         partitions: &[(String, i32)],
@@ -1144,20 +1144,20 @@ impl SourceAdapter for KafkaSource {
             ));
         };
         // A range read under another consumer group (the engine's group was
-        // renamed since): it is archived and verified, but its offsets are
-        // that group's. Committing it here would move THIS group's offset to
+        // renamed since): it is archived and verified, but its offset is that
+        // group's. Committing it here would move THIS group's offset to
         // wherever the old group had read, past records this group has not
-        // archived (review of #563).
+        // archived; reporting success would mark the row SOURCE_COMMITTED and
+        // lose the fact that the old group's offset was never committed - a
+        // rollback to that group would then re-read the range. It is an
+        // error: the row stays VERIFIED until an engine consuming as that
+        // group recovers it (review of #563).
         if let Some(group) = self.foreign_group(marker) {
-            tracing::warn!(
-                topic,
-                partition,
-                marker_group = group,
-                group = %self.cfg.consumer_group,
-                "range read under another consumer group: archived, but its offset is not this \
-                 group's to commit"
-            );
-            return Ok(());
+            return Err(VtopError::Source(format!(
+                "range of {topic}[{partition}] was read under consumer group {group}; this engine \
+                 consumes as {} and cannot commit {group}'s offset, so the batch stays VERIFIED",
+                self.cfg.consumer_group
+            )));
         }
 
         // Committed offset is "next to read" = last consumed + 1.
@@ -1470,7 +1470,13 @@ mod tests {
         assert_eq!(src.read_position(&old), None);
         assert_eq!(src.read_position(&marker("vtop-engine", 50)), Some(100));
 
-        src.commit_progress(&old).await.unwrap();
+        let refused = src.commit_progress(&old).await;
+        assert!(
+            refused.as_ref().is_err_and(|e| e
+                .to_string()
+                .contains("cannot commit vtop-engine-old's offset")),
+            "another group's range must not report a commit that did not happen: {refused:?}"
+        );
         assert_eq!(
             src.cursors[&("t".into(), 0)].committed_offset,
             Some(100),
