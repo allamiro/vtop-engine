@@ -32,6 +32,10 @@ ALTER TABLE batches ADD COLUMN IF NOT EXISTS owner TEXT;
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS lease_expires_at TEXT;
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS object_size_bytes BIGINT;
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS manifest_version_id TEXT;
+-- The claim fence (#557): every claim bumps it, and a writer that holds an older
+-- generation is refused. Nullable-free with a default so rows written by older
+-- builds, which never name the column, read as generation 0.
+ALTER TABLE batches ADD COLUMN IF NOT EXISTS claim_gen BIGINT NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
 CREATE INDEX IF NOT EXISTS idx_batches_source ON batches(source_type, source_name);

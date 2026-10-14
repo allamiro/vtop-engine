@@ -56,6 +56,8 @@ const MAX_CONFLICT_RETRIES: u32 = 5;
 #[derive(Clone)]
 pub struct PgStateStore {
     pool: PgPool,
+    /// The claim generations this process holds (#557).
+    fence: crate::fence::ClaimFence,
 }
 
 fn map_sqlx(e: sqlx::Error) -> VtopError {
@@ -172,7 +174,10 @@ impl PgStateStore {
     /// [`Self::migrate`] first with a separate privileged identity.
     pub async fn connect(conn_str: &str) -> Result<Self, VtopError> {
         let pool = connect_pool(conn_str, 10).await?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            fence: Default::default(),
+        };
         store.check_schema().await?;
         Ok(store)
     }
@@ -185,7 +190,12 @@ impl PgStateStore {
             .execute(&pool)
             .await
             .map_err(map_sqlx)?;
-        Self { pool }.check_schema().await
+        Self {
+            pool,
+            fence: Default::default(),
+        }
+        .check_schema()
+        .await
     }
 
     /// Execute a raw SQL string against the pool. TEST-ONLY: the battery uses it
@@ -211,7 +221,7 @@ impl PgStateStore {
             "SELECT batch_id, tenant, source_type, source_name, format, state, \
                     progress_start_json, progress_end_json, object_uri, manifest_uri, \
                     object_sha256, manifest_sha256, manifest_version_id, object_size_bytes, record_count, \
-                    error_message, owner, lease_expires_at, created_at, updated_at \
+                    error_message, owner, lease_expires_at, created_at, updated_at, claim_gen \
              FROM batches WHERE FALSE",
         )
         .fetch_optional(&self.pool)
@@ -300,6 +310,7 @@ impl StateStore for PgStateStore {
             .execute(&self.pool)
         })
         .await?;
+        self.fence.created(&rec.batch_id);
         Ok(())
     }
 
@@ -322,6 +333,13 @@ impl StateStore for PgStateStore {
         // error on the next pass. A genuinely illegal transition therefore still
         // fails immediately - only a lost update loops. The 40001 serialization
         // retry sits inside, on the write itself.
+        //
+        // For a row this process holds a claim on, the write is ALSO
+        // conditional on the claim generation (#557): the state guard alone
+        // lets an engine whose lease lapsed write over the engine that claimed
+        // the row, because state names recur. A lost claim is not a lost
+        // update — retrying cannot help — so it is reported at once.
+        let held = self.fence.held(batch_id);
         let mut attempt = 0;
         loop {
             let current = self.get_state(batch_id).await?;
@@ -341,7 +359,8 @@ impl StateStore for PgStateStore {
                          record_count = COALESCE($8, record_count),
                          error_message = COALESCE($9, error_message),
                          updated_at = $10
-                       WHERE batch_id = $11 AND state = $12"#,
+                       WHERE batch_id = $11 AND state = $12
+                         AND ($13::bigint IS NULL OR claim_gen = $13)"#,
                 )
                 .bind(validated.as_str())
                 .bind(&patch.object_uri)
@@ -355,13 +374,28 @@ impl StateStore for PgStateStore {
                 .bind(&now)
                 .bind(batch_id)
                 .bind(expected)
+                .bind(held)
                 .execute(&self.pool)
             })
             .await?
             .rows_affected();
 
             if rows >= 1 {
+                if validated == BatchState::SourceCommitted {
+                    self.fence.release(batch_id);
+                }
                 return Ok(());
+            }
+            if let Some(held) = held {
+                let actual: Option<i64> =
+                    sqlx::query_scalar("SELECT claim_gen FROM batches WHERE batch_id = $1")
+                        .bind(batch_id)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(map_sqlx)?;
+                if let Some(actual) = actual.filter(|actual| *actual != held) {
+                    return Err(crate::fence::claim_lost(batch_id, held, actual));
+                }
             }
             // Lost update: the row's state changed between our read and write.
             attempt += 1;
@@ -402,19 +436,27 @@ impl StateStore for PgStateStore {
         let now = crate::store::normalize_rfc3339_utc("now", now)?;
         let lease_until = crate::store::normalize_rfc3339_utc("lease_until", lease_until)?;
         let (now, lease_until) = (now.as_str(), lease_until.as_str());
-        with_retry(|| {
+        // RETURNING gives the generation THIS statement set, exactly (see the
+        // SQLite implementation and #557).
+        let claimed = with_retry(|| {
             sqlx::query(
-                "UPDATE batches SET owner = $1, lease_expires_at = $2, updated_at = $3 \
+                "UPDATE batches SET owner = $1, lease_expires_at = $2, updated_at = $3, \
+                        claim_gen = claim_gen + 1 \
                  WHERE state != $4 \
-                   AND (owner IS NULL OR owner = $1 OR lease_expires_at IS NULL OR lease_expires_at <= $3)",
+                   AND (owner IS NULL OR owner = $1 OR lease_expires_at IS NULL OR lease_expires_at <= $3) \
+                 RETURNING batch_id, claim_gen",
             )
             .bind(owner)
             .bind(lease_until)
             .bind(now)
             .bind(BatchState::SourceCommitted.as_str())
-            .execute(&self.pool)
+            .fetch_all(&self.pool)
         })
         .await?;
+        for row in &claimed {
+            let batch_id: String = row.get("batch_id");
+            self.fence.claimed(&batch_id, row.get("claim_gen"));
+        }
         let rows = sqlx::query(
             "SELECT * FROM batches WHERE state != $1 AND owner = $2 ORDER BY created_at ASC",
         )

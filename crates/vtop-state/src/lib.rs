@@ -6,6 +6,7 @@
 //! progress for unverified data. SQLite is the built-in backend; the engine
 //! depends only on the trait.
 
+mod fence;
 pub mod models;
 #[cfg(feature = "postgres")]
 pub mod pg_store;

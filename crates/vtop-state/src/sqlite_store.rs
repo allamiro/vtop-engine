@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS batches (
     owner TEXT,
     lease_expires_at TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    claim_gen INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
 CREATE INDEX IF NOT EXISTS idx_batches_source ON batches(source_type, source_name);
@@ -95,6 +96,8 @@ macro_rules! prune_committed_sql {
 #[derive(Clone)]
 pub struct SqliteStateStore {
     pool: SqlitePool,
+    /// The claim generations this process holds (#557).
+    fence: crate::fence::ClaimFence,
 }
 
 fn map_sqlx(e: sqlx::Error) -> VtopError {
@@ -111,7 +114,10 @@ impl SqliteStateStore {
             .connect_with(opts)
             .await
             .map_err(map_sqlx)?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            fence: Default::default(),
+        };
         store.migrate().await?;
         Ok(store)
     }
@@ -137,6 +143,9 @@ impl SqliteStateStore {
             "ALTER TABLE batches ADD COLUMN lease_expires_at TEXT",
             "ALTER TABLE batches ADD COLUMN object_size_bytes INTEGER",
             "ALTER TABLE batches ADD COLUMN manifest_version_id TEXT",
+            // The claim fence (#557): every claim bumps it; a writer holding an
+            // older generation is refused.
+            "ALTER TABLE batches ADD COLUMN claim_gen INTEGER NOT NULL DEFAULT 0",
         ] {
             if let Err(e) = sqlx::raw_sql(stmt).execute(&self.pool).await {
                 if !e.to_string().contains("duplicate column name") {
@@ -156,6 +165,35 @@ impl SqliteStateStore {
             .ok_or_else(|| VtopError::NotFound(format!("batch {batch_id}")))?;
         let s: String = row.get("state");
         BatchState::from_str(&s)
+    }
+
+    /// Why a conditional write matched no row: the claim moved on, or the row
+    /// changed state under us. Distinguished so the caller can tell "another
+    /// engine owns this batch now" from "retry".
+    async fn refused_write(
+        &self,
+        batch_id: &str,
+        held: Option<i64>,
+        expected: BatchState,
+    ) -> VtopError {
+        let row = sqlx::query("SELECT state, claim_gen FROM batches WHERE batch_id = ?")
+            .bind(batch_id)
+            .fetch_optional(&self.pool)
+            .await;
+        match row {
+            Ok(Some(row)) => {
+                let actual: i64 = row.get("claim_gen");
+                if let Some(held) = held.filter(|held| *held != actual) {
+                    return crate::fence::claim_lost(batch_id, held, actual);
+                }
+                let state: String = row.get("state");
+                VtopError::State(format!(
+                    "batch {batch_id} changed state concurrently (expected {expected}, found {state})"
+                ))
+            }
+            Ok(None) => VtopError::NotFound(format!("batch {batch_id}")),
+            Err(e) => map_sqlx(e),
+        }
     }
 
     /// Shared read helper for the `list_*` queries. `sql` is `'static` because
@@ -214,6 +252,7 @@ impl StateStore for SqliteStateStore {
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?;
+        self.fence.created(&rec.batch_id);
         Ok(())
     }
 
@@ -227,11 +266,17 @@ impl StateStore for SqliteStateStore {
         to: BatchState,
         patch: &BatchPatch,
     ) -> Result<(), VtopError> {
+        let held = self.fence.held(batch_id);
         let current = self.get_state(batch_id).await?;
         let validated = transition(current, to)?; // enforces the core invariant
 
         let now = chrono::Utc::now().to_rfc3339();
-        sqlx::query(
+        // Conditional on the state we validated against AND, for a row this
+        // process holds a claim on, on the claim still being the one it holds
+        // (#557). Unconditional, a write could land on a row another engine
+        // claimed and moved on; state names recur, so the state guard alone
+        // does not stop it.
+        let rows = sqlx::query(
             r#"UPDATE batches SET
                  state = ?,
                  object_uri = COALESCE(?, object_uri),
@@ -243,7 +288,7 @@ impl StateStore for SqliteStateStore {
                  record_count = COALESCE(?, record_count),
                  error_message = COALESCE(?, error_message),
                  updated_at = ?
-               WHERE batch_id = ?"#,
+               WHERE batch_id = ? AND state = ? AND (? IS NULL OR claim_gen = ?)"#,
         )
         .bind(validated.as_str())
         .bind(&patch.object_uri)
@@ -256,9 +301,19 @@ impl StateStore for SqliteStateStore {
         .bind(&patch.error_message)
         .bind(now)
         .bind(batch_id)
+        .bind(current.as_str())
+        .bind(held)
+        .bind(held)
         .execute(&self.pool)
         .await
-        .map_err(map_sqlx)?;
+        .map_err(map_sqlx)?
+        .rows_affected();
+        if rows == 0 {
+            return Err(self.refused_write(batch_id, held, current).await);
+        }
+        if validated == BatchState::SourceCommitted {
+            self.fence.release(batch_id);
+        }
         Ok(())
     }
 
@@ -288,18 +343,28 @@ impl StateStore for SqliteStateStore {
         let now = crate::store::normalize_rfc3339_utc("now", now)?;
         let lease_until = crate::store::normalize_rfc3339_utc("lease_until", lease_until)?;
         let (now, lease_until) = (now.as_str(), lease_until.as_str());
-        sqlx::query(
-            "UPDATE batches SET owner = ?1, lease_expires_at = ?2, updated_at = ?3 \
+        // RETURNING gives the generation THIS statement set, exactly: a second
+        // claim by an engine that shares this `owner` string cannot slip in
+        // between an UPDATE and a follow-up read and leave both holding the
+        // same generation.
+        let claimed = sqlx::query(
+            "UPDATE batches SET owner = ?1, lease_expires_at = ?2, updated_at = ?3, \
+                    claim_gen = claim_gen + 1 \
              WHERE state != ?4 \
-               AND (owner IS NULL OR owner = ?1 OR lease_expires_at IS NULL OR lease_expires_at <= ?3)",
+               AND (owner IS NULL OR owner = ?1 OR lease_expires_at IS NULL OR lease_expires_at <= ?3) \
+             RETURNING batch_id, claim_gen",
         )
         .bind(owner)
         .bind(lease_until)
         .bind(now)
         .bind(BatchState::SourceCommitted.as_str())
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
+        for row in &claimed {
+            let batch_id: String = row.get("batch_id");
+            self.fence.claimed(&batch_id, row.get("claim_gen"));
+        }
         let rows = sqlx::query(
             "SELECT * FROM batches WHERE state != ? AND owner = ? ORDER BY created_at ASC",
         )
@@ -470,6 +535,54 @@ fn row_to_record(row: sqlx::sqlite::SqliteRow) -> Result<BatchRecord, VtopError>
 mod tests {
     use super::*;
     use crate::test_battery;
+
+    /// #557: two handles on one database file stand for two engines.
+    #[tokio::test]
+    async fn sqlite_fences_an_engine_that_lost_its_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("fence.db").display());
+        let a = SqliteStateStore::connect(&url).await.unwrap();
+        let b = SqliteStateStore::connect(&url).await.unwrap();
+        test_battery::run_fencing_battery(&a, &b).await;
+    }
+
+    /// A database created before the fence existed gains the column and keeps
+    /// working: its rows read as generation 0.
+    #[tokio::test]
+    async fn sqlite_upgrades_a_database_that_predates_the_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        let url = format!("sqlite://{}", path.display());
+        {
+            // The pre-fence schema: the table exactly as it was, no claim_gen.
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .connect_with(parse_sqlite_opts(&url).unwrap())
+                .await
+                .unwrap();
+            sqlx::raw_sql(
+                "CREATE TABLE batches (batch_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, \
+                 source_type TEXT NOT NULL, source_name TEXT NOT NULL, format TEXT NOT NULL, \
+                 state TEXT NOT NULL, progress_start_json TEXT NOT NULL, \
+                 progress_end_json TEXT NOT NULL, object_uri TEXT, manifest_uri TEXT, \
+                 object_sha256 TEXT, manifest_sha256 TEXT, manifest_version_id TEXT, \
+                 object_size_bytes INTEGER, record_count INTEGER, error_message TEXT, \
+                 owner TEXT, lease_expires_at TEXT, created_at TEXT NOT NULL, \
+                 updated_at TEXT NOT NULL)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        let rec = test_battery::sample_record("old-1");
+        store.save_batch_state(&rec).await.unwrap();
+        store
+            .update_batch_state("old-1", BatchState::Sealed, &BatchPatch::default())
+            .await
+            .unwrap();
+        // Reopening is idempotent: the column is added once.
+        SqliteStateStore::connect(&url).await.unwrap();
+    }
 
     // The SQLite backend must pass the same behavioural contract every backend
     // passes. Individual scenarios (save/reload, duplicate rejection, commit-
