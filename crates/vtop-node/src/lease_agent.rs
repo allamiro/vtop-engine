@@ -1254,6 +1254,18 @@ impl Promoter {
     }
 }
 
+/// The least the agent waits between rounds, however long the last one took, so
+/// a run of slow rounds cannot spin.
+const MIN_ROUND_PAUSE: Duration = Duration::from_millis(50);
+
+/// The wait after a round that took `elapsed` when rounds should START `delay`
+/// apart.
+fn paced(delay: Duration, elapsed: Duration) -> Duration {
+    delay
+        .saturating_sub(elapsed)
+        .max(MIN_ROUND_PAUSE.min(delay))
+}
+
 /// One round's RPC budget: a single interval shared by every call the round
 /// makes, so a slow read followed by a slow renewal cannot add up to more than
 /// the interval [`LeaseAgentConfig::validate`] reasons about.
@@ -1332,7 +1344,10 @@ impl LeaseAgentConfig {
             ));
         }
         // The longest ONE failed round can take before the next attempt, from
-        // the last good renewal. The agent next acts `renew_interval` later;
+        // the START of the last good renewal round. Rounds start
+        // `renew_interval` apart (the wait after a round is shortened by the
+        // time it took - see `paced`), so the agent next acts `renew_interval`
+        // later however long that round ran;
         // a round that hangs rather than failing fast spends its whole RPC
         // budget, which is `renew_interval` IN TOTAL across the read and the
         // renewal (`RoundClock` — each call draws on what the round has left);
@@ -1932,6 +1947,7 @@ impl LeaseAgent {
             // Cloned out of `self` so the wake branch can ride the same
             // select as the mutably-borrowed step.
             let stand_down = self.stand_down.clone();
+            let round_began = tokio::time::Instant::now();
             let stepped = if release_closed {
                 tokio::select! {
                     stepped = self.step() => stepped,
@@ -1992,7 +2008,12 @@ impl LeaseAgent {
                         }
                         self.gate_degraded = false;
                     }
-                    delay
+                    // Rounds START every `delay`, not every `delay` after the
+                    // last one ENDED: a successful round that spent most of
+                    // its RPC budget would otherwise push the next one later
+                    // by that much, past the spacing `validate` proves the
+                    // lease survives (review of #566).
+                    paced(delay, round_began.elapsed())
                 }
                 Err(error) => {
                     // A metadata group mid-election refuses reads. Retrying is
@@ -4191,6 +4212,21 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(round);
         assert_eq!(clock.budget(interval), interval);
+    }
+
+    /// Rounds start `delay` apart: a round that took most of its budget leaves
+    /// less of the wait, and a very slow one still leaves a pause so a run of
+    /// them cannot spin (review of #566).
+    #[test]
+    fn rounds_start_a_renew_interval_apart_not_a_renew_interval_after_the_last_ended() {
+        let s = Duration::from_secs;
+        assert_eq!(paced(s(5), Duration::ZERO), s(5));
+        assert_eq!(paced(s(5), s(4)), s(1));
+        assert_eq!(paced(s(5), s(5)), MIN_ROUND_PAUSE);
+        assert_eq!(paced(s(5), s(30)), MIN_ROUND_PAUSE);
+        // A delay shorter than the pause is not stretched.
+        let tiny = Duration::from_millis(10);
+        assert_eq!(paced(tiny, Duration::ZERO), tiny);
     }
 
     #[test]

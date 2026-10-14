@@ -136,7 +136,7 @@ granted at it). A live scenario that skews a lease-holding data node would build
 
 What the guard does and does not do. It **bounds** the error; it does not
 remove it. An accepted request keeps the proposer's timestamp, and the
-tolerance is the greater of a quarter of the lease and one second, so a
+tolerance is the greater of a quarter of the lease and one second, capped at half the lease, so a
 deadline can be off by up to that much in either direction. The leader's check
 is also made on a snapshot of its role immediately before the proposal, not
 inside the proposal: if leadership moves to another node in that window, one
