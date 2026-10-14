@@ -33,10 +33,18 @@ Book lens: chapter 4 — formats for encoding data, schema evolution, and datafl
 8. **Dataflow through the database means old rows meet new code.** Postgres/SQLite ledger migrations are explicit and separate from runtime connect (`migrate_state_store`); keep migrations additive and the engine identity free of DDL rights.
 9. **Services: prefer evolvable request/response shapes** over positional ones; carry capability/version in the handshake rather than inferring from behaviour.
 
+10. **Decode-then-re-encode drops what a newer writer added.** Any component that relays or rewrites records must keep unknown bytes. If a hash or MAC covers the re-encoded form, a newer manifest fails verification on an older reader and looks like corruption. Hash stored bytes (or preserve unknown keys), and check the `version` field first so the error says *newer than supported*, not *corrupt*.
+11. **Pick the compatibility direction per flow.** Request/response between servers upgraded in order needs backward compat on requests and forward on responses; anything stored or replicated (log, snapshot, manifest, Raft entry) needs both. A checksum-valid entry that fails to decode is "newer format", not "corrupt".
+12. **Enum/integer shape matters.** Adding an enum variant is backward-only (old readers have no arm); give closed enums an explicit unknown/skip behaviour or a version gate. Widening an integer lets old readers truncate.
+13. **A version field no reader checks is dead.** Negotiate in-band; an unknown message kind gets a typed `Unsupported` reply on a skippable frame, not a dropped connection. Bump the minor when adding kinds; check the peer's selected minor before sending one.
+14. **Mixed-version cluster is its own test.** Raft peers with exact-equality wire versions and strict trailing-byte decoding cannot form a quorum across a rolling upgrade if the new leader proposes a new command tag. Either gate new commands on a persisted cluster `min_version`, or document and enforce all-at-once upgrade of the metadata tier (`OnDelete`/partitioned rollout). `upgrade-compat.sh` only proves a single data dir opens.
+15. **Large integers in JSON** above 2^53 are parsed inexactly by non-Rust consumers; carry large u64s as strings where such consumers exist.
+
 ## Checklist for a format change
 
 - [ ] Which version marker changes, and what do old readers do with the new data?
 - [ ] Is there an old-release fixture in `upgrade-compat.sh` coverage (add the profile if the format is new)?
+- [ ] Mixed-version behaviour stated for each of: old leader/new follower, new leader/old follower, old reader of new data?
 - [ ] Fuzz target extended (`fuzz/fuzz_targets/`: `manifest_parse`, `detect_*`; add one for new parsers)?
 - [ ] Docs updated: `docs/VTOP_PROTOCOL_DRAFT.md` for protocol, `docs/ROADMAP.md` known limitations for compatibility notes?
 - [ ] CHANGELOG / release notes mention it (`scripts/release-notes.sh`, `docs/RELEASE_VERIFICATION.md`)?

@@ -29,12 +29,22 @@ Book lens: chapter 3 (storage engines: log-structured vs B-tree, write amplifica
 
 - **Write amplification and group commit.** `group_commit.rs` shares one durability barrier across producers; ask what latency/throughput the batching window trades and whether ack still follows the shared barrier.
 - **Log vs B-tree.** Sequential appends are cheap and recovery is a scan; random-update structures need a WAL anyway. Don't add in-place updates to segment files.
+- **Background reclaimers need backpressure signals.** Retention, compaction, tier copy and repair each need a backlog metric and an alert; state what happens when one cannot keep up (default: nothing throttles writes and the disk fills). A retention pass that is blocked (floor) or failing must be observable — not silently `eprintln!`.
+- **Retention vs slow consumers.** A log is a bounded buffer; a consumer whose cursor falls below the retention floor loses data, and only that consumer. State whether group cursors are consulted; export per-group lag and time-to-eviction and alert on it. Do not protect a slow consumer by growing the log without bound.
+- **In-memory state has a cardinality bound.** For every map (producer windows, sequence maps, metadata KV) state what bounds it, what evicts, and the restart cost as a function of retained bytes and key count. Sealed-segment open that re-hashes every byte makes restart O(retained data).
+- **Verify/repair/transfer reads are analytics-shaped.** Throttle or isolate them from the produce path and measure foreground p99 while they run. Opening an artifact for audit must not mutate it (no sidecar rewrites on a read-only mount).
+- **Count durability barriers per ack** (data fsync, sidecar fsync, dir fsync), not only bytes written.
 - **Read amplification of indexes.** Sparse index + chunk sidecar rebuild must be derivable from the segment alone (`rebuild_index`); an index that cannot be rebuilt is a second source of truth.
 - **SQLite vs Postgres ledger.** Same trait, different failure modes (single-node file vs networked DB with its own replication lag and failover). Treat Postgres failover as a source of in-doubt commits; the batch state machine must tolerate a ledger that rolls back to an earlier state.
 
 ## Isolation notes for the ledger
 
-If a change makes two engines (HA) touch the same batch row: lost updates, write skew and phantoms are the real risks. Use compare-and-set on state (the transition check already is one), not read-modify-write in application code; keep uniqueness constraints in the database.
+If a change makes two engines (HA) touch the same batch row: lost updates, write skew and phantoms are the real risks.
+- **Lost update:** any read-validate-write on a batch row loses a concurrent change unless the write is conditional on what was read (`UPDATE ... WHERE state = $expected`, check rows affected, re-read on zero). Check both backends — conditional on one is not conditional on the other. A serialization-failure retry must repeat the whole read-validate-write.
+- **Write skew / phantoms** need a multi-row invariant ("no two live batches cover one byte range of a path", "progress equals a contiguous verified prefix"). Row CAS cannot protect these: use a unique constraint, a lock row per source, a single writer per source, or SERIALIZABLE with retry — and name which one holds.
+- "Single engine per store" (instance lock) is the repo's serial-execution isolation. List every path that bypasses it (shared Postgres across hosts, duplicate engine names).
+- **A lease column is a lock with a timeout, not a fence.** Add a claim generation to every later UPDATE of a claimed row.
+- **The ledger is derived data.** It is an index over the manifest log. Can it be rebuilt from manifests, and is a rolled-back ledger (Postgres failover) detected by comparing against the object store?
 
 ## Checklist
 
