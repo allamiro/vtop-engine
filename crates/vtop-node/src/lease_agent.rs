@@ -1254,6 +1254,46 @@ impl Promoter {
     }
 }
 
+/// One round's RPC budget: a single interval shared by every call the round
+/// makes, so a slow read followed by a slow renewal cannot add up to more than
+/// the interval [`LeaseAgentConfig::validate`] reasons about.
+#[derive(Clone, Default)]
+struct RoundClock(Arc<std::sync::Mutex<Option<tokio::time::Instant>>>);
+
+impl RoundClock {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<tokio::time::Instant>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Start a round that may spend `interval` in total. The guard ends it
+    /// when the round finishes or its future is dropped (a `select!` arm).
+    fn open(&self, interval: Duration) -> RoundGuard {
+        *self.slot() = Some(tokio::time::Instant::now() + interval);
+        RoundGuard(self.clone())
+    }
+
+    /// What one call may spend: what is left of the round, never more than
+    /// `interval`; outside a round, the whole `interval`.
+    fn budget(&self, interval: Duration) -> Duration {
+        match *self.slot() {
+            Some(end) => end
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(interval),
+            None => interval,
+        }
+    }
+}
+
+struct RoundGuard(RoundClock);
+
+impl Drop for RoundGuard {
+    fn drop(&mut self) {
+        *self.0.slot() = None;
+    }
+}
+
 /// How the agent paces itself.
 #[derive(Clone, Copy, Debug)]
 pub struct LeaseAgentConfig {
@@ -1294,7 +1334,9 @@ impl LeaseAgentConfig {
         // The longest ONE failed round can take before the next attempt, from
         // the last good renewal. The agent next acts `renew_interval` later;
         // a round that hangs rather than failing fast spends its whole RPC
-        // deadline, which is `renew_interval` (`rpc_deadline`); and a round
+        // budget, which is `renew_interval` IN TOTAL across the read and the
+        // renewal (`RoundClock` — each call draws on what the round has left);
+        // and a round
         // that fails is retried after `poll_interval`, not `renew_interval`.
         // If that sum reaches the lease, ONE lost round trip (a metadata
         // leader election, say) costs the range. The documented pacing is a
@@ -1590,6 +1632,11 @@ pub struct LeaseAgent {
     /// not an epoch) — and only an answer that stops naming this node
     /// clears it. See [`stood_down_verdict`].
     stood_down_latched: bool,
+    /// The instant the current round's RPC budget runs out (see
+    /// [`LeaseAgent::bounded`]). Open for the span of a round and closed by a
+    /// guard when the round ends OR is dropped by a `select!`, so a shutdown
+    /// release outside any round gets a fresh budget.
+    round_clock: RoundClock,
     /// A persistent handle on the same gate, kept so a range that goes
     /// missing AFTER the gate opened can revoke readiness — the consumable
     /// `ready` above only governs the first open (review).
@@ -1704,6 +1751,7 @@ impl LeaseAgent {
             ready: None,
             stand_down: None,
             stood_down_latched: false,
+            round_clock: RoundClock::default(),
             gate: None,
             gate_degraded: false,
             range_missing: false,
@@ -2129,6 +2177,13 @@ impl LeaseAgent {
     /// stays promoted past the instant a rival may legally own the range.
     /// The renew interval is the natural bound: an answer that arrives later
     /// than the next renewal was due is an answer the pacing cannot use.
+    ///
+    /// The bound is per ROUND, not per call: a round reads the lease, may
+    /// publish, then proposes, and giving each call the full interval let a
+    /// slow read plus a slow renewal run two intervals — past the budget
+    /// [`LeaseAgentConfig::validate`] proves the lease survives (review of
+    /// #566). Inside a round, every bounded call draws on what is left of one
+    /// interval; outside a round (shutdown) a call gets the whole interval.
     fn rpc_deadline(&self) -> Duration {
         self.config.renew_interval
     }
@@ -2138,10 +2193,11 @@ impl LeaseAgent {
         what: &str,
         call: impl std::future::Future<Output = Result<T, E>>,
     ) -> Result<T, String> {
-        match tokio::time::timeout(self.rpc_deadline(), call).await {
+        let budget = self.round_clock.budget(self.rpc_deadline());
+        match tokio::time::timeout(budget, call).await {
             Ok(result) => result.map_err(|error| format!("{what}: {error}")),
             Err(_) => Err(format!(
-                "{what}: no answer within {:?}",
+                "{what}: no answer within {budget:?} (the round's budget is {:?})",
                 self.rpc_deadline()
             )),
         }
@@ -2149,6 +2205,11 @@ impl LeaseAgent {
 
     /// One round. Returns how long to wait before the next.
     async fn step(&mut self) -> Result<Duration, String> {
+        let _round = self.round_clock.open(self.rpc_deadline());
+        self.step_round().await
+    }
+
+    async fn step_round(&mut self) -> Result<Duration, String> {
         // Captured BEFORE any proposal: the state machine mints its deadline
         // later than this, so a local deadline derived from it is always at
         // or before the one metadata records.
@@ -4095,6 +4156,41 @@ mod tests {
         let mut promoter = promoter(Arc::clone(&recorder), None);
         assert!(promoter.ensure(5).await);
         assert_eq!(*recorder.promoted.lock().unwrap(), vec![(5, None)]);
+    }
+
+    /// A round's calls share ONE interval. Each call used to get the whole
+    /// interval, so a read that took nearly all of it plus a renewal that hung
+    /// ran two intervals - past the point the pacing validation proves the
+    /// lease survives (review of #566).
+    #[tokio::test]
+    async fn a_rounds_calls_share_one_interval() {
+        // Real (short) time: sleeps never complete early, so every bound below
+        // holds however loaded the machine is.
+        let clock = RoundClock::default();
+        let interval = Duration::from_millis(600);
+        assert_eq!(clock.budget(interval), interval, "outside a round: whole");
+        {
+            let _round = clock.open(interval);
+            assert!(clock.budget(interval) <= interval);
+            // The read takes 400 ms; the renewal may have at most what is left.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let left = clock.budget(interval);
+            assert!(
+                left <= Duration::from_millis(200),
+                "a call after a slow one gets the remainder, not a fresh interval: {left:?}"
+            );
+            // A call after the budget is spent gets nothing.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            assert_eq!(clock.budget(interval), Duration::ZERO);
+        }
+        // The round ended: a shutdown release gets a whole interval again.
+        assert_eq!(clock.budget(interval), interval);
+
+        // A dropped round (a select! arm) closes its budget too.
+        let round = clock.open(interval);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(round);
+        assert_eq!(clock.budget(interval), interval);
     }
 
     #[test]

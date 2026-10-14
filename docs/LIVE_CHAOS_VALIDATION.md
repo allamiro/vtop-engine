@@ -134,6 +134,20 @@ takeover follows the replicated deadline (refused one millisecond before it,
 granted at it). A live scenario that skews a lease-holding data node would build on
 `09-range-leader-failover` and has not been written.
 
+What the guard does and does not do. It **bounds** the error; it does not
+remove it. An accepted request keeps the proposer's timestamp, and the
+tolerance is the greater of a quarter of the lease and one second, so a
+deadline can be off by up to that much in either direction. The leader's check
+is also made on a snapshot of its role immediately before the proposal, not
+inside the proposal: if leadership moves to another node in that window, one
+skewed request can be replicated without being judged. That request is a
+single lease deadline, and the next acquire or renewal is judged by the new
+leader; closing the window outright would need the check inside a
+leader-serialized proposal path, which this change does not attempt. The test
+covers an hour-fast renewal and an hour-slow acquisition; it does not skew a
+holder after a successful renewal, so takeover timing against a holder whose
+clock drifts mid-lease is exercised only for the replicated deadline itself.
+
 The data scenarios stop each process before offline sealing. Recovery first
 truncates any tail beyond the durable commit boundary, then `vtopctl segment
 verify` checks the resulting sealed bundle. For the disk-full follower, the
