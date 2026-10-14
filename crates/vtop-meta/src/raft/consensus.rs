@@ -150,6 +150,20 @@ pub struct OpenraftConsensus {
     /// MAC, never as a MAC of nothing. Installed after construction because
     /// the node resolves it from its environment once the store is open.
     transition_mac_key: std::sync::RwLock<Option<[u8; 32]>>,
+    /// The clock a lease command is stamped with before it is replicated
+    /// (#555). `None` reads the wall clock; tests install a fixed one.
+    leader_clock: std::sync::RwLock<Option<LeaderClock>>,
+}
+
+/// Milliseconds since the Unix epoch, as the metadata leader sees them.
+type LeaderClock = std::sync::Arc<dyn Fn() -> i64 + Send + Sync>;
+
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 impl OpenraftConsensus {
@@ -158,6 +172,28 @@ impl OpenraftConsensus {
             raft,
             store: None,
             transition_mac_key: std::sync::RwLock::new(None),
+            leader_clock: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Stamp lease commands with `clock` instead of the wall clock. For tests
+    /// that need a leader whose time they control.
+    pub fn set_leader_clock(&self, clock: impl Fn() -> i64 + Send + Sync + 'static) {
+        *self
+            .leader_clock
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::sync::Arc::new(clock));
+    }
+
+    fn leader_now_ms(&self) -> i64 {
+        match self
+            .leader_clock
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            Some(clock) => clock(),
+            None => wall_clock_ms(),
         }
     }
 
@@ -652,6 +688,11 @@ pub trait AdminReadSegmentPlacement: Send + Sync {
 #[async_trait]
 impl Consensus for OpenraftConsensus {
     async fn propose(&self, command: MetadataCommand) -> ConsensusResult<CommitReceipt> {
+        // Only the leader gets as far as replicating: a follower's
+        // `client_write` is refused with a redirect, and the client retries at
+        // the leader, which stamps. So the clock that sets a lease deadline is
+        // always the one clock of the node that is leading (#555).
+        let command = command.stamped_by_leader(self.leader_now_ms());
         let response = self
             .raft
             .client_write(command)

@@ -12,15 +12,24 @@
 //! `issued_at_ms` is advisory for every command EXCEPT the lease-election pair
 //! ([`MetadataCommand::AcquireRangeLease`] and
 //! [`MetadataCommand::RenewRangeLease`], #223), where it is the time the
-//! deadline is computed from. Apply stays deterministic either way — the value
-//! is data in the replicated log, so every replica derives the same expiry —
-//! but wall-clock skew on a PROPOSER does affect lease liveness, and pretending
-//! otherwise would be the kind of comment that costs someone an afternoon.
+//! deadline is computed from AND the time an incumbent's lease is judged live
+//! against. Apply stays deterministic either way — the value is data in the
+//! replicated log, so every replica derives the same expiry.
+//!
+//! That value used to come from the PROPOSER's wall clock, so one data node
+//! with a bad clock could steal live leases (clock ahead: every rival looked
+//! expired) or poison its own (clock ahead while holding: the deadline sat in
+//! the future, and after it died nobody could take over until the skew
+//! elapsed) (#555). The metadata leader now overwrites it on exactly these two
+//! commands before proposing ([`MetadataCommand::stamped_by_leader`]), so the
+//! deadline and the liveness judgement come from ONE clock and a proposer's
+//! skew cannot move either. The leader's own clock still matters, and is the
+//! only one that does.
 //!
 //! Skew is bounded in consequence, not prevented: acquisition always mints a
-//! higher fencing epoch, so a skewed candidate can take a range early and be
-//! disruptive, but can never produce two holders that both believe they may
-//! write. Expiry is liveness; the epoch is safety.
+//! higher fencing epoch, so a skewed clock can make a range change hands
+//! earlier or later than intended, but can never produce two holders that both
+//! believe they may write. Expiry is liveness; the epoch is safety.
 
 use crate::keys::{MAX_GROUP_NAME_BYTES, MAX_TOPIC_NAME_BYTES};
 use crate::placement::{MAX_FAILURE_DOMAIN_BYTES, MAX_REPLICAS, MIN_PLACEMENT_WEIGHT};
@@ -126,14 +135,35 @@ const ERROR_KIND_LINEAGE_MISMATCH: u16 = 7;
 /// Common prefix of every command. `request_id` keys the exactly-once dedup
 /// table.
 ///
-/// `issued_at_ms` comes from the proposer's clock. It is advisory for every
-/// command except the lease-election pair (#223), which derives a lease
-/// deadline from it — see the module docs for what that does and does not
-/// expose to clock skew.
+/// `issued_at_ms` is advisory for every command except the lease-election pair
+/// (#223), which derives a lease deadline from it. For that pair the metadata
+/// leader replaces the proposer's value with its own clock before the command
+/// is replicated (#555) — see the module docs.
+///
+/// Every other command keeps the proposer's value as an audit timestamp: no
+/// decision in the state machine reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandEnvelope {
     pub request_id: Uuid,
     pub issued_at_ms: i64,
+}
+
+impl MetadataCommand {
+    /// The command with its lease clock taken from the metadata leader.
+    ///
+    /// Only the lease-election pair is touched: they are the only commands
+    /// whose outcome depends on `issued_at_ms`. The stamped value is what gets
+    /// replicated, so apply stays deterministic and every replica derives the
+    /// same deadline. A retry of a request that already committed is answered
+    /// from the dedup table and is never re-stamped.
+    pub fn stamped_by_leader(mut self, leader_now_ms: i64) -> Self {
+        match &mut self {
+            MetadataCommand::AcquireRangeLease { env, .. }
+            | MetadataCommand::RenewRangeLease { env, .. } => env.issued_at_ms = leader_now_ms,
+            _ => {}
+        }
+        self
+    }
 }
 
 /// Lifecycle state of a registered node.
@@ -2465,6 +2495,41 @@ mod tests {
             request_id: Uuid::from_u128(request),
             issued_at_ms: 1_750_000_000_000,
         }
+    }
+
+    /// #555: exactly the lease-election pair is re-stamped with the leader's
+    /// clock; no other command's timestamp, and nothing else about the pair,
+    /// changes.
+    #[test]
+    fn the_leader_stamps_only_the_lease_election_pair_and_only_their_timestamp() {
+        const LEADER_NOW: i64 = 42;
+        let mut stamped_lease_commands = 0;
+        for original in every_command() {
+            let stamped = original.clone().stamped_by_leader(LEADER_NOW);
+            match &original {
+                MetadataCommand::AcquireRangeLease { .. }
+                | MetadataCommand::RenewRangeLease { .. } => {
+                    stamped_lease_commands += 1;
+                    // Same command, same request id; only the clock replaced.
+                    let mut expected = original.clone();
+                    if let MetadataCommand::AcquireRangeLease { env, .. }
+                    | MetadataCommand::RenewRangeLease { env, .. } = &mut expected
+                    {
+                        env.issued_at_ms = LEADER_NOW;
+                    }
+                    assert_eq!(stamped, expected);
+                    assert_ne!(stamped, original, "the fixture's own timestamp differs");
+                }
+                _ => assert_eq!(
+                    stamped, original,
+                    "a command whose outcome never reads issued_at_ms must not be rewritten"
+                ),
+            }
+        }
+        assert_eq!(
+            stamped_lease_commands, 2,
+            "both lease-election commands are covered by the fixture"
+        );
     }
 
     fn every_command() -> Vec<MetadataCommand> {

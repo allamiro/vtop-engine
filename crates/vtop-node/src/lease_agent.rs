@@ -1291,6 +1291,26 @@ impl LeaseAgentConfig {
                 self.renew_interval, self.lease_duration
             ));
         }
+        // The next renewal is attempted one interval after a failed one. At
+        // half the lease or more, that attempt lands at or after the deadline:
+        // one lost round trip (a metadata leader election, say) costs the
+        // range. The documented pacing is a third (see `Default`), which
+        // tolerates two failures in a row.
+        if self.renew_interval.saturating_mul(2) >= self.lease_duration {
+            return Err(format!(
+                "renew_interval ({:?}) is at least half of lease_duration ({:?}), so a single \
+                 failed renewal loses the range; keep it at a third of the lease or less",
+                self.renew_interval, self.lease_duration
+            ));
+        }
+        if self.renew_interval.saturating_mul(3) > self.lease_duration {
+            tracing::warn!(
+                renew_interval = ?self.renew_interval,
+                lease_duration = ?self.lease_duration,
+                "renew_interval is more than a third of lease_duration: two consecutive failed \
+                 renewals will lose the range"
+            );
+        }
         if self.poll_interval.is_zero() {
             return Err("poll_interval must be greater than zero".into());
         }
@@ -4080,6 +4100,36 @@ mod tests {
             "a renew interval that never beats the deadline loses the range every \
              time: {error}"
         );
+    }
+
+    /// At half the lease or more, the attempt after a failed renewal lands at
+    /// or after the deadline: one lost round trip costs the range (#555).
+    #[test]
+    fn a_renew_interval_of_half_the_lease_or_more_is_rejected() {
+        let lease = Duration::from_secs(12);
+        for renew in [Duration::from_secs(6), Duration::from_secs(9)] {
+            let config = LeaseAgentConfig {
+                lease_duration: lease,
+                renew_interval: renew,
+                poll_interval: Duration::from_secs(1),
+            };
+            let error = config.validate().unwrap_err();
+            assert!(
+                error.contains("a single failed renewal loses the range"),
+                "{renew:?} of {lease:?}: {error}"
+            );
+        }
+        // A third is the documented pacing; just over a third is allowed (it
+        // warns) because two lost renewals in a row is a tuning choice.
+        for renew in [Duration::from_secs(4), Duration::from_millis(5_500)] {
+            LeaseAgentConfig {
+                lease_duration: lease,
+                renew_interval: renew,
+                poll_interval: Duration::from_secs(1),
+            }
+            .validate()
+            .unwrap_or_else(|e| panic!("{renew:?} of {lease:?} should be accepted: {e}"));
+        }
     }
 
     #[test]

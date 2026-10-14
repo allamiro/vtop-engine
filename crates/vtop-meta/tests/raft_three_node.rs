@@ -949,6 +949,155 @@ async fn lease_fencing_epochs_are_strictly_monotonic_across_the_cluster() {
     cluster.assert_converged_snapshots();
 }
 
+/// #555: a lease deadline used to be the PROPOSER's wall clock plus the lease
+/// length. A data node with a fast clock then saw every incumbent's lease as
+/// expired and stole it, and one holding a lease stamped its own deadline an
+/// hour into the future, so after it died nobody could take over until that
+/// hour passed. The leader now stamps both commands with its own clock, so one
+/// clock sets the deadline AND judges liveness, and a proposer's skew moves
+/// neither.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn the_leader_stamps_lease_time_so_a_skewed_proposer_cannot_steal_or_poison_a_lease() {
+    use vtop_meta::{Consensus, MetadataError, OpenraftConsensus};
+
+    const LEADER_NOW: i64 = 1_750_000_100_000;
+    const HOUR_MS: i64 = 3_600_000;
+    const LEASE_MS: u64 = 15_000;
+
+    let seed = SEED ^ 0x555;
+    let mut cluster = Cluster::boot(seed).await;
+    let (holder, rival) = (Uuid::from_u128(0x10), Uuid::from_u128(0x11));
+    let (topic_uuid, range_uuid) = (Uuid::from_u128(0x20), Uuid::from_u128(0x21));
+    for node in [holder, rival] {
+        let env = cluster.envelope();
+        let resp = cluster.write(register_cmd(env, node)).await;
+        assert!(matches!(resp, MetadataResponse::Ack { .. }), "{resp:?}");
+    }
+    let env = cluster.envelope();
+    let resp = cluster
+        .write(MetadataCommand::CreateTopic {
+            env,
+            name: "events.v1".into(),
+            topic_uuid,
+            root_range_uuid: range_uuid,
+        })
+        .await;
+    assert!(
+        matches!(resp, MetadataResponse::TopicCreated { .. }),
+        "{resp:?}"
+    );
+
+    // The consensus façade over the LEADER's raft, with a clock we control.
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone());
+    consensus.set_leader_clock(|| LEADER_NOW);
+    let read_lease = |cluster: &Cluster| {
+        let range_key = MetaKey::Range {
+            topic_uuid,
+            range_uuid,
+        };
+        cluster
+            .leader()
+            .store
+            .with_storage(|s| match s.state().record(&range_key) {
+                Some(MetaValue::Range(range)) => range.clone(),
+                other => panic!("missing range seed={seed:#x}: {other:?}"),
+            })
+    };
+    let envelope = |cluster: &mut Cluster, issued_at_ms: i64| CommandEnvelope {
+        issued_at_ms,
+        ..cluster.envelope()
+    };
+
+    // 1. A holder whose clock runs an hour FAST asks for a 15 s lease. The
+    //    deadline must be the leader's time plus 15 s, not an hour later.
+    let generation = read_lease(&cluster).generation;
+    let env = envelope(&mut cluster, LEADER_NOW + HOUR_MS);
+    let receipt = consensus
+        .propose(MetadataCommand::AcquireRangeLease {
+            env,
+            topic_uuid,
+            range_uuid,
+            holder_node_uuid: holder,
+            expected_range_generation: generation,
+            lease_duration_ms: LEASE_MS,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(receipt.response, MetadataResponse::LeaseGranted { .. }),
+        "seed={seed:#x}: {:?}",
+        receipt.response
+    );
+    // Heartbeats are off in this harness; `Cluster::write` pushes the commit
+    // to the followers the same way.
+    let _ = cluster.leader().raft.trigger().heartbeat().await;
+    cluster
+        .wait_applied_at_least(receipt.log_id.index - 1)
+        .await; // meta index is 1-based
+    let lease = read_lease(&cluster).lease.expect("a lease");
+    assert_eq!(
+        lease.expires_at_ms,
+        Some(LEADER_NOW + LEASE_MS as i64),
+        "the deadline is the LEADER's clock plus the duration; the holder's fast clock \
+         must not have pushed it an hour out (seed={seed:#x})"
+    );
+
+    // 2. A rival whose clock is an hour fast would have seen that lease as long
+    //    expired and taken it. Judged on the leader's clock it is live.
+    let generation = read_lease(&cluster).generation;
+    let env = envelope(&mut cluster, LEADER_NOW + HOUR_MS);
+    let receipt = consensus
+        .propose(MetadataCommand::AcquireRangeLease {
+            env,
+            topic_uuid,
+            range_uuid,
+            holder_node_uuid: rival,
+            expected_range_generation: generation,
+            lease_duration_ms: LEASE_MS,
+        })
+        .await
+        .unwrap();
+    match receipt.response {
+        MetadataResponse::Rejected(MetadataError::InvalidTransition(why)) => {
+            assert!(why.contains("still live"), "seed={seed:#x}: {why}")
+        }
+        other => panic!("a fast-clocked rival stole a live lease (seed={seed:#x}): {other:?}"),
+    }
+
+    // 3. A renewal by the holder, again with an hour-fast clock, extends the
+    //    deadline from the leader's time too.
+    let epoch = read_lease(&cluster).fencing_epoch;
+    let env = envelope(&mut cluster, LEADER_NOW + HOUR_MS);
+    let receipt = consensus
+        .propose(MetadataCommand::RenewRangeLease {
+            env,
+            topic_uuid,
+            range_uuid,
+            holder_node_uuid: holder,
+            expected_fencing_epoch: epoch,
+            lease_duration_ms: LEASE_MS,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            receipt.response,
+            MetadataResponse::LeaseGranted { fencing_epoch } if fencing_epoch == epoch
+        ),
+        "a renewal keeps the epoch (seed={seed:#x}): {:?}",
+        receipt.response
+    );
+    let _ = cluster.leader().raft.trigger().heartbeat().await;
+    cluster
+        .wait_applied_at_least(receipt.log_id.index - 1)
+        .await; // meta index is 1-based
+    assert_eq!(
+        read_lease(&cluster).lease.expect("a lease").expires_at_ms,
+        Some(LEADER_NOW + LEASE_MS as i64),
+        "renewal is stamped by the leader as well (seed={seed:#x})"
+    );
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn single_node_client_write_commits() {
     let seed = SEED ^ 0x99;
