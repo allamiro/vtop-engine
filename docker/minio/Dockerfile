@@ -64,5 +64,13 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/minio /out/mc /usr/local/bin/
+# Not root. /data is created owned by this user, so a NEW named volume mounted
+# there starts with that ownership (Docker copies it from the image). A lab
+# volume left by the withdrawn upstream image, which ran as root, is
+# root-owned: `docker compose down -v` once to recreate it.
+RUN useradd --system --uid 10002 --home-dir /tmp --shell /usr/sbin/nologin minio \
+ && mkdir -p /data \
+ && chown minio:minio /data
+USER minio
 EXPOSE 9000 9001
 ENTRYPOINT ["minio"]

@@ -478,7 +478,9 @@ Hub and then quay.io), so the lab builds the pinned release from MinIO's
 source (`docker/minio/Dockerfile`, checked out by commit). The first
 `docker compose up` compiles it, which takes a minute or two. The upstream
 repository is archived and receives no security fixes: this is a lab endpoint
-on loopback-bound ports, never a store for real data.
+on loopback-bound ports, never a store for real data. It runs as an
+unprivileged user; a `minio-data` volume left by the older root-run image is
+root-owned, so recreate it once with `docker compose down -v`.
 
 MinIO endpoints (loopback only):
 
