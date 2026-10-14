@@ -1085,14 +1085,14 @@ impl LocalBroker {
     /// node configuration rejects zero outright, so the only way to disable
     /// retention is to not configure it.
     pub fn set_retention(&self, policy: Option<vtop_log::RetentionPolicy>) {
-        self.retention_max_total_bytes.store(
-            policy.map(|policy| policy.max_total_bytes).unwrap_or(0),
-            Ordering::SeqCst,
-        );
-        if policy.is_none() {
-            // Nothing will record over the last pass's state now; left in
-            // place it would keep exporting a stale bound, size and blocked
-            // reason (review of #572).
+        let bound = policy.map(|policy| policy.max_total_bytes).unwrap_or(0);
+        self.retention_max_total_bytes
+            .store(bound, Ordering::SeqCst);
+        if bound == 0 {
+            // Disabled - by `None` or by a zero bound, which this layer
+            // treats the same (review). Nothing will record over the last
+            // pass's state now; left in place it would keep exporting a
+            // stale bound, size and blocked reason (review of #572).
             self.retention_stats.clear();
         }
     }

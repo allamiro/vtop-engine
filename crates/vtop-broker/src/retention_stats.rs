@@ -70,7 +70,6 @@ impl RetentionStats {
             }
         };
         self.last_pass_failed.store(false, Ordering::Relaxed);
-        self.measured.store(true, Ordering::Relaxed);
         self.retained_bytes
             .store(outcome.retained_bytes, Ordering::Relaxed);
         self.reclaimed_bytes
@@ -85,6 +84,10 @@ impl RetentionStats {
             None => 0,
         };
         let before = self.blocked_now.swap(now, Ordering::Relaxed);
+        // LAST, and Release (review): a scrape that sees `measured` (with
+        // Acquire) sees the size and blocked state this pass measured, not
+        // the zero/unblocked defaults a first pass is still replacing.
+        self.measured.store(true, Ordering::Release);
         if before != now {
             match outcome.blocked {
                 Some(reason) => eprintln!(
@@ -113,7 +116,7 @@ impl RetentionStats {
     /// exports nothing rather than a misleading bound of zero.
     pub fn snapshot(&self) -> Option<RetentionSnapshot> {
         let bound_bytes = self.bound_bytes();
-        let measured = self.measured.load(Ordering::Relaxed);
+        let measured = self.measured.load(Ordering::Acquire);
         (bound_bytes > 0).then(|| RetentionSnapshot {
             retained_bytes: measured.then(|| self.retained_bytes()),
             bound_bytes,

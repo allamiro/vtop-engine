@@ -123,7 +123,7 @@ past the bound; a lagging follower the quorum can do without does not. The
 pass used to report that exactly as it reported a range comfortably under its
 bound: silently. `vtop_broker_retention_blocked{reason}` now says which:
 `committed_floor` (the quorum mark is behind; `vtop_broker_follower_lag_records`
-shows which followers are) or `active_segment` (the bound is smaller than one
+shows which followers are behind) or `active_segment` (the bound is smaller than one
 segment). The node logs the change once, not every append. The rule **Range
 retention blocked** fires after 15 minutes, and **Range retention failing**
 when the latest pass failed and none has succeeded for 10 minutes (a pass runs
