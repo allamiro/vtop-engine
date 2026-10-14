@@ -73,6 +73,20 @@ const RETENTION_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// `None` for a partition with no committed cursor. Nothing has been read, so
 /// nothing can have been missed, and reporting a "gap" the size of the whole
 /// topic on first assignment is the fastest way to make this signal useless.
+/// Where a rewind to `start_offset` should actually land.
+///
+/// The consumer group's committed offset is the frontier everything below which
+/// is archived: it is only ever advanced after a batch is VERIFIED. A rewind
+/// below it would re-read, and re-archive, records that are already safe, and
+/// recovery asks for exactly that on every restart for a ledger row that a
+/// later batch has long since superseded. So a rewind never moves below the
+/// committed frontier, the same rule the file and spool adapters apply to
+/// their committed byte. When the frontier is not known (the broker could not
+/// be asked) the requested start is used unchanged.
+fn clamp_rewind(start_offset: i64, group_committed: Option<i64>) -> i64 {
+    group_committed.map_or(start_offset, |committed| start_offset.max(committed))
+}
+
 fn retention_gap(desired_offset: Option<i64>, low_watermark: i64) -> Option<u64> {
     let desired = desired_offset?;
     // A NEGATIVE OFFSET IS A SENTINEL, NOT A POSITION. librdkafka spells
@@ -531,6 +545,25 @@ impl KafkaSource {
                 records,
             })
             .collect()
+    }
+
+    /// The group's committed "next offset" for one partition, from the broker.
+    /// `None` when nothing is committed or the broker cannot be asked within
+    /// the bound; callers then fall back to what they already know.
+    fn group_committed_offset(&mut self, topic: &str, partition: i32) -> Option<i64> {
+        let consumer = self.consumer().ok()?;
+        let mut wanted = TopicPartitionList::new();
+        wanted.add_partition(topic, partition);
+        let committed = consumer
+            .committed_offsets(
+                wanted,
+                std::time::Duration::from_secs(WATERMARK_TIMEOUT_SECONDS),
+            )
+            .ok()?;
+        match committed.find_partition(topic, partition)?.offset() {
+            Offset::Offset(at) => Some(at),
+            _ => None,
+        }
     }
 
     fn consumer(&mut self) -> Result<&BaseConsumer, VtopError> {
@@ -1115,10 +1148,34 @@ impl SourceAdapter for KafkaSource {
         // Reads assign() from the cursor, so rewinding means resetting the
         // cursor: clear the in-memory read head and pin the resume position to
         // start_offset. The next read assigns the partition at that offset.
+        //
+        // Never below the group's committed offset: see `clamp_rewind`. The
+        // broker is asked because after a restart this process holds no
+        // committed offset of its own, and the in-memory one is only a lower
+        // bound of it.
+        let broker = self.group_committed_offset(topic, *partition);
+        let in_memory = self
+            .cursors
+            .get(&(topic.clone(), *partition))
+            .and_then(|cur| cur.committed_offset);
+        let frontier = match (broker, in_memory) {
+            (Some(b), Some(m)) => Some(b.max(m)),
+            (b, m) => b.or(m),
+        };
+        let resume_at = clamp_rewind(*start_offset, frontier);
         let cur = self.cursors.entry((topic.clone(), *partition)).or_default();
         cur.last_read_offset = None;
-        cur.committed_offset = Some(*start_offset);
-        tracing::warn!(topic, partition, start_offset, "kafka rewound for replay");
+        cur.committed_offset = Some(resume_at);
+        if resume_at != *start_offset {
+            tracing::info!(
+                topic,
+                partition,
+                requested = start_offset,
+                committed = resume_at,
+                "kafka rewind clamped to the group's committed offset: the range is already archived"
+            );
+        }
+        tracing::warn!(topic, partition, resume_at, "kafka rewound for replay");
         Ok(())
     }
 
@@ -1135,6 +1192,20 @@ impl SourceAdapter for KafkaSource {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn a_rewind_never_goes_below_the_groups_committed_offset() {
+        // A genuine rewind: nothing committed past the failed range, so it
+        // lands where asked.
+        assert_eq!(clamp_rewind(100, Some(100)), 100);
+        assert_eq!(clamp_rewind(100, Some(40)), 100);
+        // A superseded ledger row: the group has committed well past it, and
+        // rewinding to it would re-archive everything since.
+        assert_eq!(clamp_rewind(100, Some(5_000)), 5_000);
+        // Nothing known: the request is honoured.
+        assert_eq!(clamp_rewind(100, None), 100);
+        assert_eq!(clamp_rewind(0, Some(0)), 0);
+    }
 
     fn cfg() -> KafkaSourceConfig {
         KafkaSourceConfig {

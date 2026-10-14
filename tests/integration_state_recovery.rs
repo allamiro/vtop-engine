@@ -16,7 +16,7 @@ use vtop_core::types::{CompressionType, ProgressMarker, SourceType, TelemetryFor
 use vtop_state::{BatchPatch, BatchRecord, SqliteStateStore, StateStore};
 
 #[allow(clippy::too_many_arguments)]
-fn write_recovery_manifest(
+fn write_recovery_manifest_with_records(
     work_dir: &Path,
     batch_id: &str,
     source_name: &str,
@@ -26,6 +26,7 @@ fn write_recovery_manifest(
     object_size: u64,
     checksum_algorithm: &str,
     checksum: &str,
+    record_count: usize,
 ) -> (VtopManifest, PathBuf) {
     let manifest = ManifestBuilder {
         batch_id: batch_id.into(),
@@ -34,7 +35,7 @@ fn write_recovery_manifest(
         source_name: source_name.into(),
         format: TelemetryFormat::Raw,
         compression: CompressionType::None,
-        record_count: 1,
+        record_count,
         first_timestamp: None,
         last_timestamp: None,
         source_progress: progress,
@@ -52,6 +53,32 @@ fn write_recovery_manifest(
     .unwrap();
     let path = manifest.write_to_file(work_dir).unwrap();
     (manifest, path)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_recovery_manifest(
+    work_dir: &Path,
+    batch_id: &str,
+    source_name: &str,
+    progress: ProgressMarker,
+    object_uri: &str,
+    manifest_uri: &str,
+    object_size: u64,
+    checksum_algorithm: &str,
+    checksum: &str,
+) -> (VtopManifest, PathBuf) {
+    write_recovery_manifest_with_records(
+        work_dir,
+        batch_id,
+        source_name,
+        progress,
+        object_uri,
+        manifest_uri,
+        object_size,
+        checksum_algorithm,
+        checksum,
+        1,
+    )
 }
 
 #[tokio::test]
@@ -996,7 +1023,8 @@ async fn recovery_does_not_commit_a_verified_range_above_a_failed_one() {
     let manifest_uri = "s3://telemetry-data/x/b-above.manifest.json";
     let object_bytes = b"archived-bytes";
     let object_digest = vtop_core::checksum::sha256_bytes(object_bytes);
-    let (manifest, manifest_path) = write_recovery_manifest(
+    // The ledger row below says two records; the manifest must agree.
+    let (manifest, manifest_path) = write_recovery_manifest_with_records(
         &work,
         "b-above",
         &path,
@@ -1006,6 +1034,7 @@ async fn recovery_does_not_commit_a_verified_range_above_a_failed_one() {
         object_bytes.len() as u64,
         "sha256",
         &object_digest,
+        2,
     );
     let row = |id: &str, start: u64, end: u64, at: &str| BatchRecord {
         batch_id: id.into(),

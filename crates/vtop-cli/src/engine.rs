@@ -2147,7 +2147,7 @@ impl Engine {
                             summary.still_pending += 1;
                             continue;
                         }
-                        rewinds.add(&rec.progress_start, &rec.progress_end);
+                        rewinds.add(&rec.progress_start);
                         // Dashboards must see this refusal path like any other
                         // replay (#123 review).
                         if let Some(mx) = telemetry::metrics() {
@@ -2205,7 +2205,7 @@ impl Engine {
                         summary.still_pending += 1;
                         continue;
                     }
-                    rewinds.add(&rec.progress_start, &rec.progress_end);
+                    rewinds.add(&rec.progress_start);
                     if let Some(mx) = telemetry::metrics() {
                         // Replay is safe by design, but a sustained rate means
                         // work is being repeated - worth seeing on a dashboard.
@@ -2238,7 +2238,7 @@ impl Engine {
         // stays VERIFIED, its object stays in the archive, and a later pass
         // commits it once the source has caught up.
         for rec in verified {
-            if rewinds.holds_back(&rec.progress_start, &rec.progress_end) {
+            if rewinds.holds_back(&rec.progress_start) {
                 tracing::warn!(
                     batch_id = %rec.batch_id,
                     "recovery: not committing a VERIFIED range above an incomplete one of the same source; \
@@ -2458,19 +2458,23 @@ impl Engine {
 #[derive(Default)]
 struct RewindPlan {
     lowest: HashMap<String, ProgressMarker>,
-    /// Every range being handed back, per unit, as `(start, position after)`.
-    ranges: HashMap<String, Vec<(i128, i128)>>,
+    /// The lowest pending start per source (a path or a topic-partition), per
+    /// inode, for [`RewindPlan::holds_back`].
+    by_source: HashMap<String, Vec<(Option<u64>, i128)>>,
 }
 
 impl RewindPlan {
-    /// Record that the range `start..end` is being handed back to its source.
-    fn add(&mut self, start: &ProgressMarker, end: &ProgressMarker) {
+    /// Record that the range starting at `start` is being handed back to its
+    /// source. (Only where it starts matters: see [`RewindPlan::holds_back`].)
+    fn add(&mut self, start: &ProgressMarker) {
         let position = start_position(start);
+        let inode = marker_inode(start);
+        let groups = self.by_source.entry(source_key(start)).or_default();
+        match groups.iter_mut().find(|(i, _)| *i == inode) {
+            Some((_, lowest)) => *lowest = (*lowest).min(position),
+            None => groups.push((inode, position)),
+        }
         let unit = unit_key(start);
-        self.ranges
-            .entry(unit.clone())
-            .or_default()
-            .push((position, position_after(end)));
         match self.lowest.get(&unit) {
             Some(held) if start_position(held) <= position => {}
             _ => {
@@ -2479,22 +2483,37 @@ impl RewindPlan {
         }
     }
 
-    /// Whether committing the VERIFIED range `start..end` would move its source
-    /// unit's committed point past a range that is about to be re-read and that
-    /// this range does not itself cover. The file adapters never rewind below
-    /// their committed point, so committing first would turn the rewind into a
-    /// no-op and skip the failed data.
+    /// Whether committing the VERIFIED range starting at `start` would strand
+    /// bytes that are about to be re-read.
     ///
-    /// A VERIFIED range that covers the pending one is the common benign case
-    /// (the object that replaced a stale row for the same bytes): committing
-    /// it is right, and the clamped rewind then correctly does nothing.
-    fn holds_back(&self, start: &ProgressMarker, end: &ProgressMarker) -> bool {
-        let (from, after) = (start_position(start), position_after(end));
-        self.ranges.get(&unit_key(end)).is_some_and(|pending| {
-            pending.iter().any(|&(r_start, r_after)| {
-                r_start < after && !(from <= r_start && r_after <= after)
+    /// The file adapters never rewind below their committed point, so a commit
+    /// moves a source unit's frontier to the end of the committed range and
+    /// everything below it is treated as archived. A VERIFIED range archives
+    /// exactly `start..end`. Pending bytes at or above its end stay above the
+    /// frontier and are still re-read; pending bytes inside it are archived by
+    /// it. The only bytes it can strand are pending ones BELOW its start: so
+    /// the commit is held back exactly when a range of the same unit that
+    /// starts below it is about to be re-read.
+    ///
+    /// A VERIFIED range that replaces a stale row for the same bytes starts
+    /// where the pending range starts, so it commits (the clamped rewind then
+    /// correctly does nothing).
+    ///
+    /// A marker with no inode (written before inodes were recorded, or on a
+    /// platform without them) cannot be told apart from any file at its path,
+    /// so it is compared against every inode's pending ranges, and a pending
+    /// range with no inode counts against every VERIFIED range at the path.
+    fn holds_back(&self, start: &ProgressMarker) -> bool {
+        let from = start_position(start);
+        let inode = marker_inode(start);
+        self.by_source
+            .get(&source_key(start))
+            .is_some_and(|groups| {
+                groups
+                    .iter()
+                    .filter(|(i, _)| inode.is_none() || i.is_none() || *i == inode)
+                    .any(|&(_, lowest)| lowest < from)
             })
-        })
     }
 
     fn into_markers(self) -> Vec<ProgressMarker> {
@@ -2505,10 +2524,9 @@ impl RewindPlan {
     }
 }
 
-/// The source unit a marker belongs to: the same for a batch's start and end
-/// markers, and for every batch read from the same file at the same inode.
-fn unit_key(marker: &ProgressMarker) -> String {
-    let inode = |inode: &Option<u64>| inode.map_or_else(|| "?".to_string(), |i| i.to_string());
+/// The source a marker belongs to, ignoring which file at that path it was
+/// read from: a path, or a Kafka topic-partition.
+fn source_key(marker: &ProgressMarker) -> String {
     match marker {
         ProgressMarker::Kafka {
             topic,
@@ -2516,15 +2534,25 @@ fn unit_key(marker: &ProgressMarker) -> String {
             consumer_group,
             ..
         } => format!("kafka|{consumer_group}|{topic}#p{partition}"),
-        ProgressMarker::File {
-            path, inode: ino, ..
-        } => format!("file|{path}|{}", inode(ino)),
-        ProgressMarker::SyslogSpool {
-            spool_id,
-            path,
-            inode: ino,
-            ..
-        } => format!("spool|{spool_id}|{path}|{}", inode(ino)),
+        ProgressMarker::File { path, .. } => format!("file|{path}"),
+        ProgressMarker::SyslogSpool { spool_id, path, .. } => format!("spool|{spool_id}|{path}"),
+    }
+}
+
+/// The inode a marker was read from, where it records one.
+fn marker_inode(marker: &ProgressMarker) -> Option<u64> {
+    match marker {
+        ProgressMarker::Kafka { .. } => None,
+        ProgressMarker::File { inode, .. } | ProgressMarker::SyslogSpool { inode, .. } => *inode,
+    }
+}
+
+/// The source unit a marker belongs to: the same for a batch's start and end
+/// markers, and for every batch read from the same file at the same inode.
+fn unit_key(marker: &ProgressMarker) -> String {
+    match marker_inode(marker) {
+        Some(inode) => format!("{}|{inode}", source_key(marker)),
+        None => format!("{}|?", source_key(marker)),
     }
 }
 
@@ -2534,17 +2562,6 @@ fn start_position(marker: &ProgressMarker) -> i128 {
         ProgressMarker::Kafka { start_offset, .. } => i128::from(*start_offset),
         ProgressMarker::File { start_byte, .. }
         | ProgressMarker::SyslogSpool { start_byte, .. } => i128::from(*start_byte),
-    }
-}
-
-/// The first position AFTER a range: what committing it would advance its
-/// unit to. Kafka marker offsets are inclusive, so the next offset is one past.
-fn position_after(marker: &ProgressMarker) -> i128 {
-    match marker {
-        ProgressMarker::Kafka { end_offset, .. } => i128::from(*end_offset) + 1,
-        ProgressMarker::File { end_byte, .. } | ProgressMarker::SyslogSpool { end_byte, .. } => {
-            i128::from(*end_byte)
-        }
     }
 }
 
@@ -3463,11 +3480,11 @@ mod tests {
             ];
             let mut plan = RewindPlan::default();
             for i in order {
-                plan.add(&candidates[i], &candidates[i]);
+                plan.add(&candidates[i]);
             }
             // The current file at the same path, at a HIGHER offset than the
             // old one's lowest: it must not be hidden by it.
-            let add = |plan: &mut RewindPlan, m: ProgressMarker| plan.add(&m, &m);
+            let add = |plan: &mut RewindPlan, m: ProgressMarker| plan.add(&m);
             add(&mut plan, file("/a", Some(2), 500));
             add(&mut plan, file("/b", None, 5));
             add(&mut plan, kafka(0, 50));
@@ -3484,21 +3501,20 @@ mod tests {
                     ("file|/a|1".to_string(), 20),
                     ("file|/a|2".to_string(), 500),
                     ("file|/b|?".to_string(), 5),
-                    ("kafka|g|t#p0".to_string(), 10),
-                    ("kafka|g|t#p1".to_string(), 99),
+                    ("kafka|g|t#p0|?".to_string(), 10),
+                    ("kafka|g|t#p1|?".to_string(), 99),
                 ],
                 "order {order:?}"
             );
         }
     }
 
-    /// Committing a VERIFIED range above one that is about to be re-read would
-    /// move the adapter's committed point past it, and the file adapters clamp
-    /// a rewind to the committed point: the lower range would be skipped. A
-    /// VERIFIED range that COVERS the pending one is a different thing — it is
-    /// the archive of those very bytes — and must commit.
+    /// Committing a VERIFIED range moves its unit's frontier to the end of that
+    /// range, and the file adapters never rewind below the frontier. A
+    /// VERIFIED range archives exactly its own bytes, so the only bytes a
+    /// commit can strand are pending ones BELOW its start.
     #[test]
-    fn a_verified_range_is_held_back_only_by_a_pending_range_it_does_not_cover() {
+    fn a_verified_range_is_held_back_only_by_a_pending_range_that_starts_below_it() {
         let file = |path: &str, inode: u64, start: u64, end: u64| ProgressMarker::File {
             path: path.into(),
             inode: Some(inode),
@@ -3507,38 +3523,33 @@ mod tests {
             file_size: 0,
             mtime: String::new(),
         };
-        let held = |plan: &RewindPlan, m: &ProgressMarker| plan.holds_back(m, m);
         let mut plan = RewindPlan::default();
-        let pending = file("/a", 1, 100, 150);
-        plan.add(&pending, &pending);
-        // Above the pending range, or straddling it without covering it: held.
-        assert!(held(&plan, &file("/a", 1, 150, 200)));
-        assert!(held(&plan, &file("/a", 1, 90, 101)), "straddles the start");
-        assert!(held(&plan, &file("/a", 1, 120, 200)), "starts inside it");
-        // The same bytes, or more: committing it covers what is being re-read.
-        assert!(!held(&plan, &file("/a", 1, 100, 150)));
-        assert!(!held(&plan, &file("/a", 1, 90, 200)));
-        // Ends at or below the pending range: cannot skip it.
-        assert!(!held(&plan, &file("/a", 1, 50, 100)));
-        assert!(!held(&plan, &file("/a", 1, 0, 40)));
+        plan.add(&file("/a", 1, 100, 150));
+        // Starts above the pending range: its commit would strand bytes 100..
+        assert!(plan.holds_back(&file("/a", 1, 150, 200)));
+        assert!(
+            plan.holds_back(&file("/a", 1, 120, 200)),
+            "starts inside it"
+        );
+        // The same start (the object that replaced a stale row for these
+        // bytes), or lower: nothing pending is left below its start.
+        assert!(!plan.holds_back(&file("/a", 1, 100, 150)));
+        assert!(!plan.holds_back(&file("/a", 1, 90, 200)));
+        assert!(
+            !plan.holds_back(&file("/a", 1, 90, 101)),
+            "pending 101.. stays above the frontier"
+        );
+        assert!(!plan.holds_back(&file("/a", 1, 50, 100)));
+        assert!(!plan.holds_back(&file("/a", 1, 0, 40)));
         // Another inode of the path, another path: unaffected.
-        assert!(!held(&plan, &file("/a", 2, 150, 200)));
-        assert!(!held(&plan, &file("/b", 1, 150, 200)));
-        // With several pending ranges, one the VERIFIED range does not cover is
-        // enough to hold it back; ranges wholly above it do not matter.
-        let second = file("/a", 1, 300, 320);
-        plan.add(&second, &second);
-        assert!(
-            !held(&plan, &file("/a", 1, 90, 200)),
-            "covers 100-150; 300 is above it"
-        );
-        assert!(!held(&plan, &file("/a", 1, 90, 400)), "covers both");
-        assert!(
-            held(&plan, &file("/a", 1, 200, 400)),
-            "covers 300-320 but not 100-150"
-        );
-        // Kafka offsets are inclusive: a range ENDING at the pending offset
-        // commits through it.
+        assert!(!plan.holds_back(&file("/a", 2, 150, 200)));
+        assert!(!plan.holds_back(&file("/b", 1, 150, 200)));
+        // The LOWEST pending start decides, however many there are.
+        plan.add(&file("/a", 1, 300, 320));
+        plan.add(&file("/a", 1, 60, 80));
+        assert!(plan.holds_back(&file("/a", 1, 90, 200)), "60 is below 90");
+        assert!(!plan.holds_back(&file("/a", 1, 60, 400)));
+        // Kafka offsets are inclusive: the pending range 10..=19.
         let kafka = |start: i64, end: i64| ProgressMarker::Kafka {
             topic: "t".into(),
             partition: 0,
@@ -3547,14 +3558,43 @@ mod tests {
             consumer_group: "g".into(),
         };
         let mut plan = RewindPlan::default();
-        let pending = kafka(10, 19);
-        plan.add(&pending, &pending);
+        plan.add(&kafka(10, 19));
         assert!(
-            held(&plan, &kafka(5, 10)),
-            "offset 10 is inside the pending range"
+            plan.holds_back(&kafka(15, 25)),
+            "starts above the pending offset"
         );
-        assert!(!held(&plan, &kafka(0, 9)), "ends before it");
-        assert!(!held(&plan, &kafka(10, 19)), "the same offsets");
+        assert!(!plan.holds_back(&kafka(10, 19)), "the same offsets");
+        assert!(!plan.holds_back(&kafka(0, 12)), "starts below it");
+    }
+
+    /// A marker with no inode (written before inodes were recorded) cannot be
+    /// told apart from any file at its path: it must not slip past a pending
+    /// range that has one, nor hide one from a VERIFIED range that has one.
+    #[test]
+    fn a_marker_without_an_inode_is_compared_against_every_inode_at_its_path() {
+        let spool = |inode: Option<u64>, start: u64, end: u64| ProgressMarker::SyslogSpool {
+            spool_id: "s".into(),
+            path: "/spool".into(),
+            inode,
+            start_byte: start,
+            end_byte: end,
+            received_time_start: None,
+            received_time_end: None,
+        };
+        // Pending range with an inode, VERIFIED range from a legacy marker.
+        let mut plan = RewindPlan::default();
+        plan.add(&spool(Some(7), 100, 150));
+        assert!(plan.holds_back(&spool(None, 150, 200)));
+        assert!(!plan.holds_back(&spool(None, 100, 150)), "same start");
+        // Legacy pending range, VERIFIED range with an inode.
+        let mut plan = RewindPlan::default();
+        plan.add(&spool(None, 100, 150));
+        assert!(plan.holds_back(&spool(Some(7), 150, 200)));
+        assert!(plan.holds_back(&spool(Some(9), 150, 200)));
+        // Two KNOWN, different inodes stay apart.
+        let mut plan = RewindPlan::default();
+        plan.add(&spool(Some(7), 100, 150));
+        assert!(!plan.holds_back(&spool(Some(9), 150, 200)));
     }
 
     #[test]
