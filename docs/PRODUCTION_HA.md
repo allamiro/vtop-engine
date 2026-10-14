@@ -474,13 +474,20 @@ ranges tile:
 - overlapping commits are counted as duplicates (expected under
   at-least-once).
 
-`--check-storage` also HEADs every committed object and manifest (present, of
-the recorded size); content is `verify-manifest`'s job. `--metrics-file`
+`--check-storage` also HEADs every committed object and manifest: both must be
+present, and an object must be of the size the ledger recorded (a manifest has
+no recorded size). A committed row that names no object or manifest, and an
+object whose size the store does not report, are findings. Content is
+`verify-manifest`'s job. `--metrics-file`
 writes the result as a Prometheus text file, with counts by source type and
 never by path, for a node exporter's textfile collector. The command exits
-non-zero on lost data, so it can gate a cron job. It cannot judge anything
-below a unit's first committed range: a tail started mid-file, a consumer
-group that began at a later offset, or history pruned before digests existed.
+non-zero on lost data, so it can gate a cron job. Below a unit's first
+committed range it judges only what a failed row there names; history nothing
+recorded (a tail started mid-file, a consumer group that began at a later
+offset, history pruned before digests existed) cannot be judged. Neither can a
+file or spool known only from rows without an inode: they are reported as not
+judged. A window that spans a rotation counts for both files - the old one from
+where the window started to its end, the new one from byte 0.
 
 ---
 

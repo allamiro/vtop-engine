@@ -543,8 +543,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 Ok(())
             } else {
                 Err(VtopError::Other(
-                    "coverage audit FAILED: the archive is missing ranges (see the report above)"
-                        .into(),
+                    "coverage audit FAILED (see the report above)".into(),
                 ))
             }
         }

@@ -73,6 +73,17 @@ impl Unit {
     fn contiguous(&self) -> bool {
         !matches!(self, Unit::Kafka { .. })
     }
+
+    /// A file or spool row without an inode (a legacy marker, or a platform
+    /// without inodes) cannot be told from another file that lived at the
+    /// same path, so ranges from different files would be judged as one
+    /// (review of #573). Such a unit is reported, not judged.
+    fn judgeable(&self) -> bool {
+        !matches!(
+            self,
+            Unit::File { inode: None, .. } | Unit::SyslogSpool { inode: None, .. }
+        )
+    }
 }
 
 impl std::fmt::Display for Unit {
@@ -92,14 +103,40 @@ impl std::fmt::Display for Unit {
     }
 }
 
-/// A batch's unit and half-open range `[start, end)`, from its markers.
+/// One end of a range whose upper bound is unknown: the rest of the file.
+pub const END_OF_FILE: u64 = u64::MAX;
+
+/// A batch's units and half-open ranges `[start, end)`, from its markers.
 ///
 /// The range runs from the window's first read (`progress_start`) to its last
-/// (`progress_end`). A window whose two markers name different files (it
-/// spans a rotation) is reduced to its last read: the audit then reports at
-/// worst a hole that is not one, never hides one. A Kafka `end_offset` is the
-/// last offset read, so the range ends one past it.
-pub fn unit_and_range(record: &BatchRecord) -> Option<(Unit, u64, u64)> {
+/// (`progress_end`). A Kafka `end_offset` is the last offset read, so the
+/// range ends one past it. A window whose markers name two different files -
+/// it spans a rotation - covers BOTH (review of #573): the old file from where
+/// the window started to that file's end (the window read on until the
+/// rotation; nothing records where), and the new file from byte 0 (a read
+/// restarted on new content starts there) to the window's end. Reducing it to
+/// its last read, as this did, could hide lost bytes of the old file.
+pub fn unit_ranges(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
+    let file_like = |start_path: &String,
+                     start_inode: &Option<u64>,
+                     start_byte: u64,
+                     path: &String,
+                     inode: &Option<u64>,
+                     end_byte: u64,
+                     make: &dyn Fn(String, Option<u64>) -> Unit| {
+        if start_path == path && start_inode == inode {
+            vec![(make(path.clone(), *inode), start_byte, end_byte)]
+        } else {
+            vec![
+                (
+                    make(start_path.clone(), *start_inode),
+                    start_byte,
+                    END_OF_FILE,
+                ),
+                (make(path.clone(), *inode), 0, end_byte),
+            ]
+        }
+    };
     match (&record.progress_start, &record.progress_end) {
         (
             ProgressMarker::Kafka {
@@ -116,14 +153,22 @@ pub fn unit_and_range(record: &BatchRecord) -> Option<(Unit, u64, u64)> {
                 start_offset: last_read_start,
             },
         ) => {
+            // A Kafka window never spans partitions (one buffer each); a pair
+            // that does is reduced to its last read.
             let start = if start_topic == topic && start_partition == partition {
                 *start_offset
             } else {
                 *last_read_start
             };
-            let start = u64::try_from(start).ok()?;
-            let end = u64::try_from(*end_offset).ok()?.checked_add(1)?;
-            Some((
+            let (Ok(start), Some(end)) = (
+                u64::try_from(start),
+                u64::try_from(*end_offset)
+                    .ok()
+                    .and_then(|e| e.checked_add(1)),
+            ) else {
+                return Vec::new();
+            };
+            vec![(
                 Unit::Kafka {
                     topic: topic.clone(),
                     partition: *partition,
@@ -131,7 +176,7 @@ pub fn unit_and_range(record: &BatchRecord) -> Option<(Unit, u64, u64)> {
                 },
                 start,
                 end,
-            ))
+            )]
         }
         (
             ProgressMarker::File {
@@ -143,25 +188,18 @@ pub fn unit_and_range(record: &BatchRecord) -> Option<(Unit, u64, u64)> {
             ProgressMarker::File {
                 path,
                 inode,
-                start_byte: last_read_start,
                 end_byte,
                 ..
             },
-        ) => {
-            let start = if start_path == path && start_inode == inode {
-                *start_byte
-            } else {
-                *last_read_start
-            };
-            Some((
-                Unit::File {
-                    path: path.clone(),
-                    inode: *inode,
-                },
-                start,
-                *end_byte,
-            ))
-        }
+        ) => file_like(
+            start_path,
+            start_inode,
+            *start_byte,
+            path,
+            inode,
+            *end_byte,
+            &|path, inode| Unit::File { path, inode },
+        ),
         (
             ProgressMarker::SyslogSpool {
                 path: start_path,
@@ -172,26 +210,19 @@ pub fn unit_and_range(record: &BatchRecord) -> Option<(Unit, u64, u64)> {
             ProgressMarker::SyslogSpool {
                 path,
                 inode,
-                start_byte: last_read_start,
                 end_byte,
                 ..
             },
-        ) => {
-            let start = if start_path == path && start_inode == inode {
-                *start_byte
-            } else {
-                *last_read_start
-            };
-            Some((
-                Unit::SyslogSpool {
-                    path: path.clone(),
-                    inode: *inode,
-                },
-                start,
-                *end_byte,
-            ))
-        }
-        _ => None,
+        ) => file_like(
+            start_path,
+            start_inode,
+            *start_byte,
+            path,
+            inode,
+            *end_byte,
+            &|path, inode| Unit::SyslogSpool { path, inode },
+        ),
+        _ => Vec::new(),
     }
 }
 
@@ -233,14 +264,18 @@ pub struct UnitReport {
     pub pending: Vec<Pending>,
     /// Bytes/offsets archived more than once.
     pub duplicated: u64,
+    /// Why the unit was not judged (its holes are then not looked for), or
+    /// `None` when it was.
+    pub not_judged: Option<&'static str>,
 }
 
 impl UnitReport {
     /// Whether this unit shows lost data: a failed range never re-archived,
     /// or (for contiguous sources) a stretch nothing archived.
     pub fn has_findings(&self) -> bool {
-        !self.failed_holes.is_empty()
-            || (self.unit.contiguous() && !self.unexplained_holes.is_empty())
+        self.not_judged.is_none()
+            && (!self.failed_holes.is_empty()
+                || (self.unit.contiguous() && !self.unexplained_holes.is_empty()))
     }
 }
 
@@ -261,18 +296,17 @@ pub fn audit(records: impl IntoIterator<Item = BatchRecord>) -> Vec<UnitReport> 
         if !seen.insert(record.batch_id.clone()) {
             continue;
         }
-        let Some((unit, start, end)) = unit_and_range(&record) else {
-            continue;
-        };
-        if end <= start {
-            continue; // an empty read covers nothing
+        for (unit, start, end) in unit_ranges(&record) {
+            if end <= start {
+                continue; // an empty read covers nothing
+            }
+            units.entry(unit).or_default().push(Row {
+                batch_id: record.batch_id.clone(),
+                state: record.state,
+                start,
+                end,
+            });
         }
-        units.entry(unit).or_default().push(Row {
-            batch_id: record.batch_id,
-            state: record.state,
-            start,
-            end,
-        });
     }
     units
         .into_iter()
@@ -280,87 +314,160 @@ pub fn audit(records: impl IntoIterator<Item = BatchRecord>) -> Vec<UnitReport> 
         .collect()
 }
 
+/// Rows merged into disjoint spans, sorted, each with the rows it came from.
+struct Span<'a> {
+    start: u64,
+    end: u64,
+    rows: Vec<&'a Row>,
+}
+
+fn spans<'a>(rows: impl Iterator<Item = &'a Row>) -> Vec<Span<'a>> {
+    let mut sorted: Vec<&Row> = rows.collect();
+    sorted.sort_unstable_by_key(|row| (row.start, row.end));
+    let mut out: Vec<Span> = Vec::new();
+    for row in sorted {
+        match out.last_mut() {
+            Some(span) if row.start <= span.end => {
+                span.end = span.end.max(row.end);
+                span.rows.push(row);
+            }
+            _ => out.push(Span {
+                start: row.start,
+                end: row.end,
+                rows: vec![row],
+            }),
+        }
+    }
+    out
+}
+
+/// The spans overlapping `[start, end)`, found by binary search: the sweep
+/// costs the overlaps, not a scan of every row per gap (review of #573).
+fn overlapping<'s, 'a>(spans: &'s [Span<'a>], start: u64, end: u64) -> &'s [Span<'a>] {
+    let first = spans.partition_point(|span| span.end <= start);
+    let count = spans[first..].partition_point(|span| span.start < end);
+    &spans[first..first + count]
+}
+
+/// `[start, end)` less every span: the uncovered pieces, in order.
+fn uncovered(start: u64, end: u64, spans: &[Span]) -> Vec<(u64, u64)> {
+    let mut pieces = Vec::new();
+    let mut cursor = start;
+    for span in overlapping(spans, start, end) {
+        if span.start > cursor {
+            pieces.push((cursor, span.start));
+        }
+        cursor = cursor.max(span.end);
+    }
+    if cursor < end {
+        pieces.push((cursor, end));
+    }
+    pieces
+}
+
 /// `None` for a unit with no committed range: there is nothing to tile, and
 /// whatever is pending there will be read from the source's own position.
 fn audit_unit(unit: Unit, rows: Vec<Row>) -> Option<UnitReport> {
-    let mut committed: Vec<(u64, u64)> = rows
-        .iter()
-        .filter(|row| row.state == BatchState::SourceCommitted)
-        .map(|row| (row.start, row.end))
-        .collect();
+    let committed = spans(
+        rows.iter()
+            .filter(|row| row.state == BatchState::SourceCommitted),
+    );
     if committed.is_empty() {
         return None;
     }
-    committed.sort_unstable();
-    let total: u64 = committed.iter().map(|(s, e)| e - s).sum();
-    let mut covered: Vec<(u64, u64)> = Vec::new();
-    for (start, end) in committed.iter().copied() {
-        match covered.last_mut() {
-            Some((_, last_end)) if start <= *last_end => *last_end = (*last_end).max(end),
-            _ => covered.push((start, end)),
-        }
-    }
-    let merged: u64 = covered.iter().map(|(s, e)| e - s).sum();
-    let audited_from = covered[0].0;
-    let committed_through = covered.last().expect("non-empty").1;
-
-    let failed = |row: &&Row| matches!(row.state, BatchState::Failed | BatchState::ReplayRequired);
-    let in_flight = |row: &&Row| !failed(row) && row.state != BatchState::SourceCommitted;
-    let overlapping = |start: u64, end: u64, keep: &dyn Fn(&&Row) -> bool| -> Vec<&Row> {
+    let committed_rows: usize = committed.iter().map(|span| span.rows.len()).sum();
+    let total: u128 = committed
+        .iter()
+        .flat_map(|span| &span.rows)
+        .map(|row| u128::from(row.end - row.start))
+        .sum();
+    let merged: u128 = committed
+        .iter()
+        .map(|span| u128::from(span.end - span.start))
+        .sum();
+    let audited_from = committed[0].start;
+    let committed_through = committed.last().expect("non-empty").end;
+    let duplicated = u64::try_from(total - merged).unwrap_or(u64::MAX);
+    let failed = spans(
         rows.iter()
-            .filter(|row| keep(row) && row.start < end && row.end > start)
-            .collect()
+            .filter(|row| matches!(row.state, BatchState::Failed | BatchState::ReplayRequired)),
+    );
+    let in_flight = spans(rows.iter().filter(|row| {
+        !matches!(
+            row.state,
+            BatchState::Failed | BatchState::ReplayRequired | BatchState::SourceCommitted
+        )
+    }));
+
+    let mut report = UnitReport {
+        committed: committed_rows,
+        audited_from,
+        committed_through,
+        failed_holes: Vec::new(),
+        unexplained_holes: Vec::new(),
+        pending: Vec::new(),
+        duplicated,
+        not_judged: None,
+        unit,
     };
-    // The stretches to judge: between committed ranges, and - when a failed
+    if !report.unit.judgeable() {
+        report.not_judged =
+            Some("rows without an inode: another file at the same path cannot be told apart");
+        return Some(report);
+    }
+
+    // The stretches to judge: between committed spans, and - when a failed
     // range lies below the first committed one - from that failed range up.
     // A first batch that failed under later commits is the #552 hole too.
     let mut gaps: Vec<(u64, u64)> = Vec::new();
-    if let Some(lowest_failed) = rows
-        .iter()
-        .filter(|row| failed(row) && row.start < audited_from)
-        .map(|row| row.start)
-        .min()
-    {
-        gaps.push((lowest_failed, audited_from));
+    if let Some(lowest) = failed.first().filter(|span| span.start < audited_from) {
+        gaps.push((lowest.start, audited_from));
     }
-    gaps.extend(covered.windows(2).map(|pair| (pair[0].1, pair[1].0)));
+    gaps.extend(
+        committed
+            .windows(2)
+            .map(|pair| (pair[0].end, pair[1].start)),
+    );
 
-    let (mut failed_holes, mut unexplained_holes, mut pending) =
-        (Vec::new(), Vec::new(), Vec::new());
+    // Each gap is split, not judged whole (review of #573): the parts a failed
+    // row names are failed holes; of the rest, the parts in-flight work covers
+    // are pending; whatever remains is unexplained. A VERIFIED [10,15) inside
+    // a [10,20) gap no longer excuses [15,20).
     for (start, end) in gaps {
-        let names: Vec<String> = overlapping(start, end, &failed)
-            .into_iter()
-            .map(|row| row.batch_id.clone())
-            .collect();
-        if !names.is_empty() {
-            failed_holes.push(Hole {
-                start,
-                end,
-                failed_batches: names,
-            });
-            continue;
-        }
-        // A range verified but not yet committed (recovery holds a commit
-        // back while a range below it is re-read) is work in progress.
-        let working = overlapping(start, end, &in_flight);
-        if working.is_empty() {
-            unexplained_holes.push(Hole {
-                start,
-                end,
-                failed_batches: Vec::new(),
+        for span in overlapping(&failed, start, end) {
+            report.failed_holes.push(Hole {
+                start: span.start.max(start),
+                end: span.end.min(end),
+                failed_batches: span.rows.iter().map(|row| row.batch_id.clone()).collect(),
             });
         }
-        pending.extend(working.into_iter().map(|row| Pending {
-            batch_id: row.batch_id.clone(),
-            state: row.state,
-            start: row.start.max(start),
-            end: row.end.min(end),
-        }));
+        for (piece_start, piece_end) in uncovered(start, end, &failed) {
+            for span in overlapping(&in_flight, piece_start, piece_end) {
+                for row in &span.rows {
+                    if row.start < piece_end && row.end > piece_start {
+                        report.pending.push(Pending {
+                            batch_id: row.batch_id.clone(),
+                            state: row.state,
+                            start: row.start.max(piece_start),
+                            end: row.end.min(piece_end),
+                        });
+                    }
+                }
+            }
+            for (hole_start, hole_end) in uncovered(piece_start, piece_end, &in_flight) {
+                report.unexplained_holes.push(Hole {
+                    start: hole_start,
+                    end: hole_end,
+                    failed_batches: Vec::new(),
+                });
+            }
+        }
     }
-    let audited_from = failed_holes
+    report.audited_from = report
+        .failed_holes
         .first()
         .map_or(audited_from, |hole| hole.start.min(audited_from));
-    pending.extend(
+    report.pending.extend(
         rows.iter()
             .filter(|row| row.state != BatchState::SourceCommitted && row.end > committed_through)
             .map(|row| Pending {
@@ -370,16 +477,7 @@ fn audit_unit(unit: Unit, rows: Vec<Row>) -> Option<UnitReport> {
                 end: row.end,
             }),
     );
-    Some(UnitReport {
-        committed: committed.len(),
-        audited_from,
-        committed_through,
-        failed_holes,
-        unexplained_holes,
-        pending,
-        duplicated: total - merged,
-        unit,
-    })
+    Some(report)
 }
 
 // ---- Prune digest -----------------------------------------------------------
@@ -434,12 +532,18 @@ pub fn write_digest(dir: &Path, cutoff: &str, rows: &[BatchRecord]) -> Result<Pa
     body.push_str(&serde_json::to_string(&trailer)?);
     body.push('\n');
 
-    let name = format!(
-        "ledger-digest-{}-{}.jsonl",
-        now.format("%Y%m%dT%H%M%S%.9fZ"),
-        uuid::Uuid::new_v4().simple()
-    );
+    // Named by WHICH rows it holds (review of #573): a prune whose delete
+    // failed lists the same candidates a minute later, and a fresh name each
+    // time would write the same anchor again on every retry. The same set
+    // names the same file, already durable, so it is not rewritten.
+    let mut ids: Vec<&str> = rows.iter().map(|row| row.batch_id.as_str()).collect();
+    ids.sort_unstable();
+    let key = vtop_core::checksum::sha256_bytes(ids.join("\n").as_bytes());
+    let name = format!("ledger-digest-{}.jsonl", &key[..32]);
     let path = dir.join(&name);
+    if path.exists() {
+        return Ok(path);
+    }
     let tmp = dir.join(format!(".{name}.tmp"));
     {
         let mut file = std::fs::File::create(&tmp)?;
@@ -461,9 +565,13 @@ pub fn read_digests(dir: &Path) -> Result<(Vec<BatchRecord>, usize), VtopError> 
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(error) => return Err(error.into()),
     };
+    // An entry that cannot be read is an error, not an absence: skipping it
+    // could drop a digest and report the pruned history as holes, or clean
+    // (review of #573).
     let mut paths: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
@@ -482,9 +590,10 @@ fn read_digest(path: &Path) -> Result<Vec<BatchRecord>, VtopError> {
     let bad = |why: String| VtopError::Other(format!("ledger digest {}: {why}", path.display()));
     let text = std::fs::read_to_string(path)?;
     let lines: Vec<&str> = text.lines().collect();
-    let (Some(first), Some(last)) = (lines.first(), lines.last()) else {
-        return Err(bad("empty".into()));
-    };
+    if lines.len() < 2 {
+        return Err(bad("no header and trailer (truncated?)".into()));
+    }
+    let (first, last) = (lines[0], lines[lines.len() - 1]);
     let header: DigestHeader =
         serde_json::from_str(first).map_err(|e| bad(format!("header: {e}")))?;
     if header.vtop_ledger_digest != DIGEST_VERSION {
@@ -554,22 +663,30 @@ pub async fn check_storage(
     records: &[BatchRecord],
 ) -> Vec<StorageFinding> {
     use futures::StreamExt;
-    let probes = records
+    // A committed row that names no object or no manifest is a finding in
+    // itself, not a probe to skip: skipped, it let the check pass without
+    // having checked that batch at all (review of #573).
+    let mut findings: Vec<StorageFinding> = Vec::new();
+    let mut probes = Vec::new();
+    for record in records
         .iter()
         .filter(|record| record.state == BatchState::SourceCommitted)
-        .flat_map(|record| {
-            let object = record
-                .object_uri
-                .clone()
-                .map(|uri| (record.batch_id.clone(), uri, record.object_size_bytes));
-            let manifest = record
-                .manifest_uri
-                .clone()
-                .map(|uri| (record.batch_id.clone(), uri, None));
-            object.into_iter().chain(manifest)
-        })
-        .collect::<Vec<_>>();
-    futures::stream::iter(probes)
+    {
+        for (what, uri, size) in [
+            ("object", &record.object_uri, record.object_size_bytes),
+            ("manifest", &record.manifest_uri, None),
+        ] {
+            match uri {
+                Some(uri) => probes.push((record.batch_id.clone(), uri.clone(), size)),
+                None => findings.push(StorageFinding {
+                    batch_id: record.batch_id.clone(),
+                    uri: String::new(),
+                    problem: format!("the committed row names no {what}"),
+                }),
+            }
+        }
+    }
+    let probed: Vec<StorageFinding> = futures::stream::iter(probes)
         .map(|(batch_id, uri, size)| async move {
             match backend.head_object(&uri).await {
                 Err(error) => Some(StorageFinding {
@@ -585,6 +702,14 @@ pub async fn check_storage(
                             problem: format!("{got} bytes stored, the ledger recorded {want}"),
                         })
                     }
+                    // The ledger knows the size and the store did not say:
+                    // nothing was compared, so it is not a pass (review of
+                    // #573; a command backend whose output did not parse).
+                    (Some(want), None) => Some(StorageFinding {
+                        batch_id,
+                        uri,
+                        problem: format!("the store reported no size; the ledger recorded {want}"),
+                    }),
                     _ => None,
                 },
             }
@@ -592,7 +717,9 @@ pub async fn check_storage(
         .buffer_unordered(16)
         .filter_map(|finding| async move { finding })
         .collect()
-        .await
+        .await;
+    findings.extend(probed);
+    findings
 }
 
 // ---- Output ---------------------------------------------------------------
@@ -622,16 +749,30 @@ impl AuditReport {
             self.digest_files,
             self.units.len()
         )];
+        let bound = |at: u64| {
+            if at == END_OF_FILE {
+                "end of file".to_owned()
+            } else {
+                at.to_string()
+            }
+        };
         for unit in &self.units {
-            let verdict = if unit.has_findings() { "FAIL" } else { "ok" };
+            let verdict = match (unit.not_judged, unit.has_findings()) {
+                (Some(_), _) => "skip",
+                (None, true) => "FAIL",
+                (None, false) => "ok",
+            };
             out.push(format!(
                 "{verdict:4} {}: {} committed range(s) over [{}, {}), {} duplicated",
                 unit.unit,
                 unit.committed,
                 unit.audited_from,
-                unit.committed_through,
+                bound(unit.committed_through),
                 unit.duplicated
             ));
+            if let Some(why) = unit.not_judged {
+                out.push(format!("     not judged: {why}"));
+            }
             for hole in &unit.failed_holes {
                 out.push(format!(
                     "     hole [{}, {}): failed and never re-archived ({})",
@@ -831,6 +972,175 @@ mod tests {
     }
 
     use BatchState::{Failed, ReplayRequired, SourceCommitted as Committed, Verified};
+
+    /// Review of #573: a VERIFIED range covering part of a gap excuses only
+    /// that part; the rest of the gap is still lost.
+    #[test]
+    fn work_in_flight_excuses_only_the_part_of_a_gap_it_covers() {
+        let units = audit([
+            bytes("a", Committed, 0, 10),
+            bytes("held", Verified, 10, 15),
+            bytes("c", Committed, 20, 30),
+        ]);
+        let unit = &units[0];
+        assert!(unit.has_findings(), "{unit:?}");
+        assert_eq!(
+            unit.unexplained_holes,
+            vec![Hole {
+                start: 15,
+                end: 20,
+                failed_batches: vec![]
+            }]
+        );
+        assert_eq!(unit.pending.len(), 1);
+        assert_eq!((unit.pending[0].start, unit.pending[0].end), (10, 15));
+    }
+
+    /// A failed row covering part of a gap names that part; the rest is
+    /// reported apart, not absorbed into it.
+    #[test]
+    fn a_failed_row_names_only_the_part_of_a_gap_it_covers() {
+        let units = audit([
+            bytes("a", Committed, 0, 10),
+            bytes("lost", Failed, 10, 12),
+            bytes("c", Committed, 20, 30),
+        ]);
+        let unit = &units[0];
+        assert_eq!(
+            (unit.failed_holes[0].start, unit.failed_holes[0].end),
+            (10, 12)
+        );
+        assert_eq!(
+            (
+                unit.unexplained_holes[0].start,
+                unit.unexplained_holes[0].end
+            ),
+            (12, 20)
+        );
+    }
+
+    /// Review of #573: rows without an inode could be two files at one path;
+    /// their ranges are reported, never judged as one file.
+    #[test]
+    fn a_path_known_only_without_inodes_is_not_judged() {
+        let legacy = |id: &str, start: u64, end: u64| {
+            let marker = |at: u64| ProgressMarker::File {
+                path: "/legacy.log".into(),
+                inode: None,
+                start_byte: at,
+                end_byte: end,
+                file_size: end,
+                mtime: String::new(),
+            };
+            row(id, Committed, marker(start), marker(start))
+        };
+        let units = audit([legacy("a", 0, 10), legacy("b", 50, 60)]);
+        let unit = &units[0];
+        assert!(unit.not_judged.is_some());
+        assert!(!unit.has_findings(), "a gap across what may be two files");
+    }
+
+    /// Review of #573: a window that spans a rotation covers the old file to
+    /// its end and the new file from byte 0; dropping the old part could hide
+    /// lost bytes of the old file, and keeping only the last read invented a
+    /// gap at the start of the new one.
+    #[test]
+    fn a_window_across_a_rotation_covers_both_files() {
+        let units = audit([
+            row(
+                "old",
+                Committed,
+                file("/a.log", 1, 0, 0),
+                file("/a.log", 1, 0, 100),
+            ),
+            row(
+                "across",
+                Committed,
+                file("/a.log", 1, 100, 100),
+                file("/a.log", 2, 20, 30),
+            ),
+            row(
+                "new",
+                Committed,
+                file("/a.log", 2, 30, 30),
+                file("/a.log", 2, 30, 60),
+            ),
+        ]);
+        assert_eq!(units.len(), 2);
+        for unit in &units {
+            assert!(!unit.has_findings(), "{unit:?}");
+        }
+        let old = units
+            .iter()
+            .find(|u| matches!(u.unit, Unit::File { inode: Some(1), .. }))
+            .unwrap();
+        assert_eq!(old.committed_through, END_OF_FILE);
+        let new = units
+            .iter()
+            .find(|u| matches!(u.unit, Unit::File { inode: Some(2), .. }))
+            .unwrap();
+        assert_eq!((new.audited_from, new.committed_through), (0, 60));
+    }
+
+    /// Review of #573: a prune whose delete failed lists the same rows again;
+    /// the same rows are the same digest, written once.
+    #[test]
+    fn the_same_rows_are_one_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = vec![bytes("a", Committed, 0, 10), bytes("b", Committed, 10, 20)];
+        let first = write_digest(dir.path(), "c", &rows).unwrap();
+        let again = write_digest(
+            dir.path(),
+            "c",
+            &rows.iter().rev().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(first, again);
+        assert_eq!(read_digests(dir.path()).unwrap().1, 1);
+        let other = write_digest(dir.path(), "c", &rows[..1]).unwrap();
+        assert_ne!(first, other);
+    }
+
+    /// Review of #573: a one-line file is refused, not a panic.
+    #[test]
+    fn a_one_line_digest_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ledger-digest-x.jsonl"), "{}\n").unwrap();
+        assert!(read_digests(dir.path()).is_err());
+    }
+
+    /// Review of #573: a committed row that names no object is a finding,
+    /// as is one the store does not hold or holds at another size.
+    #[tokio::test]
+    async fn the_storage_check_finds_what_it_cannot_check() {
+        let backend = vtop_upload::mock::MockBackend::new();
+        let dir = tempfile::tempdir().unwrap();
+        let body = dir.path().join("body");
+        std::fs::write(&body, b"0123456789").unwrap();
+        use vtop_upload::UploadBackend;
+        let mut present = bytes("present", Committed, 0, 10);
+        for uri in [
+            present.object_uri.clone().unwrap(),
+            present.manifest_uri.clone().unwrap(),
+        ] {
+            backend.put_object(&body, &uri, None).await.unwrap();
+        }
+        present.object_size_bytes = Some(10);
+        let mut no_uris = bytes("no-uris", Committed, 10, 20);
+        no_uris.object_uri = None;
+        no_uris.manifest_uri = None;
+        let missing = bytes("missing", Committed, 20, 30);
+        let mut wrong_size = present.clone();
+        wrong_size.batch_id = "wrong-size".into();
+        wrong_size.object_size_bytes = Some(11);
+
+        let findings = check_storage(&backend, &[present, no_uris, missing, wrong_size]).await;
+        let of = |id: &str| findings.iter().filter(|f| f.batch_id == id).count();
+        assert_eq!(of("present"), 0, "{findings:?}");
+        assert_eq!(of("no-uris"), 2, "{findings:?}");
+        assert_eq!(of("missing"), 2, "{findings:?}");
+        assert_eq!(of("wrong-size"), 1, "{findings:?}");
+    }
 
     #[test]
     fn ranges_that_tile_pass() {
