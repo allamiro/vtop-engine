@@ -1160,3 +1160,164 @@ async fn recovery_does_not_commit_a_verified_range_above_a_failed_one() {
     );
     assert_eq!(reread[0].record_count, Some(4));
 }
+
+/// #563 (review): a FAILED row whose bytes a later retry already archived and
+/// committed is stale. Its rewind is clamped to the committed point, so nothing
+/// is re-read for it, and it must not hold back the VERIFIED range above it
+/// for ever.
+#[tokio::test]
+async fn recovery_commits_a_verified_range_above_a_failed_row_that_a_retry_already_covered() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    // Four 7-byte lines: the failed range is [0,14), the verified one [14,28).
+    std::fs::write(&input, "line-0\nline-1\nline-2\nline-3\n").unwrap();
+    let db = dir.path().join("state.db");
+    let url = format!("sqlite://{}", db.display());
+    let path = input.to_string_lossy().into_owned();
+    let range = |start: u64, end: u64| ProgressMarker::File {
+        path: path.clone(),
+        inode: None,
+        start_byte: start,
+        end_byte: end,
+        file_size: 28,
+        mtime: String::new(),
+    };
+
+    let object_uri = "s3://telemetry-data/x/b-above.raw.gz";
+    let manifest_uri = "s3://telemetry-data/x/b-above.manifest.json";
+    let object_bytes = b"archived-bytes";
+    let object_digest = vtop_core::checksum::sha256_bytes(object_bytes);
+    // The ledger row below says two records; the manifest must agree.
+    let (manifest, manifest_path) = write_recovery_manifest_with_records(
+        &work,
+        "b-above",
+        &path,
+        range(14, 28),
+        object_uri,
+        manifest_uri,
+        object_bytes.len() as u64,
+        "sha256",
+        &object_digest,
+        2,
+    );
+    let row = |id: &str, start: u64, end: u64, at: &str| BatchRecord {
+        batch_id: id.into(),
+        tenant: "default".into(),
+        source_type: SourceType::File,
+        source_name: path.clone(),
+        format: vtop_core::types::TelemetryFormat::Raw,
+        state: BatchState::Batching,
+        progress_start: range(start, end),
+        progress_end: range(start, end),
+        object_uri: None,
+        manifest_uri: None,
+        object_sha256: None,
+        manifest_sha256: None,
+        manifest_version_id: None,
+        object_size_bytes: None,
+        record_count: Some(2),
+        error_message: None,
+        owner: None,
+        lease_expires_at: None,
+        created_at: at.into(),
+        updated_at: at.into(),
+    };
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        // The failed LOWER range, created first.
+        store
+            .save_batch_state(&row("b-failed", 0, 14, "2026-01-01T00:00:00+00:00"))
+            .await
+            .unwrap();
+        store
+            .mark_failed("b-failed", "upload failed")
+            .await
+            .unwrap();
+        // The retry that re-archived those bytes and committed them.
+        let mut retry = row("b-retry", 0, 14, "2026-01-01T00:00:00+00:30");
+        retry.object_uri = Some("s3://telemetry-data/x/b-retry.raw.gz".into());
+        retry.manifest_uri = Some("s3://telemetry-data/x/b-retry.manifest.json".into());
+        store.save_batch_state(&retry).await.unwrap();
+        for st in [
+            BatchState::Sealed,
+            BatchState::Compressed,
+            BatchState::Checksummed,
+            BatchState::ObjectUploaded,
+            BatchState::ManifestUploaded,
+            BatchState::Verified,
+            BatchState::SourceCommitted,
+        ] {
+            store
+                .update_batch_state("b-retry", st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+        // The verified HIGHER range.
+        let mut above = row("b-above", 14, 28, "2026-01-01T00:00:01+00:00");
+        above.object_uri = Some(object_uri.into());
+        above.manifest_uri = Some(manifest_uri.into());
+        above.object_sha256 = Some(object_digest.clone());
+        above.manifest_sha256 = Some(manifest.manifest.sha256.clone());
+        above.object_size_bytes = Some(object_bytes.len() as i64);
+        store.save_batch_state(&above).await.unwrap();
+        for st in [
+            BatchState::Sealed,
+            BatchState::Compressed,
+            BatchState::Checksummed,
+            BatchState::ObjectUploaded,
+            BatchState::ManifestUploaded,
+            BatchState::Verified,
+        ] {
+            store
+                .update_batch_state("b-above", st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    let cfg = file_config(work.to_str().unwrap(), &url, vec![path.clone()], "mock");
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    // The VERIFIED row's object and manifest exist, so it passes the re-check.
+    let staged = dir.path().join("staged-object");
+    std::fs::write(&staged, object_bytes).unwrap();
+    engine
+        .backend
+        .put_object(
+            &staged,
+            object_uri,
+            Some(vtop_upload::ObjectChecksum::new("sha256", &object_digest)),
+        )
+        .await
+        .unwrap();
+    engine
+        .backend
+        .put_manifest(
+            &manifest_path,
+            manifest_uri,
+            Some(vtop_upload::ObjectChecksum::new(
+                "sha256",
+                &manifest.manifest.sha256,
+            )),
+        )
+        .await
+        .unwrap();
+
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(
+        summary.committed, 1,
+        "the VERIFIED range commits: the failed row below it is covered by the retry"
+    );
+    assert_eq!(summary.still_pending, 0, "nothing is held back");
+    let above = engine.store.get_batch("b-above").await.unwrap().unwrap();
+    assert_eq!(above.state, BatchState::SourceCommitted);
+
+    // The source resumes after the committed ranges, so nothing is archived twice.
+    let outcomes = engine.process_once(SourceType::File).await.unwrap();
+    assert!(
+        outcomes.is_empty(),
+        "[0,28) is committed; a re-read here would duplicate it: {outcomes:?}"
+    );
+}

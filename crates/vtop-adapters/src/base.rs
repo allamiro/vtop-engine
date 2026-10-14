@@ -177,6 +177,20 @@ pub trait SourceAdapter: Send + Sync {
     /// Rewind the read position to a marker so uncommitted data is replayed.
     async fn replay_from_marker(&mut self, marker: &ProgressMarker) -> Result<(), VtopError>;
 
+    /// Where the next read of `marker`'s source unit will start, in the unit
+    /// the markers use (a byte offset, a Kafka offset); `None` when the adapter
+    /// cannot say.
+    ///
+    /// After a rewind this is where the rewind actually LANDED, which is above
+    /// the requested start when the source has already committed past it: a
+    /// rewind never goes below the committed point, so for a stale ledger row
+    /// whose range a later batch has since re-archived it reports the
+    /// committed point, not the row's start. Recovery uses that to tell a
+    /// range that is really about to be re-read from one that is already safe.
+    fn read_position(&self, _marker: &ProgressMarker) -> Option<i128> {
+        None
+    }
+
     /// Rewind several ranges at once, one result per marker in the same order.
     ///
     /// The default rewinds one at a time. An adapter whose rewind consults an

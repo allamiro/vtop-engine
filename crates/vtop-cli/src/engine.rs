@@ -2233,6 +2233,37 @@ impl Engine {
                 }
             }
         }
+        // Group by source type so each adapter rewinds its whole batch in one
+        // call (see `SourceAdapter::replay_from_markers`).
+        let mut by_source: Vec<(SourceType, Vec<ProgressMarker>)> = Vec::new();
+        for marker in rewinds.markers() {
+            match by_source
+                .iter_mut()
+                .find(|(source_type, _)| *source_type == marker.source_type())
+            {
+                Some((_, markers)) => markers.push(marker),
+                None => by_source.push((marker.source_type(), vec![marker])),
+            }
+        }
+        // First pass: rewind, only to learn where each unit's read head LANDS.
+        // A rewind never goes below the source's committed point, so a stale
+        // ledger row whose bytes a later batch already archived lands above its
+        // own start. Counting such a row as "about to be re-read" made it hold
+        // back every VERIFIED range above it for good (review of #563). Errors
+        // are reported by the second pass.
+        let mut landed: HashMap<String, i128> = HashMap::new();
+        for (source_type, markers) in &by_source {
+            let Some(adapter) = self.adapters.get_mut(source_type) else {
+                continue;
+            };
+            let _ = adapter.replay_from_markers(markers).await;
+            for marker in markers {
+                if let Some(position) = adapter.read_position(marker) {
+                    landed.insert(unit_key(marker), position);
+                }
+            }
+        }
+        rewinds.rebase(&landed);
         // Commit the VERIFIED rows — unless a lower range of the same source
         // unit is about to be re-read. Committing the higher one first moves
         // the adapter's committed point past the lower one, and the rewind that
@@ -2252,18 +2283,9 @@ impl Engine {
             }
             self.commit_recovered(&rec, &mut summary).await?;
         }
-        // Group by source type so each adapter rewinds its whole batch in one
-        // call (see `SourceAdapter::replay_from_markers`).
-        let mut by_source: Vec<(SourceType, Vec<ProgressMarker>)> = Vec::new();
-        for marker in rewinds.into_markers() {
-            match by_source
-                .iter_mut()
-                .find(|(source_type, _)| *source_type == marker.source_type())
-            {
-                Some((_, markers)) => markers.push(marker),
-                None => by_source.push((marker.source_type(), vec![marker])),
-            }
-        }
+        // Second pass: the commits above moved committed points up, and the
+        // first pass's rewinds are not clamped to them. Rewind again so no
+        // range that was just committed is read a second time.
         for (source_type, markers) in by_source {
             let Some(adapter) = self.adapters.get_mut(&source_type) else {
                 // The decision to replay is durable, but there is nothing to
@@ -2504,6 +2526,29 @@ impl RewindPlan {
         }
     }
 
+    /// Replace each unit's raw start with the position its rewind actually
+    /// landed on (`effective`, by unit key). A rewind never goes below what the
+    /// source has already committed, so a stale ledger row whose range a later
+    /// batch re-archived lands AT the committed point, not at its own start:
+    /// nothing is about to be re-read for it, and it must not hold back a
+    /// VERIFIED range above it (review of #563). A unit with no entry keeps its
+    /// raw start, which is the conservative answer.
+    fn rebase(&mut self, effective: &HashMap<String, i128>) {
+        for (unit, marker) in &self.lowest {
+            let Some(&landed) = effective.get(unit) else {
+                continue;
+            };
+            let inode = marker_inode(marker);
+            if let Some((_, lowest)) = self
+                .by_source
+                .get_mut(&source_key(marker))
+                .and_then(|groups| groups.iter_mut().find(|(i, _)| *i == inode))
+            {
+                *lowest = (*lowest).max(landed);
+            }
+        }
+    }
+
     /// Whether committing the VERIFIED range starting at `start` would strand
     /// bytes that are about to be re-read.
     ///
@@ -2537,8 +2582,12 @@ impl RewindPlan {
             })
     }
 
-    fn into_markers(self) -> Vec<ProgressMarker> {
-        let mut markers: Vec<_> = self.lowest.into_iter().collect();
+    fn markers(&self) -> Vec<ProgressMarker> {
+        let mut markers: Vec<_> = self
+            .lowest
+            .iter()
+            .map(|(k, m)| (k.clone(), m.clone()))
+            .collect();
         // Stable order, so the log and the tests do not depend on hash order.
         markers.sort_by(|a, b| a.0.cmp(&b.0));
         markers.into_iter().map(|(_, m)| m).collect()
@@ -3512,7 +3561,7 @@ mod tests {
             add(&mut plan, kafka(0, 10));
             add(&mut plan, kafka(1, 99));
             let got: Vec<(String, i128)> = plan
-                .into_markers()
+                .markers()
                 .iter()
                 .map(|m| (unit_key(m), start_position(m)))
                 .collect();
@@ -3528,6 +3577,39 @@ mod tests {
                 "order {order:?}"
             );
         }
+    }
+
+    /// A stale ledger row whose bytes a later batch already archived rewinds to
+    /// the committed point, not to its own start. The plan must follow where
+    /// the rewind landed, or the stale row holds back every VERIFIED range above
+    /// it for ever (review of #563).
+    #[test]
+    fn a_rebased_plan_stops_a_covered_row_from_holding_back_a_verified_range() {
+        let file = |start: u64, end: u64| ProgressMarker::File {
+            path: "/a".into(),
+            inode: Some(1),
+            start_byte: start,
+            end_byte: end,
+            file_size: 0,
+            mtime: String::new(),
+        };
+        let mut plan = RewindPlan::default();
+        plan.add(&file(0, 100));
+        assert!(plan.holds_back(&file(100, 200)), "raw start 0 is below 100");
+        // The rewind landed at 100: [0, 100) was already archived.
+        let landed = HashMap::from([(unit_key(&file(0, 100)), 100)]);
+        plan.rebase(&landed);
+        assert!(!plan.holds_back(&file(100, 200)));
+        // A rewind that landed BELOW the VERIFIED range still holds it back.
+        let mut plan = RewindPlan::default();
+        plan.add(&file(0, 100));
+        plan.rebase(&HashMap::from([(unit_key(&file(0, 100)), 0)]));
+        assert!(plan.holds_back(&file(100, 200)));
+        // A unit the adapter could not place keeps its raw start.
+        let mut plan = RewindPlan::default();
+        plan.add(&file(0, 100));
+        plan.rebase(&HashMap::new());
+        assert!(plan.holds_back(&file(100, 200)));
     }
 
     /// Committing a VERIFIED range moves its unit's frontier to the end of that

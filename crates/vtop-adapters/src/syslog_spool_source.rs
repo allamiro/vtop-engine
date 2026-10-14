@@ -448,6 +448,13 @@ impl SourceAdapter for SyslogSpoolSource {
         Ok(())
     }
 
+    fn read_position(&self, marker: &ProgressMarker) -> Option<i128> {
+        let ProgressMarker::SyslogSpool { path, .. } = marker else {
+            return None;
+        };
+        self.cursors.get(path).map(|c| i128::from(c.read_byte))
+    }
+
     fn source_type(&self) -> SourceType {
         SourceType::SyslogSpool
     }

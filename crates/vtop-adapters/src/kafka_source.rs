@@ -1225,6 +1225,23 @@ impl SourceAdapter for KafkaSource {
             .collect()
     }
 
+    fn read_position(&self, marker: &ProgressMarker) -> Option<i128> {
+        let ProgressMarker::Kafka {
+            topic, partition, ..
+        } = marker
+        else {
+            return None;
+        };
+        let cursor = self.cursors.get(&(topic.clone(), *partition))?;
+        // The next offset a read would ask for: past what was read ahead, or
+        // the committed/rewound position when nothing has been read since.
+        cursor
+            .last_read_offset
+            .map(|read| read + 1)
+            .or(cursor.committed_offset)
+            .map(i128::from)
+    }
+
     fn source_type(&self) -> SourceType {
         SourceType::Kafka
     }
