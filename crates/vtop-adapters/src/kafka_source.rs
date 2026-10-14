@@ -551,6 +551,19 @@ impl KafkaSource {
     /// broker, in ONE request. A partition with nothing committed, or every
     /// partition when the broker cannot answer within the bound, is simply
     /// absent; callers then fall back to what they already know.
+    /// The marker's consumer group, when it is not the one this adapter
+    /// consumes as.
+    fn foreign_group<'m>(&self, marker: &'m ProgressMarker) -> Option<&'m str> {
+        match marker {
+            ProgressMarker::Kafka { consumer_group, .. }
+                if *consumer_group != self.cfg.consumer_group =>
+            {
+                Some(consumer_group.as_str())
+            }
+            _ => None,
+        }
+    }
+
     fn group_committed_offsets(
         &mut self,
         partitions: &[(String, i32)],
@@ -1130,6 +1143,22 @@ impl SourceAdapter for KafkaSource {
                 "kafka adapter given non-kafka marker".into(),
             ));
         };
+        // A range read under another consumer group (the engine's group was
+        // renamed since): it is archived and verified, but its offsets are
+        // that group's. Committing it here would move THIS group's offset to
+        // wherever the old group had read, past records this group has not
+        // archived (review of #563).
+        if let Some(group) = self.foreign_group(marker) {
+            tracing::warn!(
+                topic,
+                partition,
+                marker_group = group,
+                group = %self.cfg.consumer_group,
+                "range read under another consumer group: archived, but its offset is not this \
+                 group's to commit"
+            );
+            return Ok(());
+        }
 
         // Committed offset is "next to read" = last consumed + 1.
         let commit_at = end_offset + 1;
@@ -1170,6 +1199,7 @@ impl SourceAdapter for KafkaSource {
     ) -> Vec<Result<(), VtopError>> {
         let partitions: Vec<(String, i32)> = markers
             .iter()
+            .filter(|m| self.foreign_group(m).is_none())
             .filter_map(|m| match m {
                 ProgressMarker::Kafka {
                     topic, partition, ..
@@ -1192,6 +1222,25 @@ impl SourceAdapter for KafkaSource {
                         "kafka adapter given non-kafka marker".into(),
                     ));
                 };
+                // The cursor is keyed by (topic, partition) - it is THIS
+                // group's position. A marker from another group (left in the
+                // ledger by the engine before its group was renamed) must not
+                // move it: recovery rewinds its units in an order that knows
+                // nothing of groups, and an old group's rewind landing last
+                // would overwrite the active group's lower one and skip
+                // records (review of #563). The old group's range is not
+                // re-read under this group; this group reads from its own
+                // committed offset.
+                if let Some(group) = self.foreign_group(marker) {
+                    tracing::warn!(
+                        topic,
+                        partition,
+                        marker_group = group,
+                        group = %self.cfg.consumer_group,
+                        "not rewinding for a range read under another consumer group"
+                    );
+                    return Ok(());
+                }
                 // Reads assign() from the cursor, so rewinding means resetting
                 // the cursor: clear the in-memory read head and pin the resume
                 // position. The next read assigns the partition at that offset.
@@ -1232,6 +1281,11 @@ impl SourceAdapter for KafkaSource {
         else {
             return None;
         };
+        // This group's cursor says nothing about where another group's
+        // range would be read from.
+        if self.foreign_group(marker).is_some() {
+            return None;
+        }
         let cursor = self.cursors.get(&(topic.clone(), *partition))?;
         // The next offset a read would ask for: past what was read ahead, or
         // the committed/rewound position when nothing has been read since.
@@ -1380,6 +1434,47 @@ mod tests {
             newly_lost(Some(-2), 10_000, None),
             0,
             "sentinels stay sentinels here too"
+        );
+    }
+
+    /// Review of #563: the cursor is this group's position. A range left in
+    /// the ledger by the engine under its previous group name must neither
+    /// rewind it (recovery's order knows nothing of groups, so an old group's
+    /// rewind could land last and overwrite the active group's lower one),
+    /// nor answer for it, nor be committed under this group.
+    #[tokio::test]
+    async fn a_range_from_another_consumer_group_never_moves_this_groups_cursor() {
+        let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
+        src.cursors.insert(
+            ("t".into(), 0),
+            PartitionCursor {
+                last_read_offset: None,
+                committed_offset: Some(100),
+            },
+        );
+        let marker = |group: &str, start: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition: 0,
+            start_offset: start,
+            end_offset: start + 9,
+            consumer_group: group.into(),
+        };
+        let old = marker("vtop-engine-old", 700);
+
+        src.replay_from_marker(&old).await.unwrap();
+        assert_eq!(
+            src.cursors[&("t".into(), 0)].committed_offset,
+            Some(100),
+            "another group's range rewound this group's cursor"
+        );
+        assert_eq!(src.read_position(&old), None);
+        assert_eq!(src.read_position(&marker("vtop-engine", 50)), Some(100));
+
+        src.commit_progress(&old).await.unwrap();
+        assert_eq!(
+            src.cursors[&("t".into(), 0)].committed_offset,
+            Some(100),
+            "another group's range was committed as this group's progress"
         );
     }
 
