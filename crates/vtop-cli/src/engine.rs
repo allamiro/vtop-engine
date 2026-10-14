@@ -2093,9 +2093,12 @@ impl Engine {
         // `replay_from_marker` overwrites the adapter's read position, so with
         // several incomplete ranges for one source the last row visited used to
         // win and every earlier range was skipped (#552). Keeping the lowest
-        // start per source and applying it once after the scan reads from the
-        // first byte that is not archived, whatever order the rows came in.
+        // start per source unit and applying it once after the scan reads from
+        // the first byte that is not archived, whatever order the rows came in.
         let mut rewinds = RewindPlan::default();
+        // VERIFIED rows that still check out against storage. Their source
+        // commits wait until every replay decision is known (see below).
+        let mut verified: Vec<BatchRecord> = Vec::new();
         for rec in incomplete {
             let action = next_recovery_action(rec.state);
             tracing::info!(batch_id = %rec.batch_id, state = %rec.state, ?action, "recovery_scan");
@@ -2144,7 +2147,7 @@ impl Engine {
                             summary.still_pending += 1;
                             continue;
                         }
-                        rewinds.add(&rec.progress_start);
+                        rewinds.add(&rec.progress_start, &rec.progress_end);
                         // Dashboards must see this refusal path like any other
                         // replay (#123 review).
                         if let Some(mx) = telemetry::metrics() {
@@ -2166,63 +2169,7 @@ impl Engine {
                         summary.replay_required += 1;
                         continue;
                     }
-                    // Verified — and just re-verified against storage — commit.
-                    if let Some(adapter) = self.adapters.get_mut(&rec.source_type) {
-                        match adapter.commit_progress(&rec.progress_end).await {
-                            Ok(()) => {
-                                self.store.mark_source_committed(&rec.batch_id).await?;
-                                // A restart-recovery commit is still a commit:
-                                // without it, commits_total under-counts on
-                                // exactly the path where the invariant is most
-                                // delicate (VERIFIED but not yet committed).
-                                //
-                                // The verification is counted HERE TOO, even
-                                // though it happened in the process that
-                                // crashed. Prometheus counters are per-process
-                                // and reset on restart, so counting only the
-                                // commit would leave this process reporting
-                                // commits_total > verified_total - which reads
-                                // as "SOURCE_COMMITTED without VERIFIED", the
-                                // one alarm that must never cry wolf. The state
-                                // store is the authority that the batch really
-                                // did reach VERIFIED, so recording both keeps
-                                // the pair self-consistent and honest.
-                                if let Some(mx) = telemetry::metrics() {
-                                    let l = [
-                                        rec.tenant.as_str(),
-                                        rec.source_type.as_str(),
-                                        rec.format.extension(),
-                                    ];
-                                    mx.verified_total.with_label_values(&l).inc();
-                                    mx.batches_total
-                                        .with_label_values(&[
-                                            l[0],
-                                            l[1],
-                                            l[2],
-                                            BatchState::Verified.as_str(),
-                                        ])
-                                        .inc();
-                                    mx.commits_total.with_label_values(&l).inc();
-                                    mx.batches_total
-                                        .with_label_values(&[
-                                            l[0],
-                                            l[1],
-                                            l[2],
-                                            BatchState::SourceCommitted.as_str(),
-                                        ])
-                                        .inc();
-                                }
-                                summary.committed += 1;
-                                tracing::info!(batch_id = %rec.batch_id, "recovered: source_committed");
-                            }
-                            Err(e) => {
-                                tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery commit failed");
-                                summary.still_pending += 1;
-                            }
-                        }
-                    } else {
-                        summary.still_pending += 1;
-                    }
+                    verified.push(rec);
                 }
                 RecoveryAction::None => {}
                 _ => {
@@ -2230,19 +2177,35 @@ impl Engine {
                     // object we can finish from in this prototype: mark for
                     // replay so the *uncommitted* source range is re-read.
                     // Source progress was never advanced, so this is safe.
-                    let _ = self
+                    //
+                    // The replay decision must be DURABLE before the adapter
+                    // rewinds, exactly as on the stale-VERIFIED path: if either
+                    // transition fails the row stays as it was, no rewind is
+                    // recorded, and the next recovery decides again — never
+                    // rewind on a decision the ledger did not record (#123).
+                    if let Err(e) = self
                         .store
                         .mark_failed(&rec.batch_id, "recovered: replay required")
-                        .await;
-                    self.store
+                        .await
+                    {
+                        tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist FAILED");
+                        summary.still_pending += 1;
+                        continue;
+                    }
+                    if let Err(e) = self
+                        .store
                         .update_batch_state(
                             &rec.batch_id,
                             BatchState::ReplayRequired,
                             &BatchPatch::default(),
                         )
                         .await
-                        .ok();
-                    rewinds.add(&rec.progress_start);
+                    {
+                        tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist REPLAY_REQUIRED");
+                        summary.still_pending += 1;
+                        continue;
+                    }
+                    rewinds.add(&rec.progress_start, &rec.progress_end);
                     if let Some(mx) = telemetry::metrics() {
                         // Replay is safe by design, but a sustained rate means
                         // work is being repeated - worth seeing on a dashboard.
@@ -2267,8 +2230,34 @@ impl Engine {
                 }
             }
         }
+        // Commit the VERIFIED rows — unless a lower range of the same source
+        // unit is about to be re-read. Committing the higher one first moves
+        // the adapter's committed point past the lower one, and the rewind that
+        // follows is clamped to it: the failed range would then be skipped (the
+        // file adapters never rewind below their committed point). The row
+        // stays VERIFIED, its object stays in the archive, and a later pass
+        // commits it once the source has caught up.
+        for rec in verified {
+            if rewinds.holds_back(&rec.progress_start, &rec.progress_end) {
+                tracing::warn!(
+                    batch_id = %rec.batch_id,
+                    "recovery: not committing a VERIFIED range above an incomplete one of the same source; \
+                     it stays VERIFIED until the lower range has been re-read"
+                );
+                summary.still_pending += 1;
+                continue;
+            }
+            self.commit_recovered(&rec, &mut summary).await?;
+        }
         for marker in rewinds.into_markers() {
             let Some(adapter) = self.adapters.get_mut(&marker.source_type()) else {
+                // The decision to replay is durable, but there is nothing to
+                // rewind: this process has no adapter for that source type.
+                tracing::error!(
+                    start = ?marker,
+                    "recovery has no adapter for an incomplete range's source; it will not be re-read"
+                );
+                summary.still_pending += 1;
                 continue;
             };
             if let Err(e) = adapter.replay_from_marker(&marker).await {
@@ -2284,6 +2273,67 @@ impl Engine {
             }
         }
         Ok(summary)
+    }
+
+    /// Commit the source progress of a VERIFIED batch that was just re-checked
+    /// against storage, and record it.
+    async fn commit_recovered(
+        &mut self,
+        rec: &BatchRecord,
+        summary: &mut RecoverySummary,
+    ) -> Result<(), VtopError> {
+        if let Some(adapter) = self.adapters.get_mut(&rec.source_type) {
+            match adapter.commit_progress(&rec.progress_end).await {
+                Ok(()) => {
+                    self.store.mark_source_committed(&rec.batch_id).await?;
+                    // A restart-recovery commit is still a commit:
+                    // without it, commits_total under-counts on
+                    // exactly the path where the invariant is most
+                    // delicate (VERIFIED but not yet committed).
+                    //
+                    // The verification is counted HERE TOO, even
+                    // though it happened in the process that
+                    // crashed. Prometheus counters are per-process
+                    // and reset on restart, so counting only the
+                    // commit would leave this process reporting
+                    // commits_total > verified_total - which reads
+                    // as "SOURCE_COMMITTED without VERIFIED", the
+                    // one alarm that must never cry wolf. The state
+                    // store is the authority that the batch really
+                    // did reach VERIFIED, so recording both keeps
+                    // the pair self-consistent and honest.
+                    if let Some(mx) = telemetry::metrics() {
+                        let l = [
+                            rec.tenant.as_str(),
+                            rec.source_type.as_str(),
+                            rec.format.extension(),
+                        ];
+                        mx.verified_total.with_label_values(&l).inc();
+                        mx.batches_total
+                            .with_label_values(&[l[0], l[1], l[2], BatchState::Verified.as_str()])
+                            .inc();
+                        mx.commits_total.with_label_values(&l).inc();
+                        mx.batches_total
+                            .with_label_values(&[
+                                l[0],
+                                l[1],
+                                l[2],
+                                BatchState::SourceCommitted.as_str(),
+                            ])
+                            .inc();
+                    }
+                    summary.committed += 1;
+                    tracing::info!(batch_id = %rec.batch_id, "recovered: source_committed");
+                }
+                Err(e) => {
+                    tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery commit failed");
+                    summary.still_pending += 1;
+                }
+            }
+        } else {
+            summary.still_pending += 1;
+        }
+        Ok(())
     }
 
     async fn seed_committed_offsets(&mut self) -> Result<(), VtopError> {
@@ -2398,23 +2448,53 @@ impl Engine {
     }
 }
 
-/// The lowest start position to rewind to, per source unit (a file, a spool
-/// file, a Kafka topic-partition), gathered while recovery scans incomplete
-/// batches. See the note at the top of [`Engine::recover`].
+/// The lowest start position to rewind to, per source unit (one file or spool
+/// file at one inode, or one Kafka topic-partition), gathered while recovery
+/// scans incomplete batches. See the note at the top of [`Engine::recover`].
+///
+/// The inode is part of the unit: a path that was rotated has incomplete
+/// ranges for the old file and for the current one, and a lower offset in the
+/// old file must not hide the current file's range from the plan.
 #[derive(Default)]
 struct RewindPlan {
     lowest: HashMap<String, ProgressMarker>,
+    /// Every range being handed back, per unit, as `(start, position after)`.
+    ranges: HashMap<String, Vec<(i128, i128)>>,
 }
 
 impl RewindPlan {
-    fn add(&mut self, start: &ProgressMarker) {
-        let (unit, position) = rewind_unit(start);
+    /// Record that the range `start..end` is being handed back to its source.
+    fn add(&mut self, start: &ProgressMarker, end: &ProgressMarker) {
+        let position = start_position(start);
+        let unit = unit_key(start);
+        self.ranges
+            .entry(unit.clone())
+            .or_default()
+            .push((position, position_after(end)));
         match self.lowest.get(&unit) {
-            Some(held) if rewind_unit(held).1 <= position => {}
+            Some(held) if start_position(held) <= position => {}
             _ => {
                 self.lowest.insert(unit, start.clone());
             }
         }
+    }
+
+    /// Whether committing the VERIFIED range `start..end` would move its source
+    /// unit's committed point past a range that is about to be re-read and that
+    /// this range does not itself cover. The file adapters never rewind below
+    /// their committed point, so committing first would turn the rewind into a
+    /// no-op and skip the failed data.
+    ///
+    /// A VERIFIED range that covers the pending one is the common benign case
+    /// (the object that replaced a stale row for the same bytes): committing
+    /// it is right, and the clamped rewind then correctly does nothing.
+    fn holds_back(&self, start: &ProgressMarker, end: &ProgressMarker) -> bool {
+        let (from, after) = (start_position(start), position_after(end));
+        self.ranges.get(&unit_key(end)).is_some_and(|pending| {
+            pending.iter().any(|&(r_start, r_after)| {
+                r_start < after && !(from <= r_start && r_after <= after)
+            })
+        })
     }
 
     fn into_markers(self) -> Vec<ProgressMarker> {
@@ -2425,28 +2505,46 @@ impl RewindPlan {
     }
 }
 
-/// The unit a start marker belongs to, and its position within that unit.
-fn rewind_unit(marker: &ProgressMarker) -> (String, i128) {
+/// The source unit a marker belongs to: the same for a batch's start and end
+/// markers, and for every batch read from the same file at the same inode.
+fn unit_key(marker: &ProgressMarker) -> String {
+    let inode = |inode: &Option<u64>| inode.map_or_else(|| "?".to_string(), |i| i.to_string());
     match marker {
         ProgressMarker::Kafka {
             topic,
             partition,
-            start_offset,
             consumer_group,
             ..
-        } => (
-            format!("kafka|{consumer_group}|{topic}#p{partition}"),
-            i128::from(*start_offset),
-        ),
+        } => format!("kafka|{consumer_group}|{topic}#p{partition}"),
         ProgressMarker::File {
-            path, start_byte, ..
-        } => (format!("file|{path}"), i128::from(*start_byte)),
+            path, inode: ino, ..
+        } => format!("file|{path}|{}", inode(ino)),
         ProgressMarker::SyslogSpool {
             spool_id,
             path,
-            start_byte,
+            inode: ino,
             ..
-        } => (format!("spool|{spool_id}|{path}"), i128::from(*start_byte)),
+        } => format!("spool|{spool_id}|{path}|{}", inode(ino)),
+    }
+}
+
+/// Where a range begins within its unit.
+fn start_position(marker: &ProgressMarker) -> i128 {
+    match marker {
+        ProgressMarker::Kafka { start_offset, .. } => i128::from(*start_offset),
+        ProgressMarker::File { start_byte, .. }
+        | ProgressMarker::SyslogSpool { start_byte, .. } => i128::from(*start_byte),
+    }
+}
+
+/// The first position AFTER a range: what committing it would advance its
+/// unit to. Kafka marker offsets are inclusive, so the next offset is one past.
+fn position_after(marker: &ProgressMarker) -> i128 {
+    match marker {
+        ProgressMarker::Kafka { end_offset, .. } => i128::from(*end_offset) + 1,
+        ProgressMarker::File { end_byte, .. } | ProgressMarker::SyslogSpool { end_byte, .. } => {
+            i128::from(*end_byte)
+        }
     }
 }
 
@@ -2455,8 +2553,12 @@ fn rewind_unit(marker: &ProgressMarker) -> (String, i128) {
 const FAILURE_BACKOFF_CAP: Duration = Duration::from_secs(60);
 
 /// How long to wait after the `streak`-th consecutive cycle that failed a
-/// batch: the idle interval, doubling each time, capped, plus up to a quarter
-/// of that again so that engines which failed together do not retry together.
+/// batch: the idle interval, doubling each time and capped, less up to a
+/// quarter of that so that engines which failed together do not retry together.
+///
+/// The jitter is SUBTRACTED, not added: added past the cap it would be cut off
+/// by the cap, and a long outage — exactly when many engines are retrying —
+/// would put them all back in lockstep at the ceiling.
 ///
 /// Before failed ranges were re-read, a failing store was answered by draining
 /// the source into FAILED batches at read speed. Now the same range is read
@@ -2471,7 +2573,7 @@ fn failure_backoff(base: Duration, streak: u32, seed: u64) -> Duration {
         .min(FAILURE_BACKOFF_CAP);
     let spread = u64::try_from(wait.as_millis() / 4).unwrap_or(0);
     let jitter = if spread == 0 { 0 } else { seed % (spread + 1) };
-    (wait + Duration::from_millis(jitter)).min(FAILURE_BACKOFF_CAP)
+    wait - Duration::from_millis(jitter)
 }
 
 /// Buffer key that isolates accumulation per source AND per Kafka partition, so
@@ -3334,12 +3436,13 @@ mod tests {
 
     /// Several incomplete ranges of one source: recovery used to apply each
     /// rewind in turn, so the last row visited decided where the source
-    /// resumed. The plan keeps the lowest start per unit, and keeps units apart.
+    /// resumed. The plan keeps the lowest start per unit, and keeps units apart
+    /// — including two inodes of one path.
     #[test]
     fn a_rewind_plan_keeps_the_lowest_start_per_unit_whatever_the_order() {
-        let file = |path: &str, start: u64| ProgressMarker::File {
+        let file = |path: &str, inode: Option<u64>, start: u64| ProgressMarker::File {
             path: path.into(),
-            inode: None,
+            inode,
             start_byte: start,
             end_byte: start + 10,
             file_size: 0,
@@ -3353,54 +3456,143 @@ mod tests {
             consumer_group: "g".into(),
         };
         for order in [[0usize, 1, 2], [2, 1, 0], [1, 2, 0]] {
-            let candidates = [file("/a", 100), file("/a", 20), file("/a", 60)];
+            let candidates = [
+                file("/a", Some(1), 100),
+                file("/a", Some(1), 20),
+                file("/a", Some(1), 60),
+            ];
             let mut plan = RewindPlan::default();
             for i in order {
-                plan.add(&candidates[i]);
+                plan.add(&candidates[i], &candidates[i]);
             }
-            plan.add(&file("/b", 5));
-            plan.add(&kafka(0, 50));
-            plan.add(&kafka(0, 10));
-            plan.add(&kafka(1, 99));
-            let got: Vec<String> = plan
+            // The current file at the same path, at a HIGHER offset than the
+            // old one's lowest: it must not be hidden by it.
+            let add = |plan: &mut RewindPlan, m: ProgressMarker| plan.add(&m, &m);
+            add(&mut plan, file("/a", Some(2), 500));
+            add(&mut plan, file("/b", None, 5));
+            add(&mut plan, kafka(0, 50));
+            add(&mut plan, kafka(0, 10));
+            add(&mut plan, kafka(1, 99));
+            let got: Vec<(String, i128)> = plan
                 .into_markers()
                 .iter()
-                .map(|m| format!("{:?}", rewind_unit(m)))
+                .map(|m| (unit_key(m), start_position(m)))
                 .collect();
             assert_eq!(
                 got,
                 vec![
-                    r#"("file|/a", 20)"#,
-                    r#"("file|/b", 5)"#,
-                    r#"("kafka|g|t#p0", 10)"#,
-                    r#"("kafka|g|t#p1", 99)"#,
+                    ("file|/a|1".to_string(), 20),
+                    ("file|/a|2".to_string(), 500),
+                    ("file|/b|?".to_string(), 5),
+                    ("kafka|g|t#p0".to_string(), 10),
+                    ("kafka|g|t#p1".to_string(), 99),
                 ],
                 "order {order:?}"
             );
         }
     }
 
+    /// Committing a VERIFIED range above one that is about to be re-read would
+    /// move the adapter's committed point past it, and the file adapters clamp
+    /// a rewind to the committed point: the lower range would be skipped. A
+    /// VERIFIED range that COVERS the pending one is a different thing — it is
+    /// the archive of those very bytes — and must commit.
     #[test]
-    fn the_failure_backoff_doubles_is_capped_and_jitters_within_a_quarter() {
+    fn a_verified_range_is_held_back_only_by_a_pending_range_it_does_not_cover() {
+        let file = |path: &str, inode: u64, start: u64, end: u64| ProgressMarker::File {
+            path: path.into(),
+            inode: Some(inode),
+            start_byte: start,
+            end_byte: end,
+            file_size: 0,
+            mtime: String::new(),
+        };
+        let held = |plan: &RewindPlan, m: &ProgressMarker| plan.holds_back(m, m);
+        let mut plan = RewindPlan::default();
+        let pending = file("/a", 1, 100, 150);
+        plan.add(&pending, &pending);
+        // Above the pending range, or straddling it without covering it: held.
+        assert!(held(&plan, &file("/a", 1, 150, 200)));
+        assert!(held(&plan, &file("/a", 1, 90, 101)), "straddles the start");
+        assert!(held(&plan, &file("/a", 1, 120, 200)), "starts inside it");
+        // The same bytes, or more: committing it covers what is being re-read.
+        assert!(!held(&plan, &file("/a", 1, 100, 150)));
+        assert!(!held(&plan, &file("/a", 1, 90, 200)));
+        // Ends at or below the pending range: cannot skip it.
+        assert!(!held(&plan, &file("/a", 1, 50, 100)));
+        assert!(!held(&plan, &file("/a", 1, 0, 40)));
+        // Another inode of the path, another path: unaffected.
+        assert!(!held(&plan, &file("/a", 2, 150, 200)));
+        assert!(!held(&plan, &file("/b", 1, 150, 200)));
+        // With several pending ranges, one the VERIFIED range does not cover is
+        // enough to hold it back; ranges wholly above it do not matter.
+        let second = file("/a", 1, 300, 320);
+        plan.add(&second, &second);
+        assert!(
+            !held(&plan, &file("/a", 1, 90, 200)),
+            "covers 100-150; 300 is above it"
+        );
+        assert!(!held(&plan, &file("/a", 1, 90, 400)), "covers both");
+        assert!(
+            held(&plan, &file("/a", 1, 200, 400)),
+            "covers 300-320 but not 100-150"
+        );
+        // Kafka offsets are inclusive: a range ENDING at the pending offset
+        // commits through it.
+        let kafka = |start: i64, end: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition: 0,
+            start_offset: start,
+            end_offset: end,
+            consumer_group: "g".into(),
+        };
+        let mut plan = RewindPlan::default();
+        let pending = kafka(10, 19);
+        plan.add(&pending, &pending);
+        assert!(
+            held(&plan, &kafka(5, 10)),
+            "offset 10 is inside the pending range"
+        );
+        assert!(!held(&plan, &kafka(0, 9)), "ends before it");
+        assert!(!held(&plan, &kafka(10, 19)), "the same offsets");
+    }
+
+    #[test]
+    fn the_failure_backoff_doubles_is_capped_and_keeps_its_jitter_at_the_cap() {
         let base = Duration::from_secs(2);
-        let no_jitter = |streak| failure_backoff(base, streak, 0);
-        assert_eq!(no_jitter(1), Duration::from_secs(2));
-        assert_eq!(no_jitter(2), Duration::from_secs(4));
-        assert_eq!(no_jitter(3), Duration::from_secs(8));
-        assert_eq!(no_jitter(6), Duration::from_secs(60), "capped");
+        let top = |streak| failure_backoff(base, streak, 0);
+        assert_eq!(top(1), Duration::from_secs(2));
+        assert_eq!(top(2), Duration::from_secs(4));
+        assert_eq!(top(3), Duration::from_secs(8));
+        assert_eq!(top(6), FAILURE_BACKOFF_CAP, "capped");
         assert_eq!(
-            no_jitter(10_000),
+            top(10_000),
             FAILURE_BACKOFF_CAP,
             "a long outage stays capped"
         );
-        // Jitter only ever adds, by at most a quarter, and never past the cap.
-        for seed in [1u64, 499, 500, 501, u64::MAX] {
-            let got = failure_backoff(base, 1, seed);
+        // Jitter only ever shortens, by at most a quarter, and it must still
+        // spread engines out when they are AT the cap.
+        for streak in [1u32, 3, 6, 10_000] {
+            let full = top(streak);
+            let spread = Duration::from_millis(u64::try_from(full.as_millis() / 4).unwrap());
+            let samples: Vec<Duration> = [0u64, 1, 499, 500, 7_777, u64::MAX]
+                .iter()
+                .map(|seed| failure_backoff(base, streak, *seed))
+                .collect();
+            for got in &samples {
+                assert!(
+                    *got <= full && *got >= full - spread,
+                    "streak {streak}: {got:?}"
+                );
+            }
             assert!(
-                got >= Duration::from_secs(2) && got <= Duration::from_millis(2_500),
-                "seed {seed}: {got:?}"
+                samples
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    > 1,
+                "streak {streak}: jitter produced one value for every seed"
             );
-            assert!(failure_backoff(base, 40, seed) <= FAILURE_BACKOFF_CAP);
         }
         // A zero streak (no failure yet) and a zero base cannot divide or panic.
         assert_eq!(failure_backoff(base, 0, 0), Duration::from_secs(2));
