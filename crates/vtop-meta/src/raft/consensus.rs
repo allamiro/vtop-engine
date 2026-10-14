@@ -198,6 +198,15 @@ impl OpenraftConsensus {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::sync::Arc::new(clock));
     }
 
+    /// Whether a request with this id was already applied on this node. False
+    /// when the node has no applied state to ask (a bare-Raft harness): the
+    /// check then errs towards judging the request.
+    fn already_applied(&self, request_id: uuid::Uuid) -> bool {
+        self.store.as_ref().is_some_and(|store| {
+            store.with_storage(|storage| storage.state().has_applied_request(request_id))
+        })
+    }
+
     fn leader_now_ms(&self) -> i64 {
         match self
             .leader_clock
@@ -704,15 +713,26 @@ impl Consensus for OpenraftConsensus {
         // A lease deadline is built from the proposer's clock, and the lease
         // agent compares it with its own: a proposer whose clock is far from
         // the leader's would steal or poison a lease. Refuse it BEFORE it is
-        // replicated, so it never reaches the log (#555). A follower's
-        // `client_write` is refused with a redirect anyway; the client retries
-        // at the leader, which is the node that checks.
-        if let Some(skew) = command.lease_clock_skew(self.leader_now_ms()) {
-            if !skew.is_within_bound() {
-                return Err(ConsensusError::ClockSkew {
-                    skew_ms: skew.skew_ms,
-                    bound_ms: skew.bound_ms,
-                });
+        // replicated, so it never reaches the log (#555).
+        //
+        // Only the LEADER judges. A follower's clock may differ from the
+        // proposer's by more than the bound while the leader's does not, and a
+        // `ClockSkew` from a follower is not a redirect: the client would keep
+        // retrying the follower instead of reaching the leader. A follower
+        // lets `client_write` answer with `NotLeader`, as it always has.
+        //
+        // And only a NEW request is judged. One that already committed is
+        // answered from the dedup table by `client_write`; a retry whose
+        // timestamp has aged past the bound since the original must still get
+        // that answer, not a skew error about a request that succeeded.
+        if self.raft.metrics().borrow().state == ServerState::Leader {
+            if let Some(skew) = command.lease_clock_skew(self.leader_now_ms()) {
+                if !skew.is_within_bound() && !self.already_applied(skew.request_id) {
+                    return Err(ConsensusError::ClockSkew {
+                        skew_ms: skew.skew_ms,
+                        bound_ms: skew.bound_ms,
+                    });
+                }
             }
         }
         let response = self

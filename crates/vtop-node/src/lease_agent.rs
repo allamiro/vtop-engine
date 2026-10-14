@@ -1291,18 +1291,25 @@ impl LeaseAgentConfig {
                 self.renew_interval, self.lease_duration
             ));
         }
-        // A round that fails is retried after `poll_interval`, not
-        // `renew_interval`, so the attempt after a lost renewal lands
-        // `renew_interval + poll_interval` after the last good one. If that is
-        // at or past the lease, ONE lost round trip (a metadata leader
-        // election, say) costs the range. The documented pacing is a third of
-        // the lease for renewals, which with the default poll interval
-        // tolerates two failures in a row.
-        if self.renew_interval.saturating_add(self.poll_interval) >= self.lease_duration {
+        // The longest ONE failed round can take before the next attempt, from
+        // the last good renewal. The agent next acts `renew_interval` later;
+        // a round that hangs rather than failing fast spends its whole RPC
+        // deadline, which is `renew_interval` (`rpc_deadline`); and a round
+        // that fails is retried after `poll_interval`, not `renew_interval`.
+        // If that sum reaches the lease, ONE lost round trip (a metadata
+        // leader election, say) costs the range. The documented pacing is a
+        // third of the lease for renewals, which with the default poll
+        // interval tolerates two failures in a row.
+        let after_one_lost_round = self
+            .renew_interval
+            .saturating_mul(2)
+            .saturating_add(self.poll_interval);
+        if after_one_lost_round >= self.lease_duration {
             return Err(format!(
-                "renew_interval ({:?}) plus poll_interval ({:?}) is at least lease_duration ({:?}): \
-                 a failed renewal is retried after the poll interval, so a single lost round trip \
-                 would lose the range; shorten them or lengthen the lease",
+                "renew_interval ({:?}) twice, plus poll_interval ({:?}), is at least lease_duration \
+                 ({:?}): a hung renewal costs a full RPC deadline and is retried after the poll \
+                 interval, so a single lost round trip would lose the range; shorten them or \
+                 lengthen the lease",
                 self.renew_interval, self.poll_interval, self.lease_duration
             ));
         }
@@ -4105,10 +4112,10 @@ mod tests {
         );
     }
 
-    /// A failed round is retried after `poll_interval`, so the attempt after a
-    /// lost renewal lands `renew_interval + poll_interval` after the last good
-    /// one. When that reaches the lease, one lost round trip costs the range
-    /// (#555).
+    /// One failed round can cost `renew_interval` before it starts, a whole RPC
+    /// deadline (also `renew_interval`) while it hangs, and `poll_interval`
+    /// before the retry. When that sum reaches the lease, one lost round trip
+    /// costs the range (#555).
     #[test]
     fn a_pacing_where_one_failed_renewal_loses_the_range_is_rejected() {
         let config = |lease_s, renew_s, poll_s| LeaseAgentConfig {
@@ -4117,11 +4124,11 @@ mod tests {
             poll_interval: Duration::from_secs(poll_s),
         };
         // 4 s to renew, then 9 s to retry: the retry is after the 12 s lease.
-        // (Renew alone is under half the lease, which is what the first check
-        // looked at.)
         let error = config(12, 4, 9).validate().unwrap_err();
         assert!(error.contains("a single lost round trip"), "{error}");
-        // Exactly at the lease is already too late.
+        // A 5 s renewal hanging for its full 5 s RPC deadline and retried 2 s
+        // later lands exactly at the 12 s deadline: too late.
+        assert!(config(12, 5, 2).validate().is_err());
         assert!(config(12, 6, 6).validate().is_err());
         assert!(config(12, 3, 9).validate().is_err());
         // The shipped defaults, and the live-chaos pacing, leave room.
@@ -4134,9 +4141,10 @@ mod tests {
         }
         .validate()
         .unwrap();
-        // More than a third is accepted (it warns): two lost renewals in a row
-        // is a tuning choice, one is not.
-        config(12, 5, 2).validate().unwrap();
+        // One more second of lease is enough for the 5 s / 2 s pacing. (It is
+        // still more than a third, which warns: two lost renewals in a row is
+        // a tuning choice, one is not.)
+        config(13, 5, 2).validate().unwrap();
     }
 
     #[test]

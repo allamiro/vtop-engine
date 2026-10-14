@@ -128,7 +128,10 @@ is a different path and is covered deterministically, not live, in
 lease request whose clock is further from its own than a quarter of the lease
 (#555), and that test drives a proposer an hour fast and an hour slow through
 the real propose path, asserting neither can take a lease, push a deadline out,
-or renew. A live scenario that skews a lease-holding data node would build on
+or renew; that a follower redirects instead of reporting skew; that a retry of
+an already-committed request is answered from the dedup table; and that
+takeover follows the replicated deadline (refused one millisecond before it,
+granted at it). A live scenario that skews a lease-holding data node would build on
 `09-range-leader-failover` and has not been written.
 
 The data scenarios stop each process before offline sealing. Recovery first

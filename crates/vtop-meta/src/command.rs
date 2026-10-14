@@ -165,6 +165,9 @@ pub const MIN_LEASE_SKEW_BOUND_MS: u64 = 1_000;
 /// what the leader tolerates for that request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LeaseClockSkew {
+    /// The request this was measured for, so a caller can tell a request that
+    /// already committed (answered from the dedup table) from a new one.
+    pub request_id: Uuid,
     /// Proposer's `issued_at_ms` minus the leader's clock. Positive: the
     /// proposer is ahead.
     pub skew_ms: i64,
@@ -202,6 +205,7 @@ impl MetadataCommand {
             _ => return None,
         };
         Some(LeaseClockSkew {
+            request_id: env.request_id,
             skew_ms: env.issued_at_ms.saturating_sub(leader_now_ms),
             bound_ms: (lease_duration_ms / 4).max(MIN_LEASE_SKEW_BOUND_MS),
         })

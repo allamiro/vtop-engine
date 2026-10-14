@@ -961,6 +961,7 @@ async fn lease_fencing_epochs_are_strictly_monotonic_across_the_cluster() {
 /// own fresh lease every round).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn the_leader_refuses_a_skewed_lease_proposer_so_it_cannot_steal_or_poison_a_lease() {
+    use std::sync::atomic::{AtomicI64, Ordering};
     use vtop_meta::{Consensus, ConsensusError, MetadataError, OpenraftConsensus};
 
     const LEADER_NOW: i64 = 1_750_000_100_000;
@@ -990,9 +991,15 @@ async fn the_leader_refuses_a_skewed_lease_proposer_so_it_cannot_steal_or_poison
         "{resp:?}"
     );
 
-    // The consensus façade over the LEADER's raft, with a clock we control.
-    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone());
-    consensus.set_leader_clock(|| LEADER_NOW);
+    // The consensus façade over the LEADER's raft, with a clock we control and
+    // the applied state attached (the dedup check reads it).
+    let leader_clock = std::sync::Arc::new(AtomicI64::new(LEADER_NOW));
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone());
+    {
+        let clock = leader_clock.clone();
+        consensus.set_leader_clock(move || clock.load(Ordering::SeqCst));
+    }
     let read_range = |cluster: &Cluster| {
         let range_key = MetaKey::Range {
             topic_uuid,
@@ -1019,6 +1026,14 @@ async fn the_leader_refuses_a_skewed_lease_proposer_so_it_cannot_steal_or_poison
             expected_range_generation,
             lease_duration_ms: LEASE_MS,
         };
+    let renew = |env, holder_node_uuid, expected_fencing_epoch| MetadataCommand::RenewRangeLease {
+        env,
+        topic_uuid,
+        range_uuid,
+        holder_node_uuid,
+        expected_fencing_epoch,
+        lease_duration_ms: LEASE_MS,
+    };
 
     // 1. A candidate an hour FAST is refused outright: nothing is replicated,
     //    the range keeps no lease. (Before, it won, with a deadline an hour out.)
@@ -1046,10 +1061,8 @@ async fn the_leader_refuses_a_skewed_lease_proposer_so_it_cannot_steal_or_poison
     //    value is KEPT: the deadline is the proposer's time plus the lease, so
     //    the agent that holds it compares like with like.
     let env = envelope(&mut cluster, LEADER_NOW + 2_000);
-    let receipt = consensus
-        .propose(acquire(env, holder, generation))
-        .await
-        .unwrap();
+    let granted = acquire(env, holder, generation);
+    let receipt = consensus.propose(granted.clone()).await.unwrap();
     assert!(
         matches!(receipt.response, MetadataResponse::LeaseGranted { .. }),
         "seed={seed:#x}: {:?}",
@@ -1059,24 +1072,80 @@ async fn the_leader_refuses_a_skewed_lease_proposer_so_it_cannot_steal_or_poison
     cluster
         .wait_applied_at_least(receipt.log_id.index - 1)
         .await; // meta index is 1-based
-    let lease = read_range(&cluster).lease.expect("a lease");
+    let epoch = read_range(&cluster).fencing_epoch;
+    let deadline = LEADER_NOW + 2_000 + LEASE_MS as i64;
     assert_eq!(
-        lease.expires_at_ms,
-        Some(LEADER_NOW + 2_000 + LEASE_MS as i64),
+        read_range(&cluster).lease.expect("a lease").expires_at_ms,
+        Some(deadline),
         "within the bound the proposer's clock is kept (seed={seed:#x})"
     );
 
-    // 4. A fast-clocked rival can no longer see that live lease as expired:
-    //    it is refused before it can try. (Before: it took the range.)
+    // 4. A retry of a request that already COMMITTED is answered from the dedup
+    //    table even when its timestamp has aged past the bound since: a skew
+    //    error about a request that succeeded would tell the caller it failed.
+    leader_clock.store(LEADER_NOW + HOUR_MS, Ordering::SeqCst);
+    let retried = consensus.propose(granted).await;
+    assert!(
+        matches!(
+            retried,
+            Ok(ref r) if matches!(r.response, MetadataResponse::LeaseGranted { fencing_epoch } if fencing_epoch == epoch)
+        ),
+        "a committed request must be answered from the dedup table (seed={seed:#x}): {retried:?}"
+    );
+    leader_clock.store(LEADER_NOW, Ordering::SeqCst);
+
+    // 5. A FOLLOWER does not judge: its clock may differ from the proposer's
+    //    by more than the bound while the leader's does not, and a skew error
+    //    is not a redirect. It answers NotLeader, as it always has.
+    let leader = cluster.leader_id();
+    let follower = *cluster
+        .nodes
+        .keys()
+        .find(|id| **id != leader)
+        .expect("a follower");
+    let on_follower = OpenraftConsensus::new(cluster.nodes[&follower].raft.clone())
+        .with_store(cluster.nodes[&follower].store.clone());
+    on_follower.set_leader_clock(|| LEADER_NOW);
+    let env = envelope(&mut cluster, LEADER_NOW + HOUR_MS);
     let generation = read_range(&cluster).generation;
+    assert!(
+        matches!(
+            on_follower.propose(acquire(env, rival, generation)).await,
+            Err(ConsensusError::NotLeader { .. })
+        ),
+        "a follower must redirect, not report skew (seed={seed:#x})"
+    );
+
+    // 6. A fast-clocked rival is refused before it can try to take the live
+    //    lease. (Before: it took the range.)
     let env = envelope(&mut cluster, LEADER_NOW + HOUR_MS);
     assert!(matches!(
         consensus.propose(acquire(env, rival, generation)).await,
         Err(ConsensusError::ClockSkew { .. })
     ));
-    // ...and a rival with a good clock is rejected by the state machine, as
-    // before, because the incumbent is live.
-    let env = envelope(&mut cluster, LEADER_NOW + 500);
+
+    // 7. Renewals are held to the same bound, in both directions, and a
+    //    refused renewal leaves the deadline alone.
+    for skew in [HOUR_MS, -HOUR_MS] {
+        let env = envelope(&mut cluster, LEADER_NOW + skew);
+        assert!(
+            matches!(
+                consensus.propose(renew(env, holder, epoch)).await,
+                Err(ConsensusError::ClockSkew { .. })
+            ),
+            "renewal {skew} ms off (seed={seed:#x})"
+        );
+    }
+    assert_eq!(
+        read_range(&cluster).lease.expect("a lease").expires_at_ms,
+        Some(deadline)
+    );
+
+    // 8. Takeover timing follows the replicated deadline. One millisecond
+    //    before it a rival with a good clock is turned away because the
+    //    incumbent is live; at the deadline it wins.
+    leader_clock.store(deadline - 1, Ordering::SeqCst);
+    let env = envelope(&mut cluster, deadline - 1);
     let receipt = consensus
         .propose(acquire(env, rival, generation))
         .await
@@ -1087,28 +1156,21 @@ async fn the_leader_refuses_a_skewed_lease_proposer_so_it_cannot_steal_or_poison
         }
         other => panic!("a live lease was taken (seed={seed:#x}): {other:?}"),
     }
-
-    // 5. A holder that drifts out of the bound cannot renew its way to a
-    //    deadline in the future either.
-    let epoch = read_range(&cluster).fencing_epoch;
-    let env = envelope(&mut cluster, LEADER_NOW + HOUR_MS);
-    assert!(matches!(
-        consensus
-            .propose(MetadataCommand::RenewRangeLease {
-                env,
-                topic_uuid,
-                range_uuid,
-                holder_node_uuid: holder,
-                expected_fencing_epoch: epoch,
-                lease_duration_ms: LEASE_MS,
-            })
-            .await,
-        Err(ConsensusError::ClockSkew { .. })
-    ));
-    assert_eq!(
-        read_range(&cluster).lease.expect("a lease").expires_at_ms,
-        Some(LEADER_NOW + 2_000 + LEASE_MS as i64),
-        "the refused renewal left the deadline alone (seed={seed:#x})"
+    let _ = cluster.leader().raft.trigger().heartbeat().await;
+    cluster
+        .wait_applied_at_least(receipt.log_id.index - 1)
+        .await;
+    let generation = read_range(&cluster).generation;
+    leader_clock.store(deadline, Ordering::SeqCst);
+    let env = envelope(&mut cluster, deadline);
+    let receipt = consensus
+        .propose(acquire(env, rival, generation))
+        .await
+        .unwrap();
+    assert!(
+        matches!(receipt.response, MetadataResponse::LeaseGranted { fencing_epoch } if fencing_epoch == epoch + 1),
+        "at the replicated deadline the lease is up for election (seed={seed:#x}): {:?}",
+        receipt.response
     );
 }
 
