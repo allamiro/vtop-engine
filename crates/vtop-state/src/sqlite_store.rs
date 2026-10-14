@@ -175,11 +175,7 @@ impl SqliteStateStore {
     /// (another engine owns this batch now) - as opposed to the row changing
     /// state under us, which a retry can resolve. `Ok(None)` when the claim is
     /// still the one held.
-    async fn lost_claim(
-        &self,
-        batch_id: &str,
-        held: Option<i64>,
-    ) -> Result<Option<VtopError>, VtopError> {
+    async fn lost_claim(&self, batch_id: &str, held: i64) -> Result<Option<VtopError>, VtopError> {
         let row = sqlx::query("SELECT claim_gen FROM batches WHERE batch_id = ?")
             .bind(batch_id)
             .fetch_optional(&self.pool)
@@ -187,9 +183,7 @@ impl SqliteStateStore {
             .map_err(map_sqlx)?
             .ok_or_else(|| VtopError::NotFound(format!("batch {batch_id}")))?;
         let actual: i64 = row.get("claim_gen");
-        Ok(held
-            .filter(|held| *held != actual)
-            .map(|held| crate::fence::claim_lost(batch_id, held, actual)))
+        Ok((held != actual).then(|| crate::fence::claim_lost(batch_id, held, actual)))
     }
 
     /// Shared read helper for the `list_*` queries. `sql` is `'static` because
@@ -273,13 +267,16 @@ impl StateStore for SqliteStateStore {
         loop {
             let current = self.get_state(batch_id).await?;
             let validated = transition(current, to)?; // enforces the core invariant
+                                                      // Only rows this process created or claimed are written; see the
+                                                      // fence module for why a missing token refuses rather than
+                                                      // writing unconditionally.
+            let held = held.ok_or_else(|| crate::fence::not_held(batch_id))?;
 
             let now = chrono::Utc::now().to_rfc3339();
-            // Conditional on the state we validated against AND, for a row this
-            // process holds a claim on, on the claim still being the one it
-            // holds. Unconditional, a write could land on a row another engine
-            // claimed and moved on; state names recur, so the state guard alone
-            // does not stop it.
+            // Conditional on the state we validated against AND on the claim
+            // still being the one this process holds. Without the second, a
+            // write could land on a row another engine claimed and moved on;
+            // state names recur, so the state guard alone does not stop it.
             let rows = sqlx::query(
                 r#"UPDATE batches SET
                      state = ?,
@@ -292,7 +289,7 @@ impl StateStore for SqliteStateStore {
                      record_count = COALESCE(?, record_count),
                      error_message = COALESCE(?, error_message),
                      updated_at = ?
-                   WHERE batch_id = ? AND state = ? AND (? IS NULL OR claim_gen = ?)"#,
+                   WHERE batch_id = ? AND state = ? AND claim_gen = ?"#,
             )
             .bind(validated.as_str())
             .bind(&patch.object_uri)
@@ -307,18 +304,16 @@ impl StateStore for SqliteStateStore {
             .bind(batch_id)
             .bind(current.as_str())
             .bind(held)
-            .bind(held)
             .execute(&self.pool)
             .await
             .map_err(map_sqlx)?
             .rows_affected();
             if rows >= 1 {
-                if crate::fence::ends_work(validated) {
-                    self.fence.release(batch_id);
-                }
+                self.fence.wrote(batch_id, validated);
                 return Ok(());
             }
             if let Some(lost) = self.lost_claim(batch_id, held).await? {
+                self.fence.lost(batch_id);
                 return Err(lost);
             }
             attempt += 1;
@@ -559,12 +554,16 @@ mod tests {
         test_battery::run_fencing_battery(&a, &b).await;
     }
 
-    /// A process holds a fence token only for work in flight (review of #569):
-    /// a batch that ends in FAILED, or is handed back for replay, no longer
-    /// pins an entry for the life of the engine - but a token whose claim was
-    /// LOST stays, because it is what keeps the stalled writer fenced.
+    /// A process holds a fence token while it may still write the batch, and
+    /// writes nothing it holds no token for (review of #569):
+    /// - FAILED keeps the token: recovery writes REPLAY_REQUIRED over it next,
+    ///   and an engine sharing this one's owner name can claim the row in
+    ///   between. Released at FAILED, that write went through unfenced.
+    /// - REPLAY_REQUIRED releases it.
+    /// - A lost claim keeps it: it is what keeps the stalled writer fenced.
+    /// - A row this process never created or claimed is refused.
     #[tokio::test]
-    async fn fence_tokens_are_released_when_work_ends_and_kept_when_the_claim_is_lost() {
+    async fn fence_tokens_are_kept_while_the_batch_can_still_be_written() {
         let dir = tempfile::tempdir().unwrap();
         let url = format!("sqlite://{}", dir.path().join("tokens.db").display());
         let a = SqliteStateStore::connect(&url).await.unwrap();
@@ -573,46 +572,67 @@ mod tests {
         let record = |id: &str| {
             let mut rec = test_battery::sample_record(id);
             rec.owner = Some("engine-a".into());
-            rec.lease_expires_at = Some("2000-01-01T00:00:00+00:00".into());
+            rec.lease_expires_at = Some("2100-01-01T00:00:00+00:00".into());
             rec
         };
-
-        // Failed: the work on this process ended.
-        a.save_batch_state(&record("tok-failed")).await.unwrap();
-        assert_eq!(a.fence.held("tok-failed"), Some(0));
-        a.mark_failed("tok-failed", "upload failed").await.unwrap();
-        assert_eq!(a.fence.held("tok-failed"), None);
-
-        // Handed back for replay: the recovery pass is done with it.
-        a.update_batch_state("tok-failed", BatchState::ReplayRequired, &patch)
-            .await
-            .unwrap();
-        assert_eq!(a.fence.held("tok-failed"), None);
-
-        // A lost claim keeps its token: the stale writer stays fenced.
-        a.save_batch_state(&record("tok-lost")).await.unwrap();
-        let claimed = b
-            .claim_incomplete_batches(
-                "engine-b",
+        let claim_as_engine_a = || {
+            b.claim_incomplete_batches(
+                "engine-a",
                 "2050-01-01T00:00:00+00:00",
                 "2100-01-01T00:00:00+00:00",
             )
+        };
+
+        // FAILED then REPLAY_REQUIRED, uncontended: the token spans both.
+        a.save_batch_state(&record("tok-handoff")).await.unwrap();
+        a.mark_failed("tok-handoff", "upload failed").await.unwrap();
+        assert_eq!(a.fence.held("tok-handoff"), Some(0));
+        a.update_batch_state("tok-handoff", BatchState::ReplayRequired, &patch)
             .await
             .unwrap();
-        assert!(claimed.iter().any(|r| r.batch_id == "tok-lost"));
-        assert!(a
-            .update_batch_state("tok-lost", BatchState::Sealed, &patch)
-            .await
-            .is_err());
-        assert_eq!(
-            a.fence.held("tok-lost"),
-            Some(0),
-            "retired, the stale writer's next attempt would be unfenced"
+        assert_eq!(a.fence.held("tok-handoff"), None);
+
+        // FAILED, then an engine under the same name claims the row, then the
+        // first writes REPLAY_REQUIRED: refused, and the row is left as the
+        // new claimant has it.
+        a.save_batch_state(&record("tok-race")).await.unwrap();
+        a.mark_failed("tok-race", "upload failed").await.unwrap();
+        let claimed = claim_as_engine_a().await.unwrap();
+        assert!(claimed.iter().any(|r| r.batch_id == "tok-race"));
+        let refused = a
+            .update_batch_state("tok-race", BatchState::ReplayRequired, &patch)
+            .await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("claimed by another engine")),
+            "the handoff write went through over the new claim: {refused:?}"
         );
-        assert!(a
-            .update_batch_state("tok-lost", BatchState::Sealed, &patch)
-            .await
-            .is_err());
+        assert_eq!(
+            a.get_batch("tok-race").await.unwrap().unwrap().state,
+            BatchState::Failed
+        );
+        assert_eq!(
+            a.fence.held("tok-race"),
+            Some(0),
+            "kept: the stale writer's next attempt must be refused too"
+        );
+
+        // A row this process never created or claimed is not written at all.
+        let c = SqliteStateStore::connect(&url).await.unwrap();
+        let refused = c
+            .update_batch_state("tok-race", BatchState::ReplayRequired, &patch)
+            .await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("not claimed by this engine")),
+            "written without a token: {refused:?}"
+        );
+        assert_eq!(
+            c.get_batch("tok-race").await.unwrap().unwrap().state,
+            BatchState::Failed
+        );
     }
 
     /// A database created before the fence existed gains the column and keeps

@@ -334,16 +334,18 @@ impl StateStore for PgStateStore {
         // fails immediately - only a lost update loops. The 40001 serialization
         // retry sits inside, on the write itself.
         //
-        // For a row this process holds a claim on, the write is ALSO
-        // conditional on the claim generation (#557): the state guard alone
-        // lets an engine whose lease lapsed write over the engine that claimed
-        // the row, because state names recur. A lost claim is not a lost
-        // update — retrying cannot help — so it is reported at once.
+        // The write is ALSO conditional on the claim generation this process
+        // holds (#557): the state guard alone lets an engine whose lease
+        // lapsed write over the engine that claimed the row, because state
+        // names recur. A lost claim is not a lost update — retrying cannot
+        // help — so it is reported at once. A row this process holds no
+        // generation for is refused (see the fence module).
         let held = self.fence.held(batch_id);
         let mut attempt = 0;
         loop {
             let current = self.get_state(batch_id).await?;
             let validated = transition(current, to)?;
+            let held = held.ok_or_else(|| crate::fence::not_held(batch_id))?;
             let now = chrono::Utc::now().to_rfc3339();
             let expected = current.as_str();
             let rows = with_retry(|| {
@@ -359,8 +361,7 @@ impl StateStore for PgStateStore {
                          record_count = COALESCE($8, record_count),
                          error_message = COALESCE($9, error_message),
                          updated_at = $10
-                       WHERE batch_id = $11 AND state = $12
-                         AND ($13::bigint IS NULL OR claim_gen = $13)"#,
+                       WHERE batch_id = $11 AND state = $12 AND claim_gen = $13"#,
                 )
                 .bind(validated.as_str())
                 .bind(&patch.object_uri)
@@ -381,21 +382,18 @@ impl StateStore for PgStateStore {
             .rows_affected();
 
             if rows >= 1 {
-                if crate::fence::ends_work(validated) {
-                    self.fence.release(batch_id);
-                }
+                self.fence.wrote(batch_id, validated);
                 return Ok(());
             }
-            if let Some(held) = held {
-                let actual: Option<i64> =
-                    sqlx::query_scalar("SELECT claim_gen FROM batches WHERE batch_id = $1")
-                        .bind(batch_id)
-                        .fetch_optional(&self.pool)
-                        .await
-                        .map_err(map_sqlx)?;
-                if let Some(actual) = actual.filter(|actual| *actual != held) {
-                    return Err(crate::fence::claim_lost(batch_id, held, actual));
-                }
+            let actual: Option<i64> =
+                sqlx::query_scalar("SELECT claim_gen FROM batches WHERE batch_id = $1")
+                    .bind(batch_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(map_sqlx)?;
+            if let Some(actual) = actual.filter(|actual| *actual != held) {
+                self.fence.lost(batch_id);
+                return Err(crate::fence::claim_lost(batch_id, held, actual));
             }
             // Lost update: the row's state changed between our read and write.
             attempt += 1;

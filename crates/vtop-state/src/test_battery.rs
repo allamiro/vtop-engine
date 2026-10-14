@@ -171,18 +171,26 @@ pub async fn run_fencing_battery(a: &dyn StateStore, b: &dyn StateStore) {
         .await
         .unwrap();
 
-    // 3. A process that holds no claim on a row — an operator tool, or a row an
-    //    older build created — is written exactly as before: the fence guards
-    //    claims, it does not forbid a tool from touching the ledger. And the
-    //    creator's own later writes are unaffected, because nothing moved the
-    //    generation.
+    // 3. A process that holds no claim on a row - it neither created nor
+    //    claimed it, or dropped the token - is refused, not let through
+    //    unfenced: an unchecked write is exactly what a stalled writer whose
+    //    token went missing would make (review of #569). The creator's own
+    //    later writes are unaffected, because nothing moved the generation.
     a.save_batch_state(&batch("fence-tool", "engine-a"))
         .await
         .unwrap();
-    b.update_batch_state("fence-tool", BatchState::Sealed, &patch)
+    match b
+        .update_batch_state("fence-tool", BatchState::Sealed, &patch)
         .await
-        .unwrap();
-    a.update_batch_state("fence-tool", BatchState::Compressed, &patch)
+    {
+        Err(e) => assert!(
+            e.to_string().contains("not claimed by this engine")
+                && e.to_string().contains("fence-tool"),
+            "must be refused as not held, naming the batch: {e}"
+        ),
+        Ok(()) => panic!("fence-tool: a write from a process holding no claim was accepted"),
+    }
+    a.update_batch_state("fence-tool", BatchState::Sealed, &patch)
         .await
         .unwrap();
 

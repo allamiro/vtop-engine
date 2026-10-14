@@ -854,8 +854,11 @@ Short procedures now; expand into a full ops runbook before go-live.
   (`claim_incomplete_batches`: an owner and a lease, #93) and, since #557, a
   **claim generation** that fences a stalled engine: every claim bumps it, and
   a writer that holds an older one is refused instead of overwriting the
-  engine that took the row over (for the batches this process created or
-  claimed; a row it holds no claim on is written as before). That makes a
+  engine that took the row over. An engine writes only the rows it created or
+  claimed, and keeps the generation while it can still write one (a FAILED
+  batch keeps it until it is handed back for replay; a lost claim keeps it so
+  the stalled writer stays refused); a write to a row it holds no generation
+  for is refused, never made unchecked. That makes a
   recovery *handover* safe at the ledger - between engines that all run a
   build with the fence: an older build neither bumps nor checks the
   generation, so drain older engines before relying on it. It does **not** make two engines
