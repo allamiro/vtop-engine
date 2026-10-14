@@ -2015,7 +2015,7 @@ mod tests {
                 attr.to_token_stream()
             ));
         }
-        if declaration.unsafety.is_some() || declaration.auto_token.is_some() {
+        if declaration.unsafety.is_some() || declaration.modifiers.auto_token.is_some() {
             refusals.push("the trait's qualifiers changed from a plain `pub trait`".to_string());
         }
         if !declaration.generics.params.is_empty() || declaration.generics.where_clause.is_some() {

@@ -258,15 +258,24 @@ impl ServerMetrics {
 
     pub fn session_closed(&self, role: Role) {
         self.sessions_closed[role_index(role)].fetch_add(1, Ordering::Relaxed);
-        // `fetch_update` rather than `fetch_sub`: an unbalanced close would
+        // A clamped decrement rather than `fetch_sub`: an unbalanced close would
         // wrap the gauge to u64::MAX and render as an absurd session count.
         // Clamping at zero keeps a bookkeeping slip from looking like an
-        // incident.
-        let _ = self.sessions_active[role_index(role)].fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(1)),
-        );
+        // incident. A compare-exchange loop because `fetch_update` is deprecated
+        // on current stable and its replacement is newer than the MSRV.
+        let gauge = &self.sessions_active[role_index(role)];
+        let mut current = gauge.load(Ordering::Relaxed);
+        while current > 0 {
+            match gauge.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub fn session_refused_at_capacity(&self) {
