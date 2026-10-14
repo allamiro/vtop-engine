@@ -989,9 +989,23 @@ struct Promoter {
     /// read from metadata's transition chain before each verification
     /// (#449): the boundary established here must not fall below it.
     published_floor: Option<u64>,
+    /// The agent's round clock. A promotion runs inside a round, and its
+    /// probe and transition report are network calls the round's budget must
+    /// cover too: the reporter alone retries five times with backoff, which
+    /// is several renew intervals (review of #566).
+    round: RoundClock,
 }
 
 impl Promoter {
+    /// Run `call` within what is left of the current round; `None` if the
+    /// round's budget ran out first. Outside a round, unbounded.
+    async fn within_round<T>(&self, call: impl std::future::Future<Output = T>) -> Option<T> {
+        match self.round.remaining() {
+            None => Some(call.await),
+            Some(left) => tokio::time::timeout(left, call).await.ok(),
+        }
+    }
+
     /// Make this node servable at `fencing_epoch`, verifying the committed
     /// boundary first if this epoch has not been verified yet.
     async fn ensure(&mut self, fencing_epoch: u64) -> bool {
@@ -1004,7 +1018,13 @@ impl Promoter {
             // form would make single-replica deployments unleadable.
             None => None,
             Some(probe) => {
-                let probes = probe.probe(fencing_epoch).await;
+                // A probe the round could not wait for has no answers: the
+                // same verdict as a quorum that did not answer, retried next
+                // round.
+                let probes = self
+                    .within_round(probe.probe(fencing_epoch))
+                    .await
+                    .unwrap_or_default();
                 match crate::promotion::establish(
                     &probes,
                     probe.replication_factor(),
@@ -1184,7 +1204,13 @@ impl Promoter {
         // not a boundary nobody will know about: the epoch is held still and
         // the next round verifies again.
         if let Some(outcome) = self.evidence.take() {
-            if let Err(error) = self.reporter.report(fencing_epoch, outcome).await {
+            let reported = self
+                .within_round(self.reporter.report(fencing_epoch, outcome))
+                .await
+                .unwrap_or_else(|| {
+                    Err("the round's budget ran out before metadata answered".to_owned())
+                });
+            if let Err(error) = reported {
                 tracing::warn!(
                     range = %self.range_uuid,
                     fencing_epoch,
@@ -1209,7 +1235,13 @@ impl Promoter {
     /// and a report that fails must not change the verdict.
     async fn report_refusal(&mut self, fencing_epoch: u64) {
         if let Some(outcome) = self.evidence.take() {
-            if let Err(error) = self.reporter.report(fencing_epoch, outcome).await {
+            let reported = self
+                .within_round(self.reporter.report(fencing_epoch, outcome))
+                .await
+                .unwrap_or_else(|| {
+                    Err("the round's budget ran out before metadata answered".to_owned())
+                });
+            if let Err(error) = reported {
                 tracing::warn!(
                     range = %self.range_uuid,
                     fencing_epoch,
@@ -1286,6 +1318,12 @@ impl RoundClock {
         RoundGuard(self.clone())
     }
 
+    /// What is left of the current round; `None` outside one.
+    fn remaining(&self) -> Option<Duration> {
+        self.slot()
+            .map(|end| end.saturating_duration_since(tokio::time::Instant::now()))
+    }
+
     /// What one call may spend: what is left of the round, never more than
     /// `interval`; outside a round, the whole `interval`.
     fn budget(&self, interval: Duration) -> Duration {
@@ -1354,19 +1392,28 @@ impl LeaseAgentConfig {
         // and a round
         // that fails is retried after `poll_interval`, not `renew_interval`.
         // If that sum reaches the lease, ONE lost round trip (a metadata
-        // leader election, say) costs the range. The documented pacing is a
-        // third of the lease for renewals, which with the default poll
-        // interval tolerates two failures in a row.
+        // leader election, say) costs the range.
+        //
+        // And the lease a rival sees is not the whole lease: the deadline is
+        // this node's clock plus the lease, and a rival's acquire is judged by
+        // the rival's clock, so a holder slow by the tolerated skew and a
+        // rival fast by it shorten the lease, in real time, by twice the
+        // allowance metadata tolerates (review of #566). The sum must fit in
+        // what is left.
         let after_one_lost_round = self
             .renew_interval
             .saturating_mul(2)
             .saturating_add(self.poll_interval);
-        if after_one_lost_round >= self.lease_duration {
+        let lease_ms = u64::try_from(self.lease_duration.as_millis()).unwrap_or(u64::MAX);
+        let skew = Duration::from_millis(vtop_meta::lease_skew_bound_ms(lease_ms));
+        let worst_case_lease = self.lease_duration.saturating_sub(skew.saturating_mul(2));
+        if after_one_lost_round >= worst_case_lease {
             return Err(format!(
-                "renew_interval ({:?}) twice, plus poll_interval ({:?}), is at least lease_duration \
-                 ({:?}): a hung renewal costs a full RPC deadline and is retried after the poll \
-                 interval, so a single lost round trip would lose the range; shorten them or \
-                 lengthen the lease",
+                "renew_interval ({:?}) twice, plus poll_interval ({:?}), is at least the lease a \
+                 rival can see ({worst_case_lease:?}: lease_duration {:?} less twice the {skew:?} \
+                 clock skew metadata tolerates for it): a hung renewal costs a full RPC deadline \
+                 and is retried after the poll interval, so a single lost round trip would lose \
+                 the range; shorten them or lengthen the lease",
                 self.renew_interval, self.poll_interval, self.lease_duration
             ));
         }
@@ -1736,6 +1783,7 @@ impl LeaseAgent {
     ) -> Result<Self, String> {
         config.validate()?;
         let admin = Arc::new(admin);
+        let round_clock = RoundClock::default();
         Ok(Self {
             admin: Arc::clone(&admin),
             config,
@@ -1761,12 +1809,13 @@ impl LeaseAgent {
                 range_uuid,
                 stand_aside: false,
                 published_floor: None,
+                round: round_clock.clone(),
             },
             state: LeaseState::NotHeld,
             ready: None,
             stand_down: None,
             stood_down_latched: false,
-            round_clock: RoundClock::default(),
+            round_clock,
             gate: None,
             gate_degraded: false,
             range_missing: false,
@@ -3614,6 +3663,7 @@ mod tests {
             node_uuid: Uuid::from_u128(1),
             range_uuid: Uuid::from_u128(21),
             published_floor: None,
+            round: RoundClock::default(),
         }
     }
 
@@ -3710,6 +3760,46 @@ mod tests {
             node_id: Uuid::from_u128(node),
             local_committed_offset: offset,
         }
+    }
+
+    /// Review of #566: a promotion's network calls are inside the round, so
+    /// the round's budget bounds them. The admin reporter retries five times
+    /// with backoff - several renew intervals - and a reporter that never
+    /// answers used to hold the round open past the next renewal. Now the
+    /// round's end cancels it: the boundary is not exposed (a report that did
+    /// not land is a report that did not land) and the epoch is suspended for
+    /// the next round to retry.
+    #[tokio::test]
+    async fn a_promotion_cannot_outlast_its_round() {
+        struct Silent;
+        #[async_trait::async_trait]
+        impl TransitionReporter for Silent {
+            async fn report(
+                &self,
+                _fencing_epoch: u64,
+                _outcome: vtop_meta::PromotionOutcome,
+            ) -> Result<(), String> {
+                std::future::pending().await
+            }
+        }
+        let recorder = Arc::new(Recorder::default());
+        let mut promoter = promoter_with(recorder.clone(), Arc::new(Silent), None);
+        let round = promoter.round.clone();
+        let budget = Duration::from_millis(300);
+        let _open = round.open(budget);
+        let started = tokio::time::Instant::now();
+        let held = tokio::time::timeout(Duration::from_secs(10), promoter.ensure(3))
+            .await
+            .expect("the promotion outlasted its round: the reporter was not bounded by it");
+        assert!(!held, "a boundary whose report never landed was exposed");
+        // Slack for a loaded runner; far below the reporter's own retries.
+        assert!(
+            started.elapsed() < budget + Duration::from_secs(1),
+            "spent {:?} of a {budget:?} round",
+            started.elapsed()
+        );
+        assert!(recorder.promoted.lock().unwrap().is_empty());
+        assert_eq!(*recorder.suspended.lock().unwrap(), vec![3]);
     }
 
     /// A refused promotion must PUBLISH the refusal, not merely flip local
@@ -4246,8 +4336,9 @@ mod tests {
 
     /// One failed round can cost `renew_interval` before it starts, a whole RPC
     /// deadline (also `renew_interval`) while it hangs, and `poll_interval`
-    /// before the retry. When that sum reaches the lease, one lost round trip
-    /// costs the range (#555).
+    /// before the retry. When that sum reaches the lease a rival can see - the
+    /// lease less twice the clock skew metadata tolerates - one lost round trip
+    /// costs the range (#555, review of #566).
     #[test]
     fn a_pacing_where_one_failed_renewal_loses_the_range_is_rejected() {
         let config = |lease_s, renew_s, poll_s| LeaseAgentConfig {
@@ -4273,10 +4364,18 @@ mod tests {
         }
         .validate()
         .unwrap();
-        // One more second of lease is enough for the 5 s / 2 s pacing. (It is
-        // still more than a third, which warns: two lost renewals in a row is
-        // a tuning choice, one is not.)
-        config(13, 5, 2).validate().unwrap();
+        // 12 s of 5 s / 2 s pacing needs 14 s of lease once the 1 s skew
+        // allowance is taken from each side. 13 s passed before skew was
+        // counted (review of #566: with a quarter-lease allowance even the
+        // 15 s default left only 7.5 s).
+        assert!(
+            config(13, 5, 2)
+                .validate()
+                .unwrap_err()
+                .contains("clock skew metadata tolerates"),
+            "the skew allowance is not counted"
+        );
+        config(14, 4, 2).validate().unwrap();
     }
 
     #[test]

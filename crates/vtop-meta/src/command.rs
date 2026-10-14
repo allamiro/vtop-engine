@@ -161,6 +161,36 @@ pub struct CommandEnvelope {
 /// milliseconds; one second is far above both and far below any lease.
 pub const MIN_LEASE_SKEW_BOUND_MS: u64 = 1_000;
 
+/// The clock error tolerated between a lease proposer and the metadata leader
+/// for a lease of `lease_duration_ms`: a twentieth of the lease, never less
+/// than [`MIN_LEASE_SKEW_BOUND_MS`] - except that it is never more than a
+/// tenth of the lease, which for a lease under ten seconds is below the floor
+/// and wins.
+///
+/// A deadline is the proposer's `issued_at_ms` plus the lease, and a rival's
+/// acquire is judged against it by the rival's own `issued_at_ms`. A holder
+/// slow by the bound and a rival fast by it therefore see a lease that is
+/// shorter, in real time, by TWICE the bound - which the holder's renewal
+/// pacing must absorb on top of a lost round
+/// (`LeaseAgentConfig::validate`). At a quarter of the lease, as it was, the
+/// default 15 s lease kept only 7.5 s, less than one lost 5 s round plus its
+/// retry (review of #566). NTP-synchronised hosts agree to milliseconds, so
+/// the floor is still far above honest error. The cap keeps the two-sided
+/// loss to a fifth of any lease: the live-chaos pacing (6 s lease, 2 s renew,
+/// 0.5 s poll) keeps 4.8 s against the 4.5 s one lost round needs, where the
+/// floor alone would leave 4 s.
+///
+/// The skew is measured when the request reaches the leader, so time on the
+/// wire counts against it, always in the direction of the proposer looking
+/// behind. A request that spends longer than the bound getting there is
+/// refused and retried next round - its deadline would already be stale by
+/// that much.
+pub fn lease_skew_bound_ms(lease_duration_ms: u64) -> u64 {
+    (lease_duration_ms / 20)
+        .max(MIN_LEASE_SKEW_BOUND_MS)
+        .min(lease_duration_ms / 10)
+}
+
 /// How far a lease proposer's clock was from the metadata leader's, against
 /// what the leader tolerates for that request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,14 +216,10 @@ impl MetadataCommand {
     /// `leader_now_ms` and how much the leader tolerates; `None` for every
     /// other command, whose outcome never reads `issued_at_ms`.
     ///
-    /// The tolerance is a quarter of the requested lease, never less than
-    /// [`MIN_LEASE_SKEW_BOUND_MS`] - and never more than half the lease, so a
-    /// lease shorter than the floor cannot be given an allowance larger than
-    /// itself (a rival 900 ms fast against a 500 ms lease would otherwise see a
-    /// live incumbent as already expired). A proposer's error then moves a
-    /// deadline by at most a quarter of the lease it asked for (half, for a
-    /// lease under four seconds), which the renewal pacing (a third of the
-    /// lease) already absorbs for the usual lengths.
+    /// The tolerance is [`lease_skew_bound_ms`] of the requested lease. A
+    /// proposer's error then moves a deadline by at most that much, and two
+    /// proposers' errors move a takeover by at most twice it, which
+    /// `LeaseAgentConfig::validate` counts against the renewal pacing.
     pub fn lease_clock_skew(&self, leader_now_ms: i64) -> Option<LeaseClockSkew> {
         let (env, lease_duration_ms) = match self {
             MetadataCommand::AcquireRangeLease {
@@ -211,9 +237,7 @@ impl MetadataCommand {
         Some(LeaseClockSkew {
             request_id: env.request_id,
             skew_ms: env.issued_at_ms.saturating_sub(leader_now_ms),
-            bound_ms: (lease_duration_ms / 4)
-                .max(MIN_LEASE_SKEW_BOUND_MS)
-                .min(lease_duration_ms / 2),
+            bound_ms: lease_skew_bound_ms(lease_duration_ms),
         })
     }
 }
@@ -2571,12 +2595,7 @@ mod tests {
                     checked += 1;
                     let skew = skew.expect("the lease pair is checked");
                     assert_eq!(skew.skew_ms, env.issued_at_ms - LEADER_NOW);
-                    assert_eq!(
-                        skew.bound_ms,
-                        (lease_duration_ms / 4)
-                            .max(MIN_LEASE_SKEW_BOUND_MS)
-                            .min(lease_duration_ms / 2)
-                    );
+                    assert_eq!(skew.bound_ms, lease_skew_bound_ms(*lease_duration_ms));
                 }
                 _ => assert_eq!(skew, None, "{command:?} never reads issued_at_ms"),
             }
@@ -2588,7 +2607,12 @@ mod tests {
     }
 
     #[test]
-    fn the_skew_bound_is_a_quarter_of_the_lease_with_a_floor_and_is_symmetric() {
+    fn the_skew_bound_is_a_twentieth_of_the_lease_with_a_floor_and_a_cap_and_is_symmetric() {
+        // The two-sided loss stays inside a fifth of every lease, so pacing
+        // can be validated against it (review of #566).
+        for lease in [500, 1_000, 6_000, 10_000, 15_000, 60_000, 600_000] {
+            assert!(2 * lease_skew_bound_ms(lease) <= lease / 5, "{lease}");
+        }
         let acquire =
             |issued_at_ms: i64, lease_duration_ms: u64| MetadataCommand::AcquireRangeLease {
                 env: CommandEnvelope {
@@ -2607,23 +2631,29 @@ mod tests {
                 .unwrap()
                 .is_within_bound()
         };
-        // 15 s lease: 3.75 s either way.
+        // 15 s lease: the 1 s floor either way (a twentieth is 750 ms).
         assert!(within(1_000_000, 15_000));
-        assert!(within(1_003_750, 15_000));
-        assert!(within(996_250, 15_000));
-        assert!(!within(1_003_751, 15_000), "just ahead of the bound");
-        assert!(!within(996_249, 15_000), "just behind it");
-        // A lease between 2 s and 4 s tolerates the floor: latency is not skew.
-        assert!(within(1_001_000, 3_000));
-        assert!(!within(1_001_001, 3_000));
-        // A lease shorter than the floor is capped at half of itself: the
-        // allowance can never exceed the lease it applies to. A rival 900 ms
-        // fast against a 500 ms lease is refused (review of #566).
-        assert!(within(1_000_250, 500));
-        assert!(!within(1_000_251, 500));
+        assert!(within(1_001_000, 15_000));
+        assert!(within(999_000, 15_000));
+        assert!(!within(1_001_001, 15_000), "just ahead of the bound");
+        assert!(!within(998_999, 15_000), "just behind it");
+        // 60 s lease: a twentieth, 3 s.
+        assert!(within(1_003_000, 60_000));
+        assert!(!within(1_003_001, 60_000));
+        // Under ten seconds the cap, a tenth of the lease, is below the floor
+        // and wins: two proposers' errors can eat at most a fifth of it. A
+        // rival 900 ms fast against a 500 ms lease is refused (review of
+        // #566).
+        assert!(within(1_000_600, 6_000));
+        assert!(!within(1_000_601, 6_000));
+        assert!(
+            within(1_001_000, 10_000),
+            "the floor and the cap meet at 10 s"
+        );
+        assert!(!within(1_001_001, 10_000));
+        assert!(within(1_000_050, 500));
+        assert!(!within(1_000_051, 500));
         assert!(!within(1_000_900, 500));
-        assert!(within(1_000_200, 400));
-        assert!(!within(1_000_201, 400));
         // Extremes cannot overflow.
         assert!(!within(i64::MAX, 15_000));
         assert!(!within(i64::MIN, 15_000));
