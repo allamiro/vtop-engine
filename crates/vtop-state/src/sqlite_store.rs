@@ -64,11 +64,9 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_cursor ON batches(
 /// `idx_batches_commit_cursor` expressions above: SQLite matches expression
 /// indexes structurally, and without the index every candidate row rescans
 /// the entire committed set (quadratic on the engine's idle-cycle pass).
-macro_rules! prune_committed_sql {
+macro_rules! prune_predicate_sql {
     () => {
-        "DELETE FROM batches WHERE batch_id IN ( \
-            SELECT b.batch_id FROM batches b \
-            WHERE b.state = ?1 AND b.updated_at < ?2 \
+        "b.state = ?1 AND b.updated_at < ?2 \
               AND EXISTS ( \
                 SELECT 1 FROM batches n \
                 WHERE n.state = ?1 \
@@ -85,9 +83,46 @@ macro_rules! prune_committed_sql {
                            OR (n.updated_at = b.updated_at AND n.batch_id > b.batch_id)) \
                     ) \
                   ) \
-              ) \
-            LIMIT ?3 \
-        )"
+              )"
+    };
+}
+
+macro_rules! prune_committed_sql {
+    () => {
+        concat!(
+            "DELETE FROM batches WHERE batch_id IN ( \
+                SELECT b.batch_id FROM batches b WHERE ",
+            prune_predicate_sql!(),
+            " LIMIT ?3 )"
+        )
+    };
+}
+
+/// The rows the prune would delete next, read and not deleted (#560): the
+/// caller records them durably before [`prune_listed_sql`] deletes them.
+macro_rules! prune_candidates_sql {
+    () => {
+        concat!(
+            "SELECT * FROM batches WHERE batch_id IN ( \
+                SELECT b.batch_id FROM batches b WHERE ",
+            prune_predicate_sql!(),
+            " LIMIT ?3 ) ORDER BY created_at, batch_id"
+        )
+    };
+}
+
+/// Delete exactly the listed rows (a JSON array in ?3), each only if it still
+/// meets the prune predicate: a row that gained a reason to stay since it was
+/// listed (it became the newest of its path) stays.
+macro_rules! prune_listed_sql {
+    () => {
+        concat!(
+            "DELETE FROM batches WHERE batch_id IN ( \
+                SELECT b.batch_id FROM batches b \
+                WHERE b.batch_id IN (SELECT value FROM json_each(?3)) AND ",
+            prune_predicate_sql!(),
+            " )"
+        )
     };
 }
 
@@ -388,6 +423,35 @@ impl StateStore for SqliteStateStore {
             .bind(BatchState::SourceCommitted.as_str())
             .bind(older_than)
             .bind(limit)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(result.rows_affected())
+    }
+
+    async fn prune_candidates(
+        &self,
+        older_than: &str,
+        limit: u32,
+    ) -> Result<Vec<BatchRecord>, VtopError> {
+        let rows = sqlx::query(prune_candidates_sql!())
+            .bind(BatchState::SourceCommitted.as_str())
+            .bind(older_than)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        rows.into_iter().map(row_to_record).collect()
+    }
+
+    async fn prune_listed(&self, older_than: &str, batch_ids: &[String]) -> Result<u64, VtopError> {
+        if batch_ids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(prune_listed_sql!())
+            .bind(BatchState::SourceCommitted.as_str())
+            .bind(older_than)
+            .bind(serde_json::to_string(batch_ids)?)
             .execute(&self.pool)
             .await
             .map_err(map_sqlx)?;

@@ -53,7 +53,10 @@ engine:
    the runtime role keeps its DELETE denial, and the engine refuses
    `engine.ledger_retention_days` on PostgreSQL at startup. Schedule
    `vtopctl prune-ledger --older-than-days N` (cron/systemd timer) with a
-   dedicated maintenance identity instead:
+   dedicated maintenance identity instead. Each pass writes a digest of the
+   rows it deletes before deleting them (`--digest-dir`, default
+   `<engine.work_dir>/ledger-digests`), which `vtopctl audit-coverage` reads
+   (#560); run both against the same directory:
 
    ```sql
    GRANT CONNECT ON DATABASE vtop TO vtop_maintenance;

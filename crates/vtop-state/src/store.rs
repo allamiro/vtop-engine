@@ -170,6 +170,26 @@ pub trait StateStore: Send + Sync {
     /// seeds before and after any prune.
     async fn prune_committed_history(&self, older_than: &str, limit: u32)
         -> Result<u64, VtopError>;
+
+    /// The rows [`StateStore::prune_committed_history`] would delete next -
+    /// the same predicate and limit - read, not deleted (#560).
+    ///
+    /// Pruning removes the ledger's record that a range was archived, and with
+    /// it the only cross-check a coverage audit has against a manifest that
+    /// was later replaced. A caller that must keep that anchor lists the rows
+    /// first, writes them somewhere durable, and only then deletes them with
+    /// [`StateStore::prune_listed`].
+    async fn prune_candidates(
+        &self,
+        older_than: &str,
+        limit: u32,
+    ) -> Result<Vec<BatchRecord>, VtopError>;
+
+    /// Delete exactly the listed rows, each only if it still meets the prune
+    /// predicate at the moment of deletion - so every deleted row was listed,
+    /// and a listed row that has since become the newest of its path stays.
+    /// Returns the number deleted.
+    async fn prune_listed(&self, older_than: &str, batch_ids: &[String]) -> Result<u64, VtopError>;
 }
 
 #[cfg(test)]

@@ -448,6 +448,40 @@ prune-ledger --older-than-days N` under a maintenance identity (see
 [`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md)).
 Rows in any non-committed state are never touched.
 
+**Pruning keeps an anchor (#560).** Every prune pass, the engine's and
+`vtopctl prune-ledger`'s alike, lists the rows it is about to delete, writes
+them to a versioned digest (`<engine.work_dir>/ledger-digests/`, or
+`--digest-dir`), fsyncs it into place, and only then deletes exactly those
+rows; each is re-checked against the prune predicate at deletion. A crash
+between the two leaves rows that are digested and still in the ledger, which
+the audit counts once. The digest carries a SHA-256 trailer that catches a
+truncated or edited file. It is not a signature: anyone who can rewrite the
+file can rewrite the hash, so keep the directory where the engine's identity
+can write and others cannot, and back it up with the ledger.
+
+**Coverage audit (#560).** `vtopctl audit-coverage --config ...` reads the
+ledger and the digests and checks, per source unit (a Kafka topic-partition
+under one consumer group, a file or spool file at one inode), that committed
+ranges tile:
+- a stretch a FAILED or REPLAY_REQUIRED row names, below a later commit, is a
+  range that failed and was never re-archived (the #552 shape);
+- a stretch nothing names is lost data for a file or spool (bytes are
+  contiguous, e.g. the #558 rotation shape), and is reported but not failed
+  for Kafka (compaction and transaction markers occupy offsets with no
+  records);
+- ranges above the last committed point, and VERIFIED ranges held back from
+  committing, are pending, not holes;
+- overlapping commits are counted as duplicates (expected under
+  at-least-once).
+
+`--check-storage` also HEADs every committed object and manifest (present, of
+the recorded size); content is `verify-manifest`'s job. `--metrics-file`
+writes the result as a Prometheus text file, with counts by source type and
+never by path, for a node exporter's textfile collector. The command exits
+non-zero on lost data, so it can gate a cron job. It cannot judge anything
+below a unit's first committed range: a tail started mid-file, a consumer
+group that began at a later offset, or history pruned before digests existed.
+
 ---
 
 ## 7. Object storage, idempotency & Object Lock / WORM
@@ -830,7 +864,11 @@ Short procedures now; expand into a full ops runbook before go-live.
   rows remain → export file/syslog cursors → switch `engine.state_store` → import
   cursors → validate → keep the old store until validation passes.
 - **Prune the PostgreSQL ledger:** run `vtopctl prune-ledger --older-than-days N`
-  on a schedule under the maintenance identity (§6.6).
+  on a schedule under the maintenance identity (§6.6). It writes a digest of
+  what it deletes first; keep `--digest-dir` on durable, backed-up storage.
+- **Audit archive coverage:** run `vtopctl audit-coverage --config ...
+  [--check-storage] [--metrics-file ...]` on a schedule (§6.6); a non-zero
+  exit names the source units with lost ranges.
 - **Restore from DB backup:** restore Postgres PITR → verify object store →
   start the engine (recovery scan re-reconciles) → run the divergence checker.
 - **Reconcile state store vs object storage:** list `SOURCE_COMMITTED` rows and
