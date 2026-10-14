@@ -83,7 +83,8 @@ pub enum Command {
     AuditCoverage {
         #[arg(long)]
         config: PathBuf,
-        /// Where prune digests are read from [default: <engine.work_dir>/ledger-digests].
+        /// Where prune digests are read from [default: engine.ledger_digest_dir,
+        /// else beside a SQLite database file, else <engine.work_dir>/ledger-digests].
         #[arg(long)]
         digest_dir: Option<PathBuf>,
         /// Also ask the object store whether every committed object and
@@ -105,8 +106,9 @@ pub enum Command {
     PruneLedger {
         #[arg(long)]
         config: PathBuf,
-        /// Where the digest of the deleted rows is written
-        /// [default: <engine.work_dir>/ledger-digests].
+        /// Where the digest of the deleted rows is written [default:
+        /// engine.ledger_digest_dir, else beside a SQLite database file, else
+        /// <engine.work_dir>/ledger-digests - scratch: name one for PostgreSQL].
         #[arg(long)]
         digest_dir: Option<PathBuf>,
         /// Delete committed rows whose last transition is older than this
@@ -507,7 +509,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             );
             let digest_dir = digest_dir
                 .clone()
-                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine.work_dir));
+                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
             // Read-only construction: an audit may run beside a live engine.
             let engine = Engine::new(cfg, streams).await?;
             let ledger = engine.store.list_batches().await?;
@@ -565,7 +567,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 .to_rfc3339();
             let digest_dir = digest_dir
                 .clone()
-                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine.work_dir));
+                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
             let (deleted, digest) =
                 crate::coverage::prune_with_digest(store.as_ref(), &cutoff, *limit, &digest_dir)
                     .await?;

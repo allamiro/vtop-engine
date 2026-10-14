@@ -78,6 +78,13 @@ pub struct EngineConfig {
     /// cycles and in bounded batches so it never blocks the hot path.
     #[serde(default = "default_ledger_prune_batch")]
     pub ledger_prune_batch: u32,
+    /// Where prune digests are written and read (#560). Unset, they go
+    /// beside a SQLite database file - on the database's own volume, so
+    /// wherever the ledger survives its digests do too - and otherwise under
+    /// `work_dir`, which is scratch: name a durable directory here (or pass
+    /// `--digest-dir`) for PostgreSQL.
+    #[serde(default)]
+    pub ledger_digest_dir: Option<String>,
 }
 
 fn default_ledger_prune_batch() -> u32 {

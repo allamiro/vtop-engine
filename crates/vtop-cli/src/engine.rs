@@ -2254,7 +2254,7 @@ impl Engine {
         // The rows go to a digest before they are deleted (#560): without it,
         // a coverage audit would read the pruned history as holes, and lose
         // the ledger's record of what each manifest was.
-        let digest_dir = crate::coverage::default_digest_dir(&self.config.engine.work_dir);
+        let digest_dir = crate::coverage::default_digest_dir(&self.config.engine);
         match crate::coverage::prune_with_digest(
             self.store.as_ref(),
             &cutoff,

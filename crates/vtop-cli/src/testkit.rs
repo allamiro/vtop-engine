@@ -35,6 +35,7 @@ pub fn file_config(
             log_level: "warn".into(),
             ledger_retention_days: None,
             ledger_prune_batch: 500,
+            ledger_digest_dir: None,
         },
         batching: BatchingConfig {
             adaptive_width: Default::default(),

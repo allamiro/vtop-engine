@@ -450,14 +450,18 @@ Rows in any non-committed state are never touched.
 
 **Pruning keeps an anchor (#560).** Every prune pass, the engine's and
 `vtopctl prune-ledger`'s alike, lists the rows it is about to delete, writes
-them to a versioned digest (`<engine.work_dir>/ledger-digests/`, or
-`--digest-dir`), fsyncs it into place, and only then deletes exactly those
+them to a versioned digest, fsyncs it into place, and only then deletes exactly those
 rows; each is re-checked against the prune predicate at deletion. A crash
 between the two leaves rows that are digested and still in the ledger, which
 the audit counts once. The digest carries a SHA-256 trailer that catches a
 truncated or edited file. It is not a signature: anyone who can rewrite the
 file can rewrite the hash, so keep the directory where the engine's identity
-can write and others cannot, and back it up with the ledger.
+can write and others cannot, and back it up with the ledger. The directory is
+`--digest-dir` or `engine.ledger_digest_dir` when given; otherwise
+`ledger-digests/` beside a SQLite database file, on the database's own volume,
+so the digests last as long as the ledger does. Only failing both (PostgreSQL)
+is it `<engine.work_dir>/ledger-digests/`, and `work_dir` is scratch: give a
+PostgreSQL deployment a durable directory.
 
 **Coverage audit (#560).** `vtopctl audit-coverage --config ...` reads the
 ledger and the digests and checks, per source unit (a Kafka topic-partition
@@ -486,8 +490,12 @@ committed range it judges only what a failed row there names; history nothing
 recorded (a tail started mid-file, a consumer group that began at a later
 offset, history pruned before digests existed) cannot be judged. Neither can a
 file or spool known only from rows without an inode: they are reported as not
-judged. A window that spans a rotation counts for both files - the old one from
-where the window started to its end, the new one from byte 0.
+judged. A window that spans a rotation counts for both files: the old one from
+where the window started to its end, the new one over its last read. Where the
+window's reading of the new file began is not recorded, so the start of that
+file below its last read is reported as unproven - a window that read it
+more than once looks the same as a release before #564 that skipped it - and
+is not counted as lost.
 
 ---
 
@@ -715,6 +723,7 @@ path needed by the distributed options is already implemented (§6.3).
 | `engine.state_store` | backend selector: inline `sqlite://…`, or `{ env: … }` / `{ file: … }` secret reference for PostgreSQL |
 | `engine.work_dir` / `log_level` | scratch dir; verbosity |
 | `engine.ledger_retention_days` / `ledger_prune_batch` | committed-row retention (§6.6; SQLite engine-side only) |
+| `engine.ledger_digest_dir` | where prune digests are written and read (default: beside a SQLite database file; else under `work_dir`, which is scratch) |
 | `batching.max_records` / `max_bytes` / `max_batch_age_seconds` | seal thresholds |
 | `batching.max_concurrent_batches` | uploads kept in flight per cycle (default 8); the ceiling when the adaptive width is on |
 | `batching.adaptive_width.enabled` / `min_width` | AIMD upload width (#102): a cycle the store throttled halves the next cycle's width, a clean cycle grows it by one, never below `min_width` (default 1) nor above the ceiling. Off by default; `vtop_upload_width` shows the width in use |

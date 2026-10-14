@@ -113,15 +113,19 @@ pub const END_OF_FILE: u64 = u64::MAX;
 /// range ends one past it. A window whose markers name two different files -
 /// it spans a rotation - covers BOTH (review of #573): the old file from where
 /// the window started to that file's end (the window read on until the
-/// rotation; nothing records where), and the new file from byte 0 (a read
-/// restarted on new content starts there) to the window's end. Reducing it to
-/// its last read, as this did, could hide lost bytes of the old file.
+/// rotation; nothing records where), and the new file over its LAST read,
+/// from where that read started to the window's end. Where the window's
+/// reading of the new file began is not recorded: crediting it from byte 0
+/// would hide exactly the skip a release before #564 made (it resumed a new
+/// file at the old file's offset), so the stretch below the last read is
+/// reported as [`UnitReport::unproven`] instead - see [`rotation_prefix`].
 pub fn unit_ranges(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
     let file_like = |start_path: &String,
                      start_inode: &Option<u64>,
                      start_byte: u64,
                      path: &String,
                      inode: &Option<u64>,
+                     last_read_start: u64,
                      end_byte: u64,
                      make: &dyn Fn(String, Option<u64>) -> Unit| {
         if start_path == path && start_inode == inode {
@@ -133,7 +137,7 @@ pub fn unit_ranges(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
                     start_byte,
                     END_OF_FILE,
                 ),
-                (make(path.clone(), *inode), 0, end_byte),
+                (make(path.clone(), *inode), last_read_start, end_byte),
             ]
         }
     };
@@ -188,6 +192,7 @@ pub fn unit_ranges(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
             ProgressMarker::File {
                 path,
                 inode,
+                start_byte: last_read_start,
                 end_byte,
                 ..
             },
@@ -197,6 +202,7 @@ pub fn unit_ranges(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
             *start_byte,
             path,
             inode,
+            *last_read_start,
             *end_byte,
             &|path, inode| Unit::File { path, inode },
         ),
@@ -210,6 +216,7 @@ pub fn unit_ranges(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
             ProgressMarker::SyslogSpool {
                 path,
                 inode,
+                start_byte: last_read_start,
                 end_byte,
                 ..
             },
@@ -219,11 +226,73 @@ pub fn unit_ranges(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
             *start_byte,
             path,
             inode,
+            *last_read_start,
             *end_byte,
             &|path, inode| Unit::SyslogSpool { path, inode },
         ),
         _ => Vec::new(),
     }
+}
+
+/// For a window that spans a rotation, the new file and where its last read
+/// started, when that is above byte 0: the stretch `[0, start)` of a file
+/// that only appeared in this window, which the ledger cannot place (review
+/// of #573). An earlier read in the same window may have archived it - or a
+/// release before #564 may have skipped it, resuming the new file at the old
+/// one's offset; the two look the same here.
+pub fn rotation_prefix(record: &BatchRecord) -> Option<(Unit, u64)> {
+    let (start_path, start_inode, path, inode, last_read_start, make): (
+        _,
+        _,
+        _,
+        _,
+        _,
+        fn(String, Option<u64>) -> Unit,
+    ) = match (&record.progress_start, &record.progress_end) {
+        (
+            ProgressMarker::File {
+                path: start_path,
+                inode: start_inode,
+                ..
+            },
+            ProgressMarker::File {
+                path,
+                inode,
+                start_byte,
+                ..
+            },
+        ) => (
+            start_path,
+            start_inode,
+            path,
+            inode,
+            *start_byte,
+            |path, inode| Unit::File { path, inode },
+        ),
+        (
+            ProgressMarker::SyslogSpool {
+                path: start_path,
+                inode: start_inode,
+                ..
+            },
+            ProgressMarker::SyslogSpool {
+                path,
+                inode,
+                start_byte,
+                ..
+            },
+        ) => (
+            start_path,
+            start_inode,
+            path,
+            inode,
+            *start_byte,
+            |path, inode| Unit::SyslogSpool { path, inode },
+        ),
+        _ => return None,
+    };
+    let spans_rotation = start_path != path || start_inode != inode;
+    (spans_rotation && last_read_start > 0).then(|| (make(path.clone(), *inode), last_read_start))
 }
 
 /// A stretch of a unit no committed range covers.
@@ -262,6 +331,11 @@ pub struct UnitReport {
     /// Holes nothing names.
     pub unexplained_holes: Vec<Hole>,
     pub pending: Vec<Pending>,
+    /// The start of a file rotated in mid-window, below that window's last
+    /// read, that nothing else covers: the ledger cannot say whether it was
+    /// read (see [`rotation_prefix`]). Reported, never a finding - a window
+    /// that simply read the new file more than once looks the same.
+    pub unproven: Vec<Hole>,
     /// Bytes/offsets archived more than once.
     pub duplicated: u64,
     /// Why the unit was not judged (its holes are then not looked for), or
@@ -292,9 +366,15 @@ struct Row {
 pub fn audit(records: impl IntoIterator<Item = BatchRecord>) -> Vec<UnitReport> {
     let mut seen = std::collections::HashSet::new();
     let mut units: BTreeMap<Unit, Vec<Row>> = BTreeMap::new();
+    let mut prefixes: BTreeMap<Unit, Vec<u64>> = BTreeMap::new();
     for record in records {
         if !seen.insert(record.batch_id.clone()) {
             continue;
+        }
+        if record.state == BatchState::SourceCommitted {
+            if let Some((unit, below)) = rotation_prefix(&record) {
+                prefixes.entry(unit).or_default().push(below);
+            }
         }
         for (unit, start, end) in unit_ranges(&record) {
             if end <= start {
@@ -310,7 +390,10 @@ pub fn audit(records: impl IntoIterator<Item = BatchRecord>) -> Vec<UnitReport> 
     }
     units
         .into_iter()
-        .filter_map(|(unit, rows)| audit_unit(unit, rows))
+        .filter_map(|(unit, rows)| {
+            let below = prefixes.remove(&unit).unwrap_or_default();
+            audit_unit(unit, rows, &below)
+        })
         .collect()
 }
 
@@ -367,7 +450,7 @@ fn uncovered(start: u64, end: u64, spans: &[Span]) -> Vec<(u64, u64)> {
 
 /// `None` for a unit with no committed range: there is nothing to tile, and
 /// whatever is pending there will be read from the source's own position.
-fn audit_unit(unit: Unit, rows: Vec<Row>) -> Option<UnitReport> {
+fn audit_unit(unit: Unit, rows: Vec<Row>, rotation_prefixes: &[u64]) -> Option<UnitReport> {
     let committed = spans(
         rows.iter()
             .filter(|row| row.state == BatchState::SourceCommitted),
@@ -406,6 +489,7 @@ fn audit_unit(unit: Unit, rows: Vec<Row>) -> Option<UnitReport> {
         failed_holes: Vec::new(),
         unexplained_holes: Vec::new(),
         pending: Vec::new(),
+        unproven: Vec::new(),
         duplicated,
         not_judged: None,
         unit,
@@ -416,18 +500,37 @@ fn audit_unit(unit: Unit, rows: Vec<Row>) -> Option<UnitReport> {
         return Some(report);
     }
 
-    // The stretches to judge: between committed spans, and - when a failed
-    // range lies below the first committed one - from that failed range up.
-    // A first batch that failed under later commits is the #552 hole too.
-    let mut gaps: Vec<(u64, u64)> = Vec::new();
-    if let Some(lowest) = failed.first().filter(|span| span.start < audited_from) {
-        gaps.push((lowest.start, audited_from));
+    // Below the first committed span nothing is judged - it may be history
+    // pruned before digests existed - EXCEPT what a failed row names there:
+    // a first batch that failed under later commits is the #552 hole too.
+    // Only the failed ranges themselves (review of #573): extending one up to
+    // the first commit reported the stretch between as unexplained, outside
+    // what the audit can judge.
+    for span in failed.iter().take_while(|span| span.start < audited_from) {
+        report.failed_holes.push(Hole {
+            start: span.start,
+            end: span.end.min(audited_from),
+            failed_batches: span.rows.iter().map(|row| row.batch_id.clone()).collect(),
+        });
     }
-    gaps.extend(
-        committed
-            .windows(2)
-            .map(|pair| (pair[0].end, pair[1].start)),
-    );
+    // ...and the start of a file rotated in mid-window: that file began at
+    // byte 0 in this very window, so its prefix is not old history. What no
+    // committed or failed row places there is unproven, not lost.
+    for &below in rotation_prefixes {
+        let end = below.min(audited_from);
+        for (start, end) in uncovered(0, end, &failed) {
+            report.unproven.push(Hole {
+                start,
+                end,
+                failed_batches: Vec::new(),
+            });
+        }
+    }
+    // The stretches to judge: between committed spans.
+    let gaps: Vec<(u64, u64)> = committed
+        .windows(2)
+        .map(|pair| (pair[0].end, pair[1].start))
+        .collect();
 
     // Each gap is split, not judged whole (review of #573): the parts a failed
     // row names are failed holes; of the rest, the parts in-flight work covers
@@ -502,9 +605,52 @@ struct DigestTrailer {
     sha256: String,
 }
 
-/// Where prune digests go when the caller names no directory.
-pub fn default_digest_dir(work_dir: &str) -> PathBuf {
-    Path::new(work_dir).join("ledger-digests")
+/// Where prune digests go when the caller names no directory (review of
+/// #573): `engine.ledger_digest_dir` when set; otherwise beside a SQLite
+/// database file, on the database's own volume - the digests anchor history
+/// the database no longer holds, and must last as long as it does; only
+/// otherwise (PostgreSQL, an in-memory SQLite) under `work_dir`, which is
+/// scratch and which a PostgreSQL deployment should override.
+pub fn default_digest_dir(engine: &vtop_core::config::EngineConfig) -> PathBuf {
+    if let Some(dir) = engine
+        .ledger_digest_dir
+        .as_deref()
+        .filter(|dir| !dir.trim().is_empty())
+    {
+        return PathBuf::from(dir);
+    }
+    if let Some(database) = engine
+        .state_store
+        .resolve()
+        .ok()
+        .and_then(|store| sqlite_database_file(store.expose_secret()))
+    {
+        let beside = database
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        return beside.join("ledger-digests");
+    }
+    Path::new(&engine.work_dir).join("ledger-digests")
+}
+
+/// The file a SQLite connection string names, or `None` for PostgreSQL and
+/// an in-memory database.
+fn sqlite_database_file(conn: &str) -> Option<PathBuf> {
+    let conn = conn.trim();
+    let lower = conn.to_ascii_lowercase();
+    if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
+        return None;
+    }
+    let path = conn
+        .strip_prefix("sqlite://")
+        .or_else(|| conn.strip_prefix("sqlite:"))
+        .unwrap_or(conn);
+    let path = path.split('?').next().unwrap_or_default();
+    if path.is_empty() || path == ":memory:" || lower.contains("mode=memory") {
+        return None;
+    }
+    Some(PathBuf::from(path))
 }
 
 /// Write `rows` as one digest file in `dir`, durably (written, fsynced,
@@ -541,16 +687,42 @@ pub fn write_digest(dir: &Path, cutoff: &str, rows: &[BatchRecord]) -> Result<Pa
     let key = vtop_core::checksum::sha256_bytes(ids.join("\n").as_bytes());
     let name = format!("ledger-digest-{}.jsonl", &key[..32]);
     let path = dir.join(&name);
+    // An existing file is TRUSTED ONLY ONCE READ BACK (review of #573): it
+    // must verify and hold exactly these rows, or the rows about to be
+    // deleted would be anchored by a damaged file. One that does not is
+    // replaced by the digest written here - the rows are in hand, so the
+    // anchor can be made right rather than refusing the prune forever.
     if path.exists() {
-        return Ok(path);
+        let mut held: Vec<String> = match read_digest(&path) {
+            Ok(rows) => rows.into_iter().map(|row| row.batch_id).collect(),
+            Err(_) => Vec::new(),
+        };
+        held.sort_unstable();
+        if held.iter().map(String::as_str).eq(ids.iter().copied()) {
+            return Ok(path);
+        }
+        tracing::warn!(
+            digest = %path.display(),
+            "an existing prune digest did not verify, or did not hold the rows its name \
+             promises; replacing it with the digest of the rows being pruned"
+        );
     }
-    let tmp = dir.join(format!(".{name}.tmp"));
-    {
+    // A temporary name of this writer's own (review of #573): two prune passes
+    // over the same rows - the engine's and `vtopctl prune-ledger` - would
+    // otherwise write into one temporary file, and either could rename the
+    // other's half-written bytes into place. Each publishes a complete file;
+    // the rename is atomic, and both carry the same rows.
+    let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let written = (|| -> std::io::Result<()> {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(body.as_bytes())?;
         file.sync_all()?;
+        std::fs::rename(&tmp, &path)
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
     }
-    std::fs::rename(&tmp, &path)?;
     std::fs::File::open(dir)?.sync_all()?;
     Ok(path)
 }
@@ -789,6 +961,14 @@ impl AuditReport {
                 };
                 out.push(format!("     gap [{}, {}): {why}", hole.start, hole.end));
             }
+            for hole in &unit.unproven {
+                out.push(format!(
+                    "     unproven [{}, {}): the start of a file rotated in mid-window; the \
+                     ledger does not record whether that window read it (a skip by a release \
+                     before #564 looks the same)",
+                    hole.start, hole.end
+                ));
+            }
             for pending in &unit.pending {
                 out.push(format!(
                     "     pending [{}, {}): {} is {}",
@@ -825,7 +1005,7 @@ impl AuditReport {
     /// textfile collector: counts by source type, never by path (paths are
     /// unbounded and would make the series count grow with the archive).
     pub fn prometheus_text(&self, now_unix: i64) -> String {
-        let mut by_type: BTreeMap<&str, [u64; 5]> = BTreeMap::new();
+        let mut by_type: BTreeMap<&str, [u64; 6]> = BTreeMap::new();
         for unit in &self.units {
             let counts = by_type.entry(unit.unit.source_type().as_str()).or_default();
             counts[0] += unit.failed_holes.len() as u64;
@@ -833,10 +1013,11 @@ impl AuditReport {
             counts[2] += unit.pending.len() as u64;
             counts[3] += unit.duplicated;
             counts[4] += 1;
+            counts[5] += unit.unproven.len() as u64;
         }
         let types: Vec<_> = by_type.into_iter().collect();
         let mut out = String::new();
-        let families: [(&str, &str, usize); 5] = [
+        let families: [(&str, &str, usize); 6] = [
             (
                 "vtop_coverage_audit_failed_holes",
                 "Ranges that failed and no later committed range covers (lost data)",
@@ -858,6 +1039,11 @@ impl AuditReport {
                 3,
             ),
             ("vtop_coverage_audit_units", "Source units audited", 4),
+            (
+                "vtop_coverage_audit_unproven_ranges",
+                "Starts of files rotated in mid-window that the ledger cannot place (not findings)",
+                5,
+            ),
         ];
         for (name, help, index) in families {
             out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
@@ -1041,9 +1227,9 @@ mod tests {
     }
 
     /// Review of #573: a window that spans a rotation covers the old file to
-    /// its end and the new file from byte 0; dropping the old part could hide
-    /// lost bytes of the old file, and keeping only the last read invented a
-    /// gap at the start of the new one.
+    /// its end and the new file over its LAST read. Below that read the new
+    /// file is unproven - the ledger does not say where the window's reading
+    /// of it began - which is reported, and is not a finding.
     #[test]
     fn a_window_across_a_rotation_covers_both_files() {
         let units = audit([
@@ -1079,7 +1265,117 @@ mod tests {
             .iter()
             .find(|u| matches!(u.unit, Unit::File { inode: Some(2), .. }))
             .unwrap();
-        assert_eq!((new.audited_from, new.committed_through), (0, 60));
+        assert_eq!((new.audited_from, new.committed_through), (20, 60));
+        assert_eq!(
+            new.unproven,
+            vec![Hole {
+                start: 0,
+                end: 20,
+                failed_batches: Vec::new()
+            }]
+        );
+        assert!(new.unexplained_holes.is_empty() && new.failed_holes.is_empty());
+    }
+
+    /// Review of #573: crediting the new file from byte 0 hid the skip a
+    /// release before #564 made - it resumed a rotated-in file at the old
+    /// one's offset. A window whose last read on the new file started at 80
+    /// leaves [0, 80) visible as unproven; one whose read started at 0 is
+    /// credited from 0 and leaves nothing.
+    #[test]
+    fn a_rotated_in_file_read_from_the_old_offset_is_not_credited_from_zero() {
+        let skipped = audit([row(
+            "across",
+            Committed,
+            file("/a.log", 1, 50, 50),
+            file("/a.log", 2, 80, 120),
+        )]);
+        let new = skipped
+            .iter()
+            .find(|u| matches!(u.unit, Unit::File { inode: Some(2), .. }))
+            .unwrap();
+        assert_eq!(new.audited_from, 80);
+        assert_eq!((new.unproven[0].start, new.unproven[0].end), (0, 80));
+        let lines = AuditReport {
+            units: skipped.clone(),
+            ledger_rows: 1,
+            digest_rows: 0,
+            digest_files: 0,
+            storage: None,
+        }
+        .lines();
+        assert!(
+            lines.iter().any(|line| line.contains("unproven [0, 80)")),
+            "{lines:?}"
+        );
+
+        let whole = audit([row(
+            "across",
+            Committed,
+            file("/a.log", 1, 50, 50),
+            file("/a.log", 2, 0, 40),
+        )]);
+        let new = whole
+            .iter()
+            .find(|u| matches!(u.unit, Unit::File { inode: Some(2), .. }))
+            .unwrap();
+        assert_eq!(new.audited_from, 0);
+        assert!(new.unproven.is_empty());
+    }
+
+    /// Review of #573: below the first commit only what a failed row names is
+    /// judged. FAILED [0,5) under a first commit at 10 is a failed hole of
+    /// [0,5) - and [5,10), which nothing names, is history the audit cannot
+    /// judge, not an unexplained gap.
+    #[test]
+    fn below_the_first_commit_only_the_failed_range_is_judged() {
+        let units = audit([
+            bytes("lost", Failed, 0, 5),
+            bytes("first", Committed, 10, 20),
+        ]);
+        let unit = &units[0];
+        assert_eq!(
+            unit.failed_holes
+                .iter()
+                .map(|hole| (hole.start, hole.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 5)]
+        );
+        assert!(unit.unexplained_holes.is_empty(), "{unit:?}");
+        assert!(unit.has_findings(), "a failed range never re-archived");
+    }
+
+    /// Review of #573: digests default to the database's own volume, not the
+    /// scratch work_dir - unless a directory is configured.
+    #[test]
+    fn prune_digests_default_beside_a_sqlite_database() {
+        let config = crate::testkit::file_config(
+            "/tmp/scratch",
+            "sqlite:///var/lib/vtop/state.db",
+            Vec::new(),
+            "mock",
+        );
+        assert_eq!(
+            default_digest_dir(&config.engine),
+            PathBuf::from("/var/lib/vtop/ledger-digests")
+        );
+        let mut configured = config.clone();
+        configured.engine.ledger_digest_dir = Some("/backed-up/digests".into());
+        assert_eq!(
+            default_digest_dir(&configured.engine),
+            PathBuf::from("/backed-up/digests")
+        );
+        let memory =
+            crate::testkit::file_config("/tmp/scratch", "sqlite::memory:", Vec::new(), "mock");
+        assert_eq!(
+            default_digest_dir(&memory.engine),
+            PathBuf::from("/tmp/scratch/ledger-digests")
+        );
+        assert_eq!(
+            sqlite_database_file("sqlite:state.db?mode=rwc"),
+            Some(PathBuf::from("state.db"))
+        );
+        assert_eq!(sqlite_database_file("postgres://u@h/db"), None);
     }
 
     /// Review of #573: a prune whose delete failed lists the same rows again;
@@ -1099,6 +1395,51 @@ mod tests {
         assert_eq!(read_digests(dir.path()).unwrap().1, 1);
         let other = write_digest(dir.path(), "c", &rows[..1]).unwrap();
         assert_ne!(first, other);
+    }
+
+    /// Review of #573: an existing digest is reused only when it verifies and
+    /// holds exactly these rows. A damaged one - here, truncated - is replaced
+    /// with the digest of the rows in hand, and reads back whole.
+    #[test]
+    fn a_damaged_digest_of_the_same_rows_is_rewritten_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = vec![bytes("a", Committed, 0, 10), bytes("b", Committed, 10, 20)];
+        let path = write_digest(dir.path(), "c", &rows).unwrap();
+        let whole = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, &whole[..whole.len() / 2]).unwrap();
+        assert!(
+            read_digests(dir.path()).is_err(),
+            "the damage is detectable"
+        );
+
+        assert_eq!(write_digest(dir.path(), "c", &rows).unwrap(), path);
+        let (read, files) = read_digests(dir.path()).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(read.len(), 2);
+    }
+
+    /// Review of #573: writers of the same digest at once each use their own
+    /// temporary file, so every one of them leaves a complete digest behind
+    /// and no temporary file is left over.
+    #[test]
+    fn concurrent_writers_of_one_digest_each_publish_a_complete_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<BatchRecord> = (0..200)
+            .map(|i| bytes(&format!("r{i:03}"), Committed, i * 10, i * 10 + 10))
+            .collect();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| write_digest(dir.path(), "c", &rows).unwrap());
+            }
+        });
+        let (read, files) = read_digests(dir.path()).unwrap();
+        assert_eq!((files, read.len()), (1, 200));
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     /// Review of #573: a one-line file is refused, not a panic.
