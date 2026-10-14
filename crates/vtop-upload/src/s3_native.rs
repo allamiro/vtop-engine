@@ -103,11 +103,12 @@ const OPERATION_ATTEMPTS: u32 = 3;
 /// The AWS SDK bounds connecting but, by default, not waiting for a response:
 /// an endpoint that accepts the connection and then says nothing blocks the
 /// request forever, and with it the engine cycle that is awaiting the upload.
-/// `read_timeout` bounds the silence between bytes of the response,
-/// `operation_attempt_timeout` caps one attempt, and `operation_timeout` caps
-/// the whole operation including the SDK's retries, so a dead store becomes an
-/// error the engine already knows how to handle (the batch fails and is read
-/// again) instead of a hang.
+/// `read_timeout` bounds the wait for the first byte of the response,
+/// `operation_attempt_timeout` caps one whole attempt, and `operation_timeout`
+/// caps the whole operation including the SDK's retries, so a dead store
+/// becomes an error the engine already knows how to handle (the batch fails
+/// and recovery re-reads its range) instead of a hang. The connect bound is
+/// fixed (`CONNECT_TIMEOUT`), not taken from the configured value.
 pub fn request_timeouts(request_timeout_seconds: u64) -> aws_smithy_types::timeout::TimeoutConfig {
     let attempt = std::time::Duration::from_secs(request_timeout_seconds);
     aws_smithy_types::timeout::TimeoutConfig::builder()

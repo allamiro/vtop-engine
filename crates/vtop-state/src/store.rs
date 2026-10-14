@@ -36,7 +36,8 @@ pub async fn connect_state_store(conn_str: &str) -> Result<Box<dyn StateStore>, 
 /// [`connect_state_store`] with an explicit bound on every request: `point`
 /// for single-row operations, ten times it for whole-ledger scans. A store
 /// that stops answering then fails its request instead of blocking the caller
-/// (see [`crate::deadline`]).
+/// (see [`crate::deadline`]). Opening a Postgres store (connecting and the
+/// schema check) is bounded by `point` as well.
 pub async fn connect_state_store_with_deadline(
     conn_str: &str,
     point: std::time::Duration,
@@ -45,7 +46,21 @@ pub async fn connect_state_store_with_deadline(
         if conn_str.starts_with("postgres://") || conn_str.starts_with("postgresql://") {
             #[cfg(feature = "postgres")]
             {
-                Box::new(crate::pg_store::PgStateStore::connect(conn_str).await?)
+                // Opening the store is network work too: the pool connects and
+                // the schema check queries. A server that accepts the
+                // connection and goes silent would hang startup outside the
+                // bound the wrapper applies to every later request (review of
+                // #568).
+                let opened =
+                    tokio::time::timeout(point, crate::pg_store::PgStateStore::connect(conn_str))
+                        .await
+                        .map_err(|_| {
+                            VtopError::State(format!(
+                                "state store connect did not complete within {point:?}: the \
+                                 server accepted the connection and did not answer"
+                            ))
+                        })??;
+                Box::new(opened)
             }
             #[cfg(not(feature = "postgres"))]
             {

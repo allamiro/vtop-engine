@@ -35,3 +35,8 @@ tokio = { workspace = true, features = ["test-util"] }
 [[test]]
 name = "pg_battery"
 required-features = ["postgres", "test-support"]
+
+# Needs the postgres backend only; no database is involved.
+[[test]]
+name = "connect_deadline"
+required-features = ["postgres"]

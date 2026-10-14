@@ -1707,3 +1707,7 @@ jobs:
           VTOP_TEST_POSTGRES: postgres://vtop:vtop@localhost:5432/vtop
           VTOP_TEST_POSTGRES_RUNTIME: postgres://vtop_runtime_test:vtop-runtime-test@localhost:5432/vtop
         run: cargo test -p vtop-state --features postgres,test-support --test pg_battery
+      # No database involved: a socket that accepts and never answers must fail
+      # the connect within its bound instead of hanging startup (#556).
+      - name: Postgres connect is bounded
+        run: cargo test -p vtop-state --features postgres --test connect_deadline

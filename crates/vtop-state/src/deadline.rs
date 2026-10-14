@@ -61,9 +61,8 @@ impl DeadlineStore {
         match tokio::time::timeout(limit, call).await {
             Ok(result) => result,
             Err(_) => Err(VtopError::State(format!(
-                "state store {operation} did not complete within {limit:?}: the store accepted \
-                 the request and did not answer (blackholed connection, failover in progress?). \
-                 The outcome is unknown; the engine will retry from the ledger"
+                "state store {operation} did not complete within {limit:?}: no answer \
+                 (blackholed connection, failover in progress?). The request's outcome is unknown"
             ))),
         }
     }

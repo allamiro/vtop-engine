@@ -925,7 +925,9 @@ impl VtopConfig {
 
     /// Enforce invariants that cannot be expressed by the type system.
     pub fn validate(&self) -> Result<(), VtopError> {
-        if self.upload.request_timeout_seconds == 0 {
+        // Only the native S3 backend consumes it; the compatibility backends
+        // are bounded by `command_timeout_seconds`.
+        if self.upload.backend == "s3_native" && self.upload.request_timeout_seconds == 0 {
             return Err(VtopError::Config(
                 "upload.request_timeout_seconds must be > 0".into(),
             ));
@@ -1918,6 +1920,14 @@ upload:
             let err = cfg.validate().unwrap_err().to_string();
             assert!(err.contains(name) && err.contains("> 0"), "{err}");
         }
+
+        // A backend that never reads the setting is not refused over it.
+        let other = yaml.replace(
+            "  backend: s3_native",
+            "  backend: mock\n  request_timeout_seconds: 0",
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&other).unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]
