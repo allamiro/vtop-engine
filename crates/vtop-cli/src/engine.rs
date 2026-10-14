@@ -1182,6 +1182,14 @@ pub struct Engine {
     /// Set by a read cycle that returned any records; drives the adaptive
     /// inter-cycle sleep in [`Engine::run`]. Reset at the top of each cycle.
     cycle_had_data: bool,
+    /// Set by a cycle in which any batch ended FAILED (or errored before
+    /// VERIFIED) and was handed back to its source for re-reading. Reset at
+    /// the top of each cycle by [`Engine::run`]; it keeps a failing store from
+    /// being retried at read speed.
+    cycle_had_failure: bool,
+    /// Consecutive loop iterations that saw a failure. Drives the retry
+    /// backoff in [`Engine::run`] and returns to zero on the first clean one.
+    failure_streak: u32,
     /// Last committed-history prune attempt (#128); pruning is idle-cycle
     /// only and rate-limited, so a busy pipeline never pays for it.
     last_ledger_prune: Option<std::time::Instant>,
@@ -1444,6 +1452,8 @@ impl Engine {
             provisioned_buckets: Arc::default(),
             pending: HashMap::new(),
             cycle_had_data: false,
+            cycle_had_failure: false,
+            failure_streak: 0,
             last_ledger_prune: None,
             _instance_locks: Vec::new(),
         })
@@ -1808,13 +1818,20 @@ impl Engine {
         // concurrency of 8 the queue alone could hold ~800 MiB of avoidable
         // copies — the clone is not bounded by the concurrency limit, only the
         // execution is.
-        let verified: Vec<Result<VerifyStep, VtopError>> =
+        //
+        // Each result travels with the marker its batch STARTED at. A batch
+        // that does not reach VERIFIED must hand its range back to the source
+        // (see the rewind below), and by then the `ReadResult` that held the
+        // marker has been consumed.
+        let verified: Vec<(ProgressMarker, Result<VerifyStep, VtopError>)> =
             futures::stream::iter(work.into_iter().map(|(source, read, stream)| {
                 let pipeline = &pipeline;
+                let started_at = read.progress_start.clone();
                 async move {
-                    pipeline
+                    let step = pipeline
                         .process_until_verified(&source, read, stream.as_ref())
-                        .await
+                        .await;
+                    (started_at, step)
                 }
             }))
             .buffer_unordered(limit)
@@ -1843,18 +1860,33 @@ impl Engine {
         // time one batch fails, others may already be persisted as VERIFIED —
         // and their buffers have been drained from `pending`. Returning early
         // would drop those VerifiedBatch values without committing source
-        // progress, leaving them verified-but-uncommitted. The next cycle would
-        // re-read the same records, build the same batch_id, and fail the state
-        // store INSERT as a duplicate, wedging that source until a restart ran
+        // progress, leaving them verified-but-uncommitted until a restart ran
         // recovery.
         //
         // So: commit every batch that succeeded, then report the first error.
         // Nothing verified is abandoned, and the caller still sees the failure.
+        //
+        // A batch that did NOT reach VERIFIED is a different matter, and the
+        // read head is the reason. Adapters advance their read position when
+        // they READ, not when the batch commits, so a failed batch's records
+        // are already behind the head: left alone, the next cycle reads on
+        // from the end of the failed range, and the first later range to
+        // verify commits PAST it. The failed bytes are then never archived,
+        // and the restart that was supposed to repair this clamps its rewind
+        // to the committed point (#552). Each such range is therefore handed
+        // back to its source here, immediately, so the very next read starts
+        // at the first byte that has not been archived.
         let mut outcomes = Vec::new();
         let mut first_err: Option<VtopError> = None;
-        for step in verified {
+        let mut rewinds: Vec<ProgressMarker> = Vec::new();
+        for (started_at, step) in verified {
             match step {
-                Ok(VerifyStep::Finished(outcome)) => outcomes.push(outcome),
+                Ok(VerifyStep::Finished(outcome)) => {
+                    if outcome.final_state == BatchState::Failed {
+                        rewinds.push(started_at);
+                    }
+                    outcomes.push(outcome);
+                }
                 Ok(VerifyStep::Verified(v)) => {
                     let batch_id = v.batch_id.clone();
                     match self.pipeline().commit_verified(adapter, v).await {
@@ -1868,6 +1900,36 @@ impl Engine {
                     }
                 }
                 Err(e) => {
+                    // An error before the batch was VERIFIED (a ledger write
+                    // that failed, say). Whether the ledger holds a row for it
+                    // is unknown, and re-reading the range costs a duplicate at
+                    // worst where skipping it costs the data.
+                    rewinds.push(started_at);
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        if !rewinds.is_empty() {
+            self.cycle_had_failure = true;
+        }
+        for marker in rewinds {
+            match adapter.replay_from_marker(&marker).await {
+                Ok(()) => tracing::warn!(
+                    source_type = %source_type,
+                    start = ?marker,
+                    "batch did not reach VERIFIED; its range was handed back to the source and will be re-read"
+                ),
+                Err(e) => {
+                    // The adapter could not rewind (a spool file that was
+                    // rotated away, say). The range is NOT being re-read, so
+                    // this must be loud: it is the one outcome that leaves the
+                    // archive short of the source.
+                    tracing::error!(
+                        source_type = %source_type,
+                        start = ?marker,
+                        error = %e,
+                        "could not hand a failed range back to its source; it will not be re-read"
+                    );
                     first_err.get_or_insert(e);
                 }
             }
@@ -2027,6 +2089,13 @@ impl Engine {
             )
             .await?;
         let mut summary = RecoverySummary::default();
+        // Rewinds are COLLECTED, not applied row by row. Each call to
+        // `replay_from_marker` overwrites the adapter's read position, so with
+        // several incomplete ranges for one source the last row visited used to
+        // win and every earlier range was skipped (#552). Keeping the lowest
+        // start per source and applying it once after the scan reads from the
+        // first byte that is not archived, whatever order the rows came in.
+        let mut rewinds = RewindPlan::default();
         for rec in incomplete {
             let action = next_recovery_action(rec.state);
             tracing::info!(batch_id = %rec.batch_id, state = %rec.state, ?action, "recovery_scan");
@@ -2075,9 +2144,7 @@ impl Engine {
                             summary.still_pending += 1;
                             continue;
                         }
-                        if let Some(adapter) = self.adapters.get_mut(&rec.source_type) {
-                            let _ = adapter.replay_from_marker(&rec.progress_start).await;
-                        }
+                        rewinds.add(&rec.progress_start);
                         // Dashboards must see this refusal path like any other
                         // replay (#123 review).
                         if let Some(mx) = telemetry::metrics() {
@@ -2175,9 +2242,7 @@ impl Engine {
                         )
                         .await
                         .ok();
-                    if let Some(adapter) = self.adapters.get_mut(&rec.source_type) {
-                        let _ = adapter.replay_from_marker(&rec.progress_start).await;
-                    }
+                    rewinds.add(&rec.progress_start);
                     if let Some(mx) = telemetry::metrics() {
                         // Replay is safe by design, but a sustained rate means
                         // work is being repeated - worth seeing on a dashboard.
@@ -2200,6 +2265,22 @@ impl Engine {
                     summary.replay_required += 1;
                     tracing::warn!(batch_id = %rec.batch_id, "recovered: REPLAY_REQUIRED (source progress preserved)");
                 }
+            }
+        }
+        for marker in rewinds.into_markers() {
+            let Some(adapter) = self.adapters.get_mut(&marker.source_type()) else {
+                continue;
+            };
+            if let Err(e) = adapter.replay_from_marker(&marker).await {
+                // The decision to replay is already durable; what failed is the
+                // rewind itself. Swallowing this made recovery report success
+                // for a range that was never going to be re-read.
+                tracing::error!(
+                    start = ?marker,
+                    error = %e,
+                    "recovery could not hand an incomplete range back to its source; it will not be re-read"
+                );
+                summary.still_pending += 1;
             }
         }
         Ok(summary)
@@ -2271,15 +2352,29 @@ impl Engine {
         loop {
             // Accumulate across cycles; only threshold-tripped buffers flush.
             self.cycle_had_data = false;
+            self.cycle_had_failure = false;
             for st in &types {
                 if let Err(e) = self.run_source(st.clone(), false).await {
                     tracing::error!(error = %e, source_type = %st, "process cycle error");
                 }
             }
+            self.failure_streak = if self.cycle_had_failure {
+                self.failure_streak.saturating_add(1)
+            } else {
+                0
+            };
+            // Failing cycle: wait, growing with the streak (the failed range is
+            // read again, so a tight loop would hammer a store that is down).
             // Productive cycle: loop again immediately. Idle cycle: back off.
             // `Duration::ZERO` still yields to the runtime through `select!`,
             // so Ctrl-C stays responsive and this never starves the executor.
-            let backoff = if self.cycle_had_data {
+            let backoff = if self.cycle_had_failure {
+                failure_backoff(
+                    idle,
+                    self.failure_streak,
+                    u64::from(Utc::now().timestamp_subsec_nanos()),
+                )
+            } else if self.cycle_had_data {
                 Duration::ZERO
             } else {
                 self.maybe_prune_ledger().await;
@@ -2301,6 +2396,82 @@ impl Engine {
             }
         }
     }
+}
+
+/// The lowest start position to rewind to, per source unit (a file, a spool
+/// file, a Kafka topic-partition), gathered while recovery scans incomplete
+/// batches. See the note at the top of [`Engine::recover`].
+#[derive(Default)]
+struct RewindPlan {
+    lowest: HashMap<String, ProgressMarker>,
+}
+
+impl RewindPlan {
+    fn add(&mut self, start: &ProgressMarker) {
+        let (unit, position) = rewind_unit(start);
+        match self.lowest.get(&unit) {
+            Some(held) if rewind_unit(held).1 <= position => {}
+            _ => {
+                self.lowest.insert(unit, start.clone());
+            }
+        }
+    }
+
+    fn into_markers(self) -> Vec<ProgressMarker> {
+        let mut markers: Vec<_> = self.lowest.into_iter().collect();
+        // Stable order, so the log and the tests do not depend on hash order.
+        markers.sort_by(|a, b| a.0.cmp(&b.0));
+        markers.into_iter().map(|(_, m)| m).collect()
+    }
+}
+
+/// The unit a start marker belongs to, and its position within that unit.
+fn rewind_unit(marker: &ProgressMarker) -> (String, i128) {
+    match marker {
+        ProgressMarker::Kafka {
+            topic,
+            partition,
+            start_offset,
+            consumer_group,
+            ..
+        } => (
+            format!("kafka|{consumer_group}|{topic}#p{partition}"),
+            i128::from(*start_offset),
+        ),
+        ProgressMarker::File {
+            path, start_byte, ..
+        } => (format!("file|{path}"), i128::from(*start_byte)),
+        ProgressMarker::SyslogSpool {
+            spool_id,
+            path,
+            start_byte,
+            ..
+        } => (format!("spool|{spool_id}|{path}"), i128::from(*start_byte)),
+    }
+}
+
+/// The longest the loop waits before reading again after cycles in which a
+/// batch failed.
+const FAILURE_BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+/// How long to wait after the `streak`-th consecutive cycle that failed a
+/// batch: the idle interval, doubling each time, capped, plus up to a quarter
+/// of that again so that engines which failed together do not retry together.
+///
+/// Before failed ranges were re-read, a failing store was answered by draining
+/// the source into FAILED batches at read speed. Now the same range is read
+/// again, so without a wait a persistent outage would be hammered in a tight
+/// loop (#552). `seed` supplies the jitter; callers pass something that
+/// varies between processes (the clock's sub-second part).
+fn failure_backoff(base: Duration, streak: u32, seed: u64) -> Duration {
+    let doublings = streak.saturating_sub(1).min(16);
+    let wait = base
+        .checked_mul(1u32 << doublings)
+        .unwrap_or(FAILURE_BACKOFF_CAP)
+        .min(FAILURE_BACKOFF_CAP);
+    let spread = u64::try_from(wait.as_millis() / 4).unwrap_or(0);
+    let jitter = if spread == 0 { 0 } else { seed % (spread + 1) };
+    (wait + Duration::from_millis(jitter)).min(FAILURE_BACKOFF_CAP)
 }
 
 /// Buffer key that isolates accumulation per source AND per Kafka partition, so
@@ -3039,16 +3210,27 @@ mod tests {
         let outcomes = engine.run_source(SourceType::File, true).await.unwrap();
         assert_eq!(outcomes[0].final_state, BatchState::Failed);
         assert_eq!(engine.upload_width(), 2, "halved after a throttled cycle");
-        // An idle cycle probes nothing and moves nothing (review).
+        // The failed range is handed back to the source (#552), so the next
+        // cycle is NOT idle: it re-reads line 1, reaches the store, and its
+        // clean verdict walks the width back up. This used to assert an idle
+        // cycle here — "nothing to flush" — which was the bug: line 1 had
+        // been read, failed, and would never be read again.
+        let retry = engine.run_source(SourceType::File, true).await.unwrap();
+        assert!(
+            retry[0].committed,
+            "the failed range is re-read and now commits"
+        );
+        assert_eq!(engine.upload_width(), 3, "a clean retry climbs one");
+        // A genuinely idle cycle probes nothing and moves nothing (review).
         let idle = engine.run_source(SourceType::File, true).await.unwrap();
         assert!(idle.is_empty(), "nothing to flush");
         assert_eq!(
             engine.upload_width(),
-            2,
+            3,
             "idle polling must not walk the width back up"
         );
         // Clean cycles climb back one at a time, and stop at the ceiling.
-        for (n, want) in [(2, 3), (3, 4), (4, 4)] {
+        for (n, want) in [(2, 4), (3, 4), (4, 4)] {
             append(n);
             let outcomes = engine.run_source(SourceType::File, true).await.unwrap();
             assert!(outcomes[0].committed, "a clean cycle commits");
@@ -3074,6 +3256,155 @@ mod tests {
             4,
             "with the knob off the width is the configured one"
         );
+    }
+
+    /// #552: a batch that fails must hand its range back to the source. The
+    /// adapters advance their read position when they READ, so without the
+    /// rewind the next cycle read on from the end of the failed range and the
+    /// first later batch to verify committed past it: the failed bytes were
+    /// never archived, and no restart repaired that because the file adapter
+    /// clamps a replay to the committed point.
+    #[tokio::test]
+    async fn a_failed_range_is_read_again_and_a_later_range_cannot_commit_past_it() {
+        // A throttled put moves a process-wide counter that another test reads
+        // as a delta, so the throttle tests take turns.
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\n").unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 3_600;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        // The store refuses exactly one put, then recovers.
+        engine.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(1));
+
+        let first = engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(first[0].final_state, BatchState::Failed);
+
+        // The file keeps growing while the store is unhappy.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&input)
+                .unwrap();
+            writeln!(f, "line 2").unwrap();
+        }
+        let second = engine.run_source(SourceType::File, true).await.unwrap();
+        assert!(second[0].committed, "the retry commits");
+
+        let committed: Vec<_> = engine
+            .store
+            .list_batches()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.state == BatchState::SourceCommitted)
+            .collect();
+        assert_eq!(committed.len(), 1, "one batch committed: {committed:?}");
+        let ProgressMarker::File { start_byte, .. } = &committed[0].progress_start else {
+            panic!("a file batch carries a file marker");
+        };
+        assert_eq!(
+            *start_byte, 0,
+            "the committed batch must start at byte 0: the failed range [0, 7) was \
+             handed back, not skipped"
+        );
+        assert_eq!(
+            committed[0].record_count,
+            Some(2),
+            "both lines are archived"
+        );
+        let ProgressMarker::File { end_byte: tail, .. } = &committed[0].progress_end else {
+            panic!("a file batch carries a file marker");
+        };
+        assert_eq!(
+            *tail,
+            std::fs::metadata(&input).unwrap().len(),
+            "and the batch ends at the end of the file"
+        );
+    }
+
+    /// Several incomplete ranges of one source: recovery used to apply each
+    /// rewind in turn, so the last row visited decided where the source
+    /// resumed. The plan keeps the lowest start per unit, and keeps units apart.
+    #[test]
+    fn a_rewind_plan_keeps_the_lowest_start_per_unit_whatever_the_order() {
+        let file = |path: &str, start: u64| ProgressMarker::File {
+            path: path.into(),
+            inode: None,
+            start_byte: start,
+            end_byte: start + 10,
+            file_size: 0,
+            mtime: String::new(),
+        };
+        let kafka = |partition: i32, start: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition,
+            start_offset: start,
+            end_offset: start + 9,
+            consumer_group: "g".into(),
+        };
+        for order in [[0usize, 1, 2], [2, 1, 0], [1, 2, 0]] {
+            let candidates = [file("/a", 100), file("/a", 20), file("/a", 60)];
+            let mut plan = RewindPlan::default();
+            for i in order {
+                plan.add(&candidates[i]);
+            }
+            plan.add(&file("/b", 5));
+            plan.add(&kafka(0, 50));
+            plan.add(&kafka(0, 10));
+            plan.add(&kafka(1, 99));
+            let got: Vec<String> = plan
+                .into_markers()
+                .iter()
+                .map(|m| format!("{:?}", rewind_unit(m)))
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    r#"("file|/a", 20)"#,
+                    r#"("file|/b", 5)"#,
+                    r#"("kafka|g|t#p0", 10)"#,
+                    r#"("kafka|g|t#p1", 99)"#,
+                ],
+                "order {order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_failure_backoff_doubles_is_capped_and_jitters_within_a_quarter() {
+        let base = Duration::from_secs(2);
+        let no_jitter = |streak| failure_backoff(base, streak, 0);
+        assert_eq!(no_jitter(1), Duration::from_secs(2));
+        assert_eq!(no_jitter(2), Duration::from_secs(4));
+        assert_eq!(no_jitter(3), Duration::from_secs(8));
+        assert_eq!(no_jitter(6), Duration::from_secs(60), "capped");
+        assert_eq!(
+            no_jitter(10_000),
+            FAILURE_BACKOFF_CAP,
+            "a long outage stays capped"
+        );
+        // Jitter only ever adds, by at most a quarter, and never past the cap.
+        for seed in [1u64, 499, 500, 501, u64::MAX] {
+            let got = failure_backoff(base, 1, seed);
+            assert!(
+                got >= Duration::from_secs(2) && got <= Duration::from_millis(2_500),
+                "seed {seed}: {got:?}"
+            );
+            assert!(failure_backoff(base, 40, seed) <= FAILURE_BACKOFF_CAP);
+        }
+        // A zero streak (no failure yet) and a zero base cannot divide or panic.
+        assert_eq!(failure_backoff(base, 0, 0), Duration::from_secs(2));
+        assert_eq!(failure_backoff(Duration::ZERO, 3, 7), Duration::ZERO);
     }
 
     /// #102 (review on #391): with `create_bucket` set, provisioning ran

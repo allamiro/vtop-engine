@@ -874,3 +874,96 @@ async fn recovery_size_check_rejects_replaced_object_without_checksums() {
     let summary = engine.recover().await.unwrap();
     assert_eq!(summary.committed, 1, "matching size commits");
 }
+
+/// #552: with several incomplete ranges of one source, recovery applied each
+/// rewind in turn, and `replay_from_marker` overwrites the adapter's read
+/// position — so whichever row it visited last decided where the source
+/// resumed, and every earlier range was skipped. It must resume from the
+/// LOWEST incomplete start.
+#[tokio::test]
+async fn recovery_resumes_from_the_lowest_incomplete_range_not_the_last_one_visited() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    // Three 7-byte lines: [0,7) [7,14) [14,21).
+    std::fs::write(&input, "line-0\nline-1\nline-2\n").unwrap();
+    let db = dir.path().join("state.db");
+    let url = format!("sqlite://{}", db.display());
+    let path = input.to_string_lossy().into_owned();
+    let range = |start: u64, end: u64| ProgressMarker::File {
+        path: path.clone(),
+        inode: None,
+        start_byte: start,
+        end_byte: end,
+        file_size: 21,
+        mtime: String::new(),
+    };
+
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        // Two FAILED ranges, the later-created one starting HIGHER, so a
+        // last-row-wins rewind lands at byte 7 and the first line is lost.
+        for (id, start, end, at) in [
+            ("b-low", 0, 7, "2026-01-01T00:00:00+00:00"),
+            ("b-high", 7, 14, "2026-01-01T00:00:01+00:00"),
+        ] {
+            let rec = BatchRecord {
+                batch_id: id.into(),
+                tenant: "default".into(),
+                source_type: SourceType::File,
+                source_name: path.clone(),
+                format: TelemetryFormat::Raw,
+                state: BatchState::Batching,
+                progress_start: range(start, end),
+                progress_end: range(start, end),
+                object_uri: None,
+                manifest_uri: None,
+                object_sha256: None,
+                manifest_sha256: None,
+                manifest_version_id: None,
+                object_size_bytes: None,
+                record_count: Some(1),
+                error_message: None,
+                owner: None,
+                lease_expires_at: None,
+                created_at: at.into(),
+                updated_at: at.into(),
+            };
+            store.save_batch_state(&rec).await.unwrap();
+            store.mark_failed(id, "upload failed").await.unwrap();
+        }
+    }
+
+    let cfg = file_config(work.to_str().unwrap(), &url, vec![path.clone()], "mock");
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(summary.replay_required, 2, "both ranges are handed back");
+
+    let outcomes = engine.process_once(SourceType::File).await.unwrap();
+    assert!(outcomes.iter().all(|o| o.committed), "{outcomes:?}");
+
+    let committed: Vec<_> = engine
+        .store
+        .list_batches()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|b| b.state == BatchState::SourceCommitted)
+        .collect();
+    assert_eq!(committed.len(), 1, "{committed:?}");
+    let ProgressMarker::File { start_byte, .. } = &committed[0].progress_start else {
+        panic!("a file batch carries a file marker");
+    };
+    assert_eq!(
+        *start_byte, 0,
+        "the source must resume at the first byte that is not archived, not at \
+         the start of whichever incomplete row recovery happened to visit last"
+    );
+    assert_eq!(
+        committed[0].record_count,
+        Some(3),
+        "all three lines archived"
+    );
+}
