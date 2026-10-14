@@ -8,7 +8,7 @@
 use crate::base::{
     AdapterReadReport, DiscoveredSource, ReadResult, SourceAdapter, SourceReadOutcome,
 };
-use crate::continuity::{self, Discontinuity};
+use crate::continuity::{self, Discontinuity, Observed};
 use async_trait::async_trait;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -252,7 +252,7 @@ impl FileSource {
     /// cursor is snapshotted before and applied after, so concurrent reads
     /// never touch shared state.
     ///
-    /// `expected_inode` is the identity the cursor last read. The open
+    /// `last_seen` is what the cursor last observed of the file. The open
     /// descriptor is checked against it (and against `start`) before any byte
     /// is read: a different inode, or a file shorter than `start`, means the
     /// position no longer applies and the read restarts at byte 0 (#558).
@@ -262,7 +262,7 @@ impl FileSource {
         max_records: usize,
         max_bytes: usize,
         whole_file: bool,
-        expected_inode: Option<u64>,
+        last_seen: Option<Observed>,
     ) -> Result<SliceRead, VtopError> {
         // Whole-file mode: read the entire remaining file as one opaque record.
         // Used for binary / already-compressed source files with no line
@@ -274,7 +274,7 @@ impl FileSource {
             let mut file = tokio::fs::File::open(&path).await?;
             let md = file.metadata().await?; // fstat: the opened file, not the path
             let fsize = md.len();
-            let discontinuity = continuity::check(expected_inode, inode_of(&md), fsize, start);
+            let discontinuity = continuity::check(last_seen, inode_of(&md), fsize, start);
             let start = if discontinuity.is_some() { 0 } else { start };
             let remaining = fsize.saturating_sub(start);
             let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
@@ -315,8 +315,7 @@ impl FileSource {
         let mut file = tokio::fs::File::open(&path).await?;
         // Judge the descriptor we are about to read, before reading it.
         let opened = Self::identity_of(&file.metadata().await?);
-        let discontinuity =
-            continuity::check(expected_inode, opened.inode, opened.file_size, start);
+        let discontinuity = continuity::check(last_seen, opened.inode, opened.file_size, start);
         let start = if discontinuity.is_some() { 0 } else { start };
         file.seek(std::io::SeekFrom::Start(start)).await?;
         // Bound the descriptor itself for the whole call. An outer Take over
@@ -683,18 +682,21 @@ impl SourceAdapter for FileSource {
                 }]);
             }
         }
-        let expected_inode = self
+        let last_seen = self
             .cursors
             .get(&path)
             .and_then(|c| c.seen.as_ref())
-            .and_then(|seen| seen.inode);
+            .map(|seen| Observed {
+                inode: seen.inode,
+                size: seen.file_size,
+            });
         let slice = Self::read_slice(
             path.clone(),
             start,
             max_records,
             max_bytes,
             self.whole_file,
-            expected_inode,
+            last_seen,
         )
         .await?;
         Ok(vec![self.apply_slice(&path, slice)])
@@ -756,7 +758,10 @@ impl SourceAdapter for FileSource {
                         PassOutcome::SkippedUnchanged(current)
                     }
                     _ => {
-                        let expected_inode = snapshot.seen.as_ref().and_then(|seen| seen.inode);
+                        let last_seen = snapshot.seen.as_ref().map(|seen| Observed {
+                            inode: seen.inode,
+                            size: seen.file_size,
+                        });
                         PassOutcome::Read(
                             Self::read_slice(
                                 path.clone(),
@@ -764,7 +769,7 @@ impl SourceAdapter for FileSource {
                                 max_records,
                                 max_bytes,
                                 whole_file,
-                                expected_inode,
+                                last_seen,
                             )
                             .await,
                         )
@@ -906,8 +911,12 @@ impl SourceAdapter for FileSource {
                     path,
                     "skipping delete-after-commit: file identity changed (possible rotation/replacement)"
                 );
-            } else if *end_byte >= size {
-                let _ = std::fs::remove_file(path);
+            } else if *end_byte >= size && std::fs::remove_file(path).is_ok() {
+                // The file this cursor described is gone. A new file at the
+                // path may be handed the freed inode number, and an inode
+                // check cannot tell it from the one it replaced, so the cursor
+                // must not outlive it (#558).
+                self.cursors.remove(path);
             }
         }
         Ok(())
@@ -2024,6 +2033,47 @@ mod tests {
         assert!(err.contains("identity changed"), "{err}");
     }
 
+    /// A bounded read of a backlog leaves the cursor far behind the end of the
+    /// file. A truncation that then leaves the file longer than the read
+    /// position but shorter than it was passed a read-position-only test, and
+    /// the read resumed in the middle of the new content.
+    #[tokio::test]
+    async fn a_truncation_to_above_the_read_position_is_still_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let backlog: String = (0..10).map(|i| format!("old-{i}\n")).collect(); // 60 bytes
+        std::fs::write(&path, &backlog).unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        // Two records only: the cursor stops at byte 12 of 60.
+        let first = fs
+            .read_batch_candidates(&src(&path), 2, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(first[0].records.len(), 2);
+
+        // Truncated in place and rewritten to 30 bytes: above the read position
+        // (12), below the length last seen (60).
+        let fresh: String = (0..5).map(|i| format!("new-{i}\n")).collect(); // 30 bytes
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap()
+            .write_all(fresh.as_bytes())
+            .unwrap();
+
+        let after = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            after[0].records.len(),
+            5,
+            "all of the new content, not the tail after byte 12"
+        );
+        assert_eq!(after[0].records[0], b"new-0".to_vec());
+    }
+
     /// `delete_after_commit` removes a source file once a batch reaching its
     /// end commits. A batch read BEFORE a truncation commits afterwards, with
     /// an end beyond the new length: the inode is unchanged and `end >= size`
@@ -2065,6 +2115,41 @@ mod tests {
             !std::path::Path::new(&path).exists(),
             "archived, so removed"
         );
+    }
+
+    /// After `delete_after_commit` removes a fully archived file, a new file at
+    /// the same path may be handed the freed inode number, and an inode check
+    /// cannot tell it from the one it replaced. The cursor must not outlive
+    /// the file: a stale read position applied to the new file would skip its
+    /// beginning (#558).
+    #[tokio::test]
+    async fn deleting_an_archived_file_drops_its_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "aaa\nbbb\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(fs.cursors.contains_key(&path));
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "archived, so removed"
+        );
+        assert!(
+            !fs.cursors.contains_key(&path),
+            "the cursor described a file that no longer exists"
+        );
+
+        // A new file at the path is read from its first byte.
+        std::fs::write(&path, "ccc\nddd\neee\n").unwrap();
+        let fresh = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(fresh[0].records.len(), 3);
     }
 
     /// A range that starts early enough to fit in what is left of a truncated

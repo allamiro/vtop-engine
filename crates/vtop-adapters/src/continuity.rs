@@ -41,29 +41,52 @@ impl std::fmt::Display for Discontinuity {
     }
 }
 
+/// What a cursor last observed of its file: the identity and the length the
+/// last read saw. An append-only file never gets shorter, so the length is
+/// evidence in its own right, independent of how far the cursor has read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Observed {
+    pub inode: Option<u64>,
+    pub size: u64,
+}
+
 /// Decide whether `read_byte` can still be applied to the file now at the
 /// path.
 ///
-/// `seen_inode` is the identity the cursor last read; `current_*` come from
-/// the OPEN descriptor the next read will use (`fstat`), never from a second
-/// path lookup that could describe a replacement. An unknown inode on either
-/// side (`None`: a platform without inodes, a cursor that has not read yet, a
-/// legacy marker) can never prove a rotation — it falls through to the length
-/// test, which needs no identity.
+/// `last_seen` is what the cursor last observed (`None` for a cursor that has
+/// not read yet); `current_*` come from the OPEN descriptor the next read will
+/// use (`fstat`), never from a second path lookup that could describe a
+/// replacement. An unknown inode on either side (`None`: a platform without
+/// inodes, a cursor that has not read yet, a legacy marker) can never prove a
+/// rotation — it falls through to the length tests, which need no identity.
+///
+/// Truncation is judged two ways. A file shorter than `read_byte` plainly
+/// cannot hold the position. But a cursor that is BEHIND the end of the file
+/// (a bounded read of a backlog, or a partial last line) has a `read_byte`
+/// much smaller than the length it last saw, and a truncation that leaves the
+/// file longer than `read_byte` but shorter than before would pass the first
+/// test and resume in the middle of new content. So a file now shorter than
+/// the length the cursor last saw is a truncation too.
 pub fn check(
-    seen_inode: Option<u64>,
+    last_seen: Option<Observed>,
     current_inode: Option<u64>,
     current_size: u64,
     read_byte: u64,
 ) -> Option<Discontinuity> {
-    if let (Some(from), Some(to)) = (seen_inode, current_inode) {
-        if from != to {
-            return Some(Discontinuity::Rotated { from, to });
+    if let Some(Observed {
+        inode: Some(from), ..
+    }) = last_seen
+    {
+        if let Some(to) = current_inode {
+            if from != to {
+                return Some(Discontinuity::Rotated { from, to });
+            }
         }
     }
-    if current_size < read_byte {
+    let shrunk_below = last_seen.map_or(0, |seen| seen.size);
+    if current_size < read_byte.max(shrunk_below) {
         return Some(Discontinuity::Truncated {
-            read_byte,
+            read_byte: read_byte.max(shrunk_below),
             size: current_size,
         });
     }
@@ -97,40 +120,70 @@ pub fn commit_is_current(
 mod tests {
     use super::*;
 
+    fn seen(inode: Option<u64>, size: u64) -> Option<Observed> {
+        Some(Observed { inode, size })
+    }
+
     #[test]
     fn an_unchanged_file_is_continuous() {
-        assert_eq!(check(Some(7), Some(7), 100, 100), None);
-        assert_eq!(check(Some(7), Some(7), 150, 100), None, "appended to");
+        assert_eq!(check(seen(Some(7), 100), Some(7), 100, 100), None);
+        assert_eq!(
+            check(seen(Some(7), 100), Some(7), 150, 100),
+            None,
+            "appended to"
+        );
         assert_eq!(check(None, None, 0, 0), None, "a fresh cursor");
+        // A cursor behind the end of a file that has only grown is fine.
+        assert_eq!(check(seen(Some(7), 100), Some(7), 400, 30), None);
     }
 
     #[test]
     fn a_different_inode_is_a_rotation_whatever_the_length() {
-        let longer = check(Some(7), Some(9), 5_000, 100);
-        let shorter = check(Some(7), Some(9), 10, 100);
-        let same = check(Some(7), Some(9), 100, 100);
-        for got in [longer, shorter, same] {
-            assert_eq!(got, Some(Discontinuity::Rotated { from: 7, to: 9 }));
+        for current_size in [5_000, 10, 100] {
+            assert_eq!(
+                check(seen(Some(7), 100), Some(9), current_size, 100),
+                Some(Discontinuity::Rotated { from: 7, to: 9 })
+            );
         }
     }
 
     #[test]
     fn a_shorter_file_with_the_same_inode_is_a_truncation() {
         assert_eq!(
-            check(Some(7), Some(7), 40, 100),
+            check(seen(Some(7), 100), Some(7), 40, 100),
             Some(Discontinuity::Truncated {
                 read_byte: 100,
                 size: 40
             })
         );
         // Shorter than the read head is the test; equal is still continuous.
-        assert_eq!(check(Some(7), Some(7), 100, 100), None);
+        assert_eq!(check(seen(Some(7), 100), Some(7), 100, 100), None);
+    }
+
+    /// The case a read-position-only test misses: the cursor is far behind the
+    /// end of the file (a bounded read of a backlog), and a truncation leaves
+    /// the file longer than the read position but shorter than it was.
+    #[test]
+    fn a_truncation_that_stays_above_the_read_position_is_still_a_truncation() {
+        // Last read saw a 40 000-byte file; the cursor is at 8. The file is now
+        // 20 bytes: above the read position, far below what it was.
+        assert_eq!(
+            check(seen(Some(7), 40_000), Some(7), 20, 8),
+            Some(Discontinuity::Truncated {
+                read_byte: 40_000,
+                size: 20
+            })
+        );
+        // A file merely a little behind where it was is not flagged by luck of
+        // the read position: it is shorter than it was, which is the evidence.
+        assert!(check(seen(Some(7), 1_000), Some(7), 999, 8).is_some());
+        assert_eq!(check(seen(Some(7), 1_000), Some(7), 1_000, 8), None);
     }
 
     #[test]
     fn unknown_identity_cannot_prove_a_rotation_but_length_still_counts() {
-        assert_eq!(check(None, Some(9), 500, 100), None);
-        assert_eq!(check(Some(7), None, 500, 100), None);
+        assert_eq!(check(seen(None, 100), Some(9), 500, 100), None);
+        assert_eq!(check(seen(Some(7), 100), None, 500, 100), None);
         assert_eq!(
             check(None, None, 10, 100),
             Some(Discontinuity::Truncated {
@@ -139,6 +192,9 @@ mod tests {
             }),
             "a file shorter than the read head is a truncation with or without inodes"
         );
+        // A seeded cursor knows an inode but no length (0): the length test
+        // cannot fire on it, only the read position can.
+        assert_eq!(check(seen(Some(7), 0), Some(7), 5, 3), None);
     }
 
     #[test]

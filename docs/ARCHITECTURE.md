@@ -321,11 +321,18 @@ Limits, stated plainly:
   truncate are lost by the rotation tool before the engine can see them. If the
   file also regrows beyond the old read position before the next read, the
   truncation is invisible to the adapter.
-- A file is identified by its **inode number alone**. Inode numbers are unique
-  per filesystem, not per host, so a replacement on a *different* filesystem
-  that happens to reuse the number is not detected as a rotation (markers do
-  not record the device). Rotation within one filesystem, which is what log
-  rotation does, is.
+- A file is identified by its **inode number alone**, and a number can be
+  reused. On a *different* filesystem a replacement that happens to carry the
+  number is not seen as a rotation (markers do not record the device). On the
+  *same* filesystem the number of a file that was **unlinked** is free to be
+  handed to the next file created, so a path that is deleted and recreated
+  (rather than renamed and recreated, which keeps the old inode alive) can
+  present a new file under the old number; if that file is also longer than
+  the old read position it looks like a continuation. The engine's own
+  `delete_after_commit` removes the cursor with the file for exactly this
+  reason, so the common route to reuse is closed; a file removed by anything
+  else is not. Rotation by rename, which is what log rotation does, is
+  detected.
 - Late commits are judged against the file as it is NOW (another inode, or an
   end beyond its length). A `copytruncate` followed by a regrow past the old
   end before the late commit lands cannot be told from the original; that is

@@ -8,7 +8,7 @@
 use crate::base::{
     AdapterReadReport, DiscoveredSource, ReadResult, SourceAdapter, SourceReadOutcome,
 };
-use crate::continuity::{self, Discontinuity};
+use crate::continuity::{self, Discontinuity, Observed};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
@@ -192,7 +192,7 @@ impl SyslogSpoolSource {
     /// complete (newline-terminated) lines are accepted — a partial line still
     /// being written by rsyslog is left for the next pass.
     ///
-    /// `expected_inode` is the identity the cursor last read; the open
+    /// `last_seen` is what the cursor last observed of the spool; the open
     /// descriptor is judged against it before any byte is read, and a rotated
     /// or truncated spool restarts at byte 0 (#558).
     async fn read_slice(
@@ -200,12 +200,11 @@ impl SyslogSpoolSource {
         start: u64,
         max_records: usize,
         max_bytes: usize,
-        expected_inode: Option<u64>,
+        last_seen: Option<Observed>,
     ) -> Result<SpoolSlice, VtopError> {
         let mut file = tokio::fs::File::open(&path).await?;
         let opened = Self::seen_of(&file.metadata().await?);
-        let discontinuity =
-            continuity::check(expected_inode, opened.inode, opened.file_size, start);
+        let discontinuity = continuity::check(last_seen, opened.inode, opened.file_size, start);
         let start = if discontinuity.is_some() { 0 } else { start };
         file.seek(std::io::SeekFrom::Start(start)).await?;
         // Put the whole-call byte limiter BELOW BufReader. If Take wrapped the
@@ -325,13 +324,16 @@ impl SourceAdapter for SyslogSpoolSource {
                 }]);
             }
         }
-        let expected_inode = self
+        let last_seen = self
             .cursors
             .get(&path)
             .and_then(|c| c.seen.as_ref())
-            .and_then(|seen| seen.inode);
+            .map(|seen| Observed {
+                inode: seen.inode,
+                size: seen.file_size,
+            });
         let slice =
-            Self::read_slice(path.clone(), start, max_records, max_bytes, expected_inode).await?;
+            Self::read_slice(path.clone(), start, max_records, max_bytes, last_seen).await?;
         Ok(vec![self.apply_slice(&path, slice)])
     }
 
@@ -352,7 +354,7 @@ impl SourceAdapter for SyslogSpoolSource {
         // identity unchanged since the read that caught it up — are
         // separated out here and never opened; what is left is the work the
         // pass actually has to do.
-        let mut jobs: Vec<(usize, String, u64, Option<u64>)> = Vec::new();
+        let mut jobs: Vec<(usize, String, u64, Option<Observed>)> = Vec::new();
         let mut skipped: Vec<(usize, String, u64, SpoolSeen)> = Vec::new();
         for (i, s) in sources.iter().enumerate() {
             let path = s.source_name.clone();
@@ -363,8 +365,11 @@ impl SourceAdapter for SyslogSpoolSource {
                     skipped.push((i, path, start, current));
                 }
                 _ => {
-                    let expected_inode = cursor.seen.as_ref().and_then(|seen| seen.inode);
-                    jobs.push((i, path, start, expected_inode));
+                    let last_seen = cursor.seen.as_ref().map(|seen| Observed {
+                        inode: seen.inode,
+                        size: seen.file_size,
+                    });
+                    jobs.push((i, path, start, last_seen));
                 }
             }
         }
@@ -381,19 +386,20 @@ impl SourceAdapter for SyslogSpoolSource {
         }
 
         let mut results: Vec<(usize, String, Result<SpoolSlice, VtopError>)> =
-            futures::stream::iter(jobs.into_iter().map(
-                |(i, path, start, expected_inode)| async move {
-                    let res = Self::read_slice(
-                        path.clone(),
-                        start,
-                        max_records,
-                        max_bytes,
-                        expected_inode,
-                    )
-                    .await;
-                    (i, path, res)
-                },
-            ))
+            futures::stream::iter(
+                jobs.into_iter()
+                    .map(|(i, path, start, last_seen)| async move {
+                        let res = Self::read_slice(
+                            path.clone(),
+                            start,
+                            max_records,
+                            max_bytes,
+                            last_seen,
+                        )
+                        .await;
+                        (i, path, res)
+                    }),
+            )
             .buffer_unordered(SPOOL_READ_CONCURRENCY)
             .collect()
             .await;
