@@ -354,6 +354,9 @@ impl InProcessFollower {
             // pass's state now; left in place it would keep exporting a
             // stale bound, size and blocked reason (review of #572).
             self.retention_stats.clear();
+        } else {
+            // A pass still running under the old bound records nothing.
+            self.retention_stats.policy_changed();
         }
     }
 
@@ -361,6 +364,8 @@ impl InProcessFollower {
     /// returned, for the same reason as on the leader — the append was
     /// already durable, and the next open finishes an interrupted pass.
     fn run_retention(&self, segment: &mut vtop_log::SegmentSet) {
+        // The generation BEFORE the bound (review of #572), as on the leader.
+        let generation = self.retention_stats.policy_generation();
         let max_total_bytes = self
             .retention_max_total_bytes
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -369,7 +374,8 @@ impl InProcessFollower {
         }
         let floor = self.cluster_committed.get().min(segment.committed_offset());
         let result = segment.retain(&vtop_log::RetentionPolicy { max_total_bytes }, floor);
-        self.retention_stats.record(
+        self.retention_stats.record_for(
+            generation,
             &format!(
                 "follower {} range {}/{}",
                 self.node_id, self.range.topic, self.range.range_id

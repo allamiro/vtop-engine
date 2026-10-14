@@ -1094,6 +1094,9 @@ impl LocalBroker {
             // pass's state now; left in place it would keep exporting a
             // stale bound, size and blocked reason (review of #572).
             self.retention_stats.clear();
+        } else {
+            // A pass still running under the old bound records nothing.
+            self.retention_stats.policy_changed();
         }
     }
 
@@ -1104,6 +1107,9 @@ impl LocalBroker {
     /// next open — refusing the produce over reclamation trouble would turn
     /// a disk-space policy into an availability incident.
     fn run_retention(&self, segment: &mut SegmentSet) {
+        // The generation BEFORE the bound: a policy change between the two
+        // makes this pass's record a no-op (review of #572).
+        let generation = self.retention_stats.policy_generation();
         let max_total_bytes = self.retention_max_total_bytes.load(Ordering::SeqCst);
         if max_total_bytes == 0 {
             return;
@@ -1115,7 +1121,8 @@ impl LocalBroker {
             .map(|committed| committed.get().min(local))
             .unwrap_or(local);
         let result = segment.retain(&vtop_log::RetentionPolicy { max_total_bytes }, floor);
-        self.retention_stats.record(
+        self.retention_stats.record_for(
+            generation,
             &format!("range {}/{}", self.range.topic, self.range.range_id),
             max_total_bytes,
             &result,
