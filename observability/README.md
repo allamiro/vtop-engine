@@ -152,16 +152,19 @@ A consumer group positioned below a range's log start is told
 `OffsetOutOfRange`: retention removed records it had not read, and nothing
 warned before it happened (#571). Two series meet in PromQL:
 
-- every metadata node exports `vtop_meta_group_cursor_offset{topic,range,group}`
-  from its own applied state (the next offset each group will read; take
-  `max by (topic, range, group)` across nodes), bounded at 10,000 series per
-  node, with the rest counted in `vtop_meta_group_cursor_series_dropped`;
+- the metadata LEADER exports `vtop_meta_group_cursor_offset{topic,range,group}`
+  from its applied state (the next offset each group will read). Only the
+  leader: a cursor can be committed backwards, so a lagging follower's copy may
+  stand above where the group really is, and no aggregate across nodes could
+  tell. At most 10,000 series; `vtop_meta_group_cursor_series_truncated` is 1
+  when some were left out;
 - every data node exports `vtop_broker_log_start_offset{topic,range}`, the first
-  offset its replica still holds.
+  offset its replica still holds (removed while a candidate has no role).
 
 `topic` is the topic name and `range` the range UUID on both, so lag is
 `cursor - on (topic, range) group_left log_start`, and time to eviction is that
-gap divided by the rate retention moves the log start.
+gap divided by how fast retention moves the log start (`deriv`, the gauge's
+slope).
 
 | Rule | Fires when | For |
 |---|---|---|
@@ -244,10 +247,10 @@ panel.
 - `MINIO_PROMETHEUS_AUTH_TYPE=public` disables auth on MinIO's metrics endpoint —
   **never do that outside a lab**;
 - Alloy holds a (read-only) docker socket to discover containers and read logs;
-- eight alert rules, file-provisioned from
+- ten alert rules, file-provisioned from
   `grafana/provisioning/alerting/vtop-alerts.yaml`: **Records lost to
   retention** fires on any increase of `vtop_retention_lost_records_total`
-  (#454), and seven data-plane and metadata rules cover retention and
+  (#454), and nine data-plane and metadata rules cover retention and
   replication health and group eviction (#561, #571; see [retention blocked](#retention-blocked),
   [group eviction](#group-eviction) and
   [replication health](#replication-health)). No contact point is provisioned,

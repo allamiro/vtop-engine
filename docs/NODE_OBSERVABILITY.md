@@ -143,8 +143,8 @@ each add the same delta and leave the export permanently above its source.
 | `vtop_meta_raft_millis_since_quorum_ack` | gauge | Milliseconds since a quorum acknowledged this leader; `-1` when not leading. **A climbing value on a self-declared leader is the signature of a partition** — it is what separates "isolated" from "slow". |
 | `vtop_meta_raft_peer_matched_index{peer}` | gauge | Highest index each peer acknowledged, or `-1` for a peer that has acknowledged nothing. Leader only. |
 | `vtop_meta_raft_peer_lag_entries{peer}` | gauge | Entries each peer trails the leader by; `-1` when the peer has never acknowledged, since its lag is unknown rather than total. |
-| `vtop_meta_group_cursor_offset{topic,range,group}` | gauge | Next offset each consumer group will read on each range, from this node's applied state (#571). `topic` is the name and `range` the UUID, as on the data nodes, so lag and time to eviction are PromQL joins against `vtop_broker_log_start_offset`. Every metadata node exports it; aggregate with `max`. A busy state machine leaves the last values standing; a deleted group disappears. `group` is the group name, or its UUID when the group record is gone. |
-| `vtop_meta_group_cursor_series_dropped` | gauge | Cursors not exported because the 10,000-series bound per node was reached. |
+| `vtop_meta_group_cursor_offset{topic,range,group}` | gauge | Next offset each consumer group will read on each range, from this node's applied state (#571). `topic` is the name and `range` the UUID, as on the data nodes, so lag and time to eviction are PromQL joins against `vtop_broker_log_start_offset`. Only the metadata leader exports it (a follower's copy can stand above a cursor committed backwards); the others export none. A busy state machine leaves the last values standing; a removed cursor disappears. `group` is the group name, or its UUID when the group record is gone. |
+| `vtop_meta_group_cursor_series_truncated` | gauge | 1 when some cursors were not exported: more than the 10,000-series bound exist, or an offset is beyond what a gauge carries. |
 
 Absent values report `-1`, never `0`: a Raft node with no log has no last
 index, and `0` is a real value in the neighbouring series. The same rule covers
@@ -172,7 +172,7 @@ not keep publishing the follower lag it saw at the instant of the failover.
 | `vtop_broker_retention_bound_bytes{topic,range}` | gauge | The range's retention bound. |
 | `vtop_broker_retention_blocked{topic,range,reason}` | gauge | 1 while the latest pass ended above the bound. `committed_floor`: the oldest segment holds records a follower or the quorum mark has not passed, so disk grows until replication catches up. `active_segment`: the bound is smaller than one segment. A pass that reclaims nothing used to look the same as a range under its bound. |
 | `vtop_broker_retention_last_pass_failed{topic,range}` | gauge | 1 while the latest pass failed outright (retried after the next append). |
-| `vtop_broker_log_start_offset{topic,range}` | gauge | First offset the replica still holds; retention moves it. A consumer below it is told `OffsetOutOfRange` (#571). |
+| `vtop_broker_log_start_offset{topic,range}` | gauge | First offset the replica still holds; retention moves it. A consumer below it is told `OffsetOutOfRange` (#571). Removed while a candidate has no role installed. |
 | `vtop_broker_group_commits_total` | counter | Commit groups sealed and fsynced. |
 | `vtop_broker_group_commit_requests_total` | counter | Produce requests folded into groups. |
 | `vtop_broker_group_commit_records_total` / `_bytes_total` | counter | Volume folded into groups. |

@@ -179,6 +179,27 @@ impl OpenraftConsensus {
         &self.raft
     }
 
+    /// Where every consumer group's durable cursor stands (#571), from this
+    /// node's APPLIED state, without waiting: `None` while the state machine
+    /// is busy, or on a node built without applied state.
+    ///
+    /// Only the LEADER answers; any other node answers with no cursors
+    /// (review of #574). Cursors are not monotonic - an unpinned cursor may
+    /// be committed backwards - so a lagging follower's copy can hold a
+    /// cursor ABOVE where the group now stands, and an aggregate across
+    /// nodes could report a group safe that is already below the log start.
+    /// The leader's applied state is the newest any node has.
+    pub fn group_cursor_positions(
+        &self,
+        limit: usize,
+    ) -> Option<(Vec<crate::state::GroupCursorPosition>, bool)> {
+        let store = self.store.as_ref()?;
+        if self.raft.metrics().borrow().state != ServerState::Leader {
+            return Some((Vec::new(), false));
+        }
+        store.try_with_storage(|storage| storage.state().group_cursor_positions(limit))
+    }
+
     /// Non-blocking snapshot of this node's Raft state for the operational
     /// surface (#224).
     ///
@@ -188,21 +209,6 @@ impl OpenraftConsensus {
     /// translated to the 1-based VTOP index space, matching what
     /// `vtopctl meta status` prints; a metric and a CLI that disagree about
     /// what "index 7" means is a bug waiting for an incident.
-    /// Where every consumer group's durable cursor stands (#571), from this
-    /// node's APPLIED state, without waiting: `None` while the state machine
-    /// is busy, or on a node built without applied state. Not linearizable -
-    /// a follower answers from its own copy - which is what a metrics scrape
-    /// wants: cursors only move forward, and a scrape that queued behind an
-    /// apply would stall the endpoint every other gauge is read from.
-    pub fn group_cursor_positions(
-        &self,
-        limit: usize,
-    ) -> Option<(Vec<crate::state::GroupCursorPosition>, usize)> {
-        self.store
-            .as_ref()?
-            .try_with_storage(|storage| storage.state().group_cursor_positions(limit))
-    }
-
     pub fn observe(&self) -> RaftObservation {
         let metrics = self.raft.metrics().borrow().clone();
         let membership = metrics.membership_config.membership();

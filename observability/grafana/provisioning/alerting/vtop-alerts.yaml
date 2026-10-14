@@ -509,7 +509,7 @@ groups:
               refId: A
               instant: true
               expr: >-
-                max by (topic, range, group) (vtop_meta_group_cursor_offset) - on (topic, range) group_left max by (topic, range) (vtop_broker_log_start_offset)
+                max by (topic, range) (vtop_broker_log_start_offset) - on (topic, range) group_right max by (topic, range, group) (vtop_meta_group_cursor_offset)
               intervalMs: 1000
               maxDataPoints: 43200
           - refId: C
@@ -523,7 +523,7 @@ groups:
               expression: A
               conditions:
                 - evaluator:
-                    type: lt
+                    type: gt
                     params: [0]
                   operator:
                     type: and
@@ -567,7 +567,7 @@ groups:
               refId: A
               instant: true
               expr: >-
-                ((max by (topic, range, group) (vtop_meta_group_cursor_offset) - on (topic, range) group_left max by (topic, range) (vtop_broker_log_start_offset)) / on (topic, range) group_left() (max by (topic, range) (rate(vtop_broker_log_start_offset[30m])) > 0)) > 0
+                ((max by (topic, range, group) (vtop_meta_group_cursor_offset) - on (topic, range) group_left max by (topic, range) (vtop_broker_log_start_offset)) / on (topic, range) group_left() (max by (topic, range) (deriv(vtop_broker_log_start_offset[30m])) > 0)) > 0
               intervalMs: 1000
               maxDataPoints: 43200
           - refId: C

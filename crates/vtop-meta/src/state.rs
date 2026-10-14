@@ -1210,10 +1210,13 @@ impl MetaStateMachine {
     }
 
     /// Every durable consumer-group cursor, for observability (#571): at
-    /// most `limit` of them, in key order, and how many exist in all. Group
+    /// most `limit` of them, in key order, and whether there were more. Group
     /// cursor keys are contiguous (shard, category, then group, topic and
-    /// range), so this walks the cursors and nothing else.
-    pub fn group_cursor_positions(&self, limit: usize) -> (Vec<GroupCursorPosition>, usize) {
+    /// range), so this walks the cursors and nothing else - and stops one
+    /// past the limit: the caller holds the store lock, and counting every
+    /// remaining cursor would make a scrape hold it for as long as the
+    /// whole set takes to walk (review of #574).
+    pub fn group_cursor_positions(&self, limit: usize) -> (Vec<GroupCursorPosition>, bool) {
         let prefix = MetaKey::GroupCursor {
             group_uuid: Uuid::nil(),
             topic_uuid: Uuid::nil(),
@@ -1222,7 +1225,6 @@ impl MetaStateMachine {
         .encode()[..3]
             .to_vec();
         let mut positions = Vec::new();
-        let mut total = 0;
         for (key, value) in self
             .records
             .range(prefix.clone()..)
@@ -1239,9 +1241,8 @@ impl MetaStateMachine {
             else {
                 continue;
             };
-            total += 1;
             if positions.len() >= limit {
-                continue;
+                return (positions, true);
             }
             let topic_name = match self.record(&MetaKey::Topic { topic_uuid }) {
                 Some(MetaValue::Topic(topic)) => Some(topic.name.clone()),
@@ -1260,7 +1261,7 @@ impl MetaStateMachine {
                 record_offset: cursor.record_offset,
             });
         }
-        (positions, total)
+        (positions, false)
     }
 
     pub fn record_count(&self) -> usize {
@@ -5425,8 +5426,9 @@ mod tests {
             );
         }
 
-        let (all, total) = machine.group_cursor_positions(100);
-        assert_eq!(total, 2);
+        let (all, truncated) = machine.group_cursor_positions(100);
+        assert_eq!(all.len(), 2);
+        assert!(!truncated);
         let named = all.iter().find(|p| p.group_uuid == group).unwrap();
         assert_eq!(named.topic_name.as_deref(), Some("events"));
         assert_eq!(named.group_name.as_deref(), Some("billing"));
@@ -5434,13 +5436,11 @@ mod tests {
         let unnamed = all.iter().find(|p| p.group_uuid == orphan).unwrap();
         assert_eq!(unnamed.group_name, None, "a group record that is gone");
 
-        let (bounded, total) = machine.group_cursor_positions(1);
-        assert_eq!(
-            (bounded.len(), total),
-            (1, 2),
-            "the bound caps the list, not the count"
-        );
+        let (bounded, truncated) = machine.group_cursor_positions(1);
+        assert_eq!(bounded.len(), 1);
+        assert!(truncated, "there was a cursor past the bound");
     }
+
     use crate::command::CommandEnvelope;
 
     fn envelope(request: u128) -> CommandEnvelope {
