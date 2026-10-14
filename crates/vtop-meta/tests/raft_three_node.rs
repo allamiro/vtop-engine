@@ -966,7 +966,7 @@ async fn the_leader_refuses_a_skewed_lease_proposer_so_it_cannot_steal_or_poison
 
     const LEADER_NOW: i64 = 1_750_000_100_000;
     const HOUR_MS: i64 = 3_600_000;
-    const LEASE_MS: u64 = 15_000; // tolerance: a quarter, 3 750 ms
+    const LEASE_MS: u64 = 15_000; // tolerance: the 1 000 ms floor (a twentieth is 750)
 
     let seed = SEED ^ 0x555;
     let mut cluster = Cluster::boot(seed).await;
@@ -1041,7 +1041,7 @@ async fn the_leader_refuses_a_skewed_lease_proposer_so_it_cannot_steal_or_poison
     let env = envelope(&mut cluster, LEADER_NOW + HOUR_MS);
     match consensus.propose(acquire(env, holder, generation)).await {
         Err(ConsensusError::ClockSkew { skew_ms, bound_ms }) => {
-            assert_eq!((skew_ms, bound_ms), (HOUR_MS, 3_750), "seed={seed:#x}");
+            assert_eq!((skew_ms, bound_ms), (HOUR_MS, 1_000), "seed={seed:#x}");
         }
         other => panic!("a fast-clocked candidate was not refused (seed={seed:#x}): {other:?}"),
     }
@@ -1057,10 +1057,10 @@ async fn the_leader_refuses_a_skewed_lease_proposer_so_it_cannot_steal_or_poison
         Err(ConsensusError::ClockSkew { skew_ms, .. }) if skew_ms == -HOUR_MS
     ));
 
-    // 3. A candidate whose clock is merely a little off (2 s) wins, and its
+    // 3. A candidate whose clock is merely a little off (500 ms) wins, and its
     //    value is KEPT: the deadline is the proposer's time plus the lease, so
     //    the agent that holds it compares like with like.
-    let env = envelope(&mut cluster, LEADER_NOW + 2_000);
+    let env = envelope(&mut cluster, LEADER_NOW + 500);
     let granted = acquire(env, holder, generation);
     let receipt = consensus.propose(granted.clone()).await.unwrap();
     assert!(
@@ -1073,7 +1073,7 @@ async fn the_leader_refuses_a_skewed_lease_proposer_so_it_cannot_steal_or_poison
         .wait_applied_at_least(receipt.log_id.index - 1)
         .await; // meta index is 1-based
     let epoch = read_range(&cluster).fencing_epoch;
-    let deadline = LEADER_NOW + 2_000 + LEASE_MS as i64;
+    let deadline = LEADER_NOW + 500 + LEASE_MS as i64;
     assert_eq!(
         read_range(&cluster).lease.expect("a lease").expires_at_ms,
         Some(deadline),

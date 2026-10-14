@@ -125,7 +125,7 @@ checks is a gate that silently stops working.
 Scenario 07 skews a Raft **voter**. Skew on a lease **proposer** (a data node)
 is a different path and is covered deterministically, not live, in
 `crates/vtop-meta/tests/raft_three_node.rs`: the metadata leader refuses a
-lease request whose clock is further from its own than a quarter of the lease
+lease request whose clock is further from its own than the tolerance below
 (#555), and that test drives a proposer an hour fast and an hour slow through
 the real propose path, asserting neither can take a lease, push a deadline out,
 or renew; that a follower redirects instead of reporting skew; that a retry of
@@ -136,8 +136,12 @@ granted at it). A live scenario that skews a lease-holding data node would build
 
 What the guard does and does not do. It **bounds** the error; it does not
 remove it. An accepted request keeps the proposer's timestamp, and the
-tolerance is the greater of a quarter of the lease and one second, capped at half the lease, so a
-deadline can be off by up to that much in either direction. The leader's check
+tolerance (`lease_skew_bound_ms`) is the greater of a twentieth of the lease and one second,
+capped at a tenth of the lease, so a deadline can be off by up to that much in either
+direction, and a holder slow by it facing a rival fast by it loses twice it from the lease.
+The lease agent's pacing validation subtracts that twice-the-tolerance from the lease before
+checking that one lost round fits; the cap keeps it to a fifth of any lease, which is what
+lets this suite's 6 s / 2 s / 0.5 s pacing pass (4.5 s needed, 4.8 s left). The leader's check
 is also made on a snapshot of its role immediately before the proposal, not
 inside the proposal: if leadership moves to another node in that window, one
 skewed request can be replicated without being judged. That request is a
