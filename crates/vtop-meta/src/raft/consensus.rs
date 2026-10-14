@@ -204,16 +204,19 @@ impl OpenraftConsensus {
     /// has no applied state to ask (a bare-Raft harness) - the caller then
     /// judges the request as new.
     fn applied_receipt(&self, request_id: uuid::Uuid) -> Option<CommitReceipt> {
-        let store = self.store.as_ref()?;
-        let response =
-            store.with_storage(|storage| storage.state().applied_response(request_id).cloned())?;
-        let applied = self.raft.metrics().borrow().last_applied?;
-        Some(CommitReceipt {
-            log_id: WireLogId {
-                term: applied.leader_id.term,
-                index: to_meta_index(applied.index),
-            },
-            response,
+        // The response and the applied position are read under ONE storage
+        // lock (review): the metrics snapshot is published after apply and
+        // can lag it, so pairing the two could name a log id from before
+        // the entry that produced the response.
+        self.store.as_ref()?.with_storage(|storage| {
+            let response = storage.state().applied_response(request_id).cloned()?;
+            Some(CommitReceipt {
+                log_id: WireLogId {
+                    term: storage.last_applied_term(),
+                    index: storage.last_applied(),
+                },
+                response,
+            })
         })
     }
 

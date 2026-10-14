@@ -1093,6 +1093,16 @@ async fn the_leader_refuses_a_skewed_lease_proposer_so_it_cannot_steal_or_poison
         ),
         "a committed request must be answered from the dedup table (seed={seed:#x}): {retried:?}"
     );
+    // The receipt names a position at or after the entry that produced the
+    // response - read with it, not from a metrics snapshot that can lag
+    // (review of #566).
+    let retried_index = retried.as_ref().unwrap().log_id.index;
+    assert!(
+        retried_index >= receipt.log_id.index,
+        "the aged retry's receipt ({retried_index}) predates the original commit ({}) \
+         (seed={seed:#x})",
+        receipt.log_id.index
+    );
     // ...answered, not re-proposed (review of #566): a stale command that
     // reached the log could be applied as new if the table evicted it first.
     assert_eq!(
