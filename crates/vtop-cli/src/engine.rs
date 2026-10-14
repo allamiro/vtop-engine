@@ -159,7 +159,10 @@ impl<'a> Pipeline<'a> {
         read: ReadResult,
         stream: Option<&StreamConfig>,
     ) -> Result<BatchOutcome, VtopError> {
-        match self.process_until_verified(source, read, stream).await? {
+        match self
+            .process_until_verified(source, read, stream, Utc::now())
+            .await?
+        {
             VerifyStep::Finished(outcome) => Ok(outcome),
             VerifyStep::Verified(v) => self.commit_verified(adapter, v).await,
         }
@@ -177,11 +180,16 @@ impl<'a> Pipeline<'a> {
     /// The invariant is unaffected: a batch still reaches SOURCE_COMMITTED only
     /// after IT has reached VERIFIED. Concurrency is ACROSS batches, never
     /// within one, and never between one batch's verify and another's commit.
+    ///
+    /// `sealed_at` is when the batch's contents were fixed: the caller takes
+    /// it as the read leaves its buffer, before the batch queues for an upload
+    /// slot. The time partition is taken from it (#559).
     async fn process_until_verified(
         &self,
         source: &DiscoveredSource,
         read: ReadResult,
         stream: Option<&StreamConfig>,
+        sealed_at: chrono::DateTime<Utc>,
     ) -> Result<VerifyStep, VtopError> {
         if read.is_empty() {
             return Ok(VerifyStep::Finished(BatchOutcome {
@@ -221,10 +229,7 @@ impl<'a> Pipeline<'a> {
             .unwrap_or_else(|| source.source_name.clone());
 
         let batch_id = vtop_core::batch::build_batch_id(&source.source_name, &read.progress_end);
-        // The batch is sealed now: this instant is fixed before any upload
-        // work, so it is the one the time partition is taken from (#559).
-        let sealed_at = Utc::now();
-        let now = sealed_at.to_rfc3339();
+        let now = Utc::now().to_rfc3339();
 
         // ---- DISCOVERED -> BATCHING (persisted) -------------------------
         let mut batch = TelemetryBatch {
@@ -339,7 +344,11 @@ impl<'a> Pipeline<'a> {
         mark_state!(BatchState::Batching);
 
         // ---- BATCHING -> SEALED -----------------------------------------
-        batch.seal()?;
+        // Stamped with the drain instant, not the time this line runs: the
+        // batch may have waited for an upload slot and its first ledger write
+        // since, possibly across an hour boundary, and the partition below and
+        // the recorded seal time must name the same hour (review on #570).
+        batch.seal_at(sealed_at)?;
         let t_write = Instant::now();
         self.store
             .update_batch_state(&batch_id, BatchState::Sealed, &BatchPatch::default())
@@ -1796,8 +1805,12 @@ impl Engine {
                 continue;
             };
             let Some(read) = buf.drain() else { continue };
+            // The batch's contents are fixed here. It may then queue behind
+            // `limit` others for an upload slot, so the seal instant is taken
+            // now, not when its future first runs (review on #570).
+            let sealed_at = Utc::now();
             let stream = self.streams.lookup(&buf.source.source_name).cloned();
-            work.push((buf.source.clone(), read, stream));
+            work.push((buf.source.clone(), read, stream, sealed_at));
         }
 
         // The width this cycle runs at (#102): the ceiling, or the
@@ -1822,11 +1835,11 @@ impl Engine {
         // copies — the clone is not bounded by the concurrency limit, only the
         // execution is.
         let verified: Vec<Result<VerifyStep, VtopError>> =
-            futures::stream::iter(work.into_iter().map(|(source, read, stream)| {
+            futures::stream::iter(work.into_iter().map(|(source, read, stream, sealed_at)| {
                 let pipeline = &pipeline;
                 async move {
                     pipeline
-                        .process_until_verified(&source, read, stream.as_ref())
+                        .process_until_verified(&source, read, stream.as_ref(), sealed_at)
                         .await
                 }
             }))
@@ -2775,6 +2788,66 @@ mod tests {
             5,
             "each batch keeps its own identity; a shared batch_id would collide \
              in the ledger the moment two of them committed"
+        );
+    }
+
+    /// Review on #570: a batch waits for an upload slot (and its first ledger
+    /// write) after it leaves the buffer, and that wait can cross an hour. The
+    /// partition is the hour the batch was drained in - the instant the caller
+    /// passes - not the hour processing reached it.
+    #[tokio::test]
+    async fn a_batch_is_filed_under_the_hour_it_was_drained_not_processed() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "one\n").unwrap();
+        let cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        let engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let source = DiscoveredSource {
+            source_type: SourceType::File,
+            source_name: "in".into(),
+            format: vtop_core::types::TelemetryFormat::Raw,
+        };
+        let marker = ProgressMarker::File {
+            path: input.to_string_lossy().into_owned(),
+            inode: None,
+            start_byte: 0,
+            end_byte: 4,
+            file_size: 4,
+            mtime: String::new(),
+        };
+        let read = ReadResult {
+            records: vec![b"one".to_vec()],
+            progress_start: marker.clone(),
+            progress_end: marker,
+            first_timestamp: None,
+            last_timestamp: None,
+            verbatim: false,
+        };
+        let drained = chrono::DateTime::parse_from_rfc3339("2020-01-02T03:59:59.900Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let step = engine
+            .pipeline()
+            .process_until_verified(&source, read, None, drained)
+            .await
+            .unwrap();
+        let VerifyStep::Verified(verified) = step else {
+            panic!("the batch did not verify");
+        };
+        assert!(
+            verified
+                .object_uri
+                .contains("year=2020/month=01/day=02/hour=03"),
+            "filed under the hour processing reached it, not the hour it was \
+             drained in (2020-01-02 03:59:59.900): {}",
+            verified.object_uri
         );
     }
 

@@ -7,16 +7,21 @@
 //! record's times": producer-supplied timestamps arrive out of order, so a
 //! window's range is a minimum and a maximum.
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, TimeZone, Utc};
 
 /// Milliseconds since the epoch as RFC 3339 UTC with millisecond precision, or
-/// `None` for a value no clock produces (negative: Kafka's "no timestamp").
+/// `None` for a value no clock produces (negative: Kafka's "no timestamp") or
+/// one RFC 3339 cannot write. Its year has four digits; chrono would print
+/// 10000 as `+10000`, which [`parse`] then rejects, so a producer stamping a
+/// far-future time would have put an unreadable value in the manifest
+/// (review on #570). Such a time is no time at all, like a negative one.
 pub fn format_millis(ms: i64) -> Option<String> {
     if ms < 0 {
         return None;
     }
     Utc.timestamp_millis_opt(ms)
         .single()
+        .filter(|t| t.year() <= 9999)
         .map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
 }
 
@@ -65,6 +70,11 @@ mod tests {
             Some("2026-01-01T00:00:00.123Z")
         );
         assert_eq!(format_millis(-1), None);
+        // The last millisecond RFC 3339 can write, and the first it cannot.
+        let last = format_millis(253_402_300_799_999).unwrap();
+        assert_eq!(last, "9999-12-31T23:59:59.999Z");
+        assert!(parse(&last).is_some());
+        assert_eq!(format_millis(253_402_300_800_000), None);
     }
 
     #[test]

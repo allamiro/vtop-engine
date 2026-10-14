@@ -340,8 +340,10 @@ The bound manifest is stored at the same prefix as `{batch_id}.manifest.json`.
 
 **Which clock picks the time partition** (`partitioning.time_source`, #559):
 
-- `seal` (default): the instant the batch was sealed, fixed before compression,
-  checksumming and upload. A slow upload or a retry within the batch does not
+- `seal` (default): the instant the batch was sealed — taken as it leaves the
+  engine's buffer, before it waits for an upload slot, its ledger writes,
+  compression, checksumming and upload, and recorded as its `sealed_at`. A
+  saturated upload queue, a slow upload or a retry within the batch does not
   move it. Late data, a backlog drain and a replay land in the hour they were
   **sealed** in — a replay of yesterday's range is a new batch and is filed
   under today. Partitions used to come from the wall clock at upload, so a
@@ -386,7 +388,7 @@ On startup, the `replay` module inspects `vtop-state` and maps each incomplete b
 
 1. A batch in **`VERIFIED`** but not yet committed (object and manifest durably stored and verified) has its **source commit retried** (`VERIFIED → SOURCE_COMMITTED`). The verified object is never discarded.
 2. A batch in any state **before `VERIFIED`** is transitioned `... → FAILED → REPLAY_REQUIRED → BATCHING` and re-driven from the last committed source progress marker.
-3. Replay currently produces a **new** object key: the `batch_id` and the `year/…/hour` path components are derived from wall-clock time plus a random suffix, so a replayed batch writes a duplicate object (at-least-once, no data loss). Protocol §14/§15.1/§16 specify deterministic naming so that replay is idempotent — this is the open gap tracked as [PRODUCTION_HA.md](PRODUCTION_HA.md) Phase 4.
+3. Replay currently produces a **new** object key: the `batch_id` is derived from wall-clock time plus a random suffix, and the `year/…/hour` path components from the replayed batch's own partition time (§11, `partitioning.time_source`) - under `seal`, the hour the replay was sealed in, so a replay of yesterday's range is filed under today; under `event`, the earliest record time, so a Kafka replay usually lands in the original hour but under a new key. Either way a replayed batch writes a duplicate object (at-least-once, no data loss). Protocol §14/§15.1/§16 specify deterministic naming so that replay is idempotent — this is the open gap tracked as [PRODUCTION_HA.md](PRODUCTION_HA.md) Phase 4.
 4. A state/storage mismatch (e.g., an object present but unverified) is resolved by re-verifying or re-uploading **before** any commit.
 
 This guarantees: no source progress marker is committed unless its object and manifest are durably stored and verified, and no committed marker is double-committed. Source progress is **never** advanced for unverified data.
