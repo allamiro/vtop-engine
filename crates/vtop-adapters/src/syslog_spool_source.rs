@@ -75,6 +75,26 @@ impl SyslogSpoolSource {
         }
     }
 
+    /// A read failed after finding the spool replaced or truncated: restart the
+    /// cursor on the new content as a successful read would
+    /// (`FileSource::apply_failed_read`).
+    fn apply_failed_read(&mut self, path: &str, failed: SpoolReadError) -> VtopError {
+        if let Some(restart) = failed.restart {
+            let (why, seen) = *restart;
+            let cursor = self.cursors.entry(path.to_string()).or_default();
+            tracing::warn!(
+                path,
+                previous_read_byte = cursor.read_byte,
+                "{why}; the read of the new content then failed"
+            );
+            cursor.committed_byte = 0;
+            cursor.read_byte = 0;
+            cursor.generations.discontinuity();
+            cursor.seen = Some(seen);
+        }
+        failed.error
+    }
+
     /// Fold a completed read into the spool's cursor and build its result. A
     /// discontinuity restarts the cursor on the new content, including the
     /// committed point (see `FileSource::apply_slice`).
@@ -205,11 +225,34 @@ impl SyslogSpoolSource {
         max_records: usize,
         max_bytes: usize,
         last_seen: Option<Observed>,
-    ) -> Result<SpoolSlice, VtopError> {
-        let mut file = tokio::fs::File::open(&path).await?;
-        let opened = Self::seen_of(&file.metadata().await?);
+    ) -> Result<SpoolSlice, SpoolReadError> {
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(SpoolReadError::before_judged)?;
+        let opened = Self::seen_of(
+            &file
+                .metadata()
+                .await
+                .map_err(SpoolReadError::before_judged)?,
+        );
         let discontinuity = continuity::check(last_seen, opened.inode, opened.file_size, start);
         let start = if discontinuity.is_some() { 0 } else { start };
+        // A failure from here still restarts the cursor on what the judgement
+        // found (see `FileSource::read_slice`, review of #564).
+        let restart = discontinuity.map(|why| Box::new((why, opened.clone())));
+        Self::read_opened(file, &path, start, max_records, max_bytes, discontinuity)
+            .await
+            .map_err(|error| SpoolReadError { error, restart })
+    }
+
+    async fn read_opened(
+        mut file: tokio::fs::File,
+        path: &str,
+        start: u64,
+        max_records: usize,
+        max_bytes: usize,
+        discontinuity: Option<Discontinuity>,
+    ) -> Result<SpoolSlice, VtopError> {
         file.seek(std::io::SeekFrom::Start(start)).await?;
         // Put the whole-call byte limiter BELOW BufReader. If Take wrapped the
         // BufReader instead, its default 8 KiB fill could read far beyond a
@@ -266,6 +309,22 @@ impl SyslogSpoolSource {
             seen,
             discontinuity,
         })
+    }
+}
+
+/// A failed spool read, and the discontinuity it had already found, if any.
+struct SpoolReadError {
+    error: VtopError,
+    // Boxed: the identity is large and failures are rare.
+    restart: Option<Box<(Discontinuity, SpoolSeen)>>,
+}
+
+impl SpoolReadError {
+    fn before_judged(error: std::io::Error) -> Self {
+        Self {
+            error: error.into(),
+            restart: None,
+        }
     }
 }
 
@@ -336,9 +395,10 @@ impl SourceAdapter for SyslogSpoolSource {
                 inode: seen.inode,
                 size: seen.file_size,
             });
-        let slice =
-            Self::read_slice(path.clone(), start, max_records, max_bytes, last_seen).await?;
-        Ok(vec![self.apply_slice(&path, slice)])
+        match Self::read_slice(path.clone(), start, max_records, max_bytes, last_seen).await {
+            Ok(slice) => Ok(vec![self.apply_slice(&path, slice)]),
+            Err(failed) => Err(self.apply_failed_read(&path, failed)),
+        }
     }
 
     /// Read every spool file CONCURRENTLY (#96 B2): independent handles and
@@ -389,7 +449,7 @@ impl SourceAdapter for SyslogSpoolSource {
             );
         }
 
-        let mut results: Vec<(usize, String, Result<SpoolSlice, VtopError>)> =
+        let mut results: Vec<(usize, String, Result<SpoolSlice, SpoolReadError>)> =
             futures::stream::iter(
                 jobs.into_iter()
                     .map(|(i, path, start, last_seen)| async move {
@@ -440,9 +500,9 @@ impl SourceAdapter for SyslogSpoolSource {
                     any_records |= !slice.records.is_empty();
                     Ok(vec![self.apply_slice(&path, slice)])
                 }
-                Err(e) => {
+                Err(failed) => {
                     any_failed = true;
-                    Err(e)
+                    Err(self.apply_failed_read(&path, failed))
                 }
             };
             report.outcomes.push(SourceReadOutcome {
@@ -1139,6 +1199,39 @@ mod tests {
         assert_eq!(
             spool.cursors[&path].read_byte, 3,
             "the stale commit must leave the cursor where the restart put it"
+        );
+    }
+
+    /// The spool twin of the file test (review of #564): a truncation found
+    /// by a read that then fails still restarts the cursor.
+    #[tokio::test]
+    async fn a_truncation_found_by_a_read_that_then_fails_still_restarts_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap(); // 14 bytes
+        let mut spool = SyslogSpoolSource::new(vec![path.clone()]);
+        let old = spool
+            .read_batch_candidates(&spool_source(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let old_end = old[0].progress_end.clone();
+
+        std::fs::write(&path, "xxxxxxxxxx\n").unwrap(); // 11 bytes, over budget
+        assert!(spool
+            .read_batch_candidates(&spool_source(&path), 100, 5, Duration::ZERO)
+            .await
+            .is_err());
+
+        std::fs::write(&path, "aa\nbb\ncc\ndd\nee\nff\n").unwrap(); // 18 > 14
+        spool.commit_progress(&old_end).await.unwrap();
+        let next = spool
+            .read_batch_candidates(&spool_source(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            next[0].records.len(),
+            6,
+            "the new content is read from byte 0, not from the old offset 14"
         );
     }
 

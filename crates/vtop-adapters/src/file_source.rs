@@ -263,6 +263,27 @@ impl FileSource {
         }
     }
 
+    /// A read failed. If it had already found the file under the cursor
+    /// replaced or truncated, the cursor restarts on the new content exactly
+    /// as a successful read would make it (see [`Self::apply_slice`]): the
+    /// failure is in reading the new content, not in noticing it.
+    fn apply_failed_read(&mut self, path: &str, failed: SliceError) -> VtopError {
+        if let Some(restart) = failed.restart {
+            let (why, opened) = *restart;
+            let cursor = self.cursors.entry(path.to_string()).or_default();
+            tracing::warn!(
+                path,
+                previous_read_byte = cursor.read_byte,
+                "{why}; the read of the new content then failed"
+            );
+            cursor.committed_byte = 0;
+            cursor.read_byte = 0;
+            cursor.generations.discontinuity();
+            cursor.seen = Some(opened);
+        }
+        failed.error
+    }
+
     /// Read one file from `start`, honouring the budgets. Pure with respect to
     /// the adapter (no `&self`): takes everything it needs by value so many
     /// files can be read CONCURRENTLY in one pass (#96 B2) — each file's
@@ -280,19 +301,52 @@ impl FileSource {
         max_bytes: usize,
         whole_file: bool,
         last_seen: Option<Observed>,
+    ) -> Result<SliceRead, SliceError> {
+        // Read AND fingerprint through one open descriptor: a rotation between
+        // "read the bytes" and "stat the path" would otherwise mix the old
+        // file's offsets with the NEW file's identity (#65). The descriptor is
+        // judged before any byte is read.
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(SliceError::before_judged)?;
+        let opened = Self::identity_of(&file.metadata().await.map_err(SliceError::before_judged)?);
+        let discontinuity = continuity::check(last_seen, opened.inode, opened.file_size, start);
+        let start = if discontinuity.is_some() { 0 } else { start };
+        // From here a failure still reports what the judgement found: a read
+        // that saw the file truncated and then failed (a first record over
+        // max_bytes, say) must restart the cursor all the same, or the file
+        // can regrow past its old length before the next read and the
+        // truncation is never seen (review of #564).
+        let restart = discontinuity.map(|why| Box::new((why, opened.clone())));
+        Self::read_opened(
+            file,
+            &path,
+            start,
+            max_records,
+            max_bytes,
+            whole_file,
+            opened.file_size,
+            discontinuity,
+        )
+        .await
+        .map_err(|error| SliceError { error, restart })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_opened(
+        mut file: tokio::fs::File,
+        path: &str,
+        start: u64,
+        max_records: usize,
+        max_bytes: usize,
+        whole_file: bool,
+        fsize: u64,
+        discontinuity: Option<Discontinuity>,
     ) -> Result<SliceRead, VtopError> {
         // Whole-file mode: read the entire remaining file as one opaque record.
         // Used for binary / already-compressed source files with no line
         // structure. The whole file commits as a single byte range.
         if whole_file {
-            // Read AND fingerprint through one open descriptor: a rotation
-            // between "read the bytes" and "stat the path" would otherwise mix
-            // the old file's offsets with the NEW file's identity (#65).
-            let mut file = tokio::fs::File::open(&path).await?;
-            let md = file.metadata().await?; // fstat: the opened file, not the path
-            let fsize = md.len();
-            let discontinuity = continuity::check(last_seen, inode_of(&md), fsize, start);
-            let start = if discontinuity.is_some() { 0 } else { start };
             let remaining = fsize.saturating_sub(start);
             let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
             if remaining > max_bytes_u64 {
@@ -329,11 +383,6 @@ impl FileSource {
             });
         }
 
-        let mut file = tokio::fs::File::open(&path).await?;
-        // Judge the descriptor we are about to read, before reading it.
-        let opened = Self::identity_of(&file.metadata().await?);
-        let discontinuity = continuity::check(last_seen, opened.inode, opened.file_size, start);
-        let start = if discontinuity.is_some() { 0 } else { start };
         file.seek(std::io::SeekFrom::Start(start)).await?;
         // Bound the descriptor itself for the whole call. An outer Take over
         // BufReader would still allow its default 8 KiB fill to read beyond a
@@ -554,6 +603,24 @@ const FILE_READ_CONCURRENCY: usize = 8;
 /// decision is made inside the bounded pipeline, so the deciding stat rides
 /// the same concurrency as the read it gates instead of serializing on the
 /// executor thread ahead of every read (#412).
+/// A failed read, and - when it had already judged the open file replaced or
+/// truncated - that discontinuity and the identity it observed.
+struct SliceError {
+    error: VtopError,
+    // Boxed: the identity is large and failures are rare.
+    restart: Option<Box<(Discontinuity, FileIdentity)>>,
+}
+
+impl SliceError {
+    /// A failure before the open file was judged (opening it, or its fstat).
+    fn before_judged(error: std::io::Error) -> Self {
+        Self {
+            error: error.into(),
+            restart: None,
+        }
+    }
+}
+
 /// What a completed read hands back.
 struct SliceRead {
     records: Vec<Vec<u8>>,
@@ -574,7 +641,7 @@ struct SliceRead {
 
 enum PassOutcome {
     SkippedUnchanged(FileIdentity),
-    Read(Result<SliceRead, VtopError>),
+    Read(Result<SliceRead, SliceError>),
 }
 
 #[async_trait]
@@ -707,7 +774,7 @@ impl SourceAdapter for FileSource {
                 inode: seen.inode,
                 size: seen.file_size,
             });
-        let slice = Self::read_slice(
+        match Self::read_slice(
             path.clone(),
             start,
             max_records,
@@ -715,8 +782,11 @@ impl SourceAdapter for FileSource {
             self.whole_file,
             last_seen,
         )
-        .await?;
-        Ok(vec![self.apply_slice(&path, slice)])
+        .await
+        {
+            Ok(slice) => Ok(vec![self.apply_slice(&path, slice)]),
+            Err(failed) => Err(self.apply_failed_read(&path, failed)),
+        }
     }
 
     /// Read every file CONCURRENTLY (#96 B2). Each file's read is independent
@@ -842,9 +912,9 @@ impl SourceAdapter for FileSource {
                     any_records |= !slice.records.is_empty();
                     Ok(vec![self.apply_slice(&path, slice)])
                 }
-                PassOutcome::Read(Err(e)) => {
+                PassOutcome::Read(Err(failed)) => {
                     any_failed = true;
-                    Err(e)
+                    Err(self.apply_failed_read(&path, failed))
                 }
             };
             report.outcomes.push(SourceReadOutcome {
@@ -2153,6 +2223,50 @@ mod tests {
              must not have moved the cursor to byte 60 and skipped them"
         );
         assert_eq!(third[0].records[0], b"new-5".to_vec());
+    }
+
+    /// Review of #564: a read that finds the file truncated and then FAILS (the
+    /// new content's first line is over `max_bytes`) used to drop what it
+    /// found. The cursor kept the old position and the old observed length;
+    /// once the file regrew past that length the next read saw no truncation
+    /// at all and resumed at the old offset, and a pre-truncation commit
+    /// moved the cursor there too.
+    #[tokio::test]
+    async fn a_truncation_found_by_a_read_that_then_fails_still_restarts_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let old: String = (0..10).map(|i| format!("old-{i}\n")).collect(); // 60 bytes
+        std::fs::write(&path, &old).unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let old_end = first[0].progress_end.clone();
+
+        // Truncated in place; the new content's first line is over budget.
+        std::fs::write(&path, format!("{}\n", "x".repeat(30))).unwrap();
+        assert!(fs
+            .read_batch_candidates(&src(&path), 100, 20, Duration::ZERO)
+            .await
+            .is_err());
+
+        // Rewritten again, now longer than the old content (84 > 60), and
+        // the batch read before the truncation commits.
+        let fresh: String = (0..12).map(|i| format!("new-{i:02}\n")).collect();
+        std::fs::write(&path, &fresh).unwrap();
+        fs.commit_progress(&old_end).await.unwrap();
+
+        let next = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            next[0].records.len(),
+            12,
+            "the new content is read from byte 0, not from the old offset 60"
+        );
+        assert_eq!(next[0].records[0], b"new-00".to_vec());
     }
 
     /// `delete_after_commit` removes a source file once a batch reaching its

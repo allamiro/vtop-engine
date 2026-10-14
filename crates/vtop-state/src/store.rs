@@ -82,6 +82,25 @@ pub(crate) fn normalize_rfc3339_utc(label: &str, s: &str) -> Result<String, Vtop
         .map_err(|e| VtopError::State(format!("{label} is not RFC3339 ({s}): {e}")))
 }
 
+/// `created_at` as the ledger stores it: UTC with exactly nine fraction digits.
+///
+/// The restart cursor and history pruning both pick a path's newest committed
+/// row by comparing `created_at` as TEXT (an index can serve that; a parsed
+/// instant cannot). Text order is time order only for one fixed-width form:
+/// `.1Z` sorts after `.15Z` though it is 50 ms earlier (review of #564).
+/// Rows the engine wrote before this (`to_rfc3339`: `+00:00`, 0, 3, 6 or 9
+/// digits) still sort below a canonical value of the same instant or later,
+/// because `+` and `.` sort below every digit. A value that does not parse is
+/// stored as given.
+pub(crate) fn canonical_created_at(s: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|d| {
+            d.with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, false)
+        })
+        .unwrap_or_else(|_| s.to_owned())
+}
+
 /// A durable, replay-safe ledger of batch state transitions.
 ///
 /// The method set is deliberately small and matches exactly what the engine
@@ -140,17 +159,14 @@ pub trait StateStore: Send + Sync {
     /// The cursor each byte-offset source path resumes from, computed IN THE
     /// STORE like [`StateStore::max_committed_end_bytes`] (#77).
     ///
-    /// Per path: the inode of the most recently committed batch (latest
-    /// `updated_at`, ties by `batch_id`) and the highest committed `end_byte`
-    /// among the batches read from THAT inode. Unlike
-    /// `max_committed_end_bytes` it never mixes the offsets of two files that
-    /// have lived at one path (#558).
+    /// Per path: the NEWEST committed batch - created last, which is the
+    /// window read last, ties by `batch_id` - and its own inode, end byte and
+    /// observed file size. Not a maximum: two files that have lived at one
+    /// path (#558), or one file before and after a `copytruncate` (same
+    /// inode, review of #564), must never lend each other an offset.
     ///
-    /// History pruning keeps the highest-`end_byte` row per path and removes
-    /// committed rows older than its cutoff. If every row of the current
-    /// inode has been pruned (the file untouched for longer than retention)
-    /// this answers with the surviving older inode, and the adapter restarts
-    /// the file at byte 0: duplicates, bounded by the file, never a hole.
+    /// History pruning keeps exactly this row for every path, so the answer
+    /// is the same before and after any prune.
     async fn committed_cursors(
         &self,
         source_type: SourceType,
@@ -182,11 +198,13 @@ pub trait StateStore: Send + Sync {
     /// returns the number deleted. Three protections are non-negotiable:
     /// rows in any other state are never touched; rows at or after the
     /// cutoff are never touched; and for every source path (falling back to
-    /// `source_name` when the progress marker carries no path) the row with
-    /// the highest committed `end_byte` — ties broken by newest
-    /// `updated_at`, then `batch_id` — is always retained, so
-    /// [`StateStore::max_committed_end_bytes`] returns identical cursor
-    /// seeds before and after any prune.
+    /// `source_name` when the progress marker carries no path) the NEWEST
+    /// committed row - by `created_at`, then `batch_id` - is always retained,
+    /// so [`StateStore::committed_cursors`] returns identical cursor seeds
+    /// before and after any prune. [`StateStore::max_committed_end_bytes`]
+    /// is not prune-invariant: the highest end byte can belong to an older
+    /// generation of the file, which is exactly the row a restart must not
+    /// resume from.
     async fn prune_committed_history(&self, older_than: &str, limit: u32)
         -> Result<u64, VtopError>;
 }
