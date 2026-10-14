@@ -559,6 +559,16 @@ impl SourceAdapter for SyslogSpoolSource {
             c.committed_byte = *end_byte;
             if c.read_byte < *end_byte {
                 c.read_byte = *end_byte;
+            } else if generation == continuity::Settled::Unknown && c.read_byte > *end_byte {
+                // See `FileSource::commit_progress`: a recovered commit below
+                // the seeded head restarts the head here, and forgets the
+                // length the seed observed (a spool marker records none).
+                c.read_byte = *end_byte;
+                c.seen = Some(SpoolSeen {
+                    inode: *marker_inode,
+                    file_size: 0,
+                    mtime: String::new(),
+                });
             }
             tracing::info!(path, end_byte, "syslog spool progress committed");
         } else {

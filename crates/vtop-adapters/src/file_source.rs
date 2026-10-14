@@ -943,6 +943,7 @@ impl SourceAdapter for FileSource {
             start_byte,
             end_byte,
             inode: marker_inode,
+            file_size: marker_file_size,
             ..
         } = marker
         else {
@@ -971,6 +972,25 @@ impl SourceAdapter for FileSource {
             c.committed_byte = *end_byte;
             if c.read_byte < *end_byte {
                 c.read_byte = *end_byte;
+            } else if generation == continuity::Settled::Unknown && c.read_byte > *end_byte {
+                // A commit with no in-process record is recovery after a
+                // restart, and a read head ABOVE it came from the startup
+                // seed - the newest COMMITTED row, which can be the previous
+                // generation's when this batch (read after a copytruncate)
+                // was only VERIFIED at the crash. Keeping that head, and the
+                // longer length it observed, would resume above this range
+                // in a file that has since regrown, skipping the bytes in
+                // between (review of #564). Restart from this batch's end
+                // and the length it saw: a same-generation batch recovered
+                // out of order costs a re-read, never a skip. In-process
+                // commits keep the head - there it is ahead because later
+                // reads are buffered, not because it is stale.
+                c.read_byte = *end_byte;
+                c.seen = Some(FileIdentity {
+                    inode: *marker_inode,
+                    file_size: *marker_file_size,
+                    mtime: String::new(),
+                });
             }
             tracing::info!(path, end_byte, "file source progress committed");
         } else {
@@ -2417,6 +2437,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got[0].records.len(), 3, "resumes at byte 12");
+    }
+
+    /// Review of #564: the process crashes after a post-copytruncate batch
+    /// reached VERIFIED but before it committed. Startup seeds the cursor
+    /// from the newest COMMITTED row - the previous generation's, at byte
+    /// 60 - and recovery then commits the newer batch, which ends at 21. The
+    /// file has meanwhile regrown past 60. The next read must resume at 21;
+    /// keeping the seeded head would skip 21..60.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_recovered_commit_below_the_seed_restarts_the_read_head_there() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let content: String = (0..12).map(|i| format!("new-{i:02}\n")).collect(); // 84 bytes
+        std::fs::write(&path, &content).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        // The previous generation's committed row: byte 60 of a 60-byte file.
+        fs.seed_committed_from(&path, 60, Some(inode), Some(60));
+        // The newer generation's VERIFIED batch: bytes 0..21 of a 21-byte file.
+        let recovered = ProgressMarker::File {
+            path: path.clone(),
+            inode: Some(inode),
+            start_byte: 0,
+            end_byte: 21,
+            file_size: 21,
+            mtime: String::new(),
+        };
+        fs.commit_progress(&recovered).await.unwrap();
+
+        let next = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            next[0].records.first().map(Vec::as_slice),
+            Some(b"new-03".as_slice()),
+            "resumed somewhere other than byte 21, the end of the recovered batch"
+        );
+        assert_eq!(next[0].records.len(), 9);
     }
 
     /// The restart seed names the file its offset came from. A cursor seeded
