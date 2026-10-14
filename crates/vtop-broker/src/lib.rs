@@ -1560,6 +1560,19 @@ impl LocalBroker {
         ))
     }
 
+    /// The first offset this replica still holds, without blocking: `None`
+    /// while the state lock is held (see [`Self::try_local_offsets`]). A
+    /// consumer whose position is below it is told `OffsetOutOfRange`; it is
+    /// what retention moves (#571).
+    pub fn try_log_start_offset(&self) -> Option<u64> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(state.segment.base_offset())
+    }
+
     pub fn handle(&self, role: Role, frame: WireFrame) -> WireFrame {
         self.handle_with_connection(role, frame, None)
     }

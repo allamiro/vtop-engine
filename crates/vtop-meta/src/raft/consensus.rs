@@ -188,6 +188,21 @@ impl OpenraftConsensus {
     /// translated to the 1-based VTOP index space, matching what
     /// `vtopctl meta status` prints; a metric and a CLI that disagree about
     /// what "index 7" means is a bug waiting for an incident.
+    /// Where every consumer group's durable cursor stands (#571), from this
+    /// node's APPLIED state, without waiting: `None` while the state machine
+    /// is busy, or on a node built without applied state. Not linearizable -
+    /// a follower answers from its own copy - which is what a metrics scrape
+    /// wants: cursors only move forward, and a scrape that queued behind an
+    /// apply would stall the endpoint every other gauge is read from.
+    pub fn group_cursor_positions(
+        &self,
+        limit: usize,
+    ) -> Option<(Vec<crate::state::GroupCursorPosition>, usize)> {
+        self.store
+            .as_ref()?
+            .try_with_storage(|storage| storage.state().group_cursor_positions(limit))
+    }
+
     pub fn observe(&self) -> RaftObservation {
         let metrics = self.raft.metrics().borrow().clone();
         let membership = metrics.membership_config.membership();

@@ -476,3 +476,118 @@ groups:
             {{ printf "%.0f" $values.A.Value }} ms. Lease renewals cannot commit until it recovers or a new
             leader is elected.
           runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#replication-health"
+
+      # A group whose cursor is below the range's log start is told OffsetOutOfRange on its
+      # next fetch: retention already removed records it had not read (#571).
+      - uid: vtop-group-cursor-evicted
+        title: Consumer group cursor below log start
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: mimir
+            model:
+              refId: A
+              instant: true
+              expr: >-
+                max by (topic, range, group) (vtop_meta_group_cursor_offset) - on (topic, range) group_left max by (topic, range) (vtop_broker_log_start_offset)
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [0]
+                  operator:
+                    type: and
+                  query:
+                    params: [C]
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        isPaused: false
+        labels:
+          severity: page
+          service: vtop-node
+        annotations:
+          summary: "A consumer group lost records to retention"
+          description: >-
+            Group {{ $labels.group }} is positioned below the log start of range {{ $labels.range }} of
+            {{ $labels.topic }}, {{ printf "%.0f" $values.A.Value }} offsets short: the records between were
+            retained no longer and the group will be told OffsetOutOfRange. Raise the retention bound or
+            unstick the group, and account for the lost range.
+          runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#group-eviction"
+
+      # Seconds until retention passes a group's cursor, at the rate the log start has moved
+      # over 30 minutes; only ranges whose log start is moving, and only groups not already
+      # passed (those page on the rule above) (#571).
+      - uid: vtop-group-cursor-eviction-near
+        title: Consumer group near eviction
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: mimir
+            model:
+              refId: A
+              instant: true
+              expr: >-
+                ((max by (topic, range, group) (vtop_meta_group_cursor_offset) - on (topic, range) group_left max by (topic, range) (vtop_broker_log_start_offset)) / on (topic, range) group_left() (max by (topic, range) (rate(vtop_broker_log_start_offset[30m])) > 0)) > 0
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [3600]
+                  operator:
+                    type: and
+                  query:
+                    params: [C]
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        isPaused: false
+        labels:
+          severity: warning
+          service: vtop-node
+        annotations:
+          summary: "A consumer group will lose records to retention within the hour"
+          description: >-
+            At the rate retention is moving the log start of range {{ $labels.range }} of {{ $labels.topic }},
+            it passes group {{ $labels.group }}'s cursor in about {{ printf "%.0f" $values.A.Value }} s. The
+            group is too slow for the retention bound: speed it up, or raise the bound before it is
+            told OffsetOutOfRange.
+          runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#group-eviction"
