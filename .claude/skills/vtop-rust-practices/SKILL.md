@@ -5,14 +5,14 @@ description: Rust conventions and review checklist tuned to vtop-engine — edit
 
 # Rust practices for vtop-engine
 
-Ground truth for this repo, checked against the tree: workspace `edition = "2021"`, `rust-version = "1.94.1"` (a CI job builds on exactly that toolchain), CI runs `cargo clippy --workspace --all-targets -- -D warnings`, `thiserror` in library crates and `anyhow` only in `vtop-cli`, `proptest` in `vtop-core`, `cargo-mutants` (report-only) and fuzz smoke in CI. Complements `vtop-contributing` (process) and the `ddia-*` skills (design). Part of the checklist is adapted from the ideas in the MIT-licensed `rust-systems` skill in [iliaal/ai-skills](https://github.com/iliaal/ai-skills), rewritten for this codebase.
+Ground truth for this repo, checked against the tree: workspace `edition = "2021"`, `rust-version = "1.94.1"` (a CI job builds on exactly that toolchain), CI runs `cargo clippy --workspace --all-targets --locked -- -D warnings`, `thiserror` in library crates and `anyhow` only in `vtop-cli`, `proptest` in `vtop-core`, `cargo-mutants` (report-only) and fuzz smoke in CI. Complements `vtop-contributing` (process) and the `ddia-*` skills (design). Part of the checklist is adapted from the ideas in the MIT-licensed `rust-systems` skill in [iliaal/ai-skills](https://github.com/iliaal/ai-skills), rewritten for this codebase.
 
 ## Toolchain: two compilers, one tree
 
 The code must compile warning-free on the **MSRV (1.94.1)** *and* on **current stable**. Those disagree over time:
 - A std API that is deprecated on stable may have its replacement only on a newer toolchain than the MSRV (`Atomic*::fetch_update` -> `try_update` was exactly this). Do not `#[allow(deprecated)]` it away and do not adopt the newer API; write the small portable form (a compare-exchange loop) and say why in a comment.
-- Dependency bumps can change struct shapes (syn 3 moved `ItemTrait::auto_token` under `modifiers`). Build the tests (`--all-targets`), not just the lib, on the MSRV.
-- Before pushing Rust: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo check --workspace --all-targets --locked` on the MSRV. With no local toolchain, run them in `rust:1.94.1` and `rust:latest` containers (needs `cmake libsasl2-dev libssl-dev pkg-config` for rdkafka).
+- Dependency bumps can change struct shapes (syn 3.0.6 moved `ItemTrait::auto_token` under `modifiers: TraitModifiers`, which broke `vtop-upload`'s trait-declaration guard on the lib-test build). Build the tests (`--all-targets`), not just the lib, on the MSRV.
+- Before pushing Rust: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo check --workspace --all-targets --locked` on the MSRV. With no local toolchain, run them in `rust:1.94.1` and `rust:latest` containers (needs the CI package list for rdkafka: `cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config`).
 
 ## Unsafe policy
 

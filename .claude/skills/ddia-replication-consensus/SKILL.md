@@ -12,10 +12,10 @@ Ideas from DDIA part II (replication, transactions, the trouble with distributed
 | Concern | Where |
 |---|---|
 | Replicated metadata (Raft, CAS generations, fencing epochs, exactly-once dedup table) | `crates/vtop-meta` (`state.rs`, `raft/`, `storage/`) |
-| Placement over failure domains | `vtop-meta/src/placement.rs` (weighted rendezvous) |
-| Range lease acquire/renew/lose | `vtop-node/src/lease_agent.rs`, `lease_watcher.rs`, `promotion.rs` |
-| Broker refuses requests under a stale epoch | `vtop-broker/src/fencing_epochs.rs`, `replication/` |
-| Commit boundary / quorum ack | `vtop-broker/src/committed_floor.rs`, `group_commit.rs` |
+| Placement over failure domains | `crates/vtop-meta/src/placement.rs` (weighted rendezvous) |
+| Range lease acquire/renew/lose | `crates/vtop-node/src/lease_agent.rs`, `lease_watcher.rs`, `promotion.rs` |
+| Broker refuses requests under a stale epoch | `crates/vtop-broker/src/fencing_epochs.rs`, `replication/` |
+| Commit boundary / quorum ack | `crates/vtop-broker/src/committed_floor.rs`, `group_commit.rs` |
 
 ## Principles to apply
 
@@ -25,11 +25,11 @@ Ideas from DDIA part II (replication, transactions, the trouble with distributed
 
 **Offsets are not identities.** Two replicas reporting offset 90 need not hold the same record. Reconcile on `(epoch, start_offset)` history, not on high-water marks — the leader-epoch lesson `fencing_epochs.rs` already encodes. Truncation decisions need the first diverging epoch.
 
-**Clocks lie.** Wall-clock time-of-day can jump or skew; only monotonic clocks measure durations on one machine, and Raft elections here are monotonic. But a deadline that travels *in the replicated log* cannot be monotonic — a reading from one machine means nothing on another. Range-lease deadlines are therefore proposer-stamped wall-clock instants (`issued_at_ms`, see `vtop-meta/src/command.rs` header). Consequences to design for:
-- Skew on a **proposer** has two failure directions: a fast clock judges a live rival's lease expired and steals it repeatedly; a fast clock that holds the lease pushes its own deadline into the future, so after it dies nobody can take over until the skew elapses. The epoch keeps this *safe*; it does not keep it *live*.
-- Treat `issued_at_ms` as an unbounded input: the metadata leader should stamp it, or reject values further than a bound (e.g. a fraction of the lease) from its own clock, before proposing. Apply stays deterministic because the stamped value is data in the log.
-- Each observer should time expiry from its own monotonic instant of having *seen* the renewal, not by comparing a remote wall-clock deadline with its local wall clock.
-- `07-clock-skew.sh` skews a Raft voter only. A skewed **lease proposer** (data node) needs its own scenario.
+**Clocks lie.** Wall-clock time-of-day can jump or skew; only monotonic clocks measure durations on one machine, and Raft elections here are monotonic. But a deadline that travels *in the replicated log* cannot be monotonic — a reading from one machine means nothing on another. Range-lease deadlines are therefore proposer-stamped wall-clock instants (`issued_at_ms`, see the header of `crates/vtop-meta/src/command.rs`). Consequences to design for:
+- Skew on a **proposer** has three failure directions. A fast-clocked candidate judges a live rival's lease expired and steals it repeatedly. A fast-clocked holder stamps its deadline in the future, so after it dies nobody can take over until the skew elapses. A slow-clocked holder stamps a deadline already in the past (or too short), so a correctly clocked contender acquires a higher epoch early while the holder still believes its lease is live. The epoch keeps all three *safe*; none is kept *live* or *prompt* by it.
+- Treat `issued_at_ms` as an unbounded input: the metadata leader should stamp it, or reject values further than a stated bound (a fraction of the lease) from its own clock, before proposing. Apply stays deterministic because the stamped value is data in the log. That bound **is** the skew policy; write it down next to the lease duration.
+- The replicated wall-clock deadline stays the authority for *when takeover is legal*; a holder must stand down no later than that deadline (minus margin) or it serves past the point a rival may legitimately take over. Use monotonic time only for **local elapsed budgets** (RPC deadlines, time since the last successful renew, how long a call has been blocked), and stand down at the earlier of the two views — never delay demotion because a local monotonic budget has not yet run out.
+- `07-clock-skew.sh` skews a Raft voter only. A skewed **lease proposer** (data node) needs its own scenario; see `ddia-fault-testing` for the separate skew-before-renewal and skew-after-renewal cases.
 
 **Quorum intersection.** For `n` replicas, write quorum `w` and read quorum `r` give overlap only if `w + r > n`, and even then sloppy quorums, concurrent writes, and partial failures break the guarantee. Prefer Raft's single linearizable log for metadata; do not reintroduce leaderless semantics on top of it casually.
 
@@ -43,13 +43,13 @@ Ideas from DDIA part II (replication, transactions, the trouble with distributed
 
 **Split-brain safety catches must be asymmetric.** Any "stand down on seeing a rival" path decides by epoch comparison (higher wins). A symmetric rule makes both nodes stop. Test both orderings.
 
-**Failover timing is a load decision.** Too-short leases turn GC/fsync/metadata-commit stalls into spurious failovers, and each failover adds fence + probe + marker traffic. Required margin: `lease - renew` must exceed worst-case metadata commit latency plus stall. Keep `renew_interval * 3 <= lease_duration` enforced in `validate()`, and the per-RPC deadline below the renew interval. Lease renewals share one Raft FIFO with cursor/heartbeat/segment traffic — measure renew-commit p99 under a cursor storm.
+**Failover timing is a load decision.** Too-short leases turn GC/fsync/metadata-commit stalls into spurious failovers, and each failover adds fence + probe + marker traffic. Required margin: `lease - renew` must exceed worst-case metadata commit latency plus stall. Today `LeaseAgentConfig::validate()` only requires `renew_interval < lease_duration` and a non-zero poll interval; a rule such as `renew_interval * 3 <= lease_duration` and a per-RPC deadline below the renew interval is a **validation to add**, not an existing guarantee. Lease renewals share one Raft FIFO with cursor/heartbeat/segment traffic — measure renew-commit p99 under a cursor storm.
 
 **A pause looks like a partition from outside and like nothing from inside.** After any blocking call, assume the lease may be gone; check the fence at the point of effect, and again after the call. A timed-out call means *unknown outcome*, not *did not happen* — a cancelled proposal can still commit, so every such path needs an idempotent request id or a read-back.
 
 **Replication lag is user-visible.** Follower reads can return stale data, non-monotonic results, or out-of-order effects. Name which read guarantee (read-your-writes, monotonic, consistent prefix) each API offers.
 
-**Exactly-once is idempotence plus dedup.** The metadata state machine's request-id dedup table (`DEDUP_CAPACITY`, travels in snapshots) and the producer sequence window in `vtop-log` are the pattern: retries must be safe by construction. Check the dedup window is bounded and its overflow behaviour is explicit.
+**Exactly-once is idempotence plus dedup.** The metadata state machine's request-id dedup table (`DEDUP_CAPACITY`, travels in snapshots) and the producer sequence window in `crates/vtop-log` are the pattern: retries must be safe by construction. Check the dedup window is bounded and its overflow behaviour is explicit.
 
 **CAP is narrow.** Do not label a component CP or AP. For each operation write what it does on an isolated minority node (wait, error, serve stale) and what it costs when nothing is wrong — linearizability is slow even without faults. Linearizability is a single-object recency guarantee; an invariant spanning several metadata records must be one command applied atomically in the state machine (generation CAS), not read-then-propose from a client. When a decision travels over a second channel (a metadata grant observed by a CLI, then sent to a data node), the receiver must validate the epoch/generation/applied-index that rides with it.
 

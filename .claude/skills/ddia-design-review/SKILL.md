@@ -32,13 +32,13 @@ Never write "X is scalable". Write: *if load grows in dimension D, what breaks f
 
 ## 3. Maintainability
 
-- **Operability:** can an on-call tell what is wrong from metrics and logs, and is there a safe default plus an override? Are admin surfaces authorized (`SECURITY_MODEL.md`)?
+- **Operability:** can an on-call tell what is wrong from metrics and logs, and is there a safe default plus an override? Are admin surfaces authorized (`docs/SECURITY_MODEL.md`)?
 - **Simplicity:** remove accidental complexity with a good abstraction. Existing examples worth preserving: `StateStore` and `UploadBackend` traits, the `Env` seam in `vtop-log`, consensus-crate imports confined to `vtop-meta/src/raft`.
 - **Evolvability:** can the next change land without a flag day? See `ddia-encoding-evolution`.
 
 ## 4. Derived data, time, and duties
 
-- **Assumptions.** List the environmental assumptions each component makes (peer address resolved once, clock monotonic, disk never full, producer count small) and the signal that shows each still holds. Bugs sleep until an assumption stops being true.
+- **Assumptions.** List the environmental assumptions each component makes (disk never full, producer count small, peer addresses stay valid — failed peer RPCs here already trigger a DNS re-resolve, so check that fix before flagging it — and clocks agree closely enough: lease deadlines are replicated wall-clock instants, so proposer skew affects liveness) and the signal that shows each still holds. Bugs sleep until an assumption stops being true.
 - **Open-loop latency.** Measure latency at the client including queue time, with load at a fixed arrival rate. A harness that sends request N+1 after reply N is a service-time probe, not a latency measurement. Aggregate percentiles by summing histogram buckets; never average p95s. Name fan-out per operation *and its skew*, not the mean.
 - **Integrity vs timeliness.** Timeliness violations (lag, stale reads) heal by waiting; integrity violations (loss, duplicates, wrong derived views) are permanent and need explicit checking. Spend rigor on integrity; the commit rule and manifests are integrity, visibility lag is timeliness.
 - **System of record.** Name it. Everything else is derived through an ordered idempotent log, never written by a second writer. A dual-write migration is a temporary state and needs a reconciler for the one-sided outcome.
@@ -50,6 +50,6 @@ Never write "X is scalable". Write: *if load grows in dimension D, what breaks f
 ## Review procedure
 
 1. State the claim of the change in one sentence and what it must never break.
-2. Walk the three sections above; for each, write the concrete scenario, not the principle.
+2. Walk **all four sections** above (reliability, scalability, maintainability, and derived data/time/duties); for each, write the concrete scenario, not the principle.
 3. Prefer the smallest change that removes a failure mode. Reject premature scale work that locks in an inflexible design.
 4. Output: **findings ranked by severity**, each with scenario, evidence (file:line or doc §), fix, and the test/measurement that would confirm it. End with "what I did not check".

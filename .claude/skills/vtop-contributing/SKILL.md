@@ -26,15 +26,15 @@ git push -u origin fix/short-description     # -u repoints upstream away from ma
 ## Run before opening the PR
 
 ```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace            # scripts/test-progress.sh for a progress bar
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked   # scripts/test-progress.sh for a progress bar
 scripts/check-naming.sh           # naming rule
 scripts/check-egress-claims.sh    # only if docs/EGRESS_TRANSPORT_RESEARCH.md changed
 ```
 
 - Shell changes: lint with the pinned shellcheck command in CONTRIBUTING.md (use the full file list; a shorter one gives a false green).
-- Helm changes: `helm lint` plus a render of both value files in `helm/vtop/ci/`.
+- Helm changes: run `helm lint helm/vtop -f helm/vtop/ci/<profile>.yaml` and `helm template vtop helm/vtop -f helm/vtop/ci/<profile>.yaml` for **every** profile in `helm/vtop/ci/` (`default`, `separated`, `plaintext`, `replicated`), then read the Helm jobs in `.github/workflows/ci.yml` — they assert on the rendered output (TLS shapes, tier wiring, refusals), not just the exit code.
 - CI path-filters jobs, so a green docs-only PR proves little about Rust. Say what you actually ran.
 
 ## Commit message
@@ -48,7 +48,7 @@ scripts/check-egress-claims.sh    # only if docs/EGRESS_TRANSPORT_RESEARCH.md ch
 
 ## Naming rule
 
-No commercial transport product's mark in any crate/module/feature/config key/CLI flag/metric label/scenario/branch name or in docs. Only `docs/PRIOR_ART_SEARCH_PLAN.md` and `docs/INVENTION_DISCLOSURE_DRAFT.md` may cite them. Term list: `scripts/naming-denylist.txt`. Branch names are not CI-checked — you are the check.
+No commercial transport product's mark in any crate/module/feature/config key/CLI flag/metric label/scenario/branch name or in docs (and not in the assistant skills under `.claude/`, which `scripts/check-naming.sh` now scans). Only `docs/PRIOR_ART_SEARCH_PLAN.md` and `docs/INVENTION_DISCLOSURE_DRAFT.md` may cite them. Term list: `scripts/naming-denylist.txt`. Branch names are not CI-checked — you are the check.
 
 ## Substantiation rule
 

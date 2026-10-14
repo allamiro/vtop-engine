@@ -18,12 +18,12 @@ Book lens: chapter 3 (storage engines: log-structured vs B-tree, write amplifica
 
 1. **Acknowledge only what survives the fault you claim to tolerate.** `Durability::Buffered` means OS buffer only; `Fsync` flushes data *and* a checksummed commit boundary. Any ack path must say which one it provides and the docs must match.
 2. **Data fsync is not directory fsync.** File contents become durable on `sync_data`; creates, renames and removals on `sync_dir`. The simulator models exactly this — every new file, rename, or delete needs the directory sync in the right order.
-3. **Write-then-rename is atomic only if you fsync before the rename and the dir after.** Snapshots, hard state, and intent files follow this; new files must too.
+3. **Rename publishes atomically; fsyncs make the result survive a crash.** On one filesystem a rename is atomic regardless of fsync — readers see the old file or the new one. Durability is separate: fsync the file *before* the rename (so the new name never points at unwritten data) and the directory *after* (so the rename itself is not lost). Snapshots, hard state, and intent files follow this; new files must too.
 4. **Tolerate torn and partial writes.** Recovery must accept any in-order prefix of the volatile op log with the last write cut at any byte. Records are length-prefixed and checksummed; recovery truncates the torn tail and quarantines what it cannot trust (never silently deletes).
-5. **fsync failure is not retryable.** After a failed fsync the page cache state is unknown; fail the node's write path rather than retry and acknowledge (scenario 05b).
+5. **Never acknowledge past a failed fsync.** After a failed fsync the kernel's view of the dirty pages is unknown, so on the produce path fail the node's write path rather than retry-and-acknowledge (scenario 05b). A retry is acceptable only where nothing is acknowledged or installed until a sync actually succeeds: the transfer staging path (`StagedSegment::finish_artifact`) deliberately keeps its handle when `sync_data` fails so a later call can retry. Say which of the two a new path is.
 6. **Checksums catch bit rot and bugs, not just crashes.** Verify on read paths that matter (transfer, tier copy, repair) and make verification strength explicit.
 7. **Destructive steps are two-phase and intent-logged.** Truncate and retention write an intent, act, then clear it, so a crash in the middle resumes rather than corrupts. New destructive operations follow the same shape.
-8. **Retention must be evidence-gated.** Do not retire a segment until the evidence (verified replicas / verified tier copy) is recorded — the v0.3.0 lesson in `docs/ROADMAP.md`.
+8. **Separate local retention from replica retirement.** Local log-prefix retention (`SegmentSet::retain`) reclaims segments against the **committed floor** and the configured bound; state which floor gates it. **Retiring an old replica, or deleting a tier object, must be evidence-gated**: do not do it until the replacement is proven (verified replica / verified tier copy recorded) — the v0.3.0 lesson in `docs/ROADMAP.md`.
 
 ## Trade-offs to state explicitly
 
