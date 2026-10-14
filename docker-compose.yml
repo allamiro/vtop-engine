@@ -127,12 +127,15 @@ services:
     # `compose up` failed in its pull phase. docker/minio/Dockerfile builds the
     # same release from MinIO's source, checked out by commit. LAB ONLY: the
     # upstream repository is archived and this release gets no security fixes.
-    # `pull_policy: build` - the name is local, and a pull could only fetch
-    # whatever someone else published under it.
+    # `pull_policy: never` - the name is local, and a pull could only fetch
+    # whatever someone else published under it. Compose builds the image when
+    # it is missing and reuses it after that (`build` would rebuild it on
+    # every start); after changing docker/minio/Dockerfile, rebuild it with
+    # `docker compose build minio`.
     build:
       context: docker/minio
     image: vtop-minio:RELEASE.2025-09-07T16-13-09Z
-    pull_policy: build
+    pull_policy: never
     container_name: vtop-minio
     command: server /data --console-address ":9001"
     ports:
@@ -174,7 +177,7 @@ services:
     build:
       context: docker/minio
     image: vtop-minio:RELEASE.2025-09-07T16-13-09Z
-    pull_policy: build
+    pull_policy: never
     container_name: vtop-minio-init
     security_opt:
       - no-new-privileges:true
