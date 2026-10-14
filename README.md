@@ -467,11 +467,18 @@ why that stack stays lab-only.
 |---|---|
 | `kafka` | test Kafka broker |
 | `kafka-ui` | browser UI at `http://localhost:8080` |
-| `minio` | S3-compatible object storage |
+| `minio` | S3-compatible object storage (built locally, see below) |
 | `minio-init` | bucket initialization |
 | `kafka-init` | seeded test events |
 | `vtop-engine` | VTOP runtime |
 | `rsyslog` | optional syslog collector profile |
+
+MinIO no longer publishes container images (they were withdrawn from Docker
+Hub and then quay.io), so the lab builds the pinned release from MinIO's
+source (`docker/minio/Dockerfile`, checked out by commit). The first
+`docker compose up` compiles it, which takes a minute or two. The upstream
+repository is archived and receives no security fixes: this is a lab endpoint
+on loopback-bound ports, never a store for real data.
 
 MinIO endpoints (loopback only):
 
