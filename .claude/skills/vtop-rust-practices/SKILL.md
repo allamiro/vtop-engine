@@ -40,6 +40,7 @@ The code must compile warning-free on the **MSRV (1.94.1)** *and* on **current s
 - **Bound queues and spawned work** (semaphores, bounded channels); an unbounded `spawn` per input turns an outage into a memory incident.
 - **Never hold a `std::sync` lock across `.await`**, and keep blocking work (fsync, hashing, compression) off async workers (`spawn_blocking`).
 - **Define shutdown.** Handle SIGTERM as well as SIGINT; flush or abandon in-flight work deliberately; a cancelled future must leave state recoverable (assume it can be dropped at any `.await`).
+- A deadline per call is not a deadline per round. When a round makes several awaited calls in series, give the round one budget that each call draws down, or the round can take several times the interval your pacing arithmetic assumes. Opening a store (connect plus the schema check) is network work too and needs the same bound as the requests after it.
 - A timeout means *unknown outcome*. Retrying a non-idempotent call after a timeout can double-apply; retry only idempotent calls, with backoff and jitter, at one layer.
 - Prefer monotonic `Instant` for local durations; wall-clock `SystemTime` only for values that cross machines or are stored.
 

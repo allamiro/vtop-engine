@@ -62,8 +62,11 @@ docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 \
   scripts/live-chaos/gen-certs.sh scripts/live-chaos/scenarios/*.sh
 ```
 
-and the bats tests: `docker run --rm -v "$PWD:/code" -w /code bats/bats:1.13.0
-docker/tests/ scripts/tests/`.
+and the bats tests:
+
+```bash
+docker run --rm -v "$PWD:/code" -w /code bats/bats:1.13.0 docker/tests/ scripts/tests/
+```
 
 Chart changes need `helm lint` and a render (`helm template`) of every values
 file in `helm/vtop/ci/` — `default-values.yaml`, `separated-values.yaml`,
