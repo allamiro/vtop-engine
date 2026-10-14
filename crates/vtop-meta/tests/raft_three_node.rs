@@ -1000,7 +1000,7 @@ async fn single_node_client_write_commits() {
 /// upgraded), the same command reaches the state machine on every node.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_command_newer_than_the_clusters_feature_level_never_reaches_the_log() {
-    use vtop_meta::{Consensus, ConsensusError, OpenraftConsensus};
+    use vtop_meta::{Consensus, ConsensusError, MetaNodeId, OpenraftConsensus};
     use vtop_meta::{BASELINE_FEATURE_LEVEL, SUPPORTED_FEATURE_LEVEL};
 
     let seed = SEED ^ 0x554;
@@ -1041,6 +1041,48 @@ async fn a_command_newer_than_the_clusters_feature_level_never_reaches_the_log()
         last_log(&cluster),
         before,
         "the refused command reached the log"
+    );
+
+    // A follower does not let it through on the strength of its role (a
+    // role read before the write is a race: review) - it sends the caller
+    // to the leader, which judges it.
+    let leader_id = cluster.leader_id();
+    let (follower_id, through_follower) = cluster
+        .nodes
+        .iter()
+        .find(|(id, _)| **id != leader_id)
+        .map(|(id, follower)| {
+            (
+                *id,
+                OpenraftConsensus::new(follower.raft.clone()).with_store(follower.store.clone()),
+            )
+        })
+        .unwrap();
+    let env = cluster.envelope();
+    match through_follower.propose(split(env)).await {
+        Err(ConsensusError::NotLeader { leader }) => {
+            assert_eq!(
+                leader,
+                Some(MetaNodeId(leader_id)),
+                "follower {follower_id}"
+            );
+        }
+        other => panic!("a follower let a gated command through (seed={seed:#x}): {other:?}"),
+    }
+    // Nor does a façade with no applied state to judge the level from.
+    let storeless = OpenraftConsensus::new(cluster.leader().raft.clone());
+    let env = cluster.envelope();
+    assert!(
+        matches!(
+            storeless.propose(split(env)).await,
+            Err(ConsensusError::Message(_))
+        ),
+        "a façade that cannot see the level must refuse (seed={seed:#x})"
+    );
+    assert_eq!(
+        last_log(&cluster),
+        before,
+        "a refused command reached the log"
     );
 
     let env = cluster.envelope();
