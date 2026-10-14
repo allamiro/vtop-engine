@@ -16,7 +16,7 @@
 //! batch is recorded VERIFIED, and recovery re-reads rows it finds
 //! incomplete. The worst case is a range archived twice, never a lost one.
 
-use crate::models::{BatchPatch, BatchRecord};
+use crate::models::{BatchPatch, BatchRecord, CommittedCursor};
 use crate::store::StateStore;
 use async_trait::async_trait;
 use std::future::Future;
@@ -120,6 +120,18 @@ impl StateStore for DeadlineStore {
             "max_committed_end_bytes",
             self.scan,
             self.inner.max_committed_end_bytes(source_type),
+        )
+        .await
+    }
+
+    async fn committed_cursors(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<CommittedCursor>, VtopError> {
+        self.within(
+            "committed_cursors",
+            self.scan,
+            self.inner.committed_cursors(source_type),
         )
         .await
     }
@@ -231,6 +243,12 @@ mod tests {
             &self,
             _: SourceType,
         ) -> Result<Vec<(String, u64)>, VtopError> {
+            never!()
+        }
+        async fn committed_cursors(
+            &self,
+            _: SourceType,
+        ) -> Result<Vec<CommittedCursor>, VtopError> {
             never!()
         }
         async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
