@@ -66,6 +66,12 @@ pub struct CommittedCursor {
     /// The highest committed `end_byte` among the batches read from that
     /// inode — not across inodes, which is the mistake being corrected.
     pub end_byte: u64,
+    /// The length of the file as the MOST RECENT committed batch observed it
+    /// (`file_size` in its marker); `None` where the marker records none (a
+    /// syslog spool marker, or a row that predates the field). It is the
+    /// newest row's, not a maximum: after a `copytruncate` the file legitimately
+    /// gets shorter, and a maximum would flag every restart as a truncation.
+    pub observed_size: Option<u64>,
 }
 
 /// Patch applied when advancing a batch's state. Fields set to `Some` are

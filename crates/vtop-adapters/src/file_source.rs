@@ -91,14 +91,27 @@ impl FileSource {
     /// first read compares it against the file now at the path and restarts
     /// the new file at byte 0 when they differ. `None` (a legacy ledger row,
     /// or a platform without inodes) behaves as `seed_committed` does.
-    pub fn seed_committed_from(&mut self, path: &str, committed_byte: u64, inode: Option<u64>) {
+    ///
+    /// `observed_size` is the length the committed batch saw its file at. A
+    /// cursor behind the end of the file (a bounded read) must still notice a
+    /// `copytruncate` that leaves the file longer than the committed offset but
+    /// shorter than it was: without the size, a restart compares the shrunken
+    /// file with the offset alone and resumes in the middle of new content
+    /// (review of #564). `None` (an unknown size) leaves only the offset test.
+    pub fn seed_committed_from(
+        &mut self,
+        path: &str,
+        committed_byte: u64,
+        inode: Option<u64>,
+        observed_size: Option<u64>,
+    ) {
         self.seed_committed(path, committed_byte);
-        if inode.is_some() {
-            // Only the inode is known. A zero size and an empty mtime can
-            // never satisfy `can_skip`, so a seeded cursor always reads first.
+        if inode.is_some() || observed_size.is_some() {
+            // The size feeds the truncation test; the empty mtime keeps
+            // `can_skip` false, so a seeded cursor always reads first.
             self.cursors.get_mut(path).expect("seeded above").seen = Some(FileIdentity {
                 inode,
-                file_size: 0,
+                file_size: observed_size.unwrap_or(0),
                 mtime: String::new(),
             });
         }
@@ -2185,6 +2198,45 @@ mod tests {
         assert!(err.contains("truncated"), "{err}");
     }
 
+    /// A restart seeded from a bounded read: the committed offset (12) sits far
+    /// behind the end of the 60-byte file the batch saw. If `copytruncate`
+    /// rewrote the file to 30 bytes while the engine was down, 30 is above the
+    /// offset and passed an offset-only test, so the restart resumed at 12 and
+    /// the new file's first 12 bytes were never archived (review of #564). The
+    /// size the committed batch observed catches it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_seed_that_remembers_the_observed_size_catches_a_truncation_above_the_offset() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let fresh: String = (0..5).map(|i| format!("new-{i}\n")).collect(); // 30 bytes
+        std::fs::write(&path, &fresh).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+
+        let mut with_size = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        with_size.seed_committed_from(&path, 12, Some(inode), Some(60));
+        let got = with_size
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            got[0].records.len(),
+            5,
+            "the file shrank from the 60 bytes the batch saw: it is read from byte 0"
+        );
+
+        // Without the size the offset alone cannot tell: this is the old,
+        // lossy behaviour, kept for markers that record no size.
+        let mut without = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        without.seed_committed_from(&path, 12, Some(inode), None);
+        let got = without
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(got[0].records.len(), 3, "resumes at byte 12");
+    }
+
     /// The restart seed names the file its offset came from. A cursor seeded
     /// from the OLD file's high-water mark must not be applied to the file that
     /// replaced it, and one seeded from the file still there resumes.
@@ -2199,7 +2251,7 @@ mod tests {
 
         // Same file: resume after the committed 8 bytes.
         let mut same = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
-        same.seed_committed_from(&path, 8, Some(inode));
+        same.seed_committed_from(&path, 8, Some(inode), None);
         let got = same
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
             .await
@@ -2212,7 +2264,7 @@ mod tests {
 
         // The ledger remembers a different inode: the file at the path is new.
         let mut replaced = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
-        replaced.seed_committed_from(&path, 8, Some(inode + 1_000_000));
+        replaced.seed_committed_from(&path, 8, Some(inode + 1_000_000), None);
         let got = replaced
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
             .await
@@ -2225,7 +2277,7 @@ mod tests {
 
         // A legacy row with no inode behaves as before.
         let mut legacy = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
-        legacy.seed_committed_from(&path, 8, None);
+        legacy.seed_committed_from(&path, 8, None, None);
         let got = legacy
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
             .await

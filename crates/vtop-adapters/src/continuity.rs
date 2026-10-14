@@ -21,8 +21,13 @@
 pub enum Discontinuity {
     /// A different file now lives at the path.
     Rotated { from: u64, to: u64 },
-    /// The same file, now shorter than the read position.
-    Truncated { read_byte: u64, size: u64 },
+    /// The same file, now shorter than the read position (`read_byte`) or than
+    /// the length the cursor last observed (`observed`, 0 when it knows none).
+    Truncated {
+        read_byte: u64,
+        observed: u64,
+        size: u64,
+    },
 }
 
 impl std::fmt::Display for Discontinuity {
@@ -32,10 +37,14 @@ impl std::fmt::Display for Discontinuity {
                 f,
                 "file replaced (inode {from} -> {to}); the new file is read from byte 0"
             ),
-            Discontinuity::Truncated { read_byte, size } => write!(
+            Discontinuity::Truncated {
+                read_byte,
+                observed,
+                size,
+            } => write!(
                 f,
-                "file truncated (length {size} is below the read position {read_byte}); \
-                 it is read from byte 0"
+                "file truncated (length {size} is below the read position {read_byte} \
+                 or the length last observed, {observed}); it is read from byte 0"
             ),
         }
     }
@@ -86,7 +95,8 @@ pub fn check(
     let shrunk_below = last_seen.map_or(0, |seen| seen.size);
     if current_size < read_byte.max(shrunk_below) {
         return Some(Discontinuity::Truncated {
-            read_byte: read_byte.max(shrunk_below),
+            read_byte,
+            observed: shrunk_below,
             size: current_size,
         });
     }
@@ -153,6 +163,7 @@ mod tests {
             check(seen(Some(7), 100), Some(7), 40, 100),
             Some(Discontinuity::Truncated {
                 read_byte: 100,
+                observed: 100,
                 size: 40
             })
         );
@@ -170,7 +181,8 @@ mod tests {
         assert_eq!(
             check(seen(Some(7), 40_000), Some(7), 20, 8),
             Some(Discontinuity::Truncated {
-                read_byte: 40_000,
+                read_byte: 8,
+                observed: 40_000,
                 size: 20
             })
         );
@@ -181,6 +193,17 @@ mod tests {
     }
 
     #[test]
+    fn a_truncation_reports_both_bounds_and_names_the_one_that_fired() {
+        let message = check(seen(Some(7), 1_000), Some(7), 999, 8)
+            .unwrap()
+            .to_string();
+        assert!(
+            message.contains("read position 8") && message.contains("last observed, 1000"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn unknown_identity_cannot_prove_a_rotation_but_length_still_counts() {
         assert_eq!(check(seen(None, 100), Some(9), 500, 100), None);
         assert_eq!(check(seen(Some(7), 100), None, 500, 100), None);
@@ -188,12 +211,14 @@ mod tests {
             check(None, None, 10, 100),
             Some(Discontinuity::Truncated {
                 read_byte: 100,
+                observed: 0,
                 size: 10
             }),
             "a file shorter than the read head is a truncation with or without inodes"
         );
-        // A seeded cursor knows an inode but no length (0): the length test
-        // cannot fire on it, only the read position can.
+        // A cursor seeded without a length (a spool, or a marker that records
+        // none) knows an inode but no length (0): the length test cannot fire
+        // on it, only the read position can.
         assert_eq!(check(seen(Some(7), 0), Some(7), 5, 3), None);
     }
 

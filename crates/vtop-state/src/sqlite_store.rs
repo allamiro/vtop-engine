@@ -354,17 +354,19 @@ impl StateStore for SqliteStateStore {
                  SELECT json_extract(progress_end_json, '$.path') AS path, \
                         CAST(json_extract(progress_end_json, '$.inode') AS TEXT) AS inode, \
                         CAST(json_extract(progress_end_json, '$.end_byte') AS INTEGER) AS end_byte, \
+                        CAST(json_extract(progress_end_json, '$.file_size') AS INTEGER) AS file_size, \
                         updated_at, batch_id \
                  FROM batches WHERE state = ? AND source_type = ? \
              ), latest AS ( \
-                 SELECT path, inode, ROW_NUMBER() OVER ( \
+                 SELECT path, inode, file_size, ROW_NUMBER() OVER ( \
                             PARTITION BY path ORDER BY updated_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ), per_inode AS ( \
                  SELECT path, inode, MAX(end_byte) AS end_byte \
                  FROM committed GROUP BY path, inode \
              ) \
-             SELECT l.path AS path, l.inode AS inode, p.end_byte AS end_byte \
+             SELECT l.path AS path, l.inode AS inode, p.end_byte AS end_byte, \
+                    l.file_size AS file_size \
              FROM latest l \
              JOIN per_inode p ON p.path IS l.path AND p.inode IS l.inode \
              WHERE l.rn = 1",
@@ -380,10 +382,12 @@ impl StateStore for SqliteStateStore {
                 let path: Option<String> = r.get("path");
                 let inode: Option<String> = r.get("inode");
                 let end: Option<i64> = r.get("end_byte");
+                let size: Option<i64> = r.get("file_size");
                 Some(CommittedCursor {
                     path: path?,
                     inode: inode.and_then(|i| i.parse().ok()),
                     end_byte: end?.max(0) as u64,
+                    observed_size: size.map(|s| s.max(0) as u64),
                 })
             })
             .collect())

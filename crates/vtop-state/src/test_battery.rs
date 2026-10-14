@@ -285,12 +285,15 @@ async fn max_committed_end_bytes_aggregates_in_store(store: &dyn StateStore) {
 /// `committed_cursors` names the inode of the most recent committed batch and
 /// takes the maximum over that inode alone.
 async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateStore) {
+    // `file_size` is deliberately NOT the end byte: a bounded read leaves the
+    // cursor behind the file's end, and the size the batch observed is what a
+    // restart compares a shrunken file against.
     let marker = |path: &str, inode: Option<u64>, end: u64| ProgressMarker::File {
         path: path.into(),
         inode,
         start_byte: 0,
         end_byte: end,
-        file_size: end,
+        file_size: end * 10,
         mtime: String::new(),
     };
     let mk = |id: &str, path: &str, inode: Option<u64>, end: u64| {
@@ -338,6 +341,13 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
         path: path.into(),
         inode,
         end_byte,
+        // The NEWEST committed row's observed size, not a maximum: /same.log's
+        // newest row ended at 30 (file_size 300) though an earlier one ended at
+        // 70, and /rot.log's old inode (9000) must not leak into the new one.
+        observed_size: Some(match (path, end_byte) {
+            ("/same.log", _) => 300,
+            (_, end) => end * 10,
+        }),
     };
     assert_eq!(
         got,
@@ -382,7 +392,13 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
             .iter()
             .filter(|c| c.path == "/rot-spool.log")
             .collect::<Vec<_>>(),
-        vec![&want("/rot-spool.log", Some(32), 20)],
+        vec![&CommittedCursor {
+            path: "/rot-spool.log".into(),
+            inode: Some(32),
+            end_byte: 20,
+            // A spool marker records no file length.
+            observed_size: None,
+        }],
         "the spool answers with the newest inode and that inode's maximum"
     );
     assert!(spool

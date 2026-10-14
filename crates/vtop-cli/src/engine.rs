@@ -2299,7 +2299,7 @@ impl Engine {
         if let Some(a) = self.adapters.get_mut(&SourceType::File) {
             if let Some(fs) = a.as_any_mut().downcast_mut::<FileSource>() {
                 for c in file_cursors {
-                    fs.seed_committed_from(&c.path, c.end_byte, c.inode);
+                    fs.seed_committed_from(&c.path, c.end_byte, c.inode, c.observed_size);
                 }
             }
         }

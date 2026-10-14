@@ -308,7 +308,11 @@ What follows from that, in the engine:
   (`StateStore::committed_cursors`: the inode of the most recent committed
   batch, and the highest committed offset among that inode's batches only). A
   file replaced while the engine was down is read from its first byte instead
-  of from the old file's high-water mark.
+  of from the old file's high-water mark. The seed also carries the length the
+  most recent committed batch saw its file at (`file_size` in the marker), so a
+  `copytruncate` while the engine was down is caught even when the file is
+  still longer than the committed offset. A syslog-spool marker records no
+  length, so a spool seed has the inode and the offset only.
 
 Limits, stated plainly:
 
