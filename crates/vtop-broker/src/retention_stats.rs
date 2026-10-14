@@ -26,6 +26,13 @@ pub struct RetentionStats {
     /// measurements. A first pass that failed measured nothing, and its zero
     /// must not be exported as a size (review of #572).
     measured: AtomicBool,
+    /// The retention policy's generation, bumped by every policy change and
+    /// held while a pass's result is recorded or the state cleared (review
+    /// of #572). A pass that loaded the OLD bound and finishes after the
+    /// policy changed would otherwise record over the clear - restoring a
+    /// bound, size and blocked reason for retention that no longer runs,
+    /// with no later pass to replace them.
+    policy: std::sync::Mutex<u64>,
 }
 
 /// One reading of [`RetentionStats`] for an exporter.
@@ -50,13 +57,48 @@ fn index(reason: RetentionBlocked) -> usize {
 }
 
 impl RetentionStats {
-    /// Fold one pass's result in. `what` names the range in a log line.
+    fn policy_lock(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The policy generation a pass runs under: read it BEFORE loading the
+    /// bound, and record with it.
+    pub fn policy_generation(&self) -> u64 {
+        *self.policy_lock()
+    }
+
+    /// The policy changed to another nonzero bound: a pass already running
+    /// under the old one records nothing.
+    pub fn policy_changed(&self) {
+        *self.policy_lock() += 1;
+    }
+
+    /// Fold one pass's result in, under the current policy.
     pub fn record(
         &self,
         what: &str,
         bound_bytes: u64,
         result: &Result<RetentionOutcome, LogError>,
     ) {
+        self.record_for(self.policy_generation(), what, bound_bytes, result);
+    }
+
+    /// Fold in the result of a pass that ran under policy `generation`;
+    /// nothing is recorded if the policy has changed since (review of #572).
+    /// `what` names the range in a log line.
+    pub fn record_for(
+        &self,
+        generation: u64,
+        what: &str,
+        bound_bytes: u64,
+        result: &Result<RetentionOutcome, LogError>,
+    ) {
+        let policy = self.policy_lock();
+        if *policy != generation {
+            return;
+        }
         self.bound_bytes.store(bound_bytes, Ordering::Relaxed);
         let outcome = match result {
             Ok(outcome) => outcome,
@@ -131,6 +173,8 @@ impl RetentionStats {
     /// a blocked reason that no longer apply (review of #572). The counters
     /// stay; they count what happened.
     pub fn clear(&self) {
+        let mut policy = self.policy_lock();
+        *policy += 1;
         self.bound_bytes.store(0, Ordering::Relaxed);
         self.measured.store(false, Ordering::Relaxed);
         self.blocked_now.store(0, Ordering::Relaxed);
@@ -259,6 +303,37 @@ mod tests {
     /// Review of #572: once retention is turned off no pass replaces the last
     /// one's state, so clearing is what stops a stale bound or blocked reason
     /// being exported.
+    /// Review of #572: a pass that loaded the old bound and records after
+    /// retention was disabled (or rebound) records nothing - otherwise it
+    /// restores the state the clear removed, and no later pass replaces it.
+    #[test]
+    fn a_pass_from_before_a_policy_change_records_nothing() {
+        let stats = RetentionStats::default();
+        let outcome = |retained_bytes| {
+            Ok(RetentionOutcome {
+                retained_bytes,
+                ..RetentionOutcome::default()
+            })
+        };
+        let before = stats.policy_generation();
+        stats.clear(); // disabled while the pass ran
+        stats.record_for(before, "r", 4_096, &outcome(9_000));
+        assert_eq!(
+            stats.snapshot(),
+            None,
+            "the stale pass restored the cleared state"
+        );
+
+        let before = stats.policy_generation();
+        stats.policy_changed(); // rebound while the pass ran
+        stats.record_for(before, "r", 4_096, &outcome(9_000));
+        assert_eq!(stats.snapshot(), None);
+
+        // A pass under the current policy records as always.
+        stats.record_for(stats.policy_generation(), "r", 8_192, &outcome(100));
+        assert_eq!(stats.snapshot().map(|s| s.bound_bytes), Some(8_192));
+    }
+
     #[test]
     fn clearing_forgets_the_state_and_keeps_the_counts() {
         let stats = RetentionStats::default();
