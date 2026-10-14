@@ -44,7 +44,7 @@ If a change makes two engines (HA) touch the same batch row: lost updates, write
 - **Write skew / phantoms** need a multi-row invariant ("no two live batches cover one byte range of a path", "progress equals a contiguous verified prefix"). Row CAS cannot protect these: use a unique constraint, a lock row per source, a single writer per source, or SERIALIZABLE with retry — and name which one holds.
 - "Single engine per store" (instance lock) is the repo's serial-execution isolation. List every path that bypasses it (shared Postgres across hosts, duplicate engine names).
 - **A lease column is a lock with a timeout, not a fence.** Add a claim generation to every later UPDATE of a claimed row.
-- **The ledger is derived data.** It is an index over the manifest log. Can it be rebuilt from manifests, and is a rolled-back ledger (Postgres failover) detected by comparing against the object store?
+- **The ledger is authoritative for commit state; the manifests are not a substitute.** A manifest is written at `MANIFEST_UPLOADED` and never restamped, so it cannot say whether its batch was later `VERIFIED` or `SOURCE_COMMITTED` — only the ledger holds that, and recovery depends on it. Do not describe the ledger as rebuildable from manifests. What *can* be checked is agreement: a ledger that rolled back (a Postgres failover) shows batches the object store has already moved past, and a reconciliation of ledger rows against stored objects and manifests is how that is detected (see the completeness audit in `vtop-commit-rule-review`).
 
 ## Checklist
 
