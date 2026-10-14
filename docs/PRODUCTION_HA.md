@@ -852,24 +852,32 @@ Short procedures now; expand into a full ops runbook before go-live.
   raise itself. A node that refuses to start with "written by a newer
   release" is an old binary on a newer log: upgrade it.
 - **Change a range's replica set (#553):** a range's quorum is counted over
-  the set metadata records for it (`vtopctl meta replica-set --topic-uuid T
-  --range-uuid R`); a node whose configured set (itself plus `followers`)
+  the set metadata records for it (`vtopctl meta replica-set --config
+  meta-admin.yaml --topic-uuid T --range-uuid R`; every `vtopctl meta`
+  command takes the admin config with `--config`); a node whose configured
+  set (itself plus `followers`)
   differs refuses to promote. Recording needs feature level 5 (`vtopctl meta
   enable-features --level 5`, once every metadata voter runs this release),
   and every data node of the range must run this release too - an older one
   does not check the record. Then:
   1. Record the set the range runs with today: `vtopctl meta set-replica-set
-     --topic-uuid T --range-uuid R --members A,B,C --expected-generation 0`.
-     The lease is cleared and re-won under it.
-  2. Change ONE member at a time, in this order. Start the new node (D)
-     configured with the new set, and restart the FOLLOWERS with it; the
-     leader keeps the old config and keeps leading, because it still matches
-     the record. Then record the new set with the generation `replica-set`
-     reported (`--members A,B,C,D --expected-generation 1`): the lease is
-     cleared, the old-config leader now refuses and stands aside, and a
-     replica configured with the new set wins. Restart the old leader with
-     the new set last. Restarting it before the record would leave no node
-     matching the record, and the range without a leader until it is made.
+     --config meta-admin.yaml --topic-uuid T --range-uuid R --members A,B,C
+     --expected-generation 0`. The lease is cleared and re-won under it.
+  2. Change ONE member at a time, in this order. Register the new node (D)
+     in metadata if it is not yet (`vtopctl meta register-node`): a set
+     naming an unregistered node is refused. Start D configured with the new
+     set, and restart the FOLLOWERS with it; the leader keeps the old config
+     and keeps leading, because it still matches the record. Then record the
+     new set with the generation `replica-set` reported (`--members A,B,C,D
+     --expected-generation 1`): the lease is cleared, the old-config leader
+     now refuses and stands aside, and a replica configured with the new set
+     wins. Restart the old leader with the new set last. Restarting it before
+     the record would leave no node matching the record, and the range
+     without a leader until it is made. **Between the follower restarts and
+     the record, only the old leader matches the record**: if it fails in
+     that window, nothing can take over until it returns or the record is
+     made. Keep the window short - restart the followers and record the set
+     in one sitting.
   3. The next change is refused until the range has been led under the
      current set with its leader's whole log on a majority of it - checked
      from the promotion's recorded quorum. If a promotion happened while its

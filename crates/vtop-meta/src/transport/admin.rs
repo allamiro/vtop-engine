@@ -825,39 +825,89 @@ impl AdminClient {
 
     /// Linearizable read of a range's recorded replica set (#553).
     ///
-    /// `Ok(None)` when the metadata node answering PREDATES the read: it
-    /// refuses the request kind itself, before any leadership check, so the
-    /// refusal is unambiguous. Such a node cannot hold a recorded set - a
-    /// set is recorded only at feature level 5, which an older node cannot
-    /// apply and which is raised only once every voter runs a release that
-    /// serves this read (#554) - so to the caller it means "none recorded",
-    /// which keeps a data node upgraded ahead of its metadata tier leadable.
+    /// `Ok(None)` when the metadata LEADER predates the read - and only then
+    /// (review). A node that predates it refuses the request kind itself,
+    /// before any leadership check, so the refusal alone says nothing about
+    /// the tier: an old learner, a removed voter still in the endpoint list,
+    /// or an old follower would answer it too, while the leader has a set
+    /// recorded. So the refusal is confirmed with the SAME node's status: a
+    /// leader that predates the read cannot hold a recorded set - a set is
+    /// recorded only at feature level 5, an older node cannot apply it, and
+    /// once it is committed an older node cannot be elected (it could not
+    /// append it, so its log is behind every voter that did). A refusing
+    /// node that is not the leader sends the read on to the leader it names;
+    /// one that names none, or a leader already asked, is an error - unknown
+    /// is not "none recorded". That keeps a data node upgraded ahead of its
+    /// metadata tier leadable, without letting one stale endpoint switch the
+    /// check off.
     pub async fn read_range_replica_set(
         &self,
         topic_uuid: uuid::Uuid,
         range_uuid: uuid::Uuid,
     ) -> TransportResult<Option<AdminReadRangeReplicaSetResponse>> {
-        let frame = self
-            .round_trip(VtpmFrame {
-                kind: KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ,
-                payload: AdminReadRangeReplicaSetRequest {
-                    topic_uuid,
-                    range_uuid,
+        let request = VtpmFrame {
+            kind: KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ,
+            payload: AdminReadRangeReplicaSetRequest {
+                topic_uuid,
+                range_uuid,
+            }
+            .encode(),
+        };
+        let (mut index, mut frame) = self.round_trip_indexed(request.clone()).await?;
+        let mut asked = vec![false; self.candidates.len()];
+        loop {
+            asked[index] = true;
+            match frame.kind {
+                KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP => {
+                    return Ok(Some(AdminReadRangeReplicaSetResponse::decode(
+                        &frame.payload,
+                    )?))
                 }
-                .encode(),
-            })
+                KIND_ADMIN_ERROR => {
+                    let error = AdminError::decode(&frame.payload)?;
+                    if error.message != predates_replica_set_read() {
+                        return Err(TransportError::Protocol(error.message));
+                    }
+                    let status = self.status_of(index).await?;
+                    if status.server_state == "Leader" {
+                        return Ok(None);
+                    }
+                    let Some(leader) = status
+                        .current_leader
+                        .and_then(|leader| self.index_of(leader))
+                        .filter(|leader| !asked[*leader])
+                    else {
+                        return Err(TransportError::Protocol(format!(
+                            "metadata node {} predates recorded replica sets and is not the \
+                             leader, and the leader it names ({:?}) could not be asked; whether \
+                             a set is recorded is unknown",
+                            self.candidates[index].endpoint, status.current_leader
+                        )));
+                    };
+                    index = leader;
+                    frame = self.attempt(leader, &request).await?;
+                }
+                other => return Err(TransportError::UnexpectedKind(other)),
+            }
+        }
+    }
+
+    /// The status of ONE candidate, not whichever answers first.
+    async fn status_of(&self, index: usize) -> TransportResult<AdminStatusResponse> {
+        let frame = self
+            .attempt(
+                index,
+                &VtpmFrame {
+                    kind: KIND_ADMIN_STATUS_REQ,
+                    payload: AdminStatusRequest.encode(),
+                },
+            )
             .await?;
         match frame.kind {
-            KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP => Ok(Some(
-                AdminReadRangeReplicaSetResponse::decode(&frame.payload)?,
+            KIND_ADMIN_STATUS_RESP => Ok(AdminStatusResponse::decode(&frame.payload)?),
+            KIND_ADMIN_ERROR => Err(TransportError::Protocol(
+                AdminError::decode(&frame.payload)?.message,
             )),
-            KIND_ADMIN_ERROR => {
-                let error = AdminError::decode(&frame.payload)?;
-                if error.message == predates_replica_set_read() {
-                    return Ok(None);
-                }
-                Err(TransportError::Protocol(error.message))
-            }
             other => Err(TransportError::UnexpectedKind(other)),
         }
     }
@@ -974,6 +1024,13 @@ impl AdminClient {
     /// useful message — not a connection error from whichever one happened to
     /// be tried last.
     async fn round_trip(&self, request: VtpmFrame) -> TransportResult<VtpmFrame> {
+        self.round_trip_indexed(request)
+            .await
+            .map(|(_, frame)| frame)
+    }
+
+    /// [`Self::round_trip`], also naming WHICH candidate gave the answer.
+    async fn round_trip_indexed(&self, request: VtpmFrame) -> TransportResult<(usize, VtpmFrame)> {
         use std::sync::atomic::Ordering;
 
         let mut index = self.preferred.load(Ordering::Relaxed) % self.candidates.len();
@@ -1046,7 +1103,7 @@ impl AdminClient {
                     {
                         resolution.stale = false;
                     }
-                    return Ok(frame);
+                    return Ok((index, frame));
                 }
                 // An unreachable candidate is worth moving past for the same
                 // reason as a redirect: one node being down must not make the
@@ -1488,54 +1545,137 @@ mod tests {
         task.abort();
     }
 
-    /// #553 across a mixed upgrade: a metadata node that predates the
-    /// replica-set read answers it with its unknown-kind refusal, and the
-    /// client reads that as "none recorded" - so a data node upgraded ahead
-    /// of its metadata tier still promotes. A CURRENT server that does not
-    /// serve the read is an error, never "none": only the old refusal means
-    /// a set cannot have been recorded.
-    #[tokio::test]
-    async fn an_older_metadata_node_reads_as_no_recorded_replica_set() {
-        let plaintext_client = |endpoint| {
-            AdminClient::plaintext(vec![AdminCandidate {
-                node_id: Some(MetaNodeId(1)),
-                endpoint,
-                host: None,
-                server_name: String::new(),
-                plaintext: true,
-            }])
-            .unwrap()
-        };
-
-        // The old server: its dispatcher's answer to a kind it does not know,
-        // built the way a released server builds it.
+    /// A metadata node that predates the replica-set read (#553): it refuses
+    /// kind 27 the way a released server does, and answers status as
+    /// `server_state` with `current_leader`.
+    async fn older_node(server_state: &'static str, current_leader: Option<u64>) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let old = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let request = read_frame(&mut stream).await.unwrap();
-            let refusal = AdminError {
-                message: TransportError::UnexpectedKind(request.kind).to_string(),
-                not_leader: None,
-            };
-            write_frame(
-                &mut stream,
-                &VtpmFrame {
-                    kind: KIND_ADMIN_ERROR,
-                    payload: refusal.encode().unwrap(),
-                },
-            )
-            .await
-            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    while let Ok(request) = read_frame(&mut stream).await {
+                        let reply = if request.kind == KIND_ADMIN_STATUS_REQ {
+                            let mut status = stub_status(MetaNodeId(9));
+                            status.server_state = server_state.to_owned();
+                            status.current_leader = current_leader.map(MetaNodeId);
+                            VtpmFrame {
+                                kind: KIND_ADMIN_STATUS_RESP,
+                                payload: status.encode().unwrap(),
+                            }
+                        } else {
+                            VtpmFrame {
+                                kind: KIND_ADMIN_ERROR,
+                                payload: AdminError {
+                                    message: TransportError::UnexpectedKind(request.kind)
+                                        .to_string(),
+                                    not_leader: None,
+                                }
+                                .encode()
+                                .unwrap(),
+                            }
+                        };
+                        if write_frame(&mut stream, &reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
         });
-        let read = plaintext_client(old)
-            .read_range_replica_set(Uuid::from_u128(1), Uuid::from_u128(2))
-            .await
-            .expect("an older server's refusal is an answer, not an error");
-        assert_eq!(read, None);
-        task.await.unwrap();
+        addr
+    }
 
-        // A current server whose handler does not serve the read.
+    /// A current leader with a set recorded, answering kind 27 directly.
+    async fn recording_leader() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    while let Ok(_request) = read_frame(&mut stream).await {
+                        let reply = VtpmFrame {
+                            kind: KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP,
+                            payload: AdminReadRangeReplicaSetResponse {
+                                range_found: true,
+                                replica_set: Some(crate::transport::AdminRangeReplicaSetView {
+                                    generation: 1,
+                                    members: vec![Uuid::from_u128(1), Uuid::from_u128(2)],
+                                    recorded_at_epoch: 3,
+                                }),
+                                read_at_applied_index: 7,
+                            }
+                            .encode()
+                            .unwrap(),
+                        };
+                        if write_frame(&mut stream, &reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn candidates(endpoints: &[(u64, SocketAddr)]) -> AdminClient {
+        AdminClient::plaintext(
+            endpoints
+                .iter()
+                .map(|(id, endpoint)| AdminCandidate {
+                    node_id: Some(MetaNodeId(*id)),
+                    endpoint: *endpoint,
+                    host: None,
+                    server_name: String::new(),
+                    plaintext: true,
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    /// #553 across a mixed upgrade, and the review that followed: an older
+    /// node's refusal of the replica-set read means "none recorded" ONLY when
+    /// that node is the leader. An older LEADER cannot hold a recorded set,
+    /// so a data node upgraded ahead of its tier still promotes. An older
+    /// follower (or learner, or removed voter still listed) proves nothing:
+    /// the read goes on to the leader it names, which here has a set
+    /// recorded - and one that names no leader is an error, never "none".
+    #[tokio::test]
+    async fn an_older_nodes_refusal_reads_as_no_set_only_from_the_leader() {
+        let range = (Uuid::from_u128(1), Uuid::from_u128(2));
+
+        let old_leader = older_node("Leader", Some(1)).await;
+        let read = candidates(&[(1, old_leader)])
+            .read_range_replica_set(range.0, range.1)
+            .await
+            .expect("an older leader's refusal is an answer");
+        assert_eq!(read, None);
+
+        let new_leader = recording_leader().await;
+        let old_follower = older_node("Follower", Some(2)).await;
+        let read = candidates(&[(1, old_follower), (2, new_leader)])
+            .read_range_replica_set(range.0, range.1)
+            .await
+            .expect("the leader the old follower names answers");
+        let set = read
+            .and_then(|response| response.replica_set)
+            .expect("the leader's recorded set, not \"none\"");
+        assert_eq!(set.members, vec![Uuid::from_u128(1), Uuid::from_u128(2)]);
+
+        let lost = older_node("Learner", None).await;
+        let refused = candidates(&[(1, lost)])
+            .read_range_replica_set(range.0, range.1)
+            .await;
+        assert!(
+            matches!(&refused, Err(TransportError::Protocol(message)) if message.contains("is unknown")),
+            "{refused:?}"
+        );
+    }
+
+    /// A CURRENT server that does not serve the read is an error, never
+    /// "none": only an older leader's refusal means a set cannot be recorded.
+    #[tokio::test]
+    async fn a_current_handler_that_does_not_serve_the_read_is_an_error() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let current = listener.local_addr().unwrap();
         let server = AdminServer::plaintext(
@@ -1547,7 +1687,7 @@ mod tests {
             let _ = server.serve(listener).await;
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let refused = plaintext_client(current)
+        let refused = candidates(&[(1, current)])
             .read_range_replica_set(Uuid::from_u128(1), Uuid::from_u128(2))
             .await;
         assert!(

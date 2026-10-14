@@ -1202,11 +1202,29 @@ impl MetaValue {
             VALUE_TAG_CLUSTER_CONFIG => MetaValue::ClusterConfig(ClusterConfigRecord {
                 feature_level: reader.u32("feature level")?,
             }),
-            VALUE_TAG_RANGE_REPLICA_SET => MetaValue::RangeReplicaSet(RangeReplicaSetRecord {
-                generation: reader.u64("replica set generation")?,
-                recorded_at_epoch: reader.u64("replica set recorded-at epoch")?,
-                members: decode_replica_nodes(&mut reader)?,
-            }),
+            VALUE_TAG_RANGE_REPLICA_SET => {
+                let generation = reader.u64("replica set generation")?;
+                let recorded_at_epoch = reader.u64("replica set recorded-at epoch")?;
+                let members = decode_replica_nodes(&mut reader)?;
+                // The apply path only ever writes a set that is non-empty,
+                // sorted, distinct and within MAX_REPLICAS; a decoded one that
+                // is not was not written by it, and `established_under` would
+                // count a duplicate as two voters (review).
+                if members.is_empty()
+                    || members.len() > crate::placement::MAX_REPLICAS
+                    || members.windows(2).any(|pair| pair[0] >= pair[1])
+                {
+                    return Err(CodecError::InvalidValue {
+                        what: "replica set members",
+                        reason: "must be 1 to MAX_REPLICAS distinct node ids, sorted",
+                    });
+                }
+                MetaValue::RangeReplicaSet(RangeReplicaSetRecord {
+                    generation,
+                    members,
+                    recorded_at_epoch,
+                })
+            }
             other => {
                 return Err(CodecError::UnknownTag {
                     what: "record value tag",
@@ -1423,6 +1441,12 @@ impl MetaStateMachine {
             };
             if quorum.is_empty() {
                 return set.members.as_slice() == [*holder_to];
+            }
+            // The leader is one of the set it led under (review): a holder
+            // outside it was not configured with this set, whatever the
+            // offsets say.
+            if !set.members.contains(holder_to) {
+                return false;
             }
             let Some(own) = quorum
                 .iter()
@@ -5941,6 +5965,94 @@ mod tests {
             10_000,
         );
         assert!(!is_rejected(&acquired), "{acquired:?}");
+    }
+
+    /// Review of #576: a promotion whose holder is outside the set does not
+    /// vouch for it, even with every member in its quorum at or above the
+    /// holder's offset.
+    #[test]
+    fn a_promotion_led_from_outside_the_set_does_not_count() {
+        let (mut machine, first, topic, range) = leaseable_range(1);
+        for (index, node) in (3..).zip(2..=5u128) {
+            machine.apply(
+                index,
+                &MetadataCommand::RegisterNode {
+                    env: envelope(u128::from(index)),
+                    node_uuid: Uuid::from_u128(node),
+                    addr: format!("n{node}:9200"),
+                    expected_generation: None,
+                },
+            );
+        }
+        let mut index = 10;
+        let mut next = || {
+            index += 1;
+            index
+        };
+        assert_eq!(
+            set_replica_set(&mut machine, next(), topic, range, &[2, 3, 4], 0),
+            MetadataResponse::Ack { generation: 1 }
+        );
+        // Node 1 - not a member - takes the lease and reports a quorum of
+        // every member at its offset.
+        let generation = range_of(&machine, topic, range).generation;
+        acquire(
+            &mut machine,
+            next(),
+            700,
+            1_000,
+            first,
+            topic,
+            range,
+            generation,
+            10_000,
+        );
+        let epoch = range_of(&machine, topic, range).fencing_epoch;
+        assert!(!is_rejected(&report(
+            &mut machine,
+            next(),
+            701,
+            1_100,
+            first,
+            topic,
+            range,
+            epoch,
+            established(50, &[(1, 50), (2, 50), (3, 50), (4, 50)], 4, 3)
+        )));
+        assert!(is_rejected(&set_replica_set(
+            &mut machine,
+            next(),
+            topic,
+            range,
+            &[2, 3, 4, 5],
+            1
+        )));
+    }
+
+    /// Review of #576: a stored set is non-empty, sorted and distinct - the
+    /// apply path writes no other - so a decoded one that is not is refused
+    /// rather than counted (a duplicate would count as two voters).
+    #[test]
+    fn a_decoded_replica_set_must_be_sorted_and_distinct() {
+        for members in [
+            vec![Uuid::from_u128(2), Uuid::from_u128(1)],
+            vec![Uuid::from_u128(1), Uuid::from_u128(1)],
+            Vec::new(),
+        ] {
+            let value = MetaValue::RangeReplicaSet(RangeReplicaSetRecord {
+                generation: 1,
+                members: members.clone(),
+                recorded_at_epoch: 0,
+            });
+            let bytes = value.encode().unwrap();
+            assert!(MetaValue::decode(&bytes).is_err(), "{members:?}");
+        }
+        let fine = MetaValue::RangeReplicaSet(RangeReplicaSetRecord {
+            generation: 1,
+            members: vec![Uuid::from_u128(1), Uuid::from_u128(2)],
+            recorded_at_epoch: 0,
+        });
+        assert_eq!(MetaValue::decode(&fine.encode().unwrap()).unwrap(), fine);
     }
 
     /// A standalone promotion vouches only for a set of its holder alone.

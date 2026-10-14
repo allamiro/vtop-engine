@@ -3490,10 +3490,6 @@ transport: plaintext
         check_failure_domain("rack-a").expect("a real domain is the accepted case");
     }
 
-    /// #457 slice 2b: `group-cursor` names the group one way — by UUID, or
-    /// by the Kafka name under the cluster id the gateway derives it from. A
-    /// name without the cluster id, both ways at once, or neither, is refused
-    /// at parse time; the derivation is the plane's own.
     /// `set-replica-set` takes the members comma-separated and names the
     /// CAS generation explicitly: there is no default to fall back on.
     #[test]
@@ -3539,6 +3535,10 @@ transport: plaintext
         assert!(parse(&["--expected-generation", "0"]).is_err());
     }
 
+    /// #457 slice 2b: `group-cursor` names the group one way — by UUID, or
+    /// by the Kafka name under the cluster id the gateway derives it from. A
+    /// name without the cluster id, both ways at once, or neither, is refused
+    /// at parse time; the derivation is the plane's own.
     #[test]
     fn group_cursor_names_the_group_one_way() {
         use clap::Parser;

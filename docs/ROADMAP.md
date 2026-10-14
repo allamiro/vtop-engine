@@ -194,8 +194,11 @@ reopen quietly.
   makes the new leader hold everything acknowledged under the set before,
   but promotion truncates nothing and the part above the boundary may still
   sit on that older majority alone. A range with no record behaves as
-  before, and a metadata node that predates the read reads as "none
-  recorded", so data nodes may be upgraded ahead of the metadata tier.
+  before. An older metadata node refuses the read outright; the CLIENT reads
+  that refusal as "none recorded" only after the same node's status says it
+  is the leader (an older leader cannot hold a set), and otherwise asks the
+  leader it names - so data nodes may be upgraded ahead of the metadata
+  tier without one stale endpoint switching the check off.
 
 One observation rode along without becoming a fix: scenario 09 once left a
 promotion unacquired within its deadline (#318). The flake has not recurred —
