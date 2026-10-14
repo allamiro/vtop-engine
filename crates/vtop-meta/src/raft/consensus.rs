@@ -72,6 +72,16 @@ pub enum ConsensusError {
         None => "; no leader is known yet".to_owned(),
     })]
     NotLeader { leader: Option<MetaNodeId> },
+    /// The command's kind is newer than the cluster's metadata feature level
+    /// (#554): refused before it reaches the log, where a voter running an
+    /// older release could not decode it - and could then append nothing
+    /// after it. Raised with `SetFeatureLevel` once every voter is upgraded.
+    #[error(
+        "this command needs metadata feature level {needed} and the cluster runs at \
+         {enabled}; finish upgrading every metadata voter, then raise the level \
+         (vtopctl meta enable-features --level {needed})"
+    )]
+    FeatureNotEnabled { needed: u32, enabled: u32 },
 }
 
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
@@ -652,6 +662,21 @@ pub trait AdminReadSegmentPlacement: Send + Sync {
 #[async_trait]
 impl Consensus for OpenraftConsensus {
     async fn propose(&self, command: MetadataCommand) -> ConsensusResult<CommitReceipt> {
+        // The feature gate (#554), judged by the leader against its applied
+        // state before the command is replicated. A follower lets
+        // `client_write` redirect as always; `SetFeatureLevel` is the one
+        // command not held back, because it is how the gate opens.
+        if !matches!(command, MetadataCommand::SetFeatureLevel { .. }) {
+            if let Some(store) = self.store.as_ref() {
+                if self.raft.metrics().borrow().state == ServerState::Leader {
+                    let enabled = store.with_storage(|storage| storage.state().feature_level());
+                    let needed = command.feature_level();
+                    if needed > enabled {
+                        return Err(ConsensusError::FeatureNotEnabled { needed, enabled });
+                    }
+                }
+            }
+        }
         let response = self
             .raft
             .client_write(command)

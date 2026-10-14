@@ -172,9 +172,42 @@ impl PeerServer {
 }
 
 fn tracing_peer_error(peer: SocketAddr, error: TransportError) {
-    // Avoid a tracing dependency in this crate: stderr is enough for the
-    // skeleton; operators wire structured logs at the process boundary.
-    let _ = (peer, error);
+    // Avoid a tracing dependency in this crate; operators wire structured
+    // logs at the process boundary. Most connection errors are transient and
+    // stay quiet. One is not (#554): a frame this build cannot decode
+    // because a NEWER leader sent a command kind it does not know. That is a
+    // voter that can append nothing more until it is upgraded, and it used to
+    // fail without a word while the leader saw only an unreachable peer. It
+    // is said on stderr, at most once per interval - the leader retries
+    // continuously.
+    let newer = match &error {
+        TransportError::Codec(codec) => crate::storage::is_newer_format(codec),
+        TransportError::BadVersion(_) => true,
+        _ => false,
+    };
+    if newer && peer_newer_warning_due() {
+        eprintln!(
+            "metadata peer {peer} sent a frame this build cannot decode ({error}): it runs a \
+             newer release. This voter can append nothing more until it is upgraded too; \
+             finish the rollout of the metadata tier"
+        );
+    }
+}
+
+/// At most one newer-release warning per interval, process-wide.
+fn peer_newer_warning_due() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const INTERVAL_SECS: u64 = 30;
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let last = LAST.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < INTERVAL_SECS {
+        return false;
+    }
+    LAST.compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 async fn serve_connection(

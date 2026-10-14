@@ -19,15 +19,23 @@ for scenario in "$SCRIPT_DIR"/scenarios/*.sh; do
   if [[ -n "${CHAOS_WORKDIR:-}" ]]; then
     scenario_workdir="${CHAOS_WORKDIR%/}/${name%.sh}"
   fi
-  if [[ -n "$scenario_workdir" ]] \
-    && CHAOS_WORKDIR="$scenario_workdir" bash "$scenario"; then
-    RESULTS+=("PASS $name")
-  elif [[ -z "$scenario_workdir" ]] && bash "$scenario"; then
-    RESULTS+=("PASS $name")
+  # Exit 77 is a SKIP: the scenario needs something this run did not provide
+  # (scenario 22: a previous release's binary). It is reported, not counted
+  # as a pass or a failure.
+  code=0
+  if [[ -n "$scenario_workdir" ]]; then
+    CHAOS_WORKDIR="$scenario_workdir" bash "$scenario" || code=$?
   else
-    RESULTS+=("FAIL $name")
-    overall=1
+    bash "$scenario" || code=$?
   fi
+  case "$code" in
+    0) RESULTS+=("PASS $name") ;;
+    77) RESULTS+=("SKIP $name") ;;
+    *)
+      RESULTS+=("FAIL $name")
+      overall=1
+      ;;
+  esac
 done
 
 echo

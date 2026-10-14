@@ -154,6 +154,20 @@ pub enum MetaCommand {
         #[arg(long, default_value_t = 5_000, value_parser = clap::value_parser!(u64).range(1..))]
         replica_timeout_ms: u64,
     },
+    /// Raise the metadata feature level (#554), enabling the command kinds up
+    /// to it. Run it ONLY once every metadata voter runs a release that
+    /// supports the level: an older voter cannot decode this command, nor
+    /// the commands it enables. Raising is permanent - there is no lowering -
+    /// and asking for a level already in force is a no-op. The reply's
+    /// generation is the level now in force.
+    EnableFeatures {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        level: u32,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
     /// Propose `RegisterNode` through the Consensus façade.
     RegisterNode {
         #[command(flatten)]
@@ -1362,6 +1376,26 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 });
             }
             verdict
+        }
+        MetaCommand::EnableFeatures {
+            common,
+            level,
+            request_id,
+        } => {
+            if level > vtop_meta::SUPPORTED_FEATURE_LEVEL {
+                return Err(format!(
+                    "this vtopctl knows feature levels up to {}; level {level} needs a newer release",
+                    vtop_meta::SUPPORTED_FEATURE_LEVEL
+                ));
+            }
+            let command = MetadataCommand::SetFeatureLevel {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms: chrono::Utc::now().timestamp_millis(),
+                },
+                feature_level: level,
+            };
+            propose_and_print(&common.config, command, json).await
         }
         MetaCommand::RegisterNode {
             common,

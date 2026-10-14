@@ -42,6 +42,16 @@ pub enum MetaStoreError {
     },
     #[error("corrupt metadata artifact {path}: {reason}")]
     Corrupt { path: PathBuf, reason: String },
+    /// Checksum-valid, but naming a kind or tag this build does not know:
+    /// written by a NEWER release, not damaged (#554). Reported apart from
+    /// `Corrupt` because the two call for opposite responses - upgrade this
+    /// node, versus restore or replace it - and an old node that restarts
+    /// against a newer cluster's log used to call the log corrupt.
+    #[error(
+        "metadata artifact {path} was written by a newer release ({reason}); this build \
+         cannot read it. Upgrade this node: downgrade is not supported"
+    )]
+    NewerFormat { path: PathBuf, reason: String },
     #[error("unsupported format version {version} in {path}")]
     UnsupportedVersion { path: PathBuf, version: u16 },
     #[error("invalid metadata store usage: {0}")]
@@ -67,7 +77,30 @@ pub(crate) fn corrupt(path: &Path, reason: impl Into<String>) -> MetaStoreError 
 }
 
 pub(crate) fn codec_corrupt(path: &Path, error: &CodecError) -> MetaStoreError {
+    if is_newer_format(error) {
+        return MetaStoreError::NewerFormat {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        };
+    }
     corrupt(path, error.to_string())
+}
+
+/// Whether a decode failure is a kind, tag or version this build does not
+/// know - the signature of a newer writer - rather than malformed bytes. Only
+/// meaningful once the bytes' checksum has verified, as it has everywhere
+/// these are decoded from disk.
+pub(crate) fn is_newer_format(error: &CodecError) -> bool {
+    matches!(
+        error,
+        CodecError::UnknownTag {
+            what: "command kind"
+                | "record value tag"
+                | "meta key category"
+                | "snapshot payload version",
+            ..
+        }
+    )
 }
 
 pub(crate) fn sync_parent(storage: &dyn Storage, path: &Path) -> MetaStoreResult<()> {

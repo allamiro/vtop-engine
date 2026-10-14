@@ -831,6 +831,19 @@ Short procedures now; expand into a full ops runbook before go-live.
   cursors → validate → keep the old store until validation passes.
 - **Prune the PostgreSQL ledger:** run `vtopctl prune-ledger --older-than-days N`
   on a schedule under the maintenance identity (§6.6).
+- **Upgrade the metadata tier (#554):** roll the voters one at a time - the
+  chart's `RollingUpdate` with the tier's PodDisruptionBudget (`maxUnavailable:
+  1`) does exactly this - waiting for each to be ready and caught up before
+  the next. Upgrade from the immediately preceding release only, and never
+  downgrade. Mixed releases are safe while they run: the leader refuses any
+  command kind above the cluster's metadata feature level, so nothing an
+  older voter cannot decode enters the log. Once EVERY voter runs the new
+  release, run `vtopctl meta enable-features --level N` for the level the
+  release introduced (its notes name it); only then do the new command kinds
+  work. Raising the level is permanent, and raising it while an older voter
+  remains is the one way to stall the tier - that voter cannot decode the
+  raise itself. A node that refuses to start with "written by a newer
+  release" is an old binary on a newer log: upgrade it.
 - **Restore from DB backup:** restore Postgres PITR → verify object store →
   start the engine (recovery scan re-reconciles) → run the divergence checker.
 - **Reconcile state store vs object storage:** list `SOURCE_COMMITTED` rows and
