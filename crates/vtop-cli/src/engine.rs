@@ -2504,6 +2504,13 @@ struct RewindPlan {
     /// The lowest pending start per source (a path or a topic-partition), per
     /// inode, for [`RewindPlan::holds_back`].
     by_source: HashMap<String, Vec<(Option<u64>, i128)>>,
+    /// When each unit was last added. Recovery visits incomplete rows oldest
+    /// first, so a higher number is a more recent file; the adapters keep one
+    /// cursor per path, so the unit applied LAST at a path decides where it
+    /// resumes, and that must be the most recent file, not whichever inode
+    /// sorts last as text (review of #563).
+    recency: HashMap<String, u64>,
+    added: u64,
 }
 
 impl RewindPlan {
@@ -2518,6 +2525,8 @@ impl RewindPlan {
             None => groups.push((inode, position)),
         }
         let unit = unit_key(start);
+        self.added += 1;
+        self.recency.insert(unit.clone(), self.added);
         match self.lowest.get(&unit) {
             Some(held) if start_position(held) <= position => {}
             _ => {
@@ -2588,8 +2597,16 @@ impl RewindPlan {
             .iter()
             .map(|(k, m)| (k.clone(), m.clone()))
             .collect();
-        // Stable order, so the log and the tests do not depend on hash order.
-        markers.sort_by(|a, b| a.0.cmp(&b.0));
+        // Grouped by source, and within a source oldest file first so the most
+        // recent file's rewind is applied last. The unit key breaks ties, so
+        // the log and the tests do not depend on hash order.
+        markers.sort_by_cached_key(|(unit, marker)| {
+            (
+                source_key(marker),
+                self.recency.get(unit).copied().unwrap_or(0),
+                unit.clone(),
+            )
+        });
         markers.into_iter().map(|(_, m)| m).collect()
     }
 }
@@ -3519,6 +3536,38 @@ mod tests {
             std::fs::metadata(&input).unwrap().len(),
             "and the batch ends at the end of the file"
         );
+    }
+
+    /// The adapters keep one cursor per path, so when a path has incomplete
+    /// rows for an old and a current file, the rewind applied LAST decides where
+    /// the path resumes. It must be the most recent file's, whatever the inodes
+    /// look like as text (inode 9 sorts after inode 10).
+    #[test]
+    fn the_most_recent_file_at_a_path_is_rewound_last() {
+        let file = |inode: u64, start: u64| ProgressMarker::File {
+            path: "/a".into(),
+            inode: Some(inode),
+            start_byte: start,
+            end_byte: start + 10,
+            file_size: 0,
+            mtime: String::new(),
+        };
+        let inodes = |plan: &RewindPlan| -> Vec<Option<u64>> {
+            plan.markers().iter().map(marker_inode).collect()
+        };
+        // Recovery visits rows oldest first: inode 10 is the older file.
+        let mut plan = RewindPlan::default();
+        plan.add(&file(10, 500));
+        plan.add(&file(9, 40));
+        assert_eq!(inodes(&plan), vec![Some(10), Some(9)]);
+        // And the other way round: the lexically smaller inode is the older.
+        let mut plan = RewindPlan::default();
+        plan.add(&file(9, 40));
+        plan.add(&file(10, 500));
+        assert_eq!(inodes(&plan), vec![Some(9), Some(10)]);
+        // A later row of an already-planned file makes it the most recent.
+        plan.add(&file(9, 60));
+        assert_eq!(inodes(&plan), vec![Some(10), Some(9)]);
     }
 
     /// Several incomplete ranges of one source: recovery used to apply each
