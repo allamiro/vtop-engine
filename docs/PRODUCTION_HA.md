@@ -674,6 +674,8 @@ path needed by the distributed options is already implemented (§6.3).
 | `engine.state_store` | backend selector: inline `sqlite://…`, or `{ env: … }` / `{ file: … }` secret reference for PostgreSQL |
 | `engine.work_dir` / `log_level` | scratch dir; verbosity |
 | `engine.ledger_retention_days` / `ledger_prune_batch` | committed-row retention (§6.6; SQLite engine-side only) |
+| `engine.state_store_timeout_seconds` | wall-clock bound on every state-store request (default 30 s; whole-ledger scans get 10x) — a blackholed Postgres fails the request instead of hanging the engine (#556) |
+| `upload.request_timeout_seconds` | wall-clock bound on one attempt of one object-store request on the native S3 backend (default 300 s; the SDK's retries apply) (#556) |
 | `batching.max_records` / `max_bytes` / `max_batch_age_seconds` | seal thresholds |
 | `batching.max_concurrent_batches` | uploads kept in flight per cycle (default 8); the ceiling when the adaptive width is on |
 | `batching.adaptive_width.enabled` / `min_width` | AIMD upload width (#102): a cycle the store throttled halves the next cycle's width, a clean cycle grows it by one, never below `min_width` (default 1) nor above the ceiling. Off by default; `vtop_upload_width` shows the width in use |
