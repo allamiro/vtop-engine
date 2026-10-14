@@ -314,10 +314,14 @@ What follows from that, in the engine:
   from. The record is in-process: after a restart a commit falls back to the
   inode and length test.
 - **A restart seeds the cursor with the inode** the offset came from
-  (`StateStore::committed_cursors`: the inode of the most recent committed
-  batch, and the highest committed offset among that inode's batches only). A
-  file replaced while the engine was down is read from its first byte instead
-  of from the old file's high-water mark. The seed also carries the length the
+  (`StateStore::committed_cursors`: the most recent committed batch per path -
+  the one created last, which is the window read last - with its own inode
+  and offset, never a maximum: after a `copytruncate` the inode is unchanged
+  and the old content's higher offset would skip the new content's first
+  bytes). A file replaced while the engine was down is read from its first
+  byte instead of from the old file's high-water mark. Ledger pruning keeps
+  exactly this row for every path, so the seed is the same before and after
+  any prune. The seed also carries the length the
   most recent committed batch saw its file at (`file_size` in the marker), so a
   `copytruncate` while the engine was down is caught even when the file is
   still longer than the committed offset. A syslog-spool marker records no

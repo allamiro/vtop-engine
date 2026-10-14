@@ -305,7 +305,7 @@ impl StateStore for PgStateStore {
             .bind(&rec.error_message)
             .bind(&rec.owner)
             .bind(&rec.lease_expires_at)
-            .bind(&rec.created_at)
+            .bind(crate::store::canonical_created_at(&rec.created_at))
             .bind(&rec.updated_at)
             .execute(&self.pool)
         })
@@ -496,10 +496,12 @@ impl StateStore for PgStateStore {
         &self,
         source_type: SourceType,
     ) -> Result<Vec<CommittedCursor>, VtopError> {
-        // See the SQLite implementation and #77 (including why "newest" is the
-        // batch created last, not the one updated last). The column is TEXT, so cast to
-        // jsonb; markers are internally tagged (fields at top level). The inode
-        // is read as text and parsed here so a u64 above i64::MAX stays exact.
+        // See the SQLite implementation and #77: the newest committed row per
+        // path, by (created_at, batch_id) - stored fixed-width, so text order
+        // is time order, and the order pruning keeps - with its own end byte.
+        // The markers column is TEXT, so cast to jsonb; markers are internally
+        // tagged (fields at top level). The inode is read as text and parsed
+        // here so a u64 above i64::MAX stays exact.
         let rows = sqlx::query(
             "WITH committed AS ( \
                  SELECT progress_end_json::jsonb ->> 'path' AS path, \
@@ -509,19 +511,11 @@ impl StateStore for PgStateStore {
                         created_at, batch_id \
                  FROM batches WHERE state = $1 AND source_type = $2 \
              ), latest AS ( \
-                 SELECT path, inode, file_size, ROW_NUMBER() OVER ( \
+                 SELECT path, inode, end_byte, file_size, ROW_NUMBER() OVER ( \
                             PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
-             ), per_inode AS ( \
-                 SELECT path, inode, MAX(end_byte) AS end_byte \
-                 FROM committed GROUP BY path, inode \
              ) \
-             SELECT l.path AS path, l.inode AS inode, p.end_byte AS end_byte, \
-                    l.file_size AS file_size \
-             FROM latest l \
-             JOIN per_inode p ON p.path IS NOT DISTINCT FROM l.path \
-                             AND p.inode IS NOT DISTINCT FROM l.inode \
-             WHERE l.rn = 1",
+             SELECT path, inode, end_byte, file_size FROM latest WHERE rn = 1",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(source_type.as_str())
@@ -590,11 +584,12 @@ impl StateStore for PgStateStore {
         limit: u32,
     ) -> Result<u64, VtopError> {
         // Same predicate as the SQLite store: a row is deletable only when a
-        // strictly greater committed row — ordered by (end_byte, updated_at,
-        // batch_id) — exists for its source path, so the per-path
-        // MAX(end_byte) cursor seed always survives. The successor probe's
-        // expressions must stay identical to idx_batches_commit_cursor in
-        // migrations/postgres/0001_state_store.sql, which bounds it.
+        // newer committed row — ordered by (created_at, batch_id), the order
+        // committed_cursors reads — exists for its source path, so the
+        // restart cursor's row always survives (review of #564). The
+        // successor probe's expressions must stay identical to
+        // idx_batches_commit_newest in migrations/postgres/0001_state_store.sql,
+        // which bounds it.
         let result = with_retry(|| {
             sqlx::query(
                 "DELETE FROM batches WHERE batch_id IN ( \
@@ -606,16 +601,8 @@ impl StateStore for PgStateStore {
                           AND n.source_type = b.source_type \
                           AND COALESCE(n.progress_end_json::jsonb ->> 'path', n.source_name) \
                               = COALESCE(b.progress_end_json::jsonb ->> 'path', b.source_name) \
-                          AND ( \
-                            COALESCE((n.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
-                              > COALESCE((b.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
-                            OR ( \
-                              COALESCE((n.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
-                                = COALESCE((b.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
-                              AND (n.updated_at > b.updated_at \
-                                   OR (n.updated_at = b.updated_at AND n.batch_id > b.batch_id)) \
-                            ) \
-                          ) \
+                          AND (n.created_at > b.created_at \
+                               OR (n.created_at = b.created_at AND n.batch_id > b.batch_id)) \
                       ) \
                     LIMIT $3 \
                 )",

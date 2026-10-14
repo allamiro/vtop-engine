@@ -200,6 +200,17 @@ impl Generations {
     /// windows were read, so the OLDEST matching record is the one being
     /// committed; if the same range exists in two generations, the older one
     /// is taken first, which errs towards a duplicate rather than a skip.
+    ///
+    /// Every record of the SAME generation issued before the matched one is
+    /// retired with it. The engine buffers several reads into one window and
+    /// commits only the last read's range, so the window's earlier ranges are
+    /// never settled by name; left queued, one of them could later match a
+    /// range the new content repeats after a truncation, and that valid
+    /// commit would be judged stale (review of #564). Within a generation a
+    /// record ahead of a committed one belongs to its window or to an earlier
+    /// one, and nothing will settle it by name. An OLDER generation's records
+    /// stay: a window read before the truncation can still commit after one
+    /// read since, and must find its record to be judged stale.
     pub fn settle(&mut self, start: u64, end: u64) -> Settled {
         let Some(at) = self
             .issued
@@ -209,6 +220,11 @@ impl Generations {
             return Settled::Unknown;
         };
         let issued = self.issued.remove(at).expect("position found above");
+        let mut before = 0;
+        self.issued.retain(|other| {
+            before += 1;
+            before > at || other.generation != issued.generation
+        });
         if issued.generation == self.current {
             Settled::Current
         } else {
@@ -344,6 +360,42 @@ mod tests {
         assert_eq!(generations.settle(0, 40), Settled::Current);
         // Settled once: a repeat is unknown, not current.
         assert_eq!(generations.settle(0, 40), Settled::Unknown);
+    }
+
+    /// Review of #564: a window of several reads commits only its last range.
+    /// Its earlier ranges must go with it, or after a truncation the new
+    /// content's identical first range matches the leftover and a valid
+    /// commit is judged stale.
+    #[test]
+    fn a_window_of_several_reads_retires_all_of_them() {
+        let mut generations = Generations::default();
+        // One window: three reads, committed by the last one's range.
+        generations.issue(0, 50);
+        generations.issue(50, 80);
+        generations.issue(80, 100);
+        assert_eq!(generations.settle(80, 100), Settled::Current);
+        // copytruncate, and the new content's first read is byte for byte the
+        // same range as the old window's first read.
+        generations.discontinuity();
+        generations.issue(0, 50);
+        assert_eq!(
+            generations.settle(0, 50),
+            Settled::Current,
+            "matched the old window's leftover first range"
+        );
+    }
+
+    /// A window read before a truncation can commit after a window read since
+    /// it: settling the newer one must not retire the older record, or the
+    /// late commit falls back to the length test and moves the cursor.
+    #[test]
+    fn a_newer_commit_does_not_retire_an_older_generations_record() {
+        let mut generations = Generations::default();
+        generations.issue(0, 100);
+        generations.discontinuity();
+        generations.issue(0, 40);
+        assert_eq!(generations.settle(0, 40), Settled::Current);
+        assert_eq!(generations.settle(0, 100), Settled::Stale);
     }
 
     #[test]

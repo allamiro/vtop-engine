@@ -63,8 +63,10 @@ pub struct CommittedCursor {
     /// `None` for a legacy marker that predates inode tracking, or on a
     /// platform that has none.
     pub inode: Option<u64>,
-    /// The highest committed `end_byte` among the batches read from that
-    /// inode — not across inodes, which is the mistake being corrected.
+    /// The MOST RECENT committed batch's `end_byte` — not a maximum, across
+    /// inodes or within one: after a `copytruncate` the inode is unchanged
+    /// and the old content's higher offset would skip the new content's
+    /// bytes (#558, review of #564).
     pub end_byte: u64,
     /// The length of the file as the MOST RECENT committed batch observed it
     /// (`file_size` in its marker); `None` where the marker records none (a

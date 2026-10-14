@@ -433,8 +433,9 @@ instances never recover the same batch. Required before fleet mode.
 ```text
 - keep ACTIVE, FAILED, REPLAY_REQUIRED, and recent SOURCE_COMMITTED rows hot;
 - delete old SOURCE_COMMITTED rows incrementally, always retaining the
-  per-path row with the highest committed end_byte so recovery cursor
-  seeding is unchanged;
+  per-path NEWEST committed row (by created_at) so recovery cursor seeding
+  is unchanged - the newest, not the highest end_byte, which after a
+  rotation or copytruncate is the old content's row (#564);
 - retain enough for audit, replay, and compliance (age window is
   configurable; archival to cold tables / object storage remains a
   possible future extension).
