@@ -382,7 +382,7 @@ impl StateStore for PgStateStore {
             .rows_affected();
 
             if rows >= 1 {
-                self.fence.wrote(batch_id, validated);
+                self.fence.wrote(batch_id, validated, held);
                 return Ok(());
             }
             let actual: Option<i64> =
@@ -392,7 +392,7 @@ impl StateStore for PgStateStore {
                     .await
                     .map_err(map_sqlx)?;
             if let Some(actual) = actual.filter(|actual| *actual != held) {
-                self.fence.lost(batch_id);
+                self.fence.lost(batch_id, held);
                 return Err(crate::fence::claim_lost(batch_id, held, actual));
             }
             // Lost update: the row's state changed between our read and write.

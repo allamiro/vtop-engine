@@ -858,7 +858,11 @@ Short procedures now; expand into a full ops runbook before go-live.
   claimed, and keeps the generation while it can still write one (a FAILED
   batch keeps it until it is handed back for replay; a lost claim keeps it so
   the stalled writer stays refused); a write to a row it holds no generation
-  for is refused, never made unchecked. That makes a
+  for is refused, never made unchecked. The kept tokens of FAILED and
+  lost-claim batches are bounded (65,536 per process, oldest dropped first):
+  a FAILED batch whose token was dropped is refused its REPLAY_REQUIRED
+  write, fail closed, and is handed back by the next recovery's claim
+  instead. That makes a
   recovery *handover* safe at the ledger - between engines that all run a
   build with the fence: an older build neither bumps nor checks the
   generation, so drain older engines before relying on it. It does **not** make two engines

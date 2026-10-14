@@ -91,23 +91,36 @@ impl ClaimFence {
         self.lock().tokens.get(batch_id).map(|t| t.generation)
     }
 
-    /// Record a successful transition to `to`.
-    pub(crate) fn wrote(&self, batch_id: &str, to: BatchState) {
+    /// Record a successful transition to `to`, made holding `generation`.
+    ///
+    /// Only the token AT that generation is affected. Store handles share
+    /// one fence, so a claim through another handle can raise the token while
+    /// this write is in flight; a completion for the older generation must
+    /// not release or park the newer claim, or that claim's own writes would
+    /// then be refused (review of #569).
+    pub(crate) fn wrote(&self, batch_id: &str, to: BatchState, generation: i64) {
         match to {
-            BatchState::SourceCommitted | BatchState::ReplayRequired => self.release(batch_id),
-            BatchState::Failed => self.park(batch_id),
+            BatchState::SourceCommitted | BatchState::ReplayRequired => {
+                self.release(batch_id, generation)
+            }
+            BatchState::Failed => self.park(batch_id, generation),
             _ => {}
         }
     }
 
-    /// A write was refused because another engine claimed the batch. The
-    /// token is kept - it is what refuses this process if it tries again.
-    pub(crate) fn lost(&self, batch_id: &str) {
-        self.park(batch_id);
+    /// A write made holding `generation` was refused because another engine
+    /// claimed the batch. The token is kept - it is what refuses this
+    /// process if it tries again - unless it has since moved on (see
+    /// [`Self::wrote`]).
+    pub(crate) fn lost(&self, batch_id: &str, generation: i64) {
+        self.park(batch_id, generation);
     }
 
-    fn release(&self, batch_id: &str) {
+    fn release(&self, batch_id: &str, generation: i64) {
         let mut held = self.lock();
+        if held.tokens.get(batch_id).map(|t| t.generation) != Some(generation) {
+            return;
+        }
         if let Some(token) = held.tokens.remove(batch_id) {
             if token.parked.is_some() {
                 held.parked -= 1;
@@ -139,11 +152,15 @@ impl ClaimFence {
         held.compact();
     }
 
-    fn park(&self, batch_id: &str) {
+    fn park(&self, batch_id: &str, generation: i64) {
         let mut held = self.lock();
         let held = &mut *held;
         let seq = held.next_seq;
-        let Some(token) = held.tokens.get_mut(batch_id) else {
+        let Some(token) = held
+            .tokens
+            .get_mut(batch_id)
+            .filter(|token| token.generation == generation)
+        else {
             return;
         };
         if token.parked.is_none() {
@@ -219,7 +236,7 @@ mod tests {
         let other = fence.clone();
         other.claimed("b", 4);
         assert_eq!(fence.held("b"), Some(4));
-        fence.wrote("b", BatchState::SourceCommitted);
+        fence.wrote("b", BatchState::SourceCommitted, 4);
         assert_eq!(other.held("b"), None);
     }
 
@@ -242,13 +259,29 @@ mod tests {
     fn a_failed_batch_keeps_its_token_until_it_is_handed_back() {
         let fence = ClaimFence::default();
         fence.claimed("b", 2);
-        fence.wrote("b", BatchState::Failed);
+        fence.wrote("b", BatchState::Failed, 2);
         assert_eq!(
             fence.held("b"),
             Some(2),
             "FAILED is not the end of the work"
         );
-        fence.wrote("b", BatchState::ReplayRequired);
+        fence.wrote("b", BatchState::ReplayRequired, 2);
+        assert_eq!(fence.held("b"), None);
+    }
+
+    /// Review of #569: a write's completion affects only the token it was
+    /// made with. A newer claim registered meanwhile (through another handle
+    /// on the same fence) is neither released nor parked by it.
+    #[test]
+    fn a_completion_for_an_older_generation_leaves_a_newer_claim_alone() {
+        let fence = ClaimFence::default();
+        fence.claimed("b", 1);
+        fence.claimed("b", 2);
+        fence.wrote("b", BatchState::ReplayRequired, 1);
+        assert_eq!(fence.held("b"), Some(2), "released by a stale completion");
+        fence.lost("b", 1);
+        assert_eq!(fence.lock().parked, 0, "parked by a stale refusal");
+        fence.wrote("b", BatchState::ReplayRequired, 2);
         assert_eq!(fence.held("b"), None);
     }
 
@@ -272,7 +305,7 @@ mod tests {
         for i in 0..(MAX_PARKED + 10) {
             let id = format!("b{i}");
             fence.claimed(&id, 1);
-            fence.lost(&id);
+            fence.lost(&id, 1);
         }
         assert_eq!(fence.lock().parked, MAX_PARKED);
         assert_eq!(fence.held("b0"), None, "the oldest parked token went");
@@ -286,15 +319,15 @@ mod tests {
     fn a_stale_queue_entry_cannot_evict_a_token_that_came_back() {
         let fence = ClaimFence::default();
         fence.claimed("again", 1);
-        fence.lost("again"); // queued at the front
+        fence.lost("again", 1); // queued at the front
         fence.claimed("again", 2); // re-claimed: active now, front entry stale
         for i in 0..MAX_PARKED {
             let id = format!("b{i}");
             fence.claimed(&id, 1);
-            fence.lost(&id);
+            fence.lost(&id, 1);
         }
         fence.claimed("x", 1);
-        fence.lost("x"); // one over the bound: the front entry is popped
+        fence.lost("x", 1); // one over the bound: the front entry is popped
         assert_eq!(
             fence.held("again"),
             Some(2),
@@ -310,8 +343,8 @@ mod tests {
         for i in 0..(3 * MAX_PARKED) {
             let id = format!("churn{i}");
             fence.created(&id);
-            fence.wrote(&id, BatchState::Failed);
-            fence.wrote(&id, BatchState::ReplayRequired);
+            fence.wrote(&id, BatchState::Failed, 0);
+            fence.wrote(&id, BatchState::ReplayRequired, 0);
         }
         let held = fence.lock();
         assert_eq!(held.parked, 0);

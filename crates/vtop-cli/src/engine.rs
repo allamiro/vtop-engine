@@ -2163,18 +2163,35 @@ impl Engine {
                     // object we can finish from in this prototype: mark for
                     // replay so the *uncommitted* source range is re-read.
                     // Source progress was never advanced, so this is safe.
-                    let _ = self
+                    //
+                    // The replay decision must be DURABLE before the adapter
+                    // rewinds - as in the stale-VERIFIED branch above. Both
+                    // writes are fenced (#557): one refused because another
+                    // engine claimed the batch in between means that engine
+                    // re-reads the range now, and rewinding here as well
+                    // would ingest it twice (review of #569).
+                    if let Err(e) = self
                         .store
                         .mark_failed(&rec.batch_id, "recovered: replay required")
-                        .await;
-                    self.store
+                        .await
+                    {
+                        tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist the replay decision; not rewinding");
+                        summary.still_pending += 1;
+                        continue;
+                    }
+                    if let Err(e) = self
+                        .store
                         .update_batch_state(
                             &rec.batch_id,
                             BatchState::ReplayRequired,
                             &BatchPatch::default(),
                         )
                         .await
-                        .ok();
+                    {
+                        tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist REPLAY_REQUIRED; not rewinding");
+                        summary.still_pending += 1;
+                        continue;
+                    }
                     if let Some(adapter) = self.adapters.get_mut(&rec.source_type) {
                         let _ = adapter.replay_from_marker(&rec.progress_start).await;
                     }

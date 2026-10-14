@@ -309,11 +309,11 @@ impl StateStore for SqliteStateStore {
             .map_err(map_sqlx)?
             .rows_affected();
             if rows >= 1 {
-                self.fence.wrote(batch_id, validated);
+                self.fence.wrote(batch_id, validated, held);
                 return Ok(());
             }
             if let Some(lost) = self.lost_claim(batch_id, held).await? {
-                self.fence.lost(batch_id);
+                self.fence.lost(batch_id, held);
                 return Err(lost);
             }
             attempt += 1;
