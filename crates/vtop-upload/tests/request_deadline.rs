@@ -14,6 +14,7 @@
 
 use std::io::Write;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use vtop_upload::s3_native::{request_timeouts, S3NativeBackend, S3NativeConfig};
 use vtop_upload::UploadBackend;
@@ -100,5 +101,79 @@ fn the_deadline_covers_connect_read_attempt_and_the_whole_operation() {
         config.operation_timeout(),
         Some(Duration::from_secs(60)),
         "the whole operation is allowed the SDK's three attempts"
+    );
+}
+
+/// Answer every request with headers promptly and then a body that drips one
+/// byte every half second and never finishes: past the SDK's stalled-stream
+/// protection (which catches a stream that STOPS), and past every SDK
+/// timeout, which end when the headers arrive.
+async fn dripping_store() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let headers = "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\
+                               Content-Type: application/octet-stream\r\n\r\n";
+                if socket.write_all(headers.as_bytes()).await.is_err() {
+                    return;
+                }
+                loop {
+                    if socket.write_all(b"x").await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            });
+        }
+    });
+    (endpoint, task)
+}
+
+/// Review of #568: a store that answers the headers and then drips the body
+/// held every body read - verification, manifest recovery - open long past
+/// the configured deadline. The read now fails within the whole-operation
+/// allowance (three attempts of 1 s here).
+#[tokio::test]
+async fn a_body_that_drips_after_the_headers_fails_the_read_instead_of_hanging() {
+    std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+
+    let (endpoint, _store) = dripping_store().await;
+    let backend = S3NativeBackend::new(&S3NativeConfig {
+        region: "us-east-1".into(),
+        endpoint_url: Some(endpoint),
+        force_path_style: true,
+        verify_tls: false,
+        transport: "tcp_tls".into(),
+        tuning: Default::default(),
+        request_timeout_seconds: 1,
+    })
+    .await
+    .expect("the backend builds against a plaintext lab endpoint");
+
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        backend.get_object("s3://telemetry-raw/some/key.bin"),
+    )
+    .await
+    .expect("the body read was still going after 60 s: nothing bounds it");
+    let error = outcome.expect_err("a body that never finishes cannot have been read");
+    assert!(
+        error.to_string().contains("did not finish within"),
+        "the failure must name the body deadline: {error}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a 3 s body allowance gave up after {:?}",
+        started.elapsed()
     );
 }

@@ -121,6 +121,14 @@ pub fn request_timeouts(request_timeout_seconds: u64) -> aws_smithy_types::timeo
 
 pub struct S3NativeBackend {
     client: Client,
+    /// The bound on reading a response BODY (review of #568). The SDK's
+    /// timeouts end when `send()` returns the headers; a body consumed after
+    /// that is outside them, and the SDK's stalled-stream protection only
+    /// catches a stream that stops, not one that drips a byte at a time. The
+    /// whole-operation allowance (the SDK's attempts times
+    /// `request_timeout_seconds`), so an object a slow link can still deliver
+    /// in that time is not cut off.
+    body_deadline: std::time::Duration,
 }
 
 /// Enforce the transport policy BEFORE any client is built (#75).
@@ -590,6 +598,8 @@ impl S3NativeBackend {
 
         Ok(Self {
             client: Client::from_conf(s3_conf),
+            body_deadline: std::time::Duration::from_secs(cfg.request_timeout_seconds)
+                .saturating_mul(OPERATION_ATTEMPTS),
         })
     }
 
@@ -666,9 +676,35 @@ impl S3NativeBackend {
         // verify_reader_content does, so a huge object cannot be pulled
         // down before it is rejected on size.
         use tokio::io::AsyncReadExt;
-        digest_reader(algo, out.body.into_async_read().take(max_bytes))
-            .await?
-            .ok_or_else(|| VtopError::Upload("cannot hash with disabled checksum mode".into()))
+        self.within_body_deadline(
+            "get_object",
+            object_uri,
+            digest_reader(algo, out.body.into_async_read().take(max_bytes)),
+        )
+        .await?
+        .ok_or_else(|| VtopError::Upload("cannot hash with disabled checksum mode".into()))
+    }
+}
+
+impl S3NativeBackend {
+    /// Read a response body within [`Self::body_deadline`]: a store that sent
+    /// the headers and then stalls, or drips, fails the read instead of
+    /// holding verification or recovery open indefinitely.
+    async fn within_body_deadline<T>(
+        &self,
+        what: &str,
+        uri: &str,
+        read: impl std::future::Future<Output = Result<T, VtopError>>,
+    ) -> Result<T, VtopError> {
+        tokio::time::timeout(self.body_deadline, read)
+            .await
+            .map_err(|_| {
+                VtopError::Upload(format!(
+                    "{what} {uri}: the response body did not finish within {:?} (the store \
+                     sent its headers and then stalled)",
+                    self.body_deadline
+                ))
+            })?
     }
 }
 
@@ -784,7 +820,12 @@ impl UploadBackend for S3NativeBackend {
                 "stored object {object_uri} exceeds the {max_bytes}-byte read limit"
             )));
         }
-        read_bounded(out.body.into_async_read(), max_bytes, object_uri).await
+        self.within_body_deadline(
+            "get_object",
+            object_uri,
+            read_bounded(out.body.into_async_read(), max_bytes, object_uri),
+        )
+        .await
     }
 
     fn supports_object_versions(&self) -> bool {
@@ -818,11 +859,14 @@ impl UploadBackend for S3NativeBackend {
             .send()
             .await
             .map_err(|e| sdk_failure("get_object", object_uri, e))?;
-        let bytes = out
-            .body
-            .collect()
-            .await
-            .map_err(|e| VtopError::Upload(format!("get_object body {object_uri}: {e}")))?;
+        let bytes = self
+            .within_body_deadline("get_object", object_uri, async {
+                out.body
+                    .collect()
+                    .await
+                    .map_err(|e| VtopError::Upload(format!("get_object body {object_uri}: {e}")))
+            })
+            .await?;
         Ok(bytes.into_bytes().to_vec())
     }
 
@@ -848,7 +892,12 @@ impl UploadBackend for S3NativeBackend {
                 "stored object {object_uri} exceeds the {max_bytes}-byte read limit"
             )));
         }
-        read_bounded(out.body.into_async_read(), max_bytes, object_uri).await
+        self.within_body_deadline(
+            "get_object",
+            object_uri,
+            read_bounded(out.body.into_async_read(), max_bytes, object_uri),
+        )
+        .await
     }
 
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
