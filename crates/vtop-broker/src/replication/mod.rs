@@ -191,6 +191,8 @@ pub struct InProcessFollower {
     committed_floor_armed: AtomicBool,
     /// Sealed-prefix retention bound in bytes; 0 = disabled (#290).
     retention_max_total_bytes: std::sync::atomic::AtomicU64,
+    /// What retention has been doing, for the exporter (#561).
+    retention_stats: crate::retention_stats::RetentionStats,
     state: Mutex<FollowerState>,
     online: AtomicBool,
     /// When set, appends land with [`Durability::Buffered`] and are not
@@ -264,6 +266,7 @@ impl InProcessFollower {
             committed_floor: Mutex::new(None),
             committed_floor_armed: AtomicBool::new(false),
             retention_max_total_bytes: std::sync::atomic::AtomicU64::new(0),
+            retention_stats: Default::default(),
             state: Mutex::new(FollowerState {
                 segment,
                 producer_epochs,
@@ -359,12 +362,14 @@ impl InProcessFollower {
             return;
         }
         let floor = self.cluster_committed.get().min(segment.committed_offset());
-        if let Err(problem) = segment.retain(&vtop_log::RetentionPolicy { max_total_bytes }, floor)
-        {
-            eprintln!(
-                "follower retention failed and will be retried after the next append: {problem}"
-            );
-        }
+        let result = segment.retain(&vtop_log::RetentionPolicy { max_total_bytes }, floor);
+        self.retention_stats
+            .record("follower range", max_total_bytes, &result);
+    }
+
+    /// What retention has been doing on this replica (#561).
+    pub fn retention_stats(&self) -> &crate::retention_stats::RetentionStats {
+        &self.retention_stats
     }
 
     /// Durably commit the tail's boundary for an orderly shutdown (#280).

@@ -32,6 +32,7 @@ pub mod fencing_epochs;
 pub mod group_commit;
 pub mod memory_budget;
 pub mod replication;
+pub mod retention_stats;
 pub mod server_metrics;
 
 use crate::group_commit::{GroupCommitConfig, GroupCommitCoordinator, QueuedProduce};
@@ -647,6 +648,8 @@ pub struct LocalBroker {
     /// Atomic so operators can set it after construction without a lock, and
     /// the produce path can read it inside the state-lock critical section.
     retention_max_total_bytes: std::sync::atomic::AtomicU64,
+    /// What retention has been doing, for the exporter (#561).
+    retention_stats: crate::retention_stats::RetentionStats,
     /// Optional follower fan-out for quorum produce.
     replicas: Option<Arc<dyn ReplicaSet>>,
     /// Leader identity embedded in replica append requests.
@@ -774,6 +777,7 @@ impl LocalBroker {
             meta_fencing_epoch,
             segment_format,
             retention_max_total_bytes: std::sync::atomic::AtomicU64::new(0),
+            retention_stats: Default::default(),
             cluster_committed,
             boundary_pending: AtomicBool::new(false),
             replicas,
@@ -1104,13 +1108,14 @@ impl LocalBroker {
             .as_ref()
             .map(|committed| committed.get().min(local))
             .unwrap_or(local);
-        if let Err(problem) = segment.retain(&vtop_log::RetentionPolicy { max_total_bytes }, floor)
-        {
-            eprintln!(
-                "retention on {} failed and will be retried after the next append: {problem}",
-                self.range.topic
-            );
-        }
+        let result = segment.retain(&vtop_log::RetentionPolicy { max_total_bytes }, floor);
+        self.retention_stats
+            .record(&self.range.topic, max_total_bytes, &result);
+    }
+
+    /// What retention has been doing on this range (#561).
+    pub fn retention_stats(&self) -> &crate::retention_stats::RetentionStats {
+        &self.retention_stats
     }
 
     /// Install the durable epoch→offset vector for this replica (#240).
