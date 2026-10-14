@@ -347,9 +347,15 @@ impl RetentionGauges {
             }
             return;
         };
-        self.retained_bytes
-            .with_label_values(range)
-            .set(snapshot.retained_bytes as i64);
+        // A size only once a pass has measured one: a failed first pass
+        // exports its failure, not a retained size of zero.
+        match snapshot.retained_bytes {
+            Some(bytes) => self
+                .retained_bytes
+                .with_label_values(range)
+                .set(bytes as i64),
+            None => self.retained_bytes.reset(),
+        }
         self.bound_bytes
             .with_label_values(range)
             .set(snapshot.bound_bytes as i64);
@@ -591,6 +597,10 @@ pub struct BrokerCollector {
     follower_lag_records: IntGaugeVec,
     follower_connected: IntGaugeVec,
     retention: RetentionGauges,
+    /// Refresh and read-out under one lock, as in `CandidateCollector`: an
+    /// overlapping scrape that read no retention snapshot must not reset the
+    /// series after another wrote a newer one (review of #572).
+    scrape: std::sync::Mutex<()>,
 
     group_commit_last_batch_records: IntGauge,
     group_commit_last_batch_bytes: IntGauge,
@@ -673,6 +683,7 @@ impl BrokerCollector {
                 &["follower"],
             )?,
             retention: RetentionGauges::new()?,
+            scrape: std::sync::Mutex::new(()),
             group_commits: CounterFamily::new(
                 "broker_group_commits_total",
                 "Commit groups sealed and fsynced",
@@ -927,6 +938,10 @@ impl Collector for BrokerCollector {
     }
 
     fn collect(&self) -> Vec<MetricFamily> {
+        let _serialized = self
+            .scrape
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.refresh();
         let mut families = collect_all(&self.members());
         families.extend(self.counter_families());
@@ -949,6 +964,10 @@ pub struct FollowerCollector {
     meta_fencing_epoch: IntGaugeVec,
     online: IntGaugeVec,
     retention: RetentionGauges,
+    /// Refresh and read-out under one lock, as in `CandidateCollector`: an
+    /// overlapping scrape that read no retention snapshot must not reset the
+    /// series after another wrote a newer one (review of #572).
+    scrape: std::sync::Mutex<()>,
 }
 
 impl FollowerCollector {
@@ -984,6 +1003,7 @@ impl FollowerCollector {
                 &["topic", "range"],
             )?,
             retention: RetentionGauges::new()?,
+            scrape: std::sync::Mutex::new(()),
         })
     }
 
@@ -1034,6 +1054,10 @@ impl Collector for FollowerCollector {
     }
 
     fn collect(&self) -> Vec<MetricFamily> {
+        let _serialized = self
+            .scrape
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.refresh();
         collect_all(&self.members())
     }
@@ -2158,7 +2182,7 @@ mod tests {
         );
 
         *view.snapshot.lock().unwrap() = Some(RetentionSnapshot {
-            retained_bytes: 900,
+            retained_bytes: Some(900),
             bound_bytes: 500,
             blocked: Some(RetentionBlocked::CommittedFloor),
             last_pass_failed: false,
@@ -2191,7 +2215,7 @@ mod tests {
         );
 
         *view.snapshot.lock().unwrap() = Some(RetentionSnapshot {
-            retained_bytes: 400,
+            retained_bytes: Some(400),
             bound_bytes: 500,
             blocked: None,
             last_pass_failed: true,

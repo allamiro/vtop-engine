@@ -1089,6 +1089,12 @@ impl LocalBroker {
             policy.map(|policy| policy.max_total_bytes).unwrap_or(0),
             Ordering::SeqCst,
         );
+        if policy.is_none() {
+            // Nothing will record over the last pass's state now; left in
+            // place it would keep exporting a stale bound, size and blocked
+            // reason (review of #572).
+            self.retention_stats.clear();
+        }
     }
 
     /// Run one retention pass under the state lock the caller already holds.
@@ -1109,8 +1115,11 @@ impl LocalBroker {
             .map(|committed| committed.get().min(local))
             .unwrap_or(local);
         let result = segment.retain(&vtop_log::RetentionPolicy { max_total_bytes }, floor);
-        self.retention_stats
-            .record(&self.range.topic, max_total_bytes, &result);
+        self.retention_stats.record(
+            &format!("range {}/{}", self.range.topic, self.range.range_id),
+            max_total_bytes,
+            &result,
+        );
     }
 
     /// What retention has been doing on this range (#561).

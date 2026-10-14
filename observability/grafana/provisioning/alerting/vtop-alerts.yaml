@@ -146,8 +146,10 @@ groups:
             bound is smaller than one segment.
           runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#retention-blocked"
 
-      # A retention pass that fails outright is retried after the next append; one
-      # that keeps failing leaves disk unreclaimed (#561).
+      # A retention pass that fails outright is retried after the next append. The
+      # gauge holds the LATEST pass's result, so it stays 1 until a pass succeeds:
+      # this fires on a failure unresolved for ten minutes - with no appends, one
+      # failure is enough (#561, review of #572).
       - uid: vtop-retention-failing
         title: Range retention failing
         condition: C
@@ -194,10 +196,11 @@ groups:
           severity: warning
           service: vtop-node
         annotations:
-          summary: "Range retention keeps failing"
+          summary: "Range retention failure unresolved"
           description: >-
-            Every retention pass on range {{ $labels.range }} of {{ $labels.topic }} has failed for
-            ten minutes. The node's log names the error.
+            The latest retention pass on range {{ $labels.range }} of {{ $labels.topic }} failed, and
+            none has succeeded in the ten minutes since (a pass runs after each append, so an idle
+            range keeps its last failure). The node's log names the error.
           runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#retention-blocked"
 
       # The leader holds no replication stream to a follower. Two minutes rides out
@@ -325,7 +328,13 @@ groups:
             model:
               refId: A
               instant: true
-              expr: max by (topic, range) (changes(vtop_broker_meta_fencing_epoch[30m]))
+              # The epoch's RISE, not its number of changes (review of #572):
+              # several leadership changes between two scrapes are one
+              # change of the gauge but several epochs. Zeros (a replica that
+              # has not read metadata yet) are left out of the low end.
+              expr: >-
+                max by (topic, range) (max_over_time(vtop_broker_meta_fencing_epoch[30m]))
+                - max by (topic, range) (min_over_time((vtop_broker_meta_fencing_epoch > 0)[30m:1m]))
               intervalMs: 1000
               maxDataPoints: 43200
           - refId: C
@@ -436,7 +445,15 @@ groups:
             model:
               refId: A
               instant: true
-              expr: max by (instance) (vtop_meta_raft_millis_since_quorum_ack)
+              # -1 means "no acknowledgement yet" for a leader and "not a
+              # leader" for everyone else (review of #572). A leader still at
+              # -1 has never heard from a quorum, so it is lifted to 1e9 ms
+              # here; a follower's -1 stays below the threshold.
+              expr: >-
+                max by (instance) (vtop_meta_raft_millis_since_quorum_ack)
+                + on (instance)
+                (max by (instance) (vtop_meta_raft_state{state="leader"})
+                * (max by (instance) (vtop_meta_raft_millis_since_quorum_ack) == bool -1) * 1e9)
               intervalMs: 1000
               maxDataPoints: 43200
           - refId: C
@@ -473,6 +490,6 @@ groups:
           summary: "A metadata leader has lost its quorum"
           description: >-
             The metadata leader on {{ $labels.instance }} has not been acknowledged by a quorum for
-            {{ printf "%.0f" $values.A.Value }} ms. Lease renewals cannot commit until it recovers or a new
-            leader is elected.
+            {{ printf "%.0f" $values.A.Value }} ms (about 1000000000 means never, since it became
+            leader). Lease renewals cannot commit until it recovers or a new leader is elected.
           runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#replication-health"
