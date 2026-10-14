@@ -221,7 +221,10 @@ impl<'a> Pipeline<'a> {
             .unwrap_or_else(|| source.source_name.clone());
 
         let batch_id = vtop_core::batch::build_batch_id(&source.source_name, &read.progress_end);
-        let now = Utc::now().to_rfc3339();
+        // The batch is sealed now: this instant is fixed before any upload
+        // work, so it is the one the time partition is taken from (#559).
+        let sealed_at = Utc::now();
+        let now = sealed_at.to_rfc3339();
 
         // ---- DISCOVERED -> BATCHING (persisted) -------------------------
         let mut batch = TelemetryBatch {
@@ -414,7 +417,16 @@ impl<'a> Pipeline<'a> {
         );
 
         // ---- Resolve object / manifest URIs -----------------------------
-        let ctx = PartitionContext::new(&tenant, &s3_source, format.clone(), Utc::now());
+        // The time partition comes from the seal time (or, on request, the
+        // earliest record time), never from the wall clock at this point: by
+        // now the batch has been compressed and checksummed, and a batch
+        // sealed at 12:59 used to be filed under hour 13 (#559).
+        let partition_at = partitioning::partition_time(
+            self.config.partitioning.time_source,
+            sealed_at,
+            batch.first_timestamp.as_deref(),
+        );
+        let ctx = PartitionContext::new(&tenant, &s3_source, format.clone(), partition_at);
         let ctx = match &stream.and_then(|s| s.retention_class.clone()) {
             Some(rc) => ctx.with("retention_class", rc.clone()),
             None => ctx,
@@ -1045,12 +1057,13 @@ impl PendingBuffer {
             // ignored by the batcher.
             self.batcher.push(record, &start, None);
         }
-        if self.first_timestamp.is_none() {
-            self.first_timestamp = read.first_timestamp;
-        }
-        if read.last_timestamp.is_some() {
-            self.last_timestamp = read.last_timestamp;
-        }
+        // The window's event-time range is the earliest and latest of its
+        // reads' ranges, not the first read's start and the last read's end:
+        // record times arrive out of order (#559).
+        self.first_timestamp =
+            vtop_core::event_time::earliest(self.first_timestamp.take(), read.first_timestamp);
+        self.last_timestamp =
+            vtop_core::event_time::latest(self.last_timestamp.take(), read.last_timestamp);
         self.latest_end = Some(read.progress_end);
     }
 
@@ -2414,6 +2427,54 @@ mod tests {
     use crate::testkit::file_config;
     use std::io::Write;
     use vtop_core::config::StreamsConfig;
+
+    /// #559: a buffered window spans several reads; its event-time range is
+    /// the earliest and latest of theirs, not the first read's start and the
+    /// last read's end (producer timestamps arrive out of order).
+    #[test]
+    fn a_buffered_window_keeps_the_earliest_and_latest_record_time() {
+        let source = DiscoveredSource {
+            source_type: SourceType::Kafka,
+            source_name: "t".into(),
+            format: vtop_core::types::TelemetryFormat::Raw,
+        };
+        let mut buf = PendingBuffer::new("default", source, BatchLimits::default());
+        let marker = |offset: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition: 0,
+            start_offset: offset,
+            end_offset: offset,
+            consumer_group: "g".into(),
+        };
+        let read = |offset: i64, lo: Option<&str>, hi: Option<&str>| ReadResult {
+            records: vec![b"r".to_vec()],
+            progress_start: marker(offset),
+            progress_end: marker(offset),
+            first_timestamp: lo.map(str::to_owned),
+            last_timestamp: hi.map(str::to_owned),
+            verbatim: false,
+        };
+        buf.append(read(
+            0,
+            Some("2026-01-01T10:00:00.000Z"),
+            Some("2026-01-01T10:30:00.000Z"),
+        ));
+        buf.append(read(
+            1,
+            Some("2026-01-01T09:00:00.000Z"),
+            Some("2026-01-01T09:05:00.000Z"),
+        ));
+        buf.append(read(2, None, None));
+        let drained = buf.drain().unwrap();
+        assert_eq!(
+            drained.first_timestamp.as_deref(),
+            Some("2026-01-01T09:00:00.000Z")
+        );
+        assert_eq!(
+            drained.last_timestamp.as_deref(),
+            Some("2026-01-01T10:30:00.000Z")
+        );
+    }
 
     /// #66: a mutating engine is single-instance per state store AND work dir;
     /// a second one must be refused however the collision arises, read-only

@@ -185,3 +185,7 @@ upload:
 
 partitioning:
   template: "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/"
+  # Which clock fills {yyyy}..{hh} (#559): seal (default) = when the batch was
+  # sealed, before upload; event = the earliest record time the source
+  # reported (Kafka message timestamps), falling back to the seal time.
+  # time_source: seal

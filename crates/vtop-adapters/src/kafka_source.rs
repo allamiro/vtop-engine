@@ -167,6 +167,11 @@ struct PartAcc {
     records: Vec<Vec<u8>>,
     start_offset: i64,
     end_offset: i64,
+    /// Earliest and latest message timestamp (ms) among the kept records, for
+    /// the batch's event-time range (#559). Producer timestamps arrive out of
+    /// order, so these are a minimum and a maximum, not the first and last.
+    min_ts_ms: Option<i64>,
+    max_ts_ms: Option<i64>,
 }
 
 /// Record/byte usage of one topic during a poll pass.
@@ -247,10 +252,24 @@ impl MultiTopicAcc {
                 records: Vec::new(),
                 start_offset: offset,
                 end_offset: offset,
+                min_ts_ms: None,
+                max_ts_ms: None,
             });
         acc.end_offset = offset;
         acc.records.push(payload);
         true
+    }
+
+    /// Fold a KEPT message's timestamp into its partition's event-time range.
+    /// A negative value is Kafka's "no timestamp" and is ignored.
+    fn note_timestamp(&mut self, topic_idx: usize, partition: i32, ts_ms: i64) {
+        if ts_ms < 0 {
+            return;
+        }
+        if let Some(acc) = self.parts.get_mut(&(topic_idx, partition)) {
+            acc.min_ts_ms = Some(acc.min_ts_ms.map_or(ts_ms, |m| m.min(ts_ms)));
+            acc.max_ts_ms = Some(acc.max_ts_ms.map_or(ts_ms, |m| m.max(ts_ms)));
+        }
     }
 
     /// Whether this topic has reached its budget for the pass.
@@ -929,6 +948,11 @@ impl SourceAdapter for KafkaSource {
                         // for Offset::Stored partitions below.
                         delivered_local.insert((idx, msg.partition()), msg.offset() + 1);
                         let kept = acc.push(idx, msg.partition(), msg.offset(), payload.to_vec());
+                        if kept {
+                            if let Some(ts_ms) = msg.timestamp().to_millis() {
+                                acc.note_timestamp(idx, msg.partition(), ts_ms);
+                            }
+                        }
                         must_reassign |= !kept;
                     }
                     // A full topic keeps DELIVERING otherwise: rdkafka would
@@ -1019,8 +1043,12 @@ impl SourceAdapter for KafkaSource {
                 progress_start: mk(part.start_offset, part.start_offset),
                 progress_end: mk(part.start_offset, part.end_offset.max(part.start_offset)),
                 records: part.records,
-                first_timestamp: None,
-                last_timestamp: None,
+                first_timestamp: part
+                    .min_ts_ms
+                    .and_then(vtop_core::event_time::format_millis),
+                last_timestamp: part
+                    .max_ts_ms
+                    .and_then(vtop_core::event_time::format_millis),
                 // Kafka messages are newline-framed into the object
                 // (offset-based, not byte-exact), so records are re-framed on
                 // serialization.
@@ -1506,5 +1534,22 @@ mod tests {
         assert_eq!(sorted.len(), 1);
         assert_eq!((sorted[0].0, sorted[0].1), (1, 0));
         assert_eq!(sorted[0].2.records, vec![b"preserve".to_vec()]);
+    }
+
+    /// #559: a partition's records carry the earliest and latest message
+    /// timestamp of what was KEPT - out-of-order producer times give a range,
+    /// a rejected message does not widen it, and "no timestamp" is ignored.
+    #[test]
+    fn a_partition_reports_the_time_range_of_the_records_it_kept() {
+        let mut acc = MultiTopicAcc::new(1, 3, usize::MAX);
+        for (offset, ts) in [(0, 2_000), (1, 1_000), (2, -1)] {
+            assert!(acc.push(0, 0, offset, b"r".to_vec()));
+            acc.note_timestamp(0, 0, ts);
+        }
+        // At budget: rejected, and the caller only notes kept messages.
+        assert!(!acc.push(0, 0, 3, b"r".to_vec()));
+        let parts = acc.into_sorted();
+        assert_eq!(parts[0].2.min_ts_ms, Some(1_000));
+        assert_eq!(parts[0].2.max_ts_ms, Some(2_000));
     }
 }

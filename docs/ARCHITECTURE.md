@@ -338,6 +338,26 @@ s3://{bucket}/{prefix}/tenant={tenant}/source={source}/format={format}/year={yyy
 
 The bound manifest is stored at the same prefix as `{batch_id}.manifest.json`.
 
+**Which clock picks the time partition** (`partitioning.time_source`, #559):
+
+- `seal` (default): the instant the batch was sealed, fixed before compression,
+  checksumming and upload. A slow upload or a retry within the batch does not
+  move it. Late data, a backlog drain and a replay land in the hour they were
+  **sealed** in — a replay of yesterday's range is a new batch and is filed
+  under today. Partitions used to come from the wall clock at upload, so a
+  batch sealed at 12:59 and uploaded at 13:00 was filed under hour 13.
+- `event`: the earliest record time the source reported. Only the Kafka source
+  reports one (the message timestamp — producer `CreateTime` or broker
+  `LogAppendTime`, whichever the topic uses); a batch from a source that reports
+  none falls back to its seal time. Late data lands in the hour it **happened**
+  in, which can be a partition a downstream reader has already processed:
+  readers that need completeness must look back, or use the manifests.
+
+Either way the manifest's `first_timestamp` / `last_timestamp` are the batch's
+earliest and latest record times when the source reports them (Kafka), and
+absent otherwise. They are a minimum and a maximum, not the first and last
+record's times: producer timestamps arrive out of order.
+
 - **Extensible fields:** the path **may** be extended with `environment`, `facility`, `severity`, `retention_class`, `region`, `site`.
 - **Per-format buckets:** bucket names may be templated, e.g. `bucket: "telemetry-{format}"`, with optional on-demand bucket creation via `ensure_bucket`. The fully resolved bucket and key are recorded in the manifest.
 
