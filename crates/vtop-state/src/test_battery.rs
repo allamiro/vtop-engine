@@ -349,13 +349,51 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
             want("/same.log", Some(5), 70),
         ]
     );
-    // Rows of another source type never appear.
-    assert!(store
+    // Rows of another source type never appear in a File answer, and a
+    // SyslogSpool row is answered for SyslogSpool alone — with its own inode.
+    let spool_marker = |path: &str, inode: Option<u64>, end: u64| ProgressMarker::SyslogSpool {
+        spool_id: "s".into(),
+        path: path.into(),
+        inode,
+        start_byte: 0,
+        end_byte: end,
+        received_time_start: None,
+        received_time_end: None,
+    };
+    for (id, inode, end) in [("cur-s1", Some(31), 500), ("cur-s2", Some(32), 20)] {
+        let mut r = sample_record(id);
+        r.source_type = SourceType::SyslogSpool;
+        r.source_name = "/rot-spool.log".to_string();
+        r.progress_start = spool_marker("/rot-spool.log", inode, 0);
+        r.progress_end = spool_marker("/rot-spool.log", inode, end);
+        store.save_batch_state(&r).await.unwrap();
+        let p = BatchPatch::default();
+        for st in LEGAL_WALK {
+            store.update_batch_state(id, st, &p).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let spool = store
         .committed_cursors(SourceType::SyslogSpool)
+        .await
+        .unwrap();
+    assert_eq!(
+        spool
+            .iter()
+            .filter(|c| c.path == "/rot-spool.log")
+            .collect::<Vec<_>>(),
+        vec![&want("/rot-spool.log", Some(32), 20)],
+        "the spool answers with the newest inode and that inode's maximum"
+    );
+    assert!(spool
+        .iter()
+        .all(|c| !["/rot.log", "/same.log", "/legacy.log"].contains(&c.path.as_str())));
+    assert!(store
+        .committed_cursors(SourceType::File)
         .await
         .unwrap()
         .iter()
-        .all(|c| !["/rot.log", "/same.log", "/legacy.log"].contains(&c.path.as_str())));
+        .all(|c| c.path != "/rot-spool.log"));
 }
 
 /// #93: the claim primitive is what makes N engines safe over one store. A

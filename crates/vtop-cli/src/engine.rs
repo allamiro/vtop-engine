@@ -1873,18 +1873,29 @@ impl Engine {
         // concurrency of 8 the queue alone could hold ~800 MiB of avoidable
         // copies — the clone is not bounded by the concurrency limit, only the
         // execution is.
-        let verified: Vec<Result<VerifyStep, VtopError>> =
-            futures::stream::iter(work.into_iter().map(|(source, read, stream)| {
-                let pipeline = &pipeline;
-                async move {
-                    pipeline
-                        .process_until_verified(&source, read, stream.as_ref())
-                        .await
-                }
-            }))
+        let mut verified: Vec<(usize, Result<VerifyStep, VtopError>)> =
+            futures::stream::iter(work.into_iter().enumerate().map(
+                |(order, (source, read, stream))| {
+                    let pipeline = &pipeline;
+                    async move {
+                        let step = pipeline
+                            .process_until_verified(&source, read, stream.as_ref())
+                            .await;
+                        (order, step)
+                    }
+                },
+            ))
             .buffer_unordered(limit)
             .collect()
             .await;
+        // Verification finishes in whatever order the store answers, but the
+        // commits are applied in the order the windows were READ. When a
+        // rotation seals the old file's window and starts a new one in the
+        // same cycle, both are in flight at once; committing the new file's
+        // window first would leave the OLD one as the most recent commit, and
+        // the restart seed (the newest committed row's inode) would then name a
+        // file that is no longer there and re-read the live one from byte 0.
+        verified.sort_by_key(|(order, _)| *order);
 
         // The cycle's verdict for the width controller (#102): any throttle
         // in it halves the next width; none grows it by one.
@@ -1917,7 +1928,7 @@ impl Engine {
         // Nothing verified is abandoned, and the caller still sees the failure.
         let mut outcomes = Vec::new();
         let mut first_err: Option<VtopError> = None;
-        for step in verified {
+        for (_, step) in verified {
             match step {
                 Ok(VerifyStep::Finished(outcome)) => outcomes.push(outcome),
                 Ok(VerifyStep::Verified(v)) => {

@@ -292,8 +292,18 @@ What follows from that, in the engine:
   but the cursor stays on the current file.
 - **Replay refuses a range from a file that has changed.** The old bytes are
   not at those offsets any more, and rewinding the new file there would archive
-  its middle as though it were the lost range. The adapter returns an error and
-  the engine reports that the range will not be re-read.
+  its middle as though it were the lost range. The adapters return an error
+  when the inode differs from the marker's, when the file is shorter than the
+  range's start, or (file sources, whose markers record the length at read
+  time) when it is shorter than it was when the range was read. A spool marker
+  without an inode keeps the older size-only check, and a spool truncated and
+  regrown past the range's start cannot be told from the original. How the
+  engine reports a refused rewind is described in section 13.
+- **Commits are applied in the order the windows were read**, not the order
+  their uploads finish. A rotation seals the old file's window and starts a new
+  one in the same cycle, so both are in flight at once; committing the new
+  window first would leave the old file as the most recent commit and make the
+  restart seed name a file that is gone.
 - **A restart seeds the cursor with the inode** the offset came from
   (`StateStore::committed_cursors`: the inode of the most recent committed
   batch, and the highest committed offset among that inode's batches only). A
@@ -311,6 +321,15 @@ Limits, stated plainly:
   truncate are lost by the rotation tool before the engine can see them. If the
   file also regrows beyond the old read position before the next read, the
   truncation is invisible to the adapter.
+- A file is identified by its **inode number alone**. Inode numbers are unique
+  per filesystem, not per host, so a replacement on a *different* filesystem
+  that happens to reuse the number is not detected as a rotation (markers do
+  not record the device). Rotation within one filesystem, which is what log
+  rotation does, is.
+- Late commits are judged against the file as it is NOW (another inode, or an
+  end beyond its length). A `copytruncate` followed by a regrow past the old
+  end before the late commit lands cannot be told from the original; that is
+  the same invisible case as a regrow before the next read, above.
 - History pruning keeps one row per path, so a file untouched for longer than
   the retention window can lose the rows that name its inode. The restart then
   reads it from byte 0 again: duplicates, bounded by the file.

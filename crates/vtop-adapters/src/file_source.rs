@@ -863,7 +863,9 @@ impl SourceAdapter for FileSource {
         // read. The batch is archived and its ledger row commits; only the
         // cursor stays put (#558).
         let (current_inode, current_size, _) = Self::file_identity(Path::new(path));
-        if continuity::commit_is_current(*marker_inode, current_inode, current_size, *end_byte) {
+        let still_current =
+            continuity::commit_is_current(*marker_inode, current_inode, current_size, *end_byte);
+        if still_current {
             let c = self.cursors.entry(path.clone()).or_default();
             c.committed_byte = *end_byte;
             if c.read_byte < *end_byte {
@@ -883,13 +885,23 @@ impl SourceAdapter for FileSource {
             // Validate file identity before the irreversible delete: if the path
             // now points to a different inode than the batch's marker (rotation
             // / replacement), deleting would destroy an unrelated/newer file.
+            //
+            // The same goes for a file that was TRUNCATED since the batch was
+            // read: the inode is unchanged and the old range ends beyond the
+            // new length, so `end_byte >= size` below would hold for a stale
+            // commit and delete the new, unarchived content (#558).
             let (cur_inode, size, _) = Self::file_identity(Path::new(path));
             let identity_ok = match (marker_inode, cur_inode) {
                 (Some(m), Some(cur)) => *m == cur,
                 (None, None) => true, // platform without inode support: size-only
                 _ => false,
             };
-            if !identity_ok {
+            if !still_current {
+                tracing::warn!(
+                    path,
+                    "skipping delete-after-commit: the file was rotated or truncated since this batch was read"
+                );
+            } else if !identity_ok {
                 tracing::warn!(
                     path,
                     "skipping delete-after-commit: file identity changed (possible rotation/replacement)"
@@ -906,6 +918,7 @@ impl SourceAdapter for FileSource {
             path,
             start_byte,
             inode: marker_inode,
+            file_size: size_when_read,
             ..
         } = marker
         else {
@@ -929,9 +942,15 @@ impl SourceAdapter for FileSource {
                 )));
             }
         }
-        if *start_byte > current_size {
+        // The marker records how long the file was when the range was read,
+        // and an append-only file only grows. A file now SHORTER than that has
+        // been truncated, even when the range starts early enough to fit in
+        // what is left: replaying from byte 0 would archive replacement bytes
+        // as though they were the range that was lost.
+        if *start_byte > current_size || current_size < *size_when_read {
             return Err(VtopError::Source(format!(
-                "cannot replay file {path} at byte {start_byte}: file length is {current_size} (truncated)"
+                "cannot replay file {path} at byte {start_byte}: file length is {current_size} \
+                 (truncated; it was {size_when_read} when this range was read)"
             )));
         }
         let c = self.cursors.entry(path.clone()).or_default();
@@ -2003,6 +2022,82 @@ mod tests {
         std::fs::write(&path, "fresh content here\n").unwrap();
         let err = fs.replay_from_marker(&start).await.unwrap_err().to_string();
         assert!(err.contains("identity changed"), "{err}");
+    }
+
+    /// `delete_after_commit` removes a source file once a batch reaching its
+    /// end commits. A batch read BEFORE a truncation commits afterwards, with
+    /// an end beyond the new length: the inode is unchanged and `end >= size`
+    /// holds, so the stale commit deleted the new, unarchived content.
+    #[tokio::test]
+    async fn a_stale_commit_does_not_delete_a_truncated_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "aaa\nbbb\nccc\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true);
+        let old = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let old_end = old[0].progress_end.clone();
+
+        // Truncated in place, then rewritten shorter.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"zzz\n")
+            .unwrap();
+        fs.commit_progress(&old_end).await.unwrap();
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "the new content has not been archived and must not be deleted"
+        );
+
+        // The control: a commit that really reaches the end of the file it was
+        // read from still deletes it.
+        let fresh = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&fresh[0].progress_end).await.unwrap();
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "archived, so removed"
+        );
+    }
+
+    /// A range that starts early enough to fit in what is left of a truncated
+    /// file must still not be replayed: the bytes there are not the ones read.
+    #[tokio::test]
+    async fn replay_refuses_a_file_shorter_than_it_was_when_the_range_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "aaa\nbbb\nccc\nddd\n").unwrap(); // 16 bytes
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let start = read[0].progress_start.clone();
+        let ProgressMarker::File { file_size, .. } = &start else {
+            panic!("a file marker");
+        };
+        assert_eq!(
+            *file_size, 16,
+            "the start marker records the length the file had when it was read"
+        );
+
+        // Truncated to 8 bytes: byte 0 is still inside the file.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"zzz\nyyy\n")
+            .unwrap();
+        let err = fs.replay_from_marker(&start).await.unwrap_err().to_string();
+        assert!(err.contains("truncated"), "{err}");
     }
 
     /// The restart seed names the file its offset came from. A cursor seeded
