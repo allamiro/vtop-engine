@@ -182,9 +182,9 @@ pub const MIN_LEASE_SKEW_BOUND_MS: u64 = 1_000;
 ///
 /// The skew is measured when the request reaches the leader, so time on the
 /// wire counts against it, always in the direction of the proposer looking
-/// behind. A request that spends longer than the bound getting there is
-/// refused and retried next round - its deadline would already be stale by
-/// that much.
+/// behind. A request whose timestamp is older than the tolerated skew when it
+/// arrives is refused and retried next round with a fresh one; its deadline
+/// is not yet stale, but it can no longer be told apart from a slow clock.
 pub fn lease_skew_bound_ms(lease_duration_ms: u64) -> u64 {
     (lease_duration_ms / 20)
         .max(MIN_LEASE_SKEW_BOUND_MS)

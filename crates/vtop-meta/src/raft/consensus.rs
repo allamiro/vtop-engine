@@ -718,21 +718,34 @@ impl Consensus for OpenraftConsensus {
         // Only the LEADER judges. A follower's clock may differ from the
         // proposer's by more than the bound while the leader's does not, and a
         // `ClockSkew` from a follower is not a redirect: the client would keep
-        // retrying the follower instead of reaching the leader. A follower
-        // lets `client_write` answer with `NotLeader`, as it always has.
+        // retrying the follower instead of reaching the leader.
+        //
+        // And a lease command reaches `client_write` ONLY through a node that
+        // judged it as leader. A follower used to pass it on to
+        // `client_write` unjudged, trusting that call to redirect - but if
+        // the follower won an election in between, `client_write` accepted it
+        // as the new leader, and an hour-skewed proposer that hit that window
+        // could steal or poison a lease (review of #566). A non-leader now
+        // redirects lease commands itself; a leader that loses office after
+        // judging is refused by `client_write`, which cannot append once it
+        // is not the leader.
         //
         // And only a NEW request is judged. One that already committed is
         // answered from the dedup table by `client_write`; a retry whose
         // timestamp has aged past the bound since the original must still get
         // that answer, not a skew error about a request that succeeded.
-        if self.raft.metrics().borrow().state == ServerState::Leader {
-            if let Some(skew) = command.lease_clock_skew(self.leader_now_ms()) {
-                if !skew.is_within_bound() && !self.already_applied(skew.request_id) {
-                    return Err(ConsensusError::ClockSkew {
-                        skew_ms: skew.skew_ms,
-                        bound_ms: skew.bound_ms,
-                    });
-                }
+        if let Some(skew) = command.lease_clock_skew(self.leader_now_ms()) {
+            let metrics = self.raft.metrics().borrow().clone();
+            if metrics.state != ServerState::Leader {
+                return Err(ConsensusError::NotLeader {
+                    leader: metrics.current_leader.map(MetaNodeId),
+                });
+            }
+            if !skew.is_within_bound() && !self.already_applied(skew.request_id) {
+                return Err(ConsensusError::ClockSkew {
+                    skew_ms: skew.skew_ms,
+                    bound_ms: skew.bound_ms,
+                });
             }
         }
         let response = self

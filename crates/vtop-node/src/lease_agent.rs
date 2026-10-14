@@ -85,6 +85,19 @@ pub trait QuorumProbe: Send + Sync {
     /// leader measures it. A replica that could not be fenced must report
     /// `None` — absent from the quorum — rather than its last known offset.
     async fn probe(&self, fencing_epoch: u64) -> Vec<crate::promotion::ReplicaProbe>;
+    /// [`Self::probe`], answering within `budget`: a replica that has not
+    /// answered by then is absent, and the ones that did still count. A
+    /// promotion runs inside the agent's round, and one blackholed follower
+    /// must not cost the answers of the rest - with a 3-replica set the
+    /// candidate and one follower ARE the quorum (review of #566).
+    async fn probe_within(
+        &self,
+        fencing_epoch: u64,
+        budget: Duration,
+    ) -> Vec<crate::promotion::ReplicaProbe> {
+        let _ = budget;
+        self.probe(fencing_epoch).await
+    }
     /// The CONFIGURED replica-set size, not the number that answered.
     fn replication_factor(&self) -> usize;
     /// The candidate's own sealed-prefix end at promotion, for the
@@ -252,6 +265,35 @@ impl ReplicaPlaneProbe {
 #[async_trait::async_trait]
 impl QuorumProbe for ReplicaPlaneProbe {
     async fn probe(&self, fencing_epoch: u64) -> Vec<crate::promotion::ReplicaProbe> {
+        self.probe_bounded(fencing_epoch, None).await
+    }
+
+    async fn probe_within(
+        &self,
+        fencing_epoch: u64,
+        budget: Duration,
+    ) -> Vec<crate::promotion::ReplicaProbe> {
+        self.probe_bounded(fencing_epoch, Some(budget)).await
+    }
+
+    fn replication_factor(&self) -> usize {
+        // The leader plus its configured followers.
+        self.followers.len() + 1
+    }
+
+    fn sealed_prefix_end(&self) -> Option<u64> {
+        self.view.sealed_prefix_end()
+    }
+}
+
+impl ReplicaPlaneProbe {
+    /// Every follower is fenced concurrently; with a `budget`, each fence
+    /// that has not answered when it runs out is counted absent.
+    async fn probe_bounded(
+        &self,
+        fencing_epoch: u64,
+        budget: Option<Duration>,
+    ) -> Vec<crate::promotion::ReplicaProbe> {
         // THE LOCAL LOG IS STOPPED BEFORE IT IS COUNTED (review, #410).
         // Every remote vote below is read from a log its fence has just
         // stopped, and the local one gets no exemption: a candidate's view
@@ -359,17 +401,21 @@ impl QuorumProbe for ReplicaPlaneProbe {
                 }
                 None => follower.addr,
             };
-            let fenced = self
-                .client
-                .fence(
-                    addr,
-                    &follower.server_name,
-                    follower.node_uuid,
-                    &self.range,
-                    fencing_epoch,
-                    leader_epoch_starts,
-                )
-                .await;
+            let fence = self.client.fence(
+                addr,
+                &follower.server_name,
+                follower.node_uuid,
+                &self.range,
+                fencing_epoch,
+                leader_epoch_starts,
+            );
+            let fenced = match budget {
+                None => fence.await.map_err(|error| error.to_string()),
+                Some(budget) => match tokio::time::timeout(budget, fence).await {
+                    Ok(answer) => answer.map_err(|error| error.to_string()),
+                    Err(_) => Err(format!("no answer within the probe's {budget:?}")),
+                },
+            };
             crate::promotion::ReplicaProbe {
                 node_id: follower.node_uuid,
                 local_committed_offset: match fenced {
@@ -407,15 +453,6 @@ impl QuorumProbe for ReplicaPlaneProbe {
         .await;
         probes.extend(answers);
         probes
-    }
-
-    fn replication_factor(&self) -> usize {
-        // The leader plus its configured followers.
-        self.followers.len() + 1
-    }
-
-    fn sealed_prefix_end(&self) -> Option<u64> {
-        self.view.sealed_prefix_end()
     }
 }
 
@@ -878,11 +915,44 @@ enum Promoted {
 /// never published, so its `Pending` record is rightly no floor.
 #[async_trait::async_trait]
 pub trait TransitionReporter: Send + Sync {
+    /// Record `outcome` under `request_id`. The caller chooses the id so that
+    /// a report whose answer never arrived can be sent again AS THE SAME
+    /// REQUEST: metadata's dedup table then answers with what the first one
+    /// did, instead of a fresh report being refused because the first one
+    /// already recorded the outcome (review of #566).
     async fn report(
         &self,
         fencing_epoch: u64,
         outcome: vtop_meta::PromotionOutcome,
-    ) -> Result<(), String>;
+        request_id: Uuid,
+    ) -> Result<(), ReportFailure>;
+}
+
+/// Why a promotion report did not succeed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReportFailure {
+    /// Metadata answered, and the answer was no.
+    Refused(String),
+    /// No answer: it may or may not have been recorded.
+    Unanswered(String),
+}
+
+impl std::fmt::Display for ReportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReportFailure::Refused(why) | ReportFailure::Unanswered(why) => f.write_str(why),
+        }
+    }
+}
+
+/// An Established report whose answer never arrived, kept so the next round
+/// resolves it before anything else (review of #566).
+#[derive(Clone, Debug)]
+struct UnansweredReport {
+    fencing_epoch: u64,
+    outcome: vtop_meta::PromotionOutcome,
+    committed_offset: Option<u64>,
+    request_id: Uuid,
 }
 
 /// The reporter over the admin plane: a bounded proposal, retried a few
@@ -902,9 +972,13 @@ impl TransitionReporter for AdminTransitionReporter {
         &self,
         fencing_epoch: u64,
         outcome: vtop_meta::PromotionOutcome,
-    ) -> Result<(), String> {
+        request_id: Uuid,
+    ) -> Result<(), ReportFailure> {
         let command = MetadataCommand::ReportPromotionOutcome {
-            env: envelope(),
+            env: CommandEnvelope {
+                request_id,
+                issued_at_ms: now_ms(),
+            },
             topic_uuid: self.topic_uuid,
             range_uuid: self.range_uuid,
             holder_node_uuid: self.node_uuid,
@@ -928,10 +1002,10 @@ impl TransitionReporter for AdminTransitionReporter {
                         return Ok(());
                     }
                     other => {
-                        return Err(format!(
+                        return Err(ReportFailure::Refused(format!(
                             "metadata refused the promotion report ({other:?}); the transition \
                              stays as it was"
-                        ));
+                        )));
                     }
                 },
                 Ok(Err(error)) => last = format!("promotion report not delivered: {error}"),
@@ -946,7 +1020,9 @@ impl TransitionReporter for AdminTransitionReporter {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(4));
         }
-        Err(format!("{last} (after 5 attempts)"))
+        Err(ReportFailure::Unanswered(format!(
+            "{last} (after 5 attempts)"
+        )))
     }
 }
 
@@ -994,6 +1070,8 @@ struct Promoter {
     /// cover too: the reporter alone retries five times with backoff, which
     /// is several renew intervals (review of #566).
     round: RoundClock,
+    /// An Established report sent and never answered (review of #566).
+    unanswered: Option<UnansweredReport>,
 }
 
 impl Promoter {
@@ -1012,6 +1090,56 @@ impl Promoter {
         if self.verified_epoch == Some(fencing_epoch) {
             return true;
         }
+        // A report sent for THIS epoch whose answer never came may have been
+        // recorded. Probing afresh and reporting again would be refused once
+        // it was - the outcome is already established - and the lease would
+        // lapse into another epoch. So the same request goes first: metadata
+        // answers a recorded one from its dedup table, and records an
+        // unrecorded one now; the boundary it carries was proven on logs
+        // this epoch's fence stopped, so it still stands (review of #566).
+        if let Some(pending) = self.unanswered.take() {
+            if pending.fencing_epoch == fencing_epoch {
+                let answer = self
+                    .within_round(self.reporter.report(
+                        fencing_epoch,
+                        pending.outcome.clone(),
+                        pending.request_id,
+                    ))
+                    .await
+                    .unwrap_or_else(|| {
+                        Err(ReportFailure::Unanswered(
+                            "the round's budget ran out before metadata answered".to_owned(),
+                        ))
+                    });
+                match answer {
+                    Ok(()) => {
+                        self.publisher
+                            .promote(fencing_epoch, pending.committed_offset);
+                        self.verified_epoch = Some(fencing_epoch);
+                        tracing::info!(
+                            range = %self.range_uuid,
+                            fencing_epoch,
+                            "range lease held: the earlier unanswered report was recorded"
+                        );
+                        return true;
+                    }
+                    Err(ReportFailure::Unanswered(error)) => {
+                        tracing::warn!(
+                            range = %self.range_uuid,
+                            fencing_epoch,
+                            %error,
+                            "the earlier promotion report is still unanswered; holding the epoch"
+                        );
+                        self.unanswered = Some(pending);
+                        self.quorum_miss = true;
+                        self.suspended(fencing_epoch);
+                        return false;
+                    }
+                    // A definite no: verify afresh below.
+                    Err(ReportFailure::Refused(_)) => {}
+                }
+            }
+        }
         let committed_offset = match self.probe.as_ref() {
             // A standalone range has no quorum to establish against and
             // promotes on its own durable boundary; requiring one it cannot
@@ -1021,10 +1149,21 @@ impl Promoter {
                 // A probe the round could not wait for has no answers: the
                 // same verdict as a quorum that did not answer, retried next
                 // round.
-                let probes = self
-                    .within_round(probe.probe(fencing_epoch))
-                    .await
-                    .unwrap_or_default();
+                //
+                // Half of what is left, and per replica: a follower that has
+                // not answered by then is absent and the others still count,
+                // and the other half is the report's. Cancelling the whole
+                // probe at the round's end threw away a quorum the candidate
+                // and one healthy follower had already formed (review of
+                // #566).
+                let probes = match self.round.remaining() {
+                    Some(left) => {
+                        self.within_round(probe.probe_within(fencing_epoch, left / 2))
+                            .await
+                    }
+                    None => Some(probe.probe(fencing_epoch).await),
+                }
+                .unwrap_or_default();
                 match crate::promotion::establish(
                     &probes,
                     probe.replication_factor(),
@@ -1204,13 +1343,27 @@ impl Promoter {
         // not a boundary nobody will know about: the epoch is held still and
         // the next round verifies again.
         if let Some(outcome) = self.evidence.take() {
+            let request_id = Uuid::new_v4();
             let reported = self
-                .within_round(self.reporter.report(fencing_epoch, outcome))
+                .within_round(
+                    self.reporter
+                        .report(fencing_epoch, outcome.clone(), request_id),
+                )
                 .await
                 .unwrap_or_else(|| {
-                    Err("the round's budget ran out before metadata answered".to_owned())
+                    Err(ReportFailure::Unanswered(
+                        "the round's budget ran out before metadata answered".to_owned(),
+                    ))
                 });
             if let Err(error) = reported {
+                if matches!(error, ReportFailure::Unanswered(_)) {
+                    self.unanswered = Some(UnansweredReport {
+                        fencing_epoch,
+                        outcome,
+                        committed_offset,
+                        request_id,
+                    });
+                }
                 tracing::warn!(
                     range = %self.range_uuid,
                     fencing_epoch,
@@ -1236,10 +1389,12 @@ impl Promoter {
     async fn report_refusal(&mut self, fencing_epoch: u64) {
         if let Some(outcome) = self.evidence.take() {
             let reported = self
-                .within_round(self.reporter.report(fencing_epoch, outcome))
+                .within_round(self.reporter.report(fencing_epoch, outcome, Uuid::new_v4()))
                 .await
                 .unwrap_or_else(|| {
-                    Err("the round's budget ran out before metadata answered".to_owned())
+                    Err(ReportFailure::Unanswered(
+                        "the round's budget ran out before metadata answered".to_owned(),
+                    ))
                 });
             if let Err(error) = reported {
                 tracing::warn!(
@@ -1810,6 +1965,7 @@ impl LeaseAgent {
                 stand_aside: false,
                 published_floor: None,
                 round: round_clock.clone(),
+                unanswered: None,
             },
             state: LeaseState::NotHeld,
             ready: None,
@@ -3664,6 +3820,7 @@ mod tests {
             range_uuid: Uuid::from_u128(21),
             published_floor: None,
             round: RoundClock::default(),
+            unanswered: None,
         }
     }
 
@@ -3697,12 +3854,15 @@ mod tests {
             &self,
             fencing_epoch: u64,
             outcome: vtop_meta::PromotionOutcome,
-        ) -> Result<(), String> {
+            _request_id: Uuid,
+        ) -> Result<(), ReportFailure> {
             if self
                 .refuse_reports
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
-                return Err("metadata unreachable (test)".to_owned());
+                return Err(ReportFailure::Unanswered(
+                    "metadata unreachable (test)".to_owned(),
+                ));
             }
             self.reported.lock().unwrap().push((fencing_epoch, outcome));
             Ok(())
@@ -3778,7 +3938,8 @@ mod tests {
                 &self,
                 _fencing_epoch: u64,
                 _outcome: vtop_meta::PromotionOutcome,
-            ) -> Result<(), String> {
+                _request_id: Uuid,
+            ) -> Result<(), ReportFailure> {
                 std::future::pending().await
             }
         }
@@ -3800,6 +3961,108 @@ mod tests {
         );
         assert!(recorder.promoted.lock().unwrap().is_empty());
         assert_eq!(*recorder.suspended.lock().unwrap(), vec![3]);
+    }
+
+    /// Review of #566: a round can end after an Established report commits
+    /// but before its answer arrives. A fresh report next round would be
+    /// refused - the outcome is already recorded - and the lease would lapse.
+    /// The next round re-sends the SAME request instead, which metadata
+    /// answers from its dedup table, and exposes the boundary.
+    #[tokio::test]
+    async fn an_unanswered_report_is_resolved_as_the_same_request_next_round() {
+        use std::sync::Mutex;
+        struct Dedup {
+            seen: Mutex<Vec<Uuid>>,
+        }
+        #[async_trait::async_trait]
+        impl TransitionReporter for Dedup {
+            async fn report(
+                &self,
+                _fencing_epoch: u64,
+                _outcome: vtop_meta::PromotionOutcome,
+                request_id: Uuid,
+            ) -> Result<(), ReportFailure> {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(request_id);
+                match seen.len() {
+                    // Recorded, but the answer never arrives.
+                    1 => Err(ReportFailure::Unanswered("timed out".into())),
+                    // The dedup table answers the same request...
+                    _ if request_id == seen[0] => Ok(()),
+                    // ...and refuses a new one: the outcome is recorded.
+                    _ => Err(ReportFailure::Refused("already established".into())),
+                }
+            }
+        }
+        let recorder = Arc::new(Recorder::default());
+        let reporter = Arc::new(Dedup {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut promoter = promoter_with(recorder.clone(), reporter.clone(), None);
+
+        assert!(!promoter.ensure(4).await, "unanswered: not exposed");
+        assert!(recorder.promoted.lock().unwrap().is_empty());
+        assert!(promoter.ensure(4).await, "the same request resolves it");
+        assert_eq!(recorder.promoted.lock().unwrap().len(), 1);
+        let seen = reporter.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0], seen[1], "the retry was a new request");
+    }
+
+    /// Review of #566: one follower that never answers must not cost the
+    /// answers of the rest. The promoter probes with a deadline inside the
+    /// round, so the candidate and the healthy follower still make the
+    /// 2-of-3 quorum.
+    #[tokio::test]
+    async fn a_blackholed_follower_does_not_cost_the_quorum_the_others_formed() {
+        use std::sync::Mutex;
+        struct PartlyBlackholed {
+            budget: Mutex<Option<Duration>>,
+        }
+        #[async_trait::async_trait]
+        impl QuorumProbe for PartlyBlackholed {
+            async fn probe(&self, _fencing_epoch: u64) -> Vec<crate::promotion::ReplicaProbe> {
+                // Without a deadline the third replica is waited on forever.
+                std::future::pending().await
+            }
+            async fn probe_within(
+                &self,
+                _fencing_epoch: u64,
+                budget: Duration,
+            ) -> Vec<crate::promotion::ReplicaProbe> {
+                *self.budget.lock().unwrap() = Some(budget);
+                tokio::time::sleep(budget).await;
+                vec![at(1, Some(10)), at(2, Some(10)), at(3, None)]
+            }
+            fn replication_factor(&self) -> usize {
+                3
+            }
+        }
+        let recorder = Arc::new(Recorder::default());
+        let probe = Arc::new(PartlyBlackholed {
+            budget: Mutex::new(None),
+        });
+        let mut promoter = promoter(
+            Arc::clone(&recorder),
+            Some(probe.clone() as Arc<dyn QuorumProbe>),
+        );
+        let round = promoter.round.clone();
+        let total = Duration::from_millis(400);
+        let _open = round.open(total);
+        assert!(
+            promoter.ensure(5).await,
+            "the candidate and one follower are a quorum of three"
+        );
+        let budget = probe
+            .budget
+            .lock()
+            .unwrap()
+            .expect("probed with a deadline");
+        assert!(
+            budget <= total / 2,
+            "the probe took {budget:?} of a {total:?} round"
+        );
+        assert_eq!(recorder.promoted.lock().unwrap().len(), 1);
     }
 
     /// A refused promotion must PUBLISH the refusal, not merely flip local
