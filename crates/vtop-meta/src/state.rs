@@ -1211,6 +1211,12 @@ impl MetaStateMachine {
         self.dedup_responses.contains_key(&request_id)
     }
 
+    /// The response a request with this id was applied with, while the
+    /// dedup table still remembers it.
+    pub fn applied_response(&self, request_id: Uuid) -> Option<&MetadataResponse> {
+        self.dedup_responses.get(&request_id)
+    }
+
     /// Apply one command at `apply_index`. Pure and deterministic: identical
     /// (state, index, command) triples always produce identical responses
     /// and identical successor states on every replica.

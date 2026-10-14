@@ -198,12 +198,22 @@ impl OpenraftConsensus {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::sync::Arc::new(clock));
     }
 
-    /// Whether a request with this id was already applied on this node. False
-    /// when the node has no applied state to ask (a bare-Raft harness): the
-    /// check then errs towards judging the request.
-    fn already_applied(&self, request_id: uuid::Uuid) -> bool {
-        self.store.as_ref().is_some_and(|store| {
-            store.with_storage(|storage| storage.state().has_applied_request(request_id))
+    /// The receipt for a request this node already applied, answered from
+    /// its dedup table: the original response, as of the applied index it
+    /// was read at. `None` when the table no longer remembers it, or the node
+    /// has no applied state to ask (a bare-Raft harness) - the caller then
+    /// judges the request as new.
+    fn applied_receipt(&self, request_id: uuid::Uuid) -> Option<CommitReceipt> {
+        let store = self.store.as_ref()?;
+        let response =
+            store.with_storage(|storage| storage.state().applied_response(request_id).cloned())?;
+        let applied = self.raft.metrics().borrow().last_applied?;
+        Some(CommitReceipt {
+            log_id: WireLogId {
+                term: applied.leader_id.term,
+                index: to_meta_index(applied.index),
+            },
+            response,
         })
     }
 
@@ -730,10 +740,14 @@ impl Consensus for OpenraftConsensus {
         // judging is refused by `client_write`, which cannot append once it
         // is not the leader.
         //
-        // And only a NEW request is judged. One that already committed is
-        // answered from the dedup table by `client_write`; a retry whose
-        // timestamp has aged past the bound since the original must still get
-        // that answer, not a skew error about a request that succeeded.
+        // And only a NEW request is judged. A retry whose timestamp has aged
+        // past the bound since the original committed must still get the
+        // original's answer, not a skew error about a request that succeeded
+        // - and it gets it HERE, read from the dedup table and returned,
+        // never passed on to `client_write` (review of #566): between a
+        // check that found it and the write, other commands can evict it
+        // from the full table, and the stale command would then be applied
+        // as new, past the very bound this exists to enforce.
         if let Some(skew) = command.lease_clock_skew(self.leader_now_ms()) {
             let metrics = self.raft.metrics().borrow().clone();
             if metrics.state != ServerState::Leader {
@@ -741,7 +755,10 @@ impl Consensus for OpenraftConsensus {
                     leader: metrics.current_leader.map(MetaNodeId),
                 });
             }
-            if !skew.is_within_bound() && !self.already_applied(skew.request_id) {
+            if !skew.is_within_bound() {
+                if let Some(receipt) = self.applied_receipt(skew.request_id) {
+                    return Ok(receipt);
+                }
                 return Err(ConsensusError::ClockSkew {
                     skew_ms: skew.skew_ms,
                     bound_ms: skew.bound_ms,

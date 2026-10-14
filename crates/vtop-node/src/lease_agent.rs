@@ -345,6 +345,12 @@ impl ReplicaPlaneProbe {
             })
             .collect();
         let leader_epoch_starts = &leader_epoch_starts;
+        // ONE deadline per follower for the lookup AND the fence (review of
+        // #566): a fence timeout that started only after a slow lookup let
+        // one follower outlast the round, and the round's own deadline then
+        // cancelled the whole probe - discarding the answers that HAD come
+        // back. Fixed here, before any follower starts.
+        let deadline = budget.map(|budget| tokio::time::Instant::now() + budget);
         // Concurrent: a follower that has stopped answering must not add its
         // full deadline to every other follower's wait.
         let answers = futures::future::join_all(self.followers.iter().map(|follower| async move {
@@ -361,9 +367,14 @@ impl ReplicaPlaneProbe {
             // Bounded by the same deadline the fence itself gets: a probe that
             // waited out a stalled resolver would spend the round budget
             // before asking a single replica anything.
+            let resolve_within = match deadline {
+                Some(deadline) => PROBE_RESOLVE_TIMEOUT
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                None => PROBE_RESOLVE_TIMEOUT,
+            };
             let addr = match &follower.host {
                 Some(host) => {
-                    match vtop_broker::replication::address_now(host, PROBE_RESOLVE_TIMEOUT).await {
+                    match vtop_broker::replication::address_now(host, resolve_within).await {
                         // REMEMBERED ON RESOLUTION, and this reverses an
                         // earlier revision that waited for a fence to prove it
                         // (review, twice, in both directions — so here is the
@@ -409,12 +420,16 @@ impl ReplicaPlaneProbe {
                 fencing_epoch,
                 leader_epoch_starts,
             );
-            let fenced = match budget {
-                None => fence.await.map_err(|error| error.to_string()),
-                Some(budget) => match tokio::time::timeout(budget, fence).await {
-                    Ok(answer) => answer.map_err(|error| error.to_string()),
-                    Err(_) => Err(format!("no answer within the probe's {budget:?}")),
-                },
+            let fenced = match (budget, deadline) {
+                (Some(budget), Some(deadline)) => {
+                    match tokio::time::timeout_at(deadline, fence).await {
+                        Ok(answer) => answer.map_err(|error| error.to_string()),
+                        Err(_) => Err(format!(
+                            "no answer within the probe's {budget:?} (lookup and fence together)"
+                        )),
+                    }
+                }
+                _ => fence.await.map_err(|error| error.to_string()),
             };
             crate::promotion::ReplicaProbe {
                 node_id: follower.node_uuid,
@@ -1493,6 +1508,18 @@ impl RoundClock {
 
 struct RoundGuard(RoundClock);
 
+/// A published-floor scan's progress for one epoch (see
+/// [`LeaseAgent::floor_scan`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FloorScan {
+    for_epoch: u64,
+    /// The epoch the next page starts at.
+    next_from: u64,
+    /// The highest Established boundary in the pages read so far.
+    floor: Option<u64>,
+    complete: bool,
+}
+
 impl Drop for RoundGuard {
     fn drop(&mut self) {
         *self.0.slot() = None;
@@ -1849,6 +1876,15 @@ pub struct LeaseAgent {
     /// not an epoch) — and only an answer that stops naming this node
     /// clears it. See [`stood_down_verdict`].
     stood_down_latched: bool,
+    /// How far the published-floor scan for the epoch being verified got
+    /// (review of #566). Each page is drawn from the round's budget, so a
+    /// long transition chain can outlast a round; restarting at epoch 1 every
+    /// round would never finish, and the range would never promote. A round
+    /// that runs out mid-scan leaves the progress here and the next round
+    /// for the SAME epoch resumes it - no weaker than one long scan, which
+    /// reads its early pages earlier than its late ones too. A different
+    /// epoch starts over.
+    floor_scan: Option<FloorScan>,
     /// The instant the current round's RPC budget runs out (see
     /// [`LeaseAgent::bounded`]). Open for the span of a round and closed by a
     /// guard when the round ends OR is dropped by a `select!`, so a shutdown
@@ -1972,6 +2008,7 @@ impl LeaseAgent {
             stand_down: None,
             stood_down_latched: false,
             round_clock,
+            floor_scan: None,
             gate: None,
             gate_degraded: false,
             range_missing: false,
@@ -2668,24 +2705,45 @@ impl LeaseAgent {
     /// holds the new boundary to. Every Established record in chain order
     /// counts, whatever the audit later says of its vote; `None` when no
     /// promotion has published a boundary yet.
-    async fn read_published_floor(&self) -> Result<Option<u64>, String> {
+    ///
+    /// Resumable per epoch (see [`LeaseAgent::floor_scan`]): a page that does
+    /// not answer within the round's budget fails this round, keeping the
+    /// pages already read, and the next round verifying the same epoch
+    /// continues from the next page.
+    async fn read_published_floor(&mut self, fencing_epoch: u64) -> Result<Option<u64>, String> {
         const PAGE: u16 = 256;
-        let mut from_epoch = 1;
-        let mut floor: Option<u64> = None;
-        loop {
-            let page = self
+        let mut scan = match self.floor_scan.take() {
+            Some(scan) if scan.for_epoch == fencing_epoch => scan,
+            _ => FloorScan {
+                for_epoch: fencing_epoch,
+                next_from: 1,
+                floor: None,
+                complete: false,
+            },
+        };
+        while !scan.complete {
+            let page = match self
                 .bounded(
                     "read range transitions",
                     self.admin.read_range_transitions(
                         self.topic_uuid,
                         self.range_uuid,
-                        from_epoch,
+                        scan.next_from,
                         PAGE,
                     ),
                 )
-                .await?;
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    self.floor_scan = Some(scan);
+                    return Err(error);
+                }
+            };
             if !page.found {
-                return Ok(None);
+                scan.floor = None;
+                scan.complete = true;
+                break;
             }
             for view in &page.transitions {
                 if let vtop_meta::TransitionOutcome::Reported {
@@ -2697,16 +2755,19 @@ impl LeaseAgent {
                     ..
                 } = &view.outcome
                 {
-                    floor = Some(floor.map_or(*boundary, |seen| seen.max(*boundary)));
+                    scan.floor = Some(scan.floor.map_or(*boundary, |seen| seen.max(*boundary)));
                 }
             }
             match page.transitions.last() {
                 Some(last) if page.transitions.len() == usize::from(PAGE) => {
-                    from_epoch = last.epoch_to.saturating_add(1);
+                    scan.next_from = last.epoch_to.saturating_add(1);
                 }
-                _ => return Ok(floor),
+                _ => scan.complete = true,
             }
         }
+        let floor = scan.floor;
+        self.floor_scan = Some(scan);
+        Ok(floor)
     }
 
     async fn publish_held(&mut self, fencing_epoch: u64, held_until_ms: Option<i64>) -> Promoted {
@@ -2716,7 +2777,7 @@ impl LeaseAgent {
         // still and the next round reads again, the same way a quorum that
         // did not answer is treated.
         if self.promoter.verified_epoch != Some(fencing_epoch) {
-            match self.read_published_floor().await {
+            match self.read_published_floor(fencing_epoch).await {
                 Ok(floor) => self.promoter.published_floor = floor,
                 Err(error) => {
                     tracing::warn!(
@@ -3824,6 +3885,201 @@ mod tests {
         }
     }
 
+    /// A metadata node serving a long transition chain, one page at a time,
+    /// each page taking `delay`; it records where each page started. Epoch
+    /// 600 carries an Established boundary of 77.
+    struct SlowChain {
+        chain_len: u64,
+        delay: Duration,
+        asked: std::sync::Mutex<Vec<u64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl vtop_meta::AdminHandler for SlowChain {
+        async fn status(
+            &self,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::AdminStatusResponse> {
+            Ok(vtop_meta::transport::stub_status(vtop_meta::MetaNodeId(1)))
+        }
+        async fn propose(
+            &self,
+            _command: MetadataCommand,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::transport::AdminProposeResponse>
+        {
+            Err(unused())
+        }
+        async fn init(
+            &self,
+            _members: Vec<u64>,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::transport::AdminMembershipResponse>
+        {
+            Err(unused())
+        }
+        async fn add_learner(
+            &self,
+            _node_id: u64,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::transport::AdminMembershipResponse>
+        {
+            Err(unused())
+        }
+        async fn change_membership(
+            &self,
+            _voters: Vec<u64>,
+            _retain: bool,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::transport::AdminMembershipResponse>
+        {
+            Err(unused())
+        }
+        async fn read_range_lease(
+            &self,
+            _request: vtop_meta::AdminReadRangeLeaseRequest,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::AdminReadRangeLeaseResponse> {
+            Err(unused())
+        }
+        async fn read_segment_placement(
+            &self,
+            _request: vtop_meta::transport::AdminReadSegmentPlacementRequest,
+        ) -> vtop_meta::transport::TransportResult<
+            vtop_meta::transport::AdminReadSegmentPlacementResponse,
+        > {
+            Err(unused())
+        }
+        async fn read_range_transitions(
+            &self,
+            request: vtop_meta::AdminReadRangeTransitionsRequest,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::AdminReadRangeTransitionsResponse>
+        {
+            self.asked.lock().unwrap().push(request.from_epoch);
+            tokio::time::sleep(self.delay).await;
+            let end = (request.from_epoch + u64::from(request.limit) - 1).min(self.chain_len);
+            let transitions = (request.from_epoch..=end)
+                .map(|epoch| vtop_meta::AdminTransitionView {
+                    epoch_from: epoch - 1,
+                    epoch_to: epoch,
+                    holder_from: None,
+                    holder_to: Uuid::from_u128(1),
+                    grant: vtop_meta::GrantKind::Election,
+                    granted_at_ms: 0,
+                    granted_apply_index: epoch,
+                    outcome: if epoch == 600 {
+                        vtop_meta::TransitionOutcome::Reported {
+                            outcome: vtop_meta::PromotionOutcome::Established {
+                                boundary_offset: Some(77),
+                                sealed_prefix_end: None,
+                                quorum: Vec::new(),
+                                votes: 0,
+                                required: 0,
+                            },
+                            reported_at_ms: 0,
+                            reported_apply_index: epoch,
+                        }
+                    } else {
+                        vtop_meta::TransitionOutcome::Pending
+                    },
+                    mac: None,
+                })
+                .collect();
+            Ok(vtop_meta::AdminReadRangeTransitionsResponse {
+                found: true,
+                transitions,
+                read_at_applied_index: 1,
+            })
+        }
+    }
+
+    fn unused() -> vtop_meta::transport::TransportError {
+        vtop_meta::transport::TransportError::Protocol("not served by this fake".into())
+    }
+
+    /// Review of #566: each page of the published-floor scan draws on the
+    /// round's budget, and a chain longer than a round can read used to be
+    /// restarted at epoch 1 every round - the scan never finished and the
+    /// range never promoted. 700 transitions are three pages of 150 ms
+    /// against a 400 ms round: the first round reads two and runs out, the
+    /// next resumes at the third (not at 1) and finds the boundary of 77
+    /// there. A different epoch starts over.
+    #[tokio::test]
+    async fn a_floor_scan_longer_than_a_round_resumes_where_it_stopped() {
+        let handler = Arc::new(SlowChain {
+            chain_len: 700,
+            delay: Duration::from_millis(150),
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = vtop_meta::AdminServer::plaintext(
+            Arc::clone(&handler) as Arc<dyn vtop_meta::AdminHandler>,
+            vtop_meta::transport::AdminAuthorizer::permissive(),
+        )
+        .unwrap();
+        let serving = tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        let admin = AdminClient::plaintext(vec![vtop_meta::AdminCandidate {
+            node_id: Some(vtop_meta::MetaNodeId(1)),
+            endpoint,
+            host: None,
+            server_name: String::new(),
+            plaintext: true,
+        }])
+        .unwrap();
+        let config = LeaseAgentConfig {
+            lease_duration: Duration::from_secs(5),
+            renew_interval: Duration::from_millis(400),
+            poll_interval: Duration::from_millis(200),
+        };
+        let mut agent = LeaseAgent::new(
+            admin,
+            config,
+            Uuid::from_u128(1),
+            Uuid::from_u128(20),
+            Uuid::from_u128(21),
+            Arc::new(Recorder::default()),
+            None,
+        )
+        .unwrap();
+
+        let first = {
+            let _round = agent.round_clock.open(agent.rpc_deadline());
+            agent.read_published_floor(9).await
+        };
+        assert!(
+            first.is_err(),
+            "three pages cannot fit one round: {first:?}"
+        );
+        let after_first = handler.asked.lock().unwrap().len();
+
+        let second = {
+            let _round = agent.round_clock.open(agent.rpc_deadline());
+            agent.read_published_floor(9).await
+        };
+        assert_eq!(
+            second,
+            Ok(Some(77)),
+            "the resumed scan finds epoch 600's boundary"
+        );
+        let resumed = handler.asked.lock().unwrap()[after_first..].to_vec();
+        assert_eq!(
+            resumed.first(),
+            Some(&513),
+            "the second round resumes at the page the first could not finish: {resumed:?}"
+        );
+        assert!(!resumed.contains(&1), "{resumed:?}");
+
+        // Verified: a later call for the same epoch asks nothing more.
+        let asked = handler.asked.lock().unwrap().len();
+        assert_eq!(agent.read_published_floor(9).await, Ok(Some(77)));
+        assert_eq!(handler.asked.lock().unwrap().len(), asked);
+
+        // A new epoch reads the chain afresh.
+        let _ = {
+            let _round = agent.round_clock.open(agent.rpc_deadline());
+            agent.read_published_floor(10).await
+        };
+        assert_eq!(handler.asked.lock().unwrap()[asked], 1);
+        serving.abort();
+    }
+
     #[derive(Default)]
     struct Recorder {
         promoted: std::sync::Mutex<Vec<(u64, Option<u64>)>>,
@@ -4426,6 +4682,81 @@ mod tests {
             .find(|entry| entry.node_id == leader_uuid)
             .expect("the leader probes its own disk");
         assert!(leader.local_committed_offset.is_some());
+    }
+
+    /// Review of #566: one deadline covers a follower's lookup AND its fence.
+    /// A named follower that accepts the connection and never answers, a
+    /// client whose own timeout is far longer, and a 300 ms probe budget:
+    /// the probe returns inside the budget, the follower absent and the
+    /// leader's own vote kept - nothing waits on the client's timeout, and
+    /// the answers that did arrive are not discarded by an outer cancel.
+    #[tokio::test]
+    async fn a_bounded_probe_returns_within_its_budget_with_the_answers_it_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let leader_uuid = Uuid::from_u128(1);
+        let follower_uuid = Uuid::from_u128(2);
+        let broker = Arc::new(test_broker(dir.path(), 5));
+
+        let certified = rcgen::generate_simple_self_signed(vec!["replica".to_owned()]).unwrap();
+        let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+        let mut trust_roots = rustls::RootCertStore::empty();
+        trust_roots.add(cert.clone()).unwrap();
+        let client = vtop_broker::replication::ReplicaStatusClient::new(
+            vtop_broker::replication::ReplicaTlsMaterial {
+                certificate_chain: vec![cert],
+                private_key: rustls::pki_types::PrivatePkcs8KeyDer::from(
+                    certified.signing_key.serialize_der(),
+                )
+                .into(),
+                trust_roots,
+            },
+        )
+        .unwrap()
+        .with_timeout(std::time::Duration::from_secs(30));
+
+        // Accepts, reads nothing back, never closes: a wedged replica.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let probe = ReplicaPlaneProbe::new(
+            Arc::clone(&broker) as Arc<dyn CandidateLocalView>,
+            leader_uuid,
+            client,
+            vec![FollowerEndpoint {
+                node_uuid: follower_uuid,
+                addr: "127.0.0.1:1".parse().unwrap(),
+                // Named, so the lookup runs inside the same deadline.
+                host: Some(format!("localhost:{port}")),
+                server_name: "replica".to_owned(),
+            }],
+            broker.range().clone(),
+        );
+
+        let started = std::time::Instant::now();
+        let probes = probe
+            .probe_within(6, std::time::Duration::from_millis(300))
+            .await;
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(1_500),
+            "a 300 ms budget, and the probe took {took:?}"
+        );
+        let follower = probes
+            .iter()
+            .find(|entry| entry.node_id == follower_uuid)
+            .expect("the follower appears, as absent");
+        assert_eq!(follower.local_committed_offset, None);
+        let leader = probes
+            .iter()
+            .find(|entry| entry.node_id == leader_uuid)
+            .expect("the leader's own answer is kept");
+        assert!(leader.local_committed_offset.is_some());
+        silent.abort();
     }
 
     /// The probe must fence at the epoch being promoted, not some other one.

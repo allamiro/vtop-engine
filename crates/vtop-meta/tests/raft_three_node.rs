@@ -1084,6 +1084,7 @@ async fn the_leader_refuses_a_skewed_lease_proposer_so_it_cannot_steal_or_poison
     //    table even when its timestamp has aged past the bound since: a skew
     //    error about a request that succeeded would tell the caller it failed.
     leader_clock.store(LEADER_NOW + HOUR_MS, Ordering::SeqCst);
+    let log_before = cluster.leader().raft.metrics().borrow().last_log_index;
     let retried = consensus.propose(granted).await;
     assert!(
         matches!(
@@ -1091,6 +1092,13 @@ async fn the_leader_refuses_a_skewed_lease_proposer_so_it_cannot_steal_or_poison
             Ok(ref r) if matches!(r.response, MetadataResponse::LeaseGranted { fencing_epoch } if fencing_epoch == epoch)
         ),
         "a committed request must be answered from the dedup table (seed={seed:#x}): {retried:?}"
+    );
+    // ...answered, not re-proposed (review of #566): a stale command that
+    // reached the log could be applied as new if the table evicted it first.
+    assert_eq!(
+        cluster.leader().raft.metrics().borrow().last_log_index,
+        log_before,
+        "the aged retry reached the log (seed={seed:#x})"
     );
     leader_clock.store(LEADER_NOW, Ordering::SeqCst);
 
