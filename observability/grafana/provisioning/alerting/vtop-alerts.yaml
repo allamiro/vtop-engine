@@ -85,3 +85,394 @@ groups:
             five minutes. They will never be archived. Size retention above the worst-case
             lag and check consumer lag; the engine's log carries the WARN naming the rule.
           runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#retention-loss"
+
+      # The data plane's retention cannot bring a range under its bound (#561).
+      # committed_floor: the oldest segment holds records a follower has not
+      # acknowledged or the quorum mark has not passed, so disk grows past the bound
+      # until replication catches up. active_segment: the bound is smaller than one
+      # segment. Either way the range is over its bound and the pass is quiet about
+      # it; 15 minutes rides out a follower restart.
+      - uid: vtop-retention-blocked
+        title: Range retention blocked
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: mimir
+            model:
+              refId: A
+              instant: true
+              expr: max by (topic, range, reason) (vtop_broker_retention_blocked)
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+                  operator:
+                    type: and
+                  query:
+                    params: [C]
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        isPaused: false
+        labels:
+          severity: warning
+          service: vtop-node
+        annotations:
+          summary: "Range retention is blocked"
+          description: >-
+            Range {{ $labels.range }} of {{ $labels.topic }} is above its retention bound and the
+            pass cannot reclaim it ({{ $labels.reason }}). committed_floor: a follower or the
+            quorum mark is behind - check vtop_broker_follower_lag_records. active_segment: the
+            bound is smaller than one segment.
+          runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#retention-blocked"
+
+      # A retention pass that fails outright is retried after the next append; one
+      # that keeps failing leaves disk unreclaimed (#561).
+      - uid: vtop-retention-failing
+        title: Range retention failing
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: mimir
+            model:
+              refId: A
+              instant: true
+              expr: max by (topic, range) (vtop_broker_retention_last_pass_failed)
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+                  operator:
+                    type: and
+                  query:
+                    params: [C]
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        isPaused: false
+        labels:
+          severity: warning
+          service: vtop-node
+        annotations:
+          summary: "Range retention keeps failing"
+          description: >-
+            Every retention pass on range {{ $labels.range }} of {{ $labels.topic }} has failed for
+            ten minutes. The node's log names the error.
+          runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#retention-blocked"
+
+      # The leader holds no replication stream to a follower. Two minutes rides out
+      # a rolling restart; past that the range runs on fewer replicas than it was
+      # sized for, and a quorum produce may already be failing (#561).
+      - uid: vtop-follower-disconnected
+        title: Follower disconnected
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: mimir
+            model:
+              refId: A
+              instant: true
+              expr: min by (follower) (vtop_broker_follower_connected)
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [1]
+                  operator:
+                    type: and
+                  query:
+                    params: [C]
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        isPaused: false
+        labels:
+          severity: warning
+          service: vtop-node
+        annotations:
+          summary: "A follower is disconnected from its leader"
+          description: >-
+            The leader has had no replication stream to follower {{ $labels.follower }} for two
+            minutes. The range is running with less redundancy than configured.
+          runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#replication-health"
+
+      # A follower whose lag only grows will not catch up on its own: it is starved
+      # of bandwidth or disk, and it holds the committed floor down, which blocks
+      # retention (#561). A burst grows lag briefly; 15 minutes of growth does not.
+      - uid: vtop-follower-lag-growing
+        title: Follower lag growing
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: mimir
+            model:
+              refId: A
+              instant: true
+              expr: max by (follower) (deriv(vtop_broker_follower_lag_records[10m]))
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+                  operator:
+                    type: and
+                  query:
+                    params: [C]
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        isPaused: false
+        labels:
+          severity: warning
+          service: vtop-node
+        annotations:
+          summary: "A follower's replication lag keeps growing"
+          description: >-
+            Follower {{ $labels.follower }} has fallen further behind for fifteen minutes. It holds
+            the committed floor down, which blocks retention on the range.
+          runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#replication-health"
+
+      # Each new fencing epoch is a leadership change. A few in half an hour means
+      # leases are lapsing - stalls, skew, or a lease too short for the metadata
+      # commit latency - and every failover costs a fence and a probe (#561).
+      - uid: vtop-fencing-epoch-churn
+        title: Fencing epoch churn
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 1800
+              to: 0
+            datasourceUid: mimir
+            model:
+              refId: A
+              instant: true
+              expr: max by (topic, range) (changes(vtop_broker_meta_fencing_epoch[30m]))
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [3]
+                  operator:
+                    type: and
+                  query:
+                    params: [C]
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        isPaused: false
+        labels:
+          severity: warning
+          service: vtop-node
+        annotations:
+          summary: "Range leadership is churning"
+          description: >-
+            Range {{ $labels.range }} of {{ $labels.topic }} changed leader {{ printf "%.0f" $values.A.Value }}
+            times in thirty minutes. Check lease renewals, clock skew and metadata commit latency.
+          runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#replication-health"
+
+      # After a promotion, fetch is refused until the new epoch's boundary marker is
+      # quorum-acknowledged. That should take about one replication round trip; two
+      # minutes is many leases' worth, and consumers are being refused meanwhile (#561).
+      - uid: vtop-boundary-pending
+        title: Promotion boundary stuck
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: mimir
+            model:
+              refId: A
+              instant: true
+              expr: max by (topic, range) (vtop_broker_boundary_pending)
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+                  operator:
+                    type: and
+                  query:
+                    params: [C]
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        isPaused: false
+        labels:
+          severity: page
+          service: vtop-node
+        annotations:
+          summary: "A promoted leader cannot establish its boundary"
+          description: >-
+            Range {{ $labels.range }} of {{ $labels.topic }} has refused fetch for two minutes because its
+            promotion boundary is not quorum-acknowledged. Check that a majority of followers is
+            connected.
+          runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#replication-health"
+
+      # A metadata leader that a quorum has not acknowledged for ten seconds is
+      # partitioned from its peers; lease renewals cannot commit, and ranges start
+      # failing over when their leases lapse (#561). -1 (not leading) never fires.
+      - uid: vtop-meta-quorum-ack-age
+        title: Metadata leader lost its quorum
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: mimir
+            model:
+              refId: A
+              instant: true
+              expr: max by (instance) (vtop_meta_raft_millis_since_quorum_ack)
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [10000]
+                  operator:
+                    type: and
+                  query:
+                    params: [C]
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        isPaused: false
+        labels:
+          severity: page
+          service: vtop-node
+        annotations:
+          summary: "A metadata leader has lost its quorum"
+          description: >-
+            The metadata leader on {{ $labels.instance }} has not been acknowledged by a quorum for
+            {{ printf "%.0f" $values.A.Value }} ms. Lease renewals cannot commit until it recovers or a new
+            leader is elected.
+          runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#replication-health"

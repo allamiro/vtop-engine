@@ -113,6 +113,40 @@ dashboard's total starts again from zero. The durable record of a loss is the
 WARN line the adapter logs, which Loki keeps; the counter and the alert are
 how you notice it.
 
+### Retention blocked
+
+The native broker reclaims a range's oldest sealed segments once the range is
+over its byte bound - but never past the committed floor, the offset every
+replica has acknowledged. A follower that falls behind therefore holds
+retention back, and disk grows past the bound. The pass used to report that
+exactly as it reported a range comfortably under its bound: silently.
+`vtop_broker_retention_blocked{reason}` now says which: `committed_floor` (fix
+the follower; `vtop_broker_follower_lag_records` names it) or `active_segment`
+(the bound is smaller than one segment). The node logs the change once, not
+every append. The rule **Range retention blocked** fires after 15 minutes, and
+**Range retention failing** after 10 minutes of failed passes.
+
+### Replication health
+
+Rules on metrics the nodes already exported, which nothing watched:
+
+| Rule | Fires when | For |
+|---|---|---|
+| Follower disconnected | `vtop_broker_follower_connected` is 0 | 2 min |
+| Follower lag growing | `deriv(vtop_broker_follower_lag_records[10m])` stays positive | 15 min |
+| Fencing epoch churn | more than 3 `vtop_broker_meta_fencing_epoch` changes in 30 min | — |
+| Promotion boundary stuck | `vtop_broker_boundary_pending` stays 1 (fetch is refused meanwhile) | 2 min |
+| Metadata leader lost its quorum | `vtop_meta_raft_millis_since_quorum_ack` above 10 s | 1 min |
+
+The follower series come from a leader's collector; a candidate deployment
+exports the range and retention gauges but not per-follower ones, so those two
+rules stay silent (no data is not an alert) there. The thresholds are starting
+points for the lab's pacing, not tuned values.
+
+**Not covered yet:** per-consumer-group lag on the native broker, and time to
+eviction against retention. A group's committed position lives on the metadata
+plane, and nothing exports it beside the range's log start.
+
 ### Design decisions worth knowing
 
 - **Labels are bounded**: `tenant`, `source_type`, `format`, `stage`, `state` —
@@ -184,12 +218,14 @@ panel.
 - `MINIO_PROMETHEUS_AUTH_TYPE=public` disables auth on MinIO's metrics endpoint —
   **never do that outside a lab**;
 - Alloy holds a (read-only) docker socket to discover containers and read logs;
-- one alert rule, file-provisioned from
+- eight alert rules, file-provisioned from
   `grafana/provisioning/alerting/vtop-alerts.yaml`: **Records lost to
   retention** fires on any increase of `vtop_retention_lost_records_total`
-  (#454). No contact point is provisioned, so it shows in Grafana's alert list
-  and on the engine dashboard, and goes nowhere else — wire a contact point and
-  a notification policy for a real deployment. Grafana creates the rule's
+  (#454), and seven data-plane and metadata rules cover retention and
+  replication health (#561; see [retention blocked](#retention-blocked) and
+  [replication health](#replication-health)). No contact point is provisioned,
+  so a firing rule shows in Grafana's alert list and goes nowhere else — wire a
+  contact point and a notification policy for a real deployment. Grafana creates the rule's
   `VTOP` folder at boot; the dashboard seeder adopts it, so the rule and the
   dashboards share one folder.
 

@@ -42,11 +42,12 @@ use std::sync::Arc;
 use uuid::Uuid;
 use vtop_broker::memory_budget::BudgetRejectReason;
 use vtop_broker::replication::{InProcessFollower, NetworkedReplicaSet};
+use vtop_broker::retention_stats::RetentionSnapshot;
 use vtop_broker::server_metrics;
 use vtop_broker::{
     LocalBroker, RequestKind, RequestOutcome, ServerMetrics, LATENCY_BUCKETS_MICROS,
 };
-use vtop_log::RecoveryReport;
+use vtop_log::{RecoveryReport, RetentionBlocked};
 use vtop_meta::{OpenraftConsensus, RaftObservation, RaftServerState};
 use vtop_observe::{Readiness, ReadinessGate};
 
@@ -275,6 +276,81 @@ fn gauge_vec(name: &str, help: &str, labels: &[&str]) -> Result<IntGaugeVec, Str
         .map_err(|error| format!("build {name}: {error}"))
 }
 
+/// Retention on one range (#561), shared by every data-plane collector so the
+/// names are the same whichever role a replica holds.
+///
+/// Gauges, not counters: a candidate's role object is replaced on every
+/// transition, and a counter that restarted with it would read as a reset.
+/// What an alert needs is the CURRENT state - over the bound and why, or
+/// failing - and how far over.
+struct RetentionGauges {
+    retained_bytes: IntGaugeVec,
+    bound_bytes: IntGaugeVec,
+    blocked: IntGaugeVec,
+    failing: IntGaugeVec,
+}
+
+impl RetentionGauges {
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            retained_bytes: gauge_vec(
+                "broker_retention_retained_bytes",
+                "Content bytes the range holds after the latest retention pass",
+                &["topic", "range"],
+            )?,
+            bound_bytes: gauge_vec(
+                "broker_retention_bound_bytes",
+                "The range's retention bound in bytes (absent while retention is disabled)",
+                &["topic", "range"],
+            )?,
+            blocked: gauge_vec(
+                "broker_retention_blocked",
+                "1 while the latest retention pass ended above the bound, by reason: \
+                 committed_floor (the oldest segment holds records a follower or the quorum \
+                 mark has not passed) or active_segment (the bound is smaller than one segment)",
+                &["topic", "range", "reason"],
+            )?,
+            failing: gauge_vec(
+                "broker_retention_last_pass_failed",
+                "1 while the latest retention pass failed outright (it is retried after the \
+                 next append)",
+                &["topic", "range"],
+            )?,
+        })
+    }
+
+    fn members(&self) -> [&dyn Collector; 4] {
+        [
+            &self.retained_bytes,
+            &self.bound_bytes,
+            &self.blocked,
+            &self.failing,
+        ]
+    }
+
+    /// `None` leaves the gauges as they were: no pass has run on this role
+    /// yet, which is not news that retention stopped.
+    fn refresh(&self, range: &[&str; 2], snapshot: Option<RetentionSnapshot>) {
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        self.retained_bytes
+            .with_label_values(range)
+            .set(snapshot.retained_bytes as i64);
+        self.bound_bytes
+            .with_label_values(range)
+            .set(snapshot.bound_bytes as i64);
+        for reason in RetentionBlocked::ALL {
+            self.blocked
+                .with_label_values(&[range[0], range[1], reason.as_str()])
+                .set(i64::from(snapshot.blocked == Some(reason)));
+        }
+        self.failing
+            .with_label_values(range)
+            .set(i64::from(snapshot.last_pass_failed));
+    }
+}
+
 fn descs_of<'a>(members: &[&'a dyn Collector]) -> Vec<&'a Desc> {
     members.iter().flat_map(|m| m.desc()).collect()
 }
@@ -501,6 +577,7 @@ pub struct BrokerCollector {
     follower_durable_offset: IntGaugeVec,
     follower_lag_records: IntGaugeVec,
     follower_connected: IntGaugeVec,
+    retention: RetentionGauges,
 
     group_commit_last_batch_records: IntGauge,
     group_commit_last_batch_bytes: IntGauge,
@@ -582,6 +659,7 @@ impl BrokerCollector {
                 "1 while the leader holds a live replication stream to the follower",
                 &["follower"],
             )?,
+            retention: RetentionGauges::new()?,
             group_commits: CounterFamily::new(
                 "broker_group_commits_total",
                 "Commit groups sealed and fsynced",
@@ -648,7 +726,7 @@ impl BrokerCollector {
     }
 
     fn members(&self) -> Vec<&dyn Collector> {
-        vec![
+        let mut members: Vec<&dyn Collector> = vec![
             &self.local_committed,
             &self.next_offset,
             &self.cluster_committed,
@@ -663,7 +741,9 @@ impl BrokerCollector {
             &self.group_commit_last_batch_bytes,
             &self.memory_used_bytes,
             &self.memory_queue_depth,
-        ]
+        ];
+        members.extend(self.retention.members());
+        members
     }
 
     fn range(&self) -> [&str; 2] {
@@ -754,6 +834,9 @@ impl BrokerCollector {
                 .set(last.records as i64);
             self.group_commit_last_batch_bytes.set(last.bytes as i64);
         }
+
+        self.retention
+            .refresh(&range, self.broker.retention_stats().snapshot());
 
         let budget = self.broker.memory_budget().metrics();
         for (scope, used) in [
@@ -852,6 +935,7 @@ pub struct FollowerCollector {
     cluster_committed: IntGaugeVec,
     meta_fencing_epoch: IntGaugeVec,
     online: IntGaugeVec,
+    retention: RetentionGauges,
 }
 
 impl FollowerCollector {
@@ -886,17 +970,20 @@ impl FollowerCollector {
                 "1 while this follower accepts replication appends",
                 &["topic", "range"],
             )?,
+            retention: RetentionGauges::new()?,
         })
     }
 
     fn members(&self) -> Vec<&dyn Collector> {
-        vec![
+        let mut members: Vec<&dyn Collector> = vec![
             &self.local_committed,
             &self.next_offset,
             &self.cluster_committed,
             &self.meta_fencing_epoch,
             &self.online,
-        ]
+        ];
+        members.extend(self.retention.members());
+        members
     }
 
     fn refresh(&self) {
@@ -923,6 +1010,8 @@ impl FollowerCollector {
         self.online
             .with_label_values(&range)
             .set(i64::from(self.follower.is_online()));
+        self.retention
+            .refresh(&range, self.follower.retention_stats().snapshot());
     }
 }
 
@@ -970,6 +1059,12 @@ pub trait ReplicaObservation: Send + Sync {
     /// that does not lead has nothing pending.
     fn boundary_pending(&self) -> bool {
         false
+    }
+
+    /// What retention has been doing on the range (#561); `None` before any
+    /// pass, or from a view with no role installed.
+    fn retention(&self) -> Option<RetentionSnapshot> {
+        None
     }
 
     /// Everything the authorization gauges are derived from, AS ONE
@@ -1043,6 +1138,10 @@ impl ReplicaObservation for LocalBroker {
     fn boundary_pending(&self) -> bool {
         LocalBroker::boundary_pending(self)
     }
+
+    fn retention(&self) -> Option<RetentionSnapshot> {
+        self.retention_stats().snapshot()
+    }
 }
 
 impl ReplicaObservation for InProcessFollower {
@@ -1064,6 +1163,10 @@ impl ReplicaObservation for InProcessFollower {
 
     fn is_leading(&self) -> bool {
         false
+    }
+
+    fn retention(&self) -> Option<RetentionSnapshot> {
+        self.retention_stats().snapshot()
     }
 }
 
@@ -1108,6 +1211,7 @@ pub struct CandidateCollector {
     lease_active: IntGaugeVec,
     leading: IntGaugeVec,
     boundary_pending: IntGaugeVec,
+    retention: RetentionGauges,
     /// Serializes refresh-plus-collect (#411 review): the coherent-pair
     /// guarantee on `leading`/`lease_active` holds within one refresh, but
     /// two concurrent scrapes could interleave their gauge writes between
@@ -1173,12 +1277,13 @@ impl CandidateCollector {
                  beside broker_candidate_leading — 0 on a replica that does not lead.",
                 &["topic", "range"],
             )?,
+            retention: RetentionGauges::new()?,
             scrape: std::sync::Mutex::new(()),
         })
     }
 
     fn members(&self) -> Vec<&dyn Collector> {
-        vec![
+        let mut members: Vec<&dyn Collector> = vec![
             &self.local_committed,
             &self.next_offset,
             &self.cluster_committed,
@@ -1187,7 +1292,9 @@ impl CandidateCollector {
             &self.lease_active,
             &self.leading,
             &self.boundary_pending,
-        ]
+        ];
+        members.extend(self.retention.members());
+        members
     }
 
     fn refresh(&self) {
@@ -1207,6 +1314,7 @@ impl CandidateCollector {
                 .with_label_values(&range)
                 .set(cluster as i64);
         }
+        self.retention.refresh(&range, self.view.retention());
         // ONE observation of the role rather than an ownership question
         // followed by three answers, so a transition cannot land in the middle
         // of a scrape and have it publish half of each role (review; the
@@ -1978,6 +2086,111 @@ mod tests {
         assert!(
             pending_line(&text).is_some_and(|line| line.ends_with(" 0")),
             "acknowledged on the very next scrape: {text}"
+        );
+    }
+
+    /// #561: a range whose retention is blocked used to look exactly like one
+    /// under its bound. The state is exported under one name whichever role
+    /// holds the range, and nothing is exported before a pass has run.
+    #[test]
+    fn a_candidate_exports_whether_retention_is_blocked_and_why() {
+        use std::sync::Mutex;
+
+        struct Retaining {
+            snapshot: Mutex<Option<RetentionSnapshot>>,
+        }
+        impl ReplicaObservation for Retaining {
+            fn try_local_offsets(&self) -> Option<(u64, u64)> {
+                Some((9, 9))
+            }
+            fn cluster_committed_offset(&self) -> Option<u64> {
+                Some(9)
+            }
+            fn try_meta_fencing_epoch(&self) -> Option<(u64, bool)> {
+                Some((2, true))
+            }
+            fn held_fencing_epoch(&self) -> u64 {
+                2
+            }
+            fn is_leading(&self) -> bool {
+                false
+            }
+            fn retention(&self) -> Option<RetentionSnapshot> {
+                *self.snapshot.lock().unwrap()
+            }
+        }
+
+        let range = test_range();
+        let view = Arc::new(Retaining {
+            snapshot: Mutex::new(None),
+        });
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                CandidateCollector::new(Arc::clone(&view) as Arc<dyn ReplicaObservation>, &range)
+                    .unwrap(),
+            ))
+            .unwrap();
+        let line = |text: &str, prefix: &str| {
+            text.lines()
+                .find(|line| line.starts_with(prefix))
+                .map(str::to_owned)
+        };
+
+        let text = scrape(&registry);
+        assert!(
+            line(&text, "vtop_broker_retention_bound_bytes{").is_none(),
+            "no pass has run: nothing to report, not a bound of zero: {text}"
+        );
+
+        *view.snapshot.lock().unwrap() = Some(RetentionSnapshot {
+            retained_bytes: 900,
+            bound_bytes: 500,
+            blocked: Some(RetentionBlocked::CommittedFloor),
+            last_pass_failed: false,
+        });
+        let text = scrape(&registry);
+        let blocked = |text: &str, reason: &str| {
+            text.lines()
+                .find(|l| {
+                    l.starts_with("vtop_broker_retention_blocked{")
+                        && l.contains(&format!("reason=\"{reason}\""))
+                })
+                .map(str::to_owned)
+        };
+        assert!(
+            blocked(&text, "committed_floor").is_some_and(|l| l.ends_with(" 1")),
+            "{text}"
+        );
+        assert!(
+            blocked(&text, "active_segment").is_some_and(|l| l.ends_with(" 0")),
+            "{text}"
+        );
+        assert!(
+            line(&text, "vtop_broker_retention_retained_bytes{")
+                .is_some_and(|l| l.ends_with(" 900")),
+            "{text}"
+        );
+        assert!(
+            line(&text, "vtop_broker_retention_bound_bytes{").is_some_and(|l| l.ends_with(" 500")),
+            "{text}"
+        );
+
+        *view.snapshot.lock().unwrap() = Some(RetentionSnapshot {
+            retained_bytes: 400,
+            bound_bytes: 500,
+            blocked: None,
+            last_pass_failed: true,
+        });
+        let text = scrape(&registry);
+        assert!(
+            blocked(&text, "committed_floor").is_some_and(|l| l.ends_with(" 0")),
+            "{text}"
+        );
+        assert!(
+            line(&text, "vtop_broker_retention_last_pass_failed{")
+                .is_some_and(|l| l.ends_with(" 1")),
+            "{text}"
         );
     }
 
