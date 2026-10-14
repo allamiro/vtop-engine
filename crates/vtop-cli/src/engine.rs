@@ -2534,14 +2534,25 @@ impl Engine {
         }
         self.last_ledger_prune = Some(std::time::Instant::now());
         let cutoff = (chrono::Utc::now() - chrono::Duration::days(i64::from(days))).to_rfc3339();
-        match self
-            .store
-            .prune_committed_history(&cutoff, self.config.engine.ledger_prune_batch)
-            .await
+        // The rows go to a digest before they are deleted (#560): without it,
+        // a coverage audit would read the pruned history as holes, and lose
+        // the ledger's record of what each manifest was.
+        let digest_dir = crate::coverage::default_digest_dir(&self.config.engine.work_dir);
+        match crate::coverage::prune_with_digest(
+            self.store.as_ref(),
+            &cutoff,
+            self.config.engine.ledger_prune_batch,
+            &digest_dir,
+        )
+        .await
         {
-            Ok(0) => {}
-            Ok(deleted) => {
-                tracing::info!(deleted, "ledger retention pruned committed history");
+            Ok((0, _)) => {}
+            Ok((deleted, digest)) => {
+                tracing::info!(
+                    deleted,
+                    digest = ?digest,
+                    "ledger retention pruned committed history"
+                );
             }
             Err(error) => tracing::warn!(%error, "ledger retention prune failed"),
         }

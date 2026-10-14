@@ -52,6 +52,23 @@ const MAX_SERIALIZATION_RETRIES: u32 = 5;
 /// livelock cannot spin forever.
 const MAX_CONFLICT_RETRIES: u32 = 5;
 
+/// The prune predicate over a candidate row `b`, shared by the prune, the
+/// candidate listing and the listed delete (#560) so the three cannot drift.
+macro_rules! pg_prune_predicate_sql {
+    () => {
+        "b.state = $1 AND b.updated_at < $2 \
+          AND EXISTS ( \
+            SELECT 1 FROM batches n \
+            WHERE n.state = $1 \
+              AND n.source_type = b.source_type \
+              AND COALESCE(n.progress_end_json::jsonb ->> 'path', n.source_name) \
+                  = COALESCE(b.progress_end_json::jsonb ->> 'path', b.source_name) \
+              AND (n.created_at > b.created_at \
+                   OR (n.created_at = b.created_at AND n.batch_id > b.batch_id)) \
+          )"
+    };
+}
+
 /// Handle to the persistent Postgres-compatible state store.
 #[derive(Clone)]
 pub struct PgStateStore {
@@ -589,25 +606,57 @@ impl StateStore for PgStateStore {
         // idx_batches_commit_newest in migrations/postgres/0001_state_store.sql,
         // which bounds it.
         let result = with_retry(|| {
-            sqlx::query(
+            sqlx::query(concat!(
                 "DELETE FROM batches WHERE batch_id IN ( \
-                    SELECT b.batch_id FROM batches b \
-                    WHERE b.state = $1 AND b.updated_at < $2 \
-                      AND EXISTS ( \
-                        SELECT 1 FROM batches n \
-                        WHERE n.state = $1 \
-                          AND n.source_type = b.source_type \
-                          AND COALESCE(n.progress_end_json::jsonb ->> 'path', n.source_name) \
-                              = COALESCE(b.progress_end_json::jsonb ->> 'path', b.source_name) \
-                          AND (n.created_at > b.created_at \
-                               OR (n.created_at = b.created_at AND n.batch_id > b.batch_id)) \
-                      ) \
-                    LIMIT $3 \
-                )",
-            )
+                    SELECT b.batch_id FROM batches b WHERE ",
+                pg_prune_predicate_sql!(),
+                " LIMIT $3 )"
+            ))
             .bind(BatchState::SourceCommitted.as_str())
             .bind(older_than)
             .bind(i64::from(limit))
+            .execute(&self.pool)
+        })
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn prune_candidates(
+        &self,
+        older_than: &str,
+        limit: u32,
+    ) -> Result<Vec<BatchRecord>, VtopError> {
+        let rows = with_retry(|| {
+            sqlx::query(concat!(
+                "SELECT * FROM batches WHERE batch_id IN ( \
+                    SELECT b.batch_id FROM batches b WHERE ",
+                pg_prune_predicate_sql!(),
+                " LIMIT $3 ) ORDER BY created_at, batch_id"
+            ))
+            .bind(BatchState::SourceCommitted.as_str())
+            .bind(older_than)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+        })
+        .await?;
+        rows.into_iter().map(row_to_record).collect()
+    }
+
+    async fn prune_listed(&self, older_than: &str, batch_ids: &[String]) -> Result<u64, VtopError> {
+        if batch_ids.is_empty() {
+            return Ok(0);
+        }
+        let result = with_retry(|| {
+            sqlx::query(concat!(
+                "DELETE FROM batches WHERE batch_id IN ( \
+                    SELECT b.batch_id FROM batches b \
+                    WHERE b.batch_id = ANY($3) AND ",
+                pg_prune_predicate_sql!(),
+                " )"
+            ))
+            .bind(BatchState::SourceCommitted.as_str())
+            .bind(older_than)
+            .bind(batch_ids)
             .execute(&self.pool)
         })
         .await?;

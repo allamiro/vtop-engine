@@ -216,6 +216,7 @@ pub async fn run_fencing_battery(a: &dyn StateStore, b: &dyn StateStore) {
 /// by design and must keep failing it.
 pub async fn run_prune_battery(store: &dyn StateStore) {
     prune_preserves_cursor_seeds_and_bounds_deletion(store).await;
+    listed_prune_deletes_only_what_was_listed(store).await;
 }
 
 async fn empty_store_is_empty(store: &dyn StateStore) {
@@ -854,4 +855,90 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
             "{deleted} must be pruned"
         );
     }
+}
+
+/// #560: a prune that must keep an anchor lists its rows first and deletes
+/// only those - never a row it did not list, never a row that has since
+/// gained a reason to stay, and never more than the listing's limit.
+async fn listed_prune_deletes_only_what_was_listed(store: &dyn StateStore) {
+    let marker = |end: u64| ProgressMarker::File {
+        path: "/logs/listed".into(),
+        inode: None,
+        start_byte: 0,
+        end_byte: end,
+        file_size: end,
+        mtime: String::new(),
+    };
+    for (id, end) in [("lp-10", 10), ("lp-20", 20), ("lp-30", 30), ("lp-40", 40)] {
+        let mut rec = sample_record(id);
+        rec.source_type = SourceType::File;
+        rec.source_name = "listed-src".into();
+        rec.progress_start = marker(end - 10);
+        rec.progress_end = marker(end);
+        store.save_batch_state(&rec).await.unwrap();
+        for st in LEGAL_WALK {
+            store
+                .update_batch_state(id, st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+    }
+    let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    let ours = |rows: Vec<BatchRecord>| -> Vec<String> {
+        rows.into_iter()
+            .map(|r| r.batch_id)
+            .filter(|id| id.starts_with("lp-"))
+            .collect()
+    };
+
+    // Listing deletes nothing, and never names the row a seed needs.
+    let listed = ours(store.prune_candidates(&future, 1_000).await.unwrap());
+    assert_eq!(
+        listed,
+        ["lp-10", "lp-20", "lp-30"],
+        "the newest row is never a candidate"
+    );
+    assert!(
+        store.get_batch("lp-10").await.unwrap().is_some(),
+        "listing deleted a row"
+    );
+    let limited = store.prune_candidates(&future, 1).await.unwrap();
+    assert_eq!(limited.len(), 1, "the limit bounds the listing");
+
+    // Delete a listed SUBSET plus a row that was never a candidate: only the
+    // listed candidates go.
+    let deleted = store
+        .prune_listed(
+            &future,
+            &["lp-10".into(), "lp-40".into(), "no-such-row".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+    assert!(store.get_batch("lp-10").await.unwrap().is_none());
+    assert!(
+        store.get_batch("lp-40").await.unwrap().is_some(),
+        "the newest row of its path was deleted because it was named"
+    );
+    assert!(
+        store.get_batch("lp-20").await.unwrap().is_some(),
+        "a row that was listed but not named in the delete was deleted"
+    );
+    // An age cutoff the rows do not meet protects them even when named.
+    let past = "1970-01-01T00:00:00+00:00";
+    assert_eq!(
+        store
+            .prune_listed(past, &["lp-20".into(), "lp-30".into()])
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(store.prune_listed(&future, &[]).await.unwrap(), 0);
+    assert_eq!(
+        store
+            .prune_listed(&future, &["lp-20".into(), "lp-30".into()])
+            .await
+            .unwrap(),
+        2
+    );
 }
