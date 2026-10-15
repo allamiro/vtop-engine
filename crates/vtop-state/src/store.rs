@@ -11,7 +11,7 @@
 //! engine holds a `Box<dyn StateStore>`. Postgres arrives in Phase 3 behind a
 //! Cargo feature and implements the exact same trait.
 
-use crate::models::{BatchPatch, BatchRecord};
+use crate::models::{BatchPatch, BatchRecord, CommittedCursor};
 use crate::sqlite_store::SqliteStateStore;
 use async_trait::async_trait;
 use vtop_core::errors::VtopError;
@@ -25,24 +25,55 @@ use vtop_core::types::SourceType;
 /// - `sqlite://path`, `sqlite:path`, `sqlite::memory:`, or a bare path → SQLite
 /// - `postgres://…` / `postgresql://…` → Postgres (Phase 3, behind the
 ///   `postgres` feature; an unhelpful build without it returns a clear error)
+///
+/// Every request on the returned store is bounded by
+/// [`crate::deadline::DEFAULT_REQUEST_DEADLINE`] (#556); use
+/// [`connect_state_store_with_deadline`] to choose the bound.
 pub async fn connect_state_store(conn_str: &str) -> Result<Box<dyn StateStore>, VtopError> {
-    if conn_str.starts_with("postgres://") || conn_str.starts_with("postgresql://") {
-        #[cfg(feature = "postgres")]
-        {
-            let store = crate::pg_store::PgStateStore::connect(conn_str).await?;
-            return Ok(Box::new(store));
-        }
-        #[cfg(not(feature = "postgres"))]
-        {
-            return Err(VtopError::State(
-                "postgres:// state store requires a build with --features postgres".to_string(),
-            ));
-        }
-    }
-    // Everything else is treated as SQLite (including a bare filesystem path),
-    // matching the existing single-node default.
-    let store = SqliteStateStore::connect(conn_str).await?;
-    Ok(Box::new(store))
+    connect_state_store_with_deadline(conn_str, crate::deadline::DEFAULT_REQUEST_DEADLINE).await
+}
+
+/// [`connect_state_store`] with an explicit bound on every request: `point`
+/// for single-row operations, ten times it for whole-ledger scans. A store
+/// that stops answering then fails its request instead of blocking the caller
+/// (see [`crate::deadline`]). Opening a Postgres store (connecting and the
+/// schema check) is bounded by `point` as well.
+pub async fn connect_state_store_with_deadline(
+    conn_str: &str,
+    point: std::time::Duration,
+) -> Result<Box<dyn StateStore>, VtopError> {
+    let inner: Box<dyn StateStore> =
+        if conn_str.starts_with("postgres://") || conn_str.starts_with("postgresql://") {
+            #[cfg(feature = "postgres")]
+            {
+                // Opening the store is network work too: the pool connects and
+                // the schema check queries. A server that accepts the
+                // connection and goes silent would hang startup outside the
+                // bound the wrapper applies to every later request (review of
+                // #568).
+                let opened =
+                    tokio::time::timeout(point, crate::pg_store::PgStateStore::connect(conn_str))
+                        .await
+                        .map_err(|_| {
+                            VtopError::State(format!(
+                                "state store connect did not complete within {point:?} \
+                                 (dialing the server, the handshake, or the schema check)"
+                            ))
+                        })??;
+                Box::new(opened)
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                return Err(VtopError::State(
+                    "postgres:// state store requires a build with --features postgres".to_string(),
+                ));
+            }
+        } else {
+            // Everything else is treated as SQLite (including a bare filesystem
+            // path), matching the existing single-node default.
+            Box::new(SqliteStateStore::connect(conn_str).await?)
+        };
+    Ok(Box::new(crate::deadline::DeadlineStore::new(inner, point)))
 }
 
 /// Apply state-store schema migrations explicitly.
@@ -80,6 +111,25 @@ pub(crate) fn normalize_rfc3339_utc(label: &str, s: &str) -> Result<String, Vtop
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&chrono::Utc).to_rfc3339())
         .map_err(|e| VtopError::State(format!("{label} is not RFC3339 ({s}): {e}")))
+}
+
+/// `created_at` as the ledger stores it: UTC with exactly nine fraction digits.
+///
+/// The restart cursor and history pruning both pick a path's newest committed
+/// row by comparing `created_at` as TEXT (an index can serve that; a parsed
+/// instant cannot). Text order is time order only for one fixed-width form:
+/// `.1Z` sorts after `.15Z` though it is 50 ms earlier (review of #564).
+/// Rows the engine wrote before this (`to_rfc3339`: `+00:00`, 0, 3, 6 or 9
+/// digits) still sort below a canonical value of the same instant or later,
+/// because `+` and `.` sort below every digit. A value that does not parse is
+/// stored as given.
+pub(crate) fn canonical_created_at(s: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|d| {
+            d.with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, false)
+        })
+        .unwrap_or_else(|_| s.to_owned())
 }
 
 /// A durable, replay-safe ledger of batch state transitions.
@@ -137,6 +187,22 @@ pub trait StateStore: Send + Sync {
         source_type: SourceType,
     ) -> Result<Vec<(String, u64)>, VtopError>;
 
+    /// The cursor each byte-offset source path resumes from, computed IN THE
+    /// STORE like [`StateStore::max_committed_end_bytes`] (#77).
+    ///
+    /// Per path: the NEWEST committed batch - created last, which is the
+    /// window read last, ties by `batch_id` - and its own inode, end byte and
+    /// observed file size. Not a maximum: two files that have lived at one
+    /// path (#558), or one file before and after a `copytruncate` (same
+    /// inode, review of #564), must never lend each other an offset.
+    ///
+    /// History pruning keeps exactly this row for every path, so the answer
+    /// is the same before and after any prune.
+    async fn committed_cursors(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<CommittedCursor>, VtopError>;
+
     /// All batches, newest first.
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError>;
 
@@ -163,11 +229,13 @@ pub trait StateStore: Send + Sync {
     /// returns the number deleted. Three protections are non-negotiable:
     /// rows in any other state are never touched; rows at or after the
     /// cutoff are never touched; and for every source path (falling back to
-    /// `source_name` when the progress marker carries no path) the row with
-    /// the highest committed `end_byte` — ties broken by newest
-    /// `updated_at`, then `batch_id` — is always retained, so
-    /// [`StateStore::max_committed_end_bytes`] returns identical cursor
-    /// seeds before and after any prune.
+    /// `source_name` when the progress marker carries no path) the NEWEST
+    /// committed row - by `created_at`, then `batch_id` - is always retained,
+    /// so [`StateStore::committed_cursors`] returns identical cursor seeds
+    /// before and after any prune. [`StateStore::max_committed_end_bytes`]
+    /// is not prune-invariant: the highest end byte can belong to an older
+    /// generation of the file, which is exactly the row a restart must not
+    /// resume from.
     async fn prune_committed_history(&self, older_than: &str, limit: u32)
         -> Result<u64, VtopError>;
 }

@@ -66,6 +66,22 @@ impl PartitionContext {
     }
 }
 
+/// The instant that picks a batch's time partition under `policy` (#559):
+/// its seal time, or the earliest record time it carries when the policy asks
+/// for event time and the source reported one.
+pub fn partition_time(
+    policy: crate::config::PartitionTime,
+    sealed_at: DateTime<Utc>,
+    earliest_event: Option<&str>,
+) -> DateTime<Utc> {
+    match policy {
+        crate::config::PartitionTime::Seal => sealed_at,
+        crate::config::PartitionTime::Event => earliest_event
+            .and_then(crate::event_time::parse)
+            .unwrap_or(sealed_at),
+    }
+}
+
 /// Resolve `{placeholder}` tokens in `template` against `ctx`. Unknown tokens
 /// resolve to empty (and collapse cleanly). The result never contains leading
 /// or doubled slashes.
@@ -333,5 +349,36 @@ mod tests {
             object_file_name("b1", TelemetryFormat::Jsonl, CompressionType::None),
             "b1.jsonl"
         );
+    }
+
+    /// #559: the seal time is the default and does not move with the upload;
+    /// event time is opt-in, uses the earliest record time, and falls back to
+    /// the seal time when the source reported none (or a malformed one).
+    #[test]
+    fn the_partition_clock_is_seal_time_by_default_and_event_time_on_request() {
+        use crate::config::PartitionTime;
+        let sealed = Utc.with_ymd_and_hms(2026, 3, 1, 12, 59, 0).unwrap();
+        let event = "2026-02-28T23:10:00.000Z";
+        assert_eq!(
+            partition_time(PartitionTime::default(), sealed, Some(event)),
+            sealed
+        );
+        assert_eq!(
+            partition_time(PartitionTime::Event, sealed, Some(event)),
+            Utc.with_ymd_and_hms(2026, 2, 28, 23, 10, 0).unwrap()
+        );
+        assert_eq!(partition_time(PartitionTime::Event, sealed, None), sealed);
+        assert_eq!(
+            partition_time(PartitionTime::Event, sealed, Some("soon")),
+            sealed
+        );
+        // The hour the template sees is the chosen instant's.
+        let ctx = PartitionContext::new(
+            "t",
+            "s",
+            TelemetryFormat::Cef,
+            partition_time(PartitionTime::Event, sealed, Some(event)),
+        );
+        assert!(resolve_template(DEFAULT_TEMPLATE, &ctx).contains("day=28/hour=23"));
     }
 }

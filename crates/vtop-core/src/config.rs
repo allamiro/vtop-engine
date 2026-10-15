@@ -78,6 +78,18 @@ pub struct EngineConfig {
     /// cycles and in bounded batches so it never blocks the hot path.
     #[serde(default = "default_ledger_prune_batch")]
     pub ledger_prune_batch: u32,
+    /// Wall-clock limit for one state-store request (#556). A store that
+    /// accepts a connection and never answers (a Postgres primary that was
+    /// blackholed during a failover, say) otherwise blocks the whole engine
+    /// with the process alive and no error until the kernel gives up on the
+    /// socket, many minutes later. Single-row operations get this limit;
+    /// whole-ledger scans (startup recovery, pruning) get ten times it.
+    #[serde(default = "default_state_store_timeout_seconds")]
+    pub state_store_timeout_seconds: u64,
+}
+
+fn default_state_store_timeout_seconds() -> u64 {
+    30
 }
 
 fn default_ledger_prune_batch() -> u32 {
@@ -466,6 +478,17 @@ pub struct UploadConfig {
     /// is refused there, not at first upload. `VTOP_S3_TRANSPORT` overrides it.
     #[serde(default = "default_transport")]
     pub transport: String,
+    /// Wall-clock limit for ONE attempt of ONE request to the object store
+    /// (native S3 backend), connection through the end of the response head
+    /// (#556). Without it a store that accepts the connection and never
+    /// answers blocks the engine forever with the process alive and no error:
+    /// the AWS SDK's defaults bound connecting but not waiting for a response.
+    /// The SDK's own retries still apply, so one request is bounded by three
+    /// of these. An upload part or object body counts: size it for the
+    /// slowest link a part must cross (a 64 MiB part at 1 MiB/s needs about a
+    /// minute). Compatibility backends use `command_timeout_seconds` instead.
+    #[serde(default = "default_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
     /// Optional named profile / alias for command-based backends.
     #[serde(default)]
     pub profile: Option<String>,
@@ -850,6 +873,9 @@ fn default_region() -> String {
 fn default_command_timeout_seconds() -> u64 {
     300
 }
+fn default_request_timeout_seconds() -> u64 {
+    300
+}
 fn default_command_max_output_bytes() -> usize {
     1024 * 1024
 }
@@ -873,14 +899,39 @@ fn default_multipart_abandon_after_secs() -> u64 {
 pub struct PartitioningConfig {
     #[serde(default = "default_template")]
     pub template: String,
+    /// Which clock picks an object's time partition (`{yyyy}`..`{hh}`) (#559).
+    #[serde(default)]
+    pub time_source: PartitionTime,
 }
 
 impl Default for PartitioningConfig {
     fn default() -> Self {
         Self {
             template: default_template(),
+            time_source: PartitionTime::default(),
         }
     }
+}
+
+/// Which clock picks an object's time partition (#559).
+///
+/// Partitions used to come from the wall clock at upload, after compression
+/// and checksumming: a batch sealed at 12:59 and uploaded at 13:00 was filed
+/// under hour 13, and a backlog drain or a replay filed old events under the
+/// hour it happened to be uploaded in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionTime {
+    /// When the batch was sealed: fixed before any upload work, so retries
+    /// within a batch and slow uploads do not move it. Late data and replays
+    /// land in the hour they were SEALED in.
+    #[default]
+    Seal,
+    /// The earliest record time the source reported (Kafka message
+    /// timestamps). A batch whose source reports no record time falls back to
+    /// its seal time. Late data lands in the hour it HAPPENED in, which can be
+    /// a partition a downstream reader has already processed.
+    Event,
 }
 
 fn default_template() -> String {
@@ -899,6 +950,18 @@ impl VtopConfig {
 
     /// Enforce invariants that cannot be expressed by the type system.
     pub fn validate(&self) -> Result<(), VtopError> {
+        // Only the native S3 backend consumes it; the compatibility backends
+        // are bounded by `command_timeout_seconds`.
+        if self.upload.backend == "s3_native" && self.upload.request_timeout_seconds == 0 {
+            return Err(VtopError::Config(
+                "upload.request_timeout_seconds must be > 0".into(),
+            ));
+        }
+        if self.engine.state_store_timeout_seconds == 0 {
+            return Err(VtopError::Config(
+                "engine.state_store_timeout_seconds must be > 0".into(),
+            ));
+        }
         if self.engine.ledger_prune_batch == 0 {
             return Err(VtopError::Config(
                 "engine.ledger_prune_batch must be at least 1; unset \
@@ -1825,6 +1888,71 @@ upload:
         let cfg: VtopConfig = serde_yaml::from_str(&ok).unwrap();
         cfg.validate()
             .expect("source_poll_wait_ms: 0 is legitimate");
+    }
+
+    /// #556: the two request deadlines default to bounded values, can be set,
+    /// and a zero would fail every request before it started so it is refused
+    /// at load time rather than at first use.
+    #[test]
+    fn the_request_deadlines_default_are_settable_and_refuse_zero() {
+        let yaml = r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources:
+  file:
+    enabled: true
+    paths: ["/data/*.log"]
+upload:
+  bucket: telemetry-data
+  backend: s3_native
+"#;
+        let cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.upload.request_timeout_seconds, 300);
+        assert_eq!(cfg.engine.state_store_timeout_seconds, 30);
+
+        let set = yaml
+            .replace(
+                "  work_dir: /tmp/work",
+                "  work_dir: /tmp/work\n  state_store_timeout_seconds: 7",
+            )
+            .replace(
+                "  backend: s3_native",
+                "  backend: s3_native\n  request_timeout_seconds: 45",
+            );
+        let cfg: VtopConfig = serde_yaml::from_str(&set).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.upload.request_timeout_seconds, 45);
+        assert_eq!(cfg.engine.state_store_timeout_seconds, 7);
+
+        for (from, to, name) in [
+            (
+                "  backend: s3_native",
+                "  backend: s3_native\n  request_timeout_seconds: 0",
+                "upload.request_timeout_seconds",
+            ),
+            (
+                "  work_dir: /tmp/work",
+                "  work_dir: /tmp/work\n  state_store_timeout_seconds: 0",
+                "engine.state_store_timeout_seconds",
+            ),
+        ] {
+            let cfg: VtopConfig = serde_yaml::from_str(&yaml.replace(from, to)).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(name) && err.contains("> 0"), "{err}");
+        }
+
+        // A backend that never reads the setting is not refused over it.
+        let other = yaml.replace(
+            "  backend: s3_native",
+            "  backend: mock\n  request_timeout_seconds: 0",
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&other).unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]
