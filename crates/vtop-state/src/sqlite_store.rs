@@ -10,7 +10,7 @@
 //! trait (Phase 1 of the HA plan). The Postgres implementation (Phase 3) lives
 //! behind a Cargo feature and implements the same trait.
 
-use crate::models::{BatchPatch, BatchRecord};
+use crate::models::{BatchPatch, BatchRecord, CommittedCursor};
 use crate::store::StateStore;
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -45,23 +45,38 @@ CREATE TABLE IF NOT EXISTS batches (
 );
 CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
 CREATE INDEX IF NOT EXISTS idx_batches_source ON batches(source_type, source_name);
+-- Bounds the successor probe in prune_committed_history: each candidate row
+-- finds a newer committed row for its path by a range seek on created_at.
+-- Supersedes idx_batches_commit_cursor, which ordered by end_byte (#564).
+-- The old index is KEPT for a runtime rolled back past #564, whose prune
+-- query seeks through it (review). Drop it once that rollback is
+-- unsupported.
 CREATE INDEX IF NOT EXISTS idx_batches_commit_cursor ON batches(
     state,
     source_type,
     COALESCE(json_extract(progress_end_json, '$.path'), source_name),
     COALESCE(CAST(json_extract(progress_end_json, '$.end_byte') AS INTEGER), -1)
 );
+CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
+    state,
+    source_type,
+    COALESCE(json_extract(progress_end_json, '$.path'), source_name),
+    created_at,
+    batch_id
+);
 "#;
 
 /// Prune predicate shared between the store method and the plan-shape test.
-/// A row is deletable only when a strictly "greater" committed row — ordered
-/// by (end_byte, updated_at, batch_id) — exists for the same source path
-/// (source_name when the marker has no path). Exactly one row per path group
-/// has no successor, so the per-path MAX(end_byte) aggregate that seeds
-/// recovery cursors is preserved verbatim.
+/// A row is deletable only when a NEWER committed row - ordered by
+/// (created_at, batch_id), the order `committed_cursors` reads - exists for
+/// the same source path (source_name when the marker has no path). Exactly
+/// one row per path group has no successor, and it is the one the restart
+/// cursor is seeded from. Ordering by end_byte, as this did, kept the highest
+/// offset instead, and after a rotation or a copytruncate that is the old
+/// content's row: pruning deleted the restart cursor (review of #564).
 ///
 /// The successor probe expressions must stay textually identical to the
-/// `idx_batches_commit_cursor` expressions above: SQLite matches expression
+/// `idx_batches_commit_newest` expressions above: SQLite matches expression
 /// indexes structurally, and without the index every candidate row rescans
 /// the entire committed set (quadratic on the engine's idle-cycle pass).
 macro_rules! prune_committed_sql {
@@ -75,16 +90,8 @@ macro_rules! prune_committed_sql {
                   AND n.source_type = b.source_type \
                   AND COALESCE(json_extract(n.progress_end_json, '$.path'), n.source_name) \
                       = COALESCE(json_extract(b.progress_end_json, '$.path'), b.source_name) \
-                  AND ( \
-                    COALESCE(CAST(json_extract(n.progress_end_json, '$.end_byte') AS INTEGER), -1) \
-                      > COALESCE(CAST(json_extract(b.progress_end_json, '$.end_byte') AS INTEGER), -1) \
-                    OR ( \
-                      COALESCE(CAST(json_extract(n.progress_end_json, '$.end_byte') AS INTEGER), -1) \
-                        = COALESCE(CAST(json_extract(b.progress_end_json, '$.end_byte') AS INTEGER), -1) \
-                      AND (n.updated_at > b.updated_at \
-                           OR (n.updated_at = b.updated_at AND n.batch_id > b.batch_id)) \
-                    ) \
-                  ) \
+                  AND (n.created_at > b.created_at \
+                       OR (n.created_at = b.created_at AND n.batch_id > b.batch_id)) \
               ) \
             LIMIT ?3 \
         )"
@@ -209,7 +216,7 @@ impl StateStore for SqliteStateStore {
         .bind(&rec.error_message)
         .bind(&rec.owner)
         .bind(&rec.lease_expires_at)
-        .bind(&rec.created_at)
+        .bind(crate::store::canonical_created_at(&rec.created_at))
         .bind(&rec.updated_at)
         .execute(&self.pool)
         .await
@@ -336,6 +343,68 @@ impl StateStore for SqliteStateStore {
                 let path: Option<String> = r.get("path");
                 let end: Option<i64> = r.get("end_byte");
                 Some((path?, end?.max(0) as u64))
+            })
+            .collect())
+    }
+
+    async fn committed_cursors(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<CommittedCursor>, VtopError> {
+        // Aggregated in SQL (#77): per path, the NEWEST committed row - its
+        // inode, its end byte and the length it observed. The inode is read as
+        // the JSON token (`->`) and parsed here: `json_extract` turns a u64
+        // above i64::MAX into a lossy REAL, and an unparseable value must read
+        // as "unknown", not as a wrong identity.
+        //
+        // "Newest" is the batch CREATED last - the order the windows were read
+        // - not the one whose state changed last: recovery can commit an older
+        // VERIFIED window after a newer one, and ordering by `updated_at` would
+        // then name the older file as the restart cursor (review of #564).
+        // `created_at` is stored in one fixed-width form, so its text order is
+        // time order (`canonical_created_at`), and this is the same order
+        // pruning keeps the newest row by - the row read here always survives.
+        //
+        // The end byte is the newest row's own, not a maximum over the rows
+        // that share its inode. A path's newest window is in its newest
+        // generation, and within one generation the newest window has read
+        // furthest - a rewind clamps to the committed point, so a replay never
+        // ends below it. A newer window ending LOWER on the same inode is a
+        // `copytruncate`, and the maximum would hand the new content the old
+        // content's offset, skipping what was written between (review of #564).
+        let rows = sqlx::query(
+            "WITH committed AS ( \
+                 SELECT json_extract(progress_end_json, '$.path') AS path, \
+                        CAST(progress_end_json -> '$.inode' AS TEXT) AS inode, \
+                        CAST(json_extract(progress_end_json, '$.end_byte') AS INTEGER) AS end_byte, \
+                        CAST(json_extract(progress_end_json, '$.file_size') AS INTEGER) AS file_size, \
+                        created_at, batch_id \
+                 FROM batches WHERE state = ? AND source_type = ? \
+             ), latest AS ( \
+                 SELECT path, inode, end_byte, file_size, ROW_NUMBER() OVER ( \
+                            PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
+                 FROM committed \
+             ) \
+             SELECT path, inode, end_byte, file_size FROM latest WHERE rn = 1",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(source_type.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let path: Option<String> = r.get("path");
+                let inode: Option<String> = r.get("inode");
+                let end: Option<i64> = r.get("end_byte");
+                let size: Option<i64> = r.get("file_size");
+                Some(CommittedCursor {
+                    path: path?,
+                    inode: inode.and_then(|i| i.parse().ok()),
+                    end_byte: end?.max(0) as u64,
+                    observed_size: size.map(|s| s.max(0) as u64),
+                })
             })
             .collect())
     }
@@ -484,12 +553,12 @@ mod tests {
         test_battery::run_prune_battery(&store).await;
     }
 
-    // The prune successor probe must resolve through idx_batches_commit_cursor;
+    // The prune successor probe must resolve through idx_batches_commit_newest;
     // a correlated scan over idx_batches_state alone made a converged no-op
     // prune quadratic in the committed row count (PR #213 review). Plan shape,
     // not timing: EXPLAIN QUERY PLAN either names the index or it regressed.
     #[tokio::test]
-    async fn sqlite_prune_successor_probe_uses_the_commit_cursor_index() {
+    async fn sqlite_prune_successor_probe_uses_the_commit_newest_index() {
         let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
         let rows = sqlx::query(concat!("EXPLAIN QUERY PLAN ", prune_committed_sql!()))
             .bind(BatchState::SourceCommitted.as_str())
@@ -504,8 +573,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            plan.contains("idx_batches_commit_cursor"),
-            "successor probe no longer uses idx_batches_commit_cursor:\n{plan}"
+            plan.contains("idx_batches_commit_newest"),
+            "successor probe no longer uses idx_batches_commit_newest:\n{plan}"
         );
     }
 }

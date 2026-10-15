@@ -25,7 +25,7 @@
 //!
 //! Compiled only with `--features postgres`.
 
-use crate::models::{BatchPatch, BatchRecord};
+use crate::models::{BatchPatch, BatchRecord, CommittedCursor};
 use crate::store::StateStore;
 use async_trait::async_trait;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
@@ -295,7 +295,7 @@ impl StateStore for PgStateStore {
             .bind(&rec.error_message)
             .bind(&rec.owner)
             .bind(&rec.lease_expires_at)
-            .bind(&rec.created_at)
+            .bind(crate::store::canonical_created_at(&rec.created_at))
             .bind(&rec.updated_at)
             .execute(&self.pool)
         })
@@ -453,6 +453,53 @@ impl StateStore for PgStateStore {
             .collect())
     }
 
+    async fn committed_cursors(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<CommittedCursor>, VtopError> {
+        // See the SQLite implementation and #77: the newest committed row per
+        // path, by (created_at, batch_id) - stored fixed-width, so text order
+        // is time order, and the order pruning keeps - with its own end byte.
+        // The markers column is TEXT, so cast to jsonb; markers are internally
+        // tagged (fields at top level). The inode is read as text and parsed
+        // here so a u64 above i64::MAX stays exact.
+        let rows = sqlx::query(
+            "WITH committed AS ( \
+                 SELECT progress_end_json::jsonb ->> 'path' AS path, \
+                        progress_end_json::jsonb ->> 'inode' AS inode, \
+                        (progress_end_json::jsonb ->> 'end_byte')::bigint AS end_byte, \
+                        (progress_end_json::jsonb ->> 'file_size')::bigint AS file_size, \
+                        created_at, batch_id \
+                 FROM batches WHERE state = $1 AND source_type = $2 \
+             ), latest AS ( \
+                 SELECT path, inode, end_byte, file_size, ROW_NUMBER() OVER ( \
+                            PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
+                 FROM committed \
+             ) \
+             SELECT path, inode, end_byte, file_size FROM latest WHERE rn = 1",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(source_type.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let path: Option<String> = r.get("path");
+                let inode: Option<String> = r.get("inode");
+                let end: Option<i64> = r.get("end_byte");
+                let size: Option<i64> = r.get("file_size");
+                Some(CommittedCursor {
+                    path: path?,
+                    inode: inode.and_then(|i| i.parse().ok()),
+                    end_byte: end?.max(0) as u64,
+                    observed_size: size.map(|s| s.max(0) as u64),
+                })
+            })
+            .collect())
+    }
+
     async fn list_incomplete_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
         self.query_records(
             "SELECT * FROM batches WHERE state != $1 ORDER BY created_at ASC",
@@ -498,11 +545,12 @@ impl StateStore for PgStateStore {
         limit: u32,
     ) -> Result<u64, VtopError> {
         // Same predicate as the SQLite store: a row is deletable only when a
-        // strictly greater committed row — ordered by (end_byte, updated_at,
-        // batch_id) — exists for its source path, so the per-path
-        // MAX(end_byte) cursor seed always survives. The successor probe's
-        // expressions must stay identical to idx_batches_commit_cursor in
-        // migrations/postgres/0001_state_store.sql, which bounds it.
+        // newer committed row — ordered by (created_at, batch_id), the order
+        // committed_cursors reads — exists for its source path, so the
+        // restart cursor's row always survives (review of #564). The
+        // successor probe's expressions must stay identical to
+        // idx_batches_commit_newest in migrations/postgres/0001_state_store.sql,
+        // which bounds it.
         let result = with_retry(|| {
             sqlx::query(
                 "DELETE FROM batches WHERE batch_id IN ( \
@@ -514,16 +562,8 @@ impl StateStore for PgStateStore {
                           AND n.source_type = b.source_type \
                           AND COALESCE(n.progress_end_json::jsonb ->> 'path', n.source_name) \
                               = COALESCE(b.progress_end_json::jsonb ->> 'path', b.source_name) \
-                          AND ( \
-                            COALESCE((n.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
-                              > COALESCE((b.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
-                            OR ( \
-                              COALESCE((n.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
-                                = COALESCE((b.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
-                              AND (n.updated_at > b.updated_at \
-                                   OR (n.updated_at = b.updated_at AND n.batch_id > b.batch_id)) \
-                            ) \
-                          ) \
+                          AND (n.created_at > b.created_at \
+                               OR (n.created_at = b.created_at AND n.batch_id > b.batch_id)) \
                       ) \
                     LIMIT $3 \
                 )",
