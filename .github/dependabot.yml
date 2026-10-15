@@ -65,8 +65,26 @@ updates:
     commit-message:
       prefix: "docker"
 
+  # ---- Lab MinIO build (docker/minio/Dockerfile) ---------------------------
+  # The lab builds MinIO from source because no registry serves its images any
+  # more (#550). The Go builder and the runtime base are still images, and still
+  # rot; the MinIO and mc commits themselves are pinned by hand (the upstream
+  # repositories are archived, so there is nothing to bump them to).
+  - package-ecosystem: docker
+    directory: "/docker/minio"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "docker"
+
   # ---- Compose manifests (lab stack) --------------------------------------
-  # docker-compose.yml pins the lab images (apache/kafka, minio, kafka-ui, ...).
+  # docker-compose.yml pins the lab images (apache/kafka, kafka-ui, ...; MinIO is
+  # built locally, see above).
   # This is where image rot actually bites: the previously pinned bitnami/kafka:3.7
   # stopped resolving when Bitnami relocated its Docker Hub catalog, and the
   # Dockerfile-only scan above would never have caught it.
