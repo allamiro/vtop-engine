@@ -168,6 +168,44 @@ pub enum MetaCommand {
         #[arg(long)]
         request_id: Option<Uuid>,
     },
+    /// The replica set metadata recorded for a range (#553): the nodes its
+    /// quorum is counted over, the record's generation (the CAS token
+    /// `set-replica-set` names), and the fencing epoch it was recorded at.
+    /// "none recorded" means each node counts the set it is configured with,
+    /// as before #553.
+    ReplicaSet {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+    },
+    /// Record a range's replica set (#553), needing feature level 5. A
+    /// candidate whose configured set differs refuses to promote, so the
+    /// range is only ever led counting the recorded set. The first record
+    /// names the set the range's nodes are configured with now; each change
+    /// after it adds or removes ONE member, and is refused until the range
+    /// has been led under the set it replaces with its leader's whole log on
+    /// a majority of that set. Every record clears the
+    /// range's lease, so it is re-won under the new set: configure the
+    /// replicas with the new set first, then record it. Members are the
+    /// nodes' registered UUIDs, comma-separated, the leader's included.
+    SetReplicaSet {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        #[arg(long, value_delimiter = ',', required = true)]
+        members: Vec<Uuid>,
+        /// The generation `replica-set` reported; 0 when none is recorded.
+        #[arg(long)]
+        expected_generation: u64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
     /// Propose `RegisterNode` through the Consensus façade.
     RegisterNode {
         #[command(flatten)]
@@ -1394,6 +1432,94 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                     issued_at_ms: chrono::Utc::now().timestamp_millis(),
                 },
                 feature_level: level,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::ReplicaSet {
+            common,
+            topic_uuid,
+            range_uuid,
+        } => {
+            let config = load_admin_config(&common.config)?;
+            let client = connect(&config)?;
+            let view = client
+                .read_range_replica_set(topic_uuid, range_uuid)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "the metadata tier predates recorded replica sets (#553); none can be \
+                     recorded on it"
+                        .to_owned()
+                })?;
+            note_redirects(&client);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "topic_uuid": topic_uuid,
+                        "range_uuid": range_uuid,
+                        "range_found": view.range_found,
+                        "read_at_applied_index": view.read_at_applied_index,
+                        "replica_set": view.replica_set.as_ref().map(|set| serde_json::json!({
+                            "generation": set.generation,
+                            "members": set.members,
+                            "recorded_at_epoch": set.recorded_at_epoch,
+                        })),
+                    }))
+                    .map_err(|error| error.to_string())?
+                );
+            } else if !view.range_found {
+                println!("range {range_uuid} not found");
+            } else {
+                match &view.replica_set {
+                    None => println!(
+                        "no replica set recorded (each node counts its configured set); \
+                         read at applied index {}",
+                        view.read_at_applied_index
+                    ),
+                    Some(set) => println!(
+                        "generation {} members {} recorded at fencing epoch {}; read at \
+                         applied index {}",
+                        set.generation,
+                        set.members
+                            .iter()
+                            .map(Uuid::to_string)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        set.recorded_at_epoch,
+                        view.read_at_applied_index
+                    ),
+                }
+            }
+            if view.range_found {
+                Ok(())
+            } else {
+                Err(format!("range {range_uuid} not found"))
+            }
+        }
+        MetaCommand::SetReplicaSet {
+            common,
+            topic_uuid,
+            range_uuid,
+            members,
+            expected_generation,
+            request_id,
+        } => {
+            if members.is_empty() || members.len() > vtop_meta::MAX_REPLICAS {
+                return Err(format!(
+                    "a replica set names 1..={} nodes",
+                    vtop_meta::MAX_REPLICAS
+                ));
+            }
+            let command = MetadataCommand::SetRangeReplicaSet {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms: chrono::Utc::now().timestamp_millis(),
+                },
+                topic_uuid,
+                range_uuid,
+                members,
+                expected_generation,
             };
             propose_and_print(&common.config, command, json).await
         }
@@ -3362,6 +3488,51 @@ transport: plaintext
                 .expect_err("a blank domain leaves RF > 1 refused for the same reason as before");
         }
         check_failure_domain("rack-a").expect("a real domain is the accepted case");
+    }
+
+    /// `set-replica-set` takes the members comma-separated and names the
+    /// CAS generation explicitly: there is no default to fall back on.
+    #[test]
+    fn set_replica_set_takes_members_and_an_explicit_generation() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            command: MetaCommand,
+        }
+
+        let (topic, range) = (node(1).to_string(), node(2).to_string());
+        let members = format!("{},{},{}", node(3), node(4), node(5));
+        let base = [
+            "vtopctl",
+            "set-replica-set",
+            "--config",
+            "/nonexistent/meta.yaml",
+            "--topic-uuid",
+            topic.as_str(),
+            "--range-uuid",
+            range.as_str(),
+        ];
+        let parse = |extra: &[&str]| {
+            Harness::try_parse_from(base.iter().copied().chain(extra.iter().copied()))
+        };
+        match parse(&["--members", &members, "--expected-generation", "0"]) {
+            Ok(Harness {
+                command:
+                    MetaCommand::SetReplicaSet {
+                        members,
+                        expected_generation: 0,
+                        ..
+                    },
+            }) => assert_eq!(members, vec![node(3), node(4), node(5)]),
+            _ => panic!("members and generation should parse"),
+        }
+        assert!(
+            parse(&["--members", &members]).is_err(),
+            "the CAS generation is never implied"
+        );
+        assert!(parse(&["--expected-generation", "0"]).is_err());
     }
 
     /// #457 slice 2b: `group-cursor` names the group one way — by UUID, or

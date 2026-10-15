@@ -16,10 +16,10 @@ use crate::raft::type_config::{MetaRaftTypeConfig, NodeId};
 use crate::state::MetaValue;
 use crate::transport::admin::AdminHandler;
 use crate::transport::wire::{
-    AdminGroupCursorView, AdminLeaseView, AdminReadGroupCursorResponse,
-    AdminReadRangeLeaseResponse, AdminReadRangeTransitionsResponse,
-    AdminReadSegmentPlacementResponse, AdminRebalanceIntentView, AdminSegmentView,
-    AdminTransitionView, MAX_TRANSITIONS_PER_READ,
+    AdminGroupCursorView, AdminLeaseView, AdminRangeReplicaSetView, AdminReadGroupCursorResponse,
+    AdminReadRangeLeaseResponse, AdminReadRangeReplicaSetResponse,
+    AdminReadRangeTransitionsResponse, AdminReadSegmentPlacementResponse, AdminRebalanceIntentView,
+    AdminSegmentView, AdminTransitionView, MAX_TRANSITIONS_PER_READ,
 };
 use crate::transport::wire::{
     AdminMembershipResponse, AdminProposeResponse, AdminStatusResponse, TransportError,
@@ -528,6 +528,57 @@ impl AdminReadGroupCursor for OpenraftConsensus {
     }
 }
 
+/// Linearizable read of a range's recorded replica set (#553), its own
+/// trait as the other reads are.
+#[async_trait]
+pub trait AdminReadRangeReplicaSet: Send + Sync {
+    async fn read_range_replica_set(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> ConsensusResult<AdminReadRangeReplicaSetResponse>;
+}
+
+#[async_trait]
+impl AdminReadRangeReplicaSet for OpenraftConsensus {
+    async fn read_range_replica_set(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> ConsensusResult<AdminReadRangeReplicaSetResponse> {
+        let Some(store) = self.store.as_ref() else {
+            return Err(ConsensusError::Message(
+                "this node was built without applied state and cannot serve reads".to_owned(),
+            ));
+        };
+        // Fence FIRST, as every admin read does: a candidate checking its
+        // configured set against a lagging copy could miss the change that
+        // replaced it, and promote counting a majority of the old set.
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(classify_read_error)?;
+        store.with_storage(|storage| {
+            let read_at_applied_index = storage.last_applied();
+            let state = storage.state();
+            let range_found = matches!(
+                state.record(&MetaKey::Range {
+                    topic_uuid,
+                    range_uuid,
+                }),
+                Some(MetaValue::Range(_))
+            );
+            Ok(AdminReadRangeReplicaSetResponse {
+                range_found,
+                replica_set: state
+                    .range_replica_set(topic_uuid, range_uuid)
+                    .map(AdminRangeReplicaSetView::from),
+                read_at_applied_index,
+            })
+        })
+    }
+}
+
 /// Linearizable range-lease read, kept as its own trait so the consensus
 /// façade stays the narrow propose/status interface it was.
 #[async_trait]
@@ -965,6 +1016,19 @@ impl AdminHandler for OpenraftConsensus {
         AdminReadGroupCursor::read_group_cursor(
             self,
             request.group_uuid,
+            request.topic_uuid,
+            request.range_uuid,
+        )
+        .await
+        .map_err(to_transport_error)
+    }
+
+    async fn read_range_replica_set(
+        &self,
+        request: crate::transport::wire::AdminReadRangeReplicaSetRequest,
+    ) -> TransportResult<AdminReadRangeReplicaSetResponse> {
+        AdminReadRangeReplicaSet::read_range_replica_set(
+            self,
             request.topic_uuid,
             request.range_uuid,
         )
