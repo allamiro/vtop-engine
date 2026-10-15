@@ -96,13 +96,23 @@ exercised by `scripts/k8s-smoke.sh` against a live cluster.
 | `standalone` (default) | `role: standalone` on every pod, no replica peers | Each pod serves an **independent** range: three replicas are three separate logs. Quorum durability is refused, and a pod nobody produced to stays empty. The default because it needs no coordination and cannot half-work. |
 | `replicated` | `role: candidate` on every pod, one shared peer list (self included — the binary skips its own entry, and identical lists keep the rendered configs diffable) | **One** range across the pods (#284). The role follows the metadata lease inside the binary: whichever pod acquires the range leads and the rest follow it. When the holder dies a surviving candidate takes the range **in place** — no re-render, no `helm upgrade`, no restart. |
 
-`replicated` requires two other values, and both are enforced at render time
-rather than left to fail in the cluster:
+`replicated` requires three other things, all enforced at render time rather
+than left to fail in the cluster:
 
 - **`data.lease.enabled: true`** (with `data.lease.topicUuid`) — candidates
   take the range *through* the lease, so without it no pod would ever lead.
 - **`data.fencingEpoch: 0`** — grants are minted from 1, so a static floor at
   or above the first grant refuses the very grant that makes a candidate lead.
+- **An odd replica count** (#562). A write is acknowledged on a majority of the
+  replicas, so an even count survives no more failures than the odd count
+  below it while raising the majority it must gather: 4 replicas need 3
+  acknowledgements and survive 1 failure, exactly as 3 do, and 2 replicas need
+  both and survive none (any follower loss stops quorum produce, any leader
+  loss leaves no majority to promote from). Co-located mode already forces an
+  odd `replicaCount` through the metadata voters; in `separated` mode the
+  data tier is sized on its own, so `deployment.data.replicaCount` is refused
+  when even. `standalone` pods serve independent ranges, have no quorum, and
+  are not subject to it.
 
 `data.leaderOrdinal` is **retired** and now fails the render in *every*
 topology. The chart used to freeze `role: leader` on one ordinal, which made
