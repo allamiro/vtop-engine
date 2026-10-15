@@ -84,7 +84,8 @@ pub enum Command {
         #[arg(long)]
         config: PathBuf,
         /// Where prune digests are read from [default: engine.ledger_digest_dir,
-        /// else beside a SQLite database file, else <engine.work_dir>/ledger-digests].
+        /// else <database file>.ledger-digests beside a SQLite database file, else
+        /// <engine.work_dir>/ledger-digests].
         #[arg(long)]
         digest_dir: Option<PathBuf>,
         /// Also ask the object store whether every committed object and
@@ -100,15 +101,18 @@ pub enum Command {
     /// newest committed row per source path always survives, so recovery
     /// cursor seeding is unchanged; rows in any other state are untouched.
     /// On PostgreSQL this needs a maintenance identity with DELETE on the
-    /// ledger — the runtime role is denied DELETE by design. The rows are
-    /// written to a digest BEFORE they are deleted (#560), so a coverage
-    /// audit can still account for them.
+    /// ledger — the runtime role is denied DELETE by design. The CANDIDATE
+    /// rows are written to a digest BEFORE they are deleted (#560), so a
+    /// coverage audit can still account for them; each is re-checked at
+    /// deletion, and one that has gained a reason to stay is digested but
+    /// kept.
     PruneLedger {
         #[arg(long)]
         config: PathBuf,
         /// Where the digest of the deleted rows is written [default:
-        /// engine.ledger_digest_dir, else beside a SQLite database file, else
-        /// <engine.work_dir>/ledger-digests - scratch: name one for PostgreSQL].
+        /// engine.ledger_digest_dir, else <database file>.ledger-digests beside
+        /// a SQLite database file, else <engine.work_dir>/ledger-digests -
+        /// scratch: name one for PostgreSQL].
         #[arg(long)]
         digest_dir: Option<PathBuf>,
         /// Delete committed rows whose last transition is older than this

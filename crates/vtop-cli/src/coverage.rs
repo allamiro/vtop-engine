@@ -30,7 +30,7 @@
 //! pruned without a digest), and whether an object the ledger names still
 //! exists - `--check-storage` asks the store about each one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -52,6 +52,15 @@ pub enum Unit {
     File {
         path: String,
         inode: Option<u64>,
+        /// Which content generation at this path and inode (review of
+        /// #573): a copytruncate keeps the inode, and a filesystem can hand
+        /// a reused inode to a replacement file, so path and inode alone
+        /// would merge an old file's ranges with a new one's - and the old
+        /// file's commits would cover the new file's lost bytes. A row whose
+        /// read saw the file SMALLER than an earlier row of the same path
+        /// and inode had already read starts a new generation. Spool markers
+        /// record no size, so spool units are not split this way.
+        generation: u32,
     },
     SyslogSpool {
         path: String,
@@ -95,7 +104,17 @@ impl std::fmt::Display for Unit {
                 partition,
                 consumer_group,
             } => write!(f, "kafka {topic}[{partition}] group {consumer_group}"),
-            Unit::File { path, inode: i } => write!(f, "file {path} (inode {})", inode(i)),
+            Unit::File {
+                path,
+                inode: i,
+                generation,
+            } => {
+                write!(f, "file {path} (inode {}", inode(i))?;
+                if *generation > 0 {
+                    write!(f, ", generation {generation}")?;
+                }
+                write!(f, ")")
+            }
             Unit::SyslogSpool { path, inode: i } => {
                 write!(f, "spool {path} (inode {})", inode(i))
             }
@@ -111,14 +130,14 @@ pub const END_OF_FILE: u64 = u64::MAX;
 /// The range runs from the window's first read (`progress_start`) to its last
 /// (`progress_end`). A Kafka `end_offset` is the last offset read, so the
 /// range ends one past it. A window whose markers name two different files -
-/// it spans a rotation - covers BOTH (review of #573): the old file from where
-/// the window started to that file's end (the window read on until the
-/// rotation; nothing records where), and the new file over its LAST read,
-/// from where that read started to the window's end. Where the window's
-/// reading of the new file began is not recorded: crediting it from byte 0
-/// would hide exactly the skip a release before #564 made (it resumed a new
-/// file at the old file's offset), so the stretch below the last read is
-/// reported as [`UnitReport::unproven`] instead - see [`rotation_prefix`].
+/// it spans a rotation - is credited only over what its markers prove
+/// (review of #573): the new file over its LAST read, from where that read
+/// started to the window's end. How far the window read the old file, and
+/// where its reading of the new file began, are not recorded; crediting the
+/// old file to its end could hide a lost tail, and the new one from byte 0
+/// the skip a release before #564 made (it resumed a new file at the old
+/// file's offset). Both stretches are reported as [`UnitReport::unproven`]
+/// instead - see [`rotation_unproven`].
 pub fn unit_ranges(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
     let file_like = |start_path: &String,
                      start_inode: &Option<u64>,
@@ -131,14 +150,12 @@ pub fn unit_ranges(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
         if start_path == path && start_inode == inode {
             vec![(make(path.clone(), *inode), start_byte, end_byte)]
         } else {
-            vec![
-                (
-                    make(start_path.clone(), *start_inode),
-                    start_byte,
-                    END_OF_FILE,
-                ),
-                (make(path.clone(), *inode), last_read_start, end_byte),
-            ]
+            // Neither file is credited past what the markers prove: the
+            // new one over its last read, the old one not at all - the
+            // window's reads of it end somewhere nothing records. Both
+            // stretches are reported by `rotation_unproven` instead.
+            let _ = (start_path, start_inode, start_byte);
+            vec![(make(path.clone(), *inode), last_read_start, end_byte)]
         }
     };
     match (&record.progress_start, &record.progress_end) {
@@ -204,7 +221,11 @@ pub fn unit_ranges(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
             inode,
             *last_read_start,
             *end_byte,
-            &|path, inode| Unit::File { path, inode },
+            &|path, inode| Unit::File {
+                path,
+                inode,
+                generation: 0,
+            },
         ),
         (
             ProgressMarker::SyslogSpool {
@@ -234,14 +255,15 @@ pub fn unit_ranges(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
     }
 }
 
-/// For a window that spans a rotation, the new file and where its last read
-/// started, when that is above byte 0: the stretch `[0, start)` of a file
-/// that only appeared in this window, which the ledger cannot place (review
-/// of #573). An earlier read in the same window may have archived it - or a
-/// release before #564 may have skipped it, resuming the new file at the old
-/// one's offset; the two look the same here.
-pub fn rotation_prefix(record: &BatchRecord) -> Option<(Unit, u64)> {
-    let (start_path, start_inode, path, inode, last_read_start, make): (
+/// For a window that spans a rotation, the stretches its markers cannot
+/// place (review of #573): the old file from where the window started to its
+/// end - the window read on into it, how far is not recorded - and the start
+/// of the new file below the window's last read, when that is above byte 0.
+/// An earlier read in the window may have archived them, or a release
+/// before #564 may have skipped them; the two look the same here.
+pub fn rotation_unproven(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
+    let (start_path, start_inode, start_byte, path, inode, last_read_start, make): (
+        _,
         _,
         _,
         _,
@@ -253,6 +275,7 @@ pub fn rotation_prefix(record: &BatchRecord) -> Option<(Unit, u64)> {
             ProgressMarker::File {
                 path: start_path,
                 inode: start_inode,
+                start_byte: window_start,
                 ..
             },
             ProgressMarker::File {
@@ -264,15 +287,21 @@ pub fn rotation_prefix(record: &BatchRecord) -> Option<(Unit, u64)> {
         ) => (
             start_path,
             start_inode,
+            *window_start,
             path,
             inode,
             *start_byte,
-            |path, inode| Unit::File { path, inode },
+            |path, inode| Unit::File {
+                path,
+                inode,
+                generation: 0,
+            },
         ),
         (
             ProgressMarker::SyslogSpool {
                 path: start_path,
                 inode: start_inode,
+                start_byte: window_start,
                 ..
             },
             ProgressMarker::SyslogSpool {
@@ -284,15 +313,90 @@ pub fn rotation_prefix(record: &BatchRecord) -> Option<(Unit, u64)> {
         ) => (
             start_path,
             start_inode,
+            *window_start,
             path,
             inode,
             *start_byte,
             |path, inode| Unit::SyslogSpool { path, inode },
         ),
-        _ => return None,
+        _ => return Vec::new(),
     };
-    let spans_rotation = start_path != path || start_inode != inode;
-    (spans_rotation && last_read_start > 0).then(|| (make(path.clone(), *inode), last_read_start))
+    if start_path == path && start_inode == inode {
+        return Vec::new();
+    }
+    let mut stretches = vec![(
+        make(start_path.clone(), *start_inode),
+        start_byte,
+        END_OF_FILE,
+    )];
+    if last_read_start > 0 {
+        stretches.push((make(path.clone(), *inode), 0, last_read_start));
+    }
+    stretches
+}
+
+/// The size a row's read saw the file at, for the file `unit` names.
+fn observed_size(record: &BatchRecord, unit: &Unit) -> Option<u64> {
+    let Unit::File { path, inode, .. } = unit else {
+        return None;
+    };
+    [&record.progress_end, &record.progress_start]
+        .into_iter()
+        .find_map(|marker| match marker {
+            ProgressMarker::File {
+                path: read_path,
+                inode: read_inode,
+                file_size,
+                ..
+            } if read_path == path && read_inode == inode => Some(*file_size),
+            _ => None,
+        })
+}
+
+/// The content generation of each file (see [`Unit::File`]), assigned
+/// walking rows in creation order.
+#[derive(Default)]
+struct Generations {
+    /// (path, inode) -> (generation, highest end read in it).
+    files: HashMap<(String, Option<u64>), (u32, u64)>,
+}
+
+impl Generations {
+    /// `unit` with its generation, for a read ending at `end` that saw the
+    /// file at `observed` bytes: a file seen smaller than this generation
+    /// has already been read is new content.
+    fn place(&mut self, unit: Unit, observed: Option<u64>, end: u64) -> Unit {
+        let Unit::File { path, inode, .. } = unit else {
+            return unit;
+        };
+        let (generation, read_to) = self.files.entry((path.clone(), inode)).or_insert((0, 0));
+        if observed.is_some_and(|size| size > 0 && size < *read_to) {
+            *generation += 1;
+            *read_to = 0;
+        }
+        *read_to = (*read_to).max(end);
+        Unit::File {
+            path,
+            inode,
+            generation: *generation,
+        }
+    }
+
+    /// `unit` in the generation its file is in now.
+    fn current(&self, unit: Unit) -> Unit {
+        let Unit::File { path, inode, .. } = unit else {
+            return unit;
+        };
+        let generation = self
+            .files
+            .get(&(path.clone(), inode))
+            .map_or(0, |(generation, _)| *generation);
+        Unit::File {
+            path,
+            inode,
+            generation,
+        }
+    }
 }
 
 /// A stretch of a unit no committed range covers.
@@ -333,7 +437,7 @@ pub struct UnitReport {
     pub pending: Vec<Pending>,
     /// The start of a file rotated in mid-window, below that window's last
     /// read, that nothing else covers: the ledger cannot say whether it was
-    /// read (see [`rotation_prefix`]). Reported, never a finding - a window
+    /// read (see [`rotation_unproven`]). Reported, never a finding - a window
     /// that simply read the new file more than once looks the same.
     pub unproven: Vec<Hole>,
     /// Bytes/offsets archived more than once.
@@ -365,20 +469,33 @@ struct Row {
 /// whose deletion did not happen) is counted once, first occurrence wins.
 pub fn audit(records: impl IntoIterator<Item = BatchRecord>) -> Vec<UnitReport> {
     let mut seen = std::collections::HashSet::new();
+    let mut records: Vec<BatchRecord> = records
+        .into_iter()
+        .filter(|record| seen.insert(record.batch_id.clone()))
+        .collect();
+    // Creation order: a file's generations are found by walking its rows in
+    // the order they were read. Stable, so rows created together keep the
+    // order they were listed in.
+    records
+        .sort_by_cached_key(|record| chrono::DateTime::parse_from_rfc3339(&record.created_at).ok());
+    let mut generations = Generations::default();
     let mut units: BTreeMap<Unit, Vec<Row>> = BTreeMap::new();
-    let mut prefixes: BTreeMap<Unit, Vec<u64>> = BTreeMap::new();
-    for record in records {
-        if !seen.insert(record.batch_id.clone()) {
-            continue;
-        }
-        if record.state == BatchState::SourceCommitted {
-            if let Some((unit, below)) = rotation_prefix(&record) {
-                prefixes.entry(unit).or_default().push(below);
-            }
-        }
-        for (unit, start, end) in unit_ranges(&record) {
+    let mut unproven: BTreeMap<Unit, Vec<(u64, u64)>> = BTreeMap::new();
+    for record in &records {
+        for (unit, start, end) in unit_ranges(record) {
             if end <= start {
                 continue; // an empty read covers nothing
+            }
+            let observed = observed_size(record, &unit);
+            let unit = generations.place(unit, observed, end);
+            // A later generation is new content from byte 0, so its start
+            // below its first read is not old history: unproven, as at a
+            // rotation (a copytruncated file resumed at the old offset by a
+            // release before #564 looks like this).
+            if let Unit::File { generation, .. } = &unit {
+                if *generation > 0 && start > 0 && !units.contains_key(&unit) {
+                    unproven.entry(unit.clone()).or_default().push((0, start));
+                }
             }
             units.entry(unit).or_default().push(Row {
                 batch_id: record.batch_id.clone(),
@@ -387,12 +504,24 @@ pub fn audit(records: impl IntoIterator<Item = BatchRecord>) -> Vec<UnitReport> 
                 end,
             });
         }
+        if record.state == BatchState::SourceCommitted {
+            for (unit, start, end) in rotation_unproven(record) {
+                if end > start {
+                    unproven
+                        .entry(generations.current(unit))
+                        .or_default()
+                        .push((start, end));
+                }
+            }
+        }
     }
-    units
-        .into_iter()
-        .filter_map(|(unit, rows)| {
-            let below = prefixes.remove(&unit).unwrap_or_default();
-            audit_unit(unit, rows, &below)
+    let all: std::collections::BTreeSet<Unit> =
+        units.keys().chain(unproven.keys()).cloned().collect();
+    all.into_iter()
+        .filter_map(|unit| {
+            let rows = units.remove(&unit).unwrap_or_default();
+            let stretches = unproven.remove(&unit).unwrap_or_default();
+            audit_unit(unit, rows, &stretches)
         })
         .collect()
 }
@@ -450,13 +579,43 @@ fn uncovered(start: u64, end: u64, spans: &[Span]) -> Vec<(u64, u64)> {
 
 /// `None` for a unit with no committed range: there is nothing to tile, and
 /// whatever is pending there will be read from the source's own position.
-fn audit_unit(unit: Unit, rows: Vec<Row>, rotation_prefixes: &[u64]) -> Option<UnitReport> {
+fn audit_unit(unit: Unit, rows: Vec<Row>, unproven: &[(u64, u64)]) -> Option<UnitReport> {
     let committed = spans(
         rows.iter()
             .filter(|row| row.state == BatchState::SourceCommitted),
     );
+    let failed = spans(
+        rows.iter()
+            .filter(|row| matches!(row.state, BatchState::Failed | BatchState::ReplayRequired)),
+    );
     if committed.is_empty() {
-        return None;
+        // Known only through a rotation window's unplaceable stretches:
+        // nothing to tile, but the stretches are still reported.
+        if unproven.is_empty() || !unit.judgeable() {
+            return None;
+        }
+        let mut report = UnitReport {
+            committed: 0,
+            audited_from: 0,
+            committed_through: 0,
+            failed_holes: Vec::new(),
+            unexplained_holes: Vec::new(),
+            pending: Vec::new(),
+            unproven: Vec::new(),
+            duplicated: 0,
+            not_judged: None,
+            unit,
+        };
+        for &(start, end) in unproven {
+            for (start, end) in uncovered(start, end, &failed) {
+                report.unproven.push(Hole {
+                    start,
+                    end,
+                    failed_batches: Vec::new(),
+                });
+            }
+        }
+        return Some(report);
     }
     let committed_rows: usize = committed.iter().map(|span| span.rows.len()).sum();
     let total: u128 = committed
@@ -471,10 +630,6 @@ fn audit_unit(unit: Unit, rows: Vec<Row>, rotation_prefixes: &[u64]) -> Option<U
     let audited_from = committed[0].start;
     let committed_through = committed.last().expect("non-empty").end;
     let duplicated = u64::try_from(total - merged).unwrap_or(u64::MAX);
-    let failed = spans(
-        rows.iter()
-            .filter(|row| matches!(row.state, BatchState::Failed | BatchState::ReplayRequired)),
-    );
     let in_flight = spans(rows.iter().filter(|row| {
         !matches!(
             row.state,
@@ -513,17 +668,27 @@ fn audit_unit(unit: Unit, rows: Vec<Row>, rotation_prefixes: &[u64]) -> Option<U
             failed_batches: span.rows.iter().map(|row| row.batch_id.clone()).collect(),
         });
     }
-    // ...and the start of a file rotated in mid-window: that file began at
-    // byte 0 in this very window, so its prefix is not old history. What no
-    // committed or failed row places there is unproven, not lost.
-    for &below in rotation_prefixes {
-        let end = below.min(audited_from);
-        for (start, end) in uncovered(0, end, &failed) {
-            report.unproven.push(Hole {
-                start,
-                end,
-                failed_batches: Vec::new(),
-            });
+    // ...and what a rotation window cannot place (see `rotation_unproven`),
+    // outside the stretch the audit judges anyway and not covered by any
+    // committed or failed row: unproven, not lost.
+    for &(start, end) in unproven {
+        for (start, end) in uncovered(start, end, &committed) {
+            let outside_judged = [
+                (start, end.min(audited_from)),
+                (start.max(committed_through), end),
+            ];
+            for (start, end) in outside_judged {
+                if start >= end {
+                    continue;
+                }
+                for (start, end) in uncovered(start, end, &failed) {
+                    report.unproven.push(Hole {
+                        start,
+                        end,
+                        failed_batches: Vec::new(),
+                    });
+                }
+            }
         }
     }
     // The stretches to judge: between committed spans.
@@ -608,9 +773,11 @@ struct DigestTrailer {
 /// Where prune digests go when the caller names no directory (review of
 /// #573): `engine.ledger_digest_dir` when set; otherwise beside a SQLite
 /// database file, on the database's own volume - the digests anchor history
-/// the database no longer holds, and must last as long as it does; only
-/// otherwise (PostgreSQL, an in-memory SQLite) under `work_dir`, which is
-/// scratch and which a PostgreSQL deployment should override.
+/// the database no longer holds, and must last as long as it does - in a
+/// directory named for that database file, so two databases side by side
+/// never read each other's digests as their own history; only otherwise
+/// (PostgreSQL, an in-memory SQLite) under `work_dir`, which is scratch and
+/// which a PostgreSQL deployment should override.
 pub fn default_digest_dir(engine: &vtop_core::config::EngineConfig) -> PathBuf {
     if let Some(dir) = engine
         .ledger_digest_dir
@@ -629,7 +796,10 @@ pub fn default_digest_dir(engine: &vtop_core::config::EngineConfig) -> PathBuf {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        return beside.join("ledger-digests");
+        let name = database
+            .file_name()
+            .map_or_else(|| "state".into(), |name| name.to_string_lossy());
+        return beside.join(format!("{name}.ledger-digests"));
     }
     Path::new(&engine.work_dir).join("ledger-digests")
 }
@@ -642,12 +812,17 @@ fn sqlite_database_file(conn: &str) -> Option<PathBuf> {
     if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
         return None;
     }
-    let path = conn
+    let rest = conn
         .strip_prefix("sqlite://")
         .or_else(|| conn.strip_prefix("sqlite:"))
         .unwrap_or(conn);
-    let path = path.split('?').next().unwrap_or_default();
-    if path.is_empty() || path == ":memory:" || lower.contains("mode=memory") {
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    // The `mode=memory` QUERY PARAMETER, exactly - not those characters
+    // anywhere in the string, which a real path can contain (review).
+    let in_memory = query
+        .split('&')
+        .any(|parameter| parameter.eq_ignore_ascii_case("mode=memory"));
+    if path.is_empty() || path == ":memory:" || in_memory {
         return None;
     }
     Some(PathBuf::from(path))
@@ -963,10 +1138,11 @@ impl AuditReport {
             }
             for hole in &unit.unproven {
                 out.push(format!(
-                    "     unproven [{}, {}): the start of a file rotated in mid-window; the \
-                     ledger does not record whether that window read it (a skip by a release \
+                    "     unproven [{}, {}): a stretch a window spanning a rotation may have \
+                     read; the ledger does not record whether it did (a skip by a release \
                      before #564 looks the same)",
-                    hole.start, hole.end
+                    hole.start,
+                    bound(hole.end)
                 ));
             }
             for pending in &unit.pending {
@@ -1041,7 +1217,7 @@ impl AuditReport {
             ("vtop_coverage_audit_units", "Source units audited", 4),
             (
                 "vtop_coverage_audit_unproven_ranges",
-                "Starts of files rotated in mid-window that the ledger cannot place (not findings)",
+                "Stretches of files around a mid-window rotation that the ledger cannot place (not findings)",
                 5,
             ),
         ];
@@ -1107,9 +1283,32 @@ mod tests {
             inode: Some(inode),
             start_byte: start,
             end_byte: end,
-            file_size: end,
+            // A file larger than any read here: one generation throughout,
+            // unless a test says otherwise (see `sized`).
+            file_size: 1 << 40,
             mtime: String::new(),
         }
+    }
+
+    /// A one-read window over `[start, end)` of `path`/`inode` that saw the
+    /// file at `size` bytes.
+    fn sized(
+        id: &str,
+        state: BatchState,
+        inode: u64,
+        start: u64,
+        end: u64,
+        size: u64,
+    ) -> BatchRecord {
+        let marker = |end_byte: u64| ProgressMarker::File {
+            path: "/a.log".into(),
+            inode: Some(inode),
+            start_byte: start,
+            end_byte,
+            file_size: size,
+            mtime: String::new(),
+        };
+        row(id, state, marker(start), marker(end))
     }
 
     fn kafka(start: i64, end: i64) -> ProgressMarker {
@@ -1260,7 +1459,16 @@ mod tests {
             .iter()
             .find(|u| matches!(u.unit, Unit::File { inode: Some(1), .. }))
             .unwrap();
-        assert_eq!(old.committed_through, END_OF_FILE);
+        // The old file is credited only through its own last commit; how far
+        // the rotation window read on into it is unproven, not committed.
+        assert_eq!(old.committed_through, 100);
+        assert_eq!(
+            old.unproven
+                .iter()
+                .map(|hole| (hole.start, hole.end))
+                .collect::<Vec<_>>(),
+            vec![(100, END_OF_FILE)]
+        );
         let new = units
             .iter()
             .find(|u| matches!(u.unit, Unit::File { inode: Some(2), .. }))
@@ -1323,6 +1531,65 @@ mod tests {
         assert!(new.unproven.is_empty());
     }
 
+    /// Review of #573: a window that read part of the old file and then the
+    /// new one does not credit the old file to its end - nothing records how
+    /// far it read - so a lost tail stays visible as unproven, even for an
+    /// old file known only through that window.
+    #[test]
+    fn a_rotated_out_tail_is_unproven_not_committed() {
+        let units = audit([row(
+            "across",
+            Committed,
+            file("/a.log", 1, 0, 0),
+            file("/a.log", 2, 0, 40),
+        )]);
+        let old = units
+            .iter()
+            .find(|u| matches!(u.unit, Unit::File { inode: Some(1), .. }))
+            .expect("the old file is reported for its unproven tail");
+        assert_eq!(old.committed, 0);
+        assert_eq!(
+            (old.unproven[0].start, old.unproven[0].end),
+            (0, END_OF_FILE)
+        );
+        assert!(!old.has_findings());
+    }
+
+    /// Review of #573: a copytruncate keeps the inode, and a filesystem can
+    /// reuse one for a replacement file. A read that saw the file SMALLER
+    /// than what was already read at that path and inode starts a new
+    /// generation, judged on its own: the old content's [0,100) no longer
+    /// covers the new content, whose skipped start shows as unproven.
+    #[test]
+    fn new_content_at_the_same_inode_is_a_new_generation() {
+        let units = audit([
+            sized("old", Committed, 7, 0, 100, 100),
+            // Truncated, then resumed at byte 50 of 80: [0,50) of the new
+            // content was never read.
+            sized("new", Committed, 7, 50, 80, 80),
+        ]);
+        assert_eq!(units.len(), 2, "{units:?}");
+        let new = units
+            .iter()
+            .find(|u| matches!(u.unit, Unit::File { generation: 1, .. }))
+            .expect("the new content is its own unit");
+        assert_eq!((new.audited_from, new.committed_through), (50, 80));
+        assert_eq!(
+            (new.unproven[0].start, new.unproven[0].end),
+            (0, 50),
+            "the new content's skipped start must not be covered by the old content"
+        );
+        assert!(new.unit.to_string().contains("generation 1"));
+
+        // A file that only grew stays one generation.
+        let grown = audit([
+            sized("a", Committed, 7, 0, 100, 100),
+            sized("b", Committed, 7, 100, 150, 150),
+        ]);
+        assert_eq!(grown.len(), 1);
+        assert!(grown[0].unproven.is_empty());
+    }
+
     /// Review of #573: below the first commit only what a failed row names is
     /// judged. FAILED [0,5) under a first commit at 10 is a failed hole of
     /// [0,5) - and [5,10), which nothing names, is history the audit cannot
@@ -1357,7 +1624,8 @@ mod tests {
         );
         assert_eq!(
             default_digest_dir(&config.engine),
-            PathBuf::from("/var/lib/vtop/ledger-digests")
+            PathBuf::from("/var/lib/vtop/state.db.ledger-digests"),
+            "named for the database, so a neighbour's digests are not read as its own"
         );
         let mut configured = config.clone();
         configured.engine.ledger_digest_dir = Some("/backed-up/digests".into());
@@ -1376,6 +1644,15 @@ mod tests {
             Some(PathBuf::from("state.db"))
         );
         assert_eq!(sqlite_database_file("postgres://u@h/db"), None);
+        // `mode=memory` counts only as the query parameter (review).
+        assert_eq!(
+            sqlite_database_file("sqlite:///data/mode=memory/state.db"),
+            Some(PathBuf::from("/data/mode=memory/state.db"))
+        );
+        assert_eq!(
+            sqlite_database_file("sqlite:file:state.db?cache=shared&mode=memory"),
+            None
+        );
     }
 
     /// Review of #573: a prune whose delete failed lists the same rows again;

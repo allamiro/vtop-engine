@@ -449,17 +449,20 @@ prune-ledger --older-than-days N` under a maintenance identity (see
 Rows in any non-committed state are never touched.
 
 **Pruning keeps an anchor (#560).** Every prune pass, the engine's and
-`vtopctl prune-ledger`'s alike, lists the rows it is about to delete, writes
-them to a versioned digest, fsyncs it into place, and only then deletes exactly those
-rows; each is re-checked against the prune predicate at deletion. A crash
+`vtopctl prune-ledger`'s alike, lists its CANDIDATE rows, writes them to a
+versioned digest, fsyncs it into place, and only then deletes them - each
+re-checked against the prune predicate at deletion, so a candidate that has
+since gained a reason to stay (it became the newest row for its path) stays
+in the ledger, digested but undeleted, and the audit counts it once. A crash
 between the two leaves rows that are digested and still in the ledger, which
 the audit counts once. The digest carries a SHA-256 trailer that catches a
 truncated or edited file. It is not a signature: anyone who can rewrite the
 file can rewrite the hash, so keep the directory where the engine's identity
 can write and others cannot, and back it up with the ledger. The directory is
 `--digest-dir` or `engine.ledger_digest_dir` when given; otherwise
-`ledger-digests/` beside a SQLite database file, on the database's own volume,
-so the digests last as long as the ledger does. Only failing both (PostgreSQL)
+`<database file>.ledger-digests/` beside a SQLite database file, on the
+database's own volume, so the digests last as long as the ledger does and two
+databases side by side keep apart. Only failing both (PostgreSQL)
 is it `<engine.work_dir>/ledger-digests/`, and `work_dir` is scratch: give a
 PostgreSQL deployment a durable directory.
 
@@ -490,12 +493,17 @@ committed range it judges only what a failed row there names; history nothing
 recorded (a tail started mid-file, a consumer group that began at a later
 offset, history pruned before digests existed) cannot be judged. Neither can a
 file or spool known only from rows without an inode: they are reported as not
-judged. A window that spans a rotation counts for both files: the old one from
-where the window started to its end, the new one over its last read. Where the
-window's reading of the new file began is not recorded, so the start of that
-file below its last read is reported as unproven - a window that read it
-more than once looks the same as a release before #564 that skipped it - and
-is not counted as lost.
+judged. A window that spans a rotation is credited only over what its markers
+prove: the new file over the window's last read. How far it read the old file,
+and where its reading of the new one began, are not recorded, so the old
+file's tail from the window's start and the new file's start below its last
+read are reported as unproven - a window that read them looks the same as a
+release before #564 that skipped them - and are not counted as lost. A file
+whose content restarted at the same path and inode (a copytruncate, or a
+reused inode) is told apart by the file size each read observed: a read that
+saw the file smaller than what was already read there starts a new
+generation, judged on its own, with its start below its first read unproven.
+Spool markers record no size, so spool files are judged per inode only.
 
 ---
 
