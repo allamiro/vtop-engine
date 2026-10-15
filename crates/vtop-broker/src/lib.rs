@@ -1086,18 +1086,15 @@ impl LocalBroker {
     /// retention is to not configure it.
     pub fn set_retention(&self, policy: Option<vtop_log::RetentionPolicy>) {
         let bound = policy.map(|policy| policy.max_total_bytes).unwrap_or(0);
-        self.retention_max_total_bytes
-            .store(bound, Ordering::SeqCst);
-        if bound == 0 {
-            // Disabled - by `None` or by a zero bound, which this layer
-            // treats the same (review). Nothing will record over the last
-            // pass's state now; left in place it would keep exporting a
-            // stale bound, size and blocked reason (review of #572).
-            self.retention_stats.clear();
-        } else {
-            // A pass still running under the old bound records nothing.
-            self.retention_stats.policy_changed();
-        }
+        // The bound and the policy generation move together, under the
+        // stats' policy lock, and what the last pass recorded is forgotten:
+        // disabled (by `None` or a zero bound, which this layer treats the
+        // same) or rebound, a pass of the old policy must not leave its
+        // bound, size and blocked reason exported (review of #572).
+        self.retention_stats.change_policy(|| {
+            self.retention_max_total_bytes
+                .store(bound, Ordering::SeqCst);
+        });
     }
 
     /// Run one retention pass under the state lock the caller already holds.
@@ -1107,10 +1104,11 @@ impl LocalBroker {
     /// next open — refusing the produce over reclamation trouble would turn
     /// a disk-space policy into an availability incident.
     fn run_retention(&self, segment: &mut SegmentSet) {
-        // The generation BEFORE the bound: a policy change between the two
-        // makes this pass's record a no-op (review of #572).
-        let generation = self.retention_stats.policy_generation();
-        let max_total_bytes = self.retention_max_total_bytes.load(Ordering::SeqCst);
+        // The bound and its generation, read together (review of #572): a
+        // policy change after this makes the pass's record a no-op.
+        let (generation, max_total_bytes) = self
+            .retention_stats
+            .policy(|| self.retention_max_total_bytes.load(Ordering::SeqCst));
         if max_total_bytes == 0 {
             return;
         }

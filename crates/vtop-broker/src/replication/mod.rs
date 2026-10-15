@@ -346,29 +346,26 @@ impl InProcessFollower {
     /// configuration rejects zero outright.
     pub fn set_retention(&self, policy: Option<vtop_log::RetentionPolicy>) {
         let bound = policy.map(|policy| policy.max_total_bytes).unwrap_or(0);
-        self.retention_max_total_bytes
-            .store(bound, std::sync::atomic::Ordering::SeqCst);
-        if bound == 0 {
-            // Disabled - by `None` or by a zero bound, which this layer
-            // treats the same (review). Nothing will record over the last
-            // pass's state now; left in place it would keep exporting a
-            // stale bound, size and blocked reason (review of #572).
-            self.retention_stats.clear();
-        } else {
-            // A pass still running under the old bound records nothing.
-            self.retention_stats.policy_changed();
-        }
+        // The bound and the policy generation move together, under the
+        // stats' policy lock, and what the last pass recorded is forgotten:
+        // disabled (by `None` or a zero bound, which this layer treats the
+        // same) or rebound, a pass of the old policy must not leave its
+        // bound, size and blocked reason exported (review of #572).
+        self.retention_stats.change_policy(|| {
+            self.retention_max_total_bytes
+                .store(bound, std::sync::atomic::Ordering::SeqCst);
+        });
     }
 
     /// One retention pass under the held state lock; failures reported, not
     /// returned, for the same reason as on the leader — the append was
     /// already durable, and the next open finishes an interrupted pass.
     fn run_retention(&self, segment: &mut vtop_log::SegmentSet) {
-        // The generation BEFORE the bound (review of #572), as on the leader.
-        let generation = self.retention_stats.policy_generation();
-        let max_total_bytes = self
-            .retention_max_total_bytes
-            .load(std::sync::atomic::Ordering::SeqCst);
+        // The bound and its generation, read together (review of #572).
+        let (generation, max_total_bytes) = self.retention_stats.policy(|| {
+            self.retention_max_total_bytes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        });
         if max_total_bytes == 0 {
             return;
         }
