@@ -517,8 +517,11 @@ groups:
             model:
               refId: A
               instant: true
+              # The SERVING replica's log start (review of #574): replicas reclaim
+              # independently, and after a failover the leader can hold records a
+              # follower has dropped; the group fetches from the leader.
               expr: >-
-                max by (topic, range) (vtop_broker_log_start_offset) - on (topic, range) group_right max by (topic, range, group) (vtop_meta_group_cursor_offset)
+                max by (topic, range) (vtop_broker_log_start_offset * on (instance, topic, range) group_left () (vtop_broker_lease_active == 1)) - on (topic, range) group_right max by (topic, range, group) (vtop_meta_group_cursor_offset)
               intervalMs: 1000
               maxDataPoints: 43200
           - refId: C
@@ -575,8 +578,9 @@ groups:
             model:
               refId: A
               instant: true
+              # The serving replica's log start and its rate (review of #574).
               expr: >-
-                ((max by (topic, range, group) (vtop_meta_group_cursor_offset) - on (topic, range) group_left max by (topic, range) (vtop_broker_log_start_offset)) / on (topic, range) group_left() (max by (topic, range) (deriv(vtop_broker_log_start_offset[30m])) > 0)) > 0
+                ((max by (topic, range, group) (vtop_meta_group_cursor_offset) - on (topic, range) group_left max by (topic, range) (vtop_broker_log_start_offset * on (instance, topic, range) group_left () (vtop_broker_lease_active == 1))) / on (topic, range) group_left() (max by (topic, range) (deriv(vtop_broker_log_start_offset[30m]) * on (instance, topic, range) group_left () (vtop_broker_lease_active == 1)) > 0)) > 0
               intervalMs: 1000
               maxDataPoints: 43200
           - refId: C

@@ -166,7 +166,10 @@ warned before it happened (#571). Two series meet in PromQL:
 `topic` is the topic name and `range` the range UUID on both, so lag is
 `cursor - on (topic, range) group_left log_start`, and time to eviction is that
 gap divided by how fast retention moves the log start (`deriv`, the gauge's
-slope).
+slope). The log start is the SERVING replica's - joined on
+`vtop_broker_lease_active == 1` - because replicas reclaim independently: after
+a failover the leader can still hold records a follower has dropped, and the
+group fetches from the leader.
 
 | Rule | Fires when | For |
 |---|---|---|
