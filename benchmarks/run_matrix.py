@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+from lib.competitor import COMPETITOR_COLUMNS  # noqa: E402
 from lib.scenario import load_scenario  # noqa: E402
 from lib.shaping import SHAPING_COLUMNS, selected_driver  # noqa: E402
 
@@ -43,7 +44,11 @@ COMPARE_COLS = [
     # The pipe a shaped run was measured through (#403, #477); empty when
     # unshaped. Spliced from lib/shaping.py so the matrix cannot fall behind a
     # driver that adds a column.
-    *SHAPING_COLUMNS, "emulator_validation_mbps", "upload_p95_ms",
+    *SHAPING_COLUMNS, "emulator_validation_mbps",
+    # What the run cost the flow beside it (#478); blank for the runs that
+    # started none. Spliced from lib/competitor.py so the index can never
+    # reach this table without the two per-flow numbers beside it.
+    *COMPETITOR_COLUMNS, "upload_p95_ms",
     # Which way the sender ran (#476); a comparison across modes is a
     # comparison of namespaces, and the matrix must say so.
     "runner_mode",
@@ -85,6 +90,10 @@ RESOLVED_COLUMNS = (
     # scenario 17 from scenario 12 carried the declaration rather than the
     # topology, in a spelling the other rows do not even use.
     "h3_proxy",
+    # #478: what the run MEASURED about its neighbour must outrank what the
+    # scenario asked for. No scenario key shares a name with these today; the
+    # rule is written once so the day one appears it is already correct.
+    *COMPETITOR_COLUMNS,
 )
 
 
@@ -279,8 +288,9 @@ def matrix_row(summary: dict) -> dict:
     row.update(resolved)
     # An unshaped run carries no shaping columns at all, and blank is what the
     # refusal reads as "not shaped" — spell it, rather than leaving the
-    # scenario's request showing.
-    for key in SHAPING_COLUMNS:
+    # scenario's request showing. An uncontended run's competitor columns are
+    # blank for the same reason (#478).
+    for key in (*SHAPING_COLUMNS, *COMPETITOR_COLUMNS):
         row.setdefault(key, "")
     return row
 
