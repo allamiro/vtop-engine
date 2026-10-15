@@ -899,14 +899,39 @@ fn default_multipart_abandon_after_secs() -> u64 {
 pub struct PartitioningConfig {
     #[serde(default = "default_template")]
     pub template: String,
+    /// Which clock picks an object's time partition (`{yyyy}`..`{hh}`) (#559).
+    #[serde(default)]
+    pub time_source: PartitionTime,
 }
 
 impl Default for PartitioningConfig {
     fn default() -> Self {
         Self {
             template: default_template(),
+            time_source: PartitionTime::default(),
         }
     }
+}
+
+/// Which clock picks an object's time partition (#559).
+///
+/// Partitions used to come from the wall clock at upload, after compression
+/// and checksumming: a batch sealed at 12:59 and uploaded at 13:00 was filed
+/// under hour 13, and a backlog drain or a replay filed old events under the
+/// hour it happened to be uploaded in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionTime {
+    /// When the batch was sealed: fixed before any upload work, so retries
+    /// within a batch and slow uploads do not move it. Late data and replays
+    /// land in the hour they were SEALED in.
+    #[default]
+    Seal,
+    /// The earliest record time the source reported (Kafka message
+    /// timestamps). A batch whose source reports no record time falls back to
+    /// its seal time. Late data lands in the hour it HAPPENED in, which can be
+    /// a partition a downstream reader has already processed.
+    Event,
 }
 
 fn default_template() -> String {
