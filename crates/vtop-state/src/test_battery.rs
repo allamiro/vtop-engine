@@ -13,7 +13,7 @@
 //! [`run_all`] assumes it is handed a FRESH, empty store; each check uses
 //! uniquely-prefixed `batch_id`s so they remain independent on a shared store.
 
-use crate::{BatchPatch, BatchRecord, StateStore};
+use crate::{BatchPatch, BatchRecord, CommittedCursor, StateStore};
 use vtop_core::errors::VtopError;
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
@@ -75,6 +75,7 @@ pub async fn run_all(store: &dyn StateStore) {
     mark_failed_from_any_state(store).await;
     lists_incomplete_and_failed(store).await;
     max_committed_end_bytes_aggregates_in_store(store).await;
+    committed_cursors_never_mix_the_offsets_of_two_files(store).await;
     claims_respect_live_leases_and_take_over_expired_ones(store).await;
 }
 
@@ -278,6 +279,194 @@ async fn max_committed_end_bytes_aggregates_in_store(store: &dyn StateStore) {
     );
 }
 
+/// #558: a restart seeds each file's cursor from the ledger. The ledger's
+/// per-path MAX(end_byte) mixes every file that has ever lived at the path, so
+/// after a rotation it handed the NEW file the OLD file's high-water mark.
+/// `committed_cursors` answers with the newest committed batch's inode, end
+/// byte and observed length - the newest by the instant it was created.
+async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateStore) {
+    // `file_size` is deliberately NOT the end byte: a bounded read leaves the
+    // cursor behind the file's end, and the size the batch observed is what a
+    // restart compares a shrunken file against.
+    let marker = |path: &str, inode: Option<u64>, end: u64| ProgressMarker::File {
+        path: path.into(),
+        inode,
+        start_byte: 0,
+        end_byte: end,
+        file_size: end * 10,
+        mtime: String::new(),
+    };
+    let mk = |id: &str, path: &str, inode: Option<u64>, end: u64| {
+        let mut r = sample_record(id);
+        r.source_type = SourceType::File;
+        r.source_name = path.to_string();
+        r.progress_start = marker(path, inode, 0);
+        r.progress_end = marker(path, inode, end);
+        r
+    };
+    // /rot.log: inode 11 reached byte 900, then the file was rotated and the
+    // new one (inode 22) reached byte 60. /same.log was copytruncated: the
+    // same inode reached 70, then the new content 30. /legacy.log predates
+    // inode tracking. The newest row wins outright.
+    for (id, path, inode, end) in [
+        ("cur-1", "/rot.log", Some(11), 400),
+        ("cur-2", "/rot.log", Some(11), 900),
+        ("cur-3", "/rot.log", Some(22), 20),
+        ("cur-4", "/rot.log", Some(22), 60),
+        ("cur-5", "/same.log", Some(5), 70),
+        ("cur-6", "/same.log", Some(5), 30),
+        ("cur-7", "/legacy.log", None, 15),
+    ] {
+        store
+            .save_batch_state(&mk(id, path, inode, end))
+            .await
+            .unwrap();
+        let p = BatchPatch::default();
+        for st in LEGAL_WALK {
+            store.update_batch_state(id, st, &p).await.unwrap();
+        }
+        // `updated_at` orders "most recent": make each commit strictly later.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // The restart cursor is the window READ last, not the one COMMITTED last:
+    // recovery can commit an older VERIFIED window after a newer one (review of
+    // #564). L1 (inode 41) was read first, L2 (inode 42) second; L2 commits
+    // first and L1 last, so `updated_at` would name the older file.
+    for (id, inode, end) in [("cur-l1", 41, 100), ("cur-l2", 42, 20)] {
+        store
+            .save_batch_state(&mk(id, "/late.log", Some(inode), end))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let p = BatchPatch::default();
+    for id in ["cur-l2", "cur-l1"] {
+        for st in LEGAL_WALK {
+            store.update_batch_state(id, st, &p).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // "Newest" compares instants, not text: `.1Z` sorts after `.15Z` as a
+    // string though it is 50 ms earlier (review of #564). Created in that
+    // order, as the engine would.
+    for (id, created_at, inode, end) in [
+        ("cur-z1", "2026-01-01T00:00:00.1Z", 61, 10),
+        ("cur-z2", "2026-01-01T00:00:00.15Z", 62, 20),
+    ] {
+        let mut r = mk(id, "/frac.log", Some(inode), end);
+        r.created_at = created_at.into();
+        store.save_batch_state(&r).await.unwrap();
+        for st in LEGAL_WALK {
+            store.update_batch_state(id, st, &p).await.unwrap();
+        }
+    }
+    // An inode above i64::MAX must survive the round trip exactly: a lossy
+    // conversion would read as a different (or unknown) identity.
+    let huge = u64::MAX - 1;
+    store
+        .save_batch_state(&mk("cur-huge", "/huge.log", Some(huge), 7))
+        .await
+        .unwrap();
+    for st in LEGAL_WALK {
+        store.update_batch_state("cur-huge", st, &p).await.unwrap();
+    }
+    // An UNCOMMITTED row on the new inode with a bigger end must not count.
+    store
+        .save_batch_state(&mk("cur-8", "/rot.log", Some(22), 5_000))
+        .await
+        .unwrap();
+
+    let mut got = store.committed_cursors(SourceType::File).await.unwrap();
+    got.retain(|c| {
+        [
+            "/rot.log",
+            "/same.log",
+            "/legacy.log",
+            "/late.log",
+            "/huge.log",
+            "/frac.log",
+        ]
+        .contains(&c.path.as_str())
+    });
+    got.sort_by(|a, b| a.path.cmp(&b.path));
+    let want = |path: &str, inode: Option<u64>, end_byte: u64| CommittedCursor {
+        path: path.into(),
+        inode,
+        end_byte,
+        // The NEWEST committed row's observed size, not a maximum: /same.log's
+        // newest row ended at 30 (file_size 300) though an earlier one ended at
+        // 70, and /rot.log's old inode (9000) must not leak into the new one.
+        observed_size: Some(end_byte * 10),
+    };
+    assert_eq!(
+        got,
+        vec![
+            want("/frac.log", Some(62), 20),
+            want("/huge.log", Some(huge), 7),
+            // Read last, committed first: still the restart cursor.
+            want("/late.log", Some(42), 20),
+            want("/legacy.log", None, 15),
+            // The rotated path resumes at the NEW file's 60, not the old 900.
+            want("/rot.log", Some(22), 60),
+            // copytruncate keeps the inode: the newest row's 30, not the old
+            // content's 70 - with a maximum, a restart after the new content
+            // regrew past 70 would skip its bytes 30..70 (review of #564).
+            want("/same.log", Some(5), 30),
+        ]
+    );
+    // Rows of another source type never appear in a File answer, and a
+    // SyslogSpool row is answered for SyslogSpool alone — with its own inode.
+    let spool_marker = |path: &str, inode: Option<u64>, end: u64| ProgressMarker::SyslogSpool {
+        spool_id: "s".into(),
+        path: path.into(),
+        inode,
+        start_byte: 0,
+        end_byte: end,
+        received_time_start: None,
+        received_time_end: None,
+    };
+    for (id, inode, end) in [("cur-s1", Some(31), 500), ("cur-s2", Some(32), 20)] {
+        let mut r = sample_record(id);
+        r.source_type = SourceType::SyslogSpool;
+        r.source_name = "/rot-spool.log".to_string();
+        r.progress_start = spool_marker("/rot-spool.log", inode, 0);
+        r.progress_end = spool_marker("/rot-spool.log", inode, end);
+        store.save_batch_state(&r).await.unwrap();
+        let p = BatchPatch::default();
+        for st in LEGAL_WALK {
+            store.update_batch_state(id, st, &p).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let spool = store
+        .committed_cursors(SourceType::SyslogSpool)
+        .await
+        .unwrap();
+    assert_eq!(
+        spool
+            .iter()
+            .filter(|c| c.path == "/rot-spool.log")
+            .collect::<Vec<_>>(),
+        vec![&CommittedCursor {
+            path: "/rot-spool.log".into(),
+            inode: Some(32),
+            end_byte: 20,
+            // A spool marker records no file length.
+            observed_size: None,
+        }],
+        "the spool answers with the newest inode and that inode's maximum"
+    );
+    assert!(spool
+        .iter()
+        .all(|c| !["/rot.log", "/same.log", "/legacy.log"].contains(&c.path.as_str())));
+    assert!(store
+        .committed_cursors(SourceType::File)
+        .await
+        .unwrap()
+        .iter()
+        .all(|c| c.path != "/rot-spool.log"));
+}
+
 /// #93: the claim primitive is what makes N engines safe over one store. A
 /// live engine's in-flight batches must NEVER transfer; a dead engine's must
 /// transfer wholesale once its lease expires; committed rows are never
@@ -454,16 +643,36 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
             .unwrap();
     }
 
+    // /logs/c was copytruncated: the newer row ends LOWER than the older one.
+    // The newer one is the restart cursor and is what pruning must keep; the
+    // highest offset, which pruning used to keep, is the old content's.
+    for (id, end) in [("pr-c90", 90), ("pr-c15", 15)] {
+        let rec = record(id, SourceType::File, "dir-src", file_marker("/logs/c", end));
+        store.save_batch_state(&rec).await.unwrap();
+        for st in LEGAL_WALK {
+            store
+                .update_batch_state(id, st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
     // The battery shares one store across checks, so earlier residue may
     // contribute additional paths; assert on this check's paths and on
     // before/after invariance rather than absolute contents.
-    let mut seeds_before = store
-        .max_committed_end_bytes(SourceType::File)
-        .await
-        .unwrap();
-    seeds_before.sort();
-    assert!(seeds_before.contains(&("/logs/a".to_string(), 30)));
-    assert!(seeds_before.contains(&("/logs/b".to_string(), 5)));
+    let seeds = || async {
+        let mut seeds = store.committed_cursors(SourceType::File).await.unwrap();
+        seeds.sort_by(|a, b| a.path.cmp(&b.path));
+        seeds
+    };
+    let seeds_before = seeds().await;
+    let end_of = |seeds: &[crate::models::CommittedCursor], path: &str| {
+        seeds.iter().find(|c| c.path == path).map(|c| c.end_byte)
+    };
+    assert_eq!(end_of(&seeds_before, "/logs/a"), Some(30));
+    assert_eq!(end_of(&seeds_before, "/logs/b"), Some(5));
+    assert_eq!(end_of(&seeds_before, "/logs/c"), Some(15));
 
     // Nothing is older than the epoch: age protection deletes zero rows.
     assert_eq!(
@@ -475,9 +684,10 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
     );
 
     // Deletable set under a future cutoff: pr-a10, pr-a20 (path /logs/a has a
-    // greater committed row), pr-k01 (newer kafka row exists). Protected:
-    // pr-a30 and pr-b05 (per-path maxima), pr-k02 (newest for its source),
-    // pr-v40 (not SOURCE_COMMITTED).
+    // newer committed row), pr-c90 (older than pr-c15 though its offset is
+    // higher), pr-k01 (newer kafka row exists). Protected: pr-a30, pr-b05 and
+    // pr-c15 (newest per path), pr-k02 (newest for its source), pr-v40 (not
+    // SOURCE_COMMITTED).
     let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
     assert_eq!(
         store.prune_committed_history(&future, 1).await.unwrap(),
@@ -496,22 +706,18 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
         0
     );
 
-    let mut seeds_after = store
-        .max_committed_end_bytes(SourceType::File)
-        .await
-        .unwrap();
-    seeds_after.sort();
     assert_eq!(
-        seeds_before, seeds_after,
+        seeds_before,
+        seeds().await,
         "cursor seeds are prune-invariant"
     );
-    for survivor in ["pr-a30", "pr-b05", "pr-k02", "pr-v40"] {
+    for survivor in ["pr-a30", "pr-b05", "pr-c15", "pr-k02", "pr-v40"] {
         assert!(
             store.get_batch(survivor).await.unwrap().is_some(),
             "{survivor} must survive"
         );
     }
-    for deleted in ["pr-a10", "pr-a20", "pr-k01"] {
+    for deleted in ["pr-a10", "pr-a20", "pr-c90", "pr-k01"] {
         assert!(
             store.get_batch(deleted).await.unwrap().is_none(),
             "{deleted} must be pruned"

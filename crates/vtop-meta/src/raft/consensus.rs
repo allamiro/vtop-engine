@@ -82,6 +82,19 @@ pub enum ConsensusError {
          (vtopctl meta enable-features --level {needed})"
     )]
     FeatureNotEnabled { needed: u32, enabled: u32 },
+    /// A lease request was refused because its proposer's clock is further
+    /// from the metadata leader's than the leader tolerates (#555).
+    ///
+    /// TYPED so a caller can say what is wrong (fix the proposer's NTP) rather
+    /// than retry as though the leader were merely busy. Nothing was
+    /// replicated: the request never reached the log.
+    #[error(
+        "lease request refused: this node's clock is {} ms {} the metadata leader's, more than the \
+         {bound_ms} ms tolerated for this lease; fix the node's clock (NTP) before it can hold a range",
+        .skew_ms.unsigned_abs(),
+        if *.skew_ms >= 0 { "ahead of" } else { "behind" }
+    )]
+    ClockSkew { skew_ms: i64, bound_ms: u64 },
 }
 
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
@@ -160,6 +173,20 @@ pub struct OpenraftConsensus {
     /// MAC, never as a MAC of nothing. Installed after construction because
     /// the node resolves it from its environment once the store is open.
     transition_mac_key: std::sync::RwLock<Option<[u8; 32]>>,
+    /// The leader's clock a lease request's `issued_at_ms` is checked against
+    /// (#555). `None` reads the wall clock; tests install a fixed one.
+    leader_clock: std::sync::RwLock<Option<LeaderClock>>,
+}
+
+/// Milliseconds since the Unix epoch, as the metadata leader sees them.
+type LeaderClock = std::sync::Arc<dyn Fn() -> i64 + Send + Sync>;
+
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 impl OpenraftConsensus {
@@ -168,6 +195,50 @@ impl OpenraftConsensus {
             raft,
             store: None,
             transition_mac_key: std::sync::RwLock::new(None),
+            leader_clock: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Check lease requests against `clock` instead of the wall clock. For
+    /// tests that need a leader whose time they control.
+    pub fn set_leader_clock(&self, clock: impl Fn() -> i64 + Send + Sync + 'static) {
+        *self
+            .leader_clock
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::sync::Arc::new(clock));
+    }
+
+    /// The receipt for a request this node already applied, answered from
+    /// its dedup table: the original response, as of the applied index it
+    /// was read at. `None` when the table no longer remembers it, or the node
+    /// has no applied state to ask (a bare-Raft harness) - the caller then
+    /// judges the request as new.
+    fn applied_receipt(&self, request_id: uuid::Uuid) -> Option<CommitReceipt> {
+        // The response and the applied position are read under ONE storage
+        // lock (review): the metrics snapshot is published after apply and
+        // can lag it, so pairing the two could name a log id from before
+        // the entry that produced the response.
+        self.store.as_ref()?.with_storage(|storage| {
+            let response = storage.state().applied_response(request_id).cloned()?;
+            Some(CommitReceipt {
+                log_id: WireLogId {
+                    term: storage.last_applied_term(),
+                    index: storage.last_applied(),
+                },
+                response,
+            })
+        })
+    }
+
+    fn leader_now_ms(&self) -> i64 {
+        match self
+            .leader_clock
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            Some(clock) => clock(),
+            None => wall_clock_ms(),
         }
     }
 
@@ -696,6 +767,51 @@ impl Consensus for OpenraftConsensus {
                         leader: metrics.current_leader.map(MetaNodeId),
                     });
                 }
+            }
+        }
+        // A lease deadline is built from the proposer's clock, and the lease
+        // agent compares it with its own: a proposer whose clock is far from
+        // the leader's would steal or poison a lease. Refuse it BEFORE it is
+        // replicated, so it never reaches the log (#555).
+        //
+        // Only the LEADER judges. A follower's clock may differ from the
+        // proposer's by more than the bound while the leader's does not, and a
+        // `ClockSkew` from a follower is not a redirect: the client would keep
+        // retrying the follower instead of reaching the leader.
+        //
+        // And a lease command reaches `client_write` ONLY through a node that
+        // judged it as leader. A follower used to pass it on to
+        // `client_write` unjudged, trusting that call to redirect - but if
+        // the follower won an election in between, `client_write` accepted it
+        // as the new leader, and an hour-skewed proposer that hit that window
+        // could steal or poison a lease (review of #566). A non-leader now
+        // redirects lease commands itself; a leader that loses office after
+        // judging is refused by `client_write`, which cannot append once it
+        // is not the leader.
+        //
+        // And only a NEW request is judged. A retry whose timestamp has aged
+        // past the bound since the original committed must still get the
+        // original's answer, not a skew error about a request that succeeded
+        // - and it gets it HERE, read from the dedup table and returned,
+        // never passed on to `client_write` (review of #566): between a
+        // check that found it and the write, other commands can evict it
+        // from the full table, and the stale command would then be applied
+        // as new, past the very bound this exists to enforce.
+        if let Some(skew) = command.lease_clock_skew(self.leader_now_ms()) {
+            let metrics = self.raft.metrics().borrow().clone();
+            if metrics.state != ServerState::Leader {
+                return Err(ConsensusError::NotLeader {
+                    leader: metrics.current_leader.map(MetaNodeId),
+                });
+            }
+            if !skew.is_within_bound() {
+                if let Some(receipt) = self.applied_receipt(skew.request_id) {
+                    return Ok(receipt);
+                }
+                return Err(ConsensusError::ClockSkew {
+                    skew_ms: skew.skew_ms,
+                    bound_ms: skew.bound_ms,
+                });
             }
         }
         let response = self
