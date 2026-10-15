@@ -1595,17 +1595,24 @@ impl LeaseAgentConfig {
         // rival fast by it shorten the lease, in real time, by twice the
         // allowance metadata tolerates (review of #566). The sum must fit in
         // what is left.
+        //
+        // And the pause (review of #566): `paced` never waits less than
+        // MIN_ROUND_PAUSE, so a good round that used its whole budget puts
+        // the next round's start `renew_interval` PLUS that pause after its
+        // own, and a failed round is retried after at least the pause even
+        // when `poll_interval` is shorter.
         let after_one_lost_round = self
             .renew_interval
             .saturating_mul(2)
-            .saturating_add(self.poll_interval);
+            .saturating_add(MIN_ROUND_PAUSE)
+            .saturating_add(self.poll_interval.max(MIN_ROUND_PAUSE));
         let lease_ms = u64::try_from(self.lease_duration.as_millis()).unwrap_or(u64::MAX);
         let skew = Duration::from_millis(vtop_meta::lease_skew_bound_ms(lease_ms));
         let worst_case_lease = self.lease_duration.saturating_sub(skew.saturating_mul(2));
         if after_one_lost_round >= worst_case_lease {
             return Err(format!(
-                "renew_interval ({:?}) twice, plus poll_interval ({:?}), is at least the lease a \
-                 rival can see ({worst_case_lease:?}: lease_duration {:?} less twice the {skew:?} \
+                "renew_interval ({:?}) twice, plus poll_interval ({:?}) and the agent's minimum \
+                 pause between rounds ({MIN_ROUND_PAUSE:?}), is at least the lease a rival can see ({worst_case_lease:?}: lease_duration {:?} less twice the {skew:?} \
                  clock skew metadata tolerates for it): a hung renewal costs a full RPC deadline \
                  and is retried after the poll interval, so a single lost round trip would lose \
                  the range; shorten them or lengthen the lease",
@@ -2953,6 +2960,26 @@ mod tests {
     /// renewal re-promotes the exact leader build the supervisor just
     /// watched fail. The administrative dialect matters most: it has no
     /// lapse to mop up a failed hand-back, so the retry is the ONLY exit.
+    /// Review of #566: the pause between rounds counts. 10 s / 3 s /
+    /// 1999 ms looks like 7999 ms against the 8000 ms a rival can see after
+    /// two 1 s skew allowances, but a good round that used its whole budget
+    /// starts the next one 50 ms late, and the retry lands at 8049 ms.
+    #[test]
+    fn the_pause_between_rounds_counts_against_the_lease() {
+        let config = LeaseAgentConfig {
+            lease_duration: Duration::from_secs(10),
+            renew_interval: Duration::from_secs(3),
+            poll_interval: Duration::from_millis(1_999),
+        };
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("minimum pause"), "{error}");
+        let config = LeaseAgentConfig {
+            poll_interval: Duration::from_millis(1_900),
+            ..config
+        };
+        assert!(config.validate().is_ok());
+    }
+
     #[test]
     fn a_stood_down_epoch_is_handed_back_again_not_renewed() {
         assert_eq!(
