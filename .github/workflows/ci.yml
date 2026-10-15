@@ -324,7 +324,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # THE ONLY JOB THAT WRITES THE CACHE. Three jobs build this image and they
       # run in parallel, so having each export would mean three concurrent
@@ -333,7 +333,7 @@ jobs:
       # rather than from this one, which is what makes the saving repeatable
       # instead of dependent on job ordering.
       - name: Build engine image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/Dockerfile
@@ -387,7 +387,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Prebuilt cargo-audit binary (fast; no compile).
       - name: Install cargo-audit
-        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-audit
       # Reads .cargo/audit.toml: fails on any advisory NOT documented there,
@@ -414,18 +414,18 @@ jobs:
         with:
           version: v3.16.3
 
-      - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           cluster_name: vtop-ci
 
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Imports only — see the note on the image job. `load: true` is required
       # because the next step pulls the binaries back OUT of this image and
       # `kind load` needs it in the daemon, neither of which can read a build
       # that only exists in the buildx cache.
       - name: Build the engine image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/Dockerfile
@@ -1192,7 +1192,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-deny
       - run: cargo deny check
@@ -1281,7 +1281,7 @@ jobs:
       # signal only means something once the run itself has been attempted.
       - name: Upload scenario logs
         if: steps.chaos.outcome == 'failure'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: live-chaos-logs
           path: ${{ runner.temp }}/chaos/**/logs/
@@ -1405,7 +1405,7 @@ jobs:
 
       - name: Upload fixture logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: upgrade-compat-logs
           path: |
@@ -1464,7 +1464,7 @@ jobs:
         with:
           toolchain: stable
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-llvm-cov
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1553,14 +1553,14 @@ jobs:
       # Build the engine image once, up front: the script's `compose up` would
       # otherwise build it inside the timed wait loop and could time out on a
       # cold cache rather than on a real failure.
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Built here rather than by `docker compose build` so it can read the same
       # cache as the other two jobs; compose then finds the tag already in the
       # daemon and builds nothing. The tag must match what compose would have
       # produced, or compose rebuilds it and the cache buys nothing.
       - name: Build the engine image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/Dockerfile
@@ -1612,7 +1612,7 @@ jobs:
           # triple explicitly - otherwise a musl default fails with
           # "sanitizer is incompatible with statically linked libc".
           targets: x86_64-unknown-linux-gnu
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-fuzz
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1646,7 +1646,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: stable
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-mutants
       - name: Install librdkafka build dependencies
