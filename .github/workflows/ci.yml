@@ -1477,7 +1477,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install test tooling
-        run: pip install --disable-pip-version-check pytest pyyaml ruff
+        # ruff is pinned: a new release adds lint rules, and an unpinned one
+        # turned this job red with no change to the code (ruff 0.17.0).
+        run: pip install --disable-pip-version-check pytest pyyaml ruff==0.17.0
 
       - name: ruff
         run: ruff check .
@@ -1526,6 +1528,13 @@ jobs:
           tags: vtop-engine:local
           load: true
           cache-from: type=gha,scope=ci-image
+
+      # MinIO is built from source (docker/minio/Dockerfile: no registry serves
+      # its images any more). Built here, before the smoke, for the same reason
+      # as the engine image: a cold build inside the script's `compose up` is
+      # slow, and its failure should read as a build failure, not a lab one.
+      - name: Build the lab's MinIO image
+        run: docker compose build minio
 
       - name: Run the end-to-end smoke test
         env:
