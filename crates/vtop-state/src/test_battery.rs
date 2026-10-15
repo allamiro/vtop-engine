@@ -79,12 +79,144 @@ pub async fn run_all(store: &dyn StateStore) {
     claims_respect_live_leases_and_take_over_expired_ones(store).await;
 }
 
+/// #557: the claim fence. Two handles onto ONE ledger stand for two engines
+/// (or one engine before and after a stall); each backend runs this with two
+/// connections to the same database.
+///
+/// A lease is a lock with a timeout, not a fence: an engine that stalls past its
+/// lease and then resumes used to write over a row another engine had claimed
+/// and moved on, whenever the new owner happened to be in the state the stale
+/// one expected. Every claim now bumps a generation on the row and a writer
+/// that holds an older one is refused.
+pub async fn run_fencing_battery(a: &dyn StateStore, b: &dyn StateStore) {
+    const EXPIRED: &str = "2000-01-01T00:00:00+00:00";
+    const NOW: &str = "2050-01-01T00:00:00+00:00";
+    const LATER: &str = "2100-01-01T00:00:00+00:00";
+    let refused = |result: Result<(), VtopError>, id: &str| match result {
+        Err(e) => assert!(
+            e.to_string().contains("claimed by another engine") && e.to_string().contains(id),
+            "must be refused as a lost claim, naming the batch: {e}"
+        ),
+        Ok(()) => panic!("{id}: a write from an engine that lost its claim was accepted"),
+    };
+    let batch = |id: &str, owner: &str| {
+        let mut rec = sample_record(id);
+        rec.owner = Some(owner.into());
+        rec.lease_expires_at = Some(EXPIRED.into());
+        rec
+    };
+    let patch = BatchPatch::default();
+
+    // 1. The stalled engine. A creates a batch and works on it; its lease
+    //    lapses (it stalls); B claims the batch and takes it forward.
+    a.save_batch_state(&batch("fence-stalled", "engine-a"))
+        .await
+        .unwrap();
+    a.update_batch_state("fence-stalled", BatchState::Sealed, &patch)
+        .await
+        .unwrap();
+    let claimed = b
+        .claim_incomplete_batches("engine-b", NOW, LATER)
+        .await
+        .unwrap();
+    assert!(claimed.iter().any(|r| r.batch_id == "fence-stalled"));
+    // A resumes. Its next transition is legal for the state the row is in, and
+    // the state guard alone would let it through; the claim generation does not.
+    refused(
+        a.update_batch_state("fence-stalled", BatchState::Compressed, &patch)
+            .await,
+        "fence-stalled",
+    );
+    refused(
+        a.mark_failed("fence-stalled", "stale").await,
+        "fence-stalled",
+    );
+    assert_eq!(
+        b.get_batch("fence-stalled").await.unwrap().unwrap().state,
+        BatchState::Sealed,
+        "the stale write changed nothing"
+    );
+    // B, the owner, proceeds — including to the same transition A tried.
+    b.update_batch_state("fence-stalled", BatchState::Compressed, &patch)
+        .await
+        .unwrap();
+
+    // 2. Two engines that share an `owner` string are still fenced apart: the
+    //    claim predicate accepts `owner = $1`, so a name match must not stand in
+    //    for holding the claim.
+    a.save_batch_state(&batch("fence-shared-name", "shared"))
+        .await
+        .unwrap();
+    let claimed = b
+        .claim_incomplete_batches("shared", NOW, LATER)
+        .await
+        .unwrap();
+    assert!(claimed.iter().any(|r| r.batch_id == "fence-shared-name"));
+    refused(
+        a.update_batch_state("fence-shared-name", BatchState::Sealed, &patch)
+            .await,
+        "fence-shared-name",
+    );
+    // A claims it back (a restart, say): now B is the stale one.
+    let claimed = a
+        .claim_incomplete_batches("shared", NOW, LATER)
+        .await
+        .unwrap();
+    assert!(claimed.iter().any(|r| r.batch_id == "fence-shared-name"));
+    refused(
+        b.update_batch_state("fence-shared-name", BatchState::Sealed, &patch)
+            .await,
+        "fence-shared-name",
+    );
+    a.update_batch_state("fence-shared-name", BatchState::Sealed, &patch)
+        .await
+        .unwrap();
+
+    // 3. A process that holds no claim on a row - it neither created nor
+    //    claimed it, or dropped the token - is refused, not let through
+    //    unfenced: an unchecked write is exactly what a stalled writer whose
+    //    token went missing would make (review of #569). The creator's own
+    //    later writes are unaffected, because nothing moved the generation.
+    a.save_batch_state(&batch("fence-tool", "engine-a"))
+        .await
+        .unwrap();
+    match b
+        .update_batch_state("fence-tool", BatchState::Sealed, &patch)
+        .await
+    {
+        Err(e) => assert!(
+            e.to_string().contains("not claimed by this engine")
+                && e.to_string().contains("fence-tool"),
+            "must be refused as not held, naming the batch: {e}"
+        ),
+        Ok(()) => panic!("fence-tool: a write from a process holding no claim was accepted"),
+    }
+    a.update_batch_state("fence-tool", BatchState::Sealed, &patch)
+        .await
+        .unwrap();
+
+    // 4. A committed batch is finished: no claim, no fence.
+    a.save_batch_state(&batch("fence-done", "engine-a"))
+        .await
+        .unwrap();
+    for st in LEGAL_WALK {
+        a.update_batch_state("fence-done", st, &patch)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        a.get_batch("fence-done").await.unwrap().unwrap().state,
+        BatchState::SourceCommitted
+    );
+}
+
 /// #128 prune contract, separated from [`run_all`] because pruning DELETEs
 /// rows: it is a MAINTENANCE-identity operation. The PostgreSQL battery runs
 /// it with the migrator/owner connection; the runtime role is denied DELETE
 /// by design and must keep failing it.
 pub async fn run_prune_battery(store: &dyn StateStore) {
     prune_preserves_cursor_seeds_and_bounds_deletion(store).await;
+    listed_prune_deletes_only_what_was_listed(store).await;
 }
 
 async fn empty_store_is_empty(store: &dyn StateStore) {
@@ -723,4 +855,90 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
             "{deleted} must be pruned"
         );
     }
+}
+
+/// #560: a prune that must keep an anchor lists its rows first and deletes
+/// only those - never a row it did not list, never a row that has since
+/// gained a reason to stay, and never more than the listing's limit.
+async fn listed_prune_deletes_only_what_was_listed(store: &dyn StateStore) {
+    let marker = |end: u64| ProgressMarker::File {
+        path: "/logs/listed".into(),
+        inode: None,
+        start_byte: 0,
+        end_byte: end,
+        file_size: end,
+        mtime: String::new(),
+    };
+    for (id, end) in [("lp-10", 10), ("lp-20", 20), ("lp-30", 30), ("lp-40", 40)] {
+        let mut rec = sample_record(id);
+        rec.source_type = SourceType::File;
+        rec.source_name = "listed-src".into();
+        rec.progress_start = marker(end - 10);
+        rec.progress_end = marker(end);
+        store.save_batch_state(&rec).await.unwrap();
+        for st in LEGAL_WALK {
+            store
+                .update_batch_state(id, st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+    }
+    let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    let ours = |rows: Vec<BatchRecord>| -> Vec<String> {
+        rows.into_iter()
+            .map(|r| r.batch_id)
+            .filter(|id| id.starts_with("lp-"))
+            .collect()
+    };
+
+    // Listing deletes nothing, and never names the row a seed needs.
+    let listed = ours(store.prune_candidates(&future, 1_000).await.unwrap());
+    assert_eq!(
+        listed,
+        ["lp-10", "lp-20", "lp-30"],
+        "the newest row is never a candidate"
+    );
+    assert!(
+        store.get_batch("lp-10").await.unwrap().is_some(),
+        "listing deleted a row"
+    );
+    let limited = store.prune_candidates(&future, 1).await.unwrap();
+    assert_eq!(limited.len(), 1, "the limit bounds the listing");
+
+    // Delete a listed SUBSET plus a row that was never a candidate: only the
+    // listed candidates go.
+    let deleted = store
+        .prune_listed(
+            &future,
+            &["lp-10".into(), "lp-40".into(), "no-such-row".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+    assert!(store.get_batch("lp-10").await.unwrap().is_none());
+    assert!(
+        store.get_batch("lp-40").await.unwrap().is_some(),
+        "the newest row of its path was deleted because it was named"
+    );
+    assert!(
+        store.get_batch("lp-20").await.unwrap().is_some(),
+        "a row that was listed but not named in the delete was deleted"
+    );
+    // An age cutoff the rows do not meet protects them even when named.
+    let past = "1970-01-01T00:00:00+00:00";
+    assert_eq!(
+        store
+            .prune_listed(past, &["lp-20".into(), "lp-30".into()])
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(store.prune_listed(&future, &[]).await.unwrap(), 0);
+    assert_eq!(
+        store
+            .prune_listed(&future, &["lp-20".into(), "lp-30".into()])
+            .await
+            .unwrap(),
+        2
+    );
 }

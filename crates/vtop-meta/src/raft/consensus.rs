@@ -260,6 +260,40 @@ impl OpenraftConsensus {
         &self.raft
     }
 
+    /// Where every consumer group's durable cursor stands (#571), from this
+    /// node's APPLIED state, without waiting: `None` while the state machine
+    /// is busy, or on a node built without applied state.
+    ///
+    /// Only the LEADER answers; any other node answers with no cursors
+    /// (review of #574). Cursors are not monotonic - an unpinned cursor may
+    /// be committed backwards - so a lagging follower's copy can hold a
+    /// cursor ABOVE where the group now stands, and an aggregate across
+    /// nodes could report a group safe that is already below the log start.
+    /// The leader's applied state is the newest any node has.
+    ///
+    /// And only a leader that still HAS its quorum (review of #574): a
+    /// former leader cut off from the voters keeps reporting itself Leader,
+    /// and if the new leader commits a cursor backwards, both would export
+    /// the same series and an aggregate could pick the stale, higher copy.
+    /// A leader whose last quorum acknowledgement is older than an election
+    /// timeout - by when the others may have elected someone else - exports
+    /// nothing.
+    pub fn group_cursor_positions(
+        &self,
+        limit: usize,
+    ) -> Option<(Vec<crate::state::GroupCursorPosition>, bool)> {
+        let store = self.store.as_ref()?;
+        let metrics = self.raft.metrics().borrow().clone();
+        if !exports_cursors(
+            metrics.state,
+            metrics.millis_since_quorum_ack,
+            self.raft.config().election_timeout_min,
+        ) {
+            return Some((Vec::new(), false));
+        }
+        store.try_with_storage(|storage| storage.state().group_cursor_positions(limit))
+    }
+
     /// Non-blocking snapshot of this node's Raft state for the operational
     /// surface (#224).
     ///
@@ -868,6 +902,19 @@ impl Consensus for OpenraftConsensus {
     }
 }
 
+/// Whether a node exports group cursors (#571, review of #574): a leader
+/// whose quorum acknowledged it within an election timeout. A leader past
+/// that may already have been replaced while it still reports itself
+/// Leader; a follower's copy may stand above a cursor committed backwards.
+fn exports_cursors(
+    state: ServerState,
+    millis_since_quorum_ack: Option<u64>,
+    election_timeout_min_ms: u64,
+) -> bool {
+    state == ServerState::Leader
+        && millis_since_quorum_ack.is_some_and(|ms| ms <= election_timeout_min_ms)
+}
+
 /// Carry [`ConsensusError::NotLeader`] across into the transport layer instead
 /// of flattening it to prose.
 ///
@@ -1074,6 +1121,17 @@ mod tests {
     /// this function, and both flattened until now — so `meta add-learner`
     /// against a follower failed outright while `propose` against the same node
     /// was quietly redirected.
+    /// Review of #574: only a leader in recent contact with its quorum
+    /// exports cursors - not a follower, and not a former leader cut off
+    /// past an election timeout, which still reports itself Leader.
+    #[test]
+    fn only_a_leader_with_its_quorum_exports_cursors() {
+        assert!(exports_cursors(ServerState::Leader, Some(50), 300));
+        assert!(!exports_cursors(ServerState::Leader, Some(301), 300));
+        assert!(!exports_cursors(ServerState::Leader, None, 300));
+        assert!(!exports_cursors(ServerState::Follower, Some(0), 300));
+    }
+
     #[test]
     fn a_write_refused_for_leadership_classifies_as_a_redirect() {
         let error = openraft::error::RaftError::APIError(

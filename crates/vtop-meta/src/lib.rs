@@ -60,7 +60,8 @@ pub use raft::{
     RaftServerState, ReadFence, TlsRaftNetworkFactory,
 };
 pub use state::{
-    ClusterConfigRecord, ConsumerGroupRecord, CursorCheckpointRecord, GrantKind, GroupMemberRecord,
+    ClusterConfigRecord, ConsumerGroupRecord, CursorCheckpointRecord, GrantKind,
+    GroupCursorPosition, GroupMemberRecord,
     GroupNameRecord, KeyRecord, KeyState, LeaseRecord, MetaStateMachine, MetaValue, NodeRecord,
     RangeRecord, RangeTransitionRecord, RebalanceIntentRecord, ReplacementProofRecord,
     SegmentPlacementRecord, SegmentRecord, SegmentState, TierCopyRecord, TopicNameRecord,
