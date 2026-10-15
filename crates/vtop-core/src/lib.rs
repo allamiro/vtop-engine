@@ -20,6 +20,7 @@ pub mod compression;
 pub mod config;
 pub mod detect;
 pub mod errors;
+pub mod event_time;
 pub mod manifest;
 pub mod metrics;
 pub mod partitioning;

@@ -77,14 +77,46 @@ pub enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Check that the archive covers every source without holes (#560):
+    /// committed ranges must tile each Kafka partition, file and spool file,
+    /// and a range that failed must have been archived again since. Reads
+    /// the ledger and the digests `prune-ledger` wrote for the rows it
+    /// deleted. Exits non-zero when it finds lost data.
+    AuditCoverage {
+        #[arg(long)]
+        config: PathBuf,
+        /// Where prune digests are read from [default: engine.ledger_digest_dir,
+        /// else <database file>.ledger-digests beside a SQLite database file, else
+        /// <engine.work_dir>/ledger-digests].
+        #[arg(long)]
+        digest_dir: Option<PathBuf>,
+        /// Also ask the object store whether every committed object and
+        /// manifest is present at its recorded size (one HEAD each).
+        #[arg(long)]
+        check_storage: bool,
+        /// Also write the results as a Prometheus text file (for a node
+        /// exporter's textfile collector).
+        #[arg(long)]
+        metrics_file: Option<PathBuf>,
+    },
     /// Incrementally delete old SOURCE_COMMITTED ledger rows (#128). The
     /// newest committed row per source path always survives, so recovery
     /// cursor seeding is unchanged; rows in any other state are untouched.
     /// On PostgreSQL this needs a maintenance identity with DELETE on the
-    /// ledger — the runtime role is denied DELETE by design.
+    /// ledger — the runtime role is denied DELETE by design. The CANDIDATE
+    /// rows are written to a digest BEFORE they are deleted (#560), so a
+    /// coverage audit can still account for them; each is re-checked at
+    /// deletion, and one that has gained a reason to stay is digested but
+    /// kept.
     PruneLedger {
         #[arg(long)]
         config: PathBuf,
+        /// Where the digest of the deleted rows is written [default:
+        /// engine.ledger_digest_dir, else <database file>.ledger-digests beside
+        /// a SQLite database file, else <engine.work_dir>/ledger-digests -
+        /// scratch: name one for PostgreSQL].
+        #[arg(long)]
+        digest_dir: Option<PathBuf>,
         /// Delete committed rows whose last transition is older than this
         /// many days.
         #[arg(long)]
@@ -470,8 +502,62 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             }
             Ok(())
         }
+        Command::AuditCoverage {
+            config,
+            digest_dir,
+            check_storage,
+            metrics_file,
+        } => {
+            let (cfg, streams) = load(config)?;
+            init_tracing(
+                cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
+                cli.json,
+            );
+            let digest_dir = digest_dir
+                .clone()
+                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
+            // Read-only construction: an audit may run beside a live engine.
+            let engine = Engine::new(cfg, streams).await?;
+            let ledger = engine.store.list_batches().await?;
+            let (digested, digest_files) = crate::coverage::read_digests(&digest_dir)?;
+            let (ledger_rows, digest_rows) = (ledger.len(), digested.len());
+            let all: Vec<_> = ledger.into_iter().chain(digested).collect();
+            let storage = if *check_storage {
+                Some(crate::coverage::check_storage(engine.backend.as_ref(), &all).await)
+            } else {
+                None
+            };
+            let report = crate::coverage::AuditReport {
+                ledger_rows,
+                digest_rows,
+                digest_files,
+                units: crate::coverage::audit(all),
+                storage,
+            };
+            if let Some(path) = metrics_file {
+                crate::coverage::write_textfile(
+                    path,
+                    &report.prometheus_text(chrono::Utc::now().timestamp()),
+                )?;
+            }
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for line in report.lines() {
+                    println!("{line}");
+                }
+            }
+            if report.passed() {
+                Ok(())
+            } else {
+                Err(VtopError::Other(
+                    "coverage audit FAILED (see the report above)".into(),
+                ))
+            }
+        }
         Command::PruneLedger {
             config,
+            digest_dir,
             older_than_days,
             limit,
         } => {
@@ -482,17 +568,29 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
             );
             let state_store = cfg.engine.state_store.resolve()?;
-            let store = vtop_state::connect_state_store(state_store.expose_secret()).await?;
+            // The configured bound, as the engine uses (review of #568).
+            let store = crate::engine::connect_configured_store(&cfg.engine, &state_store).await?;
             let cutoff = (chrono::Utc::now() - chrono::Duration::days(i64::from(*older_than_days)))
                 .to_rfc3339();
-            let deleted = store.prune_committed_history(&cutoff, *limit).await?;
+            let digest_dir = digest_dir
+                .clone()
+                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
+            let (deleted, digest) =
+                crate::coverage::prune_with_digest(store.as_ref(), &cutoff, *limit, &digest_dir)
+                    .await?;
             if cli.json {
                 println!(
                     "{}",
-                    serde_json::json!({"status": "ok", "deleted": deleted})
+                    serde_json::json!({"status": "ok", "deleted": deleted, "digest": digest})
                 );
             } else {
-                println!("pruned {deleted} committed ledger row(s)");
+                match digest {
+                    Some(path) => println!(
+                        "pruned {deleted} committed ledger row(s); digest {}",
+                        path.display()
+                    ),
+                    None => println!("pruned 0 committed ledger row(s)"),
+                }
             }
             Ok(())
         }

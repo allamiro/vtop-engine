@@ -96,7 +96,7 @@ rcgen = "0.14"
 # Test-only: the EgressTransport surface guard in vtop-upload PARSES the trait
 # instead of scanning its text (#488 review). Both are already in the tree via
 # proc-macro dependencies, so this adds features, not packages.
-syn = { version = "2", default-features = false, features = ["full", "parsing", "printing", "visit", "clone-impls"] }
+syn = { version = "3", default-features = false, features = ["full", "parsing", "printing", "visit", "clone-impls"] }
 quote = { version = "1", default-features = false }
 
 # Internal crates

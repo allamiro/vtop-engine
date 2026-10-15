@@ -43,6 +43,14 @@ spec:
   # Parallel: quorum members should come up together; serializing quorum
   # bringup only slows recovery for no safety gain.
   podManagementPolicy: Parallel
+  # Rolling the metadata voters one at a time is the supported upgrade
+  # (#554): the leader never proposes a command kind above the cluster's
+  # feature level, so an older voter mid-rollout can decode everything in the
+  # log. New command kinds are enabled after the rollout, by an operator
+  # (`vtopctl meta enable-features`), never by the rollout itself. The
+  # rollout waits only for readiness (listeners bound), not for a replaced
+  # voter to catch up: step it with rollingUpdate.partition and check each
+  # voter (docs/PRODUCTION_HA.md, "Upgrade the metadata tier").
   updateStrategy:
     type: RollingUpdate
   selector:

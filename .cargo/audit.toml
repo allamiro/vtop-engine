@@ -43,4 +43,14 @@ ignore = [
     # this project neither supplies nor controls. Re-evaluate when upstream
     # publishes a fix, and on the next AWS SDK bump.
     "RUSTSEC-2026-0253",
+
+    # unsafe-libyaml 0.2.11 — unmaintained (the upstream repository is archived).
+    # UNMAINTAINED, not a vulnerability: no exploitable defect is reported, but
+    # none will be fixed upstream either. It arrives only through `serde_yaml`
+    # 0.9, which is itself deprecated and is what parses the engine, node and
+    # CLI YAML configuration — operator-written files, not network input.
+    # The advisory points at safe-Rust YAML parsers (saphyr / serde-saphyr);
+    # moving to one is a deliberate migration of every config type, not a
+    # version bump, and is follow-up work. Re-evaluate when it lands.
+    "RUSTSEC-2024-0449",
 ]

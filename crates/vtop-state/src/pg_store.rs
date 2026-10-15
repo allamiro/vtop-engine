@@ -25,7 +25,7 @@
 //!
 //! Compiled only with `--features postgres`.
 
-use crate::models::{BatchPatch, BatchRecord};
+use crate::models::{BatchPatch, BatchRecord, CommittedCursor};
 use crate::store::StateStore;
 use async_trait::async_trait;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
@@ -52,10 +52,34 @@ const MAX_SERIALIZATION_RETRIES: u32 = 5;
 /// livelock cannot spin forever.
 const MAX_CONFLICT_RETRIES: u32 = 5;
 
+/// The prune predicate over a candidate row `b`, shared by the prune, the
+/// candidate listing and the listed delete (#560) so the three cannot drift.
+/// A row is deletable only when a newer committed row - ordered by
+/// (created_at, batch_id), the order committed_cursors reads - exists for
+/// its source path, so the restart cursor's row always survives (#564). The
+/// successor probe's expressions must stay identical to
+/// idx_batches_commit_newest in migrations/postgres/0001_state_store.sql.
+macro_rules! pg_prune_predicate_sql {
+    () => {
+        "b.state = $1 AND b.updated_at < $2 \
+          AND EXISTS ( \
+            SELECT 1 FROM batches n \
+            WHERE n.state = $1 \
+              AND n.source_type = b.source_type \
+              AND COALESCE(n.progress_end_json::jsonb ->> 'path', n.source_name) \
+                  = COALESCE(b.progress_end_json::jsonb ->> 'path', b.source_name) \
+              AND (n.created_at > b.created_at \
+                   OR (n.created_at = b.created_at AND n.batch_id > b.batch_id)) \
+          )"
+    };
+}
+
 /// Handle to the persistent Postgres-compatible state store.
 #[derive(Clone)]
 pub struct PgStateStore {
     pool: PgPool,
+    /// The claim generations this process holds (#557).
+    fence: crate::fence::ClaimFence,
 }
 
 fn map_sqlx(e: sqlx::Error) -> VtopError {
@@ -172,7 +196,10 @@ impl PgStateStore {
     /// [`Self::migrate`] first with a separate privileged identity.
     pub async fn connect(conn_str: &str) -> Result<Self, VtopError> {
         let pool = connect_pool(conn_str, 10).await?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            fence: Default::default(),
+        };
         store.check_schema().await?;
         Ok(store)
     }
@@ -185,7 +212,12 @@ impl PgStateStore {
             .execute(&pool)
             .await
             .map_err(map_sqlx)?;
-        Self { pool }.check_schema().await
+        Self {
+            pool,
+            fence: Default::default(),
+        }
+        .check_schema()
+        .await
     }
 
     /// Execute a raw SQL string against the pool. TEST-ONLY: the battery uses it
@@ -211,7 +243,7 @@ impl PgStateStore {
             "SELECT batch_id, tenant, source_type, source_name, format, state, \
                     progress_start_json, progress_end_json, object_uri, manifest_uri, \
                     object_sha256, manifest_sha256, manifest_version_id, object_size_bytes, record_count, \
-                    error_message, owner, lease_expires_at, created_at, updated_at \
+                    error_message, owner, lease_expires_at, created_at, updated_at, claim_gen \
              FROM batches WHERE FALSE",
         )
         .fetch_optional(&self.pool)
@@ -295,11 +327,12 @@ impl StateStore for PgStateStore {
             .bind(&rec.error_message)
             .bind(&rec.owner)
             .bind(&rec.lease_expires_at)
-            .bind(&rec.created_at)
+            .bind(crate::store::canonical_created_at(&rec.created_at))
             .bind(&rec.updated_at)
             .execute(&self.pool)
         })
         .await?;
+        self.fence.created(&rec.batch_id);
         Ok(())
     }
 
@@ -322,10 +355,19 @@ impl StateStore for PgStateStore {
         // error on the next pass. A genuinely illegal transition therefore still
         // fails immediately - only a lost update loops. The 40001 serialization
         // retry sits inside, on the write itself.
+        //
+        // The write is ALSO conditional on the claim generation this process
+        // holds (#557): the state guard alone lets an engine whose lease
+        // lapsed write over the engine that claimed the row, because state
+        // names recur. A lost claim is not a lost update — retrying cannot
+        // help — so it is reported at once. A row this process holds no
+        // generation for is refused (see the fence module).
+        let held = self.fence.held(batch_id);
         let mut attempt = 0;
         loop {
             let current = self.get_state(batch_id).await?;
             let validated = transition(current, to)?;
+            let held = held.ok_or_else(|| crate::fence::not_held(batch_id))?;
             let now = chrono::Utc::now().to_rfc3339();
             let expected = current.as_str();
             let rows = with_retry(|| {
@@ -341,7 +383,7 @@ impl StateStore for PgStateStore {
                          record_count = COALESCE($8, record_count),
                          error_message = COALESCE($9, error_message),
                          updated_at = $10
-                       WHERE batch_id = $11 AND state = $12"#,
+                       WHERE batch_id = $11 AND state = $12 AND claim_gen = $13"#,
                 )
                 .bind(validated.as_str())
                 .bind(&patch.object_uri)
@@ -355,13 +397,25 @@ impl StateStore for PgStateStore {
                 .bind(&now)
                 .bind(batch_id)
                 .bind(expected)
+                .bind(held)
                 .execute(&self.pool)
             })
             .await?
             .rows_affected();
 
             if rows >= 1 {
+                self.fence.wrote(batch_id, validated, held);
                 return Ok(());
+            }
+            let actual: Option<i64> =
+                sqlx::query_scalar("SELECT claim_gen FROM batches WHERE batch_id = $1")
+                    .bind(batch_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(map_sqlx)?;
+            if let Some(actual) = actual.filter(|actual| *actual != held) {
+                self.fence.lost(batch_id, held);
+                return Err(crate::fence::claim_lost(batch_id, held, actual));
             }
             // Lost update: the row's state changed between our read and write.
             attempt += 1;
@@ -402,28 +456,33 @@ impl StateStore for PgStateStore {
         let now = crate::store::normalize_rfc3339_utc("now", now)?;
         let lease_until = crate::store::normalize_rfc3339_utc("lease_until", lease_until)?;
         let (now, lease_until) = (now.as_str(), lease_until.as_str());
-        with_retry(|| {
+        // RETURNING gives exactly the rows THIS statement claimed, with the
+        // generation it set (see the SQLite implementation and #557).
+        let claimed = with_retry(|| {
             sqlx::query(
-                "UPDATE batches SET owner = $1, lease_expires_at = $2, updated_at = $3 \
+                "UPDATE batches SET owner = $1, lease_expires_at = $2, updated_at = $3, \
+                        claim_gen = claim_gen + 1 \
                  WHERE state != $4 \
-                   AND (owner IS NULL OR owner = $1 OR lease_expires_at IS NULL OR lease_expires_at <= $3)",
+                   AND (owner IS NULL OR owner = $1 OR lease_expires_at IS NULL OR lease_expires_at <= $3) \
+                 RETURNING *",
             )
             .bind(owner)
             .bind(lease_until)
             .bind(now)
             .bind(BatchState::SourceCommitted.as_str())
-            .execute(&self.pool)
+            .fetch_all(&self.pool)
         })
         .await?;
-        let rows = sqlx::query(
-            "SELECT * FROM batches WHERE state != $1 AND owner = $2 ORDER BY created_at ASC",
-        )
-        .bind(BatchState::SourceCommitted.as_str())
-        .bind(owner)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
-        rows.into_iter().map(row_to_record).collect()
+        for row in &claimed {
+            let batch_id: String = row.get("batch_id");
+            self.fence.claimed(&batch_id, row.get("claim_gen"));
+        }
+        let mut records = claimed
+            .into_iter()
+            .map(row_to_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        records.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(records)
     }
 
     async fn max_committed_end_bytes(
@@ -449,6 +508,53 @@ impl StateStore for PgStateStore {
                 let path: Option<String> = r.get("path");
                 let end: Option<i64> = r.get("end_byte");
                 Some((path?, end?.max(0) as u64))
+            })
+            .collect())
+    }
+
+    async fn committed_cursors(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<CommittedCursor>, VtopError> {
+        // See the SQLite implementation and #77: the newest committed row per
+        // path, by (created_at, batch_id) - stored fixed-width, so text order
+        // is time order, and the order pruning keeps - with its own end byte.
+        // The markers column is TEXT, so cast to jsonb; markers are internally
+        // tagged (fields at top level). The inode is read as text and parsed
+        // here so a u64 above i64::MAX stays exact.
+        let rows = sqlx::query(
+            "WITH committed AS ( \
+                 SELECT progress_end_json::jsonb ->> 'path' AS path, \
+                        progress_end_json::jsonb ->> 'inode' AS inode, \
+                        (progress_end_json::jsonb ->> 'end_byte')::bigint AS end_byte, \
+                        (progress_end_json::jsonb ->> 'file_size')::bigint AS file_size, \
+                        created_at, batch_id \
+                 FROM batches WHERE state = $1 AND source_type = $2 \
+             ), latest AS ( \
+                 SELECT path, inode, end_byte, file_size, ROW_NUMBER() OVER ( \
+                            PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
+                 FROM committed \
+             ) \
+             SELECT path, inode, end_byte, file_size FROM latest WHERE rn = 1",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(source_type.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let path: Option<String> = r.get("path");
+                let inode: Option<String> = r.get("inode");
+                let end: Option<i64> = r.get("end_byte");
+                let size: Option<i64> = r.get("file_size");
+                Some(CommittedCursor {
+                    path: path?,
+                    inode: inode.and_then(|i| i.parse().ok()),
+                    end_byte: end?.max(0) as u64,
+                    observed_size: size.map(|s| s.max(0) as u64),
+                })
             })
             .collect())
     }
@@ -498,39 +604,64 @@ impl StateStore for PgStateStore {
         limit: u32,
     ) -> Result<u64, VtopError> {
         // Same predicate as the SQLite store: a row is deletable only when a
-        // strictly greater committed row — ordered by (end_byte, updated_at,
-        // batch_id) — exists for its source path, so the per-path
-        // MAX(end_byte) cursor seed always survives. The successor probe's
-        // expressions must stay identical to idx_batches_commit_cursor in
-        // migrations/postgres/0001_state_store.sql, which bounds it.
+        // newer committed row — ordered by (created_at, batch_id), the order
+        // committed_cursors reads — exists for its source path, so the
+        // restart cursor's row always survives (review of #564). The
+        // successor probe's expressions must stay identical to
+        // idx_batches_commit_newest in migrations/postgres/0001_state_store.sql,
+        // which bounds it.
         let result = with_retry(|| {
-            sqlx::query(
+            sqlx::query(concat!(
                 "DELETE FROM batches WHERE batch_id IN ( \
-                    SELECT b.batch_id FROM batches b \
-                    WHERE b.state = $1 AND b.updated_at < $2 \
-                      AND EXISTS ( \
-                        SELECT 1 FROM batches n \
-                        WHERE n.state = $1 \
-                          AND n.source_type = b.source_type \
-                          AND COALESCE(n.progress_end_json::jsonb ->> 'path', n.source_name) \
-                              = COALESCE(b.progress_end_json::jsonb ->> 'path', b.source_name) \
-                          AND ( \
-                            COALESCE((n.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
-                              > COALESCE((b.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
-                            OR ( \
-                              COALESCE((n.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
-                                = COALESCE((b.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
-                              AND (n.updated_at > b.updated_at \
-                                   OR (n.updated_at = b.updated_at AND n.batch_id > b.batch_id)) \
-                            ) \
-                          ) \
-                      ) \
-                    LIMIT $3 \
-                )",
-            )
+                    SELECT b.batch_id FROM batches b WHERE ",
+                pg_prune_predicate_sql!(),
+                " LIMIT $3 )"
+            ))
             .bind(BatchState::SourceCommitted.as_str())
             .bind(older_than)
             .bind(i64::from(limit))
+            .execute(&self.pool)
+        })
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn prune_candidates(
+        &self,
+        older_than: &str,
+        limit: u32,
+    ) -> Result<Vec<BatchRecord>, VtopError> {
+        let rows = with_retry(|| {
+            sqlx::query(concat!(
+                "SELECT * FROM batches WHERE batch_id IN ( \
+                    SELECT b.batch_id FROM batches b WHERE ",
+                pg_prune_predicate_sql!(),
+                " LIMIT $3 ) ORDER BY created_at, batch_id"
+            ))
+            .bind(BatchState::SourceCommitted.as_str())
+            .bind(older_than)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+        })
+        .await?;
+        rows.into_iter().map(row_to_record).collect()
+    }
+
+    async fn prune_listed(&self, older_than: &str, batch_ids: &[String]) -> Result<u64, VtopError> {
+        if batch_ids.is_empty() {
+            return Ok(0);
+        }
+        let result = with_retry(|| {
+            sqlx::query(concat!(
+                "DELETE FROM batches WHERE batch_id IN ( \
+                    SELECT b.batch_id FROM batches b \
+                    WHERE b.batch_id = ANY($3) AND ",
+                pg_prune_predicate_sql!(),
+                " )"
+            ))
+            .bind(BatchState::SourceCommitted.as_str())
+            .bind(older_than)
+            .bind(batch_ids)
             .execute(&self.pool)
         })
         .await?;
