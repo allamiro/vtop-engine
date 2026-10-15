@@ -268,6 +268,9 @@ enum FrameParse {
     /// Provably not crash fallout: bad magic, impossible lengths, or a
     /// checksum failure with more data behind it.
     Corrupt(String),
+    /// Checksum-valid, but a command kind this build does not know: written
+    /// by a newer release (#554).
+    Newer(String),
 }
 
 /// Parse one frame at `position`. A tear (crash mid-write) always leaves a
@@ -319,6 +322,9 @@ fn parse_frame(bytes: &[u8], position: usize) -> FrameParse {
     let payload = match kind {
         ENTRY_KIND_NORMAL => match MetadataCommand::decode(payload_bytes) {
             Ok(command) => MetaLogPayload::Normal(command),
+            Err(error) if super::is_newer_format(&error) => {
+                return FrameParse::Newer(format!("entry payload: {error}"))
+            }
             Err(error) => return FrameParse::Corrupt(format!("invalid command payload: {error}")),
         },
         ENTRY_KIND_MEMBERSHIP => match MetaMembership::decode(payload_bytes) {
@@ -525,6 +531,12 @@ impl MetaLog {
                 }
                 FrameParse::Corrupt(reason) => {
                     return Err(corrupt(path, format!("entry at byte {position}: {reason}")));
+                }
+                FrameParse::Newer(reason) => {
+                    return Err(MetaStoreError::NewerFormat {
+                        path: path.to_path_buf(),
+                        reason: format!("entry at byte {position}: {reason}"),
+                    });
                 }
             }
         }
@@ -813,6 +825,12 @@ impl MetaLog {
                         payload,
                     });
                 }
+                FrameParse::Newer(reason) => {
+                    return Err(MetaStoreError::NewerFormat {
+                        path: chunk.path.clone(),
+                        reason: format!("entry at byte {}: {reason}", location.offset),
+                    });
+                }
                 FrameParse::Torn | FrameParse::Corrupt(_) => {
                     return Err(corrupt(
                         &chunk.path,
@@ -935,5 +953,76 @@ impl MetaLog {
         self.chunks.drain(..removable);
         self.entries.retain(|entry| entry.index >= new_first);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod newer_format_tests {
+    use super::*;
+    use crate::command::{CommandEnvelope, MetadataCommand};
+    use uuid::Uuid;
+
+    /// A frame whose command payload is rewritten by `edit`, re-checksummed
+    /// so only the payload's meaning differs - exactly what a newer writer
+    /// produces, and what bit rot does not.
+    fn reframed(edit: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let entry = MetaLogEntry {
+            term: 1,
+            index: 1,
+            payload: MetaLogPayload::Normal(MetadataCommand::SetFeatureLevel {
+                env: CommandEnvelope {
+                    request_id: Uuid::from_u128(1),
+                    issued_at_ms: 0,
+                },
+                feature_level: 4,
+            }),
+        };
+        let frame = entry.encode_frame().unwrap();
+        let payload_at = FRAME_PREFIX_BYTES + FRAME_FIXED_BODY_BYTES - CHECKSUM_LEN;
+        let mut payload = frame[payload_at..frame.len() - CHECKSUM_LEN].to_vec();
+        edit(&mut payload);
+        let mut out = frame[..payload_at].to_vec();
+        let frame_len = (FRAME_FIXED_BODY_BYTES + payload.len()) as u32;
+        out[8..12].copy_from_slice(&frame_len.to_be_bytes());
+        out[29..33].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(&payload);
+        let checksum = *blake3::hash(&out).as_bytes();
+        out.extend_from_slice(&checksum);
+        out
+    }
+
+    /// #554: an old node reading a newer cluster's log used to call it
+    /// corrupt. A command kind it does not know, under a valid checksum, is
+    /// a newer release; garbage under a valid checksum is still corruption.
+    #[test]
+    fn an_unknown_command_kind_is_a_newer_release_not_corruption() {
+        let unchanged = reframed(|_| {});
+        assert!(matches!(
+            parse_frame(&unchanged, 0),
+            FrameParse::Complete { .. }
+        ));
+
+        let newer = reframed(|payload| payload[..2].copy_from_slice(&999u16.to_be_bytes()));
+        match parse_frame(&newer, 0) {
+            FrameParse::Newer(reason) => {
+                assert!(reason.contains("unknown command kind tag 999"), "{reason}")
+            }
+            other => panic!("expected Newer, got {}", describe(&other)),
+        }
+
+        let garbage = reframed(|payload| payload.truncate(5));
+        assert!(
+            matches!(parse_frame(&garbage, 0), FrameParse::Corrupt(_)),
+            "a truncated payload is damage, not a newer release"
+        );
+    }
+
+    fn describe(parse: &FrameParse) -> String {
+        match parse {
+            FrameParse::Complete { .. } => "Complete".into(),
+            FrameParse::Torn => "Torn".into(),
+            FrameParse::Corrupt(reason) => format!("Corrupt({reason})"),
+            FrameParse::Newer(reason) => format!("Newer({reason})"),
+        }
     }
 }

@@ -433,8 +433,9 @@ instances never recover the same batch. Required before fleet mode.
 ```text
 - keep ACTIVE, FAILED, REPLAY_REQUIRED, and recent SOURCE_COMMITTED rows hot;
 - delete old SOURCE_COMMITTED rows incrementally, always retaining the
-  per-path row with the highest committed end_byte so recovery cursor
-  seeding is unchanged;
+  per-path NEWEST committed row (by `(created_at, batch_id)`) so recovery cursor seeding
+  is unchanged - the newest, not the highest end_byte, which after a
+  rotation or copytruncate is the old content's row (#564);
 - retain enough for audit, replay, and compliance (age window is
   configurable; archival to cold tables / object storage remains a
   possible future extension).
@@ -447,6 +448,67 @@ engine refuses the setting there and pruning runs as a scheduled `vtopctl
 prune-ledger --older-than-days N` under a maintenance identity (see
 [`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md)).
 Rows in any non-committed state are never touched.
+
+**Pruning keeps an anchor (#560).** Every prune pass, the engine's and
+`vtopctl prune-ledger`'s alike, lists its CANDIDATE rows, writes them to a
+versioned digest, fsyncs it into place, and only then deletes them - each
+re-checked against the prune predicate at deletion, so a candidate that has
+since gained a reason to stay (it became the newest row for its path) stays
+in the ledger, digested but undeleted, and the audit counts it once. A crash
+between the two leaves rows that are digested and still in the ledger, which
+the audit counts once. The digest carries a SHA-256 trailer that catches a
+truncated or edited file. It is not a signature: anyone who can rewrite the
+file can rewrite the hash, so keep the directory where the engine's identity
+can write and others cannot, and back it up with the ledger. The directory is
+`--digest-dir` or `engine.ledger_digest_dir` when given; otherwise
+`<database file>.ledger-digests/` beside a SQLite database file, on the
+database's own volume, so the digests last as long as the ledger does and two
+databases side by side keep apart. Only failing both (PostgreSQL)
+is it `<engine.work_dir>/ledger-digests/`, and `work_dir` is scratch: give a
+PostgreSQL deployment a durable directory.
+
+**Coverage audit (#560).** `vtopctl audit-coverage --config ...` reads the
+ledger and the digests and checks, per source unit (a Kafka topic-partition
+under one consumer group, a file or spool file at one inode), that committed
+ranges tile:
+- a stretch a FAILED or REPLAY_REQUIRED row names, below a later commit, is a
+  range that failed and was never re-archived (the #552 shape);
+- a stretch nothing names is lost data for a file or spool (bytes are
+  contiguous, e.g. the #558 rotation shape), and is reported but not failed
+  for Kafka (compaction and transaction markers occupy offsets with no
+  records);
+- ranges above the last committed point, and VERIFIED ranges held back from
+  committing, are pending, not holes;
+- overlapping commits are counted as duplicates (expected under
+  at-least-once).
+
+`--check-storage` also HEADs every committed object and manifest: both must be
+present, and an object must be of the size the ledger recorded (a manifest has
+no recorded size). A committed row that names no object or manifest, and an
+object whose size the store does not report, are findings. Content is
+`verify-manifest`'s job. `--metrics-file`
+writes the result as a Prometheus text file, with counts by source type and
+never by path, for a node exporter's textfile collector. The command exits
+non-zero on lost data, so it can gate a cron job. Below a unit's first
+committed range it judges only what a failed row there names; history nothing
+recorded (a tail started mid-file, a consumer group that began at a later
+offset, history pruned before digests existed) cannot be judged. Neither can a
+file or spool known only from rows without an inode: they are reported as not
+judged. A window that spans a rotation is credited only over what its markers
+prove: the new file over the window's last read. How far it read the old file,
+and where its reading of the new one began, are not recorded, so the old
+file's tail from the window's start and the new file's start below its last
+read are reported as unproven - a window that read them looks the same as a
+release before #564 that skipped them - and are not counted as lost. A file
+whose content restarted at the same path and inode (a copytruncate, or a
+reused inode) is told apart by the file size each read observed: a read that
+saw the file smaller than what was already read there starts a new
+generation, judged on its own, with its start below its first read unproven.
+Spool markers record no size, so spool files are judged per inode only. And a
+replacement that reuses the inode and was already as large as the old read
+position when first read cannot be told apart at all - path, inode and size
+agree - so the old file's commits can cover its unread start; closing that
+needs a content fingerprint in the markers (#578).
 
 ---
 
@@ -674,6 +736,9 @@ path needed by the distributed options is already implemented (§6.3).
 | `engine.state_store` | backend selector: inline `sqlite://…`, or `{ env: … }` / `{ file: … }` secret reference for PostgreSQL |
 | `engine.work_dir` / `log_level` | scratch dir; verbosity |
 | `engine.ledger_retention_days` / `ledger_prune_batch` | committed-row retention (§6.6; SQLite engine-side only) |
+| `engine.state_store_timeout_seconds` | wall-clock bound on every state-store request (default 30 s; whole-ledger scans get 10x) — a blackholed Postgres fails the request instead of hanging the engine (#556) |
+| `upload.request_timeout_seconds` | wall-clock bound on one attempt of one object-store request on the native S3 backend (default 300 s; the SDK's retries apply) (#556) |
+| `engine.ledger_digest_dir` | where prune digests are written and read (default: beside a SQLite database file; else under `work_dir`, which is scratch) |
 | `batching.max_records` / `max_bytes` / `max_batch_age_seconds` | seal thresholds |
 | `batching.max_concurrent_batches` | uploads kept in flight per cycle (default 8); the ceiling when the adaptive width is on |
 | `batching.adaptive_width.enabled` / `min_width` | AIMD upload width (#102): a cycle the store throttled halves the next cycle's width, a clean cycle grows it by one, never below `min_width` (default 1) nor above the ceiling. Off by default; `vtop_upload_width` shows the width in use |
@@ -830,7 +895,67 @@ Short procedures now; expand into a full ops runbook before go-live.
   rows remain → export file/syslog cursors → switch `engine.state_store` → import
   cursors → validate → keep the old store until validation passes.
 - **Prune the PostgreSQL ledger:** run `vtopctl prune-ledger --older-than-days N`
-  on a schedule under the maintenance identity (§6.6).
+  on a schedule under the maintenance identity (§6.6). It writes a digest of
+  what it deletes first; keep `--digest-dir` on durable, backed-up storage.
+- **Audit archive coverage:** run `vtopctl audit-coverage --config ...
+  [--check-storage] [--metrics-file ...]` on a schedule (§6.6); a non-zero
+  exit names the source units with lost ranges.
+- **Upgrade the metadata tier (#554):** roll the voters one at a time, and
+  confirm each has CAUGHT UP before the next. The chart's `RollingUpdate`
+  replaces one pod at a time, but it waits only for `/readyz`, which on a
+  metadata pod says its listeners are bound, not that the voter has caught
+  up; and a PodDisruptionBudget limits evictions, not the StatefulSet's own
+  rollout. So step it: set `spec.updateStrategy.rollingUpdate.partition` to
+  the replica count, upgrade the release, then lower the partition one
+  ordinal at a time (`kubectl patch statefulset <meta> -p
+  '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":N}}}}'`), and
+  before each step check with `vtopctl meta status` against the replaced
+  voter that its `last_applied` index has reached the leader's. Upgrade from
+  the immediately preceding release only, and never downgrade. Mixed releases are safe while they run: the leader refuses any
+  command kind above the cluster's metadata feature level, so nothing an
+  older voter cannot decode enters the log. Once EVERY voter runs the new
+  release, run `vtopctl meta enable-features --level N` for the level the
+  release introduced (its notes name it); only then do the new command kinds
+  work. Raising the level is permanent, and raising it while an older voter
+  remains is the one way to stall the tier - that voter cannot decode the
+  raise itself. A node that refuses to start with "written by a newer
+  release" is an old binary on a newer log: upgrade it.
+- **Change a range's replica set (#553):** a range's quorum is counted over
+  the set metadata records for it (`vtopctl meta replica-set --config
+  meta-admin.yaml --topic-uuid T --range-uuid R`; every `vtopctl meta`
+  command takes the admin config with `--config`); a node whose configured
+  set (itself plus `followers`)
+  differs refuses to promote. Recording needs feature level 5 (`vtopctl meta
+  enable-features --level 5`, once every metadata voter runs this release),
+  and every data node of the range must run this release too - an older one
+  does not check the record. Then:
+  1. Record the set the range runs with today: `vtopctl meta set-replica-set
+     --config meta-admin.yaml --topic-uuid T --range-uuid R --members A,B,C
+     --expected-generation 0`. The lease is cleared and re-won under it.
+  2. Change ONE member at a time, in this order. Register the new node (D)
+     in metadata if it is not yet (`vtopctl meta register-node`): a set
+     naming an unregistered node is refused. Start D configured with the new
+     set, and restart the FOLLOWERS with it; the leader keeps the old config
+     and keeps leading, because it still matches the record. Then record the
+     new set with the generation `replica-set` reported (`--members A,B,C,D
+     --expected-generation 1`): the lease is cleared, the old-config leader
+     now refuses and stands aside, and a replica configured with the new set
+     wins. Restart the old leader with the new set last. Restarting it before
+     the record would leave no node matching the record, and the range
+     without a leader until it is made. **Between the follower restarts and
+     the record, only the old leader matches the record**: if it fails in
+     that window, nothing can take over until it returns or the record is
+     made. Keep the window short - restart the followers and record the set
+     in one sitting.
+  3. The next change is refused until the range has been led under the
+     current set with its leader's whole log on a majority of it - checked
+     from the promotion's recorded quorum. If a promotion happened while its
+     leader was ahead of the replicas, wait until they have caught up, then
+     restart the leader (an orderly stop releases its lease) so the next
+     promotion proves it, and retry.
+  Never jump two members at once - the command refuses it - and never
+  change node configs without recording the change: a config that differs
+  from the record leaves that node unable to lead.
 - **Restore from DB backup:** restore Postgres PITR → verify object store →
   start the engine (recovery scan re-reconciles) → run the divergence checker.
 - **Reconcile state store vs object storage:** list `SOURCE_COMMITTED` rows and
@@ -850,12 +975,33 @@ Short procedures now; expand into a full ops runbook before go-live.
 ## 19. Known limitations (current code)
 - **SINGLE-INSTANCE ONLY — enforced at startup (#66).** The engine takes an
   exclusive OS lock on its work directory and refuses to start beside another
-  engine on the same host. There is no claim/lease/fencing in the state store
-  yet (#93), so two engines over the same store would both recover the
-  same incomplete batches and both commit source progress — duplicate ingestion
-  at best, double-commit at worst. The work-dir lock CANNOT see an engine on a
-  different host pointed at the same Postgres; that configuration is
-  unsupported and warned about at startup. Do not scale replicas.
+  engine on the same host. The state store has an ownership claim
+  (`claim_incomplete_batches`: an owner and a lease, #93) and, since #557, a
+  **claim generation** that fences a stalled engine: every claim bumps it, and
+  a writer that holds an older one is refused instead of overwriting the
+  engine that took the row over. An engine writes only the rows it created or
+  claimed, and keeps the generation while it can still write one (a FAILED
+  batch keeps it until it is handed back for replay; a lost claim keeps it so
+  the stalled writer stays refused); a write to a row it holds no generation
+  for is refused, never made unchecked. The kept tokens of FAILED and
+  lost-claim batches are bounded (65,536 per process, oldest dropped first):
+  a FAILED batch whose token was dropped is refused its REPLAY_REQUIRED
+  write, fail closed, and is handed back by the next recovery's claim
+  instead. That makes a
+  recovery *handover* safe at the ledger - between engines that all run a
+  build with the fence: an older build neither bumps nor checks the
+  generation, so drain older engines before relying on it. It does **not** make two engines
+  safe to run side by side: sources are not divided between engines (two
+  reading the same file, or the same Kafka partitions, archive the same ranges
+  twice under distinct ledger rows); engine names must be unique per instance
+  (a shared name can still reclaim another engine's live row and bump its
+  generation; only the stale writer's later transitions are fenced, so two
+  recoveries still contend for the same rows); and the lease is timed against
+  the claimant's wall clock, so skew moves when a takeover happens — the fence
+  bounds the damage, it does not remove the skew. The work-dir lock CANNOT see
+  an engine on a different host pointed at the same Postgres; that
+  configuration is unsupported and warned about at startup. Do not scale
+  replicas.
 - **Non-deterministic object keys** — replay can create **duplicate objects** (no
   loss). This is also the implementation's one known gap against the protocol
   draft's deterministic-naming MUST (protocol §15.1). Fixed by
@@ -1047,7 +1193,7 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 |---|---|---|---|---|
 | Object Lock prevents overwrite-based retry | Retries fail / stuck batches | Deterministic keys + "existing verified = success" / version_id (§7.2) | 4 | open |
 | Kafka rebalance during in-flight batch | Duplicate work / spurious revocation | Revocation handler; tune poll/session timeouts; cooperative rebalancing (§8.3) | 5 | open |
-| Two engines over one store double-recover | Duplicate ingestion / double-commit | **Same host only:** the startup instance lock (#66) refuses it. **Cross-host over shared Postgres it cannot detect** — unsupported and warned at startup (§19); open until claim/fencing lands (#93) | 5 | partially mitigated (same-host only) |
+| Two engines over one store double-recover | Duplicate ingestion / double-commit | **Same host only:** the startup instance lock (#66) refuses it. **Cross-host over shared Postgres it cannot detect** — unsupported and warned at startup (§19). The ledger now fences a stalled engine (claim generation, #557) so a handover cannot be overwritten, but sources are still not divided between engines; open until Phase 5 | 5 | partially mitigated (same-host lock; ledger fence for handover) |
 | State database unavailable | Engine cannot commit | Fails safe (stops committing); HA store; alerts | 3,6 | mitigated |
 | Object uploaded but manifest upload failed | Batch stuck pre-VERIFIED | Retry manifest; verify existing object; bounded `retry_count` → FAILED | 0,3 | mitigated |
 | Manifest uploaded but source-commit failed | Possible replay | Recovery retries commit; deterministic keys make replay idempotent | 4 | partially mitigated (duplicates until 4) |

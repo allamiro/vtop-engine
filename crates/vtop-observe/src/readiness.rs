@@ -98,12 +98,22 @@ impl ReadinessGate {
     /// mark (default: one) has arrived.
     pub fn mark_ready(&self) {
         use std::sync::atomic::Ordering;
-        let previous = self
-            .pending_marks
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |marks| {
-                Some(marks.saturating_sub(1))
-            })
-            .unwrap_or(0);
+        // A compare-exchange loop rather than `fetch_update`/`try_update`: the
+        // former is deprecated on current stable and the latter is newer than
+        // the declared MSRV, so neither compiles warning-free on both the
+        // pinned floor and the latest toolchain CI builds with.
+        let mut marks = self.pending_marks.load(Ordering::SeqCst);
+        let previous = loop {
+            match self.pending_marks.compare_exchange_weak(
+                marks,
+                marks.saturating_sub(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(previous) => break previous,
+                Err(observed) => marks = observed,
+            }
+        };
         if previous <= 1 {
             self.set(Readiness::Ready);
         } else {

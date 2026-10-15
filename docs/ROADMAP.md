@@ -160,6 +160,45 @@ reopen quietly.
   untested assumption. A directory written by release N+1 may hold artifacts
   release N cannot interpret (retention markers, epoch journals with
   adoption semantics N predates), and no test defends the reverse path.
+- **#554** — the metadata Raft tier had no mixed-version story while the chart
+  rolled it. A command kind a voter does not know fails to decode, and with it
+  the whole AppendEntries batch: an upgraded leader that proposed one left the
+  old voters unable to append anything more, and an old node restarted on the
+  newer log called it corrupt. Now each command kind carries a **feature
+  level** (the release that introduced it), and the cluster's level lives in
+  replicated state (absent means v0.6.0's level). Every node refuses, before
+  replication, any command above the level it has applied - a leader with a
+  reason saying how to proceed, a follower by sending the caller to the
+  leader - except the level-setting command itself, which is how the level
+  rises;
+  `vtopctl meta enable-features --level N` raises it - monotonically, never
+  down - once every voter runs a release that knows N. A checksum-valid entry
+  or record of an unknown kind is reported as written by a newer release, not
+  as corruption, and a voter receiving one says so on stderr instead of
+  dropping the connection silently. Scenario 22 rolls three voters from the
+  previous release to this one, one at a time, requiring a commit through the
+  mixed tier and every voter to converge at each step, then raises the level
+  and restarts a voter on it; CI runs it against the newest release tag.
+- **#553** - a range's quorum was sized from each data node's own
+  configuration (`followers` + 1), and metadata held no member set, so
+  growing a set by rolling configs could leave two nodes counting majorities
+  of different sets with no node in common: from {A,B,C} to {A..E}, a node
+  on the new config could promote on {A,D,E} over records acknowledged on
+  {B,C}. Metadata now records a range's replica set (`vtopctl meta
+  set-replica-set`, feature level 5), and a candidate whose configured set
+  differs refuses to promote and stands aside. A change adds or removes ONE
+  member - consecutive sets' majorities then always intersect - clears the
+  lease so the range is re-won under the new set, and is refused until a
+  promotion under the set it replaces shows, from its recorded quorum, the
+  leader's whole log on a majority of that set: the election restriction
+  makes the new leader hold everything acknowledged under the set before,
+  but promotion truncates nothing and the part above the boundary may still
+  sit on that older majority alone. A range with no record behaves as
+  before. An older metadata node refuses the read outright; the CLIENT reads
+  that refusal as "none recorded" only after the same node's status says it
+  is the leader (an older leader cannot hold a set), and otherwise asks the
+  leader it names - so data nodes may be upgraded ahead of the metadata
+  tier without one stale endpoint switching the check off.
 
 One observation rode along without becoming a fix: scenario 09 once left a
 promotion unacquired within its deadline (#318). The flake has not recurred —

@@ -16,10 +16,10 @@ use crate::raft::type_config::{MetaRaftTypeConfig, NodeId};
 use crate::state::MetaValue;
 use crate::transport::admin::AdminHandler;
 use crate::transport::wire::{
-    AdminGroupCursorView, AdminLeaseView, AdminReadGroupCursorResponse,
-    AdminReadRangeLeaseResponse, AdminReadRangeTransitionsResponse,
-    AdminReadSegmentPlacementResponse, AdminRebalanceIntentView, AdminSegmentView,
-    AdminTransitionView, MAX_TRANSITIONS_PER_READ,
+    AdminGroupCursorView, AdminLeaseView, AdminRangeReplicaSetView, AdminReadGroupCursorResponse,
+    AdminReadRangeLeaseResponse, AdminReadRangeReplicaSetResponse,
+    AdminReadRangeTransitionsResponse, AdminReadSegmentPlacementResponse, AdminRebalanceIntentView,
+    AdminSegmentView, AdminTransitionView, MAX_TRANSITIONS_PER_READ,
 };
 use crate::transport::wire::{
     AdminMembershipResponse, AdminProposeResponse, AdminStatusResponse, TransportError,
@@ -72,6 +72,29 @@ pub enum ConsensusError {
         None => "; no leader is known yet".to_owned(),
     })]
     NotLeader { leader: Option<MetaNodeId> },
+    /// The command's kind is newer than the cluster's metadata feature level
+    /// (#554): refused before it reaches the log, where a voter running an
+    /// older release could not decode it - and could then append nothing
+    /// after it. Raised with `SetFeatureLevel` once every voter is upgraded.
+    #[error(
+        "this command needs metadata feature level {needed} and the cluster runs at \
+         {enabled}; finish upgrading every metadata voter, then raise the level \
+         (vtopctl meta enable-features --level {needed})"
+    )]
+    FeatureNotEnabled { needed: u32, enabled: u32 },
+    /// A lease request was refused because its proposer's clock is further
+    /// from the metadata leader's than the leader tolerates (#555).
+    ///
+    /// TYPED so a caller can say what is wrong (fix the proposer's NTP) rather
+    /// than retry as though the leader were merely busy. Nothing was
+    /// replicated: the request never reached the log.
+    #[error(
+        "lease request refused: this node's clock is {} ms {} the metadata leader's, more than the \
+         {bound_ms} ms tolerated for this lease; fix the node's clock (NTP) before it can hold a range",
+        .skew_ms.unsigned_abs(),
+        if *.skew_ms >= 0 { "ahead of" } else { "behind" }
+    )]
+    ClockSkew { skew_ms: i64, bound_ms: u64 },
 }
 
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
@@ -150,6 +173,20 @@ pub struct OpenraftConsensus {
     /// MAC, never as a MAC of nothing. Installed after construction because
     /// the node resolves it from its environment once the store is open.
     transition_mac_key: std::sync::RwLock<Option<[u8; 32]>>,
+    /// The leader's clock a lease request's `issued_at_ms` is checked against
+    /// (#555). `None` reads the wall clock; tests install a fixed one.
+    leader_clock: std::sync::RwLock<Option<LeaderClock>>,
+}
+
+/// Milliseconds since the Unix epoch, as the metadata leader sees them.
+type LeaderClock = std::sync::Arc<dyn Fn() -> i64 + Send + Sync>;
+
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 impl OpenraftConsensus {
@@ -158,6 +195,50 @@ impl OpenraftConsensus {
             raft,
             store: None,
             transition_mac_key: std::sync::RwLock::new(None),
+            leader_clock: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Check lease requests against `clock` instead of the wall clock. For
+    /// tests that need a leader whose time they control.
+    pub fn set_leader_clock(&self, clock: impl Fn() -> i64 + Send + Sync + 'static) {
+        *self
+            .leader_clock
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::sync::Arc::new(clock));
+    }
+
+    /// The receipt for a request this node already applied, answered from
+    /// its dedup table: the original response, as of the applied index it
+    /// was read at. `None` when the table no longer remembers it, or the node
+    /// has no applied state to ask (a bare-Raft harness) - the caller then
+    /// judges the request as new.
+    fn applied_receipt(&self, request_id: uuid::Uuid) -> Option<CommitReceipt> {
+        // The response and the applied position are read under ONE storage
+        // lock (review): the metrics snapshot is published after apply and
+        // can lag it, so pairing the two could name a log id from before
+        // the entry that produced the response.
+        self.store.as_ref()?.with_storage(|storage| {
+            let response = storage.state().applied_response(request_id).cloned()?;
+            Some(CommitReceipt {
+                log_id: WireLogId {
+                    term: storage.last_applied_term(),
+                    index: storage.last_applied(),
+                },
+                response,
+            })
+        })
+    }
+
+    fn leader_now_ms(&self) -> i64 {
+        match self
+            .leader_clock
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            Some(clock) => clock(),
+            None => wall_clock_ms(),
         }
     }
 
@@ -177,6 +258,40 @@ impl OpenraftConsensus {
 
     pub fn raft(&self) -> &MemRaft {
         &self.raft
+    }
+
+    /// Where every consumer group's durable cursor stands (#571), from this
+    /// node's APPLIED state, without waiting: `None` while the state machine
+    /// is busy, or on a node built without applied state.
+    ///
+    /// Only the LEADER answers; any other node answers with no cursors
+    /// (review of #574). Cursors are not monotonic - an unpinned cursor may
+    /// be committed backwards - so a lagging follower's copy can hold a
+    /// cursor ABOVE where the group now stands, and an aggregate across
+    /// nodes could report a group safe that is already below the log start.
+    /// The leader's applied state is the newest any node has.
+    ///
+    /// And only a leader that still HAS its quorum (review of #574): a
+    /// former leader cut off from the voters keeps reporting itself Leader,
+    /// and if the new leader commits a cursor backwards, both would export
+    /// the same series and an aggregate could pick the stale, higher copy.
+    /// A leader whose last quorum acknowledgement is older than an election
+    /// timeout - by when the others may have elected someone else - exports
+    /// nothing.
+    pub fn group_cursor_positions(
+        &self,
+        limit: usize,
+    ) -> Option<(Vec<crate::state::GroupCursorPosition>, bool)> {
+        let store = self.store.as_ref()?;
+        let metrics = self.raft.metrics().borrow().clone();
+        if !exports_cursors(
+            metrics.state,
+            metrics.millis_since_quorum_ack,
+            self.raft.config().election_timeout_min,
+        ) {
+            return Some((Vec::new(), false));
+        }
+        store.try_with_storage(|storage| storage.state().group_cursor_positions(limit))
     }
 
     /// Non-blocking snapshot of this node's Raft state for the operational
@@ -407,6 +522,57 @@ impl AdminReadGroupCursor for OpenraftConsensus {
             Ok(AdminReadGroupCursorResponse {
                 group_found,
                 cursor,
+                read_at_applied_index,
+            })
+        })
+    }
+}
+
+/// Linearizable read of a range's recorded replica set (#553), its own
+/// trait as the other reads are.
+#[async_trait]
+pub trait AdminReadRangeReplicaSet: Send + Sync {
+    async fn read_range_replica_set(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> ConsensusResult<AdminReadRangeReplicaSetResponse>;
+}
+
+#[async_trait]
+impl AdminReadRangeReplicaSet for OpenraftConsensus {
+    async fn read_range_replica_set(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> ConsensusResult<AdminReadRangeReplicaSetResponse> {
+        let Some(store) = self.store.as_ref() else {
+            return Err(ConsensusError::Message(
+                "this node was built without applied state and cannot serve reads".to_owned(),
+            ));
+        };
+        // Fence FIRST, as every admin read does: a candidate checking its
+        // configured set against a lagging copy could miss the change that
+        // replaced it, and promote counting a majority of the old set.
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(classify_read_error)?;
+        store.with_storage(|storage| {
+            let read_at_applied_index = storage.last_applied();
+            let state = storage.state();
+            let range_found = matches!(
+                state.record(&MetaKey::Range {
+                    topic_uuid,
+                    range_uuid,
+                }),
+                Some(MetaValue::Range(_))
+            );
+            Ok(AdminReadRangeReplicaSetResponse {
+                range_found,
+                replica_set: state
+                    .range_replica_set(topic_uuid, range_uuid)
+                    .map(AdminRangeReplicaSetView::from),
                 read_at_applied_index,
             })
         })
@@ -652,6 +818,87 @@ pub trait AdminReadSegmentPlacement: Send + Sync {
 #[async_trait]
 impl Consensus for OpenraftConsensus {
     async fn propose(&self, command: MetadataCommand) -> ConsensusResult<CommitReceipt> {
+        // The feature gate (#554), judged before the command is replicated.
+        // `SetFeatureLevel` is the one command not held back, because it is
+        // how the gate opens.
+        //
+        // Judged in EVERY role, not only the leader's (review): a role read
+        // before `client_write` is a race - a follower that skipped the gate
+        // can be elected before the write lands and append the command
+        // unchecked. What makes any role safe is that the level only rises,
+        // so every applied view is a lower bound on it: a view at or above
+        // `needed` proves the command enabled whoever this node is by the
+        // time it writes, and nothing short of that reaches `client_write`.
+        // Below it, a leader refuses; a follower, whose view may simply lag,
+        // sends the caller to the leader to be judged there.
+        if !matches!(command, MetadataCommand::SetFeatureLevel { .. }) {
+            let needed = command.feature_level();
+            if needed > crate::command::BASELINE_FEATURE_LEVEL {
+                // A façade without applied state cannot see the level, and
+                // a gate it cannot judge is closed (review).
+                let Some(store) = self.store.as_ref() else {
+                    return Err(ConsensusError::Message(format!(
+                        "this node was built without applied state, so it cannot tell whether \
+                         feature level {needed} is enabled; the command is refused"
+                    )));
+                };
+                let enabled = store.with_storage(|storage| storage.state().feature_level());
+                if needed > enabled {
+                    let metrics = self.raft.metrics().borrow().clone();
+                    if metrics.state == ServerState::Leader {
+                        return Err(ConsensusError::FeatureNotEnabled { needed, enabled });
+                    }
+                    return Err(ConsensusError::NotLeader {
+                        leader: metrics.current_leader.map(MetaNodeId),
+                    });
+                }
+            }
+        }
+        // A lease deadline is built from the proposer's clock, and the lease
+        // agent compares it with its own: a proposer whose clock is far from
+        // the leader's would steal or poison a lease. Refuse it BEFORE it is
+        // replicated, so it never reaches the log (#555).
+        //
+        // Only the LEADER judges. A follower's clock may differ from the
+        // proposer's by more than the bound while the leader's does not, and a
+        // `ClockSkew` from a follower is not a redirect: the client would keep
+        // retrying the follower instead of reaching the leader.
+        //
+        // And a lease command reaches `client_write` ONLY through a node that
+        // judged it as leader. A follower used to pass it on to
+        // `client_write` unjudged, trusting that call to redirect - but if
+        // the follower won an election in between, `client_write` accepted it
+        // as the new leader, and an hour-skewed proposer that hit that window
+        // could steal or poison a lease (review of #566). A non-leader now
+        // redirects lease commands itself; a leader that loses office after
+        // judging is refused by `client_write`, which cannot append once it
+        // is not the leader.
+        //
+        // And only a NEW request is judged. A retry whose timestamp has aged
+        // past the bound since the original committed must still get the
+        // original's answer, not a skew error about a request that succeeded
+        // - and it gets it HERE, read from the dedup table and returned,
+        // never passed on to `client_write` (review of #566): between a
+        // check that found it and the write, other commands can evict it
+        // from the full table, and the stale command would then be applied
+        // as new, past the very bound this exists to enforce.
+        if let Some(skew) = command.lease_clock_skew(self.leader_now_ms()) {
+            let metrics = self.raft.metrics().borrow().clone();
+            if metrics.state != ServerState::Leader {
+                return Err(ConsensusError::NotLeader {
+                    leader: metrics.current_leader.map(MetaNodeId),
+                });
+            }
+            if !skew.is_within_bound() {
+                if let Some(receipt) = self.applied_receipt(skew.request_id) {
+                    return Ok(receipt);
+                }
+                return Err(ConsensusError::ClockSkew {
+                    skew_ms: skew.skew_ms,
+                    bound_ms: skew.bound_ms,
+                });
+            }
+        }
         let response = self
             .raft
             .client_write(command)
@@ -706,6 +953,19 @@ impl Consensus for OpenraftConsensus {
     }
 }
 
+/// Whether a node exports group cursors (#571, review of #574): a leader
+/// whose quorum acknowledged it within an election timeout. A leader past
+/// that may already have been replaced while it still reports itself
+/// Leader; a follower's copy may stand above a cursor committed backwards.
+fn exports_cursors(
+    state: ServerState,
+    millis_since_quorum_ack: Option<u64>,
+    election_timeout_min_ms: u64,
+) -> bool {
+    state == ServerState::Leader
+        && millis_since_quorum_ack.is_some_and(|ms| ms <= election_timeout_min_ms)
+}
+
 /// Carry [`ConsensusError::NotLeader`] across into the transport layer instead
 /// of flattening it to prose.
 ///
@@ -756,6 +1016,19 @@ impl AdminHandler for OpenraftConsensus {
         AdminReadGroupCursor::read_group_cursor(
             self,
             request.group_uuid,
+            request.topic_uuid,
+            request.range_uuid,
+        )
+        .await
+        .map_err(to_transport_error)
+    }
+
+    async fn read_range_replica_set(
+        &self,
+        request: crate::transport::wire::AdminReadRangeReplicaSetRequest,
+    ) -> TransportResult<AdminReadRangeReplicaSetResponse> {
+        AdminReadRangeReplicaSet::read_range_replica_set(
+            self,
             request.topic_uuid,
             request.range_uuid,
         )
@@ -912,6 +1185,17 @@ mod tests {
     /// this function, and both flattened until now — so `meta add-learner`
     /// against a follower failed outright while `propose` against the same node
     /// was quietly redirected.
+    /// Review of #574: only a leader in recent contact with its quorum
+    /// exports cursors - not a follower, and not a former leader cut off
+    /// past an election timeout, which still reports itself Leader.
+    #[test]
+    fn only_a_leader_with_its_quorum_exports_cursors() {
+        assert!(exports_cursors(ServerState::Leader, Some(50), 300));
+        assert!(!exports_cursors(ServerState::Leader, Some(301), 300));
+        assert!(!exports_cursors(ServerState::Leader, None, 300));
+        assert!(!exports_cursors(ServerState::Follower, Some(0), 300));
+    }
+
     #[test]
     fn a_write_refused_for_leadership_classifies_as_a_redirect() {
         let error = openraft::error::RaftError::APIError(

@@ -20,14 +20,20 @@
 # was started with.
 services:
   minio:
-    # quay.io, and PINNED (#507): MinIO withdrew both repositories from Docker
-    # Hub between 2026-09-11 and 2026-09-14, and every `compose up` then failed
-    # in its pull phase before creating a container. quay.io serves the same
-    # images bit-for-bit. The tag is explicit rather than `latest` because
-    # Dependabot's docker-compose ecosystem cannot bump a floating tag — a
-    # pinned one turns the next withdrawal into a failed bump instead of a
-    # broken lab, which is the whole point of the ecosystem entry.
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # BUILT, not pulled (#550): MinIO withdrew its images from Docker Hub
+    # (#507) and then from quay.io, so no registry serves any pinned tag and
+    # `compose up` failed in its pull phase. docker/minio/Dockerfile builds the
+    # same release from MinIO's source, checked out by commit. LAB ONLY: the
+    # upstream repository is archived and this release gets no security fixes.
+    # `pull_policy: never` - the name is local, and a pull could only fetch
+    # whatever someone else published under it. Compose builds the image when
+    # it is missing and reuses it after that (`build` would rebuild it on
+    # every start); after changing docker/minio/Dockerfile, rebuild it with
+    # `docker compose build minio`.
+    build:
+      context: ../docker/minio
+    image: vtop-minio:RELEASE.2025-09-07T16-13-09Z
+    pull_policy: never
     container_name: vtop-bench-minio
     command: server /data --console-address ":9001"
     ports:
@@ -62,7 +68,11 @@ services:
         ipv4_address: 10.77.0.10
 
   minio-init:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    # The same locally built image as `minio`: it carries `mc` too.
+    build:
+      context: ../docker/minio
+    image: vtop-minio:RELEASE.2025-09-07T16-13-09Z
+    pull_policy: never
     security_opt:
       - no-new-privileges:true
     cap_drop: [ALL]
@@ -286,7 +296,7 @@ services:
     # broke `compose up` in its pull phase, and Dependabot's docker-compose
     # ecosystem cannot bump a tag that never changes name. Every lab image in
     # this file is pinned for the same reason.
-    image: nginx:1.29.3-alpine
+    image: nginx:1.31.0-alpine
     container_name: vtop-bench-h3-proxy
     profiles: ["h3"]
     ports:

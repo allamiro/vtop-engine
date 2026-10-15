@@ -86,6 +86,10 @@ pub const KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP: u16 = 24;
 // Kafka gateway answers OffsetFetch with, linearizable like every admin read.
 pub const KIND_ADMIN_READ_GROUP_CURSOR_REQ: u16 = 25;
 pub const KIND_ADMIN_READ_GROUP_CURSOR_RESP: u16 = 26;
+// A range's recorded replica set (#553): what a candidate checks its own
+// configured set against before it promotes.
+pub const KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ: u16 = 27;
+pub const KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP: u16 = 28;
 
 /// The most transition records one read returns; a longer chain is paged
 /// with `from_epoch`.
@@ -1169,6 +1173,131 @@ impl AdminReadGroupCursorResponse {
         let response = Self {
             group_found,
             cursor,
+            read_at_applied_index: reader.u64("read at applied index")?,
+        };
+        reader.finish()?;
+        Ok(response)
+    }
+}
+
+/// Which range's recorded replica set to read (#553).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminReadRangeReplicaSetRequest {
+    pub topic_uuid: Uuid,
+    pub range_uuid: Uuid,
+}
+
+impl AdminReadRangeReplicaSetRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_uuid(&mut out, self.topic_uuid);
+        put_uuid(&mut out, self.range_uuid);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let request = Self {
+            topic_uuid: reader.uuid("topic uuid")?,
+            range_uuid: reader.uuid("range uuid")?,
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+}
+
+/// A recorded replica set as the admin wire carries it: the state machine's
+/// [`crate::state::RangeReplicaSetRecord`], field for field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminRangeReplicaSetView {
+    pub generation: u64,
+    /// Sorted, distinct.
+    pub members: Vec<Uuid>,
+    pub recorded_at_epoch: u64,
+}
+
+impl From<&crate::state::RangeReplicaSetRecord> for AdminRangeReplicaSetView {
+    fn from(record: &crate::state::RangeReplicaSetRecord) -> Self {
+        Self {
+            generation: record.generation,
+            members: record.members.clone(),
+            recorded_at_epoch: record.recorded_at_epoch,
+        }
+    }
+}
+
+/// Whether the range exists, its recorded replica set if one was ever
+/// recorded, and the applied index the read was served at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminReadRangeReplicaSetResponse {
+    pub range_found: bool,
+    pub replica_set: Option<AdminRangeReplicaSetView>,
+    pub read_at_applied_index: u64,
+}
+
+impl AdminReadRangeReplicaSetResponse {
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut out = Vec::new();
+        put_u8(&mut out, u8::from(self.range_found));
+        match &self.replica_set {
+            None => put_u8(&mut out, 0),
+            Some(set) => {
+                if set.members.len() > crate::placement::MAX_REPLICAS {
+                    return Err(CodecError::BoundExceeded {
+                        what: "replica set members",
+                        actual: set.members.len(),
+                        maximum: crate::placement::MAX_REPLICAS,
+                    });
+                }
+                put_u8(&mut out, 1);
+                put_u64(&mut out, set.generation);
+                put_u64(&mut out, set.recorded_at_epoch);
+                put_u16(&mut out, set.members.len() as u16);
+                for member in &set.members {
+                    put_uuid(&mut out, *member);
+                }
+            }
+        }
+        put_u64(&mut out, self.read_at_applied_index);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let range_found = reader.flag("range found")?;
+        let replica_set = match reader.u8("replica set flag")? {
+            0 => None,
+            1 => {
+                let generation = reader.u64("replica set generation")?;
+                let recorded_at_epoch = reader.u64("replica set recorded-at epoch")?;
+                let count = usize::from(reader.u16("replica set member count")?);
+                if count > crate::placement::MAX_REPLICAS {
+                    return Err(CodecError::BoundExceeded {
+                        what: "replica set members",
+                        actual: count,
+                        maximum: crate::placement::MAX_REPLICAS,
+                    });
+                }
+                let mut members = Vec::with_capacity(count);
+                for _ in 0..count {
+                    members.push(reader.uuid("replica set member")?);
+                }
+                Some(AdminRangeReplicaSetView {
+                    generation,
+                    members,
+                    recorded_at_epoch,
+                })
+            }
+            _ => {
+                return Err(CodecError::InvalidValue {
+                    what: "replica set flag",
+                    reason: "must be 0 or 1",
+                })
+            }
+        };
+        let response = Self {
+            range_found,
+            replica_set,
             read_at_applied_index: reader.u64("read at applied index")?,
         };
         reader.finish()?;
@@ -2272,6 +2401,60 @@ mod tests {
         let mut bad = none.encode().unwrap();
         bad[1] = 2;
         assert!(AdminReadGroupCursorResponse::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn range_replica_set_read_round_trips_and_bounds_its_members() {
+        let request = AdminReadRangeReplicaSetRequest {
+            topic_uuid: Uuid::from_u128(1),
+            range_uuid: Uuid::from_u128(2),
+        };
+        assert_eq!(
+            AdminReadRangeReplicaSetRequest::decode(&request.encode()).unwrap(),
+            request
+        );
+        let none = AdminReadRangeReplicaSetResponse {
+            range_found: true,
+            replica_set: None,
+            read_at_applied_index: 9,
+        };
+        assert_eq!(
+            AdminReadRangeReplicaSetResponse::decode(&none.encode().unwrap()).unwrap(),
+            none
+        );
+        let recorded = AdminReadRangeReplicaSetResponse {
+            range_found: true,
+            replica_set: Some(AdminRangeReplicaSetView {
+                generation: 2,
+                members: vec![
+                    Uuid::from_u128(10),
+                    Uuid::from_u128(11),
+                    Uuid::from_u128(12),
+                ],
+                recorded_at_epoch: 7,
+            }),
+            read_at_applied_index: 40,
+        };
+        assert_eq!(
+            AdminReadRangeReplicaSetResponse::decode(&recorded.encode().unwrap()).unwrap(),
+            recorded
+        );
+        let too_many = AdminReadRangeReplicaSetResponse {
+            replica_set: Some(AdminRangeReplicaSetView {
+                generation: 1,
+                members: (0..=crate::placement::MAX_REPLICAS as u128)
+                    .map(Uuid::from_u128)
+                    .collect(),
+                recorded_at_epoch: 0,
+            }),
+            ..recorded.clone()
+        };
+        assert!(too_many.encode().is_err());
+        // A count above the bound is refused before anything is allocated.
+        let mut bad = vec![1, 1];
+        bad.extend_from_slice(&[0; 16]);
+        bad.extend_from_slice(&u16::MAX.to_be_bytes());
+        assert!(AdminReadRangeReplicaSetResponse::decode(&bad).is_err());
     }
 
     #[test]

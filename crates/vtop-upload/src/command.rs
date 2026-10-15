@@ -409,6 +409,7 @@ mod tests {
             force_path_style: false,
             verify_tls: true,
             transport: "tcp_tls".into(),
+            request_timeout_seconds: 300,
             profile: None,
             command_binary: Some(path.to_string_lossy().into_owned()),
             command_timeout_seconds: 2,
