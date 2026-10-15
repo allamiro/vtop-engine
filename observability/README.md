@@ -146,9 +146,45 @@ exports the range and retention gauges but not per-follower ones, so those two
 rules stay silent (no data is not an alert) there. The thresholds are starting
 points for the lab's pacing, not tuned values.
 
-**Not covered yet:** per-consumer-group lag on the native broker, and time to
-eviction against retention. A group's committed position lives on the metadata
-plane, and nothing exports it beside the range's log start.
+### Group eviction
+
+A consumer group positioned below a range's log start is told
+`OffsetOutOfRange`: retention removed records it had not read, and nothing
+warned before it happened (#571). Two series meet in PromQL:
+
+- the metadata LEADER exports `vtop_meta_group_cursor_offset{topic,range,group}`
+  from its applied state (the next offset each group will read). Only the
+  leader: a cursor can be committed backwards, so a lagging follower's copy may
+  stand above where the group really is, and no aggregate across nodes could
+  tell. At most 10,000 series; `vtop_meta_group_cursor_series_truncated` is 1
+  when some were left out over that bound or an offset too large for a gauge
+  (a cursor whose topic was deleted is dropped without setting it - it has
+  no log left to lag behind);
+- every data node exports `vtop_broker_log_start_offset{topic,range}`, the first
+  offset its replica still holds (removed while a candidate has no role).
+
+`topic` is the topic name and `range` the range UUID on both, so lag is
+`cursor - on (topic, range) group_left log_start`, and time to eviction is that
+gap divided by how fast retention moves the log start (`deriv`, the gauge's
+slope). The log start is the SERVING replica's - the one holding the lease
+(`vtop_broker_lease_active == 1`) with its boundary published
+(`vtop_broker_boundary_pending` not 1) - because replicas reclaim
+independently: after a failover the leader can still hold records a follower
+has dropped, and the group fetches from the leader. The rate is taken over
+samples from while that replica served, and only once it has served the whole
+30-minute window, so reclamation it did as a follower never counts; after a
+failover the near-eviction estimate starts 30 minutes later (the eviction page
+does not wait).
+
+| Rule | Fires when | For |
+|---|---|---|
+| Consumer group cursor below log start (page) | a group's cursor is below the log start | 5 min |
+| Consumer group near eviction | at the last 30 min's rate, retention passes the cursor within an hour | 15 min |
+
+A range whose log start is not moving has no estimate (no division by zero),
+and a group that retention has already passed pages on the first rule, not the
+second. Groups that commit through the Kafka gateway (#457) are metadata
+cursors and appear here.
 
 ### Design decisions worth knowing
 
@@ -221,11 +257,12 @@ panel.
 - `MINIO_PROMETHEUS_AUTH_TYPE=public` disables auth on MinIO's metrics endpoint —
   **never do that outside a lab**;
 - Alloy holds a (read-only) docker socket to discover containers and read logs;
-- eight alert rules, file-provisioned from
+- ten alert rules, file-provisioned from
   `grafana/provisioning/alerting/vtop-alerts.yaml`: **Records lost to
   retention** fires on any increase of `vtop_retention_lost_records_total`
-  (#454), and seven data-plane and metadata rules cover retention and
-  replication health (#561; see [retention blocked](#retention-blocked) and
+  (#454), and nine data-plane and metadata rules cover retention and
+  replication health and group eviction (#561, #571; see [retention blocked](#retention-blocked),
+  [group eviction](#group-eviction) and
   [replication health](#replication-health)). No contact point is provisioned,
   so a firing rule shows in Grafana's alert list and goes nowhere else — wire a
   contact point and a notification policy for a real deployment. Grafana creates the rule's

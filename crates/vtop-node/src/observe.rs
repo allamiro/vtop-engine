@@ -276,6 +276,138 @@ fn gauge_vec(name: &str, help: &str, labels: &[&str]) -> Result<IntGaugeVec, Str
         .map_err(|error| format!("build {name}: {error}"))
 }
 
+/// The most consumer-group cursor series one metadata node exports. Each is
+/// one (topic, range, group); past this many the rest are left out and
+/// `meta_group_cursor_series_truncated` says so, instead of the scrape growing
+/// without bound (#571).
+pub const MAX_GROUP_CURSOR_SERIES: usize = 10_000;
+
+/// A replica's log start, as a collector sees it (review of #574).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogStart {
+    /// The first offset the replica holds.
+    At(u64),
+    /// The read would have waited: the last value stands.
+    Busy,
+    /// No role is installed (a candidate mid-transition): there is no log
+    /// start, and the previous role's must not stand in for one.
+    NoRole,
+}
+
+/// Where the group cursors come from; [`OpenraftConsensus`] in production.
+pub trait GroupCursorSource: Send + Sync {
+    /// `None` when the read would wait (the collector then leaves the last
+    /// values standing); otherwise up to `limit` cursors, and whether there
+    /// were more.
+    fn group_cursor_positions(
+        &self,
+        limit: usize,
+    ) -> Option<(Vec<vtop_meta::GroupCursorPosition>, bool)>;
+}
+
+impl GroupCursorSource for OpenraftConsensus {
+    fn group_cursor_positions(
+        &self,
+        limit: usize,
+    ) -> Option<(Vec<vtop_meta::GroupCursorPosition>, bool)> {
+        OpenraftConsensus::group_cursor_positions(self, limit)
+    }
+}
+
+/// Every consumer group's durable cursor, per range (#571), from a metadata
+/// node's applied state.
+///
+/// A group whose cursor falls below a range's log start is told
+/// `OffsetOutOfRange`, and nothing warned before it happened. The data nodes
+/// export the range's `broker_log_start_offset` and offsets under the same
+/// `topic` (name) and `range` (UUID) labels as these series, so lag and
+/// time-to-eviction are a PromQL join (the shipped alert rules), not a second
+/// place that has to read both. Only the metadata LEADER exports them: a
+/// follower's copy can lag behind a cursor that moved backwards, and no
+/// aggregate across nodes can tell which copy is current (review of #574).
+pub struct MetaGroupCursorCollector {
+    source: Arc<dyn GroupCursorSource>,
+    limit: usize,
+    offset: IntGaugeVec,
+    truncated: IntGauge,
+    /// Refresh and read-out under one lock: concurrent scrapes interleaving
+    /// one's reset with another's writes could emit a mixture of two
+    /// readings, or bring back a deleted cursor (review of #574).
+    scrape: std::sync::Mutex<()>,
+}
+
+impl MetaGroupCursorCollector {
+    pub fn new(source: Arc<dyn GroupCursorSource>) -> Result<Self, String> {
+        Self::with_limit(source, MAX_GROUP_CURSOR_SERIES)
+    }
+
+    fn with_limit(source: Arc<dyn GroupCursorSource>, limit: usize) -> Result<Self, String> {
+        Ok(Self {
+            source,
+            limit,
+            offset: gauge_vec(
+                "meta_group_cursor_offset",
+                "Next offset a consumer group will read on a range, from its durable cursor",
+                &["topic", "range", "group"],
+            )?,
+            truncated: gauge(
+                "meta_group_cursor_series_truncated",
+                "1 when some group cursors are not exported: more than the series bound \
+                 exist, or an offset is beyond what a gauge can carry",
+            )?,
+            scrape: std::sync::Mutex::new(()),
+        })
+    }
+
+    fn refresh(&self) {
+        let Some((positions, mut truncated)) = self.source.group_cursor_positions(self.limit)
+        else {
+            return; // busy: the last values stand, as for every other gauge
+        };
+        // Rebuilt every scrape: a deleted group or topic must disappear, not
+        // keep reporting the last place it stood.
+        self.offset.reset();
+        for position in &positions {
+            let Some(topic) = position.topic_name.as_deref() else {
+                // The cursor outlived its topic: nothing to join it to and no
+                // log for it to lag behind. Not `truncated` - that would pin
+                // the flag at 1 after every topic deletion (review of #574).
+                continue;
+            };
+            let range = position.range_uuid.to_string();
+            let group = position
+                .group_name
+                .clone()
+                .unwrap_or_else(|| position.group_uuid.to_string());
+            // A gauge is an i64: an offset beyond it is not exported rather
+            // than exported wrapped to a negative number (review of #574).
+            let Ok(offset) = i64::try_from(position.record_offset) else {
+                truncated = true;
+                continue;
+            };
+            self.offset
+                .with_label_values(&[topic, &range, &group])
+                .set(offset);
+        }
+        self.truncated.set(i64::from(truncated));
+    }
+}
+
+impl Collector for MetaGroupCursorCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        descs_of(&[&self.offset, &self.truncated])
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let _serialized = self
+            .scrape
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.refresh();
+        collect_all(&[&self.offset, &self.truncated])
+    }
+}
+
 /// Retention on one range (#561), shared by every data-plane collector so the
 /// names are the same whichever role a replica holds.
 ///
@@ -288,6 +420,7 @@ struct RetentionGauges {
     bound_bytes: IntGaugeVec,
     blocked: IntGaugeVec,
     failing: IntGaugeVec,
+    log_start: IntGaugeVec,
 }
 
 impl RetentionGauges {
@@ -316,16 +449,39 @@ impl RetentionGauges {
                  next append)",
                 &["topic", "range"],
             )?,
+            log_start: gauge_vec(
+                "broker_log_start_offset",
+                "First offset the replica still holds; retention moves it. A consumer \
+                 positioned below it is told OffsetOutOfRange",
+                &["topic", "range"],
+            )?,
         })
     }
 
-    fn members(&self) -> [&dyn Collector; 4] {
+    fn members(&self) -> [&dyn Collector; 5] {
         [
             &self.retained_bytes,
             &self.bound_bytes,
             &self.blocked,
             &self.failing,
+            &self.log_start,
         ]
+    }
+
+    /// The log start, beside the cursor that must stay above it (#571). A
+    /// read that would block leaves the last value standing, as the other
+    /// offset gauges do.
+    fn refresh_log_start(&self, range: &[&str; 2], log_start: LogStart) {
+        match log_start {
+            LogStart::At(offset) => match i64::try_from(offset) {
+                Ok(offset) => self.log_start.with_label_values(range).set(offset),
+                Err(_) => self.log_start.reset(),
+            },
+            LogStart::Busy => {}
+            // A departed role's floor would let the eviction rules judge a
+            // group against a log nobody serves now.
+            LogStart::NoRole => self.log_start.reset(),
+        }
     }
 
     /// `None` - no pass has run on the role holding the range - removes the
@@ -861,6 +1017,8 @@ impl BrokerCollector {
 
         self.retention
             .refresh(&range, self.broker.retention_stats().snapshot());
+        self.retention
+            .refresh_log_start(&range, ReplicaObservation::log_start(self.broker.as_ref()));
 
         let budget = self.broker.memory_budget().metrics();
         for (scope, used) in [
@@ -1045,6 +1203,10 @@ impl FollowerCollector {
             .set(i64::from(self.follower.is_online()));
         self.retention
             .refresh(&range, self.follower.retention_stats().snapshot());
+        self.retention.refresh_log_start(
+            &range,
+            ReplicaObservation::log_start(self.follower.as_ref()),
+        );
     }
 }
 
@@ -1102,6 +1264,11 @@ pub trait ReplicaObservation: Send + Sync {
     /// pass, or from a view with no role installed.
     fn retention(&self) -> Option<RetentionSnapshot> {
         None
+    }
+
+    /// The first offset the replica holds (#571).
+    fn log_start(&self) -> LogStart {
+        LogStart::NoRole
     }
 
     /// Everything the authorization gauges are derived from, AS ONE
@@ -1179,6 +1346,10 @@ impl ReplicaObservation for LocalBroker {
     fn retention(&self) -> Option<RetentionSnapshot> {
         self.retention_stats().snapshot()
     }
+
+    fn log_start(&self) -> LogStart {
+        Self::try_log_start_offset(self).map_or(LogStart::Busy, LogStart::At)
+    }
 }
 
 impl ReplicaObservation for InProcessFollower {
@@ -1204,6 +1375,10 @@ impl ReplicaObservation for InProcessFollower {
 
     fn retention(&self) -> Option<RetentionSnapshot> {
         self.retention_stats().snapshot()
+    }
+
+    fn log_start(&self) -> LogStart {
+        Self::try_log_start_offset(self).map_or(LogStart::Busy, LogStart::At)
     }
 }
 
@@ -1352,6 +1527,8 @@ impl CandidateCollector {
                 .set(cluster as i64);
         }
         self.retention.refresh(&range, self.view.retention());
+        self.retention
+            .refresh_log_start(&range, self.view.log_start());
         // ONE observation of the role rather than an ownership question
         // followed by three answers, so a transition cannot land in the middle
         // of a scrape and have it publish half of each role (review; the
@@ -2136,6 +2313,7 @@ mod tests {
 
         struct Retaining {
             snapshot: Mutex<Option<RetentionSnapshot>>,
+            log_start: Mutex<LogStart>,
         }
         impl ReplicaObservation for Retaining {
             fn try_local_offsets(&self) -> Option<(u64, u64)> {
@@ -2156,11 +2334,15 @@ mod tests {
             fn retention(&self) -> Option<RetentionSnapshot> {
                 *self.snapshot.lock().unwrap()
             }
+            fn log_start(&self) -> LogStart {
+                *self.log_start.lock().unwrap()
+            }
         }
 
         let range = test_range();
         let view = Arc::new(Retaining {
             snapshot: Mutex::new(None),
+            log_start: Mutex::new(LogStart::At(3)),
         });
         let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
         registry
@@ -2180,6 +2362,22 @@ mod tests {
             line(&text, "vtop_broker_retention_bound_bytes{").is_none(),
             "no pass has run: nothing to report, not a bound of zero: {text}"
         );
+        // The log start is known before any pass (#571). A busy read leaves
+        // it standing; with no role installed it is removed - a departed
+        // role's floor must not stand in for one (review of #574).
+        assert!(
+            line(&text, "vtop_broker_log_start_offset{").is_some_and(|l| l.ends_with(" 3")),
+            "{text}"
+        );
+        *view.log_start.lock().unwrap() = LogStart::Busy;
+        assert!(line(&scrape(&registry), "vtop_broker_log_start_offset{")
+            .is_some_and(|l| l.ends_with(" 3")));
+        *view.log_start.lock().unwrap() = LogStart::NoRole;
+        assert!(
+            line(&scrape(&registry), "vtop_broker_log_start_offset{").is_none(),
+            "the previous role's log start outlived it"
+        );
+        *view.log_start.lock().unwrap() = LogStart::At(3);
 
         *view.snapshot.lock().unwrap() = Some(RetentionSnapshot {
             retained_bytes: Some(900),
@@ -2246,6 +2444,101 @@ mod tests {
                 "the new role has not run a pass; {prefix} still reports the old one: {text}"
             );
         }
+    }
+
+    /// #571: each durable group cursor is a series under the topic NAME and
+    /// range UUID the data plane uses, so lag and time-to-eviction join in
+    /// PromQL. A cursor that is gone disappears; a busy state machine leaves
+    /// the last values standing; past the bound the rest are counted.
+    #[test]
+    fn group_cursors_are_exported_beside_the_data_planes_labels() {
+        use std::sync::Mutex;
+        use vtop_meta::GroupCursorPosition;
+
+        struct Cursors(Mutex<Option<Vec<GroupCursorPosition>>>);
+        impl GroupCursorSource for Cursors {
+            fn group_cursor_positions(
+                &self,
+                limit: usize,
+            ) -> Option<(Vec<GroupCursorPosition>, bool)> {
+                let all = self.0.lock().unwrap().clone()?;
+                let truncated = all.len() > limit;
+                Some((all.into_iter().take(limit).collect(), truncated))
+            }
+        }
+        let at =
+            |group: u128, name: Option<&str>, topic: Option<&str>, offset| GroupCursorPosition {
+                topic_uuid: Uuid::from_u128(1),
+                topic_name: topic.map(str::to_owned),
+                range_uuid: Uuid::from_u128(7),
+                group_uuid: Uuid::from_u128(group),
+                group_name: name.map(str::to_owned),
+                record_offset: offset,
+            };
+        let source = Arc::new(Cursors(Mutex::new(Some(vec![
+            at(10, Some("billing"), Some("telemetry"), 40),
+            at(11, None, Some("telemetry"), 12),
+            at(12, Some("orphan"), None, 3),
+        ]))));
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                MetaGroupCursorCollector::with_limit(
+                    Arc::clone(&source) as Arc<dyn GroupCursorSource>,
+                    2,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let range = Uuid::from_u128(7).to_string();
+        let series = |text: &str, group: &str| {
+            text.lines()
+                .find(|l| {
+                    l.starts_with("vtop_meta_group_cursor_offset{")
+                        && l.contains(&format!("group=\"{group}\""))
+                })
+                .map(str::to_owned)
+        };
+
+        let text = scrape(&registry);
+        let billing = series(&text, "billing").expect("billing exported");
+        assert!(billing.ends_with(" 40"), "{billing}");
+        assert!(
+            billing.contains("topic=\"telemetry\"")
+                && billing.contains(&format!("range=\"{range}\"")),
+            "the labels must match broker_log_start_offset's: {billing}"
+        );
+        let unnamed = Uuid::from_u128(11).to_string();
+        assert!(
+            series(&text, &unnamed).is_some(),
+            "a nameless group falls back to its UUID"
+        );
+        assert!(
+            text.lines()
+                .any(|l| l == "vtop_meta_group_cursor_series_truncated 1"),
+            "the third cursor is past the bound of two: {text}"
+        );
+
+        // Busy: the last values stand.
+        *source.0.lock().unwrap() = None;
+        assert!(series(&scrape(&registry), "billing").is_some());
+
+        // The group is gone: so is its series.
+        *source.0.lock().unwrap() = Some(vec![at(11, None, Some("telemetry"), 13)]);
+        let text = scrape(&registry);
+        assert!(series(&text, "billing").is_none(), "{text}");
+        assert!(series(&text, &unnamed).is_some_and(|l| l.ends_with(" 13")));
+        assert!(text
+            .lines()
+            .any(|l| l == "vtop_meta_group_cursor_series_truncated 0"));
+
+        // An offset no gauge can carry is left out, not wrapped negative.
+        *source.0.lock().unwrap() = Some(vec![at(11, None, Some("telemetry"), u64::MAX)]);
+        let text = scrape(&registry);
+        assert!(series(&text, &unnamed).is_none(), "{text}");
+        assert!(text
+            .lines()
+            .any(|l| l == "vtop_meta_group_cursor_series_truncated 1"));
     }
 
     #[test]

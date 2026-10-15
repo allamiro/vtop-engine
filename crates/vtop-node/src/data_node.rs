@@ -3348,6 +3348,14 @@ impl crate::observe::ReplicaObservation for SwitchingLocalView {
             .and_then(|view| view.retention())
     }
 
+    fn log_start(&self) -> crate::observe::LogStart {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map_or(crate::observe::LogStart::NoRole, |view| view.log_start())
+    }
+
     /// ONE acquisition for the whole reading, which is the point of it
     /// (review). Asked question by question, `clear()` could land between "is
     /// a role installed?" and the answers, and the scrape would publish this

@@ -251,6 +251,9 @@ pub async fn serve(
     observability.register(Box::new(MetaRaftCollector::new(Arc::clone(
         &node.consensus,
     ))?))?;
+    observability.register(Box::new(crate::observe::MetaGroupCursorCollector::new(
+        Arc::clone(&node.consensus) as Arc<dyn crate::observe::GroupCursorSource>,
+    )?))?;
 
     // Readiness for a metadata node is "both listeners are bound", NOT "the
     // cluster has a leader". A fresh cluster has no leader until the admin
