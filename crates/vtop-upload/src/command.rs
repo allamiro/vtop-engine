@@ -602,6 +602,62 @@ mod tests {
         }
     }
 
+    /// Review of #530: a tool that prints a throttle, leaves a descendant
+    /// holding its STDOUT open, and exits non-zero is classified from its own
+    /// exit and stderr - not timed out waiting for stdout to close.
+    #[tokio::test]
+    async fn a_failed_read_back_is_classified_while_a_descendant_holds_stdout() {
+        use crate::base::{ObjectChecksum, UploadBackend};
+        // `sleep 10 &` without a redirect inherits stdout AND stderr. Before
+        // the fix the stdout drain waited out the whole deadline and the call
+        // came back as a plain timeout; now the exit is classified from the
+        // stderr already kept, within the usual evidence budget.
+        let (_dir, path) = executable_script(
+            "printf '%s\\n' 'An error occurred (SlowDown) when calling the GetObject operation' >&2\n\
+             sleep 10 &\n\
+             exit 1",
+        );
+        let policy = CommandPolicy::from_config(&config(&path), "test").unwrap();
+        let bound = policy.timeout();
+        let backend = crate::awscli_backend::AwsCliBackend::new(policy, None, None);
+        let digest = vtop_core::checksum::sha256_bytes(b"");
+        let timed = |operation: &'static str, elapsed: Duration, error: Option<VtopError>| {
+            let error = error.unwrap_or_else(|| panic!("[{operation}] a failing tool must fail"));
+            assert!(
+                error.is_upload_throttle(),
+                "[{operation}] the tool exited with a SlowDown on stderr, yet the call reported: \
+                 {error}"
+            );
+            assert!(
+                elapsed < bound.mul_f64(1.5),
+                "[{operation}] took {elapsed:?} against a {bound:?} command timeout"
+            );
+        };
+        let get = async {
+            let started = std::time::Instant::now();
+            let error = backend
+                .get_object_bounded("s3://bucket/key", 1024)
+                .await
+                .err();
+            (started.elapsed(), error)
+        };
+        let verify = async {
+            let started = std::time::Instant::now();
+            let error = backend
+                .verify_object(
+                    "s3://bucket/key",
+                    0,
+                    Some(ObjectChecksum::new("sha256", &digest)),
+                )
+                .await
+                .err();
+            (started.elapsed(), error)
+        };
+        let ((get_elapsed, get_error), (verify_elapsed, verify_error)) = tokio::join!(get, verify);
+        timed("get_object_bounded", get_elapsed, get_error);
+        timed("verify_object", verify_elapsed, verify_error);
+    }
+
     #[tokio::test]
     async fn a_grandchild_holding_stderr_cannot_stretch_a_read_back_past_its_command_timeout() {
         // `upload.command_timeout_seconds` bounds the whole invocation. The

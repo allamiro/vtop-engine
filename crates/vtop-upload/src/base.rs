@@ -241,18 +241,36 @@ pub(crate) async fn verify_command_content(
         .ok_or_else(|| VtopError::Upload(format!("{backend} verification stdout unavailable")))?;
     let evidence = ReadBackEvidence::collect(&mut child, backend, "verification")?;
     let completed = tokio::time::timeout_at(deadline, async {
-        let (result, oversized) =
-            verify_reader_content(stdout, expected_size, expected, backend).await?;
-        if oversized {
-            let _ = child.kill().await;
-        }
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| VtopError::Upload(format!("waiting for {backend} verification: {e}")))?;
+        // The tool's exit is watched WHILE stdout drains (review of #530): a
+        // descendant it left behind can hold stdout open after the tool
+        // itself has failed, and draining first would wait out the deadline
+        // and lose the failure's evidence. A failed exit is classified now;
+        // a successful one still waits for the content.
+        let read = verify_reader_content(stdout, expected_size, expected, backend);
+        tokio::pin!(read);
+        let mut verified = None;
+        let status = loop {
+            tokio::select! {
+                outcome = &mut read, if verified.is_none() => {
+                    let (result, oversized) = outcome?;
+                    if oversized {
+                        let _ = child.kill().await;
+                    }
+                    verified = Some((result, oversized));
+                }
+                status = child.wait() => break status.map_err(|e| {
+                    VtopError::Upload(format!("waiting for {backend} verification: {e}"))
+                })?,
+            }
+        };
+        let oversized = verified.as_ref().is_some_and(|(_, oversized)| *oversized);
         if !status.success() && !oversized {
             return Ok(Err(status));
         }
+        let (result, _) = match verified {
+            Some(verified) => verified,
+            None => read.await?,
+        };
         Ok::<_, VtopError>(Ok(result))
     })
     .await;
@@ -321,14 +339,27 @@ pub(crate) async fn read_command_bounded(
         .ok_or_else(|| VtopError::Upload(format!("{backend} download stdout unavailable")))?;
     let evidence = ReadBackEvidence::collect(&mut child, backend, "download")?;
     let completed = tokio::time::timeout_at(deadline, async {
-        let bytes = read_bounded(stdout, max_bytes, object_uri).await?;
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| VtopError::Upload(format!("waiting for {backend} download: {e}")))?;
+        // Exit watched while stdout drains, as in `verify_command_content`
+        // (review of #530): a failed tool is classified on its own exit, not
+        // after a descendant holding stdout lets go.
+        let read = read_bounded(stdout, max_bytes, object_uri);
+        tokio::pin!(read);
+        let mut bytes = None;
+        let status = loop {
+            tokio::select! {
+                outcome = &mut read, if bytes.is_none() => bytes = Some(outcome?),
+                status = child.wait() => break status.map_err(|e| {
+                    VtopError::Upload(format!("waiting for {backend} download: {e}"))
+                })?,
+            }
+        };
         if !status.success() {
             return Ok(Err(status));
         }
+        let bytes = match bytes {
+            Some(bytes) => bytes,
+            None => read.await?,
+        };
         Ok::<_, VtopError>(Ok(bytes))
     })
     .await;
