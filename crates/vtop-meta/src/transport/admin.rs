@@ -853,10 +853,54 @@ impl AdminClient {
             }
             .encode(),
         };
-        let (mut index, mut frame) = self.round_trip_indexed(request.clone()).await?;
-        let mut asked = vec![false; self.candidates.len()];
+        let candidates = self.candidates.len();
+        let mut asked = vec![false; candidates];
+        let mut next = Some(self.round_trip_indexed(request.clone()).await?);
+        let mut unresolved: Option<TransportError> = None;
         loop {
+            let (index, frame) = match next.take() {
+                Some(answer) => answer,
+                // Nothing to follow: ask a member nobody has asked yet. A
+                // named leader that cannot be reached, or a node that names
+                // none, is not the end while another member may answer
+                // (review).
+                None => {
+                    let Some(index) = (0..candidates).find(|index| !asked[*index]) else {
+                        return Err(unresolved.unwrap_or_else(|| {
+                            TransportError::Protocol(
+                                "no metadata node answered the replica-set read; whether a \
+                                 set is recorded is unknown"
+                                    .to_owned(),
+                            )
+                        }));
+                    };
+                    asked[index] = true;
+                    match self.attempt(index, &request).await {
+                        Ok(frame) => (index, frame),
+                        Err(error) => {
+                            unresolved = Some(error);
+                            continue;
+                        }
+                    }
+                }
+            };
             asked[index] = true;
+            self.answered(index);
+            let follow = |leader: Option<MetaNodeId>, asked: &[bool]| {
+                leader
+                    .and_then(|leader| self.index_of(leader))
+                    .filter(|leader| !asked[*leader])
+            };
+            if let Some(hint) = redirect_of(&frame) {
+                if let Some(leader) = follow(hint.leader, &asked) {
+                    asked[leader] = true;
+                    match self.attempt(leader, &request).await {
+                        Ok(frame) => next = Some((leader, frame)),
+                        Err(error) => unresolved = Some(error),
+                    }
+                }
+                continue;
+            }
             match frame.kind {
                 KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP => {
                     return Ok(Some(AdminReadRangeReplicaSetResponse::decode(
@@ -868,27 +912,35 @@ impl AdminClient {
                     if error.message != predates_replica_set_read() {
                         return Err(TransportError::Protocol(error.message));
                     }
-                    let status = self.status_of(index).await?;
-                    if status.server_state == "Leader" {
-                        return Ok(None);
+                    match self.status_of(index).await {
+                        Ok(status) if status.server_state == "Leader" => return Ok(None),
+                        Ok(status) => {
+                            unresolved = Some(TransportError::Protocol(format!(
+                                "metadata node {} predates recorded replica sets and is not the \
+                                 leader (it names {:?}); whether a set is recorded is unknown",
+                                self.candidates[index].endpoint, status.current_leader
+                            )));
+                            if let Some(leader) = follow(status.current_leader, &asked) {
+                                asked[leader] = true;
+                                match self.attempt(leader, &request).await {
+                                    Ok(frame) => next = Some((leader, frame)),
+                                    Err(error) => unresolved = Some(error),
+                                }
+                            }
+                        }
+                        Err(error) => unresolved = Some(error),
                     }
-                    let Some(leader) = status
-                        .current_leader
-                        .and_then(|leader| self.index_of(leader))
-                        .filter(|leader| !asked[*leader])
-                    else {
-                        return Err(TransportError::Protocol(format!(
-                            "metadata node {} predates recorded replica sets and is not the \
-                             leader, and the leader it names ({:?}) could not be asked; whether \
-                             a set is recorded is unknown",
-                            self.candidates[index].endpoint, status.current_leader
-                        )));
-                    };
-                    index = leader;
-                    frame = self.attempt(leader, &request).await?;
                 }
                 other => return Err(TransportError::UnexpectedKind(other)),
             }
+        }
+    }
+
+    /// A candidate answered: whatever presumed it failed (see `attempt`) no
+    /// longer holds, so it is not looked up again on that account (review).
+    fn answered(&self, index: usize) {
+        if let Some(resolution) = self.resolutions.lock().expect("resolutions").get_mut(index) {
+            resolution.stale = false;
         }
     }
 
@@ -903,6 +955,7 @@ impl AdminClient {
                 },
             )
             .await?;
+        self.answered(index);
         match frame.kind {
             KIND_ADMIN_STATUS_RESP => Ok(AdminStatusResponse::decode(&frame.payload)?),
             KIND_ADMIN_ERROR => Err(TransportError::Protocol(
@@ -1661,6 +1714,18 @@ mod tests {
             .and_then(|response| response.replica_set)
             .expect("the leader's recorded set, not \"none\"");
         assert_eq!(set.members, vec![Uuid::from_u128(1), Uuid::from_u128(2)]);
+
+        // The leader the old follower names (node 3) cannot be reached: the
+        // read goes on to the members nobody has asked, and the current
+        // leader among them answers (review).
+        let old_follower = older_node("Follower", Some(3)).await;
+        let new_leader = recording_leader().await;
+        let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let read = candidates(&[(1, old_follower), (2, new_leader), (3, unreachable)])
+            .read_range_replica_set(range.0, range.1)
+            .await
+            .expect("another member answers when the named leader cannot");
+        assert!(read.and_then(|response| response.replica_set).is_some());
 
         let lost = older_node("Learner", None).await;
         let refused = candidates(&[(1, lost)])

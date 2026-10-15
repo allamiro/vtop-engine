@@ -3340,6 +3340,14 @@ impl MetaStateMachine {
         {
             return reject(MetadataError::AlreadyExists);
         }
+        // The children are served by the parent's replicas, so they count
+        // their quorums over the parent's recorded set (#553, review): a
+        // child with no record would fall back to each node's configuration,
+        // and a rolling change could again count majorities with no node in
+        // common. Recorded at the children's starting epoch (zero).
+        let inherited_set = self
+            .range_replica_set(topic_uuid, parent_range_uuid)
+            .map(|set| set.members.clone());
         // Every read is done; from here the split happens whole.
         let Some(MetaValue::Range(parent)) = self.records.get_mut(&parent_key) else {
             unreachable!("parent was present above and apply is single-threaded");
@@ -3365,6 +3373,22 @@ impl MetaStateMachine {
         };
         self.records.insert(left_key, child(left_interval));
         self.records.insert(right_key, child(right_interval));
+        if let Some(members) = inherited_set {
+            for range_uuid in [left_range_uuid, right_range_uuid] {
+                self.records.insert(
+                    MetaKey::RangeReplicaSet {
+                        topic_uuid,
+                        range_uuid,
+                    }
+                    .encode(),
+                    MetaValue::RangeReplicaSet(RangeReplicaSetRecord {
+                        generation: 1,
+                        members: members.clone(),
+                        recorded_at_epoch: 0,
+                    }),
+                );
+            }
+        }
         self.records.insert(
             transition_key,
             MetaValue::LineageTransition(LineageTransitionRecord {
@@ -5965,6 +5989,87 @@ mod tests {
             10_000,
         );
         assert!(!is_rejected(&acquired), "{acquired:?}");
+    }
+
+    /// Review of #576: a split's children are served by the parent's
+    /// replicas, so they inherit its recorded set - otherwise each would be
+    /// unrecorded and its candidates would count their own configurations.
+    /// A parent with no record leaves the children unrecorded too.
+    #[test]
+    fn a_split_hands_the_recorded_replica_set_to_both_children() {
+        let (mut machine, node, topic, parent) = leaseable_range(1);
+        machine.apply(
+            3,
+            &MetadataCommand::RegisterNode {
+                env: envelope(3),
+                node_uuid: Uuid::from_u128(2),
+                addr: "n2:9200".to_owned(),
+                expected_generation: None,
+            },
+        );
+        assert_eq!(
+            set_replica_set(&mut machine, 4, topic, parent, &[1, 2], 0),
+            MetadataResponse::Ack { generation: 1 }
+        );
+        let generation = range_of(&machine, topic, parent).generation;
+        acquire(
+            &mut machine,
+            5,
+            5,
+            1_000,
+            node,
+            topic,
+            parent,
+            generation,
+            10_000,
+        );
+        let before = range_of(&machine, topic, parent);
+        let response = split(
+            &mut machine,
+            6,
+            6,
+            topic,
+            parent,
+            0x41,
+            0x42,
+            0x77,
+            640,
+            before.generation,
+            node,
+            before.fencing_epoch,
+        );
+        assert!(
+            matches!(response, MetadataResponse::Ack { .. }),
+            "{response:?}"
+        );
+        for child in [0x41u128, 0x42] {
+            let set = machine
+                .range_replica_set(topic, Uuid::from_u128(child))
+                .expect("the child inherits the parent's set");
+            assert_eq!(set.members, vec![Uuid::from_u128(1), Uuid::from_u128(2)]);
+            assert_eq!((set.generation, set.recorded_at_epoch), (1, 0));
+        }
+
+        let (mut plain, node, topic, parent) = leaseable_range(1);
+        acquire(&mut plain, 3, 3, 1_000, node, topic, parent, 0, 10_000);
+        let before = range_of(&plain, topic, parent);
+        split(
+            &mut plain,
+            4,
+            4,
+            topic,
+            parent,
+            0x41,
+            0x42,
+            0x77,
+            640,
+            before.generation,
+            node,
+            before.fencing_epoch,
+        );
+        assert!(plain
+            .range_replica_set(topic, Uuid::from_u128(0x41))
+            .is_none());
     }
 
     /// Review of #576: a promotion whose holder is outside the set does not
