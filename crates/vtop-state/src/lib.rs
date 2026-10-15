@@ -6,6 +6,7 @@
 //! progress for unverified data. SQLite is the built-in backend; the engine
 //! depends only on the trait.
 
+pub mod deadline;
 pub mod models;
 #[cfg(feature = "postgres")]
 pub mod pg_store;
@@ -18,8 +19,10 @@ pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_battery;
 
-pub use models::{BatchPatch, BatchRecord};
+pub use models::{BatchPatch, BatchRecord, CommittedCursor};
 #[cfg(feature = "postgres")]
 pub use pg_store::PgStateStore;
 pub use sqlite_store::SqliteStateStore;
-pub use store::{connect_state_store, migrate_state_store, StateStore};
+pub use store::{
+    connect_state_store, connect_state_store_with_deadline, migrate_state_store, StateStore,
+};

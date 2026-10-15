@@ -123,6 +123,36 @@ checks is a gate that silently stops working.
 | `21-kafka-two-partitions` | two members of one group over two partitions, one each (#457 slice 4b): two standalone gateways, each leading one Kafka partition of the same topic and naming the other in `kafka.partitions`; a stock group (`kcat -G`, range assignor) of two members finds the one coordinator the topology elects, is assigned one partition each, and each member reads only the records produced to its partition — byte-exact, no overlap. Standalone: commits are refused by name (no metadata plane), as scenario 19; the assignment is the criterion. | the remaining in-flight acceptance of #457: two members, two partitions, one each |
 | `22-meta-rolling-upgrade` | a rolling upgrade of the metadata tier (#554): three voters start on the PREVIOUS release (`CHAOS_OLD_VTOP_NODE`) and are replaced one at a time by this build; after each replacement a write must commit within the progress deadline and every voter must reach the leader's applied index; once all are upgraded `vtopctl meta enable-features --level 4` raises the feature level, a voter restarted on the raised log reopens, and a lower level leaves 4 in force. Skips (exit 77, reported as SKIP by `run-all.sh`) without an old binary; CI's upgrade job runs it against the newest release tag. Against v0.6.0, raising the level with one voter still old leaves that voter unable to append (`applied 5, the leader 7`) - the failure this scenario catches, and the reason the leader gates new kinds. | the mixed-version check #554 asks for: the gate holds against a real previous release, not only a simulated one |
 
+Scenario 07 skews a Raft **voter**. Skew on a lease **proposer** (a data node)
+is a different path and is covered deterministically, not live, in
+`crates/vtop-meta/tests/raft_three_node.rs`: the metadata leader refuses a
+lease request whose clock is further from its own than the tolerance below
+(#555), and that test drives a proposer an hour fast and an hour slow through
+the real propose path, asserting neither can take a lease, push a deadline out,
+or renew; that a follower redirects instead of reporting skew; that a retry of
+an already-committed request is answered from the dedup table; and that
+takeover follows the replicated deadline (refused one millisecond before it,
+granted at it). A live scenario that skews a lease-holding data node would build on
+`09-range-leader-failover` and has not been written.
+
+What the guard does and does not do. It **bounds** the error; it does not
+remove it. An accepted request keeps the proposer's timestamp, and the
+tolerance (`lease_skew_bound_ms`) is the greater of a twentieth of the lease and one second,
+capped at a tenth of the lease, so a deadline can be off by up to that much in either
+direction, and a holder slow by it facing a rival fast by it loses twice it from the lease.
+The lease agent's pacing validation subtracts that twice-the-tolerance from the lease before
+checking that one lost round fits; the cap keeps it to a fifth of any lease, which is what
+lets this suite's 6 s / 2 s / 0.5 s pacing pass (4.5 s needed, 4.8 s left). The leader's check
+is also made on a snapshot of its role immediately before the proposal, not
+inside the proposal: if leadership moves to another node in that window, one
+skewed request can be replicated without being judged. That request is a
+single lease deadline, and the next acquire or renewal is judged by the new
+leader; closing the window outright would need the check inside a
+leader-serialized proposal path, which this change does not attempt. The test
+covers an hour-fast renewal and an hour-slow acquisition; it does not skew a
+holder after a successful renewal, so takeover timing against a holder whose
+clock drifts mid-lease is exercised only for the replicated deadline itself.
+
 The data scenarios stop each process before offline sealing. Recovery first
 truncates any tail beyond the durable commit boundary, then `vtopctl segment
 verify` checks the resulting sealed bundle. For the disk-full follower, the
