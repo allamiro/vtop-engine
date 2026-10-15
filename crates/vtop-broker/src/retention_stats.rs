@@ -63,16 +63,31 @@ impl RetentionStats {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The policy generation a pass runs under: read it BEFORE loading the
-    /// bound, and record with it.
+    /// The policy generation a pass runs under.
     pub fn policy_generation(&self) -> u64 {
         *self.policy_lock()
     }
 
-    /// The policy changed to another nonzero bound: a pass already running
-    /// under the old one records nothing.
-    pub fn policy_changed(&self) {
-        *self.policy_lock() += 1;
+    /// Read the bound a pass will run with, together with the generation it
+    /// belongs to - under the policy lock, so the pair is never torn by a
+    /// concurrent [`Self::change_policy`] (review of #572).
+    pub fn policy<R>(&self, read_bound: impl FnOnce() -> R) -> (u64, R) {
+        let policy = self.policy_lock();
+        (*policy, read_bound())
+    }
+
+    /// Change the retention policy: `store_bound` publishes the new bound,
+    /// and under the same lock the generation moves and what the last pass
+    /// recorded is forgotten (review of #572). A pass of the old generation
+    /// then records nothing; one of the new generation records as always.
+    /// Forgetting on EVERY change, not only on disable: a pass that ran
+    /// under the old bound and is rejected must not leave the old bound and
+    /// blocked state exported until some later append replaces them.
+    pub fn change_policy(&self, store_bound: impl FnOnce()) {
+        let mut policy = self.policy_lock();
+        store_bound();
+        *policy += 1;
+        self.forget();
     }
 
     /// Fold one pass's result in, under the current policy.
@@ -175,6 +190,10 @@ impl RetentionStats {
     pub fn clear(&self) {
         let mut policy = self.policy_lock();
         *policy += 1;
+        self.forget();
+    }
+
+    fn forget(&self) {
         self.bound_bytes.store(0, Ordering::Relaxed);
         self.measured.store(false, Ordering::Relaxed);
         self.blocked_now.store(0, Ordering::Relaxed);
@@ -324,8 +343,17 @@ mod tests {
             "the stale pass restored the cleared state"
         );
 
+        // Rebound while a pass ran: the old pass records nothing, and the
+        // state of the passes before it is forgotten too.
+        stats.record_for(stats.policy_generation(), "r", 4_096, &outcome(9_000));
+        assert!(stats.snapshot().is_some());
         let before = stats.policy_generation();
-        stats.policy_changed(); // rebound while the pass ran
+        stats.change_policy(|| {});
+        assert_eq!(
+            stats.snapshot(),
+            None,
+            "a rebind forgets the old bound's state"
+        );
         stats.record_for(before, "r", 4_096, &outcome(9_000));
         assert_eq!(stats.snapshot(), None);
 
