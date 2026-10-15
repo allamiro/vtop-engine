@@ -198,6 +198,28 @@ impl StateStore for DeadlineStore {
         )
         .await
     }
+
+    async fn prune_candidates(
+        &self,
+        older_than: &str,
+        limit: u32,
+    ) -> Result<Vec<BatchRecord>, VtopError> {
+        self.within(
+            "prune_candidates",
+            self.scan,
+            self.inner.prune_candidates(older_than, limit),
+        )
+        .await
+    }
+
+    async fn prune_listed(&self, older_than: &str, batch_ids: &[String]) -> Result<u64, VtopError> {
+        self.within(
+            "prune_listed",
+            self.scan,
+            self.inner.prune_listed(older_than, batch_ids),
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -270,6 +292,12 @@ mod tests {
             never!()
         }
         async fn prune_committed_history(&self, _: &str, _: u32) -> Result<u64, VtopError> {
+            never!()
+        }
+        async fn prune_candidates(&self, _: &str, _: u32) -> Result<Vec<BatchRecord>, VtopError> {
+            never!()
+        }
+        async fn prune_listed(&self, _: &str, _: &[String]) -> Result<u64, VtopError> {
             never!()
         }
     }

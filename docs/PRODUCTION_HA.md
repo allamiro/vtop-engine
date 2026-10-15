@@ -449,6 +449,67 @@ prune-ledger --older-than-days N` under a maintenance identity (see
 [`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md)).
 Rows in any non-committed state are never touched.
 
+**Pruning keeps an anchor (#560).** Every prune pass, the engine's and
+`vtopctl prune-ledger`'s alike, lists its CANDIDATE rows, writes them to a
+versioned digest, fsyncs it into place, and only then deletes them - each
+re-checked against the prune predicate at deletion, so a candidate that has
+since gained a reason to stay (it became the newest row for its path) stays
+in the ledger, digested but undeleted, and the audit counts it once. A crash
+between the two leaves rows that are digested and still in the ledger, which
+the audit counts once. The digest carries a SHA-256 trailer that catches a
+truncated or edited file. It is not a signature: anyone who can rewrite the
+file can rewrite the hash, so keep the directory where the engine's identity
+can write and others cannot, and back it up with the ledger. The directory is
+`--digest-dir` or `engine.ledger_digest_dir` when given; otherwise
+`<database file>.ledger-digests/` beside a SQLite database file, on the
+database's own volume, so the digests last as long as the ledger does and two
+databases side by side keep apart. Only failing both (PostgreSQL)
+is it `<engine.work_dir>/ledger-digests/`, and `work_dir` is scratch: give a
+PostgreSQL deployment a durable directory.
+
+**Coverage audit (#560).** `vtopctl audit-coverage --config ...` reads the
+ledger and the digests and checks, per source unit (a Kafka topic-partition
+under one consumer group, a file or spool file at one inode), that committed
+ranges tile:
+- a stretch a FAILED or REPLAY_REQUIRED row names, below a later commit, is a
+  range that failed and was never re-archived (the #552 shape);
+- a stretch nothing names is lost data for a file or spool (bytes are
+  contiguous, e.g. the #558 rotation shape), and is reported but not failed
+  for Kafka (compaction and transaction markers occupy offsets with no
+  records);
+- ranges above the last committed point, and VERIFIED ranges held back from
+  committing, are pending, not holes;
+- overlapping commits are counted as duplicates (expected under
+  at-least-once).
+
+`--check-storage` also HEADs every committed object and manifest: both must be
+present, and an object must be of the size the ledger recorded (a manifest has
+no recorded size). A committed row that names no object or manifest, and an
+object whose size the store does not report, are findings. Content is
+`verify-manifest`'s job. `--metrics-file`
+writes the result as a Prometheus text file, with counts by source type and
+never by path, for a node exporter's textfile collector. The command exits
+non-zero on lost data, so it can gate a cron job. Below a unit's first
+committed range it judges only what a failed row there names; history nothing
+recorded (a tail started mid-file, a consumer group that began at a later
+offset, history pruned before digests existed) cannot be judged. Neither can a
+file or spool known only from rows without an inode: they are reported as not
+judged. A window that spans a rotation is credited only over what its markers
+prove: the new file over the window's last read. How far it read the old file,
+and where its reading of the new one began, are not recorded, so the old
+file's tail from the window's start and the new file's start below its last
+read are reported as unproven - a window that read them looks the same as a
+release before #564 that skipped them - and are not counted as lost. A file
+whose content restarted at the same path and inode (a copytruncate, or a
+reused inode) is told apart by the file size each read observed: a read that
+saw the file smaller than what was already read there starts a new
+generation, judged on its own, with its start below its first read unproven.
+Spool markers record no size, so spool files are judged per inode only. And a
+replacement that reuses the inode and was already as large as the old read
+position when first read cannot be told apart at all - path, inode and size
+agree - so the old file's commits can cover its unread start; closing that
+needs a content fingerprint in the markers (#578).
+
 ---
 
 ## 7. Object storage, idempotency & Object Lock / WORM
@@ -677,6 +738,7 @@ path needed by the distributed options is already implemented (§6.3).
 | `engine.ledger_retention_days` / `ledger_prune_batch` | committed-row retention (§6.6; SQLite engine-side only) |
 | `engine.state_store_timeout_seconds` | wall-clock bound on every state-store request (default 30 s; whole-ledger scans get 10x) — a blackholed Postgres fails the request instead of hanging the engine (#556) |
 | `upload.request_timeout_seconds` | wall-clock bound on one attempt of one object-store request on the native S3 backend (default 300 s; the SDK's retries apply) (#556) |
+| `engine.ledger_digest_dir` | where prune digests are written and read (default: beside a SQLite database file; else under `work_dir`, which is scratch) |
 | `batching.max_records` / `max_bytes` / `max_batch_age_seconds` | seal thresholds |
 | `batching.max_concurrent_batches` | uploads kept in flight per cycle (default 8); the ceiling when the adaptive width is on |
 | `batching.adaptive_width.enabled` / `min_width` | AIMD upload width (#102): a cycle the store throttled halves the next cycle's width, a clean cycle grows it by one, never below `min_width` (default 1) nor above the ceiling. Off by default; `vtop_upload_width` shows the width in use |
@@ -833,7 +895,11 @@ Short procedures now; expand into a full ops runbook before go-live.
   rows remain → export file/syslog cursors → switch `engine.state_store` → import
   cursors → validate → keep the old store until validation passes.
 - **Prune the PostgreSQL ledger:** run `vtopctl prune-ledger --older-than-days N`
-  on a schedule under the maintenance identity (§6.6).
+  on a schedule under the maintenance identity (§6.6). It writes a digest of
+  what it deletes first; keep `--digest-dir` on durable, backed-up storage.
+- **Audit archive coverage:** run `vtopctl audit-coverage --config ...
+  [--check-storage] [--metrics-file ...]` on a schedule (§6.6); a non-zero
+  exit names the source units with lost ranges.
 - **Restore from DB backup:** restore Postgres PITR → verify object store →
   start the engine (recovery scan re-reconciles) → run the divergence checker.
 - **Reconcile state store vs object storage:** list `SOURCE_COMMITTED` rows and

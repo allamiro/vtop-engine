@@ -36,6 +36,7 @@ pub fn file_config(
             ledger_retention_days: None,
             ledger_prune_batch: 500,
             state_store_timeout_seconds: 30,
+            ledger_digest_dir: None,
         },
         batching: BatchingConfig {
             adaptive_width: Default::default(),
