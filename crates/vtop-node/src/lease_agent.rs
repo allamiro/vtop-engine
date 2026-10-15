@@ -1472,7 +1472,10 @@ fn paced(delay: Duration, elapsed: Duration) -> Duration {
 /// makes, so a slow read followed by a slow renewal cannot add up to more than
 /// the interval [`LeaseAgentConfig::validate`] reasons about.
 #[derive(Clone, Default)]
-struct RoundClock(Arc<std::sync::Mutex<Option<tokio::time::Instant>>>);
+struct RoundClock(
+    Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    Arc<std::sync::atomic::AtomicU64>,
+);
 
 impl RoundClock {
     fn slot(&self) -> std::sync::MutexGuard<'_, Option<tokio::time::Instant>> {
@@ -1484,8 +1487,15 @@ impl RoundClock {
     /// Start a round that may spend `interval` in total. The guard ends it
     /// when the round finishes or its future is dropped (a `select!` arm).
     fn open(&self, interval: Duration) -> RoundGuard {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *self.slot() = Some(tokio::time::Instant::now() + interval);
         RoundGuard(self.clone())
+    }
+
+    /// How many rounds have been opened: the current round's number inside
+    /// one.
+    fn number(&self) -> u64 {
+        self.1.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// What is left of the current round; `None` outside one.
@@ -1518,9 +1528,9 @@ struct FloorScan {
     /// The highest Established boundary in the pages read so far.
     floor: Option<u64>,
     complete: bool,
-    /// When the last page was read; a completed scan is reused for one
-    /// round after it, no longer.
-    completed_at: Option<tokio::time::Instant>,
+    /// The round its last page was read in; a completed scan is reused in
+    /// that round and the next, no later.
+    completed_in_round: Option<u64>,
 }
 
 impl Drop for RoundGuard {
@@ -1886,12 +1896,14 @@ pub struct LeaseAgent {
     /// that runs out mid-scan leaves the progress here and the next round
     /// for the SAME epoch resumes it - no weaker than one long scan, which
     /// reads its early pages earlier than its late ones too. A different
-    /// epoch starts over, and so does a COMPLETED scan more than one round
-    /// old (review): records it read are not final - a Pending or Refused
-    /// transition can still be reported Established - so a scan reused
-    /// across promotion retries could miss a boundary published since. One
-    /// round of reuse is what lets a scan that took the whole round be
-    /// verified in the next; beyond that it is read again.
+    /// epoch starts over, and so does a COMPLETED scan once the round after
+    /// the one it finished in is over (review): records it read are not
+    /// final - a Pending or Refused transition can still be reported
+    /// Established - so a scan reused across promotion retries could miss a
+    /// boundary published since. Counted in ROUNDS, not time (review): a
+    /// time window spans several short poll rounds. The round it finished in
+    /// and the next are what let a scan that took a whole round be verified
+    /// at all; any later attempt reads the chain again.
     floor_scan: Option<FloorScan>,
     /// The instant the current round's RPC budget runs out (see
     /// [`LeaseAgent::bounded`]). Open for the span of a round and closed by a
@@ -2724,8 +2736,8 @@ impl LeaseAgent {
             Some(scan)
                 if scan.for_epoch == fencing_epoch
                     && scan
-                        .completed_at
-                        .is_none_or(|at| at.elapsed() <= self.rpc_deadline()) =>
+                        .completed_in_round
+                        .is_none_or(|round| self.round_clock.number() <= round + 1) =>
             {
                 scan
             }
@@ -2734,7 +2746,7 @@ impl LeaseAgent {
                 next_from: 1,
                 floor: None,
                 complete: false,
-                completed_at: None,
+                completed_in_round: None,
             },
         };
         while !scan.complete {
@@ -2759,7 +2771,7 @@ impl LeaseAgent {
             if !page.found {
                 scan.floor = None;
                 scan.complete = true;
-                scan.completed_at = Some(tokio::time::Instant::now());
+                scan.completed_in_round = Some(self.round_clock.number());
                 break;
             }
             for view in &page.transitions {
@@ -2781,7 +2793,7 @@ impl LeaseAgent {
                 }
                 _ => {
                     scan.complete = true;
-                    scan.completed_at = Some(tokio::time::Instant::now());
+                    scan.completed_in_round = Some(self.round_clock.number());
                 }
             }
         }
@@ -4091,9 +4103,14 @@ mod tests {
         let asked = handler.asked.lock().unwrap().len();
         assert_eq!(agent.read_published_floor(9).await, Ok(Some(77)));
         assert_eq!(handler.asked.lock().unwrap().len(), asked);
-        // ...but not across retries: past a round it is read again, since a
+        // ...and in the round right after it, the attempt it was read for...
+        {
+            let _round = agent.round_clock.open(agent.rpc_deadline());
+            assert_eq!(agent.read_published_floor(9).await, Ok(Some(77)));
+        }
+        assert_eq!(handler.asked.lock().unwrap().len(), asked);
+        // ...but not by a later retry, however soon: it is read again, since a
         // Pending or Refused record can still become Established (review).
-        tokio::time::sleep(agent.rpc_deadline() + Duration::from_millis(50)).await;
         let _ = {
             let _round = agent.round_clock.open(agent.rpc_deadline());
             agent.read_published_floor(9).await
