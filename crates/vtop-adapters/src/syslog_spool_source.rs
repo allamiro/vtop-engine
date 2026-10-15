@@ -29,6 +29,9 @@ struct SpoolCursor {
     seen: Option<SpoolSeen>,
     /// Which generation of the spool each handed-out range was read in.
     generations: continuity::Generations,
+    /// `(inode, read_byte)` recorded when a replay validated and rewound this
+    /// cursor; valid only while `read_byte` is still where the rewind put it.
+    rewound_for: Option<(u64, u64)>,
 }
 
 /// Identity of a spool file as a read last observed it: enough to prove,
@@ -617,8 +620,31 @@ impl SourceAdapter for SyslogSpoolSource {
             )));
         }
         c.read_byte = replay_byte;
+        c.rewound_for = current_inode.map(|inode| (inode, replay_byte));
         c.generations.reissue_from(replay_byte);
         Ok(())
+    }
+
+    /// Where the next read of this marker's spool starts - only when the
+    /// cursor is positioned in THAT file (see `FileSource::read_position`).
+    fn read_position(&self, marker: &ProgressMarker) -> Option<i128> {
+        let ProgressMarker::SyslogSpool {
+            path,
+            inode: marker_inode,
+            ..
+        } = marker
+        else {
+            return None;
+        };
+        let c = self.cursors.get(path)?;
+        let identity = match c.rewound_for {
+            Some((inode, at)) if at == c.read_byte => Some(inode),
+            _ => c.seen.as_ref().and_then(|seen| seen.inode),
+        };
+        if marker_inode.is_some() && identity != *marker_inode {
+            return None;
+        }
+        Some(i128::from(c.read_byte))
     }
 
     fn source_type(&self) -> SourceType {
@@ -1318,5 +1344,41 @@ mod tests {
             3,
             "the replaced spool is read from byte 0"
         );
+    }
+    /// See `FileSource`'s test of the same name: the cursor's position belongs
+    /// to the spool it was validated against (review of #563).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_position_is_only_reported_for_the_spool_the_cursor_is_in() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "aaa\nbbb\nccc\n").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let marker = |inode: Option<u64>| ProgressMarker::SyslogSpool {
+            spool_id: "s".into(),
+            path: path.clone(),
+            inode,
+            start_byte: 4,
+            end_byte: 8,
+            received_time_start: None,
+            received_time_end: None,
+        };
+        let mut spool = SyslogSpoolSource::new(vec![path.clone()]);
+        assert_eq!(spool.read_position(&marker(Some(inode))), None);
+        spool
+            .replay_from_marker(&marker(Some(inode)))
+            .await
+            .unwrap();
+        assert_eq!(spool.read_position(&marker(Some(inode))), Some(4));
+        assert_eq!(spool.read_position(&marker(Some(inode + 1))), None);
+        assert_eq!(spool.read_position(&marker(None)), Some(4));
+        // A rejected replay (a different file at the path) leaves no identity.
+        let mut fresh = SyslogSpoolSource::new(vec![path.clone()]);
+        assert!(fresh
+            .replay_from_marker(&marker(Some(inode + 1)))
+            .await
+            .is_err());
+        assert_eq!(fresh.read_position(&marker(Some(inode + 1))), None);
     }
 }

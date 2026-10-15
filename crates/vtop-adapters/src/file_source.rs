@@ -32,6 +32,10 @@ struct FileCursor {
     seen: Option<FileIdentity>,
     /// Which generation of the file each handed-out range was read in.
     generations: continuity::Generations,
+    /// `(inode, read_byte)` recorded when a replay rewound this cursor: which
+    /// file the rewound position belongs to, valid only while `read_byte` is
+    /// still where the rewind put it (a later read supersedes it with `seen`).
+    rewound_for: Option<(u64, u64)>,
 }
 
 pub struct FileSource {
@@ -1084,6 +1088,7 @@ impl SourceAdapter for FileSource {
         }
         let c = self.cursors.entry(path.clone()).or_default();
         c.read_byte = (*start_byte).max(c.committed_byte);
+        c.rewound_for = current_inode.map(|inode| (inode, c.read_byte));
         // These bytes will be handed out again, with fresh records.
         c.generations.reissue_from(c.read_byte);
         tracing::warn!(
@@ -1092,6 +1097,33 @@ impl SourceAdapter for FileSource {
             "file source rewound for replay"
         );
         Ok(())
+    }
+
+    /// Where the next read of this marker's file starts - but only when the
+    /// cursor is positioned in THAT file. The cursor is per path, so after a
+    /// rotation it describes the current file; reporting its position for an
+    /// old inode's marker would let recovery treat the old range as handled
+    /// (review of #563). An unknown identity on the cursor side answers `None`
+    /// too: the caller then keeps the range's own start, the conservative
+    /// answer.
+    fn read_position(&self, marker: &ProgressMarker) -> Option<i128> {
+        let ProgressMarker::File {
+            path,
+            inode: marker_inode,
+            ..
+        } = marker
+        else {
+            return None;
+        };
+        let c = self.cursors.get(path)?;
+        let identity = match c.rewound_for {
+            Some((inode, at)) if at == c.read_byte => Some(inode),
+            _ => c.seen.as_ref().and_then(|seen| seen.inode),
+        };
+        if marker_inode.is_some() && identity != *marker_inode {
+            return None;
+        }
+        Some(i128::from(c.read_byte))
     }
 
     fn source_type(&self) -> SourceType {
@@ -1771,6 +1803,37 @@ mod tests {
             .unwrap();
         assert_eq!(reads2.len(), 1);
         assert_eq!(reads2[0].records, vec![b"two".to_vec(), b"three".to_vec()]);
+    }
+
+    /// The batch rewind returns one result per marker, in order, and one that
+    /// cannot be applied does not hide or reorder the others.
+    #[tokio::test]
+    async fn a_batch_rewind_answers_each_marker_in_order() {
+        let f = write_log(&["one", "two", "three"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let good = read[0].progress_start.clone();
+        let wrong_kind = ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition: 0,
+            start_offset: 0,
+            end_offset: 0,
+            consumer_group: "g".into(),
+        };
+        let results = fs
+            .replay_from_markers(&[good.clone(), wrong_kind, good])
+            .await;
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok());
+        assert!(
+            results[1].is_err(),
+            "a marker of another source type is refused"
+        );
+        assert!(results[2].is_ok(), "and does not stop the one after it");
     }
 
     #[tokio::test]
@@ -2575,5 +2638,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got[0].records, vec![b"ccc".to_vec()]);
+    }
+    /// The cursor is per path, so after a rotation it describes the CURRENT
+    /// file. Its position must not be reported for an old inode's marker
+    /// (review of #563): recovery would treat that old range as handled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_position_is_only_reported_for_the_file_the_cursor_is_in() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "aaa\nbbb\nccc\n").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let marker = |inode: Option<u64>| ProgressMarker::File {
+            path: path.clone(),
+            inode,
+            start_byte: 4,
+            end_byte: 8,
+            file_size: 12,
+            mtime: String::new(),
+        };
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        // Nothing replayed or read yet: no identity, so nothing to report for a
+        // marker that names a file.
+        assert_eq!(fs.read_position(&marker(Some(inode))), None);
+        fs.replay_from_marker(&marker(Some(inode))).await.unwrap();
+        assert_eq!(fs.read_position(&marker(Some(inode))), Some(4));
+        assert_eq!(
+            fs.read_position(&marker(Some(inode + 1))),
+            None,
+            "another file's range is not placed by this cursor"
+        );
+        assert_eq!(
+            fs.read_position(&marker(None)),
+            Some(4),
+            "a marker with no inode cannot be told apart, so it is placed"
+        );
     }
 }
