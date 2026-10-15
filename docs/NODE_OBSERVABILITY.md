@@ -166,6 +166,10 @@ not keep publishing the follower lag it saw at the instant of the failover.
 | `vtop_broker_follower_lag_records{follower}` | gauge | Records each follower trails the leader by. |
 | `vtop_broker_follower_connected{follower}` | gauge | 1 while a live replication stream exists. |
 | `vtop_broker_follower_online{topic,range}` | gauge | Follower's own view of whether it accepts appends. |
+| `vtop_broker_retention_retained_bytes{topic,range}` | gauge | Content bytes the range holds after the latest retention pass (#561). Absent while retention is disabled or before the first pass. Every role exports it under the same name. |
+| `vtop_broker_retention_bound_bytes{topic,range}` | gauge | The range's retention bound. |
+| `vtop_broker_retention_blocked{topic,range,reason}` | gauge | 1 while the latest pass ended above the bound. `committed_floor`: the oldest segment holds records a follower or the quorum mark has not passed, so disk grows until replication catches up. `active_segment`: the bound is smaller than one segment. A pass that reclaims nothing used to look the same as a range under its bound. |
+| `vtop_broker_retention_last_pass_failed{topic,range}` | gauge | 1 while the latest pass failed outright (retried after the next append). |
 | `vtop_broker_group_commits_total` | counter | Commit groups sealed and fsynced. |
 | `vtop_broker_group_commit_requests_total` | counter | Produce requests folded into groups. |
 | `vtop_broker_group_commit_records_total` / `_bytes_total` | counter | Volume folded into groups. |
