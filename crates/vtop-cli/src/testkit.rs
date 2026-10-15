@@ -35,6 +35,7 @@ pub fn file_config(
             log_level: "warn".into(),
             ledger_retention_days: None,
             ledger_prune_batch: 500,
+            state_store_timeout_seconds: 30,
             ledger_digest_dir: None,
         },
         batching: BatchingConfig {
@@ -73,6 +74,7 @@ pub fn file_config(
             force_path_style: true,
             verify_tls: false,
             transport: "tcp_tls".into(),
+            request_timeout_seconds: 300,
             profile: None,
             command_binary: None,
             command_timeout_seconds: 300,

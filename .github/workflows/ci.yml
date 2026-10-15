@@ -690,6 +690,22 @@ jobs:
             -f helm/vtop/ci/separated-values.yaml --set deployment.meta.replicaCount=4
           refuses_because "data.nodeUuids has 3 entries but deployment.data.replicaCount is 2" \
             -f helm/vtop/ci/separated-values.yaml --set deployment.data.replicaCount=2
+          # An even replicated data tier (#562). The UUID list is resized to
+          # match, so each case reaches the guard instead of stopping at the
+          # length check above (the blindness recorded earlier in this step).
+          refuses_because 'deployment.data.replicaCount 2 is even under data.topology "replicated"' \
+            -f helm/vtop/ci/separated-values.yaml --set deployment.data.replicaCount=2 \
+            --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2}'
+          refuses_because "4 replicas need 3 acknowledgements and survive 1 failure(s)" \
+            -f helm/vtop/ci/separated-values.yaml --set deployment.data.replicaCount=4 \
+            --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2,aaaaaaaa-0000-0000-0000-0000000000a3,aaaaaaaa-0000-0000-0000-0000000000a4}'
+          # Standalone pods serve independent ranges and have no quorum, so an
+          # even count is fine there: the rule must not over-reach.
+          helm template vtop helm/vtop -f helm/vtop/ci/separated-values.yaml \
+            --set data.topology=standalone --set data.lease.enabled=false \
+            --set deployment.data.replicaCount=2 \
+            --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2}' >/dev/null
+          echo "an even standalone data tier still renders"
           refuses_because "set data.lease.serverName" \
             -f helm/vtop/ci/separated-values.yaml --set data.lease.adminEndpoint=meta.example:9200
           # The transition MAC key reference must be whole (#240 item 5).
@@ -1716,3 +1732,7 @@ jobs:
           VTOP_TEST_POSTGRES: postgres://vtop:vtop@localhost:5432/vtop
           VTOP_TEST_POSTGRES_RUNTIME: postgres://vtop_runtime_test:vtop-runtime-test@localhost:5432/vtop
         run: cargo test -p vtop-state --features postgres,test-support --test pg_battery
+      # No database involved: a socket that accepts and never answers must fail
+      # the connect within its bound instead of hanging startup (#556).
+      - name: Postgres connect is bounded
+        run: cargo test -p vtop-state --features postgres --test connect_deadline

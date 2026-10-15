@@ -566,7 +566,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
             );
             let state_store = cfg.engine.state_store.resolve()?;
-            let store = vtop_state::connect_state_store(state_store.expose_secret()).await?;
+            // The configured bound, as the engine uses (review of #568).
+            let store = crate::engine::connect_configured_store(&cfg.engine, &state_store).await?;
             let cutoff = (chrono::Utc::now() - chrono::Duration::days(i64::from(*older_than_days)))
                 .to_rfc3339();
             let digest_dir = digest_dir
