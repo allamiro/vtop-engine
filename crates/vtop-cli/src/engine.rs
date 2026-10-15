@@ -34,7 +34,7 @@ use vtop_core::state_machine::BatchState;
 use vtop_core::telemetry;
 use vtop_core::types::{ChecksumAlgorithm, ProgressMarker, SourceType};
 use vtop_core::work_dir::cleanup_work_dir;
-use vtop_state::{connect_state_store, BatchPatch, BatchRecord, StateStore};
+use vtop_state::{connect_state_store_with_deadline, BatchPatch, BatchRecord, StateStore};
 use vtop_upload::multipart::{self, MultipartFence, MultipartUploadConfig};
 use vtop_upload::{ObjectChecksum, UploadBackend};
 
@@ -1339,6 +1339,21 @@ fn acquire_instance_locks(
     Ok(locks)
 }
 
+/// The state store, every request bounded by `engine.state_store_timeout_seconds`
+/// (#556). One function for every path that opens the ledger - the engine and
+/// `vtopctl prune-ledger` alike - so none can fall back to the default bound
+/// while the operator configured another (review of #568).
+pub(crate) async fn connect_configured_store(
+    engine: &vtop_core::config::EngineConfig,
+    state_store: &vtop_core::config::ResolvedStateStore,
+) -> Result<Box<dyn StateStore>, VtopError> {
+    connect_state_store_with_deadline(
+        state_store.expose_secret(),
+        Duration::from_secs(engine.state_store_timeout_seconds),
+    )
+    .await
+}
+
 impl Engine {
     /// Build an engine for MUTATING use (`run`, `process-once`, `replay`):
     /// refuses to start while another engine holds the same state store or
@@ -1423,7 +1438,7 @@ impl Engine {
         }
 
         let manifest_mac_key = config.resolve_manifest_mac_key()?;
-        let store = connect_state_store(state_store.expose_secret()).await?;
+        let store = connect_configured_store(&config.engine, &state_store).await?;
         let backend = vtop_upload::build_backend(&config.upload).await?;
 
         let mut adapters: HashMap<SourceType, Box<dyn SourceAdapter>> = HashMap::new();
