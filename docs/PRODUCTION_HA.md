@@ -503,7 +503,11 @@ whose content restarted at the same path and inode (a copytruncate, or a
 reused inode) is told apart by the file size each read observed: a read that
 saw the file smaller than what was already read there starts a new
 generation, judged on its own, with its start below its first read unproven.
-Spool markers record no size, so spool files are judged per inode only.
+Spool markers record no size, so spool files are judged per inode only. And a
+replacement that reuses the inode and was already as large as the old read
+position when first read cannot be told apart at all - path, inode and size
+agree - so the old file's commits can cover its unread start; closing that
+needs a content fingerprint in the markers (#578).
 
 ---
 

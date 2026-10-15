@@ -59,7 +59,9 @@ pub enum Unit {
         /// file's commits would cover the new file's lost bytes. A row whose
         /// read saw the file SMALLER than an earlier row of the same path
         /// and inode had already read starts a new generation. Spool markers
-        /// record no size, so spool units are not split this way.
+        /// record no size, so spool units are not split this way; and a
+        /// replacement already as large as the old read position when first
+        /// read looks like the same file (#578).
         generation: u32,
     },
     SyslogSpool {
@@ -833,7 +835,7 @@ fn sqlite_database_file(conn: &str) -> Option<PathBuf> {
 /// crash between the two leaves rows that are both digested and still in the
 /// ledger (which the audit counts once), never rows that are in neither.
 pub fn write_digest(dir: &Path, cutoff: &str, rows: &[BatchRecord]) -> Result<PathBuf, VtopError> {
-    std::fs::create_dir_all(dir)?;
+    create_dir_durably(dir)?;
     let now = chrono::Utc::now();
     let header = DigestHeader {
         vtop_ledger_digest: DIGEST_VERSION,
@@ -900,6 +902,34 @@ pub fn write_digest(dir: &Path, cutoff: &str, rows: &[BatchRecord]) -> Result<Pa
     }
     std::fs::File::open(dir)?.sync_all()?;
     Ok(path)
+}
+
+/// Create `dir` (and any missing ancestors) so the directories themselves
+/// survive a crash, not only the files later written into them (review of
+/// #573): a new directory's ENTRY lives in its parent, and syncing the new
+/// directory does not persist that. Every directory this call creates has
+/// its parent synced before it returns - so a digest synced into place,
+/// and then the ledger rows it anchors deleted, cannot be lost with a
+/// directory the parent never durably recorded.
+fn create_dir_durably(dir: &Path) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut at = dir;
+    while !at.exists() {
+        missing.push(at.to_path_buf());
+        match at.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            Some(parent) => at = parent,
+            None => break,
+        }
+    }
+    std::fs::create_dir_all(dir)?;
+    for created in &missing {
+        let parent = created
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Read every digest in `dir` (none if it does not exist). A file that is not
@@ -1717,6 +1747,21 @@ mod tests {
             .filter(|name| name.to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// Review of #573: a digest directory that does not exist yet - nested,
+    /// here - is created (with its parents synced) and the digest lands in
+    /// it, readable.
+    #[test]
+    fn a_missing_digest_directory_is_created_with_its_ancestors() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a").join("b").join("digests");
+        let rows = vec![bytes("a", Committed, 0, 10)];
+        let path = write_digest(&dir, "c", &rows).unwrap();
+        assert!(path.starts_with(&dir));
+        assert_eq!(read_digests(&dir).unwrap().0.len(), 1);
+        // And again into the now-existing directory.
+        write_digest(&dir, "c", &rows).unwrap();
     }
 
     /// Review of #573: a one-line file is refused, not a panic.
