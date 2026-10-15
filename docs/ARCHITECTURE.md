@@ -24,6 +24,7 @@
 6. [Data-flow diagram](#6-data-flow-diagram)
 7. [Source adapters](#7-source-adapters)
    - [7.1 What the commit rule does not cover](#71-what-the-commit-rule-does-not-cover)
+   - [7.2 Rotation and truncation of file and spool sources](#72-rotation-and-truncation-of-file-and-spool-sources)
 8. [Upload backends](#8-upload-backends)
 9. [Checksum subsystem](#9-checksum-subsystem)
 10. [Compression subsystem](#10-compression-subsystem)
@@ -260,6 +261,103 @@ about replay safety, manifests and verification applies to a record once the
 engine has seen it. **Size retention above worst-case lag, and monitor consumer
 lag independently of VTOP**, because VTOP will not tell you.
 
+### 7.2 Rotation and truncation of file and spool sources
+
+The file and syslog-spool adapters keep one read position per **path**, and a
+position is only meaningful for the file it was taken from. Two things break
+that, and the adapters now check for both on every read, against the open
+descriptor (`fstat`) rather than a second path lookup:
+
+- **Rotation** (rename or replace): the inode at the path differs from the one
+  the cursor last read.
+- **Truncation** (`copytruncate`, an in-place truncate): the same inode, now
+  shorter than the read position.
+
+In either case the new content is read from **byte 0**, and the cursor's
+committed point returns to 0 with it. Before this was handled, a read position
+from the old file was applied to the new one: a new file shorter than the
+position produced nothing until it outgrew it and then started mid-line, and a
+longer one silently lost its first bytes (#558).
+
+What follows from that, in the engine:
+
+- **A buffered window is sealed at the discontinuity.** A read that does not
+  start where the buffered window ended (a different inode, or a start that is
+  not the previous end) is not merged into it; the old window becomes its own
+  batch. A merged batch carried a start from one file and an end from the
+  other, a range nothing could re-read or reconcile.
+- **A late commit cannot move the restarted cursor.** A batch read before the
+  rotation commits after the cursor has restarted; its offset names a place in
+  a file that is no longer there. Its ledger row commits (the archive has it),
+  but the cursor stays on the current file.
+- **Replay refuses a range from a file that has changed.** The old bytes are
+  not at those offsets any more, and rewinding the new file there would archive
+  its middle as though it were the lost range. The adapters return an error
+  when the inode differs from the marker's, when the file is shorter than the
+  range's start, or (file sources, whose markers record the length at read
+  time) when it is shorter than it was when the range was read. A spool marker
+  without an inode keeps the older size-only check, and a spool truncated and
+  regrown past the range's start cannot be told from the original. How the
+  engine reports a refused rewind is described in section 13.
+- **Commits are applied in the order the windows were read**, not the order
+  their uploads finish. A rotation seals the old file's window and starts a new
+  one in the same cycle, so both are in flight at once; committing the new
+  window first would leave the old file as the most recent commit and make the
+  restart seed name a file that is gone.
+- **A late commit is settled against the generation its range was read in.**
+  The adapter starts a new generation each time it restarts a cursor on a
+  rotated or truncated file, and remembers which generation every range it
+  handed out was read in. A range from an older generation never moves the
+  cursor, however the file looks by the time its commit lands - a
+  `copytruncate`d file that has regrown past the old range's end is otherwise
+  indistinguishable, by inode and length, from the file the range was read
+  from. The record is in-process: after a restart a commit falls back to the
+  inode and length test.
+- **A restart seeds the cursor with the inode** the offset came from
+  (`StateStore::committed_cursors`: the most recent committed batch per path -
+  the one created last, which is the window read last - with its own inode
+  and offset, never a maximum: after a `copytruncate` the inode is unchanged
+  and the old content's higher offset would skip the new content's first
+  bytes). A file replaced while the engine was down is read from its first
+  byte instead of from the old file's high-water mark. Ledger pruning keeps
+  exactly this row for every path, so the seed is the same before and after
+  any prune. The seed also carries the length the
+  most recent committed batch saw its file at (`file_size` in the marker), so a
+  `copytruncate` while the engine was down is caught even when the file is
+  still longer than the committed offset. A syslog-spool marker records no
+  length, so a spool seed has the inode and the offset only.
+
+Limits, stated plainly:
+
+- The **unread tail of a rotated-away file** is not read through the old path.
+  If the rotated name (`app.log.1`) also matches a configured pattern it is
+  discovered as its own source, with a fresh cursor, and is archived again from
+  byte 0 — a duplicate, never a hole. Archiving the unread tail without the
+  duplicate would need cursors keyed by inode rather than path.
+- `copytruncate` is racy by nature: lines written between the copy and the
+  truncate are lost by the rotation tool before the engine can see them. If the
+  file also regrows beyond the old read position before the next read, the
+  truncation is invisible to the adapter.
+- A file is identified by its **inode number alone**, and a number can be
+  reused. On a *different* filesystem a replacement that happens to carry the
+  number is not seen as a rotation (markers do not record the device). On the
+  *same* filesystem the number of a file that was **unlinked** is free to be
+  handed to the next file created, so a path that is deleted and recreated
+  (rather than renamed and recreated, which keeps the old inode alive) can
+  present a new file under the old number; if that file is also longer than
+  the old read position it looks like a continuation. The engine's own
+  `delete_after_commit` removes the cursor with the file for exactly this
+  reason, so the common route to reuse is closed; a file removed by anything
+  else is not. Rotation by rename, which is what log rotation does, is
+  detected.
+- Late commits are judged against the file as it is NOW (another inode, or an
+  end beyond its length). A `copytruncate` followed by a regrow past the old
+  end before the late commit lands cannot be told from the original; that is
+  the same invisible case as a regrow before the next read, above.
+- History pruning keeps one row per path, so a file untouched for longer than
+  the retention window can lose the rows that name its inode. The restart then
+  reads it from byte 0 again: duplicates, bounded by the file.
+
 Tracked as #361, which also carries the question of whether the adapter should
 refuse rather than resume when it detects the jump — a refusal is only useful
 if an operator can act on it, and a source that stops archiving because it fell
@@ -400,7 +498,7 @@ These per-batch records feed the aggregate Prometheus-style counters that are de
 - Adaptive sealing (records/bytes/age) bounds in-flight batch size and provides natural backpressure: a slow upload stage delays sealing of the next batch rather than growing memory unboundedly.
 - Source adapters **may** signal backpressure to the batching layer (protocol §6).
 - The Kafka adapter's manual offset commit (auto-commit disabled) ensures the broker's notion of progress tracks the engine's verified-and-committed progress, not its in-memory read position.
-
+- **Every call the engine makes to its object store and state store has a deadline** (#556). A store that accepts a connection and never answers would otherwise block the awaiting cycle forever, with the process alive and the health endpoint green. The native S3 backend sets the SDK's first-byte (read), per-attempt and whole-operation limits from `upload.request_timeout_seconds` (default 300 s per attempt; the whole operation is allowed the SDK's three attempts); its connect limit is a fixed 10 s, not configurable — the SDK's own defaults bound connecting but not waiting for a response, which the `request_deadline` test shows against a socket that accepts and stays silent. Those SDK limits end when the response headers arrive, so every response BODY the engine reads afterwards (verification, manifest recovery) is bounded separately, by the whole-operation allowance; a store that sends headers and then drips the body fails the read rather than holding it open. The compatibility backends use `upload.command_timeout_seconds`. The state store is wrapped so every request is bounded by `engine.state_store_timeout_seconds` (default 30 s; whole-ledger scans such as startup recovery get ten times it), and opening a Postgres store (connect plus schema check) is bounded by the same value. An expired request is an ordinary failure to the engine — a failed upload fails the batch, and recovery re-reads its range — but it is an **unknown outcome**, not a failed one: the store may have applied it. That is safe here because every ledger transition is checked against the state machine and recovery re-reads rows it finds incomplete; the worst case is a range archived twice, never one lost. Size `request_timeout_seconds` for the slowest link a part must cross (a 64 MiB part at 1 MiB/s needs about a minute). Not covered: `vtopctl migrate`, an operator-run one-shot command whose Postgres connection and schema statements carry no deadline (a schema change on a large ledger can legitimately be slow) — an operator who sees it hang interrupts it, and the migration's statements are idempotent, so running it again is safe.
 ---
 
 ## 16. Benchmark harness
