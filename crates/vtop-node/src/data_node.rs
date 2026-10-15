@@ -3340,6 +3340,14 @@ impl crate::observe::ReplicaObservation for SwitchingLocalView {
             .is_some_and(|view| view.boundary_pending())
     }
 
+    fn retention(&self) -> Option<vtop_broker::retention_stats::RetentionSnapshot> {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|view| view.retention())
+    }
+
     /// ONE acquisition for the whole reading, which is the point of it
     /// (review). Asked question by question, `clear()` could land between "is
     /// a role installed?" and the answers, and the scrape would publish this

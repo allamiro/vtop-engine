@@ -246,3 +246,34 @@ fn a_transfer_chunk_for_a_reclaimed_segment_fails_closed() {
         Ok(_) => panic!("a chunk of a reclaimed segment must fail closed"),
     }
 }
+
+/// Disabling retention forgets what the last pass reported, whichever way it
+/// is disabled: `None`, or a zero bound, which this layer treats the same
+/// (review of #572). Otherwise a stale bound, size or blocked reason stays
+/// exported - and can keep an alert firing - for retention that no longer
+/// runs.
+#[test]
+fn disabling_retention_by_a_zero_bound_clears_what_it_reported() {
+    for disable in [None, Some(RetentionPolicy { max_total_bytes: 0 })] {
+        let dir = TempDir::new().unwrap();
+        let broker = bounded_broker(&dir, 4_096);
+        for sequence in 0..20 {
+            produce(&broker, sequence);
+        }
+        let before = broker
+            .retention_stats()
+            .snapshot()
+            .expect("a pass ran under the bound");
+        assert_eq!(before.bound_bytes, 4_096);
+        assert!(before.retained_bytes.is_some());
+
+        broker.set_retention(disable);
+        assert_eq!(
+            broker.retention_stats().snapshot(),
+            None,
+            "disabled by {disable:?}"
+        );
+        produce(&broker, 20);
+        assert_eq!(broker.retention_stats().snapshot(), None);
+    }
+}

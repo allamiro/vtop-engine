@@ -919,12 +919,33 @@ Short procedures now; expand into a full ops runbook before go-live.
 ## 19. Known limitations (current code)
 - **SINGLE-INSTANCE ONLY — enforced at startup (#66).** The engine takes an
   exclusive OS lock on its work directory and refuses to start beside another
-  engine on the same host. There is no claim/lease/fencing in the state store
-  yet (#93), so two engines over the same store would both recover the
-  same incomplete batches and both commit source progress — duplicate ingestion
-  at best, double-commit at worst. The work-dir lock CANNOT see an engine on a
-  different host pointed at the same Postgres; that configuration is
-  unsupported and warned about at startup. Do not scale replicas.
+  engine on the same host. The state store has an ownership claim
+  (`claim_incomplete_batches`: an owner and a lease, #93) and, since #557, a
+  **claim generation** that fences a stalled engine: every claim bumps it, and
+  a writer that holds an older one is refused instead of overwriting the
+  engine that took the row over. An engine writes only the rows it created or
+  claimed, and keeps the generation while it can still write one (a FAILED
+  batch keeps it until it is handed back for replay; a lost claim keeps it so
+  the stalled writer stays refused); a write to a row it holds no generation
+  for is refused, never made unchecked. The kept tokens of FAILED and
+  lost-claim batches are bounded (65,536 per process, oldest dropped first):
+  a FAILED batch whose token was dropped is refused its REPLAY_REQUIRED
+  write, fail closed, and is handed back by the next recovery's claim
+  instead. That makes a
+  recovery *handover* safe at the ledger - between engines that all run a
+  build with the fence: an older build neither bumps nor checks the
+  generation, so drain older engines before relying on it. It does **not** make two engines
+  safe to run side by side: sources are not divided between engines (two
+  reading the same file, or the same Kafka partitions, archive the same ranges
+  twice under distinct ledger rows); engine names must be unique per instance
+  (a shared name can still reclaim another engine's live row and bump its
+  generation; only the stale writer's later transitions are fenced, so two
+  recoveries still contend for the same rows); and the lease is timed against
+  the claimant's wall clock, so skew moves when a takeover happens — the fence
+  bounds the damage, it does not remove the skew. The work-dir lock CANNOT see
+  an engine on a different host pointed at the same Postgres; that
+  configuration is unsupported and warned about at startup. Do not scale
+  replicas.
 - **Non-deterministic object keys** — replay can create **duplicate objects** (no
   loss). This is also the implementation's one known gap against the protocol
   draft's deterministic-naming MUST (protocol §15.1). Fixed by
@@ -1116,7 +1137,7 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 |---|---|---|---|---|
 | Object Lock prevents overwrite-based retry | Retries fail / stuck batches | Deterministic keys + "existing verified = success" / version_id (§7.2) | 4 | open |
 | Kafka rebalance during in-flight batch | Duplicate work / spurious revocation | Revocation handler; tune poll/session timeouts; cooperative rebalancing (§8.3) | 5 | open |
-| Two engines over one store double-recover | Duplicate ingestion / double-commit | **Same host only:** the startup instance lock (#66) refuses it. **Cross-host over shared Postgres it cannot detect** — unsupported and warned at startup (§19); open until claim/fencing lands (#93) | 5 | partially mitigated (same-host only) |
+| Two engines over one store double-recover | Duplicate ingestion / double-commit | **Same host only:** the startup instance lock (#66) refuses it. **Cross-host over shared Postgres it cannot detect** — unsupported and warned at startup (§19). The ledger now fences a stalled engine (claim generation, #557) so a handover cannot be overwritten, but sources are still not divided between engines; open until Phase 5 | 5 | partially mitigated (same-host lock; ledger fence for handover) |
 | State database unavailable | Engine cannot commit | Fails safe (stops committing); HA store; alerts | 3,6 | mitigated |
 | Object uploaded but manifest upload failed | Batch stuck pre-VERIFIED | Retry manifest; verify existing object; bounded `retry_count` → FAILED | 0,3 | mitigated |
 | Manifest uploaded but source-commit failed | Possible replay | Recovery retries commit; deterministic keys make replay idempotent | 4 | partially mitigated (duplicates until 4) |

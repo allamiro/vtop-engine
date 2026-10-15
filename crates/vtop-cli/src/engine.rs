@@ -159,7 +159,10 @@ impl<'a> Pipeline<'a> {
         read: ReadResult,
         stream: Option<&StreamConfig>,
     ) -> Result<BatchOutcome, VtopError> {
-        match self.process_until_verified(source, read, stream).await? {
+        match self
+            .process_until_verified(source, read, stream, Utc::now())
+            .await?
+        {
             VerifyStep::Finished(outcome) => Ok(outcome),
             VerifyStep::Verified(v) => self.commit_verified(adapter, v).await,
         }
@@ -177,11 +180,16 @@ impl<'a> Pipeline<'a> {
     /// The invariant is unaffected: a batch still reaches SOURCE_COMMITTED only
     /// after IT has reached VERIFIED. Concurrency is ACROSS batches, never
     /// within one, and never between one batch's verify and another's commit.
+    ///
+    /// `sealed_at` is when the batch's contents were fixed: the caller takes
+    /// it as the read leaves its buffer, before the batch queues for an upload
+    /// slot. The time partition is taken from it (#559).
     async fn process_until_verified(
         &self,
         source: &DiscoveredSource,
         read: ReadResult,
         stream: Option<&StreamConfig>,
+        sealed_at: chrono::DateTime<Utc>,
     ) -> Result<VerifyStep, VtopError> {
         if read.is_empty() {
             return Ok(VerifyStep::Finished(BatchOutcome {
@@ -336,7 +344,11 @@ impl<'a> Pipeline<'a> {
         mark_state!(BatchState::Batching);
 
         // ---- BATCHING -> SEALED -----------------------------------------
-        batch.seal()?;
+        // Stamped with the drain instant, not the time this line runs: the
+        // batch may have waited for an upload slot and its first ledger write
+        // since, possibly across an hour boundary, and the partition below and
+        // the recorded seal time must name the same hour (review on #570).
+        batch.seal_at(sealed_at)?;
         let t_write = Instant::now();
         self.store
             .update_batch_state(&batch_id, BatchState::Sealed, &BatchPatch::default())
@@ -414,7 +426,16 @@ impl<'a> Pipeline<'a> {
         );
 
         // ---- Resolve object / manifest URIs -----------------------------
-        let ctx = PartitionContext::new(&tenant, &s3_source, format.clone(), Utc::now());
+        // The time partition comes from the seal time (or, on request, the
+        // earliest record time), never from the wall clock at this point: by
+        // now the batch has been compressed and checksummed, and a batch
+        // sealed at 12:59 used to be filed under hour 13 (#559).
+        let partition_at = partitioning::partition_time(
+            self.config.partitioning.time_source,
+            sealed_at,
+            batch.first_timestamp.as_deref(),
+        );
+        let ctx = PartitionContext::new(&tenant, &s3_source, format.clone(), partition_at);
         let ctx = match &stream.and_then(|s| s.retention_class.clone()) {
             Some(rc) => ctx.with("retention_class", rc.clone()),
             None => ctx,
@@ -1087,12 +1108,13 @@ impl PendingBuffer {
             // ignored by the batcher.
             self.batcher.push(record, &start, None);
         }
-        if self.first_timestamp.is_none() {
-            self.first_timestamp = read.first_timestamp;
-        }
-        if read.last_timestamp.is_some() {
-            self.last_timestamp = read.last_timestamp;
-        }
+        // The window's event-time range is the earliest and latest of its
+        // reads' ranges, not the first read's start and the last read's end:
+        // record times arrive out of order (#559).
+        self.first_timestamp =
+            vtop_core::event_time::earliest(self.first_timestamp.take(), read.first_timestamp);
+        self.last_timestamp =
+            vtop_core::event_time::latest(self.last_timestamp.take(), read.last_timestamp);
         self.latest_end = Some(read.progress_end);
     }
 
@@ -1873,8 +1895,12 @@ impl Engine {
         for buf in sealed_early.chain(flushed).collect::<Vec<_>>() {
             let Some(mut buf) = buf else { continue };
             let Some(read) = buf.drain() else { continue };
+            // The batch's contents are fixed here. It may then queue behind
+            // `limit` others for an upload slot, so the seal instant is taken
+            // now, not when its future first runs (review on #570).
+            let sealed_at = Utc::now();
             let stream = self.streams.lookup(&buf.source.source_name).cloned();
-            work.push((buf.source.clone(), read, stream));
+            work.push((buf.source.clone(), read, stream, sealed_at));
         }
 
         // The width this cycle runs at (#102): the ceiling, or the
@@ -1906,12 +1932,12 @@ impl Engine {
         // that held the marker has been consumed.
         let mut verified: Vec<(usize, ProgressMarker, Result<VerifyStep, VtopError>)> =
             futures::stream::iter(work.into_iter().enumerate().map(
-                |(order, (source, read, stream))| {
+                |(order, (source, read, stream, sealed_at))| {
                     let pipeline = &pipeline;
                     let started_at = read.progress_start.clone();
                     async move {
                         let step = pipeline
-                            .process_until_verified(&source, read, stream.as_ref())
+                            .process_until_verified(&source, read, stream.as_ref(), sealed_at)
                             .await;
                         (order, started_at, step)
                     }
@@ -2277,12 +2303,16 @@ impl Engine {
                     // transition fails the row stays as it was, no rewind is
                     // recorded, and the next recovery decides again — never
                     // rewind on a decision the ledger did not record (#123).
+                    // Both writes are fenced (#557): one refused because
+                    // another engine claimed the batch in between means that
+                    // engine re-reads the range now, and rewinding here as
+                    // well would ingest it twice (review of #569).
                     if let Err(e) = self
                         .store
                         .mark_failed(&rec.batch_id, "recovered: replay required")
                         .await
                     {
-                        tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist FAILED");
+                        tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist the replay decision; not rewinding");
                         summary.still_pending += 1;
                         continue;
                     }
@@ -2295,7 +2325,7 @@ impl Engine {
                         )
                         .await
                     {
-                        tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist REPLAY_REQUIRED");
+                        tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist REPLAY_REQUIRED; not rewinding");
                         summary.still_pending += 1;
                         continue;
                     }
@@ -2898,6 +2928,54 @@ mod tests {
     use std::io::Write;
     use vtop_core::config::StreamsConfig;
 
+    /// #559: a buffered window spans several reads; its event-time range is
+    /// the earliest and latest of theirs, not the first read's start and the
+    /// last read's end (producer timestamps arrive out of order).
+    #[test]
+    fn a_buffered_window_keeps_the_earliest_and_latest_record_time() {
+        let source = DiscoveredSource {
+            source_type: SourceType::Kafka,
+            source_name: "t".into(),
+            format: vtop_core::types::TelemetryFormat::Raw,
+        };
+        let mut buf = PendingBuffer::new("default", source, BatchLimits::default());
+        let marker = |offset: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition: 0,
+            start_offset: offset,
+            end_offset: offset,
+            consumer_group: "g".into(),
+        };
+        let read = |offset: i64, lo: Option<&str>, hi: Option<&str>| ReadResult {
+            records: vec![b"r".to_vec()],
+            progress_start: marker(offset),
+            progress_end: marker(offset),
+            first_timestamp: lo.map(str::to_owned),
+            last_timestamp: hi.map(str::to_owned),
+            verbatim: false,
+        };
+        buf.append(read(
+            0,
+            Some("2026-01-01T10:00:00.000Z"),
+            Some("2026-01-01T10:30:00.000Z"),
+        ));
+        buf.append(read(
+            1,
+            Some("2026-01-01T09:00:00.000Z"),
+            Some("2026-01-01T09:05:00.000Z"),
+        ));
+        buf.append(read(2, None, None));
+        let drained = buf.drain().unwrap();
+        assert_eq!(
+            drained.first_timestamp.as_deref(),
+            Some("2026-01-01T09:00:00.000Z")
+        );
+        assert_eq!(
+            drained.last_timestamp.as_deref(),
+            Some("2026-01-01T10:30:00.000Z")
+        );
+    }
+
     /// #66: a mutating engine is single-instance per state store AND work dir;
     /// a second one must be refused however the collision arises, read-only
     /// construction must keep working alongside, and the locks must free when
@@ -3197,6 +3275,66 @@ mod tests {
             5,
             "each batch keeps its own identity; a shared batch_id would collide \
              in the ledger the moment two of them committed"
+        );
+    }
+
+    /// Review on #570: a batch waits for an upload slot (and its first ledger
+    /// write) after it leaves the buffer, and that wait can cross an hour. The
+    /// partition is the hour the batch was drained in - the instant the caller
+    /// passes - not the hour processing reached it.
+    #[tokio::test]
+    async fn a_batch_is_filed_under_the_hour_it_was_drained_not_processed() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "one\n").unwrap();
+        let cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        let engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let source = DiscoveredSource {
+            source_type: SourceType::File,
+            source_name: "in".into(),
+            format: vtop_core::types::TelemetryFormat::Raw,
+        };
+        let marker = ProgressMarker::File {
+            path: input.to_string_lossy().into_owned(),
+            inode: None,
+            start_byte: 0,
+            end_byte: 4,
+            file_size: 4,
+            mtime: String::new(),
+        };
+        let read = ReadResult {
+            records: vec![b"one".to_vec()],
+            progress_start: marker.clone(),
+            progress_end: marker,
+            first_timestamp: None,
+            last_timestamp: None,
+            verbatim: false,
+        };
+        let drained = chrono::DateTime::parse_from_rfc3339("2020-01-02T03:59:59.900Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let step = engine
+            .pipeline()
+            .process_until_verified(&source, read, None, drained)
+            .await
+            .unwrap();
+        let VerifyStep::Verified(verified) = step else {
+            panic!("the batch did not verify");
+        };
+        assert!(
+            verified
+                .object_uri
+                .contains("year=2020/month=01/day=02/hour=03"),
+            "filed under the hour processing reached it, not the hour it was \
+             drained in (2020-01-02 03:59:59.900): {}",
+            verified.object_uri
         );
     }
 

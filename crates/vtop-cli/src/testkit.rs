@@ -92,6 +92,7 @@ pub fn file_config(
         },
         partitioning: PartitioningConfig {
             template: DEFAULT_TEMPLATE.into(),
+            time_source: Default::default(),
         },
     }
 }

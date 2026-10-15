@@ -121,6 +121,11 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
     // ---- 2. Same behavioural contract as every backend, using DML only ----
     test_battery::run_all(&store).await;
 
+    // ---- 2a. The claim fence (#557): two runtime connections stand for two
+    // engines on one shared ledger.
+    let second = PgStateStore::connect(&runtime_conn).await.unwrap();
+    test_battery::run_fencing_battery(&store, &second).await;
+
     // ---- 2b. Prune contract (#128) runs as the MAINTENANCE identity ----
     // The runtime role is denied DELETE by design (asserted above), so the
     // owner connection exercises pruning — mirroring production, where

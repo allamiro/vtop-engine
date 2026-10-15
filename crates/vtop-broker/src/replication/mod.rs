@@ -191,6 +191,8 @@ pub struct InProcessFollower {
     committed_floor_armed: AtomicBool,
     /// Sealed-prefix retention bound in bytes; 0 = disabled (#290).
     retention_max_total_bytes: std::sync::atomic::AtomicU64,
+    /// What retention has been doing, for the exporter (#561).
+    retention_stats: crate::retention_stats::RetentionStats,
     state: Mutex<FollowerState>,
     online: AtomicBool,
     /// When set, appends land with [`Durability::Buffered`] and are not
@@ -264,6 +266,7 @@ impl InProcessFollower {
             committed_floor: Mutex::new(None),
             committed_floor_armed: AtomicBool::new(false),
             retention_max_total_bytes: std::sync::atomic::AtomicU64::new(0),
+            retention_stats: Default::default(),
             state: Mutex::new(FollowerState {
                 segment,
                 producer_epochs,
@@ -342,29 +345,46 @@ impl InProcessFollower {
     /// with a zero bound is treated as disabled at this layer; node
     /// configuration rejects zero outright.
     pub fn set_retention(&self, policy: Option<vtop_log::RetentionPolicy>) {
-        self.retention_max_total_bytes.store(
-            policy.map(|policy| policy.max_total_bytes).unwrap_or(0),
-            std::sync::atomic::Ordering::SeqCst,
-        );
+        let bound = policy.map(|policy| policy.max_total_bytes).unwrap_or(0);
+        // The bound and the policy generation move together, under the
+        // stats' policy lock, and what the last pass recorded is forgotten:
+        // disabled (by `None` or a zero bound, which this layer treats the
+        // same) or rebound, a pass of the old policy must not leave its
+        // bound, size and blocked reason exported (review of #572).
+        self.retention_stats.change_policy(|| {
+            self.retention_max_total_bytes
+                .store(bound, std::sync::atomic::Ordering::SeqCst);
+        });
     }
 
     /// One retention pass under the held state lock; failures reported, not
     /// returned, for the same reason as on the leader — the append was
     /// already durable, and the next open finishes an interrupted pass.
     fn run_retention(&self, segment: &mut vtop_log::SegmentSet) {
-        let max_total_bytes = self
-            .retention_max_total_bytes
-            .load(std::sync::atomic::Ordering::SeqCst);
+        // The bound and its generation, read together (review of #572).
+        let (generation, max_total_bytes) = self.retention_stats.policy(|| {
+            self.retention_max_total_bytes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        });
         if max_total_bytes == 0 {
             return;
         }
         let floor = self.cluster_committed.get().min(segment.committed_offset());
-        if let Err(problem) = segment.retain(&vtop_log::RetentionPolicy { max_total_bytes }, floor)
-        {
-            eprintln!(
-                "follower retention failed and will be retried after the next append: {problem}"
-            );
-        }
+        let result = segment.retain(&vtop_log::RetentionPolicy { max_total_bytes }, floor);
+        self.retention_stats.record_for(
+            generation,
+            &format!(
+                "follower {} range {}/{}",
+                self.node_id, self.range.topic, self.range.range_id
+            ),
+            max_total_bytes,
+            &result,
+        );
+    }
+
+    /// What retention has been doing on this replica (#561).
+    pub fn retention_stats(&self) -> &crate::retention_stats::RetentionStats {
+        &self.retention_stats
     }
 
     /// Durably commit the tail's boundary for an orderly shutdown (#280).
