@@ -2303,12 +2303,16 @@ impl Engine {
                     // transition fails the row stays as it was, no rewind is
                     // recorded, and the next recovery decides again — never
                     // rewind on a decision the ledger did not record (#123).
+                    // Both writes are fenced (#557): one refused because
+                    // another engine claimed the batch in between means that
+                    // engine re-reads the range now, and rewinding here as
+                    // well would ingest it twice (review of #569).
                     if let Err(e) = self
                         .store
                         .mark_failed(&rec.batch_id, "recovered: replay required")
                         .await
                     {
-                        tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist FAILED");
+                        tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist the replay decision; not rewinding");
                         summary.still_pending += 1;
                         continue;
                     }
@@ -2321,7 +2325,7 @@ impl Engine {
                         )
                         .await
                     {
-                        tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist REPLAY_REQUIRED");
+                        tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist REPLAY_REQUIRED; not rewinding");
                         summary.still_pending += 1;
                         continue;
                     }

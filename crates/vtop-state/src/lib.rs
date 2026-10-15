@@ -7,6 +7,7 @@
 //! depends only on the trait.
 
 pub mod deadline;
+mod fence;
 pub mod models;
 #[cfg(feature = "postgres")]
 pub mod pg_store;
