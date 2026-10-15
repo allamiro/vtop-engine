@@ -1080,6 +1080,15 @@ struct Promoter {
     /// read from metadata's transition chain before each verification
     /// (#449): the boundary established here must not fall below it.
     published_floor: Option<u64>,
+    /// Where `published_floor` is read from, AFTER the probe has fenced a
+    /// majority (review of #566). A floor read BEFORE the fence could miss a
+    /// boundary an earlier epoch's holder published in between: it reports
+    /// before it exposes, and exposes once its marker is quorum-acked -
+    /// which replicas fenced at this epoch refuse. So every boundary that
+    /// was ever exposed was reported before a majority fence, and a read
+    /// after the fence sees it. `None` keeps `published_floor` as set (the
+    /// tests set it directly).
+    floor: Option<Arc<dyn FloorSource>>,
     /// The agent's round clock. A promotion runs inside a round, and its
     /// probe and transition report are network calls the round's budget must
     /// cover too: the reporter alone retries five times with backoff, which
@@ -1155,7 +1164,7 @@ impl Promoter {
                 }
             }
         }
-        let committed_offset = match self.probe.as_ref() {
+        let committed_offset = match self.probe.clone() {
             // A standalone range has no quorum to establish against and
             // promotes on its own durable boundary; requiring one it cannot
             // form would make single-replica deployments unleadable.
@@ -1179,6 +1188,34 @@ impl Promoter {
                     None => Some(probe.probe(fencing_epoch).await),
                 }
                 .unwrap_or_default();
+                // THE FLOOR AFTER THE FENCE (review of #566; see `floor`):
+                // only once a majority answered the fence, so no earlier
+                // epoch can publish anything this read could miss. Without
+                // a majority there is nothing to establish, and the read
+                // would only be stale.
+                let majority = probe.replication_factor() / 2 + 1;
+                let fenced = probes
+                    .iter()
+                    .filter(|answer| answer.local_committed_offset.is_some())
+                    .count();
+                if let Some(source) = self.floor.clone().filter(|_| fenced >= majority) {
+                    match source.read(fencing_epoch).await {
+                        Ok(floor) => self.published_floor = floor,
+                        Err(error) => {
+                            tracing::warn!(
+                                range = %self.range_uuid,
+                                fencing_epoch,
+                                %error,
+                                "refusing promotion this round: the published watermark could \
+                                 not be read from metadata, so the boundary cannot be held to \
+                                 it (#449)"
+                            );
+                            self.quorum_miss = true;
+                            self.suspended(fencing_epoch);
+                            return false;
+                        }
+                    }
+                }
                 match crate::promotion::establish(
                     &probes,
                     probe.replication_factor(),
@@ -1531,6 +1568,127 @@ struct FloorScan {
     /// The round its last page was read in; a completed scan is reused in
     /// that round and the next, no later.
     completed_in_round: Option<u64>,
+}
+
+/// Where a verification reads the published floor (#449) from.
+#[async_trait::async_trait]
+trait FloorSource: Send + Sync {
+    /// The highest boundary any earlier promotion of the range published;
+    /// `None` when none has.
+    async fn read(&self, fencing_epoch: u64) -> Result<Option<u64>, String>;
+}
+
+/// The floor from metadata's transition chain, read over the admin plane.
+///
+/// Every page draws on the round's budget, so a long chain can outlast a
+/// round: the scan's progress is kept per epoch and the next round resumes
+/// it (review of #566), and a completed scan is reused in the round it
+/// finished in and the next. Sound because the scan runs only AFTER a
+/// majority of the replicas has been fenced at the epoch being verified
+/// (see `Promoter::floor`): from then on no earlier epoch can publish a
+/// boundary, so pages read in an earlier round of the same epoch cannot
+/// have missed one.
+struct AdminFloorSource {
+    admin: Arc<AdminClient>,
+    topic_uuid: Uuid,
+    range_uuid: Uuid,
+    round: RoundClock,
+    rpc_deadline: Duration,
+    scan: std::sync::Mutex<Option<FloorScan>>,
+}
+
+#[async_trait::async_trait]
+impl FloorSource for AdminFloorSource {
+    async fn read(&self, fencing_epoch: u64) -> Result<Option<u64>, String> {
+        const PAGE: u16 = 256;
+        let taken = self
+            .scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let mut scan = match taken {
+            Some(scan)
+                if scan.for_epoch == fencing_epoch
+                    && scan
+                        .completed_in_round
+                        .is_none_or(|round| self.round.number() <= round + 1) =>
+            {
+                scan
+            }
+            _ => FloorScan {
+                for_epoch: fencing_epoch,
+                next_from: 1,
+                floor: None,
+                complete: false,
+                completed_in_round: None,
+            },
+        };
+        let keep = |scan: FloorScan| {
+            *self
+                .scan
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scan);
+        };
+        while !scan.complete {
+            let budget = self.round.budget(self.rpc_deadline);
+            let page = match tokio::time::timeout(
+                budget,
+                self.admin.read_range_transitions(
+                    self.topic_uuid,
+                    self.range_uuid,
+                    scan.next_from,
+                    PAGE,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(page)) => page,
+                Ok(Err(error)) => {
+                    keep(scan);
+                    return Err(format!("read range transitions: {error}"));
+                }
+                Err(_) => {
+                    keep(scan);
+                    return Err(format!(
+                        "read range transitions: no answer within {budget:?} (the round's budget \
+                         is {:?})",
+                        self.rpc_deadline
+                    ));
+                }
+            };
+            if !page.found {
+                scan.floor = None;
+                scan.complete = true;
+                scan.completed_in_round = Some(self.round.number());
+                break;
+            }
+            for view in &page.transitions {
+                if let vtop_meta::TransitionOutcome::Reported {
+                    outcome:
+                        vtop_meta::PromotionOutcome::Established {
+                            boundary_offset: Some(boundary),
+                            ..
+                        },
+                    ..
+                } = &view.outcome
+                {
+                    scan.floor = Some(scan.floor.map_or(*boundary, |seen| seen.max(*boundary)));
+                }
+            }
+            match page.transitions.last() {
+                Some(last) if page.transitions.len() == usize::from(PAGE) => {
+                    scan.next_from = last.epoch_to.saturating_add(1);
+                }
+                _ => {
+                    scan.complete = true;
+                    scan.completed_in_round = Some(self.round.number());
+                }
+            }
+        }
+        let floor = scan.floor;
+        keep(scan);
+        Ok(floor)
+    }
 }
 
 impl Drop for RoundGuard {
@@ -1896,22 +2054,6 @@ pub struct LeaseAgent {
     /// not an epoch) — and only an answer that stops naming this node
     /// clears it. See [`stood_down_verdict`].
     stood_down_latched: bool,
-    /// How far the published-floor scan for the epoch being verified got
-    /// (review of #566). Each page is drawn from the round's budget, so a
-    /// long transition chain can outlast a round; restarting at epoch 1 every
-    /// round would never finish, and the range would never promote. A round
-    /// that runs out mid-scan leaves the progress here and the next round
-    /// for the SAME epoch resumes it - no weaker than one long scan, which
-    /// reads its early pages earlier than its late ones too. A different
-    /// epoch starts over, and so does a COMPLETED scan once the round after
-    /// the one it finished in is over (review): records it read are not
-    /// final - a Pending or Refused transition can still be reported
-    /// Established - so a scan reused across promotion retries could miss a
-    /// boundary published since. Counted in ROUNDS, not time (review): a
-    /// time window spans several short poll rounds. The round it finished in
-    /// and the next are what let a scan that took a whole round be verified
-    /// at all; any later attempt reads the chain again.
-    floor_scan: Option<FloorScan>,
     /// The instant the current round's RPC budget runs out (see
     /// [`LeaseAgent::bounded`]). Open for the span of a round and closed by a
     /// guard when the round ends OR is dropped by a `select!`, so a shutdown
@@ -2027,6 +2169,14 @@ impl LeaseAgent {
                 range_uuid,
                 stand_aside: false,
                 published_floor: None,
+                floor: Some(Arc::new(AdminFloorSource {
+                    admin: Arc::clone(&admin),
+                    topic_uuid,
+                    range_uuid,
+                    round: round_clock.clone(),
+                    rpc_deadline: config.renew_interval,
+                    scan: std::sync::Mutex::new(None),
+                })),
                 round: round_clock.clone(),
                 unanswered: None,
             },
@@ -2035,7 +2185,6 @@ impl LeaseAgent {
             stand_down: None,
             stood_down_latched: false,
             round_clock,
-            floor_scan: None,
             gate: None,
             gate_degraded: false,
             range_missing: false,
@@ -2727,112 +2876,9 @@ impl LeaseAgent {
         ))
     }
 
-    /// The highest boundary any earlier promotion of this range published,
-    /// from metadata's transition chain (#449): the floor `establish_above`
-    /// holds the new boundary to. Every Established record in chain order
-    /// counts, whatever the audit later says of its vote; `None` when no
-    /// promotion has published a boundary yet.
-    ///
-    /// Resumable per epoch (see [`LeaseAgent::floor_scan`]): a page that does
-    /// not answer within the round's budget fails this round, keeping the
-    /// pages already read, and the next round verifying the same epoch
-    /// continues from the next page.
-    async fn read_published_floor(&mut self, fencing_epoch: u64) -> Result<Option<u64>, String> {
-        const PAGE: u16 = 256;
-        let mut scan = match self.floor_scan.take() {
-            Some(scan)
-                if scan.for_epoch == fencing_epoch
-                    && scan
-                        .completed_in_round
-                        .is_none_or(|round| self.round_clock.number() <= round + 1) =>
-            {
-                scan
-            }
-            _ => FloorScan {
-                for_epoch: fencing_epoch,
-                next_from: 1,
-                floor: None,
-                complete: false,
-                completed_in_round: None,
-            },
-        };
-        while !scan.complete {
-            let page = match self
-                .bounded(
-                    "read range transitions",
-                    self.admin.read_range_transitions(
-                        self.topic_uuid,
-                        self.range_uuid,
-                        scan.next_from,
-                        PAGE,
-                    ),
-                )
-                .await
-            {
-                Ok(page) => page,
-                Err(error) => {
-                    self.floor_scan = Some(scan);
-                    return Err(error);
-                }
-            };
-            if !page.found {
-                scan.floor = None;
-                scan.complete = true;
-                scan.completed_in_round = Some(self.round_clock.number());
-                break;
-            }
-            for view in &page.transitions {
-                if let vtop_meta::TransitionOutcome::Reported {
-                    outcome:
-                        vtop_meta::PromotionOutcome::Established {
-                            boundary_offset: Some(boundary),
-                            ..
-                        },
-                    ..
-                } = &view.outcome
-                {
-                    scan.floor = Some(scan.floor.map_or(*boundary, |seen| seen.max(*boundary)));
-                }
-            }
-            match page.transitions.last() {
-                Some(last) if page.transitions.len() == usize::from(PAGE) => {
-                    scan.next_from = last.epoch_to.saturating_add(1);
-                }
-                _ => {
-                    scan.complete = true;
-                    scan.completed_in_round = Some(self.round_clock.number());
-                }
-            }
-        }
-        let floor = scan.floor;
-        self.floor_scan = Some(scan);
-        Ok(floor)
-    }
-
     async fn publish_held(&mut self, fencing_epoch: u64, held_until_ms: Option<i64>) -> Promoted {
-        // The published watermark first (#449): read before a verification,
-        // so the boundary about to be established is held to it. A floor
-        // that cannot be read is not a floor of zero — the epoch is held
-        // still and the next round reads again, the same way a quorum that
-        // did not answer is treated.
-        if self.promoter.verified_epoch != Some(fencing_epoch) {
-            match self.read_published_floor(fencing_epoch).await {
-                Ok(floor) => self.promoter.published_floor = floor,
-                Err(error) => {
-                    tracing::warn!(
-                        range = %self.range_uuid,
-                        fencing_epoch,
-                        %error,
-                        "refusing promotion this round: the published watermark could not be \
-                         read from metadata, so the boundary cannot be held to it (#449)"
-                    );
-                    self.promoter.suspended(fencing_epoch);
-                    self.state = LeaseState::NotHeld;
-                    self.held_until_ms = None;
-                    return Promoted::QuorumMissed;
-                }
-            }
-        }
+        // The published watermark (#449) is read inside `ensure`, AFTER the
+        // probe has fenced the replicas - see `Promoter::floor`.
         let held = self.promoter.ensure(fencing_epoch).await;
         if !held {
             let quorum_miss = self.promoter.take_quorum_miss();
@@ -3939,6 +3985,7 @@ mod tests {
             node_uuid: Uuid::from_u128(1),
             range_uuid: Uuid::from_u128(21),
             published_floor: None,
+            floor: None,
             round: RoundClock::default(),
             unanswered: None,
         }
@@ -4082,25 +4129,20 @@ mod tests {
             plaintext: true,
         }])
         .unwrap();
-        let config = LeaseAgentConfig {
-            lease_duration: Duration::from_secs(5),
-            renew_interval: Duration::from_millis(400),
-            poll_interval: Duration::from_millis(200),
+        let deadline = Duration::from_millis(400);
+        let round = RoundClock::default();
+        let source = AdminFloorSource {
+            admin: Arc::new(admin),
+            topic_uuid: Uuid::from_u128(20),
+            range_uuid: Uuid::from_u128(21),
+            round: round.clone(),
+            rpc_deadline: deadline,
+            scan: std::sync::Mutex::new(None),
         };
-        let mut agent = LeaseAgent::new(
-            admin,
-            config,
-            Uuid::from_u128(1),
-            Uuid::from_u128(20),
-            Uuid::from_u128(21),
-            Arc::new(Recorder::default()),
-            None,
-        )
-        .unwrap();
 
         let first = {
-            let _round = agent.round_clock.open(agent.rpc_deadline());
-            agent.read_published_floor(9).await
+            let _round = round.open(deadline);
+            source.read(9).await
         };
         assert!(
             first.is_err(),
@@ -4109,8 +4151,8 @@ mod tests {
         let after_first = handler.asked.lock().unwrap().len();
 
         let second = {
-            let _round = agent.round_clock.open(agent.rpc_deadline());
-            agent.read_published_floor(9).await
+            let _round = round.open(deadline);
+            source.read(9).await
         };
         assert_eq!(
             second,
@@ -4128,19 +4170,19 @@ mod tests {
         // Complete: reused within one round, so a scan that took the whole
         // round can still be verified in the next...
         let asked = handler.asked.lock().unwrap().len();
-        assert_eq!(agent.read_published_floor(9).await, Ok(Some(77)));
+        assert_eq!(source.read(9).await, Ok(Some(77)));
         assert_eq!(handler.asked.lock().unwrap().len(), asked);
         // ...and in the round right after it, the attempt it was read for...
         {
-            let _round = agent.round_clock.open(agent.rpc_deadline());
-            assert_eq!(agent.read_published_floor(9).await, Ok(Some(77)));
+            let _round = round.open(deadline);
+            assert_eq!(source.read(9).await, Ok(Some(77)));
         }
         assert_eq!(handler.asked.lock().unwrap().len(), asked);
         // ...but not by a later retry, however soon: it is read again, since a
         // Pending or Refused record can still become Established (review).
         let _ = {
-            let _round = agent.round_clock.open(agent.rpc_deadline());
-            agent.read_published_floor(9).await
+            let _round = round.open(deadline);
+            source.read(9).await
         };
         assert_eq!(
             handler.asked.lock().unwrap().get(asked),
@@ -4151,11 +4193,67 @@ mod tests {
 
         // A new epoch reads the chain afresh.
         let _ = {
-            let _round = agent.round_clock.open(agent.rpc_deadline());
-            agent.read_published_floor(10).await
+            let _round = round.open(deadline);
+            source.read(10).await
         };
         assert_eq!(handler.asked.lock().unwrap()[asked], 1);
         serving.abort();
+    }
+
+    /// A floor source that records how many probes had run when it was read.
+    struct OrderedFloor {
+        probe: Arc<FixedProbe>,
+        read_after_probes: std::sync::Mutex<Vec<usize>>,
+        floor: Option<u64>,
+    }
+
+    #[async_trait::async_trait]
+    impl FloorSource for OrderedFloor {
+        async fn read(&self, _fencing_epoch: u64) -> Result<Option<u64>, String> {
+            self.read_after_probes
+                .lock()
+                .unwrap()
+                .push(self.probe.calls.load(std::sync::atomic::Ordering::SeqCst));
+            Ok(self.floor)
+        }
+    }
+
+    /// Review of #566: the published floor is read AFTER the probe has
+    /// fenced a majority - a read before it could miss a boundary an earlier
+    /// epoch published in between - and not at all without a majority, when
+    /// there is nothing to establish. The floor read then still binds: 90 is
+    /// refused below a published 95.
+    #[tokio::test]
+    async fn the_floor_is_read_after_the_fence_and_only_with_a_majority() {
+        let recorder = Arc::new(Recorder::default());
+        let probe = fixed(vec![at(1, Some(90)), at(2, Some(90)), at(3, Some(80))], 3);
+        let floor = Arc::new(OrderedFloor {
+            probe: Arc::clone(&probe),
+            read_after_probes: std::sync::Mutex::new(Vec::new()),
+            floor: Some(95),
+        });
+        let mut verifier = promoter(recorder.clone(), Some(probe.clone()));
+        verifier.floor = Some(floor.clone());
+        assert!(!verifier.ensure(5).await, "90 is below the published 95");
+        assert_eq!(
+            floor.read_after_probes.lock().unwrap().as_slice(),
+            &[1],
+            "read once, after the one probe"
+        );
+
+        let lonely = fixed(vec![at(1, Some(90)), at(2, None), at(3, None)], 3);
+        let floor = Arc::new(OrderedFloor {
+            probe: Arc::clone(&lonely),
+            read_after_probes: std::sync::Mutex::new(Vec::new()),
+            floor: Some(95),
+        });
+        let mut verifier = promoter(recorder, Some(lonely));
+        verifier.floor = Some(floor.clone());
+        assert!(!verifier.ensure(6).await);
+        assert!(
+            floor.read_after_probes.lock().unwrap().is_empty(),
+            "no majority fenced: nothing to establish, nothing read"
+        );
     }
 
     #[derive(Default)]
