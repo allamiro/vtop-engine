@@ -72,6 +72,16 @@ pub enum ConsensusError {
         None => "; no leader is known yet".to_owned(),
     })]
     NotLeader { leader: Option<MetaNodeId> },
+    /// The command's kind is newer than the cluster's metadata feature level
+    /// (#554): refused before it reaches the log, where a voter running an
+    /// older release could not decode it - and could then append nothing
+    /// after it. Raised with `SetFeatureLevel` once every voter is upgraded.
+    #[error(
+        "this command needs metadata feature level {needed} and the cluster runs at \
+         {enabled}; finish upgrading every metadata voter, then raise the level \
+         (vtopctl meta enable-features --level {needed})"
+    )]
+    FeatureNotEnabled { needed: u32, enabled: u32 },
     /// A lease request was refused because its proposer's clock is further
     /// from the metadata leader's than the leader tolerates (#555).
     ///
@@ -757,6 +767,42 @@ pub trait AdminReadSegmentPlacement: Send + Sync {
 #[async_trait]
 impl Consensus for OpenraftConsensus {
     async fn propose(&self, command: MetadataCommand) -> ConsensusResult<CommitReceipt> {
+        // The feature gate (#554), judged before the command is replicated.
+        // `SetFeatureLevel` is the one command not held back, because it is
+        // how the gate opens.
+        //
+        // Judged in EVERY role, not only the leader's (review): a role read
+        // before `client_write` is a race - a follower that skipped the gate
+        // can be elected before the write lands and append the command
+        // unchecked. What makes any role safe is that the level only rises,
+        // so every applied view is a lower bound on it: a view at or above
+        // `needed` proves the command enabled whoever this node is by the
+        // time it writes, and nothing short of that reaches `client_write`.
+        // Below it, a leader refuses; a follower, whose view may simply lag,
+        // sends the caller to the leader to be judged there.
+        if !matches!(command, MetadataCommand::SetFeatureLevel { .. }) {
+            let needed = command.feature_level();
+            if needed > crate::command::BASELINE_FEATURE_LEVEL {
+                // A façade without applied state cannot see the level, and
+                // a gate it cannot judge is closed (review).
+                let Some(store) = self.store.as_ref() else {
+                    return Err(ConsensusError::Message(format!(
+                        "this node was built without applied state, so it cannot tell whether \
+                         feature level {needed} is enabled; the command is refused"
+                    )));
+                };
+                let enabled = store.with_storage(|storage| storage.state().feature_level());
+                if needed > enabled {
+                    let metrics = self.raft.metrics().borrow().clone();
+                    if metrics.state == ServerState::Leader {
+                        return Err(ConsensusError::FeatureNotEnabled { needed, enabled });
+                    }
+                    return Err(ConsensusError::NotLeader {
+                        leader: metrics.current_leader.map(MetaNodeId),
+                    });
+                }
+            }
+        }
         // A lease deadline is built from the proposer's clock, and the lease
         // agent compares it with its own: a proposer whose clock is far from
         // the leader's would steal or poison a lease. Refuse it BEFORE it is

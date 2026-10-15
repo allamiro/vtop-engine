@@ -18,6 +18,15 @@ use vtop_meta::{
 const ROOT: &str = "/meta";
 const SEED: u64 = 0x5eed_0093;
 
+/// SetFeatureLevel (#554), derived by hand from the layout rather than taken
+/// from the encoder: kind 36, the envelope (request id, issued-at), the level.
+const GOLDEN_SET_FEATURE_LEVEL_HEX: &str = concat!(
+    "0024",                             // kind 36
+    "00112233445566778899aabbccddee04", // request id
+    "0102030405060708",                 // issued_at_ms
+    "00000004",                         // feature level 4
+);
+
 /// The pinned SplitRange command (#473): request ...ee02, barrier 0x280,
 /// CAS 1, holder bbbbbbbb…31 at epoch 1.
 const GOLDEN_SPLIT_COMMAND_HEX: &str = concat!(
@@ -243,6 +252,20 @@ fn golden_split_command() -> MetadataCommand {
         holder_node_uuid: Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000031").unwrap(),
         fencing_epoch: 0x0000_0000_0000_0001,
     }
+}
+
+#[test]
+fn set_feature_level_command_matches_golden_vector() {
+    let command = MetadataCommand::SetFeatureLevel {
+        env: CommandEnvelope {
+            request_id: Uuid::parse_str("00112233-4455-6677-8899-aabbccddee04").unwrap(),
+            issued_at_ms: 0x0102_0304_0506_0708,
+        },
+        feature_level: 4,
+    };
+    let encoded = command.encode().unwrap();
+    assert_eq!(to_hex(&encoded), GOLDEN_SET_FEATURE_LEVEL_HEX);
+    assert_eq!(MetadataCommand::decode(&encoded).unwrap(), command);
 }
 
 #[test]

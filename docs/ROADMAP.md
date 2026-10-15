@@ -160,6 +160,25 @@ reopen quietly.
   untested assumption. A directory written by release N+1 may hold artifacts
   release N cannot interpret (retention markers, epoch journals with
   adoption semantics N predates), and no test defends the reverse path.
+- **#554** — the metadata Raft tier had no mixed-version story while the chart
+  rolled it. A command kind a voter does not know fails to decode, and with it
+  the whole AppendEntries batch: an upgraded leader that proposed one left the
+  old voters unable to append anything more, and an old node restarted on the
+  newer log called it corrupt. Now each command kind carries a **feature
+  level** (the release that introduced it), and the cluster's level lives in
+  replicated state (absent means v0.6.0's level). Every node refuses, before
+  replication, any command above the level it has applied - a leader with a
+  reason saying how to proceed, a follower by sending the caller to the
+  leader - except the level-setting command itself, which is how the level
+  rises;
+  `vtopctl meta enable-features --level N` raises it - monotonically, never
+  down - once every voter runs a release that knows N. A checksum-valid entry
+  or record of an unknown kind is reported as written by a newer release, not
+  as corruption, and a voter receiving one says so on stderr instead of
+  dropping the connection silently. Scenario 22 rolls three voters from the
+  previous release to this one, one at a time, requiring a commit through the
+  mixed tier and every voter to converge at each step, then raises the level
+  and restarts a voter on it; CI runs it against the newest release tag.
 
 One observation rode along without becoming a fix: scenario 09 once left a
 promotion unacquired within its deadline (#318). The flake has not recurred —

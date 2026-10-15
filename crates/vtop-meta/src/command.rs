@@ -109,6 +109,29 @@ const COMMAND_KIND_ENSURE_GROUP_MEMBER_FOR_RANGE: u16 = 32;
 const COMMAND_KIND_COMMIT_GROUP_CURSOR_COORDINATED: u16 = 33;
 const COMMAND_KIND_ENSURE_GROUP_MEMBER_COORDINATED: u16 = 34;
 const COMMAND_KIND_SPLIT_RANGE: u16 = 35;
+const COMMAND_KIND_SET_FEATURE_LEVEL: u16 = 36;
+
+/// The metadata feature level of a cluster that has never recorded one: the
+/// command set of v0.6.0, the last release before levels existed (#554).
+///
+/// A command kind an old voter does not know fails to decode, and with it the
+/// whole AppendEntries batch carrying it: a leader that proposes one during a
+/// rolling upgrade leaves every old voter unable to append. So a command
+/// newer than the cluster's level is refused BEFORE it reaches the log, and
+/// the level is raised - by [`MetadataCommand::SetFeatureLevel`], once every
+/// voter runs a release that knows it - never implied by the leader's build.
+pub const BASELINE_FEATURE_LEVEL: u32 = 3;
+
+/// The highest feature level this build understands.
+///
+/// Raise it, and give the new kinds that level in
+/// [`MetadataCommand::feature_level`], whenever a release adds anything an
+/// older voter cannot read: a command kind, a snapshot record tag, or a
+/// change to what an existing command does when applied (gate the new
+/// behaviour on the recorded level, so every replica applies the same
+/// thing). `every_kind_newer_than_the_baseline_release_is_gated` catches a
+/// kind that forgets; the other two are on the author.
+pub const SUPPORTED_FEATURE_LEVEL: u32 = 4;
 
 /// Why a fenced cursor commit is refused (#457 slice 2b): the commit did not
 /// come from the range's current leaseholder at its current fencing epoch. A
@@ -964,9 +987,41 @@ pub enum MetadataCommand {
         segment_uuid: Uuid,
         expected_segment_generation: u64,
     },
+    /// Raise the cluster's metadata feature level (#554), enabling the
+    /// command kinds up to it. Monotonic: a level at or below the current
+    /// one is an idempotent Ack, never a downgrade. Refused above
+    /// [`SUPPORTED_FEATURE_LEVEL`].
+    ///
+    /// The one command the feature gate does not hold back, because it is
+    /// how the gate opens - and the one an operator must only send once
+    /// EVERY metadata voter runs a release that knows it (this kind is
+    /// itself new at level 4): an old voter cannot decode it, exactly as it
+    /// could not decode the commands it unlocks.
+    SetFeatureLevel {
+        env: CommandEnvelope,
+        feature_level: u32,
+    },
 }
 
 impl MetadataCommand {
+    /// The feature level a cluster must be at before this command may enter
+    /// the log (#554): the level of the release that introduced its kind.
+    pub fn feature_level(&self) -> u32 {
+        match self {
+            // v0.5.0 (#240 item 5).
+            MetadataCommand::ReportPromotionOutcome { .. } => 2,
+            // v0.6.0 (#457 slices 2b and 4a).
+            MetadataCommand::CommitGroupCursorFenced { .. }
+            | MetadataCommand::EnsureGroupMemberForRange { .. }
+            | MetadataCommand::CommitGroupCursorCoordinated { .. }
+            | MetadataCommand::EnsureGroupMemberCoordinated { .. } => 3,
+            // After v0.6.0: the split (#473) and the gate itself.
+            MetadataCommand::SplitRange { .. } | MetadataCommand::SetFeatureLevel { .. } => 4,
+            // Everything v0.4.0 already knew.
+            _ => 1,
+        }
+    }
+
     pub fn envelope(&self) -> &CommandEnvelope {
         match self {
             MetadataCommand::RegisterNode { env, .. }
@@ -1003,7 +1058,8 @@ impl MetadataCommand {
             | MetadataCommand::SetTopicRetentionPolicy { env, .. }
             | MetadataCommand::PlanRetention { env, .. }
             | MetadataCommand::ConfirmRetentionExpired { env, .. }
-            | MetadataCommand::CancelRetention { env, .. } => env,
+            | MetadataCommand::CancelRetention { env, .. }
+            | MetadataCommand::SetFeatureLevel { env, .. } => env,
         }
     }
 
@@ -1143,6 +1199,11 @@ impl MetadataCommand {
                 put_u64(&mut out, *expected_range_generation);
                 put_uuid(&mut out, *holder_node_uuid);
                 put_u64(&mut out, *fencing_epoch);
+            }
+            MetadataCommand::SetFeatureLevel { env, feature_level } => {
+                put_u16(&mut out, COMMAND_KIND_SET_FEATURE_LEVEL);
+                encode_envelope(&mut out, env);
+                put_u32(&mut out, *feature_level);
             }
             MetadataCommand::RegisterSealedSegment {
                 env,
@@ -1776,6 +1837,10 @@ impl MetadataCommand {
                 expected_range_generation: reader.u64("expected range generation")?,
                 holder_node_uuid: reader.uuid("holder node uuid")?,
                 fencing_epoch: reader.u64("fencing epoch")?,
+            }),
+            COMMAND_KIND_SET_FEATURE_LEVEL => Ok(MetadataCommand::SetFeatureLevel {
+                env: decode_envelope(reader)?,
+                feature_level: reader.u32("feature level")?,
             }),
             COMMAND_KIND_REGISTER_SEALED_SEGMENT => Ok(MetadataCommand::RegisterSealedSegment {
                 env: decode_envelope(reader)?,
@@ -2925,6 +2990,10 @@ mod tests {
                 segment_uuid: Uuid::from_u128(30),
                 expected_segment_generation: 2,
             },
+            MetadataCommand::SetFeatureLevel {
+                env: envelope(36),
+                feature_level: SUPPORTED_FEATURE_LEVEL,
+            },
             MetadataCommand::AcquireRangeLease {
                 env: envelope(31),
                 topic_uuid: Uuid::from_u128(20),
@@ -3082,6 +3151,39 @@ mod tests {
             MetadataResponse::Rejected(MetadataError::invalid_transition("dead -> active")),
             MetadataResponse::Rejected(MetadataError::limit("too many ranges")),
         ]
+    }
+
+    /// #554: a command kind an older voter does not know must not enter the
+    /// log until the cluster's level says every voter does. So every kind
+    /// added after v0.6.0 (the last release before levels: kinds 1..=34)
+    /// carries a level above the baseline, and a future kind that forgets
+    /// one fails here rather than stalling a rolling upgrade.
+    #[test]
+    fn every_kind_newer_than_the_baseline_release_is_gated() {
+        const LAST_BASELINE_KIND: u16 = 34;
+        let mut seen = std::collections::BTreeSet::new();
+        for command in every_command() {
+            let bytes = command.encode().unwrap();
+            let kind = u16::from_be_bytes([bytes[0], bytes[1]]);
+            seen.insert(kind);
+            let level = command.feature_level();
+            assert!(
+                (1..=SUPPORTED_FEATURE_LEVEL).contains(&level),
+                "kind {kind}: level {level}"
+            );
+            assert_eq!(
+                kind > LAST_BASELINE_KIND,
+                level > BASELINE_FEATURE_LEVEL,
+                "kind {kind} has level {level}; kinds after {LAST_BASELINE_KIND} must be gated \
+                 above the baseline {BASELINE_FEATURE_LEVEL}, and older ones must not be"
+            );
+        }
+        let highest = *seen.last().unwrap();
+        assert_eq!(
+            seen.len(),
+            usize::from(highest),
+            "every kind 1..={highest} must be in every_command, or this check is blind to it"
+        );
     }
 
     #[test]

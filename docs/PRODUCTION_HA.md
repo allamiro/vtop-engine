@@ -900,6 +900,26 @@ Short procedures now; expand into a full ops runbook before go-live.
 - **Audit archive coverage:** run `vtopctl audit-coverage --config ...
   [--check-storage] [--metrics-file ...]` on a schedule (§6.6); a non-zero
   exit names the source units with lost ranges.
+- **Upgrade the metadata tier (#554):** roll the voters one at a time, and
+  confirm each has CAUGHT UP before the next. The chart's `RollingUpdate`
+  replaces one pod at a time, but it waits only for `/readyz`, which on a
+  metadata pod says its listeners are bound, not that the voter has caught
+  up; and a PodDisruptionBudget limits evictions, not the StatefulSet's own
+  rollout. So step it: set `spec.updateStrategy.rollingUpdate.partition` to
+  the replica count, upgrade the release, then lower the partition one
+  ordinal at a time (`kubectl patch statefulset <meta> -p
+  '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":N}}}}'`), and
+  before each step check with `vtopctl meta status` against the replaced
+  voter that its `last_applied` index has reached the leader's. Upgrade from
+  the immediately preceding release only, and never downgrade. Mixed releases are safe while they run: the leader refuses any
+  command kind above the cluster's metadata feature level, so nothing an
+  older voter cannot decode enters the log. Once EVERY voter runs the new
+  release, run `vtopctl meta enable-features --level N` for the level the
+  release introduced (its notes name it); only then do the new command kinds
+  work. Raising the level is permanent, and raising it while an older voter
+  remains is the one way to stall the tier - that voter cannot decode the
+  raise itself. A node that refuses to start with "written by a newer
+  release" is an old binary on a newer log: upgrade it.
 - **Restore from DB backup:** restore Postgres PITR → verify object store →
   start the engine (recovery scan re-reconciles) → run the divergence checker.
 - **Reconcile state store vs object storage:** list `SOURCE_COMMITTED` rows and

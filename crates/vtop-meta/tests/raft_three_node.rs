@@ -1234,3 +1234,130 @@ async fn single_node_client_write_commits() {
     let resp = handle.raft.client_write(cmd).await.expect("write");
     assert!(resp.log_id.index >= 1);
 }
+
+/// #554: during a rolling upgrade an upgraded leader must not put a command
+/// kind into the log that a voter still on the previous release cannot decode
+/// - the old voter would fail the whole AppendEntries batch and append nothing
+/// more. A command above the cluster's feature level is refused by the leader
+/// before replication; once an operator raises the level (every voter
+/// upgraded), the same command reaches the state machine on every node.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_command_newer_than_the_clusters_feature_level_never_reaches_the_log() {
+    use vtop_meta::{Consensus, ConsensusError, MetaNodeId, OpenraftConsensus};
+    use vtop_meta::{BASELINE_FEATURE_LEVEL, SUPPORTED_FEATURE_LEVEL};
+
+    let seed = SEED ^ 0x554;
+    let mut cluster = Cluster::boot(seed).await;
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone());
+    let split = |env: CommandEnvelope| MetadataCommand::SplitRange {
+        env,
+        topic_uuid: Uuid::from_u128(0x20),
+        parent_range_uuid: Uuid::from_u128(0x21),
+        left_range_uuid: Uuid::from_u128(0x22),
+        right_range_uuid: Uuid::from_u128(0x23),
+        transition_id: Uuid::from_u128(0x24),
+        barrier_offset: 0,
+        expected_range_generation: 0,
+        holder_node_uuid: Uuid::from_u128(0x10),
+        fencing_epoch: 1,
+    };
+    let last_log = |cluster: &Cluster| {
+        cluster
+            .leader()
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0)
+    };
+
+    let before = last_log(&cluster);
+    let env = cluster.envelope();
+    match consensus.propose(split(env)).await {
+        Err(ConsensusError::FeatureNotEnabled { needed, enabled }) => {
+            assert_eq!((needed, enabled), (4, BASELINE_FEATURE_LEVEL));
+        }
+        other => panic!("a gated command was not refused (seed={seed:#x}): {other:?}"),
+    }
+    assert_eq!(
+        last_log(&cluster),
+        before,
+        "the refused command reached the log"
+    );
+
+    // A follower does not let it through on the strength of its role (a
+    // role read before the write is a race: review) - it sends the caller
+    // to the leader, which judges it.
+    let leader_id = cluster.leader_id();
+    let (follower_id, through_follower) = cluster
+        .nodes
+        .iter()
+        .find(|(id, _)| **id != leader_id)
+        .map(|(id, follower)| {
+            (
+                *id,
+                OpenraftConsensus::new(follower.raft.clone()).with_store(follower.store.clone()),
+            )
+        })
+        .unwrap();
+    let env = cluster.envelope();
+    match through_follower.propose(split(env)).await {
+        Err(ConsensusError::NotLeader { leader }) => {
+            assert_eq!(
+                leader,
+                Some(MetaNodeId(leader_id)),
+                "follower {follower_id}"
+            );
+        }
+        other => panic!("a follower let a gated command through (seed={seed:#x}): {other:?}"),
+    }
+    // Nor does a façade with no applied state to judge the level from.
+    let storeless = OpenraftConsensus::new(cluster.leader().raft.clone());
+    let env = cluster.envelope();
+    assert!(
+        matches!(
+            storeless.propose(split(env)).await,
+            Err(ConsensusError::Message(_))
+        ),
+        "a façade that cannot see the level must refuse (seed={seed:#x})"
+    );
+    assert_eq!(
+        last_log(&cluster),
+        before,
+        "a refused command reached the log"
+    );
+
+    let env = cluster.envelope();
+    let raised = consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: SUPPORTED_FEATURE_LEVEL,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        raised.response,
+        MetadataResponse::Ack {
+            generation: u64::from(SUPPORTED_FEATURE_LEVEL)
+        }
+    );
+    let _ = cluster.leader().raft.trigger().heartbeat().await;
+    cluster.wait_applied_at_least(raised.log_id.index - 1).await; // meta index is 1-based
+    for (id, node) in &cluster.nodes {
+        assert_eq!(
+            node.store.with_storage(|s| s.state().feature_level()),
+            SUPPORTED_FEATURE_LEVEL,
+            "node {id} (seed={seed:#x})"
+        );
+    }
+
+    // Past the gate, the state machine judges it (no such topic here).
+    let env = cluster.envelope();
+    let judged = consensus.propose(split(env)).await.unwrap();
+    assert!(
+        matches!(judged.response, MetadataResponse::Rejected(_)),
+        "{:?}",
+        judged.response
+    );
+}

@@ -262,6 +262,9 @@ jobs:
               - 'rust-toolchain*'
               - 'scripts/upgrade-compat.sh'
               - 'scripts/live-chaos/gen-certs.sh'
+              # The metadata rolling upgrade (#554) runs the chaos harness.
+              - 'scripts/live-chaos/lib.sh'
+              - 'scripts/live-chaos/scenarios/22-meta-rolling-upgrade.sh'
               - '.github/workflows/ci.yml'
   build-and-test:
     name: fmt + clippy + test + build
@@ -1347,6 +1350,10 @@ jobs:
       - name: Build HEAD vtop-node
         run: cargo build -p vtop-node --bin vtop-node
 
+      # vtopctl drives the metadata-tier rolling upgrade below (#554).
+      - name: Build HEAD vtopctl
+        run: cargo build -p vtop-cli --no-default-features --bin vtopctl
+
       - name: Build the released tags
         run: |
           set -euo pipefail
@@ -1382,12 +1389,28 @@ jobs:
             port=$((port + 20))
           done
 
+      # The metadata tier rolled from the newest release to HEAD, one voter at
+      # a time, the way the chart rolls it (#554): every mixed step must keep
+      # committing and every voter must converge. Only the NEWEST release:
+      # upgrading from the immediately preceding release is the supported
+      # path. Plaintext on loopback - the transport is not what is under test.
+      - name: The metadata tier rolls from the newest release to HEAD
+        run: |
+          set -euo pipefail
+          newest="$(tr ' ' '\n' <<< "${{ steps.tags.outputs.list }}" | grep . | tail -1)"
+          CHAOS_PROFILE=debug CHAOS_TRANSPORT=plaintext CHAOS_KEEP=1 \
+            CHAOS_WORKDIR="$GITHUB_WORKSPACE/upgrade-meta" \
+            CHAOS_OLD_VTOP_NODE="target-old/$newest/debug/vtop-node" \
+            scripts/live-chaos/scenarios/22-meta-rolling-upgrade.sh
+
       - name: Upload fixture logs
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: upgrade-compat-logs
-          path: upgrade-v*/logs
+          path: |
+            upgrade-v*/logs
+            upgrade-meta/logs
           if-no-files-found: ignore
           retention-days: 7
 

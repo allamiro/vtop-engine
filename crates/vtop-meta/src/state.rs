@@ -65,6 +65,18 @@ const VALUE_TAG_RANGE_TRANSITION: u8 = 19;
 /// Records without either keep encoding as the legacy tags byte-for-byte.
 const VALUE_TAG_RANGE_V3: u8 = 20;
 const VALUE_TAG_LINEAGE_TRANSITION: u8 = 21;
+/// The cluster configuration record (#554). Written only once an operator
+/// raises the feature level, so a cluster that never does carries no record
+/// a v0.6 node cannot read.
+const VALUE_TAG_CLUSTER_CONFIG: u8 = 22;
+
+/// The durable cluster configuration (#554): today, the metadata feature
+/// level the cluster runs at. Absent means
+/// [`crate::command::BASELINE_FEATURE_LEVEL`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClusterConfigRecord {
+    pub feature_level: u32,
+}
 
 /// A registered broker/controller node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -519,6 +531,7 @@ pub enum MetaValue {
     TopicRetentionPolicy(TopicRetentionPolicyRecord),
     RangeTransition(RangeTransitionRecord),
     LineageTransition(LineageTransitionRecord),
+    ClusterConfig(ClusterConfigRecord),
 }
 
 impl MetaValue {
@@ -816,6 +829,10 @@ impl MetaValue {
                 put_u8(&mut out, VALUE_TAG_TOPIC_RETENTION_POLICY);
                 put_u64(&mut out, policy.generation);
                 put_u8(&mut out, u8::from(policy.unarchived_deletion_allowed));
+            }
+            MetaValue::ClusterConfig(config) => {
+                put_u8(&mut out, VALUE_TAG_CLUSTER_CONFIG);
+                put_u32(&mut out, config.feature_level);
             }
         }
         Ok(out)
@@ -1171,6 +1188,9 @@ impl MetaValue {
                     unarchived_deletion_allowed: reader.flag("unarchived deletion allowed")?,
                 })
             }
+            VALUE_TAG_CLUSTER_CONFIG => MetaValue::ClusterConfig(ClusterConfigRecord {
+                feature_level: reader.u32("feature level")?,
+            }),
             other => {
                 return Err(CodecError::UnknownTag {
                     what: "record value tag",
@@ -1202,6 +1222,38 @@ pub struct MetaStateMachine {
 impl MetaStateMachine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The metadata feature level the cluster runs at (#554).
+    pub fn feature_level(&self) -> u32 {
+        match self.record(&MetaKey::ClusterConfig) {
+            Some(MetaValue::ClusterConfig(config)) => config.feature_level,
+            _ => crate::command::BASELINE_FEATURE_LEVEL,
+        }
+    }
+
+    fn set_feature_level(&mut self, requested: u32) -> MetadataResponse {
+        if requested > crate::command::SUPPORTED_FEATURE_LEVEL {
+            return reject(MetadataError::invalid_transition(format!(
+                "feature level {requested} is newer than this release supports ({})",
+                crate::command::SUPPORTED_FEATURE_LEVEL
+            )));
+        }
+        let current = self.feature_level();
+        // Monotonic: never a downgrade. A level at or below the current one
+        // is already in force - an idempotent Ack, so a retried enable is
+        // not an error.
+        if requested > current {
+            self.records.insert(
+                MetaKey::ClusterConfig.encode(),
+                MetaValue::ClusterConfig(ClusterConfigRecord {
+                    feature_level: requested,
+                }),
+            );
+        }
+        MetadataResponse::Ack {
+            generation: u64::from(self.feature_level()),
+        }
     }
 
     /// Look up a record by typed key.
@@ -1397,6 +1449,9 @@ impl MetaStateMachine {
                 expected_fencing_epoch,
                 ..
             } => self.release_range_lease(*topic_uuid, *range_uuid, *expected_fencing_epoch),
+            MetadataCommand::SetFeatureLevel { feature_level, .. } => {
+                self.set_feature_level(*feature_level)
+            }
             MetadataCommand::SplitRange {
                 env,
                 topic_uuid,
@@ -5205,6 +5260,7 @@ fn key_matches_value(key: &MetaKey, value: &MetaValue) -> bool {
                 MetaKey::RangeTransition { .. },
                 MetaValue::RangeTransition(_)
             )
+            | (MetaKey::ClusterConfig, MetaValue::ClusterConfig(_))
     )
 }
 
@@ -5461,6 +5517,48 @@ mod tests {
             request_id: Uuid::from_u128(request),
             issued_at_ms: 0,
         }
+    }
+
+    /// #554: the feature level starts at the baseline, only rises, never past
+    /// what this build supports, and survives a snapshot. A cluster that
+    /// never raises it carries no record at all - nothing a v0.6 node could
+    /// not read.
+    #[test]
+    fn the_feature_level_rises_monotonically_and_is_snapshotted() {
+        use crate::command::{BASELINE_FEATURE_LEVEL, SUPPORTED_FEATURE_LEVEL};
+        let mut machine = MetaStateMachine::new();
+        assert_eq!(machine.feature_level(), BASELINE_FEATURE_LEVEL);
+        assert!(machine.record(&MetaKey::ClusterConfig).is_none());
+        let set = |request: u128, level: u32| MetadataCommand::SetFeatureLevel {
+            env: envelope(request),
+            feature_level: level,
+        };
+
+        let too_new = machine.apply(1, &set(1, SUPPORTED_FEATURE_LEVEL + 1));
+        assert!(
+            matches!(too_new, MetadataResponse::Rejected { .. }),
+            "{too_new:?}"
+        );
+        assert_eq!(machine.feature_level(), BASELINE_FEATURE_LEVEL);
+
+        assert_eq!(
+            machine.apply(2, &set(2, SUPPORTED_FEATURE_LEVEL)),
+            MetadataResponse::Ack {
+                generation: u64::from(SUPPORTED_FEATURE_LEVEL)
+            }
+        );
+        // No downgrade, and asking again is not an error.
+        assert_eq!(
+            machine.apply(3, &set(3, 1)),
+            MetadataResponse::Ack {
+                generation: u64::from(SUPPORTED_FEATURE_LEVEL)
+            }
+        );
+        assert_eq!(machine.feature_level(), SUPPORTED_FEATURE_LEVEL);
+
+        let restored =
+            MetaStateMachine::decode_snapshot(&machine.encode_snapshot().unwrap()).unwrap();
+        assert_eq!(restored.feature_level(), SUPPORTED_FEATURE_LEVEL);
     }
 
     fn envelope_at(request: u128, issued_at_ms: i64) -> CommandEnvelope {
