@@ -893,6 +893,8 @@ impl AdminClient {
             };
             if let Some(hint) = redirect_of(&frame) {
                 if let Some(leader) = follow(hint.leader, &asked) {
+                    self.redirects
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     asked[leader] = true;
                     match self.attempt(leader, &request).await {
                         Ok(frame) => next = Some((leader, frame)),
@@ -913,7 +915,18 @@ impl AdminClient {
                         return Err(TransportError::Protocol(error.message));
                     }
                     match self.status_of(index).await {
-                        Ok(status) if status.server_state == "Leader" => return Ok(None),
+                        // Its own word that it leads is local metrics, not
+                        // proof (review): a former leader cut off from its
+                        // quorum still says so. A linearizable read on the
+                        // SAME node - one an older release serves too -
+                        // completes only on a leader that still has its
+                        // quorum; only then does "predates" mean "none".
+                        Ok(status) if status.server_state == "Leader" => {
+                            match self.leadership_proven(index, topic_uuid, range_uuid).await {
+                                Ok(()) => return Ok(None),
+                                Err(error) => unresolved = Some(error),
+                            }
+                        }
                         Ok(status) => {
                             unresolved = Some(TransportError::Protocol(format!(
                                 "metadata node {} predates recorded replica sets and is not the \
@@ -941,6 +954,40 @@ impl AdminClient {
     fn answered(&self, index: usize) {
         if let Some(resolution) = self.resolutions.lock().expect("resolutions").get_mut(index) {
             resolution.stale = false;
+        }
+    }
+
+    /// Whether candidate `index` is the leader WITH its quorum: a linearizable
+    /// lease read on that node (an older release serves it too) completes
+    /// only then.
+    async fn leadership_proven(
+        &self,
+        index: usize,
+        topic_uuid: uuid::Uuid,
+        range_uuid: uuid::Uuid,
+    ) -> TransportResult<()> {
+        let frame = self
+            .attempt(
+                index,
+                &VtpmFrame {
+                    kind: KIND_ADMIN_READ_RANGE_LEASE_REQ,
+                    payload: AdminReadRangeLeaseRequest {
+                        topic_uuid,
+                        range_uuid,
+                    }
+                    .encode(),
+                },
+            )
+            .await?;
+        self.answered(index);
+        match frame.kind {
+            KIND_ADMIN_READ_RANGE_LEASE_RESP => Ok(()),
+            KIND_ADMIN_ERROR => Err(TransportError::Protocol(format!(
+                "metadata node {} says it leads but could not serve a linearizable read: {}",
+                self.candidates[index].endpoint,
+                AdminError::decode(&frame.payload)?.message
+            ))),
+            other => Err(TransportError::UnexpectedKind(other)),
         }
     }
 
@@ -1601,14 +1648,42 @@ mod tests {
     /// A metadata node that predates the replica-set read (#553): it refuses
     /// kind 27 the way a released server does, and answers status as
     /// `server_state` with `current_leader`.
-    async fn older_node(server_state: &'static str, current_leader: Option<u64>) -> SocketAddr {
+    async fn older_node(
+        server_state: &'static str,
+        current_leader: Option<u64>,
+        quorum: bool,
+    ) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 tokio::spawn(async move {
                     while let Ok(request) = read_frame(&mut stream).await {
-                        let reply = if request.kind == KIND_ADMIN_STATUS_REQ {
+                        let reply = if request.kind == KIND_ADMIN_READ_RANGE_LEASE_REQ && quorum {
+                            VtpmFrame {
+                                kind: KIND_ADMIN_READ_RANGE_LEASE_RESP,
+                                payload: AdminReadRangeLeaseResponse {
+                                    found: false,
+                                    range_generation: 0,
+                                    fencing_epoch: 0,
+                                    lease: None,
+                                    read_at_applied_index: 1,
+                                }
+                                .encode(),
+                            }
+                        } else if request.kind == KIND_ADMIN_READ_RANGE_LEASE_REQ {
+                            // Cut off from its quorum: a linearizable read
+                            // cannot complete.
+                            VtpmFrame {
+                                kind: KIND_ADMIN_ERROR,
+                                payload: AdminError {
+                                    message: "has to forward request to leader".to_owned(),
+                                    not_leader: None,
+                                }
+                                .encode()
+                                .unwrap(),
+                            }
+                        } else if request.kind == KIND_ADMIN_STATUS_REQ {
                             let mut status = stub_status(MetaNodeId(9));
                             status.server_state = server_state.to_owned();
                             status.current_leader = current_leader.map(MetaNodeId);
@@ -1697,7 +1772,7 @@ mod tests {
     async fn an_older_nodes_refusal_reads_as_no_set_only_from_the_leader() {
         let range = (Uuid::from_u128(1), Uuid::from_u128(2));
 
-        let old_leader = older_node("Leader", Some(1)).await;
+        let old_leader = older_node("Leader", Some(1), true).await;
         let read = candidates(&[(1, old_leader)])
             .read_range_replica_set(range.0, range.1)
             .await
@@ -1705,7 +1780,7 @@ mod tests {
         assert_eq!(read, None);
 
         let new_leader = recording_leader().await;
-        let old_follower = older_node("Follower", Some(2)).await;
+        let old_follower = older_node("Follower", Some(2), true).await;
         let read = candidates(&[(1, old_follower), (2, new_leader)])
             .read_range_replica_set(range.0, range.1)
             .await
@@ -1718,7 +1793,7 @@ mod tests {
         // The leader the old follower names (node 3) cannot be reached: the
         // read goes on to the members nobody has asked, and the current
         // leader among them answers (review).
-        let old_follower = older_node("Follower", Some(3)).await;
+        let old_follower = older_node("Follower", Some(3), true).await;
         let new_leader = recording_leader().await;
         let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let read = candidates(&[(1, old_follower), (2, new_leader), (3, unreachable)])
@@ -1727,7 +1802,18 @@ mod tests {
             .expect("another member answers when the named leader cannot");
         assert!(read.and_then(|response| response.replica_set).is_some());
 
-        let lost = older_node("Learner", None).await;
+        // A former leader cut off from its quorum still SAYS it leads, but
+        // cannot serve a linearizable read: unknown, never "none" (review).
+        let isolated = older_node("Leader", Some(1), false).await;
+        let refused = candidates(&[(1, isolated)])
+            .read_range_replica_set(range.0, range.1)
+            .await;
+        assert!(
+            matches!(&refused, Err(TransportError::Protocol(message)) if message.contains("could not serve a linearizable read")),
+            "{refused:?}"
+        );
+
+        let lost = older_node("Learner", None, true).await;
         let refused = candidates(&[(1, lost)])
             .read_range_replica_set(range.0, range.1)
             .await;

@@ -6053,7 +6053,7 @@ mod tests {
         let (mut plain, node, topic, parent) = leaseable_range(1);
         acquire(&mut plain, 3, 3, 1_000, node, topic, parent, 0, 10_000);
         let before = range_of(&plain, topic, parent);
-        split(
+        let response = split(
             &mut plain,
             4,
             4,
@@ -6066,6 +6066,11 @@ mod tests {
             before.generation,
             node,
             before.fencing_epoch,
+        );
+        // The split must LAND for "no record" to mean anything (review).
+        assert!(
+            matches!(response, MetadataResponse::Ack { .. }),
+            "{response:?}"
         );
         assert!(plain
             .range_replica_set(topic, Uuid::from_u128(0x41))
