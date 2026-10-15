@@ -303,6 +303,19 @@ pub struct CursorCheckpointRecord {
     pub committed_by_member: Uuid,
 }
 
+/// Where one consumer group's durable cursor stands on one range (#571).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupCursorPosition {
+    pub topic_uuid: Uuid,
+    /// `None` when the topic record is gone (the cursor outlived its topic).
+    pub topic_name: Option<String>,
+    pub range_uuid: Uuid,
+    pub group_uuid: Uuid,
+    pub group_name: Option<String>,
+    /// The next offset the group will read.
+    pub record_offset: u64,
+}
+
 /// Durable ordered replica set for a verified segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentPlacementRecord {
@@ -1495,6 +1508,61 @@ impl MetaStateMachine {
     /// Look up a record by typed key.
     pub fn record(&self, key: &MetaKey) -> Option<&MetaValue> {
         self.records.get(&key.encode())
+    }
+
+    /// Every durable consumer-group cursor, for observability (#571): at
+    /// most `limit` of them, in key order, and whether there were more. Group
+    /// cursor keys are contiguous (shard, category, then group, topic and
+    /// range), so this walks the cursors and nothing else - and stops one
+    /// past the limit: the caller holds the store lock, and counting every
+    /// remaining cursor would make a scrape hold it for as long as the
+    /// whole set takes to walk (review of #574).
+    pub fn group_cursor_positions(&self, limit: usize) -> (Vec<GroupCursorPosition>, bool) {
+        let prefix = MetaKey::GroupCursor {
+            group_uuid: Uuid::nil(),
+            topic_uuid: Uuid::nil(),
+            range_uuid: Uuid::nil(),
+        }
+        .encode()[..3]
+            .to_vec();
+        let mut positions = Vec::new();
+        for (key, value) in self
+            .records
+            .range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix))
+        {
+            let (
+                Ok(MetaKey::GroupCursor {
+                    group_uuid,
+                    topic_uuid,
+                    range_uuid,
+                }),
+                MetaValue::GroupCursor(cursor),
+            ) = (MetaKey::decode(key), value)
+            else {
+                continue;
+            };
+            if positions.len() >= limit {
+                return (positions, true);
+            }
+            let topic_name = match self.record(&MetaKey::Topic { topic_uuid }) {
+                Some(MetaValue::Topic(topic)) => Some(topic.name.clone()),
+                _ => None,
+            };
+            let group_name = match self.record(&MetaKey::Group { group_uuid }) {
+                Some(MetaValue::Group(group)) => Some(group.name.clone()),
+                _ => None,
+            };
+            positions.push(GroupCursorPosition {
+                topic_uuid,
+                topic_name,
+                range_uuid,
+                group_uuid,
+                group_name,
+                record_offset: cursor.record_offset,
+            });
+        }
+        (positions, false)
     }
 
     pub fn record_count(&self) -> usize {
@@ -5660,6 +5728,74 @@ fn reject(error: MetadataError) -> MetadataResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #571: the cursors a metrics scrape reads, with the topic and group
+    /// names the data plane's labels use, bounded, and nothing else.
+    #[test]
+    fn group_cursor_positions_name_their_topic_and_group_and_are_bounded() {
+        let mut machine = MetaStateMachine::new();
+        let (topic, range, group, orphan) = (
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            Uuid::from_u128(3),
+            Uuid::from_u128(4),
+        );
+        machine.records.insert(
+            MetaKey::Topic { topic_uuid: topic }.encode(),
+            MetaValue::Topic(TopicRecord {
+                name: "events".into(),
+                topic_epoch: 1,
+                generation: 0,
+            }),
+        );
+        machine.records.insert(
+            MetaKey::Group { group_uuid: group }.encode(),
+            MetaValue::Group(ConsumerGroupRecord {
+                name: "billing".into(),
+                generation: 0,
+            }),
+        );
+        let cursor = |offset: u64| {
+            MetaValue::GroupCursor(CursorCheckpointRecord {
+                topic_epoch: 1,
+                range_generation: 0,
+                segment_uuid: Uuid::from_u128(9),
+                segment_generation: 0,
+                segment_root: [0; 32],
+                record_offset: offset,
+                record_index: 0,
+                lineage_transition_id: None,
+                checkpoint_generation: 0,
+                committed_by_member: Uuid::from_u128(5),
+            })
+        };
+        for (group_uuid, offset) in [(group, 40), (orphan, 7)] {
+            machine.records.insert(
+                MetaKey::GroupCursor {
+                    group_uuid,
+                    topic_uuid: topic,
+                    range_uuid: range,
+                }
+                .encode(),
+                cursor(offset),
+            );
+        }
+
+        let (all, truncated) = machine.group_cursor_positions(100);
+        assert_eq!(all.len(), 2);
+        assert!(!truncated);
+        let named = all.iter().find(|p| p.group_uuid == group).unwrap();
+        assert_eq!(named.topic_name.as_deref(), Some("events"));
+        assert_eq!(named.group_name.as_deref(), Some("billing"));
+        assert_eq!((named.range_uuid, named.record_offset), (range, 40));
+        let unnamed = all.iter().find(|p| p.group_uuid == orphan).unwrap();
+        assert_eq!(unnamed.group_name, None, "a group record that is gone");
+
+        let (bounded, truncated) = machine.group_cursor_positions(1);
+        assert_eq!(bounded.len(), 1);
+        assert!(truncated, "there was a cursor past the bound");
+    }
+
     use crate::command::CommandEnvelope;
 
     fn envelope(request: u128) -> CommandEnvelope {
