@@ -171,8 +171,10 @@ slope). The log start is the SERVING replica's - the one holding the lease
 (`vtop_broker_boundary_pending` not 1) - because replicas reclaim
 independently: after a failover the leader can still hold records a follower
 has dropped, and the group fetches from the leader. The rate is taken over
-samples from while that replica served, not over its reclamation as a
-follower.
+samples from while that replica served, and only once it has served the whole
+30-minute window, so reclamation it did as a follower never counts; after a
+failover the near-eviction estimate starts 30 minutes later (the eviction page
+does not wait).
 
 | Rule | Fires when | For |
 |---|---|---|

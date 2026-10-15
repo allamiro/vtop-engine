@@ -583,9 +583,14 @@ groups:
               instant: true
               # The serving replica's log start and its rate (review of #574) -
               # the rate over samples taken WHILE it served (a subquery of the
-              # masked series), not over the reclamation it did as a follower.
+              # masked series), and only from a replica that served the WHOLE
+              # window: across a serve/follow/serve gap one regression would
+              # fit the reclamation it did as a follower as serving-time
+              # movement. After a failover the estimate starts once the new
+              # leader has served 30 minutes; the eviction page itself does
+              # not wait.
               expr: >-
-                ((max by (topic, range, group) (vtop_meta_group_cursor_offset) - on (topic, range) group_left max by (topic, range) (vtop_broker_log_start_offset * on (instance, topic, range) group_left () ((vtop_broker_lease_active == 1) unless on (instance, topic, range) (vtop_broker_boundary_pending == 1)))) / on (topic, range) group_left() (max by (topic, range) (deriv((vtop_broker_log_start_offset * on (instance, topic, range) group_left () ((vtop_broker_lease_active == 1) unless on (instance, topic, range) (vtop_broker_boundary_pending == 1)))[30m:1m])) > 0)) > 0
+                ((max by (topic, range, group) (vtop_meta_group_cursor_offset) - on (topic, range) group_left max by (topic, range) (vtop_broker_log_start_offset * on (instance, topic, range) group_left () ((vtop_broker_lease_active == 1) unless on (instance, topic, range) (vtop_broker_boundary_pending == 1)))) / on (topic, range) group_left() (max by (topic, range) (deriv((vtop_broker_log_start_offset * on (instance, topic, range) group_left () ((vtop_broker_lease_active == 1) unless on (instance, topic, range) (vtop_broker_boundary_pending == 1)))[30m:1m]) and on (instance, topic, range) (count_over_time(((vtop_broker_lease_active == 1) unless on (instance, topic, range) (vtop_broker_boundary_pending == 1))[30m:1m]) >= 29)) > 0)) > 0
               intervalMs: 1000
               maxDataPoints: 43200
           - refId: C
