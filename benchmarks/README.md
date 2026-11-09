@@ -374,7 +374,7 @@ profile chain does not.
 | `shaping_bottleneck_kbps` | **kilobits/s** | the `tbf` rate; requires a `shaping_buffer_bdp`, because tbf's queue *is* the bottleneck buffer and nobody should inherit a default one |
 | `shaping_buffer_bdp` | multiples of the BDP | bottleneck queue depth; requires both a rate and a latency, since the bandwidth-delay product is their product |
 | `shaping_policer_kbps` | **kilobits/s** | token-bucket policer on the ingress hook: drops above its rate, queues nothing |
-| `shaping_competitor` | `<mode>:<seconds>` | a plain-TCP bulk flow in the same bottleneck queue, measured alone / with VTOP / alone again — see below. Absent means no competitor and no columns; needs `shaping_driver: netem` **and** a `shaping_bottleneck_kbps` |
+| `shaping_competitor` | `<mode>:<seconds>` | a plain-TCP bulk flow in the same bottleneck queue, measured alone / with VTOP / alone again — see below. Absent means no competitor, and the competitor columns are written blank; needs `shaping_driver: netem` **and** a `shaping_bottleneck_kbps` |
 
 `shaping_buffer_bdp` is the **congestion** queue, and only that — enforced as
 `tbf`'s own byte `limit`, on a queue nothing else shares. The upload's `netem`
@@ -400,18 +400,19 @@ reordering are the same in both layouts.
 > unit travels with the number; a reader comparing the raw columns has to
 > convert deliberately.
 
-The three bundled netem scenarios all shape the same 10 Mbit/s, 100 ms link,
-so that they differ in what the middlebox does with a burst and in nothing
-else. Their workload is scenario 13's (400 small JSONL files, 50-record
+The bundled netem scenarios all shape the same 10 Mbit/s, 100 ms link.
+Scenarios 14-16 differ in what the middlebox does with a burst and in nothing
+else; their workload is scenario 13's (400 small JSONL files, 50-record
 batches, a 1.5x concurrent seeder, 300 s), so the numbers can be read beside
-it — the toxiproxy row's caveats included:
+it — the toxiproxy row's caveats included. Scenario 18 has a workload of its
+own (see its row and [The flow beside the upload](#the-flow-beside-the-upload-478)):
 
 | scenario | the link | what it measures |
 |---|---|---|
 | `14-lossy-wan` | 0.5% bursty (`gemodel`) loss, one BDP of buffer | non-congestive loss, where a loss-based control law settles near the inverse square root of the loss rate. Acceptance criterion: `object_upload` p95 at least **3x** the same file at zero loss — and the zero-loss control is that file with `shaping_loss_pct: 0` **and the `shaping_loss_model` line removed**, which the driver requires |
 | `15-policed-uplink` | a 10 Mbit/s policer, no queue at all | the edge-uplink case with **no queueing-delay signal**: the round trip stays flat while the link shreds bursts, so a delay-based control law degrades silently. The drops are the policer's, so the loss columns read 0 |
 | `16-contended-bottleneck` | four BDP of buffer, no loss | queue depth: what a batch waits behind when the buffer is deep (4 BDP = 400 ms of standing queue at this rate). **Not** fairness or contention — nothing here starts a second flow; `18-competing-flow` is that half |
-| `18-competing-flow` | one BDP of buffer, no loss, **a second flow** | what the upload costs its neighbour (#478): the engine runs at the shipped default of eight concurrent batches while a plain-TCP bulk flow shares the queue. One BDP and no loss, so it reads against `14-lossy-wan`'s zero-loss control with contention as the only new variable |
+| `18-competing-flow` | one BDP of buffer, no loss, **a second flow** | what the upload costs its neighbour (#478): the engine runs at the shipped default of eight concurrent batches while a plain-TCP bulk flow shares the queue. One BDP and no loss, the link of `14-lossy-wan`'s zero-loss control — but **not** its workload: 150 small JSONL files in batches of up to 5000 records, no concurrent seeder, 150 s, because with a sustained backlog and small batches the engine's cycles ran too long for one to fit wholly inside the 60 s window, and a window with no whole cycle is refused. Read it against its own solo windows, not against scenarios 13-16 |
 
 #### The calibration gate
 
@@ -452,9 +453,10 @@ back off from.
 
 `shaping_competitor: bulk:60` runs a plain-TCP bulk flow (`iperf3`, from the
 calibration probe's container to the iperf3 server the middlebox already runs)
-across the same ingress hook, the same policer and the same `tbf` queue as the
-upload. Three windows, in this order and inside **one** installation of the
-shape:
+across the same ingress hook and the same `tbf` queue as the upload. No
+policer: a competitor beside one is refused, because the policer drops ahead
+of the shared queue. Three windows, in this order and inside **one**
+installation of the shape:
 
 1. **competitor alone**, before the engine's clock starts;
 2. **competitor with VTOP**, opened once the seed exists so the window covers
@@ -613,8 +615,10 @@ number, because each of them produces a plausible result:
   intervals that meet at a boundary are contiguous, to within the rounding
   iperf3 prints its interval bounds at.
 
-A contended run costs roughly `3 x (window + 3 s)` of extra wall clock. Those
-solo seconds are the harness's rather than the engine's — VTOP is deliberately
+A contended run adds roughly `2 x (window + 3 s)` of wall clock beyond the
+engine's `duration_seconds` — the two solo windows, each with its omitted
+ramp; the contended window runs inside the engine's duration. Those solo
+seconds are the harness's rather than the engine's — VTOP is deliberately
 idle for both of them — so `duration_seconds` excludes them and the engine's
 throughput columns stay comparable with an uncontended run's. Each phase's own
 window is recorded in `summary.json` under `competitor`.

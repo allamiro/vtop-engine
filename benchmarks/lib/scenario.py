@@ -95,8 +95,8 @@ DEFAULTS: dict[str, Any] = {
     # bulk flow across the same netem bottleneck, measured alone, then beside
     # VTOP, then alone again — because the number that authorises a
     # concurrency knob is what the NEIGHBOUR got, not what VTOP got. Absent —
-    # the default — means no competitor and no columns; `<mode>:<seconds>`,
-    # e.g. `bulk:60`, means one. Flat and a single string, because the
+    # the default — means no competitor and blank competitor columns;
+    # `<mode>:<seconds>`, e.g. `bulk:60`, means one. Flat and a single string, because the
     # dependency-free fallback parser is flat by design. netem only: a
     # per-connection toxic gives two flows no shared queue, and lib/shaping.py
     # refuses the combination by name.

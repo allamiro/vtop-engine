@@ -53,8 +53,8 @@ shaping_buffer_bdp: 1.0
 # holds the loss end of the axis.
 #
 # THE COMPETING FLOW: a plain-TCP bulk flow for 60 s per phase, three
-# phases, run from the probe container across the same ingress hook, the
-# same policer and the same tbf as the upload. 60 s because the window has
+# phases, run from the probe container across the same ingress hook and
+# the same tbf as the upload (no policer: the runner refuses one here). 60 s because the window has
 # to outlast slow start (iperf3 omits the first 3 s of each phase) and the
 # batch cadence below by enough that neither dominates the average, and
 # because three of them plus the ramps cost about three and a half minutes
