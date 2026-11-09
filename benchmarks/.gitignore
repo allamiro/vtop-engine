@@ -2,6 +2,15 @@
 results/*
 !results/.gitkeep
 
+# Lab TLS material for the h3 proxy (#484) — minted by gen-h3-certs.sh, a
+# 30-day self-signed CA and one leaf. Generated, machine-local and short-lived;
+# a private key committed once is a private key in every clone forever.
+tls/
+
 # Python caches
 __pycache__/
 *.pyc
+
+# Written by gen-h3-certs.sh (the container must run as the key's owner),
+# and the place an operator puts their own lab credentials. Never committed.
+.env

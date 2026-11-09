@@ -36,6 +36,12 @@ first boot of a fresh volume, let it exit before starting a run
 `Exited (0)`) or the first upload can fail with `NoSuchBucket`. The buckets
 live in the named volume from then on, so this is a first-boot wait only.
 
+MinIO is built from source (`docker/minio/Dockerfile`) the first time and runs
+as an unprivileged user. A `bench-minio-data` volume left by the older
+root-run image is root-owned, and MinIO fails its health check on it: recreate
+it once with `docker compose -f benchmarks/docker-compose.benchmark.yml down
+-v`, which **deletes the volume and its objects**.
+
 ## 2. Generate seed data
 
 Seed data is generated automatically per scenario, but you can also produce it
@@ -280,7 +286,13 @@ side by side in one table get compared whatever the `shaping_driver` column
 says. `run_matrix.py` raises `IncomparableRuns` — before a single row is
 written — when a comparison spans two shaped drivers. A shaped row beside an
 *unshaped* one is fine: that is the comparison shaping exists for, and the
-columns say which is which.
+columns say which is which. The refusal is decided by the rows the runs
+actually produce, never by a prediction from the scenario files — a scenario
+that fails to run contributes no row and so no driver, whatever it declares.
+To make a real conflict cheap, the runs are ordered so that one scenario of
+each declared shaped driver goes first, and the matrix is refused the moment
+two drivers have produced rows, before the rest of the list starts. `--all`
+spans toxiproxy and netem, so with both labs up it stops after two runs.
 
 #### The middlebox, and why the shaping is not on the sender
 
@@ -299,8 +311,9 @@ without inspecting a single packet:
 - **Upload** — packets *arriving* on the engine-facing interface. A
   `tc police` action on that ingress hook drops everything above the policer's
   rate and holds nothing; what survives is redirected with `act_mirred` onto
-  an `ifb` device, where the bottleneck (`tbf`: the rate and the queue depth)
-  and the impairment (`netem`: half the delay, all of the loss) live.
+  an `ifb` device, where the impairment (`netem`: half the delay, all of the
+  loss) and, beneath it, the bottleneck (`tbf`: the rate and the queue depth)
+  live.
 - **Download** — packets *leaving* on that same interface: the other half of
   the round trip, carrying no loss and no rate limit.
 
@@ -362,6 +375,19 @@ profile chain does not.
 | `shaping_buffer_bdp` | multiples of the BDP | bottleneck queue depth; requires both a rate and a latency, since the bandwidth-delay product is their product |
 | `shaping_policer_kbps` | **kilobits/s** | token-bucket policer on the ingress hook: drops above its rate, queues nothing |
 
+`shaping_buffer_bdp` is the **congestion** queue, and only that — enforced as
+`tbf`'s own byte `limit`, on a queue nothing else shares. The upload's `netem`
+sits at the root and `tbf` is its child: a packet waits out its delay in
+netem's delay line and only then joins tbf's queue, so the delay line and the
+congestion queue are two qdiscs with two limits. (The other way round, a netem
+child replaces tbf's byte-limited queue with its own packet limit, which then
+has to hold the delay line too; whatever the line was not using at a given
+instant — every jitter draw short of its worst case — became congestion buffer
+no column records.) The delay line's packet limit is set far out of reach of
+what the line can hold, because a delay line is a length of wire, not a queue
+the emulated link has. Packet timing, where loss applies and jitter's
+reordering are the same in both layouts.
+
 > **The two rate keys disagree, and the disagreement is inherited.**
 > `shaping_bandwidth_kbps` — the toxiproxy driver's — is **KILOBYTES** per
 > second, because that is what toxiproxy's bandwidth toxic takes. Every netem
@@ -395,7 +421,12 @@ traffic beside it — and tears the shape down again so the measured block
 installs its own. The result is recorded as `emulator_validation_mbps` in
 `metrics.csv` and `summary.json`, and it is a **gate**: outside ±10% of the
 configured `shaping_bottleneck_kbps` the run is refused with a
-`CalibrationError` rather than recorded. A scenario with no bottleneck — the
+`CalibrationError` rather than recorded. The probe runs on the shape's
+impairment-free twin — the same rate, buffer and mean delay, without loss, the
+policer or jitter — because each of those lowers a TCP flow's goodput by
+design: jitter reorders packets, and on an honestly one-BDP queue a flow
+reading that reordering as loss measured below the 9.0 floor of a 10 Mbit/s
+link whose bucket was delivering its rate. A scenario with no bottleneck — the
 policer in scenario 15 — still records the probe but is not gated on it, since
 a TCP flow through a policer lands well below the token rate by design and a
 band around that rate would refuse every policed run.
@@ -422,6 +453,126 @@ against that one, on the same driver, on the same machine, close together in
 time. It does not say what the engine would do over a real WAN of the same
 nominal rate, and the ±10% calibration band bounds the emulator's error, not
 the claim.
+### The HTTP/3 counterparty, and the topology it adds (#484)
+
+Neither the lab's MinIO nor AWS S3's own endpoint serves HTTP/3, so the
+datagram half of the egress epic (#475) has nothing to measure against until
+the lab provides a counterparty itself. The `h3` profile is that counterparty:
+an nginx reverse proxy terminating TLS on `127.0.0.1:9443` — TCP **and** UDP —
+and forwarding to the same MinIO every other scenario uses. It is a lab
+fixture. Whether a production deployment would want a terminating proxy in
+front of its store is a different question and is not answered here.
+
+```bash
+benchmarks/gen-h3-certs.sh                      # 30-day self-signed CA + leaf, git-ignored
+docker compose -f benchmarks/docker-compose.benchmark.yml --profile h3 up -d
+benchmarks/verify-h3.sh                         # proves HTTP/3 is negotiated
+python3 benchmarks/run_benchmark.py benchmarks/scenarios/17-proxy-hop-tcp-baseline.yaml
+docker compose -f benchmarks/docker-compose.benchmark.yml --profile h3 down
+```
+
+Four things about it are easy to get wrong quietly, so each is mechanical:
+
+- **TLS is not optional.** HTTP/3 has no plaintext form, so unlike toxiproxy
+  this hop cannot be an `http://` listener. `gen-h3-certs.sh` mints the
+  material into `benchmarks/tls/` (git-ignored; the compose mounts refuse to
+  invent a missing file, so a forgotten run fails at `up` rather than deep
+  inside nginx). The proxy is handed the leaf certificate and its key as two
+  single-file mounts and never the directory: `ca-key.pem` sits beside them,
+  the proxy runs as the owner of both keys, and a proxy that could read the CA
+  signing key could mint certificates the benchmark client trusts. Because
+  those mounts are bound to the file and not the name, **restart the proxy
+  after a run that says `action=minted`** —
+  `docker compose -f benchmarks/docker-compose.benchmark.yml --profile h3 restart h3-proxy` —
+  or it keeps serving the old leaf against the new CA. The engine's `verify_tls: false` permits plaintext endpoints
+  and does **not** relax certificate verification, so the runner exports
+  `SSL_CERT_FILE` pointing at that CA for scenarios that declare the hop — and
+  leaves an operator's own `SSL_CERT_FILE` alone if one is already exported.
+- **A scenario must declare the hop, and is then held to it.** `h3_proxy: true`
+  is what lets the harness treat loopback 9443 as the lab store; loopback 9443
+  is otherwise an entirely ordinary address for somebody else's TLS service,
+  and handing it the lab's credentials would outrank the identity its operator
+  brought. Declaring the hop and then dialling the store directly — through
+  `VTOP_S3_ENDPOINT_URL`, or by editing the endpoint and forgetting the
+  declaration — is refused before a seed byte exists.
+- **The proxy must actually be serving HTTP/3.** A silent downgrade to TCP
+  would leave every scenario passing and every later transport comparison
+  measuring TCP against itself. `verify-h3.sh` establishes an HTTP/3 connection
+  with a QUIC client, checks the negotiated ALPN, and cross-checks the protocol
+  nginx **logged** for that same request; it then runs two controls — a
+  plain-TCP fetch whose log line must not read `HTTP/3.0`, and the same probe
+  against a port with no QUIC listener, which must fail. It exits non-zero and
+  says what it saw if any of that does not hold.
+- **The published port can move, and the authority has to move with it.** 9443
+  is an unremarkable choice for somebody else's TLS service, so `VTOP_H3_PORT`
+  republishes the proxy elsewhere — set it once and the publish, the harness
+  endpoints and `verify-h3.sh` all follow it. Either way of setting it counts:
+  exported in the shell, or filed in `benchmarks/.env`, which compose
+  auto-loads and which is the form that survives a new terminal. Both are
+  resolved the way compose resolves them — the shell first, then the file, then
+  the default — by `lib/dotenv.sh` for the scripts and `engine._compose_value`
+  for the harness, so a filed override cannot move the proxy while everything
+  that has to find it goes on looking at 9443. Only the HOST side moves:
+  nginx keeps listening on 9443, because `Alt-Svc` names a single port for
+  HTTP/3 and the container's TCP and UDP listeners have to agree. What does
+  follow the override is the *authority*, and it matters more than it looks.
+  An S3 client signs the host **and port** into its SigV4 signature, and nginx
+  leaves `$http_host` empty on HTTP/3 — so the proxy rebuilds that header, and
+  a rebuild carrying the listener's port instead of the dialled one makes MinIO
+  reject every signature with `SignatureDoesNotMatch`, which reads as a
+  credential bug. nginx cannot discover its own publish, so compose hands it in
+  as `VTOP_H3_ADVERTISED_PORT` and the image renders `nginx-h3.conf.template`
+  at start-up. `verify-h3.sh` checks the forwarded `Host` and the advertised
+  port on every run, on both wires.
+
+```bash
+# once, in benchmarks/.env — compose auto-loads it and everything follows
+echo VTOP_H3_PORT=9543 >> benchmarks/.env
+
+# or per command, which outranks the file exactly as it does for compose
+VTOP_H3_PORT=9543 docker compose -f benchmarks/docker-compose.benchmark.yml --profile h3 up -d
+VTOP_H3_PORT=9543 benchmarks/verify-h3.sh
+VTOP_H3_PORT=9543 python3 benchmarks/run_benchmark.py benchmarks/scenarios/17-proxy-hop-tcp-baseline.yaml
+```
+
+`gen-h3-certs.sh` also writes `VTOP_BENCH_UID`/`VTOP_BENCH_GID` into
+`benchmarks/.env`: the private key is mode 0600 and the proxy container runs as
+whatever that pair says, so it has to be the key's owner or nginx dies reading
+its own certificate. The ids are added once and never rewritten — if the
+identity compose would resolve disagrees with the key's owner, the script
+refuses and names both, rather than leaving a stale id to surface later as a
+proxy that will not start. It judges what compose will actually use, so an
+exported `VTOP_BENCH_UID` is checked too and the refusal says which of the two
+places the value came from: an exported value cannot be corrected by editing
+the file. Two identities are refused outright rather than filed. A pair that
+cannot read the key is one. Root is the other: mint the material as an
+unprivileged user, because a root nginx under `cap_drop: [ALL]` dies chowning
+its temp paths long before it reads a certificate — so `VTOP_BENCH_UID=0`
+would only move the failure somewhere that cannot explain it. A root run that
+would mint is refused before it creates anything, so re-running as the right
+user just works; material that already belongs to root is refused on reuse,
+with the whole directory to hand over (`chown -R`) or remove.
+
+`17-proxy-hop-tcp-baseline.yaml` is scenario 12 through the proxy on the
+existing TCP path, and the two scenario files differ only where the topology
+does. That pair — 17 against 12 — is what the proxy hop costs, and 17 is the
+number any later transport comparison has to use as its baseline; comparing a
+datagram run against scenario 12 instead would credit the wire with an extra
+process, an extra TLS termination and an extra copy of every byte.
+
+Read the 17-vs-12 difference for what it is, though: it is not the hop alone.
+Scenario 12 reaches the lab store over plaintext HTTP/1.1, and a proxy that can
+serve HTTP/3 cannot be plaintext, so scenario 17 also pays TLS termination and
+whatever ALPN the shipped SDK negotiates against it — on this lab stack the AWS
+SDK settles on HTTP/2, which the proxy's access log records per request. No
+proxied baseline can avoid that (HTTP/3 has no plaintext form), which is one
+more reason the datagram comparison belongs against scenario 17 rather than
+scenario 12: both of its sides cross the same proxy on the same TLS.
+
+Runner mode is host-only for this profile: the lab CA lives on the host and the
+hardened engine container mounts only the binary and the run root, so
+`runner_mode: container` with `h3_proxy: true` is refused rather than left to
+fail at the handshake as something that reads like a proxy fault.
 
 ## 8. Clean benchmark data
 
@@ -481,6 +632,7 @@ automatically picks it up.
 | Runtime duration | ✅ any (`duration_seconds`) | 5 min / 30 min / 1 h presets easy to add |
 | Sustained backpressure | ✅ `seed_concurrently` + `backlog_multiplier` | a real deficit, not just sustained load — scenario `11-backpressure-soak` (#98) |
 | Bandwidth-shaped upload | ✅ toxiproxy on the `shaped` profile, `shaping_*` keys | the upload link as the bottleneck — scenario `13-backpressure-soak-shaped` (#403) |
+| Proxy hop in front of the store | ✅ nginx on the `h3` profile, `h3_proxy: true` | the topology control a transport comparison needs, and the lab's only HTTP/3 counterparty — scenario `17-proxy-hop-tcp-baseline` (#484) |
 
 ## Native segment write amp / proof overhead (#189)
 

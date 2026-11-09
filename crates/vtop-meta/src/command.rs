@@ -12,15 +12,31 @@
 //! `issued_at_ms` is advisory for every command EXCEPT the lease-election pair
 //! ([`MetadataCommand::AcquireRangeLease`] and
 //! [`MetadataCommand::RenewRangeLease`], #223), where it is the time the
-//! deadline is computed from. Apply stays deterministic either way — the value
-//! is data in the replicated log, so every replica derives the same expiry —
-//! but wall-clock skew on a PROPOSER does affect lease liveness, and pretending
-//! otherwise would be the kind of comment that costs someone an afternoon.
+//! deadline is computed from AND the time an incumbent's lease is judged live
+//! against. Apply stays deterministic either way — the value is data in the
+//! replicated log, so every replica derives the same expiry.
+//!
+//! That value comes from the PROPOSER's wall clock, which used to be trusted
+//! without limit: one data node with a bad clock could steal live leases
+//! (clock ahead: every rival looked expired) or poison its own (clock ahead
+//! while holding: the deadline sat in the future, and after it died nobody
+//! could take over until the skew elapsed) (#555). The metadata leader now
+//! REFUSES a lease request whose clock is further from its own than a bound
+//! ([`MetadataCommand::lease_clock_skew`]), before the command is replicated.
+//! A node with a bad clock cannot acquire or renew at all — loudly, with the
+//! skew in the error — instead of silently moving a deadline.
+//!
+//! It is refused, not overwritten, on purpose: the lease agent compares the
+//! recorded deadline with its own clock to decide whether to renew, so a
+//! deadline silently moved into the leader's clock domain would make a
+//! fast-clocked holder see its fresh lease as lapsed and re-acquire it, minting
+//! epochs every round. Within the bound the proposer's value is kept, so the
+//! error either side can make is at most the bound.
 //!
 //! Skew is bounded in consequence, not prevented: acquisition always mints a
-//! higher fencing epoch, so a skewed candidate can take a range early and be
-//! disruptive, but can never produce two holders that both believe they may
-//! write. Expiry is liveness; the epoch is safety.
+//! higher fencing epoch, so a skewed clock can make a range change hands
+//! earlier or later than intended, but can never produce two holders that both
+//! believe they may write. Expiry is liveness; the epoch is safety.
 
 use crate::keys::{MAX_GROUP_NAME_BYTES, MAX_TOPIC_NAME_BYTES};
 use crate::placement::{MAX_FAILURE_DOMAIN_BYTES, MAX_REPLICAS, MIN_PLACEMENT_WEIGHT};
@@ -93,6 +109,30 @@ const COMMAND_KIND_ENSURE_GROUP_MEMBER_FOR_RANGE: u16 = 32;
 const COMMAND_KIND_COMMIT_GROUP_CURSOR_COORDINATED: u16 = 33;
 const COMMAND_KIND_ENSURE_GROUP_MEMBER_COORDINATED: u16 = 34;
 const COMMAND_KIND_SPLIT_RANGE: u16 = 35;
+const COMMAND_KIND_SET_FEATURE_LEVEL: u16 = 36;
+const COMMAND_KIND_SET_RANGE_REPLICA_SET: u16 = 37;
+
+/// The metadata feature level of a cluster that has never recorded one: the
+/// command set of v0.6.0, the last release before levels existed (#554).
+///
+/// A command kind an old voter does not know fails to decode, and with it the
+/// whole AppendEntries batch carrying it: a leader that proposes one during a
+/// rolling upgrade leaves every old voter unable to append. So a command
+/// newer than the cluster's level is refused BEFORE it reaches the log, and
+/// the level is raised - by [`MetadataCommand::SetFeatureLevel`], once every
+/// voter runs a release that knows it - never implied by the leader's build.
+pub const BASELINE_FEATURE_LEVEL: u32 = 3;
+
+/// The highest feature level this build understands.
+///
+/// Raise it, and give the new kinds that level in
+/// [`MetadataCommand::feature_level`], whenever a release adds anything an
+/// older voter cannot read: a command kind, a snapshot record tag, or a
+/// change to what an existing command does when applied (gate the new
+/// behaviour on the recorded level, so every replica applies the same
+/// thing). `every_kind_newer_than_the_baseline_release_is_gated` catches a
+/// kind that forgets; the other two are on the author.
+pub const SUPPORTED_FEATURE_LEVEL: u32 = 5;
 
 /// Why a fenced cursor commit is refused (#457 slice 2b): the commit did not
 /// come from the range's current leaseholder at its current fencing epoch. A
@@ -126,14 +166,104 @@ const ERROR_KIND_LINEAGE_MISMATCH: u16 = 7;
 /// Common prefix of every command. `request_id` keys the exactly-once dedup
 /// table.
 ///
-/// `issued_at_ms` comes from the proposer's clock. It is advisory for every
-/// command except the lease-election pair (#223), which derives a lease
-/// deadline from it — see the module docs for what that does and does not
-/// expose to clock skew.
+/// `issued_at_ms` is advisory for every command except the lease-election pair
+/// (#223), which derives a lease deadline from it. For that pair the metadata
+/// leader refuses a value too far from its own clock before the command is
+/// replicated (#555) — see the module docs.
+///
+/// Every other command keeps the proposer's value as an audit timestamp: no
+/// decision in the state machine reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandEnvelope {
     pub request_id: Uuid,
     pub issued_at_ms: i64,
+}
+
+/// The smallest clock error between a lease proposer and the metadata leader
+/// that is always tolerated, whatever the lease length. A request spends
+/// time on the wire and in a queue, and NTP-synchronised hosts agree to
+/// milliseconds; one second is far above both and far below any lease.
+pub const MIN_LEASE_SKEW_BOUND_MS: u64 = 1_000;
+
+/// The clock error tolerated between a lease proposer and the metadata leader
+/// for a lease of `lease_duration_ms`: a twentieth of the lease, never less
+/// than [`MIN_LEASE_SKEW_BOUND_MS`] - except that it is never more than a
+/// tenth of the lease, which for a lease under ten seconds is below the floor
+/// and wins.
+///
+/// A deadline is the proposer's `issued_at_ms` plus the lease, and a rival's
+/// acquire is judged against it by the rival's own `issued_at_ms`. A holder
+/// slow by the bound and a rival fast by it therefore see a lease that is
+/// shorter, in real time, by TWICE the bound - which the holder's renewal
+/// pacing must absorb on top of a lost round
+/// (`LeaseAgentConfig::validate`). At a quarter of the lease, as it was, the
+/// default 15 s lease kept only 7.5 s, less than one lost 5 s round plus its
+/// retry (review of #566). NTP-synchronised hosts agree to milliseconds, so
+/// the floor is still far above honest error. The cap keeps the two-sided
+/// loss to a fifth of any lease: the live-chaos pacing (6 s lease, 2 s renew,
+/// 0.5 s poll) keeps 4.8 s against the 4.5 s one lost round needs, where the
+/// floor alone would leave 4 s.
+///
+/// The skew is measured when the request reaches the leader, so time on the
+/// wire counts against it, always in the direction of the proposer looking
+/// behind. A request whose timestamp is older than the tolerated skew when it
+/// arrives is refused and retried next round with a fresh one; its deadline
+/// is not yet stale, but it can no longer be told apart from a slow clock.
+pub fn lease_skew_bound_ms(lease_duration_ms: u64) -> u64 {
+    (lease_duration_ms / 20)
+        .max(MIN_LEASE_SKEW_BOUND_MS)
+        .min(lease_duration_ms / 10)
+}
+
+/// How far a lease proposer's clock was from the metadata leader's, against
+/// what the leader tolerates for that request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeaseClockSkew {
+    /// The request this was measured for, so a caller can tell a request that
+    /// already committed (answered from the dedup table) from a new one.
+    pub request_id: Uuid,
+    /// Proposer's `issued_at_ms` minus the leader's clock. Positive: the
+    /// proposer is ahead.
+    pub skew_ms: i64,
+    /// The largest error tolerated for this request.
+    pub bound_ms: u64,
+}
+
+impl LeaseClockSkew {
+    pub fn is_within_bound(&self) -> bool {
+        self.skew_ms.unsigned_abs() <= self.bound_ms
+    }
+}
+
+impl MetadataCommand {
+    /// For the lease-election pair, how far the proposer's clock is from
+    /// `leader_now_ms` and how much the leader tolerates; `None` for every
+    /// other command, whose outcome never reads `issued_at_ms`.
+    ///
+    /// The tolerance is [`lease_skew_bound_ms`] of the requested lease. A
+    /// proposer's error then moves a deadline by at most that much, and two
+    /// proposers' errors move a takeover by at most twice it, which
+    /// `LeaseAgentConfig::validate` counts against the renewal pacing.
+    pub fn lease_clock_skew(&self, leader_now_ms: i64) -> Option<LeaseClockSkew> {
+        let (env, lease_duration_ms) = match self {
+            MetadataCommand::AcquireRangeLease {
+                env,
+                lease_duration_ms,
+                ..
+            }
+            | MetadataCommand::RenewRangeLease {
+                env,
+                lease_duration_ms,
+                ..
+            } => (env, *lease_duration_ms),
+            _ => return None,
+        };
+        Some(LeaseClockSkew {
+            request_id: env.request_id,
+            skew_ms: env.issued_at_ms.saturating_sub(leader_now_ms),
+            bound_ms: lease_skew_bound_ms(lease_duration_ms),
+        })
+    }
 }
 
 /// Lifecycle state of a registered node.
@@ -858,9 +988,63 @@ pub enum MetadataCommand {
         segment_uuid: Uuid,
         expected_segment_generation: u64,
     },
+    /// Raise the cluster's metadata feature level (#554), enabling the
+    /// command kinds up to it. Monotonic: a level at or below the current
+    /// one is an idempotent Ack, never a downgrade. Refused above
+    /// [`SUPPORTED_FEATURE_LEVEL`].
+    ///
+    /// The one command the feature gate does not hold back, because it is
+    /// how the gate opens - and the one an operator must only send once
+    /// EVERY metadata voter runs a release that knows it (this kind is
+    /// itself new at level 4): an old voter cannot decode it, exactly as it
+    /// could not decode the commands it unlocks.
+    SetFeatureLevel {
+        env: CommandEnvelope,
+        feature_level: u32,
+    },
+    /// Record the replica set a range's quorum is counted over (#553).
+    ///
+    /// Each data node used to size its quorum from its own configuration, so
+    /// growing a set by rolling nodes could leave a node counting a majority
+    /// of a set the others never shared - two majorities with no node in
+    /// common, and acknowledged records overwritten. With a recorded set, a
+    /// candidate whose configured set differs refuses to promote. A change
+    /// adds or removes exactly ONE member (consecutive sets' majorities then
+    /// always intersect), clears the range's lease so it is re-won under the
+    /// new set, and is refused until a promotion under the set it replaces
+    /// shows the leader's whole log on a majority of that set (see
+    /// `MetaStateMachine::established_under`). CAS'd on the record's
+    /// generation (0: none yet).
+    SetRangeReplicaSet {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        members: Vec<Uuid>,
+        expected_generation: u64,
+    },
 }
 
 impl MetadataCommand {
+    /// The feature level a cluster must be at before this command may enter
+    /// the log (#554): the level of the release that introduced its kind.
+    pub fn feature_level(&self) -> u32 {
+        match self {
+            // v0.5.0 (#240 item 5).
+            MetadataCommand::ReportPromotionOutcome { .. } => 2,
+            // v0.6.0 (#457 slices 2b and 4a).
+            MetadataCommand::CommitGroupCursorFenced { .. }
+            | MetadataCommand::EnsureGroupMemberForRange { .. }
+            | MetadataCommand::CommitGroupCursorCoordinated { .. }
+            | MetadataCommand::EnsureGroupMemberCoordinated { .. } => 3,
+            // After v0.6.0: the split (#473) and the gate itself.
+            MetadataCommand::SplitRange { .. } | MetadataCommand::SetFeatureLevel { .. } => 4,
+            // The recorded replica set (#553).
+            MetadataCommand::SetRangeReplicaSet { .. } => 5,
+            // Everything v0.4.0 already knew.
+            _ => 1,
+        }
+    }
+
     pub fn envelope(&self) -> &CommandEnvelope {
         match self {
             MetadataCommand::RegisterNode { env, .. }
@@ -897,7 +1081,9 @@ impl MetadataCommand {
             | MetadataCommand::SetTopicRetentionPolicy { env, .. }
             | MetadataCommand::PlanRetention { env, .. }
             | MetadataCommand::ConfirmRetentionExpired { env, .. }
-            | MetadataCommand::CancelRetention { env, .. } => env,
+            | MetadataCommand::CancelRetention { env, .. }
+            | MetadataCommand::SetFeatureLevel { env, .. }
+            | MetadataCommand::SetRangeReplicaSet { env, .. } => env,
         }
     }
 
@@ -1037,6 +1223,25 @@ impl MetadataCommand {
                 put_u64(&mut out, *expected_range_generation);
                 put_uuid(&mut out, *holder_node_uuid);
                 put_u64(&mut out, *fencing_epoch);
+            }
+            MetadataCommand::SetFeatureLevel { env, feature_level } => {
+                put_u16(&mut out, COMMAND_KIND_SET_FEATURE_LEVEL);
+                encode_envelope(&mut out, env);
+                put_u32(&mut out, *feature_level);
+            }
+            MetadataCommand::SetRangeReplicaSet {
+                env,
+                topic_uuid,
+                range_uuid,
+                members,
+                expected_generation,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_SET_RANGE_REPLICA_SET);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                encode_uuid_list(&mut out, members, MAX_REPLICAS, "replica set members")?;
+                put_u64(&mut out, *expected_generation);
             }
             MetadataCommand::RegisterSealedSegment {
                 env,
@@ -1670,6 +1875,17 @@ impl MetadataCommand {
                 expected_range_generation: reader.u64("expected range generation")?,
                 holder_node_uuid: reader.uuid("holder node uuid")?,
                 fencing_epoch: reader.u64("fencing epoch")?,
+            }),
+            COMMAND_KIND_SET_FEATURE_LEVEL => Ok(MetadataCommand::SetFeatureLevel {
+                env: decode_envelope(reader)?,
+                feature_level: reader.u32("feature level")?,
+            }),
+            COMMAND_KIND_SET_RANGE_REPLICA_SET => Ok(MetadataCommand::SetRangeReplicaSet {
+                env: decode_envelope(reader)?,
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                members: decode_uuid_list(reader, MAX_REPLICAS, "replica set members")?,
+                expected_generation: reader.u64("expected replica set generation")?,
             }),
             COMMAND_KIND_REGISTER_SEALED_SEGMENT => Ok(MetadataCommand::RegisterSealedSegment {
                 env: decode_envelope(reader)?,
@@ -2467,6 +2683,92 @@ mod tests {
         }
     }
 
+    /// #555: only the lease-election pair has a clock to check, and the bound
+    /// is a quarter of the requested lease, never less than the floor.
+    #[test]
+    fn only_the_lease_election_pair_has_a_clock_skew_to_check() {
+        const LEADER_NOW: i64 = 1_750_000_000_000;
+        let mut checked = 0;
+        for command in every_command() {
+            let skew = command.lease_clock_skew(LEADER_NOW);
+            match &command {
+                MetadataCommand::AcquireRangeLease {
+                    env,
+                    lease_duration_ms,
+                    ..
+                }
+                | MetadataCommand::RenewRangeLease {
+                    env,
+                    lease_duration_ms,
+                    ..
+                } => {
+                    checked += 1;
+                    let skew = skew.expect("the lease pair is checked");
+                    assert_eq!(skew.skew_ms, env.issued_at_ms - LEADER_NOW);
+                    assert_eq!(skew.bound_ms, lease_skew_bound_ms(*lease_duration_ms));
+                }
+                _ => assert_eq!(skew, None, "{command:?} never reads issued_at_ms"),
+            }
+        }
+        assert_eq!(
+            checked, 2,
+            "both lease-election commands are in the fixture"
+        );
+    }
+
+    #[test]
+    fn the_skew_bound_is_a_twentieth_of_the_lease_with_a_floor_and_a_cap_and_is_symmetric() {
+        // The two-sided loss stays inside a fifth of every lease, so pacing
+        // can be validated against it (review of #566).
+        for lease in [500, 1_000, 6_000, 10_000, 15_000, 60_000, 600_000] {
+            assert!(2 * lease_skew_bound_ms(lease) <= lease / 5, "{lease}");
+        }
+        let acquire =
+            |issued_at_ms: i64, lease_duration_ms: u64| MetadataCommand::AcquireRangeLease {
+                env: CommandEnvelope {
+                    request_id: Uuid::from_u128(1),
+                    issued_at_ms,
+                },
+                topic_uuid: Uuid::from_u128(2),
+                range_uuid: Uuid::from_u128(3),
+                holder_node_uuid: Uuid::from_u128(4),
+                expected_range_generation: 0,
+                lease_duration_ms,
+            };
+        let within = |issued_at_ms: i64, lease_ms: u64| {
+            acquire(issued_at_ms, lease_ms)
+                .lease_clock_skew(1_000_000)
+                .unwrap()
+                .is_within_bound()
+        };
+        // 15 s lease: the 1 s floor either way (a twentieth is 750 ms).
+        assert!(within(1_000_000, 15_000));
+        assert!(within(1_001_000, 15_000));
+        assert!(within(999_000, 15_000));
+        assert!(!within(1_001_001, 15_000), "just ahead of the bound");
+        assert!(!within(998_999, 15_000), "just behind it");
+        // 60 s lease: a twentieth, 3 s.
+        assert!(within(1_003_000, 60_000));
+        assert!(!within(1_003_001, 60_000));
+        // Under ten seconds the cap, a tenth of the lease, is below the floor
+        // and wins: two proposers' errors can eat at most a fifth of it. A
+        // rival 900 ms fast against a 500 ms lease is refused (review of
+        // #566).
+        assert!(within(1_000_600, 6_000));
+        assert!(!within(1_000_601, 6_000));
+        assert!(
+            within(1_001_000, 10_000),
+            "the floor and the cap meet at 10 s"
+        );
+        assert!(!within(1_001_001, 10_000));
+        assert!(within(1_000_050, 500));
+        assert!(!within(1_000_051, 500));
+        assert!(!within(1_000_900, 500));
+        // Extremes cannot overflow.
+        assert!(!within(i64::MAX, 15_000));
+        assert!(!within(i64::MIN, 15_000));
+    }
+
     fn every_command() -> Vec<MetadataCommand> {
         vec![
             MetadataCommand::RegisterNode {
@@ -2733,6 +3035,21 @@ mod tests {
                 segment_uuid: Uuid::from_u128(30),
                 expected_segment_generation: 2,
             },
+            MetadataCommand::SetFeatureLevel {
+                env: envelope(36),
+                feature_level: SUPPORTED_FEATURE_LEVEL,
+            },
+            MetadataCommand::SetRangeReplicaSet {
+                env: envelope(37),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                members: vec![
+                    Uuid::from_u128(10),
+                    Uuid::from_u128(11),
+                    Uuid::from_u128(12),
+                ],
+                expected_generation: 0,
+            },
             MetadataCommand::AcquireRangeLease {
                 env: envelope(31),
                 topic_uuid: Uuid::from_u128(20),
@@ -2890,6 +3207,39 @@ mod tests {
             MetadataResponse::Rejected(MetadataError::invalid_transition("dead -> active")),
             MetadataResponse::Rejected(MetadataError::limit("too many ranges")),
         ]
+    }
+
+    /// #554: a command kind an older voter does not know must not enter the
+    /// log until the cluster's level says every voter does. So every kind
+    /// added after v0.6.0 (the last release before levels: kinds 1..=34)
+    /// carries a level above the baseline, and a future kind that forgets
+    /// one fails here rather than stalling a rolling upgrade.
+    #[test]
+    fn every_kind_newer_than_the_baseline_release_is_gated() {
+        const LAST_BASELINE_KIND: u16 = 34;
+        let mut seen = std::collections::BTreeSet::new();
+        for command in every_command() {
+            let bytes = command.encode().unwrap();
+            let kind = u16::from_be_bytes([bytes[0], bytes[1]]);
+            seen.insert(kind);
+            let level = command.feature_level();
+            assert!(
+                (1..=SUPPORTED_FEATURE_LEVEL).contains(&level),
+                "kind {kind}: level {level}"
+            );
+            assert_eq!(
+                kind > LAST_BASELINE_KIND,
+                level > BASELINE_FEATURE_LEVEL,
+                "kind {kind} has level {level}; kinds after {LAST_BASELINE_KIND} must be gated \
+                 above the baseline {BASELINE_FEATURE_LEVEL}, and older ones must not be"
+            );
+        }
+        let highest = *seen.last().unwrap();
+        assert_eq!(
+            seen.len(),
+            usize::from(highest),
+            "every kind 1..={highest} must be in every_command, or this check is blind to it"
+        );
     }
 
     #[test]

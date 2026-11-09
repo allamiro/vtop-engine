@@ -33,12 +33,14 @@ fi
 # keys live, which the rule names explicitly. A gate with an unscanned
 # surface is a gate with a documented way around it. Paths that do not
 # exist under ROOT are skipped so the check runs unchanged in the test's
-# miniature tree.
+# miniature tree. `.claude` holds the repo's assistant skills (review finding,
+# #551): they are authored prose about this product, so a mark there is the
+# same source-identifying use as one in a doc.
 scanned=(crates helm examples benchmarks observability docker scripts
     tests fuzz README.md Cargo.toml docs
     docker-compose.yml docker-compose.observability.yml .env.example
     CONTRIBUTING.md COMMERCIAL.md LICENSE-EE
-    .github .cargo deny.toml)
+    .github .cargo .claude deny.toml)
 
 # The ONLY documents that may name commercial marks, because naming them is
 # their job — two files, by exact path, never a directory — plus the

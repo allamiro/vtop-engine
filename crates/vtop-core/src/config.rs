@@ -78,6 +78,25 @@ pub struct EngineConfig {
     /// cycles and in bounded batches so it never blocks the hot path.
     #[serde(default = "default_ledger_prune_batch")]
     pub ledger_prune_batch: u32,
+    /// Wall-clock limit for one state-store request (#556). A store that
+    /// accepts a connection and never answers (a Postgres primary that was
+    /// blackholed during a failover, say) otherwise blocks the whole engine
+    /// with the process alive and no error until the kernel gives up on the
+    /// socket, many minutes later. Single-row operations get this limit;
+    /// whole-ledger scans (startup recovery, pruning) get ten times it.
+    #[serde(default = "default_state_store_timeout_seconds")]
+    pub state_store_timeout_seconds: u64,
+    /// Where prune digests are written and read (#560). Unset, they go
+    /// beside a SQLite database file - on the database's own volume, so
+    /// wherever the ledger survives its digests do too - and otherwise under
+    /// `work_dir`, which is scratch: name a durable directory here (or pass
+    /// `--digest-dir`) for PostgreSQL.
+    #[serde(default)]
+    pub ledger_digest_dir: Option<String>,
+}
+
+fn default_state_store_timeout_seconds() -> u64 {
+    30
 }
 
 fn default_ledger_prune_batch() -> u32 {
@@ -466,6 +485,17 @@ pub struct UploadConfig {
     /// is refused there, not at first upload. `VTOP_S3_TRANSPORT` overrides it.
     #[serde(default = "default_transport")]
     pub transport: String,
+    /// Wall-clock limit for ONE attempt of ONE request to the object store
+    /// (native S3 backend), connection through the end of the response head
+    /// (#556). Without it a store that accepts the connection and never
+    /// answers blocks the engine forever with the process alive and no error:
+    /// the AWS SDK's defaults bound connecting but not waiting for a response.
+    /// The SDK's own retries still apply, so one request is bounded by three
+    /// of these. An upload part or object body counts: size it for the
+    /// slowest link a part must cross (a 64 MiB part at 1 MiB/s needs about a
+    /// minute). Compatibility backends use `command_timeout_seconds` instead.
+    #[serde(default = "default_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
     /// Optional named profile / alias for command-based backends.
     #[serde(default)]
     pub profile: Option<String>,
@@ -657,6 +687,18 @@ pub const BUILTIN_TRANSPORTS: &[&str] = &["tcp_tls"];
 /// operator's typo rather than refusing the config at load.
 pub const MAX_PARTS_IN_FLIGHT: usize = 10_000;
 
+/// The most parts ANY backend may have in flight, whatever its protocol says.
+///
+/// Two different limits, because they defend against two different things
+/// (review). [`MAX_PARTS_IN_FLIGHT`] is S3's 10,000 parts per upload — a
+/// protocol limit, and so an `s3_native` limit. THIS one is a property of the
+/// mechanism every backend shares: the value becomes a tokio semaphore's
+/// permit count, and tokio panics above `usize::MAX >> 3`. `MockBackend`
+/// advertises multipart too, so gating only the S3 limit would leave the panic
+/// reachable on a mock backend — the fix for one review finding re-opening the
+/// hole another had just closed.
+pub const MAX_SEMAPHORE_PERMITS: usize = usize::MAX >> 3;
+
 fn default_backend() -> String {
     "s3_native".to_string()
 }
@@ -738,6 +780,29 @@ impl UploadConfig {
         } else {
             EgressTuning::default()
         }
+    }
+
+    /// Bounds that belong to the MECHANISM, not to any one backend (#480).
+    ///
+    /// On `UploadConfig` and called from `build_backend`, for the same reason
+    /// `validate_transports` is (review): `vtopctl tier copy` deserializes a
+    /// bare UploadConfig, derives its MultipartUploadConfig and goes straight
+    /// to the backend, never constructing a VtopConfig — so a bound that lives
+    /// only in `VtopConfig::validate` is a bound that path does not have. This
+    /// one is not S3's 10,000 parts (see [`MAX_PARTS_IN_FLIGHT`], which is
+    /// backend-gated in `validate`); it is tokio's permit ceiling, above which
+    /// `Semaphore::new` panics rather than degrading, on every backend that
+    /// does multipart at all.
+    pub fn validate_multipart_limits(&self) -> Result<(), VtopError> {
+        if self.multipart_max_parallelism > MAX_SEMAPHORE_PERMITS {
+            return Err(VtopError::Config(format!(
+                "upload.multipart_max_parallelism = {} exceeds the maximum permits a \
+                 semaphore can hold ({MAX_SEMAPHORE_PERMITS}); the value becomes a permit \
+                 count and an oversized one panics at the first multipart upload",
+                self.multipart_max_parallelism
+            )));
+        }
+        Ok(())
     }
 
     /// Validate the per-transport tuning map (#480).
@@ -911,6 +976,9 @@ fn default_region() -> String {
 fn default_command_timeout_seconds() -> u64 {
     300
 }
+fn default_request_timeout_seconds() -> u64 {
+    300
+}
 fn default_command_max_output_bytes() -> usize {
     1024 * 1024
 }
@@ -934,14 +1002,39 @@ fn default_multipart_abandon_after_secs() -> u64 {
 pub struct PartitioningConfig {
     #[serde(default = "default_template")]
     pub template: String,
+    /// Which clock picks an object's time partition (`{yyyy}`..`{hh}`) (#559).
+    #[serde(default)]
+    pub time_source: PartitionTime,
 }
 
 impl Default for PartitioningConfig {
     fn default() -> Self {
         Self {
             template: default_template(),
+            time_source: PartitionTime::default(),
         }
     }
+}
+
+/// Which clock picks an object's time partition (#559).
+///
+/// Partitions used to come from the wall clock at upload, after compression
+/// and checksumming: a batch sealed at 12:59 and uploaded at 13:00 was filed
+/// under hour 13, and a backlog drain or a replay filed old events under the
+/// hour it happened to be uploaded in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionTime {
+    /// When the batch was sealed: fixed before any upload work, so retries
+    /// within a batch and slow uploads do not move it. Late data and replays
+    /// land in the hour they were SEALED in.
+    #[default]
+    Seal,
+    /// The earliest record time the source reported (Kafka message
+    /// timestamps). A batch whose source reports no record time falls back to
+    /// its seal time. Late data lands in the hour it HAPPENED in, which can be
+    /// a partition a downstream reader has already processed.
+    Event,
 }
 
 fn default_template() -> String {
@@ -960,6 +1053,18 @@ impl VtopConfig {
 
     /// Enforce invariants that cannot be expressed by the type system.
     pub fn validate(&self) -> Result<(), VtopError> {
+        // Only the native S3 backend consumes it; the compatibility backends
+        // are bounded by `command_timeout_seconds`.
+        if self.upload.backend == "s3_native" && self.upload.request_timeout_seconds == 0 {
+            return Err(VtopError::Config(
+                "upload.request_timeout_seconds must be > 0".into(),
+            ));
+        }
+        if self.engine.state_store_timeout_seconds == 0 {
+            return Err(VtopError::Config(
+                "engine.state_store_timeout_seconds must be > 0".into(),
+            ));
+        }
         if self.engine.ledger_prune_batch == 0 {
             return Err(VtopError::Config(
                 "engine.ledger_prune_batch must be at least 1; unset \
@@ -1033,11 +1138,19 @@ impl VtopConfig {
                 "upload.multipart_max_parallelism must be > 0".into(),
             ));
         }
+        self.upload.validate_multipart_limits()?;
         // The legacy spelling reaches the SAME semaphore as the tuning knob
         // (MultipartUploadConfig::max_parallelism), so it carries the same
-        // bound: bounding only the new key would leave the identical panic
-        // one config line away, under the name most deployments still use.
-        if self.upload.multipart_max_parallelism > MAX_PARTS_IN_FLIGHT {
+        // bound — but only where the bound MEANS something (review). The limit
+        // is S3's 10,000 parts per upload, which is a property of S3 and not of
+        // the semaphore: a mock or localfs backend has no such part limit, and
+        // rejecting its config against an S3 number would break configurations
+        // that were valid before this check existed. Every other transport
+        // decision in this file is backend-gated for the same reason; this one
+        // was not, and that was an over-reach.
+        if self.upload.backend == "s3_native"
+            && self.upload.multipart_max_parallelism > MAX_PARTS_IN_FLIGHT
+        {
             return Err(VtopError::Config(format!(
                 "upload.multipart_max_parallelism = {} exceeds the {MAX_PARTS_IN_FLIGHT} parts                  S3 allows in one multipart upload; the value becomes a semaphore's permit                  count, and an oversized one panics at the first upload instead of failing here",
                 self.upload.multipart_max_parallelism
@@ -1509,6 +1622,39 @@ upload:
             "{err}"
         );
 
+        // ... but ONLY on s3_native (review). The limit is S3's 10,000 parts
+        // per upload — a property of S3, not of the semaphore — and a mock or
+        // localfs backend has no such limit. Rejecting its configuration
+        // against an S3 number would break setups that were valid before this
+        // check existed, and every other transport decision here is gated the
+        // same way.
+        let other_backend = format!(
+            "{}  backend: mock\n  multipart_max_parallelism: {}\n",
+            tuning_base(),
+            MAX_PARTS_IN_FLIGHT + 1
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&other_backend).unwrap();
+        cfg.validate().expect(
+            "a non-s3_native backend must not be refused against S3's part-count limit; that \
+             configuration was valid before this check and the limit does not describe it",
+        );
+
+        // ... but the MECHANISM's bound still applies to it (review). Gating
+        // the S3 limit must not re-open the panic on a backend that also does
+        // multipart: MockBackend advertises it, and the permit count is
+        // tokio's constraint, not S3's.
+        let absurd = format!(
+            "{}  backend: mock\n  multipart_max_parallelism: {}\n",
+            tuning_base(),
+            usize::MAX
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&absurd).unwrap();
+        let err = cfg.validate().expect_err(
+            "a value above tokio's permit ceiling panics at the first multipart upload, on \
+             every backend that does multipart — gating the S3 limit must not restore that",
+        );
+        assert!(err.to_string().contains("semaphore"), "{err}");
+
         // The limit itself is legal on both.
         for line in [
             format!("  transports:\n    tcp_tls:\n      parts_in_flight: {MAX_PARTS_IN_FLIGHT}\n"),
@@ -1875,6 +2021,71 @@ upload:
         let cfg: VtopConfig = serde_yaml::from_str(&ok).unwrap();
         cfg.validate()
             .expect("source_poll_wait_ms: 0 is legitimate");
+    }
+
+    /// #556: the two request deadlines default to bounded values, can be set,
+    /// and a zero would fail every request before it started so it is refused
+    /// at load time rather than at first use.
+    #[test]
+    fn the_request_deadlines_default_are_settable_and_refuse_zero() {
+        let yaml = r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources:
+  file:
+    enabled: true
+    paths: ["/data/*.log"]
+upload:
+  bucket: telemetry-data
+  backend: s3_native
+"#;
+        let cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.upload.request_timeout_seconds, 300);
+        assert_eq!(cfg.engine.state_store_timeout_seconds, 30);
+
+        let set = yaml
+            .replace(
+                "  work_dir: /tmp/work",
+                "  work_dir: /tmp/work\n  state_store_timeout_seconds: 7",
+            )
+            .replace(
+                "  backend: s3_native",
+                "  backend: s3_native\n  request_timeout_seconds: 45",
+            );
+        let cfg: VtopConfig = serde_yaml::from_str(&set).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.upload.request_timeout_seconds, 45);
+        assert_eq!(cfg.engine.state_store_timeout_seconds, 7);
+
+        for (from, to, name) in [
+            (
+                "  backend: s3_native",
+                "  backend: s3_native\n  request_timeout_seconds: 0",
+                "upload.request_timeout_seconds",
+            ),
+            (
+                "  work_dir: /tmp/work",
+                "  work_dir: /tmp/work\n  state_store_timeout_seconds: 0",
+                "engine.state_store_timeout_seconds",
+            ),
+        ] {
+            let cfg: VtopConfig = serde_yaml::from_str(&yaml.replace(from, to)).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(name) && err.contains("> 0"), "{err}");
+        }
+
+        // A backend that never reads the setting is not refused over it.
+        let other = yaml.replace(
+            "  backend: s3_native",
+            "  backend: mock\n  request_timeout_seconds: 0",
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&other).unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]

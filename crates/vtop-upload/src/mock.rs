@@ -153,11 +153,19 @@ impl MockBackend {
     }
 
     fn take_throttle(&self, budget: &AtomicUsize, uri: &str) -> Result<(), VtopError> {
-        let refused = budget
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                left.checked_sub(1)
-            })
-            .is_ok();
+        // Spend one unit of the budget if any is left. A compare-exchange loop
+        // because `fetch_update` is deprecated on current stable and its
+        // replacement is newer than the MSRV.
+        let mut left = budget.load(Ordering::SeqCst);
+        let refused = loop {
+            if left == 0 {
+                break false;
+            }
+            match budget.compare_exchange_weak(left, left - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break true,
+                Err(observed) => left = observed,
+            }
+        };
         if refused {
             Err(VtopError::UploadThrottled(format!(
                 "mock put {uri}: SlowDown (http 503): please reduce your request rate"

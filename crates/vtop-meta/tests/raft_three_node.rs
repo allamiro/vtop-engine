@@ -949,6 +949,249 @@ async fn lease_fencing_epochs_are_strictly_monotonic_across_the_cluster() {
     cluster.assert_converged_snapshots();
 }
 
+/// #555: a lease deadline used to be the PROPOSER's wall clock plus the lease
+/// length, trusted without limit. A data node with a fast clock then saw every
+/// incumbent's lease as expired and stole it, and one holding a lease stamped
+/// its own deadline an hour into the future, so after it died nobody could take
+/// over until that hour passed. The leader now refuses a lease request whose
+/// clock is further from its own than a quarter of the lease, before it is
+/// replicated; within the bound the proposer's value is kept (the lease agent
+/// compares the recorded deadline with its own clock, so silently moving it
+/// into the leader's clock domain would make a skewed holder re-acquire its
+/// own fresh lease every round).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn the_leader_refuses_a_skewed_lease_proposer_so_it_cannot_steal_or_poison_a_lease() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use vtop_meta::{Consensus, ConsensusError, MetadataError, OpenraftConsensus};
+
+    const LEADER_NOW: i64 = 1_750_000_100_000;
+    const HOUR_MS: i64 = 3_600_000;
+    const LEASE_MS: u64 = 15_000; // tolerance: the 1 000 ms floor (a twentieth is 750)
+
+    let seed = SEED ^ 0x555;
+    let mut cluster = Cluster::boot(seed).await;
+    let (holder, rival) = (Uuid::from_u128(0x10), Uuid::from_u128(0x11));
+    let (topic_uuid, range_uuid) = (Uuid::from_u128(0x20), Uuid::from_u128(0x21));
+    for node in [holder, rival] {
+        let env = cluster.envelope();
+        let resp = cluster.write(register_cmd(env, node)).await;
+        assert!(matches!(resp, MetadataResponse::Ack { .. }), "{resp:?}");
+    }
+    let env = cluster.envelope();
+    let resp = cluster
+        .write(MetadataCommand::CreateTopic {
+            env,
+            name: "events.v1".into(),
+            topic_uuid,
+            root_range_uuid: range_uuid,
+        })
+        .await;
+    assert!(
+        matches!(resp, MetadataResponse::TopicCreated { .. }),
+        "{resp:?}"
+    );
+
+    // The consensus façade over the LEADER's raft, with a clock we control and
+    // the applied state attached (the dedup check reads it).
+    let leader_clock = std::sync::Arc::new(AtomicI64::new(LEADER_NOW));
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone());
+    {
+        let clock = leader_clock.clone();
+        consensus.set_leader_clock(move || clock.load(Ordering::SeqCst));
+    }
+    let read_range = |cluster: &Cluster| {
+        let range_key = MetaKey::Range {
+            topic_uuid,
+            range_uuid,
+        };
+        cluster
+            .leader()
+            .store
+            .with_storage(|s| match s.state().record(&range_key) {
+                Some(MetaValue::Range(range)) => range.clone(),
+                other => panic!("missing range seed={seed:#x}: {other:?}"),
+            })
+    };
+    let envelope = |cluster: &mut Cluster, issued_at_ms: i64| CommandEnvelope {
+        issued_at_ms,
+        ..cluster.envelope()
+    };
+    let acquire =
+        |env, holder_node_uuid, expected_range_generation| MetadataCommand::AcquireRangeLease {
+            env,
+            topic_uuid,
+            range_uuid,
+            holder_node_uuid,
+            expected_range_generation,
+            lease_duration_ms: LEASE_MS,
+        };
+    let renew = |env, holder_node_uuid, expected_fencing_epoch| MetadataCommand::RenewRangeLease {
+        env,
+        topic_uuid,
+        range_uuid,
+        holder_node_uuid,
+        expected_fencing_epoch,
+        lease_duration_ms: LEASE_MS,
+    };
+
+    // 1. A candidate an hour FAST is refused outright: nothing is replicated,
+    //    the range keeps no lease. (Before, it won, with a deadline an hour out.)
+    let generation = read_range(&cluster).generation;
+    let env = envelope(&mut cluster, LEADER_NOW + HOUR_MS);
+    match consensus.propose(acquire(env, holder, generation)).await {
+        Err(ConsensusError::ClockSkew { skew_ms, bound_ms }) => {
+            assert_eq!((skew_ms, bound_ms), (HOUR_MS, 1_000), "seed={seed:#x}");
+        }
+        other => panic!("a fast-clocked candidate was not refused (seed={seed:#x}): {other:?}"),
+    }
+    assert!(
+        read_range(&cluster).lease.is_none(),
+        "nothing was replicated"
+    );
+
+    // 2. So is one an hour SLOW — the bound is symmetric.
+    let env = envelope(&mut cluster, LEADER_NOW - HOUR_MS);
+    assert!(matches!(
+        consensus.propose(acquire(env, holder, generation)).await,
+        Err(ConsensusError::ClockSkew { skew_ms, .. }) if skew_ms == -HOUR_MS
+    ));
+
+    // 3. A candidate whose clock is merely a little off (500 ms) wins, and its
+    //    value is KEPT: the deadline is the proposer's time plus the lease, so
+    //    the agent that holds it compares like with like.
+    let env = envelope(&mut cluster, LEADER_NOW + 500);
+    let granted = acquire(env, holder, generation);
+    let receipt = consensus.propose(granted.clone()).await.unwrap();
+    assert!(
+        matches!(receipt.response, MetadataResponse::LeaseGranted { .. }),
+        "seed={seed:#x}: {:?}",
+        receipt.response
+    );
+    let _ = cluster.leader().raft.trigger().heartbeat().await;
+    cluster
+        .wait_applied_at_least(receipt.log_id.index - 1)
+        .await; // meta index is 1-based
+    let epoch = read_range(&cluster).fencing_epoch;
+    let deadline = LEADER_NOW + 500 + LEASE_MS as i64;
+    assert_eq!(
+        read_range(&cluster).lease.expect("a lease").expires_at_ms,
+        Some(deadline),
+        "within the bound the proposer's clock is kept (seed={seed:#x})"
+    );
+
+    // 4. A retry of a request that already COMMITTED is answered from the dedup
+    //    table even when its timestamp has aged past the bound since: a skew
+    //    error about a request that succeeded would tell the caller it failed.
+    leader_clock.store(LEADER_NOW + HOUR_MS, Ordering::SeqCst);
+    let log_before = cluster.leader().raft.metrics().borrow().last_log_index;
+    let retried = consensus.propose(granted).await;
+    assert!(
+        matches!(
+            retried,
+            Ok(ref r) if matches!(r.response, MetadataResponse::LeaseGranted { fencing_epoch } if fencing_epoch == epoch)
+        ),
+        "a committed request must be answered from the dedup table (seed={seed:#x}): {retried:?}"
+    );
+    // The receipt names a position at or after the entry that produced the
+    // response - read with it, not from a metrics snapshot that can lag
+    // (review of #566).
+    let retried_index = retried.as_ref().unwrap().log_id.index;
+    assert!(
+        retried_index >= receipt.log_id.index,
+        "the aged retry's receipt ({retried_index}) predates the original commit ({}) \
+         (seed={seed:#x})",
+        receipt.log_id.index
+    );
+    // ...answered, not re-proposed (review of #566): a stale command that
+    // reached the log could be applied as new if the table evicted it first.
+    assert_eq!(
+        cluster.leader().raft.metrics().borrow().last_log_index,
+        log_before,
+        "the aged retry reached the log (seed={seed:#x})"
+    );
+    leader_clock.store(LEADER_NOW, Ordering::SeqCst);
+
+    // 5. A FOLLOWER does not judge: its clock may differ from the proposer's
+    //    by more than the bound while the leader's does not, and a skew error
+    //    is not a redirect. It answers NotLeader, as it always has.
+    let leader = cluster.leader_id();
+    let follower = *cluster
+        .nodes
+        .keys()
+        .find(|id| **id != leader)
+        .expect("a follower");
+    let on_follower = OpenraftConsensus::new(cluster.nodes[&follower].raft.clone())
+        .with_store(cluster.nodes[&follower].store.clone());
+    on_follower.set_leader_clock(|| LEADER_NOW);
+    let env = envelope(&mut cluster, LEADER_NOW + HOUR_MS);
+    let generation = read_range(&cluster).generation;
+    assert!(
+        matches!(
+            on_follower.propose(acquire(env, rival, generation)).await,
+            Err(ConsensusError::NotLeader { .. })
+        ),
+        "a follower must redirect, not report skew (seed={seed:#x})"
+    );
+
+    // 6. A fast-clocked rival is refused before it can try to take the live
+    //    lease. (Before: it took the range.)
+    let env = envelope(&mut cluster, LEADER_NOW + HOUR_MS);
+    assert!(matches!(
+        consensus.propose(acquire(env, rival, generation)).await,
+        Err(ConsensusError::ClockSkew { .. })
+    ));
+
+    // 7. Renewals are held to the same bound, in both directions, and a
+    //    refused renewal leaves the deadline alone.
+    for skew in [HOUR_MS, -HOUR_MS] {
+        let env = envelope(&mut cluster, LEADER_NOW + skew);
+        assert!(
+            matches!(
+                consensus.propose(renew(env, holder, epoch)).await,
+                Err(ConsensusError::ClockSkew { .. })
+            ),
+            "renewal {skew} ms off (seed={seed:#x})"
+        );
+    }
+    assert_eq!(
+        read_range(&cluster).lease.expect("a lease").expires_at_ms,
+        Some(deadline)
+    );
+
+    // 8. Takeover timing follows the replicated deadline. One millisecond
+    //    before it a rival with a good clock is turned away because the
+    //    incumbent is live; at the deadline it wins.
+    leader_clock.store(deadline - 1, Ordering::SeqCst);
+    let env = envelope(&mut cluster, deadline - 1);
+    let receipt = consensus
+        .propose(acquire(env, rival, generation))
+        .await
+        .unwrap();
+    match receipt.response {
+        MetadataResponse::Rejected(MetadataError::InvalidTransition(why)) => {
+            assert!(why.contains("still live"), "seed={seed:#x}: {why}")
+        }
+        other => panic!("a live lease was taken (seed={seed:#x}): {other:?}"),
+    }
+    let _ = cluster.leader().raft.trigger().heartbeat().await;
+    cluster
+        .wait_applied_at_least(receipt.log_id.index - 1)
+        .await;
+    let generation = read_range(&cluster).generation;
+    leader_clock.store(deadline, Ordering::SeqCst);
+    let env = envelope(&mut cluster, deadline);
+    let receipt = consensus
+        .propose(acquire(env, rival, generation))
+        .await
+        .unwrap();
+    assert!(
+        matches!(receipt.response, MetadataResponse::LeaseGranted { fencing_epoch } if fencing_epoch == epoch + 1),
+        "at the replicated deadline the lease is up for election (seed={seed:#x}): {:?}",
+        receipt.response
+    );
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn single_node_client_write_commits() {
     let seed = SEED ^ 0x99;
@@ -990,4 +1233,131 @@ async fn single_node_client_write_commits() {
     );
     let resp = handle.raft.client_write(cmd).await.expect("write");
     assert!(resp.log_id.index >= 1);
+}
+
+/// #554: during a rolling upgrade an upgraded leader must not put a command
+/// kind into the log that a voter still on the previous release cannot decode
+/// - the old voter would fail the whole AppendEntries batch and append nothing
+/// more. A command above the cluster's feature level is refused by the leader
+/// before replication; once an operator raises the level (every voter
+/// upgraded), the same command reaches the state machine on every node.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_command_newer_than_the_clusters_feature_level_never_reaches_the_log() {
+    use vtop_meta::{Consensus, ConsensusError, MetaNodeId, OpenraftConsensus};
+    use vtop_meta::{BASELINE_FEATURE_LEVEL, SUPPORTED_FEATURE_LEVEL};
+
+    let seed = SEED ^ 0x554;
+    let mut cluster = Cluster::boot(seed).await;
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone());
+    let split = |env: CommandEnvelope| MetadataCommand::SplitRange {
+        env,
+        topic_uuid: Uuid::from_u128(0x20),
+        parent_range_uuid: Uuid::from_u128(0x21),
+        left_range_uuid: Uuid::from_u128(0x22),
+        right_range_uuid: Uuid::from_u128(0x23),
+        transition_id: Uuid::from_u128(0x24),
+        barrier_offset: 0,
+        expected_range_generation: 0,
+        holder_node_uuid: Uuid::from_u128(0x10),
+        fencing_epoch: 1,
+    };
+    let last_log = |cluster: &Cluster| {
+        cluster
+            .leader()
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0)
+    };
+
+    let before = last_log(&cluster);
+    let env = cluster.envelope();
+    match consensus.propose(split(env)).await {
+        Err(ConsensusError::FeatureNotEnabled { needed, enabled }) => {
+            assert_eq!((needed, enabled), (4, BASELINE_FEATURE_LEVEL));
+        }
+        other => panic!("a gated command was not refused (seed={seed:#x}): {other:?}"),
+    }
+    assert_eq!(
+        last_log(&cluster),
+        before,
+        "the refused command reached the log"
+    );
+
+    // A follower does not let it through on the strength of its role (a
+    // role read before the write is a race: review) - it sends the caller
+    // to the leader, which judges it.
+    let leader_id = cluster.leader_id();
+    let (follower_id, through_follower) = cluster
+        .nodes
+        .iter()
+        .find(|(id, _)| **id != leader_id)
+        .map(|(id, follower)| {
+            (
+                *id,
+                OpenraftConsensus::new(follower.raft.clone()).with_store(follower.store.clone()),
+            )
+        })
+        .unwrap();
+    let env = cluster.envelope();
+    match through_follower.propose(split(env)).await {
+        Err(ConsensusError::NotLeader { leader }) => {
+            assert_eq!(
+                leader,
+                Some(MetaNodeId(leader_id)),
+                "follower {follower_id}"
+            );
+        }
+        other => panic!("a follower let a gated command through (seed={seed:#x}): {other:?}"),
+    }
+    // Nor does a façade with no applied state to judge the level from.
+    let storeless = OpenraftConsensus::new(cluster.leader().raft.clone());
+    let env = cluster.envelope();
+    assert!(
+        matches!(
+            storeless.propose(split(env)).await,
+            Err(ConsensusError::Message(_))
+        ),
+        "a façade that cannot see the level must refuse (seed={seed:#x})"
+    );
+    assert_eq!(
+        last_log(&cluster),
+        before,
+        "a refused command reached the log"
+    );
+
+    let env = cluster.envelope();
+    let raised = consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: SUPPORTED_FEATURE_LEVEL,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        raised.response,
+        MetadataResponse::Ack {
+            generation: u64::from(SUPPORTED_FEATURE_LEVEL)
+        }
+    );
+    let _ = cluster.leader().raft.trigger().heartbeat().await;
+    cluster.wait_applied_at_least(raised.log_id.index - 1).await; // meta index is 1-based
+    for (id, node) in &cluster.nodes {
+        assert_eq!(
+            node.store.with_storage(|s| s.state().feature_level()),
+            SUPPORTED_FEATURE_LEVEL,
+            "node {id} (seed={seed:#x})"
+        );
+    }
+
+    // Past the gate, the state machine judges it (no such topic here).
+    let env = cluster.envelope();
+    let judged = consensus.propose(split(env)).await.unwrap();
+    assert!(
+        matches!(judged.response, MetadataResponse::Rejected(_)),
+        "{:?}",
+        judged.response
+    );
 }

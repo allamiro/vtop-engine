@@ -24,6 +24,7 @@
 6. [Data-flow diagram](#6-data-flow-diagram)
 7. [Source adapters](#7-source-adapters)
    - [7.1 What the commit rule does not cover](#71-what-the-commit-rule-does-not-cover)
+   - [7.2 Rotation and truncation of file and spool sources](#72-rotation-and-truncation-of-file-and-spool-sources)
 8. [Upload backends](#8-upload-backends)
 9. [Checksum subsystem](#9-checksum-subsystem)
 10. [Compression subsystem](#10-compression-subsystem)
@@ -260,6 +261,103 @@ about replay safety, manifests and verification applies to a record once the
 engine has seen it. **Size retention above worst-case lag, and monitor consumer
 lag independently of VTOP**, because VTOP will not tell you.
 
+### 7.2 Rotation and truncation of file and spool sources
+
+The file and syslog-spool adapters keep one read position per **path**, and a
+position is only meaningful for the file it was taken from. Two things break
+that, and the adapters now check for both on every read, against the open
+descriptor (`fstat`) rather than a second path lookup:
+
+- **Rotation** (rename or replace): the inode at the path differs from the one
+  the cursor last read.
+- **Truncation** (`copytruncate`, an in-place truncate): the same inode, now
+  shorter than the read position.
+
+In either case the new content is read from **byte 0**, and the cursor's
+committed point returns to 0 with it. Before this was handled, a read position
+from the old file was applied to the new one: a new file shorter than the
+position produced nothing until it outgrew it and then started mid-line, and a
+longer one silently lost its first bytes (#558).
+
+What follows from that, in the engine:
+
+- **A buffered window is sealed at the discontinuity.** A read that does not
+  start where the buffered window ended (a different inode, or a start that is
+  not the previous end) is not merged into it; the old window becomes its own
+  batch. A merged batch carried a start from one file and an end from the
+  other, a range nothing could re-read or reconcile.
+- **A late commit cannot move the restarted cursor.** A batch read before the
+  rotation commits after the cursor has restarted; its offset names a place in
+  a file that is no longer there. Its ledger row commits (the archive has it),
+  but the cursor stays on the current file.
+- **Replay refuses a range from a file that has changed.** The old bytes are
+  not at those offsets any more, and rewinding the new file there would archive
+  its middle as though it were the lost range. The adapters return an error
+  when the inode differs from the marker's, when the file is shorter than the
+  range's start, or (file sources, whose markers record the length at read
+  time) when it is shorter than it was when the range was read. A spool marker
+  without an inode keeps the older size-only check, and a spool truncated and
+  regrown past the range's start cannot be told from the original. How the
+  engine reports a refused rewind is described in section 13.
+- **Commits are applied in the order the windows were read**, not the order
+  their uploads finish. A rotation seals the old file's window and starts a new
+  one in the same cycle, so both are in flight at once; committing the new
+  window first would leave the old file as the most recent commit and make the
+  restart seed name a file that is gone.
+- **A late commit is settled against the generation its range was read in.**
+  The adapter starts a new generation each time it restarts a cursor on a
+  rotated or truncated file, and remembers which generation every range it
+  handed out was read in. A range from an older generation never moves the
+  cursor, however the file looks by the time its commit lands - a
+  `copytruncate`d file that has regrown past the old range's end is otherwise
+  indistinguishable, by inode and length, from the file the range was read
+  from. The record is in-process: after a restart a commit falls back to the
+  inode and length test.
+- **A restart seeds the cursor with the inode** the offset came from
+  (`StateStore::committed_cursors`: the most recent committed batch per path -
+  the one created last, which is the window read last - with its own inode
+  and offset, never a maximum: after a `copytruncate` the inode is unchanged
+  and the old content's higher offset would skip the new content's first
+  bytes). A file replaced while the engine was down is read from its first
+  byte instead of from the old file's high-water mark. Ledger pruning keeps
+  exactly this row for every path, so the seed is the same before and after
+  any prune. The seed also carries the length the
+  most recent committed batch saw its file at (`file_size` in the marker), so a
+  `copytruncate` while the engine was down is caught even when the file is
+  still longer than the committed offset. A syslog-spool marker records no
+  length, so a spool seed has the inode and the offset only.
+
+Limits, stated plainly:
+
+- The **unread tail of a rotated-away file** is not read through the old path.
+  If the rotated name (`app.log.1`) also matches a configured pattern it is
+  discovered as its own source, with a fresh cursor, and is archived again from
+  byte 0 — a duplicate, never a hole. Archiving the unread tail without the
+  duplicate would need cursors keyed by inode rather than path.
+- `copytruncate` is racy by nature: lines written between the copy and the
+  truncate are lost by the rotation tool before the engine can see them. If the
+  file also regrows beyond the old read position before the next read, the
+  truncation is invisible to the adapter.
+- A file is identified by its **inode number alone**, and a number can be
+  reused. On a *different* filesystem a replacement that happens to carry the
+  number is not seen as a rotation (markers do not record the device). On the
+  *same* filesystem the number of a file that was **unlinked** is free to be
+  handed to the next file created, so a path that is deleted and recreated
+  (rather than renamed and recreated, which keeps the old inode alive) can
+  present a new file under the old number; if that file is also longer than
+  the old read position it looks like a continuation. The engine's own
+  `delete_after_commit` removes the cursor with the file for exactly this
+  reason, so the common route to reuse is closed; a file removed by anything
+  else is not. Rotation by rename, which is what log rotation does, is
+  detected.
+- Late commits are judged against the file as it is NOW (another inode, or an
+  end beyond its length). A `copytruncate` followed by a regrow past the old
+  end before the late commit lands cannot be told from the original; that is
+  the same invisible case as a regrow before the next read, above.
+- History pruning keeps one row per path, so a file untouched for longer than
+  the retention window can lose the rows that name its inode. The restart then
+  reads it from byte 0 again: duplicates, bounded by the file.
+
 Tracked as #361, which also carries the question of whether the adapter should
 refuse rather than resume when it detects the jump — a refusal is only useful
 if an operator can act on it, and a source that stops archiving because it fell
@@ -338,6 +436,28 @@ s3://{bucket}/{prefix}/tenant={tenant}/source={source}/format={format}/year={yyy
 
 The bound manifest is stored at the same prefix as `{batch_id}.manifest.json`.
 
+**Which clock picks the time partition** (`partitioning.time_source`, #559):
+
+- `seal` (default): the instant the batch was sealed — taken as it leaves the
+  engine's buffer, before it waits for an upload slot, its ledger writes,
+  compression, checksumming and upload, and recorded as its `sealed_at`. A
+  saturated upload queue, a slow upload or a retry within the batch does not
+  move it. Late data, a backlog drain and a replay land in the hour they were
+  **sealed** in — a replay of yesterday's range is a new batch and is filed
+  under today. Partitions used to come from the wall clock at upload, so a
+  batch sealed at 12:59 and uploaded at 13:00 was filed under hour 13.
+- `event`: the earliest record time the source reported. Only the Kafka source
+  reports one (the message timestamp — producer `CreateTime` or broker
+  `LogAppendTime`, whichever the topic uses); a batch from a source that reports
+  none falls back to its seal time. Late data lands in the hour it **happened**
+  in, which can be a partition a downstream reader has already processed:
+  readers that need completeness must look back, or use the manifests.
+
+Either way the manifest's `first_timestamp` / `last_timestamp` are the batch's
+earliest and latest record times when the source reports them (Kafka), and
+absent otherwise. They are a minimum and a maximum, not the first and last
+record's times: producer timestamps arrive out of order.
+
 - **Extensible fields:** the path **may** be extended with `environment`, `facility`, `severity`, `retention_class`, `region`, `site`.
 - **Per-format buckets:** bucket names may be templated, e.g. `bucket: "telemetry-{format}"`, with optional on-demand bucket creation via `ensure_bucket`. The fully resolved bucket and key are recorded in the manifest.
 
@@ -365,9 +485,16 @@ Crucially, every backend's `update_batch_state` routes **every** state change th
 On startup, the `replay` module inspects `vtop-state` and maps each incomplete batch to a recovery action (`Engine::recover()`):
 
 1. A batch in **`VERIFIED`** but not yet committed (object and manifest durably stored and verified) has its **source commit retried** (`VERIFIED → SOURCE_COMMITTED`). The verified object is never discarded.
-2. A batch in any state **before `VERIFIED`** is transitioned `... → FAILED → REPLAY_REQUIRED → BATCHING` and re-driven from the last committed source progress marker.
-3. Replay currently produces a **new** object key: the `batch_id` and the `year/…/hour` path components are derived from wall-clock time plus a random suffix, so a replayed batch writes a duplicate object (at-least-once, no data loss). Protocol §14/§15.1/§16 specify deterministic naming so that replay is idempotent — this is the open gap tracked as [PRODUCTION_HA.md](PRODUCTION_HA.md) Phase 4.
+2. A batch in any state **before `VERIFIED`** is transitioned `... → FAILED → REPLAY_REQUIRED` and its range is handed back to the source adapter (`replay_from_marker`) so it is read again. The replay decision is persisted first — if the `FAILED` or the `REPLAY_REQUIRED` write fails, no rewind is recorded for the row and it is counted as pending (a failure of the second write leaves the row `FAILED`, not untouched; the next recovery decides again). Recovery then collects the rewinds and applies the **lowest start per source unit** (one file or spool file at one inode, or one Kafka topic-partition) once, after the scan: each rewind overwrites the adapter's read position, so applying them row by row let the last row visited decide where the source resumed and skipped every earlier range. A rewind that fails, or that has no adapter to apply it to, is logged as an error and counted in the summary as still pending.
+
+   A `VERIFIED` row is committed only after that, and not at all while a range of the same source unit that **starts below it** is about to be re-read: a commit moves the unit's committed point to the end of the committed range, the file adapters clamp a rewind to the committed point, and a `VERIFIED` range archives only its own bytes — so pending bytes below its start would be skipped. Such a row stays `VERIFIED` (its object is in the archive) until a later pass commits it. A `VERIFIED` row that starts where the pending range starts — the object that replaced a stale row for the same bytes — commits normally. A marker with no inode (a legacy row) is compared against every inode at its path.
+
+   **A rewind never goes below what the source has already committed.** The file and spool adapters have always clamped to their committed byte; the Kafka adapter now clamps to the consumer group's committed offset, asked of the broker, so a stale `FAILED` row left behind by a failure that has since been repaired no longer rewinds the group to its start and re-archives everything since on each restart. The stale rows themselves stay in the ledger and are re-visited at every restart (a no-op rewind and a ledger write each); retiring them needs a new durable state and is tracked in #567.
+3. Replay currently produces a **new** object key: the `batch_id` is derived from wall-clock time plus a random suffix, and the `year/…/hour` path components from the replayed batch's own partition time (§11, `partitioning.time_source`) - under `seal`, the hour the replay was sealed in, so a replay of yesterday's range is filed under today; under `event`, the earliest record time, so a Kafka replay usually lands in the original hour but under a new key. Either way a replayed batch writes a duplicate object (at-least-once, no data loss). Protocol §14/§15.1/§16 specify deterministic naming so that replay is idempotent — this is the open gap tracked as [PRODUCTION_HA.md](PRODUCTION_HA.md) Phase 4.
 4. A state/storage mismatch (e.g., an object present but unverified) is resolved by re-verifying or re-uploading **before** any commit.
+5. **The same rule holds while the engine is running.** Adapters advance their read position when they *read*, not when a batch commits, so a batch that fails (or errors before `VERIFIED`) is handed back to its source at the end of the cycle that failed it, not at the next restart. Otherwise the next cycle reads on from the end of the failed range and the first later range to verify commits past it, leaving those bytes unarchived (#552). A cycle in which a batch failed waits before reading again — the idle interval, doubling per consecutive failing cycle up to a minute, plus jitter — because the failed range is now read again and a tight loop would hammer a store that is down.
+
+   Limits, stated rather than implied: a ledger written by a build *before* this change can already contain a committed range above a failed one. Replay does not repair that for file and spool sources — their rewind is clamped to the committed point so a superseded failed row cannot re-archive committed data on every restart — and the ledger cannot say whether the older range was later covered, because committed history may be pruned. Finding such holes is the job of an archive coverage audit (#560), not of recovery. A spool whose identity changed since the batch was read cannot be rewound; that is reported as an error and the range is not re-read — but only for a marker that recorded an inode: a legacy marker without one keeps the old size-only check and can rewind a replacement. The file adapter does not yet check identity on replay (rotation, #558).
 
 This guarantees: no source progress marker is committed unless its object and manifest are durably stored and verified, and no committed marker is double-committed. Source progress is **never** advanced for unverified data.
 
@@ -393,7 +520,7 @@ These per-batch records feed the aggregate Prometheus-style counters that are de
 - Adaptive sealing (records/bytes/age) bounds in-flight batch size and provides natural backpressure: a slow upload stage delays sealing of the next batch rather than growing memory unboundedly.
 - Source adapters **may** signal backpressure to the batching layer (protocol §6).
 - The Kafka adapter's manual offset commit (auto-commit disabled) ensures the broker's notion of progress tracks the engine's verified-and-committed progress, not its in-memory read position.
-
+- **Every call the engine makes to its object store and state store has a deadline** (#556). A store that accepts a connection and never answers would otherwise block the awaiting cycle forever, with the process alive and the health endpoint green. The native S3 backend sets the SDK's first-byte (read), per-attempt and whole-operation limits from `upload.request_timeout_seconds` (default 300 s per attempt; the whole operation is allowed the SDK's three attempts); its connect limit is a fixed 10 s, not configurable — the SDK's own defaults bound connecting but not waiting for a response, which the `request_deadline` test shows against a socket that accepts and stays silent. Those SDK limits end when the response headers arrive, so every response BODY the engine reads afterwards (verification, manifest recovery) is bounded separately, by the whole-operation allowance; a store that sends headers and then drips the body fails the read rather than holding it open. The compatibility backends use `upload.command_timeout_seconds`. The state store is wrapped so every request is bounded by `engine.state_store_timeout_seconds` (default 30 s; whole-ledger scans such as startup recovery get ten times it), and opening a Postgres store (connect plus schema check) is bounded by the same value. An expired request is an ordinary failure to the engine — a failed upload fails the batch, and recovery re-reads its range — but it is an **unknown outcome**, not a failed one: the store may have applied it. That is safe here because every ledger transition is checked against the state machine and recovery re-reads rows it finds incomplete; the worst case is a range archived twice, never one lost. Size `request_timeout_seconds` for the slowest link a part must cross (a 64 MiB part at 1 MiB/s needs about a minute). Not covered: `vtopctl migrate`, an operator-run one-shot command whose Postgres connection and schema statements carry no deadline (a schema change on a large ledger can legitimately be slow) — an operator who sees it hang interrupts it, and the migration's statements are idempotent, so running it again is safe.
 ---
 
 ## 16. Benchmark harness

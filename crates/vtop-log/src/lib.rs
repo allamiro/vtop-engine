@@ -29,7 +29,8 @@ pub use segment::{
     segment_stem, ActiveSegment, SegmentReader,
 };
 pub use segment_set::{
-    ReconfigureOutcome, RetentionOutcome, RetentionPolicy, SegmentSet, CONDEMNED_MARKER,
+    ReconfigureOutcome, RetentionBlocked, RetentionOutcome, RetentionPolicy, SegmentSet,
+    CONDEMNED_MARKER,
 };
 pub use transfer::{
     sealed_artifact_path, SegmentPresence, SegmentReceiver, StagedSegment, TransferArtifact,

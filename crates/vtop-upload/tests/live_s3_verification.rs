@@ -24,6 +24,7 @@ async fn native_s3_verifies_service_sha256_and_streamed_blake3() {
         transport: "tcp_tls".into(),
         tuning: Default::default(),
         max_egress_bytes_per_second: None,
+        request_timeout_seconds: 300,
     })
     .await
     .unwrap();

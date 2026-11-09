@@ -11,14 +11,15 @@ use super::wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
     AdminInitRequest, AdminMembershipResponse, AdminProposeRequest, AdminProposeResponse,
     AdminReadGroupCursorRequest, AdminReadGroupCursorResponse, AdminReadRangeLeaseRequest,
-    AdminReadRangeLeaseResponse, AdminReadRangeTransitionsRequest,
-    AdminReadRangeTransitionsResponse, AdminReadSegmentPlacementRequest,
-    AdminReadSegmentPlacementResponse, AdminStatusRequest, AdminStatusResponse, NotLeaderHint,
-    TransportError, TransportResult, VtpmFrame, KIND_ADMIN_ADD_LEARNER_REQ,
-    KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR, KIND_ADMIN_INIT_REQ,
-    KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ, KIND_ADMIN_PROPOSE_RESP,
-    KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+    AdminReadRangeLeaseResponse, AdminReadRangeReplicaSetRequest, AdminReadRangeReplicaSetResponse,
+    AdminReadRangeTransitionsRequest, AdminReadRangeTransitionsResponse,
+    AdminReadSegmentPlacementRequest, AdminReadSegmentPlacementResponse, AdminStatusRequest,
+    AdminStatusResponse, NotLeaderHint, TransportError, TransportResult, VtpmFrame,
+    KIND_ADMIN_ADD_LEARNER_REQ, KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR,
+    KIND_ADMIN_INIT_REQ, KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ,
+    KIND_ADMIN_PROPOSE_RESP, KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
     KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP,
+    KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ, KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP,
     KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ, KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP,
     KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ, KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP,
     KIND_ADMIN_STATUS_REQ, KIND_ADMIN_STATUS_RESP,
@@ -82,6 +83,16 @@ pub trait AdminHandler: Send + Sync {
     ) -> TransportResult<AdminReadGroupCursorResponse> {
         Err(TransportError::Protocol(
             "this admin handler does not serve group cursor reads".to_owned(),
+        ))
+    }
+    /// Linearizable read of a range's recorded replica set (#553). Defaulted
+    /// to a refusal, as the transition read is.
+    async fn read_range_replica_set(
+        &self,
+        _request: AdminReadRangeReplicaSetRequest,
+    ) -> TransportResult<AdminReadRangeReplicaSetResponse> {
+        Err(TransportError::Protocol(
+            "this admin handler does not serve replica set reads".to_owned(),
         ))
     }
 }
@@ -302,6 +313,12 @@ async fn serve_admin_connection(
     }
 }
 
+/// What a metadata node that predates the replica-set read answers it with:
+/// its dispatcher's unknown-kind refusal, from the same Display.
+fn predates_replica_set_read() -> String {
+    TransportError::UnexpectedKind(KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ).to_string()
+}
+
 fn truncate_error(message: &str) -> String {
     let max = crate::command::MAX_ERROR_DETAIL_BYTES;
     if message.len() <= max {
@@ -387,6 +404,17 @@ async fn dispatch_admin(
             let response = handler.read_group_cursor(request).await?;
             Ok(VtpmFrame {
                 kind: KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+                payload: response.encode()?,
+            })
+        }
+        KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ => {
+            let request = AdminReadRangeReplicaSetRequest::decode(&frame.payload)?;
+            // A read, like the others: which nodes a range's quorum is
+            // counted over is for anybody entitled to look at the cluster.
+            authorize(authorizer.authorize_read(identity))?;
+            let response = handler.read_range_replica_set(request).await?;
+            Ok(VtpmFrame {
+                kind: KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP,
                 payload: response.encode()?,
             })
         }
@@ -795,6 +823,195 @@ impl AdminClient {
         }
     }
 
+    /// Linearizable read of a range's recorded replica set (#553).
+    ///
+    /// `Ok(None)` when the metadata LEADER predates the read - and only then
+    /// (review). A node that predates it refuses the request kind itself,
+    /// before any leadership check, so the refusal alone says nothing about
+    /// the tier: an old learner, a removed voter still in the endpoint list,
+    /// or an old follower would answer it too, while the leader has a set
+    /// recorded. So the refusal is confirmed with the SAME node's status: a
+    /// leader that predates the read cannot hold a recorded set - a set is
+    /// recorded only at feature level 5, an older node cannot apply it, and
+    /// once it is committed an older node cannot be elected (it could not
+    /// append it, so its log is behind every voter that did). A refusing
+    /// node that is not the leader sends the read on to the leader it names;
+    /// one that names none, or a leader already asked, is an error - unknown
+    /// is not "none recorded". That keeps a data node upgraded ahead of its
+    /// metadata tier leadable, without letting one stale endpoint switch the
+    /// check off.
+    pub async fn read_range_replica_set(
+        &self,
+        topic_uuid: uuid::Uuid,
+        range_uuid: uuid::Uuid,
+    ) -> TransportResult<Option<AdminReadRangeReplicaSetResponse>> {
+        let request = VtpmFrame {
+            kind: KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ,
+            payload: AdminReadRangeReplicaSetRequest {
+                topic_uuid,
+                range_uuid,
+            }
+            .encode(),
+        };
+        let candidates = self.candidates.len();
+        let mut asked = vec![false; candidates];
+        let mut next = Some(self.round_trip_indexed(request.clone()).await?);
+        let mut unresolved: Option<TransportError> = None;
+        loop {
+            let (index, frame) = match next.take() {
+                Some(answer) => answer,
+                // Nothing to follow: ask a member nobody has asked yet. A
+                // named leader that cannot be reached, or a node that names
+                // none, is not the end while another member may answer
+                // (review).
+                None => {
+                    let Some(index) = (0..candidates).find(|index| !asked[*index]) else {
+                        return Err(unresolved.unwrap_or_else(|| {
+                            TransportError::Protocol(
+                                "no metadata node answered the replica-set read; whether a \
+                                 set is recorded is unknown"
+                                    .to_owned(),
+                            )
+                        }));
+                    };
+                    asked[index] = true;
+                    match self.attempt(index, &request).await {
+                        Ok(frame) => (index, frame),
+                        Err(error) => {
+                            unresolved = Some(error);
+                            continue;
+                        }
+                    }
+                }
+            };
+            asked[index] = true;
+            self.answered(index);
+            let follow = |leader: Option<MetaNodeId>, asked: &[bool]| {
+                leader
+                    .and_then(|leader| self.index_of(leader))
+                    .filter(|leader| !asked[*leader])
+            };
+            if let Some(hint) = redirect_of(&frame) {
+                if let Some(leader) = follow(hint.leader, &asked) {
+                    self.redirects
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    asked[leader] = true;
+                    match self.attempt(leader, &request).await {
+                        Ok(frame) => next = Some((leader, frame)),
+                        Err(error) => unresolved = Some(error),
+                    }
+                }
+                continue;
+            }
+            match frame.kind {
+                KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP => {
+                    return Ok(Some(AdminReadRangeReplicaSetResponse::decode(
+                        &frame.payload,
+                    )?))
+                }
+                KIND_ADMIN_ERROR => {
+                    let error = AdminError::decode(&frame.payload)?;
+                    if error.message != predates_replica_set_read() {
+                        return Err(TransportError::Protocol(error.message));
+                    }
+                    match self.status_of(index).await {
+                        // Its own word that it leads is local metrics, not
+                        // proof (review): a former leader cut off from its
+                        // quorum still says so. A linearizable read on the
+                        // SAME node - one an older release serves too -
+                        // completes only on a leader that still has its
+                        // quorum; only then does "predates" mean "none".
+                        Ok(status) if status.server_state == "Leader" => {
+                            match self.leadership_proven(index, topic_uuid, range_uuid).await {
+                                Ok(()) => return Ok(None),
+                                Err(error) => unresolved = Some(error),
+                            }
+                        }
+                        Ok(status) => {
+                            unresolved = Some(TransportError::Protocol(format!(
+                                "metadata node {} predates recorded replica sets and is not the \
+                                 leader (it names {:?}); whether a set is recorded is unknown",
+                                self.candidates[index].endpoint, status.current_leader
+                            )));
+                            if let Some(leader) = follow(status.current_leader, &asked) {
+                                asked[leader] = true;
+                                match self.attempt(leader, &request).await {
+                                    Ok(frame) => next = Some((leader, frame)),
+                                    Err(error) => unresolved = Some(error),
+                                }
+                            }
+                        }
+                        Err(error) => unresolved = Some(error),
+                    }
+                }
+                other => return Err(TransportError::UnexpectedKind(other)),
+            }
+        }
+    }
+
+    /// A candidate answered: whatever presumed it failed (see `attempt`) no
+    /// longer holds, so it is not looked up again on that account (review).
+    fn answered(&self, index: usize) {
+        if let Some(resolution) = self.resolutions.lock().expect("resolutions").get_mut(index) {
+            resolution.stale = false;
+        }
+    }
+
+    /// Whether candidate `index` is the leader WITH its quorum: a linearizable
+    /// lease read on that node (an older release serves it too) completes
+    /// only then.
+    async fn leadership_proven(
+        &self,
+        index: usize,
+        topic_uuid: uuid::Uuid,
+        range_uuid: uuid::Uuid,
+    ) -> TransportResult<()> {
+        let frame = self
+            .attempt(
+                index,
+                &VtpmFrame {
+                    kind: KIND_ADMIN_READ_RANGE_LEASE_REQ,
+                    payload: AdminReadRangeLeaseRequest {
+                        topic_uuid,
+                        range_uuid,
+                    }
+                    .encode(),
+                },
+            )
+            .await?;
+        self.answered(index);
+        match frame.kind {
+            KIND_ADMIN_READ_RANGE_LEASE_RESP => Ok(()),
+            KIND_ADMIN_ERROR => Err(TransportError::Protocol(format!(
+                "metadata node {} says it leads but could not serve a linearizable read: {}",
+                self.candidates[index].endpoint,
+                AdminError::decode(&frame.payload)?.message
+            ))),
+            other => Err(TransportError::UnexpectedKind(other)),
+        }
+    }
+
+    /// The status of ONE candidate, not whichever answers first.
+    async fn status_of(&self, index: usize) -> TransportResult<AdminStatusResponse> {
+        let frame = self
+            .attempt(
+                index,
+                &VtpmFrame {
+                    kind: KIND_ADMIN_STATUS_REQ,
+                    payload: AdminStatusRequest.encode(),
+                },
+            )
+            .await?;
+        self.answered(index);
+        match frame.kind {
+            KIND_ADMIN_STATUS_RESP => Ok(AdminStatusResponse::decode(&frame.payload)?),
+            KIND_ADMIN_ERROR => Err(TransportError::Protocol(
+                AdminError::decode(&frame.payload)?.message,
+            )),
+            other => Err(TransportError::UnexpectedKind(other)),
+        }
+    }
+
     /// Read a segment's placement through a linearizable fence.
     pub async fn read_segment_placement(
         &self,
@@ -907,6 +1124,13 @@ impl AdminClient {
     /// useful message — not a connection error from whichever one happened to
     /// be tried last.
     async fn round_trip(&self, request: VtpmFrame) -> TransportResult<VtpmFrame> {
+        self.round_trip_indexed(request)
+            .await
+            .map(|(_, frame)| frame)
+    }
+
+    /// [`Self::round_trip`], also naming WHICH candidate gave the answer.
+    async fn round_trip_indexed(&self, request: VtpmFrame) -> TransportResult<(usize, VtpmFrame)> {
         use std::sync::atomic::Ordering;
 
         let mut index = self.preferred.load(Ordering::Relaxed) % self.candidates.len();
@@ -979,7 +1203,7 @@ impl AdminClient {
                     {
                         resolution.stale = false;
                     }
-                    return Ok(frame);
+                    return Ok((index, frame));
                 }
                 // An unreachable candidate is worth moving past for the same
                 // reason as a redirect: one node being down must not make the
@@ -1246,6 +1470,16 @@ mod tests {
     /// error — an error could equally come from a handler that ran and then
     /// failed. It is that the handler is never entered at all, which is the
     /// difference between a gate and a warning.
+    /// The refusal a metadata node that predates the replica-set read sends
+    /// for it (#553), pinned to the bytes released servers emit: their
+    /// dispatcher answers an unknown request kind with this Display, and a
+    /// client that stopped recognizing it would read an older tier as an
+    /// error and leave every range unleadable mid-upgrade.
+    #[test]
+    fn an_older_servers_refusal_of_the_replica_set_read_is_recognized() {
+        assert_eq!(predates_replica_set_read(), "unexpected response kind 27");
+    }
+
     #[derive(Default)]
     struct CountingHandler {
         proposals: AtomicUsize,
@@ -1408,6 +1642,209 @@ mod tests {
         client.propose(acquire(NODE_A)).await.unwrap_err();
         assert_eq!(handler.proposals.load(Ordering::SeqCst), 1);
 
+        task.abort();
+    }
+
+    /// A metadata node that predates the replica-set read (#553): it refuses
+    /// kind 27 the way a released server does, and answers status as
+    /// `server_state` with `current_leader`.
+    async fn older_node(
+        server_state: &'static str,
+        current_leader: Option<u64>,
+        quorum: bool,
+    ) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    while let Ok(request) = read_frame(&mut stream).await {
+                        let reply = if request.kind == KIND_ADMIN_READ_RANGE_LEASE_REQ && quorum {
+                            VtpmFrame {
+                                kind: KIND_ADMIN_READ_RANGE_LEASE_RESP,
+                                payload: AdminReadRangeLeaseResponse {
+                                    found: false,
+                                    range_generation: 0,
+                                    fencing_epoch: 0,
+                                    lease: None,
+                                    read_at_applied_index: 1,
+                                }
+                                .encode(),
+                            }
+                        } else if request.kind == KIND_ADMIN_READ_RANGE_LEASE_REQ {
+                            // Cut off from its quorum: a linearizable read
+                            // cannot complete.
+                            VtpmFrame {
+                                kind: KIND_ADMIN_ERROR,
+                                payload: AdminError {
+                                    message: "has to forward request to leader".to_owned(),
+                                    not_leader: None,
+                                }
+                                .encode()
+                                .unwrap(),
+                            }
+                        } else if request.kind == KIND_ADMIN_STATUS_REQ {
+                            let mut status = stub_status(MetaNodeId(9));
+                            status.server_state = server_state.to_owned();
+                            status.current_leader = current_leader.map(MetaNodeId);
+                            VtpmFrame {
+                                kind: KIND_ADMIN_STATUS_RESP,
+                                payload: status.encode().unwrap(),
+                            }
+                        } else {
+                            VtpmFrame {
+                                kind: KIND_ADMIN_ERROR,
+                                payload: AdminError {
+                                    message: TransportError::UnexpectedKind(request.kind)
+                                        .to_string(),
+                                    not_leader: None,
+                                }
+                                .encode()
+                                .unwrap(),
+                            }
+                        };
+                        if write_frame(&mut stream, &reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// A current leader with a set recorded, answering kind 27 directly.
+    async fn recording_leader() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    while let Ok(_request) = read_frame(&mut stream).await {
+                        let reply = VtpmFrame {
+                            kind: KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP,
+                            payload: AdminReadRangeReplicaSetResponse {
+                                range_found: true,
+                                replica_set: Some(crate::transport::AdminRangeReplicaSetView {
+                                    generation: 1,
+                                    members: vec![Uuid::from_u128(1), Uuid::from_u128(2)],
+                                    recorded_at_epoch: 3,
+                                }),
+                                read_at_applied_index: 7,
+                            }
+                            .encode()
+                            .unwrap(),
+                        };
+                        if write_frame(&mut stream, &reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn candidates(endpoints: &[(u64, SocketAddr)]) -> AdminClient {
+        AdminClient::plaintext(
+            endpoints
+                .iter()
+                .map(|(id, endpoint)| AdminCandidate {
+                    node_id: Some(MetaNodeId(*id)),
+                    endpoint: *endpoint,
+                    host: None,
+                    server_name: String::new(),
+                    plaintext: true,
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    /// #553 across a mixed upgrade, and the review that followed: an older
+    /// node's refusal of the replica-set read means "none recorded" ONLY when
+    /// that node is the leader. An older LEADER cannot hold a recorded set,
+    /// so a data node upgraded ahead of its tier still promotes. An older
+    /// follower (or learner, or removed voter still listed) proves nothing:
+    /// the read goes on to the leader it names, which here has a set
+    /// recorded - and one that names no leader is an error, never "none".
+    #[tokio::test]
+    async fn an_older_nodes_refusal_reads_as_no_set_only_from_the_leader() {
+        let range = (Uuid::from_u128(1), Uuid::from_u128(2));
+
+        let old_leader = older_node("Leader", Some(1), true).await;
+        let read = candidates(&[(1, old_leader)])
+            .read_range_replica_set(range.0, range.1)
+            .await
+            .expect("an older leader's refusal is an answer");
+        assert_eq!(read, None);
+
+        let new_leader = recording_leader().await;
+        let old_follower = older_node("Follower", Some(2), true).await;
+        let read = candidates(&[(1, old_follower), (2, new_leader)])
+            .read_range_replica_set(range.0, range.1)
+            .await
+            .expect("the leader the old follower names answers");
+        let set = read
+            .and_then(|response| response.replica_set)
+            .expect("the leader's recorded set, not \"none\"");
+        assert_eq!(set.members, vec![Uuid::from_u128(1), Uuid::from_u128(2)]);
+
+        // The leader the old follower names (node 3) cannot be reached: the
+        // read goes on to the members nobody has asked, and the current
+        // leader among them answers (review).
+        let old_follower = older_node("Follower", Some(3), true).await;
+        let new_leader = recording_leader().await;
+        let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let read = candidates(&[(1, old_follower), (2, new_leader), (3, unreachable)])
+            .read_range_replica_set(range.0, range.1)
+            .await
+            .expect("another member answers when the named leader cannot");
+        assert!(read.and_then(|response| response.replica_set).is_some());
+
+        // A former leader cut off from its quorum still SAYS it leads, but
+        // cannot serve a linearizable read: unknown, never "none" (review).
+        let isolated = older_node("Leader", Some(1), false).await;
+        let refused = candidates(&[(1, isolated)])
+            .read_range_replica_set(range.0, range.1)
+            .await;
+        assert!(
+            matches!(&refused, Err(TransportError::Protocol(message)) if message.contains("could not serve a linearizable read")),
+            "{refused:?}"
+        );
+
+        let lost = older_node("Learner", None, true).await;
+        let refused = candidates(&[(1, lost)])
+            .read_range_replica_set(range.0, range.1)
+            .await;
+        assert!(
+            matches!(&refused, Err(TransportError::Protocol(message)) if message.contains("is unknown")),
+            "{refused:?}"
+        );
+    }
+
+    /// A CURRENT server that does not serve the read is an error, never
+    /// "none": only an older leader's refusal means a set cannot be recorded.
+    #[tokio::test]
+    async fn a_current_handler_that_does_not_serve_the_read_is_an_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let current = listener.local_addr().unwrap();
+        let server = AdminServer::plaintext(
+            Arc::new(CountingHandler::default()) as Arc<dyn AdminHandler>,
+            AdminAuthorizer::permissive(),
+        )
+        .unwrap();
+        let task = tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let refused = candidates(&[(1, current)])
+            .read_range_replica_set(Uuid::from_u128(1), Uuid::from_u128(2))
+            .await;
+        assert!(
+            matches!(&refused, Err(TransportError::Protocol(message)) if message.contains("does not serve replica set reads")),
+            "{refused:?}"
+        );
         task.abort();
     }
 

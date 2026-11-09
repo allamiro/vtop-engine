@@ -58,8 +58,89 @@ RUNNER_MODES = ("host", "container")
 # namespace a middlebox shapes must be the SAME one across cycles, not a
 # fresh one per process.
 CONTAINER_SERVICE = "vtop-engine"
-COMPOSE_FILE = os.path.join(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))), "docker-compose.benchmark.yml")
+_BENCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+COMPOSE_FILE = os.path.join(_BENCH_DIR, "docker-compose.benchmark.yml")
+
+# --- the lab's HTTP/3-terminating proxy (#484) -------------------------------
+#
+# The `h3` compose profile puts a TLS-terminating reverse proxy in front of
+# MinIO so the lab has a counterparty that speaks HTTP/3 at all. A proxy hop
+# changes the path, so the FIRST thing measured through it is the existing TCP
+# path — the topology control — and these three constants are what the harness
+# needs to recognise that hop as the lab's own rather than somebody's store.
+# The port the proxy LISTENS on inside the lab. Fixed, because Alt-Svc
+# advertises it and a client told a different number reaches nothing.
+H3_PROXY_CONTAINER_PORT = 9443
+H3_PROXY_SERVICE = "h3-proxy"
+
+
+def h3_scenario_endpoint(scenario) -> str:
+    """The scenario's proxy endpoint with the CONFIGURED host port applied.
+
+    The scenario file names the default, 9443, because that is what it is
+    without an override — but `VTOP_H3_PORT` moves the publish, and a scenario
+    left dialling 9443 would then reach nothing while `verify-h3.sh`, which
+    follows the override, still reported a healthy proxy (review). Substituting
+    here is what makes the escape hatch usable for the MEASUREMENT and not only
+    for the check; an override that works for one and not the other is worse
+    than no override at all.
+
+    Only the port is touched. The host, the scheme and everything else are the
+    scenario's own, and a scenario that does not declare the hop is returned
+    unchanged.
+    """
+    declared = str(scenario.get("endpoint_url", "") or "")
+    if not _fronted_by_the_bundled_h3_proxy(scenario) or not declared:
+        return declared
+    parts = urlsplit(declared)
+    if parts.hostname is None:
+        return declared
+    # BRACKETED if it is an IPv6 literal (review). urlsplit strips the brackets
+    # from `[::1]`, so reassembling without them yields `https://::1:9443` —
+    # not a URL, and the topology validation below then fails reading its port.
+    # The lab's certificate carries a ::1 SAN, so this form is not hypothetical.
+    host = parts.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{parts.scheme or 'https'}://{host}:{h3_proxy_host_port()}"
+
+
+def h3_proxy_host_port() -> int:
+    """The HOST port the proxy is published on.
+
+    9443 by default and overridable with `VTOP_H3_PORT`, which the compose file
+    reads for the same variable — 9443 is an unremarkable choice for somebody
+    else's TLS service, and a collision otherwise leaves the profile unable to
+    start. The override has to reach HERE too (review): it moved the publish
+    and `verify-h3.sh` followed it, but the scenario's endpoint and this
+    module's validation did not, so the escape hatch passed verification while
+    making the proxy baseline itself unusable — an override that works for the
+    check and not for the measurement is worse than none.
+
+    The CONTAINER port is untouched by it: a container-mode engine reaches the
+    service by name on the port nginx listens on, and only the host side moves.
+
+    Read the way COMPOSE read it (review): the shell first, then the `.env`
+    compose auto-loads. Consulting the process environment alone missed an
+    override filed in that file — compose published and advertised the proxy on
+    it, and the harness went on dialling 9443, which is the same class of
+    failure as the override not reaching here at all.
+    """
+    raw = _compose_value("VTOP_H3_PORT")
+    if not raw:
+        return H3_PROXY_CONTAINER_PORT
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(
+            f"VTOP_H3_PORT={raw!r} is not a port number; it selects the host port the h3 "
+            "proxy is published on, and a run cannot be pointed at a name") from None
+# The CA gen-h3-certs.sh mints. It has to reach the client's trust store:
+# `verify_tls: false` permits plaintext endpoints and explicitly does NOT
+# disable certificate verification (vtop-upload/src/s3_native.rs), so an
+# https:// lab endpoint without this file fails the handshake — which would
+# read as a transport result rather than the missing-material mistake it is.
+H3_PROXY_CA_FILE = os.path.join(_BENCH_DIR, "tls", "ca.pem")
 
 # The environment the engine's credential/endpooint resolution consumes —
 # the exact keys _backend_env manages. A container run forwards these and
@@ -102,7 +183,8 @@ def runner_mode(scenario) -> str:
     return raw
 
 
-def container_wire_endpoint(endpoint: str, shaped: bool = False) -> str:
+def container_wire_endpoint(endpoint: str, shaped: bool = False,
+                            fronted: bool = False) -> str:
     """The lab endpoint as the CONTAINERIZED engine reaches it.
 
     The compose stack publishes MinIO on the host's loopback at :9000, and
@@ -115,7 +197,7 @@ def container_wire_endpoint(endpoint: str, shaped: bool = False) -> str:
     HOST-view endpoint, so the lab fallbacks follow the store, not the
     spelling of its address.
     """
-    if _is_lab_endpoint(endpoint, shaped=shaped):
+    if _is_lab_endpoint(endpoint, shaped=shaped, fronted=fronted):
         parts = urlsplit(endpoint)
         # A SHAPED scenario goes through the proxy service, not around it
         # (review): 9100 is the same lab store behind toxiproxy, and
@@ -124,6 +206,14 @@ def container_wire_endpoint(endpoint: str, shaped: bool = False) -> str:
         # bypass require_endpoint_through_proxy exists to refuse.
         if parts.port == 9100:
             return f"{parts.scheme or 'http'}://toxiproxy:9100"
+        # Same reasoning one hop over (#484): the h3 proxy IS the topology
+        # under measurement, so a scenario declaring it must reach the proxy
+        # service by name, never the store it fronts. The scheme is kept:
+        # the proxy is TLS-only, and rewriting https to http here would turn
+        # a topology translation into a downgrade.
+        if parts.port == h3_proxy_host_port():
+            return (f"{parts.scheme or 'https'}://"
+                    f"{H3_PROXY_SERVICE}:{H3_PROXY_CONTAINER_PORT}")
         return f"{parts.scheme or 'http'}://minio:9000"
     return endpoint
 
@@ -316,7 +406,8 @@ def invocation(binary: str, args: list[str], scenario) -> tuple[list[str], dict[
         if value and key in (
                 "VTOP_S3_ENDPOINT_URL", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"):
             value = container_wire_endpoint(
-                value, shaped=_shaped_by_the_bundled_proxy(scenario))
+                value, shaped=_shaped_by_the_bundled_proxy(scenario),
+                fronted=_fronted_by_the_bundled_h3_proxy(scenario))
         if value:
             argv += ["-e", key]
             exec_env[key] = value
@@ -337,7 +428,17 @@ def _effective_endpoint(scenario) -> str:
     other produced a bucket-creating config with credentials the server
     never saw, and every upload failed on credential resolution.
     """
-    return os.environ.get("VTOP_S3_ENDPOINT_URL", "") or scenario.get("endpoint_url", "")
+    # Blank is ABSENT, here and in _backend_env alike (review): an exported
+    # `VTOP_S3_ENDPOINT_URL=` used to be "no override" to this check and a
+    # present value to the engine, which reads it as `Some("")` and fails
+    # endpoint resolution on the topology this helper had just accepted.
+    override = os.environ.get("VTOP_S3_ENDPOINT_URL", "").strip()
+    if override:
+        return override
+    # An h3 scenario's own value has the configured host port applied, so the
+    # run dials where the proxy is actually published (see
+    # `h3_scenario_endpoint`). Every other scenario gets its value unchanged.
+    return h3_scenario_endpoint(scenario) or scenario.get("endpoint_url", "")
 
 
 # The engine's own default batch ceiling (vtop-core config.rs
@@ -411,7 +512,21 @@ def _shaped_by_the_bundled_middlebox(scenario) -> bool:
         return False
 
 
-def _is_lab_endpoint(endpoint: str, shaped: bool = False) -> bool:
+def _fronted_by_the_bundled_h3_proxy(scenario) -> bool:
+    """True only for a scenario that DECLARES the lab's h3 proxy hop (#484).
+
+    A declaration, never an inference from the port — the same rule the
+    shaped path learned: port 9443 on loopback is an extremely ordinary
+    address for somebody else's TLS service, and handing it the lab's
+    credentials because the number matched would replace an identity the
+    operator brought. Declaring the hop is also what makes the summary's
+    topology claim checkable at all.
+    """
+    return bool(scenario.get("h3_proxy", False))
+
+
+def _is_lab_endpoint(endpoint: str, shaped: bool = False,
+                     fronted: bool = False) -> bool:
     # The compose stack publishes MinIO on the loopback interface at the
     # FIXED host port 9000 (docker-compose.benchmark.yml pins it; only the
     # bind address is overridable), and that one endpoint is the only one
@@ -433,9 +548,101 @@ def _is_lab_endpoint(endpoint: str, shaped: bool = False) -> bool:
     # — but only for a SHAPED scenario: the pipe changes, the store and its
     # lab credentials do not. An unshaped scenario aimed at 9100 is somebody
     # else's service, and must not be handed the lab's keys (review).
-    lab_ports = (9000, 9100) if shaped else (9000,)
+    # 9443 is the same lab MinIO behind the h3 profile's proxy (#484), on the
+    # same terms: the topology changes, the store does not, and only a
+    # scenario that declared the hop may claim it.
+    lab_ports = [9000]
+    if shaped:
+        lab_ports.append(9100)
+    if fronted:
+        lab_ports.append(h3_proxy_host_port())
     return (parts.hostname in ("localhost", "127.0.0.1", "::1")
             and port in lab_ports)
+
+
+def require_endpoint_through_h3_proxy(scenario) -> None:
+    """A scenario that declares the h3 proxy hop must actually take it (#484).
+
+    The hop exists to be a CONTROLLED confound: a later transport comparison
+    reads its TCP baseline off a run through this proxy, so a run that claimed
+    the hop and went straight to the store would turn a comparison of wires
+    into a comparison of topologies — silently, because the numbers would look
+    entirely reasonable. Every way that can happen is refused here, before a
+    seed byte exists, and each refusal names what it saw.
+
+    Raises ValueError; the runner prints it and exits, as it does for a
+    malformed runner_mode.
+    """
+    if not _fronted_by_the_bundled_h3_proxy(scenario):
+        return
+    backend = str(scenario.get("backend", "") or "")
+    if backend != "s3_native":
+        raise ValueError(
+            f"h3_proxy is set but backend is {backend!r}: only s3_native dials "
+            "endpoint_url over TLS, so any other backend would record a proxy "
+            "hop it never took")
+    # The scenario's own endpoint with VTOP_H3_PORT applied, which is what the
+    # run must actually dial; without the override this is the scenario's value
+    # unchanged.
+    declared = h3_scenario_endpoint(scenario)
+    endpoint = _effective_endpoint(scenario)
+    if endpoint != declared:
+        raise ValueError(
+            f"h3_proxy is set but the effective endpoint is {endpoint!r}, not "
+            f"the scenario's {declared!r}: VTOP_S3_ENDPOINT_URL is sending the "
+            "engine around the proxy while the run would still be filed as "
+            "proxied — unset it, or point it at the proxy")
+    # AND the SDK's OWN endpoint channels (review). `_effective_endpoint`
+    # knows about VTOP_S3_ENDPOINT_URL and the scenario value; the AWS SDK
+    # additionally consumes AWS_ENDPOINT_URL_S3 and AWS_ENDPOINT_URL at
+    # service-config construction, and vtop-upload's s3_native validates them
+    # for scheme without knowing anything about this proxy. So a host with
+    # AWS_ENDPOINT_URL_S3 pointed at MinIO directly would take the engine
+    # around the hop while every row still recorded h3_proxy — the topology
+    # claim is only worth making if every channel that could break it is
+    # checked. Any value at all is refused rather than compared: an endpoint
+    # that happens to equal the proxy's is still a second source of truth for
+    # the one thing this scenario exists to pin.
+    for var in ("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"):
+        if os.environ.get(var, "").strip():
+            raise ValueError(
+                f"h3_proxy is set but {var} is present in the environment: the AWS SDK "
+                f"reads it when it builds the client, so the engine could reach the store "
+                f"without crossing the proxy while the run is still filed as proxied. "
+                f"Unset {var} for a proxied run — the scenario's endpoint_url is the only "
+                "place the topology may be stated")
+    try:
+        parts = urlsplit(endpoint)
+        port = parts.port
+    except ValueError:
+        parts, port = None, None
+    if parts is None or parts.scheme != "https" or port != h3_proxy_host_port() or \
+            parts.hostname not in ("localhost", "127.0.0.1", "::1"):
+        raise ValueError(
+            f"h3_proxy is set but endpoint_url is {endpoint!r}: the bundled "
+            f"proxy is published on loopback at https://localhost:"
+            f"{h3_proxy_host_port()} and is TLS-only, because HTTP/3 has no plaintext "
+            "form")
+    # Container mode is refused rather than half-supported: the lab CA lives
+    # on the host under benchmarks/tls and the hardened engine container
+    # mounts only the binary and the run root, so a containerized run would
+    # fail the TLS handshake with a trust error that reads like a proxy fault.
+    # Mounting the CA in is a small change; making it silently work is not,
+    # and guessing is what this whole issue is about not doing.
+    mode = runner_mode(scenario)
+    if mode != "host":
+        raise ValueError(
+            f"h3_proxy with runner_mode={mode!r} is not supported: the lab CA "
+            f"({H3_PROXY_CA_FILE}) is not mounted into the engine container, "
+            "so the handshake would fail as a trust error and read as a "
+            "transport result. Run this scenario in host mode")
+    if not os.path.isfile(H3_PROXY_CA_FILE):
+        raise ValueError(
+            f"h3_proxy is set but the lab CA is missing at {H3_PROXY_CA_FILE}: "
+            "the engine verifies certificates even with verify_tls false. Mint "
+            "the material first — benchmarks/gen-h3-certs.sh — then start the "
+            "profile: docker compose -f benchmarks/docker-compose.benchmark.yml "
+            "--profile h3 up -d")
 
 
 def write_engine_config(scenario, work_dir: str, state_db: str,
@@ -585,7 +792,8 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
         # different stores.
         if runner_mode(scenario) == "container":
             endpoint = container_wire_endpoint(
-                endpoint, shaped=_shaped_by_the_bundled_proxy(scenario))
+                endpoint, shaped=_shaped_by_the_bundled_proxy(scenario),
+                fronted=_fronted_by_the_bundled_h3_proxy(scenario))
         lines.append(f"  endpoint_url: {endpoint}")
     with open(config_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -654,9 +862,42 @@ def _dotenv_overrides() -> dict[str, str]:
     return values
 
 
+def _compose_value(name: str) -> str:
+    """What compose resolved `${name:-...}` from, in compose's own order.
+
+    A variable PRESENT in the environment wins even when it is blank — that is
+    how compose resolves it, and the blank then falls through to the literal
+    default rather than to the file — and `.env` answers only when the shell
+    said nothing at all. Everything in this module that has to predict what the
+    STACK was started with reads through here; `lib/dotenv.sh` is the shell
+    counterpart the lab's two scripts share, and the tests hold the two to the
+    same order.
+
+    Stripped, because what this resolves are numbers and identities where
+    surrounding whitespace is a typo rather than part of the value. The
+    credentials in `_backend_env` deliberately do NOT come through here: there
+    a stray space may be the password.
+    """
+    if name in os.environ:
+        return os.environ[name].strip()
+    return _dotenv_overrides().get(name, "").strip()
+
+
 def _backend_env(scenario) -> dict[str, str]:
     env = dict(os.environ)
     endpoint = _effective_endpoint(scenario)
+    # The engine is handed the override AS VALIDATED, never as typed (review).
+    # _effective_endpoint strips before it judges, so a blank override is no
+    # override and ` https://localhost:9443 ` is the proxy endpoint; the raw
+    # value left in the child's environment would outrank that — the engine
+    # would dial "" or parse a URI with spaces in it, on a topology this run
+    # had just accepted.
+    if "VTOP_S3_ENDPOINT_URL" in env:
+        normalized = env["VTOP_S3_ENDPOINT_URL"].strip()
+        if normalized:
+            env["VTOP_S3_ENDPOINT_URL"] = normalized
+        else:
+            del env["VTOP_S3_ENDPOINT_URL"]
     if scenario.get("backend") == "s3_native" and endpoint:
         # A no-op when the endpoint came from the environment: it is
         # already set there, and setdefault leaves it alone.
@@ -667,7 +908,10 @@ def _backend_env(scenario) -> dict[str, str]:
     # credentials (already in the environment) winning over the fallbacks.
     if scenario.get("backend") == "minio" or (
             scenario.get("backend") == "s3_native" and endpoint
-            and (_is_lab_endpoint(endpoint, shaped=_shaped_by_the_bundled_proxy(scenario))
+            and (_is_lab_endpoint(
+                endpoint,
+                shaped=_shaped_by_the_bundled_proxy(scenario),
+                fronted=_fronted_by_the_bundled_h3_proxy(scenario))
                  or _shaped_by_the_bundled_middlebox(scenario))):
         # The benchmark compose lets an operator override the SERVER's
         # credentials via MINIO_ROOT_USER / MINIO_ROOT_PASSWORD (issue #81).
@@ -696,6 +940,23 @@ def _backend_env(scenario) -> dict[str, str]:
         env.setdefault("AWS_REGION", "us-east-1")
         env.setdefault("VTOP_S3_FORCE_PATH_STYLE", "true")
         env.setdefault("VTOP_S3_VERIFY_TLS", "false")
+    # The h3 proxy hop is the one lab endpoint that is https:// (#484), and
+    # VTOP_S3_VERIFY_TLS=false does NOT relax certificate verification — the
+    # engine says so itself (vtop-upload/src/s3_native.rs: "private CAs must be
+    # in the system trust store"). The chain that makes this variable the right
+    # lever: the SDK's default TrustStore enables native roots
+    # (aws-smithy-http-client, TrustStore::default), native roots on Unix are
+    # rustls_native_certs::load_native_certs, and that calls
+    # openssl_probe::probe, which reads SSL_CERT_FILE. The probe still appends
+    # the system certificate DIRECTORIES it finds, so this ADDS the lab CA
+    # rather than replacing the public roots.
+    #
+    # setdefault, so an operator who exported their own bundle keeps it: what a
+    # client trusts is operator topology, which this harness never overrides.
+    # Such a run then fails loudly at the handshake instead of the harness
+    # quietly redefining what it trusts.
+    if _fronted_by_the_bundled_h3_proxy(scenario):
+        env.setdefault("SSL_CERT_FILE", H3_PROXY_CA_FILE)
     return env
 
 

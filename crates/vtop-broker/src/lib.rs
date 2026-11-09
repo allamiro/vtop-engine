@@ -32,6 +32,7 @@ pub mod fencing_epochs;
 pub mod group_commit;
 pub mod memory_budget;
 pub mod replication;
+pub mod retention_stats;
 pub mod server_metrics;
 
 use crate::group_commit::{GroupCommitConfig, GroupCommitCoordinator, QueuedProduce};
@@ -647,6 +648,8 @@ pub struct LocalBroker {
     /// Atomic so operators can set it after construction without a lock, and
     /// the produce path can read it inside the state-lock critical section.
     retention_max_total_bytes: std::sync::atomic::AtomicU64,
+    /// What retention has been doing, for the exporter (#561).
+    retention_stats: crate::retention_stats::RetentionStats,
     /// Optional follower fan-out for quorum produce.
     replicas: Option<Arc<dyn ReplicaSet>>,
     /// Leader identity embedded in replica append requests.
@@ -774,6 +777,7 @@ impl LocalBroker {
             meta_fencing_epoch,
             segment_format,
             retention_max_total_bytes: std::sync::atomic::AtomicU64::new(0),
+            retention_stats: Default::default(),
             cluster_committed,
             boundary_pending: AtomicBool::new(false),
             replicas,
@@ -1081,10 +1085,16 @@ impl LocalBroker {
     /// node configuration rejects zero outright, so the only way to disable
     /// retention is to not configure it.
     pub fn set_retention(&self, policy: Option<vtop_log::RetentionPolicy>) {
-        self.retention_max_total_bytes.store(
-            policy.map(|policy| policy.max_total_bytes).unwrap_or(0),
-            Ordering::SeqCst,
-        );
+        let bound = policy.map(|policy| policy.max_total_bytes).unwrap_or(0);
+        // The bound and the policy generation move together, under the
+        // stats' policy lock, and what the last pass recorded is forgotten:
+        // disabled (by `None` or a zero bound, which this layer treats the
+        // same) or rebound, a pass of the old policy must not leave its
+        // bound, size and blocked reason exported (review of #572).
+        self.retention_stats.change_policy(|| {
+            self.retention_max_total_bytes
+                .store(bound, Ordering::SeqCst);
+        });
     }
 
     /// Run one retention pass under the state lock the caller already holds.
@@ -1094,7 +1104,11 @@ impl LocalBroker {
     /// next open — refusing the produce over reclamation trouble would turn
     /// a disk-space policy into an availability incident.
     fn run_retention(&self, segment: &mut SegmentSet) {
-        let max_total_bytes = self.retention_max_total_bytes.load(Ordering::SeqCst);
+        // The bound and its generation, read together (review of #572): a
+        // policy change after this makes the pass's record a no-op.
+        let (generation, max_total_bytes) = self
+            .retention_stats
+            .policy(|| self.retention_max_total_bytes.load(Ordering::SeqCst));
         if max_total_bytes == 0 {
             return;
         }
@@ -1104,13 +1118,18 @@ impl LocalBroker {
             .as_ref()
             .map(|committed| committed.get().min(local))
             .unwrap_or(local);
-        if let Err(problem) = segment.retain(&vtop_log::RetentionPolicy { max_total_bytes }, floor)
-        {
-            eprintln!(
-                "retention on {} failed and will be retried after the next append: {problem}",
-                self.range.topic
-            );
-        }
+        let result = segment.retain(&vtop_log::RetentionPolicy { max_total_bytes }, floor);
+        self.retention_stats.record_for(
+            generation,
+            &format!("range {}/{}", self.range.topic, self.range.range_id),
+            max_total_bytes,
+            &result,
+        );
+    }
+
+    /// What retention has been doing on this range (#561).
+    pub fn retention_stats(&self) -> &crate::retention_stats::RetentionStats {
+        &self.retention_stats
     }
 
     /// Install the durable epoch→offset vector for this replica (#240).
@@ -1553,6 +1572,19 @@ impl LocalBroker {
             state.segment.committed_offset(),
             state.segment.next_offset(),
         ))
+    }
+
+    /// The first offset this replica still holds, without blocking: `None`
+    /// while the state lock is held (see [`Self::try_local_offsets`]). A
+    /// consumer whose position is below it is told `OffsetOutOfRange`; it is
+    /// what retention moves (#571).
+    pub fn try_log_start_offset(&self) -> Option<u64> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(state.segment.base_offset())
     }
 
     pub fn handle(&self, role: Role, frame: WireFrame) -> WireFrame {

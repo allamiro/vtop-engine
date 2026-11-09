@@ -11,6 +11,7 @@ these tests read.
 """
 
 import json
+import os
 
 import pytest
 
@@ -239,7 +240,7 @@ def test_a_netem_knob_is_a_number_or_refused_by_name():
 
 def test_the_bottleneck_carries_the_rate_and_the_buffer_it_was_configured_for():
     shape = full_shape()
-    tbf = qdiscs_on(shape.tc_program(), IFB_DEV)[0]
+    tbf = [c for c in qdiscs_on(shape.tc_program(), IFB_DEV) if "tbf" in c][0]
     assert arg_after(tbf, "rate") == "10000kbit", (
         "tbf's rate IS the emulated bottleneck; a wrong unit or a dropped suffix here "
         "produces a link nobody configured and a calibration failure nobody can read")
@@ -255,22 +256,56 @@ def test_the_bottleneck_carries_the_rate_and_the_buffer_it_was_configured_for():
         "floor — a refused qdisc fails the run rather than shaping it")
 
 
-def test_the_impairment_is_the_bottlenecks_child_not_a_second_root():
+def test_the_bottleneck_is_the_delay_lines_child_so_its_buffer_is_its_own_queue():
+    # THE LAYOUT (review). With tbf at the root and netem beneath it, netem
+    # REPLACED tbf's internal bfifo, so one packet limit bounded the congestion
+    # backlog and the delay line together, and whatever the delay line was not
+    # using at a given instant became congestion buffer no column recorded.
+    # With netem at the root and tbf beneath it, tbf keeps its own byte-limited
+    # bfifo, and that queue is the bottleneck buffer and nothing else.
     program = full_shape().tc_program()
     ifb_qdiscs = qdiscs_on(program, IFB_DEV)
     roots = [c for c in ifb_qdiscs if "root" in c]
-    assert len(roots) == 1 and "tbf" in roots[0], (
-        "only the bottleneck may be root: a netem installed as a second root would "
-        "REPLACE tbf, and the run would measure delay and loss on an unlimited link "
-        "while the summary recorded a bottleneck")
-    child = [c for c in ifb_qdiscs if "netem" in c][0]
-    assert arg_after(child, "parent") == "1:1", (
-        "netem hangs under tbf so packets are rate-limited into the queue first and "
-        "impaired second — the order a real bottleneck link applies them")
-    assert arg_after(roots[0], "handle") == "1:", "the child's parent must be the tbf it names"
-    assert ifb_qdiscs.index(roots[0]) < ifb_qdiscs.index(child), (
+    assert len(roots) == 1 and "netem" in roots[0], (
+        "the delay line is the root: exactly one root on the ifb, because a second root "
+        "would REPLACE the first and the run would measure half the shape while the "
+        "summary recorded all of it")
+    assert arg_after(roots[0], "handle") == "1:", "the child's parent must be the netem it names"
+    child = [c for c in ifb_qdiscs if "tbf" in c]
+    assert len(child) == 1 and arg_after(child[0], "parent") == "1:1", (
+        "tbf hangs under netem, so it keeps its own bfifo and its byte `limit` is enforced "
+        "on the congestion queue alone. Under tbf, a classless netem replaces that bfifo, "
+        "and the buffer becomes whatever netem's packet limit leaves over")
+    assert int(arg_after(roots[0], "limit")) == full_shape().netem_limit_packets(), (
+        "and netem's own limit is the delay line's, which is not a queue the link has")
+    assert ifb_qdiscs.index(roots[0]) < ifb_qdiscs.index(child[0]), (
         "the parent must exist before the child is attached, or the kernel refuses the "
         "second command and the shape half-installs")
+
+
+def test_the_congestion_queue_is_the_same_bytes_whatever_the_delay_line_holds():
+    # The finding in its own terms: jitter, latency and every other property of
+    # the delay line must not reach the congestion queue's size, because any
+    # term that does is capacity congestion can borrow whenever the line holds
+    # less than that term assumed.
+    def tbf_of(shape):
+        return [c for c in qdiscs_on(shape.tc_program(), IFB_DEV) if "tbf" in c][0]
+
+    steady = NetemShape(latency_ms=100, bottleneck_kbps=10_000, buffer_bdp=1.0)
+    assert arg_after(tbf_of(steady), "parent") == "1:1", (
+        "an unchanged tbf argv proves nothing while tbf is the ROOT: there its byte limit "
+        "is replaced by its netem child's packet limit, and THAT limit is the one jitter "
+        "moves. Only as netem's child is tbf's limit the queue")
+    for jitter in (0, 2, 20, 60):
+        jittery = NetemShape(latency_ms=100, jitter_ms=jitter, bottleneck_kbps=10_000,
+                             buffer_bdp=1.0)
+        assert tbf_of(jittery) == tbf_of(steady), (
+            f"at {jitter} ms of jitter the bottleneck queue changed: a delay-line reserve "
+            "has leaked into the congestion buffer, where the line's unused share is "
+            "queue no column records — 37.5 kB, 0.3 BDP, at 20 ms on this link")
+        assert int(arg_after(tbf_of(jittery), "limit")) == 125_000, (
+            "the congestion queue is exactly one BDP of bytes, the number recorded beside "
+            "the result")
 
 
 def test_the_upload_is_redirected_onto_the_ifb_and_the_policer_drops_ahead_of_it():
@@ -813,6 +848,42 @@ def test_calibrate_can_be_driven_without_a_container():
     assert "ip" in calls, "the shape is installed for the measurement and removed after"
 
 
+def test_the_rate_gate_measures_the_bucket_without_the_jitter_that_reorders_through_it():
+    # With the congestion queue honest, a 1-BDP bottleneck with 20 ms of jitter
+    # measured 8.91-9.15 Mbit/s through a single iperf3 flow — TCP backing off
+    # from the reordering jitter causes, not the bucket missing its rate (the
+    # same shape without jitter read 9.51-9.61, and with 4 BDP of buffer
+    # 9.34-9.53). The gate's floor is 9.0, so gating through the jitter would
+    # refuse a correctly built link about half the time.
+    installed = []
+
+    def middlebox(argv):
+        installed.append(list(argv))
+        if argv[:4] == ["ip", "-o", "-4", "addr"]:
+            return 0, TWO_INTERFACES
+        if "show" in argv:
+            return (0, "") if argv[0] == "tc" else (1, 'Device "ifb0" does not exist.')
+        return 0, ""
+
+    def probe(argv):
+        return 0, json.dumps({"end": {"sum_received": {"bits_per_second": 9_600_000.0}}})
+
+    shape = NetemShape(latency_ms=100, jitter_ms=20, loss_pct=1.0, bottleneck_kbps=10_000,
+                       buffer_bdp=1.0, policer_kbps=5000, run_token="t")
+    netem.calibrate(shape, run=middlebox, probe=probe, log=lambda _m: None)
+    netems = [cmd for cmd in installed if cmd[:3] == ["tc", "qdisc", "add"] and "netem" in cmd]
+    assert netems, "the calibration still installs the delay it is measured through"
+    assert all("distribution" not in cmd and "loss" not in cmd for cmd in netems), (
+        f"the rate gate measured through jitter or loss: {netems}. Both lower a TCP flow's "
+        "goodput by design, so the gate would refuse a bucket delivering its rate")
+    assert all(arg_after(cmd, "delay") in ("50ms",) for cmd in netems), (
+        "while the MEAN delay stays: the bucket's rate is calibrated on the round trip "
+        "the run will use")
+    tbf = [cmd for cmd in installed if "tbf" in cmd]
+    assert len(tbf) == 1 and arg_after(tbf[0], "limit") == str(shape.buffer_bytes()), (
+        "and on the same buffer")
+
+
 def test_an_unshaped_baseline_can_sit_beside_a_netem_row():
     # The comparison the netem driver exists to make. Every scenario carries
     # the loader's default `shaping_driver: toxiproxy`, and the matrix fills a
@@ -834,3 +905,163 @@ def test_an_unshaped_baseline_can_sit_beside_a_netem_row():
                           "scenario": {"shaping_driver": "toxiproxy"}})
     with pytest.raises(IncomparableRuns):
         refuse_mixed_drivers([proxied, shaped_row])
+
+
+def test_the_delay_line_limit_is_out_of_reach_of_what_it_can_legitimately_hold():
+    # netem's `limit` now bounds the delay line and nothing else, and a delay
+    # line is a length of wire: it has no capacity to exceed. A limit that
+    # binds drops packets the emulated link never lost, so it is set far above
+    # the line's worst case — and the line's worst case is not `rate x delay`:
+    # a filling queue lets arrivals above the bottleneck rate into it (measured
+    # at twice the rate at peak), and some kernels count the child's packets
+    # against it.
+    shape = NetemShape(latency_ms=100, bottleneck_kbps=10_000, buffer_bdp=1.0)
+    assert shape.delay_occupancy_bytes() == 62_500, (
+        "50 ms of upload delay at 10 Mbit/s is in flight, not queued")
+    assert shape.netem_limit_packets() >= 1000, (
+        "never shallower than netem's own default: a shape that asks for a bottleneck "
+        "must not get a delay line one with no bottleneck would not")
+
+    # A shape with no delay has no occupancy, and still gets the floor.
+    flat = NetemShape(latency_ms=0, bottleneck_kbps=10_000, buffer_bdp=0.0)
+    assert flat.delay_occupancy_bytes() == 0
+
+
+def test_the_delay_line_limit_clears_twice_its_worst_case_at_every_awkward_rate_and_rtt():
+    # Swept rather than pinned to an example, because the three earlier rounds
+    # on this number were each an example that the next one broke. The bound
+    # is computed here, exactly and independently of the module: twice what the
+    # line holds at three sigma PLUS the whole congestion queue, at the MTU —
+    # which is below the module's own headroom by a factor of two, so the test
+    # checks a margin rather than restating the module's arithmetic.
+    from fractions import Fraction
+
+    from lib.netem import MTU_BYTES, NetemShape
+
+    sigmas = 3
+    for kbps in (997, 1006, 10_000, 100_003, 1_000_000):
+        for rtt in (1, 299, 334, 1001):
+            for jitter, bdp in ((0, 1.0), (7, 1.0), (20, 0.5), (13, 4.0)):
+                shape = NetemShape(latency_ms=rtt, jitter_ms=jitter,
+                                   bottleneck_kbps=kbps, buffer_bdp=bdp)
+                upload_ms = (rtt + 1) // 2
+                assert upload_ms == shape.upload_delay_ms(), (
+                    "the direction split changed; this sweep is now reserving against a "
+                    "delay line the shape does not install")
+                in_flight = Fraction(kbps * (upload_ms + sigmas * ((jitter + 1) // 2)), 8)
+                limit = shape.netem_limit_packets()
+                assert limit * MTU_BYTES >= 2 * (in_flight + shape.buffer_bytes()), (
+                    f"{kbps} kbit/s, {rtt} ms, {jitter} ms jitter, {bdp} BDP: the delay line's "
+                    f"limit of {limit} packets is within a factor of two of what the line and "
+                    "the queue can hold, so a burst of arrivals above the rate reaches it and "
+                    "netem drops packets the link never lost — recorded in no column")
+                tbf = [c for c in qdiscs_on(shape.tc_program(), IFB_DEV) if "tbf" in c][0]
+                assert int(arg_after(tbf, "limit")) == shape.buffer_bytes(), (
+                    "while the congestion queue stays exactly the configured buffer, in bytes")
+
+
+# --------------------------------------------------------------------------
+# No netem qdisc runs on a depth nobody chose (#516)
+# --------------------------------------------------------------------------
+
+
+def _every_shape_the_program_accepts():
+    """The cross product of every knob NetemShape takes, built directly so the
+    combinations a scenario validator would refuse are covered too: a future
+    caller that builds a shape by hand gets the same guarantee."""
+    for latency in (0, 101):
+        for jitter in (0, 21):
+            for loss in (0.0, 1.0):
+                for bottleneck, buffer in ((0, 0.0), (10_000, 1.0)):
+                    for policer in (0, 5_000):
+                        if not (latency or jitter or loss or bottleneck or policer):
+                            continue
+                        yield NetemShape(latency_ms=latency, jitter_ms=jitter, loss_pct=loss,
+                                         loss_model="random", bottleneck_kbps=bottleneck,
+                                         buffer_bdp=buffer, policer_kbps=policer, run_token="t")
+
+
+def test_every_netem_qdisc_in_every_shape_carries_an_explicit_limit():
+    for shape in _every_shape_the_program_accepts():
+        for cmd in shape.tc_program("eth0"):
+            if "netem" not in cmd:
+                continue
+            assert "limit" in cmd, (
+                f"{shape} installs `{' '.join(cmd)}` without a limit, so netem's default of "
+                f"{netem.NETEM_DEFAULT_LIMIT_PACKETS} packets decides that queue's depth — a "
+                "depth no column records and nobody chose")
+            assert int(arg_after(cmd, "limit")) >= netem.NETEM_DEFAULT_LIMIT_PACKETS, (
+                f"{shape}: a chosen limit must never be SHALLOWER than the one it replaced")
+
+
+def test_a_limit_never_installs_a_qdisc_the_shape_did_not_ask_for():
+    # The limit is sizing for a qdisc that exists, never a reason for one to:
+    # a pure-loss shape has no download delay line, a policer-only shape no
+    # upload netem, and the teardown must still mirror the install.
+    for shape in _every_shape_the_program_accepts():
+        program = shape.tc_program("eth0")
+        download = [c for c in program if c[:4] == ["tc", "qdisc", "add", "dev"]
+                    and c[4] == "eth0" and "netem" in c]
+        wants_download = bool(shape.download_delay_ms() or shape.jitter_ms // 2)
+        assert bool(download) == wants_download, (
+            f"{shape}: a download netem is installed={bool(download)} but the shape asks for "
+            f"one={wants_download}")
+        upload_netem = [c for c in program if IFB_DEV in c and "netem" in c]
+        wants_upload = bool(shape.upload_delay_ms() or shape.jitter_ms or shape.loss_pct)
+        assert bool(upload_netem) == wants_upload, (
+            f"{shape}: an upload netem is installed={bool(upload_netem)} but the shape asks "
+            f"for one={wants_upload}")
+        removes_download = ["tc", "qdisc", "del", "dev", "eth0", "root"] in \
+            shape.teardown_program("eth0")
+        assert removes_download == bool(download), (
+            f"{shape}: the teardown removes a download root={removes_download} while the "
+            f"install created one={bool(download)}")
+
+
+def test_the_download_delay_line_is_sized_for_the_reference_rate_it_documents():
+    shape = full_shape()
+    held_ms = shape.download_delay_ms() + netem.JITTER_HEADROOM_SIGMAS * (shape.jitter_ms // 2)
+    in_flight = netem.DELAY_LINE_REFERENCE_KBPS * held_ms / 8
+    limit = shape.download_delay_line_limit_packets()
+    assert limit * netem.MTU_BYTES >= 2 * in_flight, (
+        f"the unshaped return path's delay line holds {in_flight:.0f} bytes at the "
+        f"{netem.DELAY_LINE_REFERENCE_KBPS} kbit/s reference; a limit of {limit} packets is "
+        "within a factor of two of that and would drop what the emulated link never lost")
+    policed = NetemShape(latency_ms=100, policer_kbps=5_000, run_token="t")
+    assert policed.upload_delay_line_limit_packets() == netem.delay_line_limit_packets(
+        5_000, policed.upload_delay_ms(), 0), (
+        "an unbottlenecked upload behind a policer is sized for the policer's rate, the "
+        "fastest thing that can enter its delay line")
+
+
+def test_a_changed_mtu_moves_the_buffer_floor_and_the_packet_conversion_together(monkeypatch):
+    monkeypatch.setattr(netem, "MTU_BYTES", 9000)
+    tiny = NetemShape(latency_ms=2, bottleneck_kbps=64, buffer_bdp=0.1, run_token="t")
+    assert tiny.buffer_bytes() == 9000, (
+        "the buffer floor is one full-size packet; a literal 1500 would leave a jumbo-frame "
+        "link with a queue that cannot hold a single segment")
+    big = NetemShape(latency_ms=100, jitter_ms=0, run_token="t")
+    expected = max(netem.NETEM_DEFAULT_LIMIT_PACKETS,
+                   -(-netem.DELAY_LINE_HEADROOM
+                     * -(-netem.DELAY_LINE_REFERENCE_KBPS * big.download_delay_ms() // 8) // 9000))
+    assert big.download_delay_line_limit_packets() == expected, (
+        "the delay lines' packet limits convert at the same MTU the floor uses")
+
+
+def test_the_bundled_scenarios_congestion_queues_and_upload_lines_did_not_move():
+    # #516 gives the UNCHOSEN depths a value; it must not move the chosen ones.
+    # Pinned from the install programs before the change.
+    from lib.scenario import load_scenario
+    from lib.shaping import shape_from_scenario
+    expected = {
+        "14-lossy-wan.yaml": ("1000", "125000"),
+        "16-contended-bottleneck.yaml": ("1500", "500000"),
+    }
+    for name, (netem_limit, tbf_limit) in expected.items():
+        program = shape_from_scenario(load_scenario(
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "scenarios", name))).tc_program("eth0")
+        upload = [c for c in program if IFB_DEV in c and "netem" in c][0]
+        tbf = [c for c in program if "tbf" in c][0]
+        assert (arg_after(upload, "limit"), arg_after(tbf, "limit")) == (netem_limit, tbf_limit), (
+            f"{name}: the upload delay line and congestion queue must be what they were")
