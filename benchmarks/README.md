@@ -682,6 +682,17 @@ VTOP_META_SATURATION_JSON=benchmarks/results/native-meta-saturation/summary.json
 This is a research harness — it does **not** implement multi-group metadata
 sharding (epic #93). Multi-hour dedicated soaks remain deferred.
 
+## VTOP vs Apache Kafka, same client (#595)
+
+`kafka_compare/` runs a three-node VTOP cluster (Kafka gateway on the range
+leader) and a three-broker Apache Kafka cluster in containers with identical
+limits, one at a time, and drives both with the same JVM Kafka perf tools:
+saturation throughput, latency at fixed fractions of Kafka's saturation, and
+consume throughput, each cell proven by a byte-exact read-back first.
+`kafka_compare/report.py` turns a run's CSV into the charts and
+`docs/benchmarks/kafka-comparison.md`, and refuses partial or mixed data. See
+[`kafka_compare/README.md`](kafka_compare/README.md).
+
 ## Design principles
 
 - Benchmark logic is **separate** from engine logic (drives the binary only).
