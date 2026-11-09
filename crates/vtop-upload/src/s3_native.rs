@@ -3162,7 +3162,7 @@ mod egress_ceiling {
                 // Spend one of the throttled answers if any is left. A
                 // compare-exchange loop because `fetch_update` is deprecated on
                 // current stable and its replacement is newer than the MSRV
-                // (the same reasoning as `MockUploadBackend::take_throttle`).
+                // (the same reasoning as `MockBackend::take_throttle`).
                 let mut left = me.fail_first.load(Ordering::SeqCst);
                 let throttle = loop {
                     if left == 0 {
