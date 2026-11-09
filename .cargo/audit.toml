@@ -53,4 +53,34 @@ ignore = [
     # moving to one is a deliberate migration of every config type, not a
     # version bump, and is follow-up work. Re-evaluate when it lands.
     "RUSTSEC-2024-0449",
+
+    # crypto-bigint 0.5.5 — multiple timing-variability issues in operations
+    # intended to be constant-time. Fixed in crypto-bigint >=0.7.6, a major
+    # version bump. It reaches this build only through aws-sigv4 1.4.5 and
+    # elliptic-curve 0.13.8, both of which require the 0.5.x line; nothing in
+    # the current AWS SDK / RustCrypto graph permits 0.7 (`cargo update -p
+    # crypto-bigint` moves it nowhere). The timing channel requires an attacker
+    # measuring operations over secret key material; VTOP exercises this path
+    # only for AWS SigV4/SigV4a request signing. Remove this exception when the
+    # AWS signing / RustCrypto stack adopts crypto-bigint >=0.7.6
+    # (elliptic-curve >=0.14).
+    "RUSTSEC-2026-0387",
+
+    # libsqlite3-sys 0.30.1 — bundles a SQLite affected by CVE-2026-119375.
+    # Fixed in libsqlite3-sys >=0.39.0 (SQLite 3.54), reachable only through a
+    # newer sqlx: sqlx-sqlite 0.9.0 caps libsqlite3-sys at <0.38, so no
+    # `cargo update` reaches the fix. SQLite here parses the engine's *local*
+    # state-store database (operator-owned, on the host), never network input,
+    # so a crafted-database CVE is not reachable by a remote party. Remove this
+    # exception when sqlx ships a release depending on libsqlite3-sys >=0.39.
+    "RUSTSEC-2026-0459",
+
+    # pin-utils 0.1.0 — UNMAINTAINED (upstream repository archived; 0.1.1 is the
+    # final release and no fix will be published). Not a vulnerability.
+    # `cargo audit` treats this as a non-failing warning, but cargo-deny's
+    # `unmaintained` check fails on it, so it is ignored in both files (as with
+    # RUSTSEC-2024-0449 above). It reaches the build only through
+    # aws-smithy-http / aws-smithy-runtime. Remove when the AWS SDK drops its
+    # dependency on pin-utils.
+    "RUSTSEC-2026-0441",
 ]
