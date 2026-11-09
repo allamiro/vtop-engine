@@ -399,6 +399,32 @@ mod tests {
         (dir, path)
     }
 
+    /// A fixture that leaves a descendant behind: `{bg}` in `body` is
+    /// replaced by a line that starts `command` in the background and records
+    /// its pid in the fixture's directory, so `kill_descendants` can end it
+    /// once the test has its results. Without that the descendant outlives
+    /// the test by up to its whole sleep.
+    fn script_with_descendant(body: &str, command: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = executable_tempdir();
+        let pids = dir.path().join("descendants");
+        let background = format!("{command} &\necho $! >> '{}'", pids.display());
+        let path = dir.path().join("tool");
+        write_executable_script(&path, &body.replace("{bg}", &background)).unwrap();
+        (dir, path)
+    }
+
+    /// Kill every descendant `script_with_descendant` recorded, returning how
+    /// many there were. Called before any assertion, so a failing test does
+    /// not leave them running either.
+    fn kill_descendants(dir: &tempfile::TempDir) -> usize {
+        let recorded = std::fs::read_to_string(dir.path().join("descendants")).unwrap_or_default();
+        let pids: Vec<&str> = recorded.split_whitespace().collect();
+        if !pids.is_empty() {
+            let _ = std::process::Command::new("kill").args(&pids).status();
+        }
+        pids.len()
+    }
+
     fn config(path: &std::path::Path) -> UploadConfig {
         UploadConfig {
             backend: "awscli".into(),
@@ -612,10 +638,11 @@ mod tests {
         // the fix the stdout drain waited out the whole deadline and the call
         // came back as a plain timeout; now the exit is classified from the
         // stderr already kept, within the usual evidence budget.
-        let (_dir, path) = executable_script(
+        let (dir, path) = script_with_descendant(
             "printf '%s\\n' 'An error occurred (SlowDown) when calling the GetObject operation' >&2\n\
-             sleep 10 &\n\
+             {bg}\n\
              exit 1",
+            "sleep 10",
         );
         let policy = CommandPolicy::from_config(&config(&path), "test").unwrap();
         let bound = policy.timeout();
@@ -654,8 +681,13 @@ mod tests {
             (started.elapsed(), error)
         };
         let ((get_elapsed, get_error), (verify_elapsed, verify_error)) = tokio::join!(get, verify);
+        let descendants = kill_descendants(&dir);
         timed("get_object_bounded", get_elapsed, get_error);
         timed("verify_object", verify_elapsed, verify_error);
+        assert_eq!(
+            descendants, 2,
+            "each call's tool must have left its descendant"
+        );
     }
 
     #[tokio::test]
@@ -668,11 +700,12 @@ mod tests {
         // so a second full wait is plainly visible, while the throttle line it
         // printed first is already in the kept tail and must still count.
         use crate::base::{ObjectChecksum, UploadBackend};
-        let (_dir, path) = executable_script(
+        let (dir, path) = script_with_descendant(
             "printf '%s\\n' 'An error occurred (SlowDown) when calling the GetObject operation' >&2\n\
-             sleep 10 >/dev/null &\n\
+             {bg}\n\
              sleep 1.6\n\
              exit 1",
+            "sleep 10 >/dev/null",
         );
         let policy = CommandPolicy::from_config(&config(&path), "test").unwrap();
         let bound = policy.timeout();
@@ -712,8 +745,13 @@ mod tests {
             (started.elapsed(), error)
         };
         let ((get_elapsed, get_error), (verify_elapsed, verify_error)) = tokio::join!(get, verify);
+        let descendants = kill_descendants(&dir);
         timed("get_object_bounded", get_elapsed, get_error);
         timed("verify_object", verify_elapsed, verify_error);
+        assert_eq!(
+            descendants, 2,
+            "each call's tool must have left its descendant"
+        );
     }
 
     /// Review of #530: a tool that fails AT ONCE, leaving a descendant that
@@ -729,10 +767,11 @@ mod tests {
         // 20 s, far above the prompt bound, so waiting out the deadline (the
         // old behaviour, ~20 s) and returning on the tool's exit plus a short
         // grace are told apart by an order of magnitude, not by CI jitter.
-        let (_dir, path) = executable_script(
+        let (dir, path) = script_with_descendant(
             "printf '%s\\n' 'An error occurred (SlowDown) when calling the GetObject operation' >&2\n\
-             sleep 30 >/dev/null &\n\
+             {bg}\n\
              exit 1",
+            "sleep 30 >/dev/null",
         );
         let mut cfg = config(&path);
         cfg.command_timeout_seconds = 20;
@@ -775,8 +814,13 @@ mod tests {
             (started.elapsed(), error)
         };
         let ((get_elapsed, get_error), (verify_elapsed, verify_error)) = tokio::join!(get, verify);
+        let descendants = kill_descendants(&dir);
         timed("get_object_bounded", get_elapsed, get_error);
         timed("verify_object", verify_elapsed, verify_error);
+        assert_eq!(
+            descendants, 2,
+            "each call's tool must have left its descendant"
+        );
     }
 
     #[tokio::test]
