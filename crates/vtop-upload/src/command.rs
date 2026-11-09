@@ -155,29 +155,8 @@ impl CommandPolicy {
         operation: &str,
     ) -> Result<CapturedOutput, VtopError> {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut busy_retries = 0_u32;
-        let mut child = loop {
-            match command.spawn() {
-                Ok(child) => break child,
-                Err(error) if error.raw_os_error() == Some(26) && busy_retries < 4 => {
-                    busy_retries += 1;
-                    tokio::time::sleep(Duration::from_millis(10 * u64::from(busy_retries))).await;
-                }
-                Err(error) => {
-                    let hint = if error.kind() == std::io::ErrorKind::PermissionDenied {
-                        "; verify that the command is executable and its filesystem is not mounted noexec"
-                    } else if error.raw_os_error() == Some(26) {
-                        "; the executable remained busy after bounded retries; install/replace it atomically and retry"
-                    } else {
-                        ""
-                    };
-                    return Err(VtopError::Upload(format!(
-                        "spawning {} {operation}: {error}{hint}",
-                        self.backend
-                    )));
-                }
-            }
-        };
+        let mut child =
+            crate::base::spawn_retrying_text_busy(command, self.backend, operation).await?;
         let stdout = child.stdout.take().ok_or_else(|| {
             VtopError::Upload(format!("{} {operation} stdout unavailable", self.backend))
         })?;

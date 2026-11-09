@@ -230,11 +230,8 @@ pub(crate) async fn verify_command_content(
     timeout: Duration,
 ) -> Result<VerificationResult, VtopError> {
     let deadline = command_deadline(timeout);
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| VtopError::Upload(format!("spawning {backend} verification: {e}")))?;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = spawn_retrying_text_busy(cmd, backend, "verification").await?;
     let stdout = child
         .stdout
         .take()
@@ -328,11 +325,8 @@ pub(crate) async fn read_command_bounded(
     timeout: Duration,
 ) -> Result<Vec<u8>, VtopError> {
     let deadline = command_deadline(timeout);
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| VtopError::Upload(format!("spawning {backend} download: {e}")))?;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = spawn_retrying_text_busy(cmd, backend, "download").await?;
     let stdout = child
         .stdout
         .take()
@@ -416,6 +410,63 @@ struct ReadBackEvidence {
 impl Drop for ReadBackEvidence {
     fn drop(&mut self) {
         self.drain.abort();
+    }
+}
+
+/// Spawn a command backend's tool, retrying a briefly busy executable.
+///
+/// ETXTBSY (`Text file busy`, os error 26) means the executable is still
+/// open for writing somewhere — an installer replacing it in place, or a
+/// sibling `fork` that inherited the write descriptor before `exec`. It
+/// clears on its own, so the spawn is retried a bounded number of times with
+/// a short backoff before it is reported. Every command spawn goes through
+/// here (the write path's `CommandPolicy::capture`, the read-back and the
+/// verify), so they cannot drift apart again: the read-back and verify used
+/// to spawn once and fail outright, which this PR's concurrent test fixtures
+/// exposed as an intermittent `Text file busy`.
+pub(crate) async fn spawn_retrying_text_busy(
+    command: &mut Command,
+    backend: &str,
+    operation: &str,
+) -> Result<tokio::process::Child, VtopError> {
+    retry_text_busy(|| command.spawn(), backend, operation).await
+}
+
+/// How many times a spawn that hit ETXTBSY is retried, `10 ms × n` apart.
+const TEXT_BUSY_RETRIES: u32 = 4;
+/// `ETXTBSY` on Linux and the BSDs, macOS included.
+const TEXT_BUSY: i32 = 26;
+
+/// `spawn_retrying_text_busy` over any spawn, so the retry policy and its
+/// error messages can be tested without racing a real busy executable.
+async fn retry_text_busy<T>(
+    mut spawn: impl FnMut() -> std::io::Result<T>,
+    backend: &str,
+    operation: &str,
+) -> Result<T, VtopError> {
+    let mut busy_retries = 0_u32;
+    loop {
+        match spawn() {
+            Ok(spawned) => return Ok(spawned),
+            Err(error)
+                if error.raw_os_error() == Some(TEXT_BUSY) && busy_retries < TEXT_BUSY_RETRIES =>
+            {
+                busy_retries += 1;
+                tokio::time::sleep(Duration::from_millis(10 * u64::from(busy_retries))).await;
+            }
+            Err(error) => {
+                let hint = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    "; verify that the command is executable and its filesystem is not mounted noexec"
+                } else if error.raw_os_error() == Some(TEXT_BUSY) {
+                    "; the executable remained busy after bounded retries; install/replace it atomically and retry"
+                } else {
+                    ""
+                };
+                return Err(VtopError::Upload(format!(
+                    "spawning {backend} {operation}: {error}{hint}"
+                )));
+            }
+        }
     }
 }
 
@@ -944,5 +995,82 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("timeout"));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// The one spawn policy every command backend call shares: a busy
+    /// executable (ETXTBSY) is retried at most `TEXT_BUSY_RETRIES` times and
+    /// then reported with the install-atomically hint; any other error is
+    /// reported at once. Driven by a scripted spawn, not by racing a real
+    /// busy file. Before this, the read-back and verify spawned once, so the
+    /// "busy then free" case below failed them outright.
+    #[tokio::test]
+    async fn a_busy_executable_is_retried_a_bounded_number_of_times_on_every_spawn() {
+        use std::io::{Error, ErrorKind};
+        let scripted = |failures: Vec<Error>| {
+            let mut failures = failures.into_iter();
+            let mut attempts = 0_u32;
+            move || {
+                attempts += 1;
+                match failures.next() {
+                    Some(error) => Err(error),
+                    None => Ok(attempts),
+                }
+            }
+        };
+        let busy = || Error::from_raw_os_error(TEXT_BUSY);
+
+        // Busy for every retry the policy allows, then free: spawned.
+        let failures = (0..TEXT_BUSY_RETRIES).map(|_| busy()).collect();
+        let attempts = retry_text_busy(scripted(failures), "aws cli", "download")
+            .await
+            .expect("a spawn that frees up within the retries must succeed");
+        assert_eq!(attempts, TEXT_BUSY_RETRIES + 1);
+
+        // Busy one time more than that: reported, with the hint, after
+        // exactly 1 + TEXT_BUSY_RETRIES attempts.
+        let mut calls = 0_u32;
+        let mut spawn = scripted((0..=TEXT_BUSY_RETRIES).map(|_| busy()).collect());
+        let error = retry_text_busy(
+            || {
+                calls += 1;
+                spawn()
+            },
+            "aws cli",
+            "verification",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(calls, TEXT_BUSY_RETRIES + 1, "retries must be bounded");
+        let message = error.to_string();
+        assert!(
+            message.contains("spawning aws cli verification:")
+                && message.contains("install/replace it atomically"),
+            "unexpected error: {message}"
+        );
+
+        // Not busy: no retry, reported at once (with the noexec hint for a
+        // permission error).
+        for (error, hint) in [
+            (Error::from(ErrorKind::PermissionDenied), Some("noexec")),
+            (Error::from(ErrorKind::NotFound), None),
+        ] {
+            let mut calls = 0_u32;
+            let mut spawn = scripted(vec![error]);
+            let error = retry_text_busy(
+                || {
+                    calls += 1;
+                    spawn()
+                },
+                "s3cmd",
+                "upload",
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(calls, 1, "only a busy executable is retried: {error}");
+            let message = error.to_string();
+            assert!(message.contains("spawning s3cmd upload:"), "{message}");
+            assert_eq!(hint.is_some_and(|h| message.contains(h)), hint.is_some());
+            assert!(!message.contains("atomically"), "{message}");
+        }
     }
 }
