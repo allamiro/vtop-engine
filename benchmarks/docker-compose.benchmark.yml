@@ -108,7 +108,7 @@ services:
   # afterwards. The proxy itself is registered from toxiproxy.json at start.
   #   docker compose -f benchmarks/docker-compose.benchmark.yml --profile shaped up -d
   toxiproxy:
-    image: ghcr.io/shopify/toxiproxy:2.12.0
+    image: ghcr.io/shopify/toxiproxy:2.13.0
     container_name: vtop-bench-toxiproxy
     profiles: ["shaped"]
     command: ["-host=0.0.0.0", "-config=/etc/toxiproxy/proxies.json"]
