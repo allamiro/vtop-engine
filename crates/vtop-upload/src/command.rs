@@ -716,6 +716,69 @@ mod tests {
         timed("verify_object", verify_elapsed, verify_error);
     }
 
+    /// Review of #530: a tool that fails AT ONCE, leaving a descendant that
+    /// holds stderr open, is classified once it has exited - not after the
+    /// stderr drain has waited out the rest of the command's deadline. With
+    /// the default 300 s `upload.command_timeout_seconds` that wait made an
+    /// immediately-failed read-back or verify hang for about five minutes,
+    /// although its throttle line was already in the kept tail.
+    #[tokio::test]
+    async fn an_immediately_failed_read_back_returns_promptly_while_a_descendant_holds_stderr() {
+        use crate::base::{ObjectChecksum, UploadBackend};
+        // `sleep 30 >/dev/null &` keeps stderr only. The command timeout is
+        // 20 s, far above the prompt bound, so waiting out the deadline (the
+        // old behaviour, ~20 s) and returning on the tool's exit plus a short
+        // grace are told apart by an order of magnitude, not by CI jitter.
+        let (_dir, path) = executable_script(
+            "printf '%s\\n' 'An error occurred (SlowDown) when calling the GetObject operation' >&2\n\
+             sleep 30 >/dev/null &\n\
+             exit 1",
+        );
+        let mut cfg = config(&path);
+        cfg.command_timeout_seconds = 20;
+        let policy = CommandPolicy::from_config(&cfg, "test").unwrap();
+        let bound = policy.timeout();
+        let prompt = Duration::from_secs(6);
+        let backend = crate::awscli_backend::AwsCliBackend::new(policy, None, None);
+        let digest = vtop_core::checksum::sha256_bytes(b"");
+        let timed = |operation: &'static str, elapsed: Duration, error: Option<VtopError>| {
+            let error = error.unwrap_or_else(|| panic!("[{operation}] a failing tool must fail"));
+            assert!(
+                elapsed < prompt,
+                "[{operation}] took {elapsed:?} (command timeout {bound:?}): the tool had already \
+                 exited, yet the stderr evidence wait ran on toward the command deadline"
+            );
+            assert!(
+                error.is_upload_throttle(),
+                "[{operation}] the tool exited with a SlowDown on stderr, yet the call reported: \
+                 {error}"
+            );
+        };
+        let get = async {
+            let started = std::time::Instant::now();
+            let error = backend
+                .get_object_bounded("s3://bucket/key", 1024)
+                .await
+                .err();
+            (started.elapsed(), error)
+        };
+        let verify = async {
+            let started = std::time::Instant::now();
+            let error = backend
+                .verify_object(
+                    "s3://bucket/key",
+                    0,
+                    Some(ObjectChecksum::new("sha256", &digest)),
+                )
+                .await
+                .err();
+            (started.elapsed(), error)
+        };
+        let ((get_elapsed, get_error), (verify_elapsed, verify_error)) = tokio::join!(get, verify);
+        timed("get_object_bounded", get_elapsed, get_error);
+        timed("verify_object", verify_elapsed, verify_error);
+    }
+
     #[tokio::test]
     async fn a_throttle_after_a_flood_of_progress_output_is_still_read_as_a_throttle() {
         // The read-back keeps a bounded amount of stderr, and the classifier
