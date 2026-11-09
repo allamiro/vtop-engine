@@ -288,7 +288,7 @@ no `summary.json` is written):
 - a scrape inside the window takes longer than a tenth of the interval
   (`MAX_SCRAPE_LATENCY_FRACTION`: 100 ms at the default 1 s), or every answer
   before the window opens does. A slow first answer alone does not refuse —
-  it is not used, and the next prompt one opens the window with nothing lost,
+  it is not used, and the first answer within the bound opens the window with nothing lost,
   since the counters are read against zero at launch;
 - a counter goes backwards or a series disappears (a different process is
   answering, or the engine restarted);
