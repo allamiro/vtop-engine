@@ -84,10 +84,52 @@ pub struct S3NativeConfig {
     /// construction in [`S3NativeBackend::new`], naming the field and the
     /// transport — never silently ignored.
     pub tuning: vtop_core::config::EgressTuning,
+    /// Wall-clock limit for one attempt of one request (#556); see
+    /// `UploadConfig::request_timeout_seconds`. Must be non-zero.
+    pub request_timeout_seconds: u64,
+}
+
+/// How long a connection attempt may take. A store that is up accepts in
+/// milliseconds; the SDK's own 3.1 s default is kept in spirit but made
+/// explicit and a little more forgiving of a slow handshake.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The SDK retries a failed request up to three times by default; the whole
+/// operation is allowed that many attempts of the configured length.
+const OPERATION_ATTEMPTS: u32 = 3;
+
+/// Request deadlines for the S3 client (#556).
+///
+/// The AWS SDK bounds connecting but, by default, not waiting for a response:
+/// an endpoint that accepts the connection and then says nothing blocks the
+/// request forever, and with it the engine cycle that is awaiting the upload.
+/// `read_timeout` bounds the wait for the first byte of the response,
+/// `operation_attempt_timeout` caps one whole attempt, and `operation_timeout`
+/// caps the whole operation including the SDK's retries, so a dead store
+/// becomes an error the engine already knows how to handle (the batch fails
+/// and recovery re-reads its range) instead of a hang. The connect bound is
+/// fixed (`CONNECT_TIMEOUT`), not taken from the configured value.
+pub fn request_timeouts(request_timeout_seconds: u64) -> aws_smithy_types::timeout::TimeoutConfig {
+    let attempt = std::time::Duration::from_secs(request_timeout_seconds);
+    aws_smithy_types::timeout::TimeoutConfig::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(attempt)
+        .operation_attempt_timeout(attempt)
+        .operation_timeout(attempt.saturating_mul(OPERATION_ATTEMPTS))
+        .build()
 }
 
 pub struct S3NativeBackend {
     client: Client,
+    /// The bound on reading a response BODY (review of #568). The SDK's
+    /// timeouts end when `send()` returns the headers; a body consumed after
+    /// that is outside them, and the SDK's stalled-stream protection only
+    /// catches a stream that stops, not one that drips a byte at a time. The
+    /// whole-operation allowance (the SDK's attempts times
+    /// `request_timeout_seconds`), measured from before `send()`, so the
+    /// headers and the body share it - and an object a slow link can still
+    /// deliver in that time is not cut off.
+    body_deadline: std::time::Duration,
 }
 
 /// Enforce the transport policy BEFORE any client is built (#75).
@@ -514,8 +556,16 @@ impl S3NativeBackend {
         // The SDK resolves endpoints from its OWN configuration too —
         // AWS_ENDPOINT_URL / AWS_ENDPOINT_URL_S3 and the shared config file —
         // and those must not bypass the policy the explicit config obeys.
-        let mut loader =
-            aws_config::defaults(BehaviorVersion::latest()).region(Region::new(cfg.region.clone()));
+        if cfg.request_timeout_seconds == 0 {
+            return Err(VtopError::Config(
+                "upload.request_timeout_seconds must be > 0: a zero deadline would fail every \
+                 request before it started"
+                    .into(),
+            ));
+        }
+        let mut loader = aws_config::defaults(BehaviorVersion::latest())
+            .region(Region::new(cfg.region.clone()))
+            .timeout_config(request_timeouts(cfg.request_timeout_seconds));
         if let Some(ep) = &cfg.endpoint_url {
             loader = loader.endpoint_url(ep.clone());
         }
@@ -549,6 +599,8 @@ impl S3NativeBackend {
 
         Ok(Self {
             client: Client::from_conf(s3_conf),
+            body_deadline: std::time::Duration::from_secs(cfg.request_timeout_seconds)
+                .saturating_mul(OPERATION_ATTEMPTS),
         })
     }
 
@@ -611,6 +663,9 @@ impl S3NativeBackend {
         max_bytes: u64,
     ) -> Result<(String, u64), VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
+        // The body's deadline counts from HERE (review of #568): the time
+        // `send()` spends on the headers comes out of the same allowance.
+        let started = tokio::time::Instant::now();
         let out = self
             .client
             .get_object()
@@ -625,9 +680,42 @@ impl S3NativeBackend {
         // verify_reader_content does, so a huge object cannot be pulled
         // down before it is rejected on size.
         use tokio::io::AsyncReadExt;
-        digest_reader(algo, out.body.into_async_read().take(max_bytes))
-            .await?
-            .ok_or_else(|| VtopError::Upload("cannot hash with disabled checksum mode".into()))
+        self.within_body_deadline(
+            "get_object",
+            object_uri,
+            started,
+            digest_reader(algo, out.body.into_async_read().take(max_bytes)),
+        )
+        .await?
+        .ok_or_else(|| VtopError::Upload("cannot hash with disabled checksum mode".into()))
+    }
+}
+
+impl S3NativeBackend {
+    /// Read a response body so the WHOLE operation - the request sent at
+    /// `started`, then its body - finishes within [`Self::body_deadline`]: a
+    /// store that sent the headers and then stalls, or drips, fails the read
+    /// instead of holding verification or recovery open indefinitely. The
+    /// deadline is measured from before `send()`, not from the headers
+    /// (review of #568): a fresh allowance after headers that took most of
+    /// one would let the operation run for nearly twice its limit.
+    async fn within_body_deadline<T>(
+        &self,
+        what: &str,
+        uri: &str,
+        started: tokio::time::Instant,
+        read: impl std::future::Future<Output = Result<T, VtopError>>,
+    ) -> Result<T, VtopError> {
+        tokio::time::timeout_at(started + self.body_deadline, read)
+            .await
+            .map_err(|_| {
+                VtopError::Upload(format!(
+                    "{what} {uri}: the operation did not finish within {:?}, its whole \
+                     allowance: the response body did not finish (the store sent its \
+                     headers and then stalled)",
+                    self.body_deadline
+                ))
+            })?
     }
 }
 
@@ -720,6 +808,9 @@ impl UploadBackend for S3NativeBackend {
         max_bytes: usize,
     ) -> Result<Vec<u8>, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
+        // The body's deadline counts from HERE (review of #568): the time
+        // `send()` spends on the headers comes out of the same allowance.
+        let started = tokio::time::Instant::now();
         let out = self
             .client
             .get_object()
@@ -743,7 +834,13 @@ impl UploadBackend for S3NativeBackend {
                 "stored object {object_uri} exceeds the {max_bytes}-byte read limit"
             )));
         }
-        read_bounded(out.body.into_async_read(), max_bytes, object_uri).await
+        self.within_body_deadline(
+            "get_object",
+            object_uri,
+            started,
+            read_bounded(out.body.into_async_read(), max_bytes, object_uri),
+        )
+        .await
     }
 
     fn supports_object_versions(&self) -> bool {
@@ -769,6 +866,9 @@ impl UploadBackend for S3NativeBackend {
 
     async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
+        // The body's deadline counts from HERE (review of #568): the time
+        // `send()` spends on the headers comes out of the same allowance.
+        let started = tokio::time::Instant::now();
         let out = self
             .client
             .get_object()
@@ -777,11 +877,14 @@ impl UploadBackend for S3NativeBackend {
             .send()
             .await
             .map_err(|e| sdk_failure("get_object", object_uri, e))?;
-        let bytes = out
-            .body
-            .collect()
-            .await
-            .map_err(|e| VtopError::Upload(format!("get_object body {object_uri}: {e}")))?;
+        let bytes = self
+            .within_body_deadline("get_object", object_uri, started, async {
+                out.body
+                    .collect()
+                    .await
+                    .map_err(|e| VtopError::Upload(format!("get_object body {object_uri}: {e}")))
+            })
+            .await?;
         Ok(bytes.into_bytes().to_vec())
     }
 
@@ -791,6 +894,9 @@ impl UploadBackend for S3NativeBackend {
         max_bytes: usize,
     ) -> Result<Vec<u8>, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
+        // The body's deadline counts from HERE (review of #568): the time
+        // `send()` spends on the headers comes out of the same allowance.
+        let started = tokio::time::Instant::now();
         let out = self
             .client
             .get_object()
@@ -807,7 +913,13 @@ impl UploadBackend for S3NativeBackend {
                 "stored object {object_uri} exceeds the {max_bytes}-byte read limit"
             )));
         }
-        read_bounded(out.body.into_async_read(), max_bytes, object_uri).await
+        self.within_body_deadline(
+            "get_object",
+            object_uri,
+            started,
+            read_bounded(out.body.into_async_read(), max_bytes, object_uri),
+        )
+        .await
     }
 
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
@@ -1134,6 +1246,7 @@ pub fn config_from_upload(upload: &vtop_core::config::UploadConfig) -> S3NativeC
         verify_tls,
         transport,
         tuning,
+        request_timeout_seconds: upload.request_timeout_seconds,
     }
 }
 
@@ -2015,7 +2128,7 @@ mod tests {
                 attr.to_token_stream()
             ));
         }
-        if declaration.unsafety.is_some() || declaration.auto_token.is_some() {
+        if declaration.unsafety.is_some() || declaration.modifiers.auto_token.is_some() {
             refusals.push("the trait's qualifiers changed from a plain `pub trait`".to_string());
         }
         if !declaration.generics.params.is_empty() || declaration.generics.where_clause.is_some() {
@@ -2596,6 +2709,7 @@ mod tests {
             verify_tls: true,
             transport: "tcp_tls".to_string(),
             tuning: Default::default(),
+            request_timeout_seconds: 300,
         };
         let err = match S3NativeBackend::new(&cfg).await {
             Err(err) => err,

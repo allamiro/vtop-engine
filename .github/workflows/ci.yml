@@ -262,6 +262,9 @@ jobs:
               - 'rust-toolchain*'
               - 'scripts/upgrade-compat.sh'
               - 'scripts/live-chaos/gen-certs.sh'
+              # The metadata rolling upgrade (#554) runs the chaos harness.
+              - 'scripts/live-chaos/lib.sh'
+              - 'scripts/live-chaos/scenarios/22-meta-rolling-upgrade.sh'
               - '.github/workflows/ci.yml'
   build-and-test:
     name: fmt + clippy + test + build
@@ -321,7 +324,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # THE ONLY JOB THAT WRITES THE CACHE. Three jobs build this image and they
       # run in parallel, so having each export would mean three concurrent
@@ -330,7 +333,7 @@ jobs:
       # rather than from this one, which is what makes the saving repeatable
       # instead of dependent on job ordering.
       - name: Build engine image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/Dockerfile
@@ -384,7 +387,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Prebuilt cargo-audit binary (fast; no compile).
       - name: Install cargo-audit
-        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-audit
       # Reads .cargo/audit.toml: fails on any advisory NOT documented there,
@@ -411,18 +414,18 @@ jobs:
         with:
           version: v3.16.3
 
-      - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           cluster_name: vtop-ci
 
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Imports only — see the note on the image job. `load: true` is required
       # because the next step pulls the binaries back OUT of this image and
       # `kind load` needs it in the daemon, neither of which can read a build
       # that only exists in the buildx cache.
       - name: Build the engine image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/Dockerfile
@@ -690,6 +693,22 @@ jobs:
             -f helm/vtop/ci/separated-values.yaml --set deployment.meta.replicaCount=4
           refuses_because "data.nodeUuids has 3 entries but deployment.data.replicaCount is 2" \
             -f helm/vtop/ci/separated-values.yaml --set deployment.data.replicaCount=2
+          # An even replicated data tier (#562). The UUID list is resized to
+          # match, so each case reaches the guard instead of stopping at the
+          # length check above (the blindness recorded earlier in this step).
+          refuses_because 'deployment.data.replicaCount 2 is even under data.topology "replicated"' \
+            -f helm/vtop/ci/separated-values.yaml --set deployment.data.replicaCount=2 \
+            --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2}'
+          refuses_because "4 replicas need 3 acknowledgements and survive 1 failure(s)" \
+            -f helm/vtop/ci/separated-values.yaml --set deployment.data.replicaCount=4 \
+            --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2,aaaaaaaa-0000-0000-0000-0000000000a3,aaaaaaaa-0000-0000-0000-0000000000a4}'
+          # Standalone pods serve independent ranges and have no quorum, so an
+          # even count is fine there: the rule must not over-reach.
+          helm template vtop helm/vtop -f helm/vtop/ci/separated-values.yaml \
+            --set data.topology=standalone --set data.lease.enabled=false \
+            --set deployment.data.replicaCount=2 \
+            --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2}' >/dev/null
+          echo "an even standalone data tier still renders"
           refuses_because "set data.lease.serverName" \
             -f helm/vtop/ci/separated-values.yaml --set data.lease.adminEndpoint=meta.example:9200
           # The transition MAC key reference must be whole (#240 item 5).
@@ -1173,7 +1192,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-deny
       - run: cargo deny check
@@ -1262,7 +1281,7 @@ jobs:
       # signal only means something once the run itself has been attempted.
       - name: Upload scenario logs
         if: steps.chaos.outcome == 'failure'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: live-chaos-logs
           path: ${{ runner.temp }}/chaos/**/logs/
@@ -1331,6 +1350,10 @@ jobs:
       - name: Build HEAD vtop-node
         run: cargo build -p vtop-node --bin vtop-node
 
+      # vtopctl drives the metadata-tier rolling upgrade below (#554).
+      - name: Build HEAD vtopctl
+        run: cargo build -p vtop-cli --no-default-features --bin vtopctl
+
       - name: Build the released tags
         run: |
           set -euo pipefail
@@ -1366,12 +1389,28 @@ jobs:
             port=$((port + 20))
           done
 
+      # The metadata tier rolled from the newest release to HEAD, one voter at
+      # a time, the way the chart rolls it (#554): every mixed step must keep
+      # committing and every voter must converge. Only the NEWEST release:
+      # upgrading from the immediately preceding release is the supported
+      # path. Plaintext on loopback - the transport is not what is under test.
+      - name: The metadata tier rolls from the newest release to HEAD
+        run: |
+          set -euo pipefail
+          newest="$(tr ' ' '\n' <<< "${{ steps.tags.outputs.list }}" | grep . | tail -1)"
+          CHAOS_PROFILE=debug CHAOS_TRANSPORT=plaintext CHAOS_KEEP=1 \
+            CHAOS_WORKDIR="$GITHUB_WORKSPACE/upgrade-meta" \
+            CHAOS_OLD_VTOP_NODE="target-old/$newest/debug/vtop-node" \
+            scripts/live-chaos/scenarios/22-meta-rolling-upgrade.sh
+
       - name: Upload fixture logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: upgrade-compat-logs
-          path: upgrade-v*/logs
+          path: |
+            upgrade-v*/logs
+            upgrade-meta/logs
           if-no-files-found: ignore
           retention-days: 7
 
@@ -1425,7 +1464,7 @@ jobs:
         with:
           toolchain: stable
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-llvm-cov
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1477,7 +1516,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install test tooling
-        run: pip install --disable-pip-version-check pytest pyyaml ruff
+        # ruff is pinned: a new release adds lint rules, and an unpinned one
+        # turned this job red with no change to the code (ruff 0.17.0).
+        run: pip install --disable-pip-version-check pytest pyyaml ruff==0.17.0
 
       - name: ruff
         run: ruff check .
@@ -1512,20 +1553,27 @@ jobs:
       # Build the engine image once, up front: the script's `compose up` would
       # otherwise build it inside the timed wait loop and could time out on a
       # cold cache rather than on a real failure.
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Built here rather than by `docker compose build` so it can read the same
       # cache as the other two jobs; compose then finds the tag already in the
       # daemon and builds nothing. The tag must match what compose would have
       # produced, or compose rebuilds it and the cache buys nothing.
       - name: Build the engine image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/Dockerfile
           tags: vtop-engine:local
           load: true
           cache-from: type=gha,scope=ci-image
+
+      # MinIO is built from source (docker/minio/Dockerfile: no registry serves
+      # its images any more). Built here, before the smoke, for the same reason
+      # as the engine image: a cold build inside the script's `compose up` is
+      # slow, and its failure should read as a build failure, not a lab one.
+      - name: Build the lab's MinIO image
+        run: docker compose build minio
 
       - name: Run the end-to-end smoke test
         env:
@@ -1564,7 +1612,7 @@ jobs:
           # triple explicitly - otherwise a musl default fails with
           # "sanitizer is incompatible with statically linked libc".
           targets: x86_64-unknown-linux-gnu
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-fuzz
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1598,7 +1646,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: stable
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-mutants
       - name: Install librdkafka build dependencies
@@ -1707,3 +1755,7 @@ jobs:
           VTOP_TEST_POSTGRES: postgres://vtop:vtop@localhost:5432/vtop
           VTOP_TEST_POSTGRES_RUNTIME: postgres://vtop_runtime_test:vtop-runtime-test@localhost:5432/vtop
         run: cargo test -p vtop-state --features postgres,test-support --test pg_battery
+      # No database involved: a socket that accepts and never answers must fail
+      # the connect within its bound instead of hanging startup (#556).
+      - name: Postgres connect is bounded
+        run: cargo test -p vtop-state --features postgres --test connect_deadline

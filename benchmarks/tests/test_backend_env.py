@@ -303,3 +303,32 @@ def test_the_transport_override_crosses_the_container_boundary():
         "container mode forwards only _ENGINE_ENV_KEYS; the transport override "
         "must be in that list or host and container modes can diverge"
     )
+
+
+def test_a_blank_endpoint_override_is_absent_for_the_engine_too(tmp_path, monkeypatch):
+    # An exported-but-empty VTOP_S3_ENDPOINT_URL used to be "no override" to the
+    # runner's endpoint resolution and a PRESENT value to the engine, which reads
+    # it as Some("") over the config file. The run validated one endpoint and the
+    # engine dialled the empty string (review).
+    from lib import engine
+    monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))  # absent
+    scenario = {"backend": "s3_native", "endpoint_url": "http://127.0.0.1:9000"}
+    for blank in ("", "   "):
+        monkeypatch.setenv("VTOP_S3_ENDPOINT_URL", blank)
+        assert engine._effective_endpoint(scenario) == "http://127.0.0.1:9000", (
+            f"a blank override ({blank!r}) must resolve to the scenario's endpoint"
+        )
+        env = _backend_env(scenario)
+        assert env.get("VTOP_S3_ENDPOINT_URL") == "http://127.0.0.1:9000", (
+            f"the engine's environment kept the blank override {blank!r}, which outranks "
+            "the endpoint the run resolved and validated"
+        )
+    monkeypatch.setenv("VTOP_S3_ENDPOINT_URL", " https://localhost:9443 ")
+    assert engine._effective_endpoint(scenario) == "https://localhost:9443"
+    assert _backend_env(scenario)["VTOP_S3_ENDPOINT_URL"] == "https://localhost:9443", (
+        "the engine must receive the override the run validated, not the whitespace-bearing "
+        "value as typed, or it fails on a URI the topology check accepted")
+    monkeypatch.setenv("VTOP_S3_ENDPOINT_URL", "  ")
+    assert "VTOP_S3_ENDPOINT_URL" not in _backend_env({"backend": "minio"}), (
+        "a blank override must not reach an engine that has no endpoint to put in its place"
+    )

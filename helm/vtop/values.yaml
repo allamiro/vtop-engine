@@ -283,6 +283,10 @@ data:
   #               `lease.enabled` (candidates acquire the range through the
   #               lease) and `fencingEpoch: 0` (grants are minted from 1);
   #               both are enforced at render time.
+  #               The replica count must be ODD (#562): a write is acknowledged
+  #               on a majority, so an even count survives no more failures
+  #               than the odd count below it, and two replicas survive none.
+  #               Enforced at render time.
   #
   # `leaderOrdinal` is RETIRED (#284). The chart used to freeze `role: leader`
   # on one ordinal, which made failover a manual re-render-and-restart; setting

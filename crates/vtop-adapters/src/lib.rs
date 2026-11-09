@@ -5,6 +5,7 @@
 //! engine after a batch reaches `VERIFIED`; adapters never auto-commit.
 
 pub mod base;
+pub mod continuity;
 pub mod file_source;
 #[cfg(feature = "kafka")]
 pub mod kafka_source;

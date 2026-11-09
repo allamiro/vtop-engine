@@ -213,6 +213,18 @@ render passes through them. Three refusals live here rather than scattered:
 {{- if and (eq $v.data.topology "replicated") (lt $dataCount 2) -}}
 {{- fail (printf "\n\ndata.topology is \"replicated\" but deployment.data.replicaCount is %d: a replicated range needs at least one follower. Use topology \"standalone\" for a single data node." $dataCount) -}}
 {{- end -}}
+{{- /* An even replicated data tier (#562). The range's write quorum is a
+       majority of its replicas, so the argument that refuses an even voter
+       count applies here too: a fourth replica raises the majority from two
+       to three and tolerates no more failures than three do. Two replicas are
+       worse than they look: the majority is both of them, so any follower
+       loss stops quorum produce and any leader loss leaves no majority to
+       promote from. Standalone pods serve independent ranges and have no
+       quorum, so the rule is for "replicated" only. Placed after the length
+       and follower checks so a values file is told about its first mistake. */ -}}
+{{- if and (eq $v.data.topology "replicated") (eq (mod $dataCount 2) 0) -}}
+{{- fail (printf "\n\ndeployment.data.replicaCount %d is even under data.topology \"replicated\": a replicated range acknowledges a write on a majority of its replicas, so %d replicas need %d acknowledgements and survive %d failure(s) - no more than the odd count below it, while raising the majority it must gather. Use %s%d (a single data node is topology \"standalone\")." $dataCount $dataCount (add1 (div $dataCount 2)) (sub $dataCount (add1 (div $dataCount 2))) (ternary (printf "%d or " (sub $dataCount 1)) "" (gt $dataCount 2)) (add1 $dataCount)) -}}
+{{- end -}}
 {{- if gt (len (include "vtop.fullname" .)) 49 -}}
 {{- fail (printf "\n\nthe release name renders a fullname of %d characters; under separated mode the tier Services append \"-data-headless\" (14) and the label budget is 63. Use fullnameOverride to shorten it to 49 or fewer." (len (include "vtop.fullname" .))) -}}
 {{- end -}}

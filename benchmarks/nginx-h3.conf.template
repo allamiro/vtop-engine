@@ -1,0 +1,185 @@
+# The benchmark lab's HTTP/3-terminating reverse proxy (#484).
+#
+# WHY THIS IS A TEMPLATE AND NOT A CONFIG. One number in here cannot be known
+# until the lab is started: the HOST port the proxy is published on, which
+# VTOP_H3_PORT moves. nginx cannot discover it — it only ever sees the container
+# port it listens on — and that number is both what an S3 client signs and what
+# Alt-Svc has to name, so getting it from outside is not optional. The compose
+# file passes it in as VTOP_H3_ADVERTISED_PORT and the official image's own
+# envsubst pass (/docker-entrypoint.d/20-envsubst-on-templates.sh) renders this
+# file into /tmp before nginx reads it. `NGINX_ENVSUBST_FILTER=^VTOP_` holds
+# that pass to the lab's own placeholders: every other `$name` below is one of
+# nginx's own variables, and an unfiltered substitution would blank them.
+#
+# WHY NGINX AND NOT CADDY. Caddy was the obvious pick — it serves HTTP/3 by
+# default and needs almost no configuration — and it was tried first. It cannot
+# hold this lab's hardening baseline: the official image ships its binary with
+# the file capability `cap_net_bind_service=ep`, and executing a file that
+# carries file capabilities is refused outright when `no-new-privileges` is set
+# and the capability is not in the bounding set. The container dies at exec
+# with `exec /usr/bin/caddy: operation not permitted`, on both the alpine and
+# the debian variants. The choices were to weaken the baseline for one lab
+# service or to pick a server whose image does not need it; the baseline is not
+# the negotiable half. The official nginx image carries no file capabilities,
+# has been built `--with-http_v3_module` since 1.25, and is an official image
+# rather than a personal one — which #507 is the standing argument for.
+#
+# The cost of that choice is this file: nginx does not serve HTTP/3, preserve a
+# client's Host header, or accept a large request body unless it is told to.
+# Each of those is a line below with the reason attached, because each of them
+# silently produces a plausible-looking wrong answer if it is missing.
+
+worker_processes auto;
+# stderr/stdout, so the logs land in `docker compose logs` and nothing in this
+# container ever needs a writable log directory.
+error_log /dev/stderr warn;
+# The pid, and every temp path below, live on tmpfs: the container runs with
+# read_only: true, and a path nginx cannot create is a start-up failure.
+pid /tmp/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    client_body_temp_path /tmp/nginx-client;
+    proxy_temp_path       /tmp/nginx-proxy;
+    fastcgi_temp_path     /tmp/nginx-fastcgi;
+    uwsgi_temp_path       /tmp/nginx-uwsgi;
+    scgi_temp_path        /tmp/nginx-scgi;
+
+    # THE WITNESS. `$server_protocol` is what nginx actually served — HTTP/3.0,
+    # HTTP/2.0 or HTTP/1.1 — and `$http3` is "h3" only on a QUIC connection. A
+    # client that fell back to TCP cannot make either of them say otherwise,
+    # which is what lets verify-h3.sh detect a silent downgrade instead of
+    # taking the client's word for it. JSON on one line per request, because
+    # the check reads it out of `docker compose logs` with grep.
+    log_format wire escape=json
+        '{"proto":"$server_protocol","alpn":"$http3","host":"$signed_host",'
+        '"method":"$request_method","uri":"$request_uri","status":$status,'
+        '"bytes_in":$request_length,"bytes_out":$bytes_sent,"remote":"$remote_addr"}';
+    access_log /dev/stdout wire;
+
+    # WHICH PORT THE CLIENT CAME IN ON — which nginx is not told by the wire.
+    #
+    # A client reaches this proxy exactly two ways. From the host it goes
+    # through the compose publish, whose OUTSIDE number is VTOP_H3_PORT and
+    # whose inside number is always 9443. From inside the compose network it
+    # dials the container directly, on 9443, with no publish in between. The
+    # connection looks identical here either way: `$server_port` is 9443 for
+    # both, because that is the only port nginx listens on.
+    #
+    # What does differ is the NAME, and that is the discriminator used here.
+    # Docker's DNS answers for exactly two names — the service name and the
+    # container name — so the in-network case is the finite one and gets to be
+    # the special case; everything else (localhost, a loopback literal, or
+    # whatever a re-exposed VTOP_BIND_ADDR makes reachable) arrived through the
+    # publish and takes the published port.
+    #
+    # That the in-network set is closed is not an assumption: gen-h3-certs.sh
+    # mints SANs for localhost, 127.0.0.1, ::1, h3-proxy and vtop-bench-h3-proxy
+    # and nothing else, so a client using any other name fails certificate
+    # verification before it ever gets a Host header rebuilt — and the two
+    # in-network names are the two below.
+    map $host $authority_port {
+        h3-proxy            $server_port;
+        vtop-bench-h3-proxy $server_port;
+        default             ${VTOP_H3_ADVERTISED_PORT};
+    }
+
+    # THE HOST HEADER, RECONSTRUCTED — the single subtlest thing in this file.
+    #
+    # HTTP/1.1 sends a Host header and nginx synthesises one from `:authority`
+    # for HTTP/2, so `$http_host` is populated on both. For HTTP/3 it is NOT:
+    # nginx leaves `$http_host` empty, and forwarding that emptiness made MinIO
+    # answer every HTTP/3 request with "400 Bad Request: missing required Host
+    # header" — found by running this proxy, not by reading about it.
+    #
+    # The fallback cannot be `$host` alone: that is the authority with the port
+    # stripped, and an S3 client signs the authority INCLUDING the port into its
+    # SigV4 signature. MinIO recomputes the signature over what arrives here, so
+    # a Host of "localhost" where the client signed "localhost:9443" fails with
+    # SignatureDoesNotMatch — a wrong answer that reads like a credential
+    # problem.
+    #
+    # Nor can the port be `$server_port` (review). That is the port nginx
+    # listens on, and it is right only while the publish happens to use the
+    # same number. On a lab brought up with VTOP_H3_PORT=9543 the client signs
+    # "localhost:9543", this reconstruction forwarded "localhost:9443", and
+    # MinIO answered SignatureDoesNotMatch to every HTTP/3 request — measured
+    # against this proxy, not reasoned about. $authority_port above is that
+    # number, per client.
+    #
+    # Whatever the client did send is preferred untouched, so this only ever
+    # invents a value where the protocol left none.
+    map $http_host $signed_host {
+        ""      "$host:$authority_port";
+        default $http_host;
+    }
+
+    server {
+        # Both listeners on the SAME number, and that number is FIXED: the
+        # compose publish may move the outside of the port, never the inside.
+        # A UDP listener on a different number than the TCP one would tell
+        # every client to retry HTTP/3 where nothing is listening.
+        listen 9443 ssl;
+        listen 9443 quic reuseport;
+        http2 on;
+        server_name _;
+
+        ssl_certificate     /etc/nginx/tls/h3-proxy.pem;
+        ssl_certificate_key /etc/nginx/tls/h3-proxy-key.pem;
+        # QUIC requires TLS 1.3; 1.2 stays for the TCP leg, which is the
+        # baseline half of this lab and must keep working for any ordinary
+        # client.
+        ssl_protocols TLSv1.2 TLSv1.3;
+
+        # How a client that arrived over TCP learns HTTP/3 is available here at
+        # all — so it has to name a port that client can actually reach, which
+        # is the one it dialled and not the one nginx bound (review). A lab on
+        # VTOP_H3_PORT=9543 advertising `h3=":9443"` sends every upgrading
+        # client to a number where nothing is listening, and the client reports
+        # that as HTTP/3 being unavailable rather than as a lab misconfiguration.
+        # `always` so it rides on error responses too — a client that only ever
+        # sees a 403 from the store should still learn the alternative.
+        add_header Alt-Svc 'h3=":$authority_port"; ma=86400' always;
+
+        # UNLIMITED, deliberately: nginx defaults to 1 MB and this proxy fronts
+        # an object store. The default would 413 every batch above a megabyte,
+        # and the benchmark would read that as an upload failure rather than as
+        # a proxy misconfiguration.
+        client_max_body_size 0;
+        # Stream, never spool. Buffering would make the proxy write every
+        # uploaded object to disk before forwarding it — on a read-only
+        # container that is a failure, and even on a writable one it would put
+        # a disk round trip inside the very latency this lab measures.
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_http_version 1.1;
+        proxy_connect_timeout 30s;
+        # A soak uploads for minutes at a time over a link a later issue will
+        # deliberately make thin; the 60s defaults would cut those uploads off
+        # and the result would look like a transport fault.
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
+
+        location / {
+            proxy_pass http://minio:9000;
+            # THE ONE THAT BREAKS SIGNING IF IT IS MISSING. nginx rewrites Host
+            # to the upstream's name by default; an S3 client signs the Host
+            # header into its SigV4 signature, so MinIO would recompute the
+            # signature over "minio:9000" while the client signed
+            # "localhost:9443" and reject every request with
+            # SignatureDoesNotMatch — which reads as a credential bug, not a
+            # proxy one. $signed_host is $http_host with the HTTP/3 gap filled;
+            # see the map above.
+            proxy_set_header Host $signed_host;
+            proxy_set_header X-Real-IP $remote_addr;
+            # Keepalive to the upstream is nginx's default on 1.1 only with an
+            # empty Connection header; without this each object upload pays a
+            # fresh TCP connection to the store and the proxy hop's measured
+            # cost is mostly that.
+            proxy_set_header Connection "";
+        }
+    }
+}

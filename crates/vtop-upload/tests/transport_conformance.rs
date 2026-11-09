@@ -37,6 +37,7 @@ async fn every_registered_transport_holds_the_evidence_rules() {
             verify_tls: false,
             transport: transport.clone(),
             tuning: Default::default(),
+            request_timeout_seconds: 300,
         })
         .await
         .unwrap_or_else(|e| panic!("[{transport}] backend construction: {e}"));

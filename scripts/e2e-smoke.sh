@@ -171,72 +171,24 @@ except Exception:
     print("")' 2>/dev/null || true)"
 NET="${NET:-vtop-engine_storage-net}"
 
-# The same override variables the compose files honor, THROUGH THE SAME
-# CHANNELS and with the same precedence. compose auto-loads ./.env for the
-# services; Bash does not — but .env is COMPOSE DATA, not shell code, so it
-# must be parsed, never sourced: the shipped .env.example carries an unquoted
-# multi-word FORMATS= line that sourcing would execute as a command, killing
-# this script under set -e, and sourcing would also let the filed value
-# clobber an exported one, inverting compose's shell-wins precedence. Only
-# the two keys this client needs are read, one layer of matching quotes
-# stripped as compose strips them, and only when the shell did not set the
-# variable at all — a blank-but-set export masks .env for compose, so it
-# must mask it here too (the ${VAR:-default} at the use site then maps blank
-# to the lab default on both sides).
-env_default() { # <key> — the value filed in ./.env, read by Compose's rules
-  local value
-  value="$(sed -n "s/^$1=//p" .env | tail -1)"
-  case "$value" in
-    \"*)
-      # A quoted value ends at its CLOSING quote; an inline comment after
-      # it is not part of the credential (review — matching on a quote PAIR
-      # left the quotes inside the value whenever a comment followed). An
-      # unterminated quote stays exactly as written.
-      value="$(printf '%s' "$value" | sed -E 's/^"([^"]*)".*/\1/')"
-      ;;
-    \'*)
-      value="$(printf '%s' "$value" | sed -E "s/^'([^']*)'.*/\1/")"
-      ;;
-    *)
-      # Compose's dotenv rule for UNQUOTED values: an inline comment starts
-      # at the first whitespace-preceded '#', and trailing whitespace goes.
-      # These are the credentials the MinIO container was interpolated
-      # with, so a parser that keeps 'secret # local MinIO' hands the
-      # client a password the server never saw — and it reads as auth.
-      value="$(printf '%s' "$value" | sed -E 's/[[:space:]]+#.*$//; s/[[:space:]]+$//')"
-      ;;
-  esac
-  printf '%s' "$value"
-}
-if [ -f .env ]; then
-  MINIO_ROOT_USER="${MINIO_ROOT_USER-$(env_default MINIO_ROOT_USER)}"
-  MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD-$(env_default MINIO_ROOT_PASSWORD)}"
-fi
-# The mc image comes from the COMPOSE FILE, never a second literal (#507,
-# review). Dependabot's docker-compose ecosystem scans the manifests under /
-# and /benchmarks and nothing else, so a tag written here too would sit still
-# while the manifest advanced — and the next withdrawal would break this
-# helper alone, in the step that reports on the upload path. `--images
-# <service>` also lists that service's dependencies, so the mc one is selected
-# by name; an empty answer is a refusal, because falling back to a literal is
-# how the two drift apart in the first place.
-# `|| true` is load-bearing (review): the script runs under `set -e` with
-# `pipefail`, so a failing `compose config` — or a grep that simply matches
-# nothing — makes the whole pipeline non-zero and the shell exits HERE, before
-# the check below can say why. The diagnostic added to stop a silent failure
-# would then itself be silenced, in exactly the case it exists for.
-MC_IMAGE=$("${COMPOSE[@]}" config --images minio-init 2>/dev/null | grep '/mc:' | head -1 || true)
-if [ -z "$MC_IMAGE" ]; then
-  fail "could not read the mc image from the compose file; object counts would be meaningless"
-  exit 1
-fi
-listing=$(docker run --rm --network "$NET" \
-  -e "MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}" \
-  -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}" \
-  -e HOME=/tmp \
-  --entrypoint /bin/sh "$MC_IMAGE" -c \
+# mc runs AS the compose service that owns it (#507, #550), never from an
+# image name written or parsed here. A second literal drifts from the
+# manifest Dependabot bumps; parsing `config --images` broke once the lab
+# began building its MinIO image instead of pulling one (no registry serves
+# it any more). `compose run` takes the image, the network and the
+# credentials from the same file that started the server, so the three
+# cannot disagree - including credentials overridden in .env or the shell,
+# which this script used to re-derive by parsing .env with Compose's rules.
+#   --no-deps     the server is already up
+#   --pull never  the image was built by `up`; do not build it again here
+#   -T            no TTY, so the listing is plain text
+# Only lines in `mc ls` form ("[date] size class bucket/key") are kept: any
+# other stdout (build or pull progress) counted as objects otherwise.
+# shellcheck disable=SC2016  # expanded by the container's shell, from the service's environment
+raw_listing=$("${COMPOSE[@]}" run --rm --no-deps --pull never -T --entrypoint /bin/sh minio-init -c \
   'mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; mc ls --recursive local' 2>/tmp/vtop-smoke-mc.err || true)
-# A `docker run` that never ran is not an empty bucket (#507). Swallowing this
+listing=$(grep '^\[' <<<"$raw_listing" || true)
+# An mc run that never ran is not an empty bucket (#507). Swallowing this
 # one turned a pull failure into "no data objects in MinIO" — the listing came
 # back empty and the report blamed the upload path for a registry's decision.
 if [ ! -s /tmp/vtop-smoke-mc.err ]; then

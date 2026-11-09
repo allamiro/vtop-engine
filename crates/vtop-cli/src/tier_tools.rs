@@ -1080,6 +1080,7 @@ mod tests {
             force_path_style: true,
             verify_tls: false,
             transport: "tcp_tls".into(),
+            request_timeout_seconds: 300,
             profile: None,
             command_binary: None,
             command_timeout_seconds: 300,
