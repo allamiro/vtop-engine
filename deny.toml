@@ -68,6 +68,26 @@ ignore = [
     # version bump, and is follow-up work. Mirrors .cargo/audit.toml, which is
     # the single source of truth.
     "RUSTSEC-2024-0449",
+
+    # crypto-bigint 0.5.5 — timing-variability in constant-time operations.
+    # Fixed only in crypto-bigint >=0.7.6 (a major bump); pinned to the 0.5.x
+    # line by aws-sigv4 and elliptic-curve, so no `cargo update` reaches it.
+    # Mirrors .cargo/audit.toml, which carries the full justification. Remove
+    # when the AWS signing / RustCrypto stack adopts crypto-bigint >=0.7.6.
+    "RUSTSEC-2026-0387",
+
+    # libsqlite3-sys 0.30.1 — bundles a SQLite affected by CVE-2026-119375.
+    # Fixed in libsqlite3-sys >=0.39.0, which needs a newer sqlx; sqlx-sqlite
+    # 0.9.0 caps it at <0.38. SQLite parses only the engine's local, operator-
+    # owned state-store file here, never network input. Mirrors
+    # .cargo/audit.toml. Remove when sqlx depends on libsqlite3-sys >=0.39.
+    "RUSTSEC-2026-0459",
+
+    # pin-utils 0.1.0 — UNMAINTAINED (upstream archived; no fix will ship).
+    # Reaches the build only through aws-smithy-http / aws-smithy-runtime.
+    # cargo-deny's `unmaintained` check fails on it, so it is ignored here;
+    # mirrored in .cargo/audit.toml. Remove when the AWS SDK drops pin-utils.
+    "RUSTSEC-2026-0441",
     # NOTE: RUSTSEC-2023-0071 (rsa) is ignored in .cargo/audit.toml but is NOT
     # listed here on purpose. cargo-audit reads Cargo.lock, so it sees `rsa`;
     # cargo-deny builds a feature-aware graph and does not, because `rsa` is
