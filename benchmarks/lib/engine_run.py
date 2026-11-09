@@ -26,6 +26,8 @@ The run is REFUSED, never reported partially, when:
 * something already answers at that address before the engine starts (a leaked
   engine from an earlier run would be scraped in place of this one);
 * a scrape fails, or falls behind by more than an interval, inside the window;
+* a scrape takes longer than a tenth of the interval (MAX_SCRAPE_LATENCY_FRACTION)
+  inside the window, or every answer before it opens does;
 * a counter goes backwards or a series disappears (a different process is
   answering, or the engine restarted and its counters reset);
 * the engine exits before the window closes.
@@ -68,6 +70,20 @@ DEFAULT_SCRAPE_INTERVAL_SECONDS = 1.0
 # interval would average away exactly the one-second excursion a rate-cap
 # criterion is written to catch, so it is refused rather than accepted.
 MAX_SCRAPE_INTERVAL_SECONDS = 1.0
+
+# HOW LONG ONE SCRAPE MAY TAKE, as a fraction of the interval. A reading is
+# stamped when its answer arrives: the engine renders its registry as the
+# last step before writing the response, and what load delays is the handler
+# getting to run, before it reads anything. But WHERE in the request the read
+# happened is not observable, so each bucket edge is uncertain by up to its
+# scrape's latency — and a bucket of width dt is really somewhere in
+# [dt - L, dt + L]. A tenth of the interval bounds a one-interval bucket's
+# rate to about -9%/+11% of its true value, and the latency is on every row
+# so a reader can bound each bucket exactly. A slower scrape refuses the
+# window, as a late one does (the two-interval gap rule): a rate whose
+# bucket edges are that uncertain is how a cap violation that never happened
+# gets filed.
+MAX_SCRAPE_LATENCY_FRACTION = 0.1
 
 # How long the endpoint gets to answer after launch. The engine starts its
 # metrics server before it opens the ledger (crates/vtop-cli/src/commands.rs),
@@ -112,8 +128,8 @@ ENGINE_METRICS_PARTIAL_CSV = "engine_metrics.partial.csv"
 ENGINE_LOG = "engine-run.log"
 
 ENGINE_METRICS_COLUMNS = (
-    "timestamp", "elapsed_seconds", "interval_seconds", "metric", "labels",
-    "type", "value", "delta", "delta_per_second",
+    "timestamp", "elapsed_seconds", "interval_seconds", "scrape_latency_seconds", "metric",
+    "labels", "type", "value", "delta", "delta_per_second",
 )
 
 # THE SERIES SURFACED AS FLAT SUMMARY COLUMNS, and what each one is.
@@ -167,6 +183,10 @@ class EndpointInUse(EngineWindowError):
 
 
 class ScrapeStopped(EngineWindowError):
+    pass
+
+
+class ScrapeTooSlow(EngineWindowError):
     pass
 
 
@@ -244,7 +264,8 @@ def summary_column_names() -> list[str]:
     """Every flat column a long-lived run adds to metrics.csv and summary.json,
     derived from SUMMARY_SERIES so the two can never disagree."""
     cols = ["engine_mode", "engine_metrics_address", "engine_window_seconds",
-            "engine_scrape_interval_seconds", "engine_samples", "engine_stopped_by"]
+            "engine_scrape_interval_seconds", "engine_scrape_latency_max_seconds",
+            "engine_samples", "engine_stopped_by"]
     for name, kind in SUMMARY_SERIES:
         if kind == "counter":
             cols += [f"engine_{_short(name)}_window", f"engine_{_short(name)}_max_per_second"]
@@ -679,6 +700,9 @@ class SeriesRecorder:
     first_iso: str = ""
     last_iso: str = ""
     rollups: dict[str, _Rollup] = field(default_factory=dict)
+    # The slowest scrape among the samples, in seconds; None until one is
+    # recorded with its latency.
+    max_latency: float | None = None
 
     def __post_init__(self) -> None:
         self._fh = open(self.path, "w", newline="", encoding="utf-8")
@@ -716,7 +740,11 @@ class SeriesRecorder:
         self.first_mono, self.first_iso = mono, iso
         self.last_mono, self.last_iso = mono, iso
 
-    def add(self, iso: str, mono: float, expo: prom_text.Exposition) -> None:
+    def add(self, iso: str, mono: float, expo: prom_text.Exposition,
+            latency: float | None = None) -> None:
+        """One reading, stamped `mono`/`iso` — when its answer arrived — and
+        the `latency` of the scrape that took it (see
+        MAX_SCRAPE_LATENCY_FRACTION)."""
         prev = self._prev
         dt = (mono - self.last_mono) if self.last_mono is not None else None
         elapsed = (mono - self.first_mono) if self.first_mono is not None else 0.0
@@ -753,6 +781,7 @@ class SeriesRecorder:
                 interval_deltas[s.name] = interval_deltas.get(s.name, 0.0) + d
             self._csv.writerow([
                 iso, f"{elapsed:.3f}", f"{dt:.3f}" if dt is not None else "",
+                f"{latency:.6f}" if latency is not None else "",
                 s.name, prom_text.render_labels(s.labels)[1:-1] if s.labels else "",
                 kind, _fmt(s.value), delta, per_second,
             ])
@@ -776,6 +805,8 @@ class SeriesRecorder:
         if self.first_mono is None:
             self.first_mono, self.first_iso = mono, iso
         self.last_mono, self.last_iso = mono, iso
+        if latency is not None:
+            self.max_latency = latency if self.max_latency is None else max(self.max_latency, latency)
         self._prev = expo
         self._opening_span = False
         self.samples += 1
@@ -798,6 +829,8 @@ class EngineWindow:
     # buffers flushed), `sigkill` (forced; in-flight batches are left for the
     # recovery pass to find), or `exited`.
     stopped_by: str = "unknown"
+    # The slowest scrape in the window (each row carries its own).
+    max_scrape_latency: float | None = None
 
     def _counter(self, name: str) -> float:
         roll = self.rollups.get(name)
@@ -827,6 +860,8 @@ class EngineWindow:
             "engine_metrics_address": self.endpoint.url,
             "engine_window_seconds": round(self.window_seconds, 3),
             "engine_scrape_interval_seconds": self.interval,
+            "engine_scrape_latency_max_seconds": (
+                round(self.max_scrape_latency, 6) if self.max_scrape_latency is not None else ""),
             "engine_samples": self.samples,
             "engine_stopped_by": self.stopped_by,
         }
@@ -952,6 +987,7 @@ def measure_window(binary: str, config_path: str, scenario, results_dir: str, *,
         endpoint=endpoint, interval=interval, opened_at=recorder.first_iso,
         closed_at=recorder.last_iso, window_seconds=recorder.last_mono - recorder.first_mono,
         samples=recorder.samples, csv_path=final, log_path=log_path, rollups=recorder.rollups,
+        max_scrape_latency=recorder.max_latency,
         stopped_by=stopped_by or "unknown")
 
 
@@ -963,23 +999,50 @@ def _observe(proc, endpoint: MetricsEndpoint, recorder: SeriesRecorder, duration
             f"the engine exited with status {rc} {when}; a window it did not live through "
             f"measured nothing. Its output ({log_path}):\n{tail or '(empty)'}")
 
+    # A reading is stamped when its answer ARRIVES, and its scrape's latency
+    # is bounded — see MAX_SCRAPE_LATENCY_FRACTION. Stamped at the request's
+    # start instead, a handler delayed by load read counters later than their
+    # timestamp says, and one late answer turned a steady rate into a spike
+    # and a dip of the same size.
+    bound = interval * MAX_SCRAPE_LATENCY_FRACTION
+
+    def too_slow(latency: float, where: str) -> ScrapeTooSlow:
+        return ScrapeTooSlow(
+            f"a scrape of {endpoint.url} took {latency:.3f}s {where}, over the {bound:.3f}s bound "
+            f"(a tenth of the {interval:g}s interval): where in that span the engine read its "
+            "counters is unknown, so the bucket edges are uncertain by that much and a rate "
+            "excursion that never happened can be filed as one. Use a longer "
+            "engine_scrape_interval_seconds, or less load on the scraping host")
+
     # READINESS. The first answer is the first SAMPLE, and the scheduled ticks
     # count from it — a run whose first samples are connection refusals has
     # measured nothing. The counters' baseline is the launch, already set as
-    # the recorder's origin.
+    # the recorder's origin. The opening reading is the first bucket's left
+    # edge, so it is held to the same bound; a slow answer is not used (the
+    # engine has only just started), and costs nothing, because the next one
+    # is still read against zero at launch.
     deadline = clock() + ready_timeout
     last_error = "no attempt was made"
+    quickest = None  # of the answers too slow to open the window
     while True:
         rc = proc.exit_code()
         if rc is not None:
             raise exited(rc, f"before its metrics endpoint at {endpoint.url} answered")
-        mono, iso = clock(), _iso_now()
+        started = clock()
         try:
             expo = scrape(endpoint, timeout=max(0.1, min(2.0, ready_timeout)))
-            break
         except ScrapeFailed as err:
             last_error = str(err)
+        else:
+            mono, iso = clock(), _iso_now()
+            latency = mono - started
+            if latency <= bound:
+                break
+            quickest = latency if quickest is None else min(quickest, latency)
         if clock() >= deadline:
+            if quickest is not None:
+                raise too_slow(quickest, f"even in its quickest answer within {ready_timeout:g}s "
+                               "of launch")
             hint = ""
             if isinstance(proc, ContainerEngine):
                 hint = (f" The compose file publishes the container's :{CONTAINER_METRICS_PORT} on the "
@@ -990,7 +1053,7 @@ def _observe(proc, endpoint: MetricsEndpoint, recorder: SeriesRecorder, duration
                 f"the engine's metrics endpoint at {endpoint.url} never answered within "
                 f"{ready_timeout:g}s of launch (last error: {last_error}).{hint}")
         sleep(READY_POLL_SECONDS)
-    recorder.add(iso, mono, expo)
+    recorder.add(iso, mono, expo, latency=latency)
 
     # THE WINDOW. Ticks are scheduled from the opening sample, not from the
     # previous one, so scrape latency never accumulates into drift; the window
@@ -1005,19 +1068,23 @@ def _observe(proc, endpoint: MetricsEndpoint, recorder: SeriesRecorder, duration
         rc = proc.exit_code()
         if rc is not None:
             raise exited(rc, f"{clock() - opened:.1f}s into a {duration:g}s window")
-        mono, iso = clock(), _iso_now()
-        gap = mono - recorder.last_mono
+        started = clock()
+        gap = started - recorder.last_mono
         if gap > 2 * interval:
             raise ScrapeStopped(
                 f"the scraper fell behind: {gap:.2f}s between samples against a {interval:g}s "
-                f"interval, {mono - opened:.1f}s into the window at {endpoint.url}. A bucket that "
+                f"interval, {started - opened:.1f}s into the window at {endpoint.url}. A bucket that "
                 "wide averages the excursions it exists to show; the series is refused rather "
                 "than reported coarse")
         try:
             expo = scrape(endpoint, timeout=interval)
         except ScrapeFailed as err:
             raise ScrapeStopped(
-                f"scraping {endpoint.url} stopped {mono - opened:.1f}s into a {duration:g}s window "
+                f"scraping {endpoint.url} stopped {started - opened:.1f}s into a {duration:g}s window "
                 f"after {recorder.samples} sample(s): {err}. A partial series is not a "
                 "measurement") from err
-        recorder.add(iso, mono, expo)
+        mono, iso = clock(), _iso_now()
+        latency = mono - started
+        if latency > bound:
+            raise too_slow(latency, f"{started - opened:.1f}s into a {duration:g}s window")
+        recorder.add(iso, mono, expo, latency=latency)

@@ -216,10 +216,22 @@ recorded numbers and for per-batch latency percentiles.
 
 **What it writes.** `engine_metrics.csv`, one row per series per sample:
 `timestamp` (the sample's, ISO 8601 UTC), `elapsed_seconds` since launch,
-`interval_seconds` since the previous sample, `metric`, `labels`,
+`interval_seconds` since the previous sample, `scrape_latency_seconds` (how
+long that sample's scrape took), `metric`, `labels`,
 `type`, `value`, and for counters the interval's `delta` and
 `delta_per_second` — so "was the rate ever exceeded in any one second" is
-answered from the artifact, not from an average. The opening row's interval is
+answered from the artifact, not from an average.
+
+A sample is stamped when its scrape's answer **arrives**: the engine renders
+its counters as the last step before it writes the response, and what load
+delays is the handler getting to run at all. Stamped at the request's start,
+one answer delayed 0.08 s in 0.1 s buckets turned a steady 100 commits/s into
+180/s then 20/s. Where in the request the counters were read cannot be
+observed, though, so each bucket edge is uncertain by up to its scrape's
+latency — which is why it is on every row, and why a scrape slower than a
+tenth of the interval refuses the window (below): within that bound a
+one-interval bucket's rate is within about −9 %/+11 % of the true one, and the
+two latencies on its rows bound it exactly. The opening row's interval is
 the launch-to-first-answer span and its delta the increase since launch; that
 span is not a scheduled bucket, so it has no `delta_per_second` and does not
 enter `engine_<name>_max_per_second`. A counter series that first
@@ -237,7 +249,8 @@ The engine's series, by kind (`vtop_core::telemetry`):
 
 The flat columns appended to `metrics.csv` and `summary.json` on a `run`
 scenario only: `engine_mode`, `engine_metrics_address`,
-`engine_window_seconds`, `engine_scrape_interval_seconds`, `engine_samples`,
+`engine_window_seconds`, `engine_scrape_interval_seconds`,
+`engine_scrape_latency_max_seconds` (the slowest scrape), `engine_samples`,
 `engine_stopped_by`, and per surfaced series — summed across label sets —
 `engine_<name>_window` and `engine_<name>_max_per_second` for a counter,
 `engine_<name>_min` and `engine_<name>_max` for a gauge. Surfaced today:
@@ -272,6 +285,11 @@ no `summary.json` is written):
   place;
 - a scrape fails inside the window, or two samples land more than two
   intervals apart;
+- a scrape inside the window takes longer than a tenth of the interval
+  (`MAX_SCRAPE_LATENCY_FRACTION`: 100 ms at the default 1 s), or every answer
+  before the window opens does. A slow first answer alone does not refuse —
+  it is not used, and the next prompt one opens the window with nothing lost,
+  since the counters are read against zero at launch;
 - a counter goes backwards or a series disappears (a different process is
   answering, or the engine restarted);
 - the engine exits before the window closes.

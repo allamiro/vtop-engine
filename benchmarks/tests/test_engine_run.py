@@ -56,6 +56,22 @@ def _temp_files_stay_in_the_test(tmp_path, monkeypatch):
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
 
+# What the engine's stand-ins here allow a scrape. They are Python http.server
+# endpoints, and their loopback latency is not the engine's: 500 scrapes of
+# one measured p50 1.2 ms, p99 5.8 ms, max 19 ms on an idle 18-core dev
+# machine, against the 10 ms the production bound allows at the 0.1 s
+# intervals these tests use to stay fast. Tests about something else get a
+# bound of a whole interval; the latency rule itself is tested on a
+# deterministic clock, at the production value (`real_latency_bound`).
+STAND_IN_LATENCY_FRACTION = 1.0
+
+
+@pytest.fixture(autouse=True)
+def _stand_in_latency_bound(request, monkeypatch):
+    if request.node.get_closest_marker("real_latency_bound") is None:
+        monkeypatch.setattr(engine_run, "MAX_SCRAPE_LATENCY_FRACTION", STAND_IN_LATENCY_FRACTION)
+
+
 def _scenario(**overrides) -> Scenario:
     return Scenario({**DEFAULTS, **overrides})
 
@@ -623,6 +639,111 @@ def test_an_endpoint_that_never_answers_refuses_naming_the_address_it_tried(tmp_
     assert proc.stopped
 
 
+class LaggingEndpoint:
+    """A deterministic clock and a scrape double over it, for scrape LATENCY.
+
+    The engine's counter grows at exactly `rate` per second from launch. A
+    scrape takes `delays[n]` seconds for the n-th answer since launch, and
+    the counters are read at the END of that delay — the engine's handler
+    delayed by load, which is when it renders the registry. Nothing answers
+    before launch."""
+
+    def __init__(self, delays: dict[int, float], rate: float = 100.0) -> None:
+        self.now = 1000.0
+        self.launch = None
+        self.delays = delays
+        self.rate = rate
+        self.answers = 0
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+    def start(self) -> None:
+        self.launch = self.now
+
+    def scrape(self, endpoint, timeout):
+        if self.launch is None:
+            raise engine_run.ScrapeFailed("nothing answers before launch")
+        self.answers += 1
+        self.now += self.delays.get(self.answers, 0.0)
+        # Unrounded, so the reading is exact and any error is the timestamp's.
+        commits = self.rate * (self.now - self.launch)
+        return prom_text.parse(_body(commits=commits, bytes_out=commits))
+
+    def run(self, tmp_path, monkeypatch, duration=0.5, interval=0.1, ready_timeout=1.0):
+        monkeypatch.setattr(engine_run, "scrape", self.scrape)
+        return engine_run.measure_window(
+            "vtopctl", "/c.yaml", _scenario(engine_mode="run"), str(tmp_path),
+            duration=duration, interval=interval, ready_timeout=ready_timeout,
+            endpoint=engine_run.MetricsEndpoint("127.0.0.1:1", "127.0.0.1", 1),
+            engine_process=FakeProcess(on_start=self.start), sleep=self.sleep, clock=self.clock)
+
+
+def _commit_rates(csv_path: str) -> list[float]:
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        return [float(r["delta_per_second"]) for r in csv.DictReader(fh)
+                if r["metric"] == "vtop_commits_total" and r["delta_per_second"]]
+
+
+@pytest.mark.real_latency_bound
+def test_one_slow_scrape_cannot_fabricate_a_rate_excursion_it_refuses_the_window(
+        tmp_path, monkeypatch):
+    # The review's case: a constant 100 commits/s, 0.1 s buckets, and one
+    # scrape whose handler answered 0.08 s late. Stamped at the request's
+    # start, its counters were read 0.08 s after their timestamp: 180/s, then
+    # 20/s — a cap violation that never happened, filed without a refusal.
+    lag = LaggingEndpoint(delays={3: 0.08})
+    with pytest.raises(engine_run.ScrapeTooSlow, match="0.08"):
+        lag.run(tmp_path, monkeypatch)
+    assert not os.path.exists(tmp_path / engine_run.ENGINE_METRICS_CSV)
+
+
+@pytest.mark.real_latency_bound
+def test_a_reading_is_timed_when_it_was_taken_and_its_scrape_latency_is_recorded(
+        tmp_path, monkeypatch):
+    # Under the bound, the reading is stamped when its answer arrived — where
+    # a handler delayed by load read the counters — so a constant rate reads
+    # constant in every bucket, and the latency is on the row for anyone who
+    # wants to bound a bucket's edges exactly.
+    lag = LaggingEndpoint(delays={3: 0.009})
+    window = lag.run(tmp_path, monkeypatch)
+    rates = _commit_rates(window.csv_path)
+    assert len(rates) == 5 and rates == pytest.approx([100.0] * 5, rel=1e-6), (
+        f"a constant 100 commits/s must read 100/s in every bucket, whatever one scrape took: {rates}")
+    with open(window.csv_path, newline="", encoding="utf-8") as fh:
+        latencies = [r["scrape_latency_seconds"] for r in csv.DictReader(fh)
+                     if r["metric"] == "vtop_commits_total"]
+    # Rows are samples; the third answer (row index 2) was the slow one.
+    assert [float(x) for x in latencies] == pytest.approx([0, 0, 0.009, 0, 0, 0]), (
+        "every sample's row carries its own scrape's latency, the opening one included")
+    assert window.summary_columns()["engine_scrape_latency_max_seconds"] == pytest.approx(0.009)
+
+
+@pytest.mark.real_latency_bound
+def test_a_slow_first_answer_does_not_open_the_window_a_prompt_one_does(tmp_path, monkeypatch):
+    # The opening reading is the left edge of the first bucket, so it is held
+    # to the same bound. A slow one is not refused outright — the engine has
+    # just started — but not used either: the counters are read against zero
+    # at launch, so the next prompt answer loses nothing.
+    lag = LaggingEndpoint(delays={1: 0.05})
+    window = lag.run(tmp_path, monkeypatch)
+    assert lag.answers >= 2, "the slow first answer must not have opened the window"
+    assert _commit_rates(window.csv_path) == pytest.approx([100.0] * 5, rel=1e-6)
+    assert window.rollups["vtop_commits_total"].window == pytest.approx(100 * window.window_seconds), (
+        "the discarded answer loses no work: the window still counts from launch")
+
+
+@pytest.mark.real_latency_bound
+def test_an_endpoint_that_only_ever_answers_slowly_is_refused_naming_its_latency(
+        tmp_path, monkeypatch):
+    lag = LaggingEndpoint(delays={n: 0.05 for n in range(1, 1000)})
+    with pytest.raises(engine_run.ScrapeTooSlow, match="0.05"):
+        lag.run(tmp_path, monkeypatch, ready_timeout=0.5)
+
+
 def test_something_already_answering_before_launch_refuses_without_starting_an_engine(
         tmp_path, stub_factory):
     stub = stub_factory()
@@ -815,6 +936,12 @@ def test_a_long_lived_runs_throughput_is_its_window_counts_over_the_window_not_t
         summary["total_input_bytes"] / 1e6 / window, rel=0.01, abs=0.001)
 
 
+def _nap_before(deadline: float, step: float = 0.05) -> None:
+    """One polling step, never past `deadline`: a full step when it fits,
+    otherwise only what is left, so the loop's bound is the bound it states."""
+    time.sleep(min(step, max(0.0, deadline - time.monotonic())))
+
+
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
 def test_the_host_engine_is_stopped_when_the_runner_is_terminated_by_a_signal(
         tmp_path, fake_engine, signum):
@@ -830,6 +957,7 @@ def test_the_host_engine_is_stopped_when_the_runner_is_terminated_by_a_signal(
         sys.path.insert(0, {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))!r})
         from lib import engine_run
         from lib.scenario import DEFAULTS, Scenario
+        engine_run.MAX_SCRAPE_LATENCY_FRACTION = {STAND_IN_LATENCY_FRACTION!r}  # a stand-in engine
         sc = Scenario({{**DEFAULTS, "engine_mode": "run", "duration_seconds": 60,
                         "backend": "mock"}})
         endpoint = engine_run.endpoint_for("host")
@@ -850,14 +978,14 @@ def test_the_host_engine_is_stopped_when_the_runner_is_terminated_by_a_signal(
         while time.monotonic() < deadline:
             if partial.exists() and len(partial.read_text(encoding="utf-8").splitlines()) > 4:
                 break  # the window is open: it has samples
-            time.sleep(0.05)
+            _nap_before(deadline)
         else:
             raise AssertionError("the window never opened")
         runner.send_signal(signum)
         rc = runner.wait(timeout=30)
         deadline = time.monotonic() + 5
         while _alive(engine_pid) and time.monotonic() < deadline:
-            time.sleep(0.05)
+            _nap_before(deadline)
         assert not _alive(engine_pid), (
             f"a runner ended by {signal.Signals(signum).name} left its engine running; it keeps "
             "uploading through the shaped link into the next scenario")
