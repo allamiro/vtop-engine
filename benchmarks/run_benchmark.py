@@ -27,7 +27,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lib import competitor, engine, seed, shaping  # noqa: E402
+from lib import competitor, engine, engine_run, seed, shaping  # noqa: E402
 from lib.metrics import ResultsWriter, iso_now, new_run_id, percentile  # noqa: E402
 from lib.scenario import load_scenario, reseed_count  # noqa: E402
 from lib.sysmon import SystemMonitor  # noqa: E402
@@ -121,8 +121,24 @@ def main() -> int:
     # not fall back to host and record a run as something it was not.
     try:
         mode = engine.runner_mode(sc)
+        # And which ENGINE (#510), with the same timing: a long-lived run with
+        # no window, or a scrape interval coarser than the per-second buckets
+        # it promises, is refused before it costs anything.
+        engine_mode = engine_run.engine_mode(sc)
     except ValueError as bad:
         print(f"[bench] {bad}", file=sys.stderr)
+        return 2
+    # A COMPETITOR NEEDS CYCLES (#478 x #510). Its VTOP share is a rate over
+    # the engine cycles the contended window wholly contains, noted as each
+    # `process-once` returns (`note_progress`); a long-lived engine has no
+    # cycles to note, and its committed bytes are known only once its window
+    # closes, so the bracket would find no whole cycle inside it. Refused here,
+    # before the calibration probe and the seed, rather than after a soak.
+    if engine_mode == engine_run.LONG_LIVED and shaping.competitor_requested(sc):
+        print("[bench] engine_mode: run cannot be combined with "
+              f"{shaping.COMPETITOR_KEY}: the competitor measures VTOP's share over "
+              "per-cycle progress, and a long-lived engine has no cycles. Run the "
+              "contended scenario with engine_mode: process-once", file=sys.stderr)
         return 2
     if mode == "container":
         print("[bench] runner_mode=container: the engine runs inside the "
@@ -174,7 +190,10 @@ def main() -> int:
             from lib import netem
             emulator_validation_mbps = netem.calibrate(shape)
     run_id = new_run_id(sc.name)
-    writer = ResultsWriter(results_root, run_id)
+    # A long-lived run appends its engine counters to metrics.csv (#510); a
+    # per-cycle run passes nothing and writes exactly the headers it always has.
+    writer = ResultsWriter(results_root, run_id,
+                           extra_columns=engine_run.metrics_columns(engine_mode))
     print(f"[bench] scenario={sc.name} run_id={run_id}")
     print(f"[bench] results -> {writer.dir}")
 
@@ -210,8 +229,9 @@ def main() -> int:
     # caller-supplied seed dir is still never deleted, and the writer's
     # directory stays as the record of the run, refused or not.
     try:
-        return _measure(args, sc, mode, shape, contention_spec, emulator_validation_mbps,
-                        run_id, writer, binary, seed_dir, work_dir, state_db)
+        return _measure(args, sc, mode, engine_mode, shape, contention_spec,
+                        emulator_validation_mbps, run_id, writer, binary, seed_dir, work_dir,
+                        state_db)
     finally:
         writer.close()
         if should_remove_seed_dir(seed_dir_is_ours, args.keep_seed):
@@ -226,8 +246,8 @@ def main() -> int:
         shutil.rmtree(os.path.dirname(state_db), ignore_errors=True)
 
 
-def _measure(args, sc, mode, shape, contention_spec, emulator_validation_mbps, run_id,
-             writer, binary, seed_dir, work_dir, state_db) -> int:
+def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_validation_mbps,
+             run_id, writer, binary, seed_dir, work_dir, state_db) -> int:
     """Everything a run does once its scratch exists: the engine config, the
     preflight refusals, the measured block and the results.
 
@@ -459,7 +479,28 @@ def _measure(args, sc, mode, shape, contention_spec, emulator_validation_mbps, r
         # nobody to close it. `close()` refuses if this was never reached.
         if contention is not None:
             contention.start_with_vtop()
-        while True:
+        # ONE LONG-LIVED ENGINE INSTEAD OF THE CYCLES (#510). `vtopctl run`
+        # holds the window, its own /metrics is the record, and everything the
+        # loop below would have counted is read off the engine's counters
+        # instead. lib/engine_run.py refuses a partial series and stops the
+        # engine on every way out of the call. The seeder has ONE stop,
+        # `_stop_seeder`, reached three ways: on a clean close it runs AT the
+        # window's boundary (`on_window_closed`), before the engine's stop
+        # grace — seeding through the grace counted post-window input into
+        # total_seeded_bytes and the backlog with none of its commits in the
+        # window (review); on any other way out, the ExitStack above runs it;
+        # and the explicit call after the loop is then a no-op. Never with a
+        # competitor (refused in main()), so the contended window is not open.
+        window = None
+        if engine_mode == engine_run.LONG_LIVED:
+            window = engine_run.measure_window(binary, config_path, sc, writer.dir,
+                                               on_window_closed=_stop_seeder)
+            totals = window.run_totals()
+            success, failed = totals["success"], totals["failed"]
+            in_bytes, out_bytes, out_objects = totals["in_bytes"], totals["out_bytes"], totals["success"]
+            engine_stderr = window.log_tail()
+        # The per-cycle loop, the default; a long-lived run skips it whole.
+        while window is None:
             # WHERE THE CYCLE BEGAN (#478, review). The engine's committed-byte
             # total moves in one step when this call returns, so the contended
             # window can only be charged with a cycle whose WHOLE interval it
@@ -783,6 +824,13 @@ def _measure(args, sc, mode, shape, contention_spec, emulator_validation_mbps, r
     # competitor, whose duration is the one it has always had.
     duration_s = round(end - start - harness_close_seconds, 3)
     in_mb = in_bytes / 1e6
+    # WHAT THE RATES DIVIDE BY. A long-lived run's counts are the counters'
+    # increase inside the window, so they are divided by that window
+    # (engine_window_seconds, launch to last sample) — the wall clock also
+    # holds the seeding, the engine's stop grace and the recovery pass, none
+    # of which the counts cover (review). The per-cycle loop keeps the clock
+    # above; a matrix never puts the two side by side (refuse_mixed_engine_modes).
+    rate_s = window.window_seconds if window is not None else duration_s
     # The wire the run used and its tuning (#479, #480), recorded together so a
     # number is read with both. Only s3_native routes through the seam; the
     # effective transport follows the engine's precedence (VTOP_S3_TRANSPORT
@@ -813,8 +861,8 @@ def _measure(args, sc, mode, shape, contention_spec, emulator_validation_mbps, r
         "recovery_ms": recovery_ms,
         "final_backlog_bytes": max(0, seeded_bytes - in_bytes),
         "total_seeded_bytes": seeded_bytes,
-        "throughput_files_per_sec": round(success / duration_s, 3) if duration_s else 0,
-        "throughput_mb_per_sec": round(in_mb / duration_s, 3) if duration_s else 0,
+        "throughput_files_per_sec": round(success / rate_s, 3) if rate_s else 0,
+        "throughput_mb_per_sec": round(in_mb / rate_s, 3) if rate_s else 0,
         "avg_latency_ms": round(sum(batch_total_ms) / len(batch_total_ms), 3) if batch_total_ms else 0,
         "avg_batch_duration_ms": round(sum(batch_total_ms) / len(batch_total_ms), 3) if batch_total_ms else 0,
         "p50_latency_ms": percentile(batch_total_ms, 50),
@@ -884,6 +932,11 @@ def _measure(args, sc, mode, shape, contention_spec, emulator_validation_mbps, r
         # endpoint did not match it.
         "h3_proxy": engine.H3_PROXY_SERVICE if sc.get("h3_proxy") else "",
     }
+    # The long-lived engine's flat counters (#510), and blanks for the columns
+    # only per-cycle outcomes can fill. Absent on a per-cycle run, whose
+    # summary keeps exactly the keys it always had.
+    if window is not None:
+        summary.update(window.summary_columns())
     # CPU/mem summary from the system-metrics samples written during the run.
     # Bounded to the engine's own window on a contended run, so the resource
     # metrics correspond to duration_seconds and stay comparable with an
@@ -1077,3 +1130,9 @@ if __name__ == "__main__":
         # and a non-zero exit — not a traceback for a stack that is not up.
         print(f"[bench] {exc}", file=sys.stderr)
         raise SystemExit(2) from None
+    except engine_run.EngineWindowError as exc:
+        # A long-lived window that measured less than the whole window (#510):
+        # refused with the reason, never filed as a shorter run. The engine is
+        # already stopped; its output is in the run's engine-run.log.
+        print(f"[bench] REFUSED: {exc}", file=sys.stderr)
+        raise SystemExit(5) from None
