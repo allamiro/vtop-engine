@@ -382,11 +382,13 @@ mod tests {
     /// replaced by a line that starts `command` in the background and records
     /// its pid in the fixture's directory, so `kill_descendants` can end it
     /// once the test has its results. Without that the descendant outlives
-    /// the test by up to its whole sleep.
+    /// the test by up to its whole sleep. The pid file is named from the
+    /// script's own path (`${0%/*}`, the tool is run by absolute path), so the
+    /// directory never has to be quoted into the script: any path
+    /// `VTOP_TEST_EXEC_TMPDIR` can name, apostrophes included, works.
     fn script_with_descendant(body: &str, command: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = executable_tempdir();
-        let pids = dir.path().join("descendants");
-        let background = format!("{command} &\necho $! >> '{}'", pids.display());
+        let background = format!("{command} &\necho $! >> \"${{0%/*}}/descendants\"");
         let path = dir.path().join("tool");
         write_executable_script(&path, &body.replace("{bg}", &background)).unwrap();
         (dir, path)
