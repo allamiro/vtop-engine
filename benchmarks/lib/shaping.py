@@ -132,9 +132,26 @@ TOXIPROXY_ONLY_KEYS = ("shaping_api_url", "shaping_proxy", "shaping_bandwidth_kb
 NETEM_ONLY_DEFAULTS = {key: _SCENARIO_DEFAULTS[key] for key in NETEM_ONLY_KEYS}
 TOXIPROXY_ONLY_DEFAULTS = {key: _SCENARIO_DEFAULTS[key] for key in TOXIPROXY_ONLY_KEYS}
 
+# The competing-flow key (#478), and its default read the same way. Its name
+# lives here rather than in lib/competitor.py because the rule it needs is this
+# module's — which driver may a scenario ask this of — and because that module
+# imports this one, so the name must exist before it does. Everything the key
+# MEANS is in lib/competitor.py.
+#
+# It is deliberately NOT in NETEM_ONLY_KEYS: the generic refusal above says
+# "the run would record a shape it never applied", and this key's problem is
+# larger than a shape. A competitor under toxiproxy would run, and produce a
+# number, and the number would be meaningless — which needs its own sentence.
+COMPETITOR_KEY = "shaping_competitor"
+# Its default is empty today, so an emptiness test would happen to agree —
+# which is exactly why it is asked the same way as the rest. The trap the
+# comment above describes is in the habit, not in the value.
+COMPETITOR_DEFAULTS = {COMPETITOR_KEY: _SCENARIO_DEFAULTS[COMPETITOR_KEY]}
+
 # One lookup for both directions, so the "did the author choose this" rule is
 # written once and cannot answer differently depending on which way it is asked.
-_DRIVER_ONLY_DEFAULTS = {**NETEM_ONLY_DEFAULTS, **TOXIPROXY_ONLY_DEFAULTS}
+_DRIVER_ONLY_DEFAULTS = {**NETEM_ONLY_DEFAULTS, **TOXIPROXY_ONLY_DEFAULTS,
+                         **COMPETITOR_DEFAULTS}
 
 
 def _left_at_default(key: str, value: Any) -> bool:
@@ -159,6 +176,17 @@ def _set_but_unread(scenario, keys: tuple[str, ...]) -> list[str]:
     """
     return [key for key in keys
             if not _left_at_default(key, scenario.get(key, _DRIVER_ONLY_DEFAULTS[key]))]
+
+
+def competitor_requested(scenario) -> bool:
+    """Whether this scenario asked for a competing flow (#478).
+
+    Asked through the same "differs from the schema default" rule as every
+    other driver-conditional key, so the two cannot answer differently — and so
+    that the day `shaping_competitor` acquires a non-empty default, nothing
+    here starts reading the loader's value as the author's.
+    """
+    return bool(_set_but_unread(scenario, (COMPETITOR_KEY,)))
 
 
 @dataclass(frozen=True)
@@ -543,9 +571,27 @@ def shape_from_scenario(scenario):
                 "(and shaping_buffer_bdp), or remove the keys")
         from . import netem
         return netem.NetemShape.from_scenario(scenario)
-    # toxiproxy, the default. A netem-only knob set here would be recorded in
-    # the summary and applied by nothing, so it is refused by name rather than
-    # ignored — the scenario meant to shape something.
+    # toxiproxy, the default — and the one combination that would produce a
+    # number rather than a hole (#478). A competing flow through a
+    # TCP-terminating proxy is not a competing flow: toxiproxy reads bytes out
+    # of one connection and writes them into another, and its bandwidth toxic
+    # meters EACH connection on its own, so the two flows never queue behind
+    # one another and never take each other's bandwidth. The fairness index
+    # would come out near 1.0 on a link where VTOP could be taking everything.
+    # Refused by name, and before the generic driver-only refusal below, whose
+    # sentence ("a shape it never applied") is not this key's problem.
+    if competitor_requested(scenario):
+        raise ShapingError(
+            f"{COMPETITOR_KEY} needs the netem middlebox, and shaping_driver is "
+            f"{driver!r}: a per-connection bandwidth toxic gives the two flows no shared "
+            "queue — each is metered on its own inside the proxy — so neither can take "
+            "the other's bandwidth and the fairness number would be meaningless rather "
+            "than merely wrong. An unshaped run has no bottleneck to share at all. Set "
+            "shaping_driver: netem with a shaping_bottleneck_kbps, or remove "
+            f"{COMPETITOR_KEY}")
+    # A netem-only knob set here would be recorded in the summary and applied
+    # by nothing, so it is refused by name rather than ignored — the scenario
+    # meant to shape something.
     set_but_unread = _set_but_unread(scenario, NETEM_ONLY_KEYS)
     if set_but_unread:
         raise ValueError(

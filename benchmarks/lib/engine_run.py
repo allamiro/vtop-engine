@@ -97,10 +97,12 @@ READY_TIMEOUT_SECONDS = 30.0
 READY_POLL_SECONDS = 0.02
 
 # How long the graceful stop gets before SIGKILL. `vtopctl run` treats ctrl-c
-# as a graceful stop — it force-flushes its buffered batches and exits — but
-# only a signal that arrives while its loop is parked in `select!` is seen: the
-# ctrl_c future is created inside each iteration, so a SIGINT delivered during
-# a busy cycle is lost. Measured against the v0.6.0 release binary under a
+# as a graceful stop — it force-flushes its buffered batches and exits. Since
+# #532 (#526) it keeps a SIGINT that arrives mid-cycle and honours it between
+# cycles, so one signal is enough. Older binaries — the v0.6.0 release among
+# them — saw only a signal that arrived while the loop was parked in
+# `select!` (the ctrl_c future was created inside each iteration), so a
+# SIGINT delivered during a busy cycle was lost. Measured against v0.6.0 under a
 # concurrent seeder: no exit 15 s after one SIGINT, nor after 75 SIGINTs 0.2 s
 # apart, nor 24 s after the load stopped. So SIGINT is re-sent through the
 # grace (an engine that goes idle catches one), the grace is short, and HOW the

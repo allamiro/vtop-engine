@@ -816,6 +816,42 @@ def test_an_engine_that_exits_before_the_window_closes_refuses_the_run(
     assert not os.path.exists(tmp_path / engine_run.ENGINE_METRICS_CSV)
 
 
+def test_a_long_lived_run_with_a_competitor_is_refused_before_it_costs_anything(
+        tmp_path, monkeypatch, capsys):
+    # The competitor (#478) charges VTOP's share of its contended window from
+    # per-cycle progress; a long-lived engine has no cycles, so the bracket
+    # would hold no whole cycle. Every other check on the competitor passes
+    # here (they are stubbed through), so only the combination can refuse it.
+    import contextlib
+
+    _stub_run_benchmark(monkeypatch, lambda *a, **k: (0, [], ""))
+    # Stands in for a valid netem shape, which a competitor requires.
+    monkeypatch.setattr(run_benchmark.shaping, "shape_from_scenario", lambda sc: None)
+    monkeypatch.setattr(run_benchmark.competitor.CompetitorSpec, "from_scenario",
+                        classmethod(lambda cls, sc, shape: object()))
+
+    @contextlib.contextmanager
+    def contended(_spec, vtop_bytes):
+        raise AssertionError("no competitor may start beside a long-lived engine")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(run_benchmark.competitor, "contended", contended)
+
+    def _window(*a, **k):
+        raise AssertionError("no long-lived window may open beside a competitor")
+
+    monkeypatch.setattr(run_benchmark.engine_run, "measure_window", _window)
+    scenario = tmp_path / "both.yaml"
+    scenario.write_text("name: both\nbackend: mock\nvolume: 4\nduration_seconds: 1\n"
+                        "engine_mode: run\nshaping_competitor: \"bulk:60\"\n"
+                        "sys_sample_interval: 0.1\n", encoding="utf-8")
+    results = tmp_path / "results"
+    monkeypatch.setattr(sys, "argv", ["run_benchmark.py", str(scenario), "--results-dir", str(results)])
+    assert run_benchmark.main() == 2
+    assert "engine_mode: run cannot be combined with shaping_competitor" in capsys.readouterr().err
+    assert not os.listdir(results), "refused before a results directory, a seed or a probe exists"
+
+
 def test_a_refused_long_lived_run_raises_the_refusal_through_the_runner(tmp_path, monkeypatch):
     def _refuse(*a, **k):
         raise engine_run.ScrapeStopped("scraping stopped")
