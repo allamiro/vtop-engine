@@ -150,8 +150,14 @@ def main() -> int:
     # before-it-costs-anything timing as the shape — and BEFORE the calibration
     # probe below, because a typo in a scenario key should not first cost a
     # shape install and a thirteen-second probe. None means no competitor and
-    # no columns.
-    contention_spec = competitor.CompetitorSpec.from_scenario(sc, shape)
+    # blank competitor columns. A malformed key is refused like runner_mode's
+    # (review): its ValueError is a scenario typo, and __main__ only turns
+    # ShapingError into a one-line refusal, so it left as a traceback.
+    try:
+        contention_spec = competitor.CompetitorSpec.from_scenario(sc, shape)
+    except ValueError as bad:
+        print(f"[bench] {bad}", file=sys.stderr)
+        return 2
     emulator_validation_mbps = ""
     if shape is not None:
         # The engine must go THROUGH whatever is shaping it: an endpoint
@@ -658,23 +664,14 @@ def _measure(args, sc, mode, shape, contention_spec, emulator_validation_mbps, r
                   file=sys.stderr)
             return 3
 
-        # failure / replay measurement
-        if failed > 0 or sc.get("fault") in ("verify_fail", "replay"):
-            rstart = iso_now()
-            t0 = time.time()
-            rc, out = engine.replay(binary, config_path, sc)
-            rms = int((time.time() - t0) * 1000)
-            replayed = failed
-            writer.row("replay_metrics.csv", {
-                "run_id": run_id, "batch_id": "*", "failed_state": "failed",
-                "replay_start_time": rstart, "replay_end_time": iso_now(),
-                "replay_duration_ms": rms, "replay_attempt_number": 1,
-                "replay_success": rc == 0, "error_message": "" if rc == 0 else out[:200],
-            })
-
-        # THE BRACKET CLOSES HERE (#478): the engine's last work is done and
+        # THE BRACKET CLOSES HERE (#478): the engine's cycle loop is done and
         # the shape is still installed, which is the only moment the second
-        # solo window can measure the same link the first one did. Closing is
+        # solo window can measure the same link the first one did. BEFORE
+        # replay, not after it (review): `vtopctl replay` uploads too, but its
+        # bytes reach neither out_bytes nor the cycle log, so a window still
+        # open through it put unaccounted VTOP traffic beside the competitor —
+        # and the time replay took hid a loop that ended before the window
+        # did from close()'s overrun check. Closing is
         # the block's own act rather than the context manager's exit, because
         # this block can also stop with a plain `return` — and a solo window
         # measured on the way out of a refusal would spend a minute on it and
@@ -704,6 +701,22 @@ def _measure(args, sc, mode, shape, contention_spec, emulator_validation_mbps, r
             close_started = time.time()
             contention.close()
             harness_close_seconds = time.time() - close_started
+
+        # failure / replay measurement. Still under the shape, so its timing
+        # describes the link the run was configured for; on a contended run it
+        # falls after the engine's window, as the recovery pass below does.
+        if failed > 0 or sc.get("fault") in ("verify_fail", "replay"):
+            rstart = iso_now()
+            t0 = time.time()
+            rc, out = engine.replay(binary, config_path, sc)
+            rms = int((time.time() - t0) * 1000)
+            replayed = failed
+            writer.row("replay_metrics.csv", {
+                "run_id": run_id, "batch_id": "*", "failed_state": "failed",
+                "replay_start_time": rstart, "replay_end_time": iso_now(),
+                "replay_duration_ms": rms, "replay_attempt_number": 1,
+                "replay_success": rc == 0, "error_message": "" if rc == 0 else out[:200],
+            })
 
 
     # --- the ledger, and what it costs to open (#98 hypotheses 2 and 3) -----

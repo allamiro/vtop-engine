@@ -390,7 +390,8 @@ def test_a_competitor_window_the_engine_would_not_outlast_is_refused_before_the_
 
 def test_the_competitor_dials_the_middlebox_from_the_probe_container():
     # The claim the whole measurement rests on: the competitor's packets cross
-    # the SAME ingress hook, the same policer and the same tbf as the upload's.
+    # the SAME ingress hook and the same tbf as the upload's (a policer beside a
+    # competitor is refused).
     # The probe container sits on the engine-facing network, and the hook
     # matches every packet arriving there — narrow that filter to the store's
     # port and the competitor silently stops being shaped while still
@@ -1452,6 +1453,92 @@ def test_the_runner_stamps_a_cycles_end_when_process_once_returns_not_after_its_
         "and each cycle carries what its committed total cannot see: a failed batch, a call "
         "that exited nonzero, then a clean commit — the handle refuses a share built on "
         "either of the first two")
+
+
+def test_the_bracket_closes_before_replay_so_replay_uploads_never_land_in_the_window(
+        tmp_path, monkeypatch):
+    # THE FINDING (review). close() ran after replay, so a run with a failed
+    # batch kept the contended window open through `vtopctl replay` — uploads
+    # that reach neither out_bytes nor the cycle log, beside a competitor whose
+    # window was labelled with VTOP's share. And the overrun check in close()
+    # was judged against a block the replay had stretched: a loop that ended
+    # before the window did was not refused if replay filled the rest.
+    import contextlib
+
+    import run_benchmark
+
+    order = []
+
+    class Bracket(RecordingContention):
+        def close(self):
+            order.append("close")
+
+        def describe(self):
+            return {}
+
+        def flat_columns(self):
+            return competitor.blank_columns()
+
+    failed = {"batch_id": "b1", "committed": False, "final_state": "failed", "metrics": None}
+
+    def replay(*_a, **_k):
+        order.append("replay")
+        return 0, ""
+
+    @contextlib.contextmanager
+    def contended(_spec, vtop_bytes):
+        yield Bracket()
+
+    monkeypatch.setattr(run_benchmark.competitor.CompetitorSpec, "from_scenario",
+                        classmethod(lambda cls, sc, shape: object()))
+    monkeypatch.setattr(run_benchmark.competitor, "contended", contended)
+    monkeypatch.setattr(run_benchmark.engine, "vtopctl_path", lambda *a, **k: "true")
+    monkeypatch.setattr(run_benchmark.engine, "write_engine_config", lambda *a, **k: None)
+    monkeypatch.setattr(run_benchmark.engine, "effective_endpoint", lambda *a, **k: "")
+    monkeypatch.setattr(run_benchmark.engine, "process_once",
+                        lambda *a, **k: (0, [failed], "verify failed"))
+    monkeypatch.setattr(run_benchmark.engine, "replay", replay)
+    monkeypatch.setattr(run_benchmark.seed, "generate_dataset",
+                        lambda *a, **k: {"files": 1, "bytes": 1024})
+    scenario = tmp_path / "contended.yaml"
+    scenario.write_text(
+        "name: contended-replay\nbackend: s3_native\nendpoint_url: http://localhost:9000\n"
+        "volume: 1\nsys_sample_interval: 0.1\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["run_benchmark.py", str(scenario),
+                                      "--results-dir", str(tmp_path / "results")])
+    run_benchmark.main()
+
+    assert order == ["close", "replay"], (
+        f"the bracket and replay ran as {order}: replay's uploads crossed the bottleneck "
+        "inside the contended window without reaching VTOP's share, and its time hid an "
+        "engine loop that ended before the window did")
+
+
+def test_a_malformed_competitor_is_refused_with_exit_2_not_a_traceback(
+        tmp_path, monkeypatch, capsys):
+    # THE FINDING (review). Every other scenario check before the run —
+    # runner_mode, the h3 proxy — prints its reason and returns 2. The
+    # competitor's own parse raised ValueError straight out of main(), which
+    # __main__ does not catch (it catches ShapingError), so a typo in
+    # shaping_competitor printed a traceback instead of the sentence that says
+    # what `<mode>:<seconds>` means.
+    import run_benchmark
+
+    scenario = tmp_path / "typo.yaml"
+    scenario.write_text(
+        "name: competitor-typo\nbackend: s3_native\nendpoint_url: http://localhost:9000\n"
+        "volume: 1\nduration_seconds: 120\nshaping_driver: netem\nshaping_latency_ms: 100\n"
+        "shaping_bottleneck_kbps: 10000\nshaping_buffer_bdp: 1.0\n"
+        "shaping_competitor: bulk60\n", encoding="utf-8")
+    results = tmp_path / "results"
+    monkeypatch.setattr(sys, "argv", ["run_benchmark.py", str(scenario),
+                                      "--results-dir", str(results)])
+
+    assert run_benchmark.main() == 2
+    err = capsys.readouterr().err
+    assert "is not <mode>:<seconds>" in err, (
+        f"the refusal must name what the key should look like; stderr was {err!r}")
+    assert os.listdir(results) == [], "refused before a run directory exists"
 
 
 def test_the_cumulative_counters_are_rebased_at_the_engine_boundary():
