@@ -2699,7 +2699,10 @@ impl Engine {
         // returned `Err`, or a batch that ended FAILED (which `run_source`
         // reports as `Ok` with that outcome), left data unarchived, and
         // exiting 0 would tell a supervisor otherwise. The first such failure
-        // is returned once every type has been tried.
+        // is returned once every type has been tried. A source that cannot be
+        // READ is deliberately not one: `run_cycle` logs it and still flushes
+        // what is buffered, and the unread data never left the source, so the
+        // next start reads it like data that arrives after the flush.
         let flush = async {
             let mut first_failure: Option<String> = None;
             for st in &types {
@@ -5106,6 +5109,106 @@ mod tests {
             text.contains("shutdown flush incomplete") && text.contains("discovery unavailable"),
             "the error must say the flush did not complete and why, got: {text}"
         );
+    }
+
+    /// Delegates to the real adapter except that every read fails once
+    /// `failing` is set, so a pass reads nothing but still flushes what is
+    /// already buffered.
+    struct ReadsFail {
+        inner: Box<dyn SourceAdapter>,
+        failing: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl SourceAdapter for ReadsFail {
+        async fn discover_sources(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
+            self.inner.discover_sources().await
+        }
+        async fn read_batch_candidates(
+            &mut self,
+            source: &DiscoveredSource,
+            max_records: usize,
+            max_bytes: usize,
+            max_wait: Duration,
+        ) -> Result<Vec<ReadResult>, VtopError> {
+            if self.failing.load(Ordering::SeqCst) {
+                return Err(VtopError::Source("test: source unreadable".into()));
+            }
+            self.inner
+                .read_batch_candidates(source, max_records, max_bytes, max_wait)
+                .await
+        }
+        async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            self.inner.commit_progress(marker).await
+        }
+        async fn replay_from_marker(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            self.inner.replay_from_marker(marker).await
+        }
+        fn source_type(&self) -> SourceType {
+            self.inner.source_type()
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self.inner.as_any_mut()
+        }
+    }
+
+    /// The flush's promise is the data the engine already holds: every
+    /// buffered window is sealed, verified and committed. A source that
+    /// cannot be READ during the flush pass breaks no part of that. Its
+    /// unread data was never taken from the source and its progress is not
+    /// committed, so the next start reads it, exactly like data that arrives
+    /// after the flush; the read error is logged by `run_cycle`. Exiting 1
+    /// for it would turn a file rotated away between discovery and read into
+    /// a failed shutdown. (#532 review: a read error is not an incomplete
+    /// flush, while a failed batch or an `Err` pass is.)
+    #[tokio::test]
+    async fn a_read_error_in_the_shutdown_flush_still_flushes_the_buffer_and_exits_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, mut arrivals, permits) =
+            gated_engine(dir.path(), &["buffered before the source broke"], 60_000).await;
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inner = engine.adapters.remove(&SourceType::File).unwrap();
+        engine.adapters.insert(
+            SourceType::File,
+            Box::new(ReadsFail {
+                inner,
+                failing: failing.clone(),
+            }),
+        );
+        let (stop, requests) = tokio::sync::mpsc::unbounded_channel();
+
+        let driver = async {
+            // First pass reads the line into a buffer that no threshold seals.
+            arrivals.recv().await.expect("the first cycle starts");
+            stop.send("test-stop").unwrap();
+            permits.add_permits(1);
+            // The flush pass: its read fails, the buffer must still flush.
+            arrivals.recv().await.expect("the shutdown flush starts");
+            failing.store(true, Ordering::SeqCst);
+            permits.add_permits(1);
+            std::future::pending::<()>().await
+        };
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::select! {
+                result = engine.run_until(ChannelShutdown(requests)) => result,
+                () = driver => unreachable!("the driver never finishes"),
+            }
+        })
+        .await
+        .expect("the run must end after the flush");
+
+        assert!(
+            result.is_ok(),
+            "an unreadable source left nothing buffered unarchived: {result:?}"
+        );
+        let batches = engine.store.list_batches().await.unwrap();
+        assert_eq!(
+            batches.len(),
+            1,
+            "the buffered window must be sealed despite the failed read"
+        );
+        assert_eq!(batches[0].state, BatchState::SourceCommitted);
+        assert_eq!(batches[0].record_count, Some(1));
     }
 
     /// REGRESSION (#532 review): with ledger retention on, a stop that
