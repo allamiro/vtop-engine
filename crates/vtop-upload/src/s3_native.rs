@@ -3159,10 +3159,25 @@ mod egress_ceiling {
                     .into_bytes()
                     .to_vec();
                 me.seen.lock().unwrap().push((headers, body));
-                let throttle = me
-                    .fail_first
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok();
+                // Spend one of the throttled answers if any is left. A
+                // compare-exchange loop because `fetch_update` is deprecated on
+                // current stable and its replacement is newer than the MSRV
+                // (the same reasoning as `MockUploadBackend::take_throttle`).
+                let mut left = me.fail_first.load(Ordering::SeqCst);
+                let throttle = loop {
+                    if left == 0 {
+                        break false;
+                    }
+                    match me.fail_first.compare_exchange_weak(
+                        left,
+                        left - 1,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break true,
+                        Err(observed) => left = observed,
+                    }
+                };
                 let status = if throttle { 503 } else { 200 };
                 let mut response =
                     HttpResponse::new(StatusCode::try_from(status).unwrap(), SdkBody::empty());
