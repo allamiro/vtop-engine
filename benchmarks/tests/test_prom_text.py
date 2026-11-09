@@ -82,7 +82,25 @@ def test_escaped_label_values_and_special_values_and_timestamps_are_read():
     "# TYPE vtop_x_total countr\n",                # unknown type
     "vtop_x_total 1\nvtop_x_total 2\n",            # one series twice
     "{tenant=\"a\"} 1\n",                          # no metric name
+    "vtop_x_total.5 3\n",                          # name runs into a value: not m=0.5 @3
+    "vtop_x_total-1\n",                            # name runs into a value: not m=-1
 ])
 def test_a_body_this_parser_cannot_read_raises_rather_than_skipping_the_line(body):
     with pytest.raises(prom_text.PromParseError):
         prom_text.parse(body)
+
+
+@pytest.mark.parametrize("separator", [" ", " ", "\x85", "\x0b", "\x0c", "\x1c", "\r"])
+def test_only_a_newline_ends_a_line_so_a_label_value_may_hold_any_other_separator(separator):
+    # The text format ends a line at \n and nothing else, and a label value is
+    # any UTF-8 with only backslash, double quote and \n escaped. Splitting on
+    # what str.splitlines() treats as a break cuts a valid sample in two, and a
+    # parse error inside the window refuses a healthy run.
+    expo = prom_text.parse(f'# TYPE m counter\nm{{path="a{separator}b"}} 7\n')
+    (series,) = expo.series.values()
+    assert dict(series.labels)["path"] == f"a{separator}b" and series.value == 7
+
+
+def test_a_crlf_body_still_parses():
+    expo = prom_text.parse("# TYPE m counter\r\nm 7\r\n")
+    assert expo.series["m"].value == 7 and expo.types["m"] == "counter"

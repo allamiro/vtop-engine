@@ -195,7 +195,10 @@ def parse(text: str) -> Exposition:
     and on a series that appears twice — two values for one series in one
     scrape is not a reading, it is an ambiguity."""
     out = Exposition()
-    for lineno, raw in enumerate(text.splitlines(), start=1):
+    # Split on \n ONLY: the format ends a line there and nowhere else, and a
+    # label value may hold any other character str.splitlines() would break on
+    # (U+2028, \x85, \x0b, ...). A CRLF body's \r goes with the strip() below.
+    for lineno, raw in enumerate(text.split("\n"), start=1):
         line = raw.strip()
         if not line:
             continue
@@ -218,6 +221,10 @@ def parse(text: str) -> Exposition:
         while i < len(line) and _is_name_char(line[i]):
             i += 1
         name = line[:i]
+        # The name ends at `{` or whitespace. Anything else is a malformed
+        # line, not a shorter name: `m.5 3` would otherwise read as m=0.5.
+        if i < len(line) and line[i] != "{" and line[i] not in " \t":
+            raise PromParseError(f"line {lineno}: unexpected {line[i]!r} after metric name {name!r}: {raw!r}")
         labels: tuple[tuple[str, str], ...] = ()
         if i < len(line) and line[i] == "{":
             labels, i = _parse_labels(line, i, lineno, raw)

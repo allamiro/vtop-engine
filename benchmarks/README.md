@@ -77,6 +77,11 @@ docker compose -f benchmarks/docker-compose.benchmark.yml --profile containerize
 python3 benchmarks/run_benchmark.py my-containerized-scenario.yaml   # runner_mode: container
 ```
 
+The service publishes the long-lived engine's metrics port (#510) on
+`127.0.0.1:9464` whatever mode a scenario runs, so `up` fails if something on
+the host already holds that port. Set `VTOP_BENCH_METRICS_PORT` (in the shell
+or `benchmarks/.env`) to a free one; the runner reads the same variable.
+
 Build the binary **before** `compose up`: the `vtop-engine` service
 bind-mounts `target/release/vtopctl` read-only, and the mount is declared
 with `create_host_path: false` so Compose refuses to start (rather than
@@ -157,7 +162,11 @@ Every scenario runs the engine one of two ways:
 `process-once` stays the default for the reason `host` and `toxiproxy` do:
 every recorded scenario keeps the engine it was measured on, or its historical
 numbers stop being comparable to its future ones. A scenario that names no
-mode writes byte-for-byte the files and columns it always has.
+mode writes the files it always has, with byte-identical CSV headers and no
+`engine_*` summary key. The one difference is the echoed scenario: like every
+other scenario key, `engine_mode` and `engine_scrape_interval_seconds` are in
+the loader's defaults, so `summary.json`'s `scenario` block now lists them at
+`process-once` and `1.0`.
 
 **When to prefer `run`.** Whenever the question is about state that a fresh
 process resets: a rate cap (#481, which is verified against the engine's own
@@ -193,7 +202,11 @@ recorded numbers and for per-batch latency percentiles.
   commits then count as archived.
 - **`duration_seconds` in the summary is still the run's wall clock**
   (seeding, the window, the stop and the recovery pass), exactly as in the
-  per-cycle mode; the window itself is `engine_window_seconds`.
+  per-cycle mode; the window itself is `engine_window_seconds`. The
+  `throughput_*` columns divide by the **window**, because their counts are
+  the counters' increase inside it — over the wall clock, a 10 s stop grace
+  alone would cut a one-minute window's rate by a seventh. (The per-cycle
+  mode keeps dividing by its wall clock; a matrix never mixes the two.)
 - **The window runs from the engine's launch.** The input is seeded before
   launch, and a small run can commit all of it before the endpoint first
   answers, so the counters are read against zero at launch — true of the fresh
@@ -782,7 +795,7 @@ automatically picks it up.
 | Runtime duration | ✅ any (`duration_seconds`) | 5 min / 30 min / 1 h presets easy to add |
 | Sustained backpressure | ✅ `seed_concurrently` + `backlog_multiplier` | a real deficit, not just sustained load — scenario `11-backpressure-soak` (#98) |
 | Bandwidth-shaped upload | ✅ toxiproxy on the `shaped` profile, `shaping_*` keys | the upload link as the bottleneck — scenario `13-backpressure-soak-shaped` (#403) |
-| Engine's own metrics | ✅ `engine_mode: run` | one long-lived `vtopctl run` per window, `/metrics` scraped per second into `engine_metrics.csv` (#510) |
+| Engine's own metrics | ⚠️ `engine_mode: run` (implemented; no bundled scenario yet) | one long-lived `vtopctl run` per window, `/metrics` scraped per second into `engine_metrics.csv` (#510). Not bundled on purpose: `run_matrix.py --all` refuses a matrix that mixes engine modes, so one run-mode file among the per-cycle ones would stop `--all`; #481 adds the first |
 | Proxy hop in front of the store | ✅ nginx on the `h3` profile, `h3_proxy: true` | the topology control a transport comparison needs, and the lab's only HTTP/3 counterparty — scenario `17-proxy-hop-tcp-baseline` (#484) |
 
 ## Native segment write amp / proof overhead (#189)

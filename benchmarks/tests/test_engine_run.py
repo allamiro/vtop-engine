@@ -287,6 +287,14 @@ def test_a_long_lived_run_without_a_window_is_refused():
         engine_run.engine_mode(_scenario(engine_mode="run", duration_seconds=0))
 
 
+@pytest.mark.parametrize("duration", [float("nan"), float("inf"), "nan", "inf"])
+def test_a_long_lived_run_with_a_window_that_is_not_a_finite_number_is_refused(duration):
+    # Refused here, before anything is seeded or launched — not as a crash in
+    # the tick arithmetic after the engine has started.
+    with pytest.raises(ValueError, match="duration_seconds"):
+        engine_run.engine_mode(_scenario(engine_mode="run", duration_seconds=duration))
+
+
 @pytest.mark.parametrize("interval", [0, -1, 1.5, 5, True, "fast"])
 def test_a_scrape_interval_that_cannot_give_per_second_buckets_is_refused(interval):
     with pytest.raises(ValueError, match="engine_scrape_interval_seconds"):
@@ -353,7 +361,7 @@ def _committed_once():
 
 
 @pytest.mark.parametrize("mode_line", ["", "engine_mode: process-once\n"])
-def test_a_scenario_naming_no_engine_mode_writes_todays_results_byte_for_byte(
+def test_a_scenario_naming_no_engine_mode_writes_todays_files_and_byte_identical_headers(
         tmp_path, monkeypatch, mode_line):
     once, calls = _committed_once()
     _stub_run_benchmark(monkeypatch, once)
@@ -687,7 +695,7 @@ def test_an_engine_that_exits_before_the_window_closes_refuses_the_run(
     assert not os.path.exists(tmp_path / engine_run.ENGINE_METRICS_CSV)
 
 
-def test_a_refused_long_lived_run_exits_nonzero_through_the_runner(tmp_path, monkeypatch):
+def test_a_refused_long_lived_run_raises_the_refusal_through_the_runner(tmp_path, monkeypatch):
     def _refuse(*a, **k):
         raise engine_run.ScrapeStopped("scraping stopped")
 
@@ -770,6 +778,97 @@ def test_concurrent_seeding_stops_at_the_window_boundary_not_after_the_engine_st
         f"the seeder wrote {len(seeded_while_stopping)} round(s) after the window closed, while the "
         "engine was being stopped; that input is in total_seeded_bytes and its commits are not in "
         "the window, so the reported backlog is artificial")
+
+
+def test_a_long_lived_runs_throughput_is_its_window_counts_over_the_window_not_the_wall_clock(
+        tmp_path, monkeypatch, stub_factory):
+    # The counts are the counters' increase inside the window; dividing them by
+    # the run's wall clock — seeding, the stop grace (often all of it, #526),
+    # the recovery pass — understates the rate by however long those took.
+    stub = stub_factory()
+
+    class SlowStop(FakeProcess):
+        def stop(self, grace):
+            time.sleep(0.6)
+            return super().stop(grace)
+
+    _stub_run_benchmark(monkeypatch, lambda *a, **k: (0, [], ""))
+    monkeypatch.setattr(run_benchmark.engine_run, "endpoint_for", lambda mode: stub.endpoint)
+    monkeypatch.setattr(run_benchmark.engine_run, "launcher",
+                        lambda *a, **k: SlowStop(on_start=stub.arm))
+    scenario = tmp_path / "long.yaml"
+    scenario.write_text("name: rate\nbackend: mock\nvolume: 4\nduration_seconds: 0.3\n"
+                        "engine_mode: run\nengine_scrape_interval_seconds: 0.1\n"
+                        "sys_sample_interval: 0.1\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["run_benchmark.py", str(scenario),
+                                      "--results-dir", str(tmp_path / "results")])
+    assert run_benchmark.main() == 0
+    (run_dir,) = glob.glob(str(tmp_path / "results" / "*"))
+    with open(os.path.join(run_dir, "summary.json"), encoding="utf-8") as fh:
+        summary = json.load(fh)
+    window = summary["engine_window_seconds"]
+    assert summary["duration_seconds"] >= window + 0.6, "the wall clock includes the slow stop"
+    assert summary["throughput_files_per_sec"] == pytest.approx(
+        summary["successful_files"] / window, rel=0.01), (
+        "files per second must divide the window's commits by the window they were counted in")
+    assert summary["throughput_mb_per_sec"] == pytest.approx(
+        summary["total_input_bytes"] / 1e6 / window, rel=0.01, abs=0.001)
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
+def test_the_host_engine_is_stopped_when_the_runner_is_terminated_by_a_signal(
+        tmp_path, fake_engine, signum):
+    # A CI timeout sends SIGTERM; a closed terminal sends SIGHUP. Either one's
+    # default action ends Python without running a `finally`, and the engine,
+    # in its own session, outlives the runner. Driven in a child process:
+    # signalling this test process itself would end the test run.
+    pidfile = str(tmp_path / "engine.pid")
+    results = tmp_path / "results"
+    results.mkdir()
+    child_src = textwrap.dedent(f"""\
+        import sys
+        sys.path.insert(0, {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))!r})
+        from lib import engine_run
+        from lib.scenario import DEFAULTS, Scenario
+        sc = Scenario({{**DEFAULTS, "engine_mode": "run", "duration_seconds": 60,
+                        "backend": "mock"}})
+        endpoint = engine_run.endpoint_for("host")
+        proc = engine_run.launcher({fake_engine!r}, {str(tmp_path / "_engine.yaml")!r}, sc,
+                                   endpoint)
+        engine_run.measure_window({fake_engine!r}, {str(tmp_path / "_engine.yaml")!r}, sc,
+                                  {str(results)!r}, interval=0.1, endpoint=endpoint,
+                                  engine_process=proc)
+        """)
+    env = {**os.environ, "FAKE_ENGINE_PIDFILE": pidfile, "FAKE_ENGINE_MODE": "ok",
+           "TMPDIR": str(tmp_path)}
+    runner = subprocess.Popen([sys.executable, "-c", child_src], env=env)
+    engine_pid = None
+    try:
+        engine_pid = _read_pid(pidfile)
+        partial = results / engine_run.ENGINE_METRICS_PARTIAL_CSV
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if partial.exists() and len(partial.read_text(encoding="utf-8").splitlines()) > 4:
+                break  # the window is open: it has samples
+            time.sleep(0.05)
+        else:
+            raise AssertionError("the window never opened")
+        runner.send_signal(signum)
+        rc = runner.wait(timeout=30)
+        deadline = time.monotonic() + 5
+        while _alive(engine_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _alive(engine_pid), (
+            f"a runner ended by {signal.Signals(signum).name} left its engine running; it keeps "
+            "uploading through the shaped link into the next scenario")
+        assert rc == 128 + signum, (
+            f"the runner exits as the signal asked, after stopping the engine (got {rc})")
+    finally:
+        if runner.poll() is None:
+            runner.kill()
+            runner.wait()
+        if engine_pid is not None and _alive(engine_pid):
+            os.killpg(engine_pid, signal.SIGKILL)
 
 
 # --------------------------------------------------------------------------
@@ -1052,9 +1151,9 @@ def test_a_row_without_an_engine_mode_reads_as_the_per_cycle_run_it_was():
     assert before_510["engine_mode"] == engine_run.PROCESS_ONCE, (
         "a summary written before #510 has no engine_mode, and every such run was one "
         "process-once per cycle")
-    # A per-cycle summary never carries the key either (its results are
-    # byte-identical to before #510) even though today's loader puts the
-    # default in its scenario; and what the run DID beats what it asked for.
+    # A per-cycle summary never carries the key either (#510 adds no column
+    # to its results) even though today's loader puts the default in its
+    # scenario; and what the run DID beats what it asked for.
     per_cycle = run_matrix.matrix_row({"scenario_name": "02", "scenario": {
         "engine_mode": "run", "engine_scrape_interval_seconds": 1.0}})
     assert per_cycle["engine_mode"] == engine_run.PROCESS_ONCE, (

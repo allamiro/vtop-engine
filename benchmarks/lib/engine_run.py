@@ -31,7 +31,8 @@ The run is REFUSED, never reported partially, when:
 * the engine exits before the window closes.
 
 And the engine is stopped on EVERY way out — a clean close, any refusal above,
-a failure anywhere in between and a KeyboardInterrupt — in both runner modes. A
+a failure anywhere in between, a KeyboardInterrupt, and a SIGTERM or SIGHUP to
+the runner — in both runner modes (a SIGKILL to the runner cannot be caught). A
 leaked engine keeps uploading through the shaped link and corrupts whichever
 scenario runs next in a matrix.
 """
@@ -48,6 +49,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -205,9 +207,11 @@ def engine_mode(scenario) -> str:
         duration = float(scenario.get("duration_seconds", 0) or 0)
     except (TypeError, ValueError):
         duration = 0.0
-    if duration <= 0:
+    # NaN compares false to everything, so `<= 0` alone lets it (and inf)
+    # through to the tick arithmetic, after the engine has been launched.
+    if not math.isfinite(duration) or duration <= 0:
         raise ValueError(
-            "engine_mode: run needs duration_seconds > 0: the window IS the "
+            "engine_mode: run needs a finite duration_seconds > 0: the window IS the "
             "measurement, and a long-lived engine has no drain to stop at")
     return raw
 
@@ -359,6 +363,41 @@ def hold_endpoint(endpoint: MetricsEndpoint):
         yield
     finally:
         fh.close()  # releases the flock
+
+
+@contextlib.contextmanager
+def _termination_raises():
+    """For the window, SIGTERM and SIGHUP raise SystemExit(128 + signal).
+
+    Their default action ends the interpreter without running a `finally`,
+    and the engine — in its own session, so the runner's terminal does not
+    reach it — outlives the runner: a CI timeout or a closed terminal leaks
+    an engine that keeps uploading into the next scenario. Raised instead,
+    they unwind like a ctrl-c through the stop below (a second one during the
+    stop escalates to SIGKILL the same way), and the process still exits with
+    the status a signal death conventionally reports.
+
+    Only a signal still at its default is taken over: a runner started under
+    `nohup` keeps ignoring SIGHUP, and a caller's own handler is left alone.
+    Signal handlers can be set only from the main thread; elsewhere this does
+    nothing.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def _raise(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    previous = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(sig) is signal.SIG_DFL:
+            previous[sig] = signal.signal(sig, _raise)
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 class ScrapeFailed(Exception):
@@ -852,7 +891,8 @@ def measure_window(binary: str, config_path: str, scenario, results_dir: str, *,
 
     Raises an EngineWindowError subclass for every refusal in the module
     docstring. The engine is stopped before this returns or raises, whatever
-    happened — including a KeyboardInterrupt, which propagates after the stop.
+    happened — including a KeyboardInterrupt, which propagates after the stop,
+    and a SIGTERM or SIGHUP, which propagates as SystemExit(128 + signal).
     """
     mode = engine.runner_mode(scenario)
     if duration is None:
@@ -867,8 +907,9 @@ def measure_window(binary: str, config_path: str, scenario, results_dir: str, *,
     recorder = None
     stopped_by = ""
     # The address is this window's from before the check below until its
-    # engine is stopped — the check alone races an overlapping run.
-    with hold_endpoint(endpoint):
+    # engine is stopped — the check alone races an overlapping run. A SIGTERM
+    # or SIGHUP to the runner unwinds through the stop like a ctrl-c.
+    with _termination_raises(), hold_endpoint(endpoint):
         # BEFORE LAUNCH, nothing may answer there. A leaked engine from an
         # earlier run holding the address would be scraped in this one's
         # place, and the new engine's own bind failure is only a log line (the

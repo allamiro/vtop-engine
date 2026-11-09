@@ -319,8 +319,8 @@ def matrix_row(summary: dict) -> dict:
     for key in SHAPING_COLUMNS:
         row.setdefault(key, "")
     # The engine mode is the SUMMARY's too (#510), and its absence is an
-    # answer: a per-cycle run writes no engine column at all (its results are
-    # byte-identical to before #510), and neither did any run recorded before
+    # answer: a per-cycle run writes no engine column at all (its files and
+    # CSV headers are unchanged by #510), and neither did any run recorded before
     # it — both were one process-once per cycle. The scenario is not asked:
     # today's loader stamps its default into every scenario, so it would name a
     # mode for a run that never resolved one. The same for the engine columns,

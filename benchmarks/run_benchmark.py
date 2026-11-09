@@ -651,6 +651,14 @@ def main() -> int:
     end = time.time()
     duration_s = round(end - start, 3)
     in_mb = in_bytes / 1e6
+    # WHAT THE RATES DIVIDE BY. A long-lived run's counts are the counters'
+    # increase inside the window, so they are divided by that window
+    # (engine_window_seconds, launch to last sample) — the wall clock also
+    # holds the seeding, the stop grace (often all of it, #526) and the
+    # recovery pass, none of which the counts cover (review). The per-cycle
+    # loop keeps the wall clock it has always used; a matrix never puts the
+    # two side by side (refuse_mixed_engine_modes).
+    rate_s = window.window_seconds if window is not None else duration_s
     # The wire the run used and its tuning (#479, #480), recorded together so a
     # number is read with both. Only s3_native routes through the seam; the
     # effective transport follows the engine's precedence (VTOP_S3_TRANSPORT
@@ -681,8 +689,8 @@ def main() -> int:
         "recovery_ms": recovery_ms,
         "final_backlog_bytes": max(0, seeded_bytes - in_bytes),
         "total_seeded_bytes": seeded_bytes,
-        "throughput_files_per_sec": round(success / duration_s, 3) if duration_s else 0,
-        "throughput_mb_per_sec": round(in_mb / duration_s, 3) if duration_s else 0,
+        "throughput_files_per_sec": round(success / rate_s, 3) if rate_s else 0,
+        "throughput_mb_per_sec": round(in_mb / rate_s, 3) if rate_s else 0,
         "avg_latency_ms": round(sum(batch_total_ms) / len(batch_total_ms), 3) if batch_total_ms else 0,
         "avg_batch_duration_ms": round(sum(batch_total_ms) / len(batch_total_ms), 3) if batch_total_ms else 0,
         "p50_latency_ms": percentile(batch_total_ms, 50),

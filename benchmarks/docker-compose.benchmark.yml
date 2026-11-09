@@ -179,6 +179,12 @@ services:
     # address (unroutable from the host on Docker Desktop and rootless docker).
     # The scrape never crosses the netem middlebox, which shapes the
     # engine-to-store path, not this interface.
+    # Published whenever the container exists — a port is fixed when the
+    # container is created, before any scenario names a mode — so `up` needs
+    # the host port free even for process-once runs. If something on the host
+    # already holds 9464 (a common exporter default), set
+    # VTOP_BENCH_METRICS_PORT in the shell or benchmarks/.env; the runner
+    # reads the same variable to find the endpoint.
     ports:
       - "${VTOP_BIND_ADDR:-127.0.0.1}:${VTOP_BENCH_METRICS_PORT:-9464}:9464"
     volumes:
