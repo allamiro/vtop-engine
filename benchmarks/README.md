@@ -187,7 +187,10 @@ recorded numbers and for per-batch latency percentiles.
   committed nothing is refused like any other run that measured nothing.
   Set the thresholds for the window you give it.
 - **No per-cycle re-seeding.** There are no cycles: the input is seeded once,
-  plus the concurrent seeder if `seed_concurrently: true`.
+  plus the concurrent seeder if `seed_concurrently: true` — which stops when
+  the window closes, before the engine's stop begins, so nothing it writes
+  during the stop grace is counted as seeded while none of the engine's
+  commits then count as archived.
 - **`duration_seconds` in the summary is still the run's wall clock**
   (seeding, the window, the stop and the recovery pass), exactly as in the
   per-cycle mode; the window itself is `engine_window_seconds`.
@@ -245,6 +248,12 @@ no `summary.json` is written):
 
 - the endpoint never answers within 30 s of launch — the message names the
   address it tried;
+- another long-lived run on this host holds the address — containerized runs
+  all share one published port, and two overlapping windows would both scrape
+  whichever engine bound it (the claim is an `flock` on
+  `vtop-bench-metrics-<host>-<port>.lock` in the temp directory, held from
+  before the check below until the engine is stopped, and released by the
+  kernel if the runner dies);
 - something already answers at that address before the engine starts — a
   leaked engine from an earlier run would otherwise be scraped in this one's
   place;

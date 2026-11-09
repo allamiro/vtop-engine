@@ -29,6 +29,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -46,6 +47,13 @@ from lib.scenario import DEFAULTS, Scenario  # noqa: E402
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _temp_files_stay_in_the_test(tmp_path, monkeypatch):
+    # The runner's scratch directories and a window's address claim both live
+    # under tempfile.gettempdir(); keep each test's inside its own tmp_path.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
 
 def _scenario(**overrides) -> Scenario:
@@ -620,6 +628,56 @@ def test_something_already_answering_before_launch_refuses_without_starting_an_e
         "a leaked engine at the address would be scraped in this run's place; refuse before launching")
 
 
+def test_a_second_window_on_an_address_another_window_holds_is_refused_before_it_launches(
+        tmp_path, stub_factory):
+    # Container mode gives every run the same published port. Two overlapping
+    # runs can BOTH pass the pre-launch check — the second checks after the
+    # first launched and before its engine bound — and then only one engine
+    # binds (the other's bind failure is a log line), and both runners scrape
+    # it. The race is reproduced exactly: the second run reaches the address
+    # inside the first one's start, while nothing answers there yet, and its
+    # own engine is the one that binds.
+    stub = stub_factory()
+    second = FakeProcess(on_start=stub.arm)
+    refused: list[BaseException] = []
+    (tmp_path / "first").mkdir()
+    (tmp_path / "second").mkdir()
+
+    def first_starts():
+        try:
+            engine_run.measure_window(
+                "vtopctl", "/second.yaml", _scenario(engine_mode="run"), str(tmp_path / "second"),
+                duration=0.2, interval=0.1, endpoint=stub.endpoint, engine_process=second)
+        except engine_run.EngineWindowError as err:
+            refused.append(err)
+        stub.arm()  # the first run's own engine binds once the second is out of the way
+
+    first = FakeProcess(on_start=first_starts)
+    window = engine_run.measure_window(
+        "vtopctl", "/first.yaml", _scenario(engine_mode="run"), str(tmp_path / "first"),
+        duration=0.2, interval=0.1, endpoint=stub.endpoint, engine_process=first)
+    assert refused and isinstance(refused[0], engine_run.EndpointInUse), (
+        "a second window on an address another window holds would scrape whichever engine bound "
+        f"it and file those counters under its own scenario; it must be refused: {refused}")
+    assert stub.endpoint.url in str(refused[0]), "the refusal names the address in contention"
+    assert not second.started, "the refused run must not launch an engine that would fail to bind"
+    assert window.samples > 1, "the window that holds the address is unaffected"
+    with engine_run.hold_endpoint(stub.endpoint):
+        pass  # released once the first window's engine is stopped
+
+
+def test_a_refused_window_releases_its_address(tmp_path):
+    port = _closed_port()
+    endpoint = engine_run.MetricsEndpoint(bind=f"127.0.0.1:{port}", host="127.0.0.1", port=port)
+    with pytest.raises(engine_run.EndpointNeverAnswered):
+        engine_run.measure_window(
+            "vtopctl", "/c.yaml", _scenario(engine_mode="run"), str(tmp_path),
+            duration=1.0, interval=0.1, endpoint=endpoint, engine_process=FakeProcess(),
+            ready_timeout=0.1)
+    with engine_run.hold_endpoint(endpoint):
+        pass  # a refusal must not leave the address claimed for the next scenario
+
+
 def test_an_engine_that_exits_before_the_window_closes_refuses_the_run(
         tmp_path, monkeypatch, fake_engine):
     sc, endpoint, proc, pidfile = _host_engine(fake_engine, tmp_path, monkeypatch, mode="exit-after:0.5")
@@ -651,6 +709,67 @@ def test_a_refused_long_lived_run_exits_nonzero_through_the_runner(tmp_path, mon
         "a refused window must not leave a summary a matrix would read")
     assert not [t for t in threading.enumerate() if t.name == "seeder"], (
         "the concurrent seeder must be stopped on the refusal path too")
+
+
+def test_the_window_closed_hook_runs_after_the_last_sample_and_before_the_engine_stop(
+        tmp_path, stub_factory):
+    events: list[str] = []
+    stub = stub_factory()
+
+    class Recording(FakeProcess):
+        def stop(self, grace):
+            events.append("stop")
+            return super().stop(grace)
+
+    proc = Recording(on_start=stub.arm)
+    engine_run.measure_window(
+        "vtopctl", "/c.yaml", _scenario(engine_mode="run"), str(tmp_path),
+        duration=0.2, interval=0.1, endpoint=stub.endpoint, engine_process=proc,
+        on_window_closed=lambda: events.append(f"closed after {stub.served} samples"))
+    assert events == [f"closed after {stub.served} samples", "stop"], (
+        "the hook marks the observation boundary: after the last scrape, before the stop grace "
+        f"in which the engine's commits no longer enter the window: {events}")
+
+
+def test_concurrent_seeding_stops_at_the_window_boundary_not_after_the_engine_stop(
+        tmp_path, monkeypatch, stub_factory):
+    # Under load the engine's stop can take the whole grace (STOP_GRACE_SECONDS,
+    # usually ending in SIGKILL — #526). Input seeded then is counted into
+    # total_seeded_bytes, and nothing the engine commits then enters in_bytes,
+    # so the backlog grows by everything the seeder wrote during the stop.
+    stub = stub_factory()
+    stopping = threading.Event()
+    seeded_while_stopping: list[int] = []
+
+    class SlowStop(FakeProcess):
+        def stop(self, grace):
+            stopping.set()
+            time.sleep(0.5)  # ten seed intervals
+            return super().stop(grace)
+
+    def generate(*a, **k):
+        if stopping.is_set():
+            seeded_while_stopping.append(1)
+        return {"files": 1, "bytes": 1024}
+
+    _stub_run_benchmark(monkeypatch, lambda *a, **k: (0, [], ""))
+    monkeypatch.setattr(run_benchmark.seed, "generate_dataset", generate)
+    monkeypatch.setattr(run_benchmark.engine_run, "endpoint_for", lambda mode: stub.endpoint)
+    monkeypatch.setattr(run_benchmark.engine_run, "launcher",
+                        lambda *a, **k: SlowStop(on_start=stub.arm))
+    scenario = tmp_path / "long.yaml"
+    scenario.write_text("name: boundary\nbackend: mock\nvolume: 4\nduration_seconds: 0.3\n"
+                        "engine_mode: run\nengine_scrape_interval_seconds: 0.1\n"
+                        "seed_concurrently: true\nseed_interval_seconds: 0.05\n"
+                        "sys_sample_interval: 0.1\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["run_benchmark.py", str(scenario),
+                                      "--results-dir", str(tmp_path / "results")])
+    assert run_benchmark.main() == 0
+    assert stopping.is_set(), "the engine stop ran"
+    assert not seeded_while_stopping, (
+        f"the seeder wrote {len(seeded_while_stopping)} round(s) after the window closed, while the "
+        "engine was being stopped; that input is in total_seeded_bytes and its commits are not in "
+        "the window, so the reported backlog is artificial")
 
 
 # --------------------------------------------------------------------------

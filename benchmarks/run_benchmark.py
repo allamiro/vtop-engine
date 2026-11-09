@@ -381,11 +381,21 @@ def main() -> int:
         # instead. lib/engine_run.py refuses a partial series, and stops the
         # engine on every way out of the call — the seeder is stopped here on
         # the same ways out, so a refusal does not leave it writing into a seed
-        # directory the cleanup is about to remove.
+        # directory the cleanup is about to remove. On a clean close it is
+        # stopped AT the window's boundary, before the engine's stop grace
+        # (review): seeding through the grace counted post-window input into
+        # total_seeded_bytes and the backlog, with none of its commits in the
+        # window.
         window = None
         if engine_mode == engine_run.LONG_LIVED:
+            def _stop_seeder():
+                stop_seeding.set()
+                if seeder is not None:
+                    seeder.join()
+
             try:
-                window = engine_run.measure_window(binary, config_path, sc, writer.dir)
+                window = engine_run.measure_window(binary, config_path, sc, writer.dir,
+                                                   on_window_closed=_stop_seeder)
             except BaseException:
                 stop_seeding.set()
                 if seeder is not None:

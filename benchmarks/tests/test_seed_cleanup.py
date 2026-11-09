@@ -93,7 +93,7 @@ def _refusing_window_run(tmp_path, monkeypatch, extra_argv=()):
 
     monkeypatch.setattr(run_benchmark.engine, "process_once", _no_cycles)
 
-    def _refuse_after_some_samples(binary, config_path, sc, results_dir):
+    def _refuse_after_some_samples(binary, config_path, sc, results_dir, **kwargs):
         # What a real refusal leaves behind: the samples it did take and the
         # engine's own output, both the only diagnosis of why it was refused.
         for name in (engine_run.ENGINE_METRICS_PARTIAL_CSV, engine_run.ENGINE_LOG):

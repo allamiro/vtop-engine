@@ -21,6 +21,8 @@ The run is REFUSED, never reported partially, when:
 
 * the endpoint never answers before the window would open (the address is
   named — a run whose first samples are connection refusals measured nothing);
+* another window on this host holds the address (two overlapping runs would
+  both scrape whichever engine bound it — see `hold_endpoint`);
 * something already answers at that address before the engine starts (a leaked
   engine from an earlier run would be scraped in place of this one);
 * a scrape fails, or falls behind by more than an interval, inside the window;
@@ -35,7 +37,9 @@ scenario runs next in a matrix.
 """
 from __future__ import annotations
 
+import contextlib
 import csv
+import fcntl
 import http.client
 import math
 import os
@@ -43,6 +47,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -152,6 +157,10 @@ class EndpointNeverAnswered(EngineWindowError):
 
 
 class EndpointAlreadyAnswering(EngineWindowError):
+    pass
+
+
+class EndpointInUse(EngineWindowError):
     pass
 
 
@@ -305,6 +314,51 @@ def endpoint_for(mode: str) -> MetricsEndpoint:
         return MetricsEndpoint(bind=f"0.0.0.0:{CONTAINER_METRICS_PORT}", host=host, port=port)
     port = _free_loopback_port()
     return MetricsEndpoint(bind=f"127.0.0.1:{port}", host="127.0.0.1", port=port)
+
+
+@contextlib.contextmanager
+def hold_endpoint(endpoint: MetricsEndpoint):
+    """Claim the scrape address for one window, from before the pre-launch
+    check until the engine is stopped; refuse if another window holds it.
+
+    The pre-launch check alone is a check-then-act: in container mode every
+    run gets the same published port, so two overlapping runs can both see
+    nothing answering, launch, and then only one engine binds — the other's
+    bind failure is a log line, never fatal (crates/vtop-cli/src/commands.rs)
+    — and both runners scrape the one that did, each filing its counters as
+    its own. The engine's exposition carries nothing per-process that could
+    tell the two apart, so the address itself is made exclusive.
+
+    An flock on a file named for the address, under the temp directory: it
+    is released by the kernel when its holder exits, however it exits, so a
+    crashed runner never leaves a stale claim (a leaked ENGINE is still the
+    pre-launch check's job). Non-blocking on purpose: waiting here would not
+    serialize the runs — the runner calls this inside its shaped, monitored
+    block, so the second run's shaping is already in place — so it is
+    refused before it launches anything.
+    Every runner that scrapes a host's loopback runs on that host, which is
+    the scope this covers.
+    """
+    path = os.path.join(tempfile.gettempdir(),
+                        f"vtop-bench-metrics-{endpoint.host}-{endpoint.port}.lock")
+    fh = open(path, "a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fh.seek(0)
+            holder = fh.read().strip() or "unknown"
+            raise EndpointInUse(
+                f"another benchmark window holds {endpoint.url} (runner pid {holder}, claim "
+                f"{path}); two windows on one address both scrape whichever engine bound it. Run "
+                "long-lived scenarios one at a time per address") from None
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"{os.getpid()}\n")
+        fh.flush()
+        yield
+    finally:
+        fh.close()  # releases the flock
 
 
 class ScrapeFailed(Exception):
@@ -775,6 +829,7 @@ def measure_window(binary: str, config_path: str, scenario, results_dir: str, *,
                    endpoint: MetricsEndpoint | None = None, engine_process=None,
                    ready_timeout: float = READY_TIMEOUT_SECONDS,
                    stop_grace: float = STOP_GRACE_SECONDS,
+                   on_window_closed=None,
                    sleep=time.sleep, clock=time.monotonic) -> EngineWindow:
     """Run one long-lived engine for the window and return its closed series.
 
@@ -791,6 +846,10 @@ def measure_window(binary: str, config_path: str, scenario, results_dir: str, *,
     `vtopctl run` makes at start is inside the window by this definition; the
     runner gives every run a fresh ledger, so there it recovers nothing.
 
+    `on_window_closed` is called once, after the last sample of a window that
+    closed cleanly and before the engine's stop begins: the observation
+    boundary, for whatever load the caller drives beside the engine.
+
     Raises an EngineWindowError subclass for every refusal in the module
     docstring. The engine is stopped before this returns or raises, whatever
     happened — including a KeyboardInterrupt, which propagates after the stop.
@@ -803,39 +862,49 @@ def measure_window(binary: str, config_path: str, scenario, results_dir: str, *,
     if endpoint is None:
         endpoint = endpoint_for(mode)
 
-    # BEFORE LAUNCH, nothing may answer there. A leaked engine from an earlier
-    # run holding the address would be scraped in this one's place, and the new
-    # engine's own bind failure is only a log line (the endpoint is opt-in and
-    # never fatal to the data path).
-    try:
-        scrape(endpoint, timeout=1.0)
-    except ScrapeFailed:
-        pass
-    else:
-        raise EndpointAlreadyAnswering(
-            f"an engine already answers at {endpoint.url} before this run started one — a "
-            "leaked engine from an earlier run? Stop it first; scraping it would file its "
-            "counters under this run")
-
-    proc = engine_process if engine_process is not None else launcher(
-        binary, config_path, scenario, endpoint)
     log_path = os.path.join(results_dir, ENGINE_LOG)
     partial = os.path.join(results_dir, ENGINE_METRICS_PARTIAL_CSV)
     recorder = None
     stopped_by = ""
-    with open(log_path, "w", encoding="utf-8") as log:
+    # The address is this window's from before the check below until its
+    # engine is stopped — the check alone races an overlapping run.
+    with hold_endpoint(endpoint):
+        # BEFORE LAUNCH, nothing may answer there. A leaked engine from an
+        # earlier run holding the address would be scraped in this one's
+        # place, and the new engine's own bind failure is only a log line (the
+        # endpoint is opt-in and never fatal to the data path).
         try:
-            recorder = SeriesRecorder(partial)
-            recorder.origin(_iso_now(), clock())
-            proc.start(log)
-            _observe(proc, endpoint, recorder, duration, interval, ready_timeout,
-                     log_path, sleep, clock)
-        finally:
+            scrape(endpoint, timeout=1.0)
+        except ScrapeFailed:
+            pass
+        else:
+            raise EndpointAlreadyAnswering(
+                f"an engine already answers at {endpoint.url} before this run started one — a "
+                "leaked engine from an earlier run? Stop it first; scraping it would file its "
+                "counters under this run")
+
+        proc = engine_process if engine_process is not None else launcher(
+            binary, config_path, scenario, endpoint)
+        with open(log_path, "w", encoding="utf-8") as log:
             try:
-                if recorder is not None:
-                    recorder.close()
+                recorder = SeriesRecorder(partial)
+                recorder.origin(_iso_now(), clock())
+                proc.start(log)
+                _observe(proc, endpoint, recorder, duration, interval, ready_timeout,
+                         log_path, sleep, clock)
+                # THE WINDOW HAS CLOSED; the stop below can take the whole
+                # grace, and nothing the engine commits during it enters the
+                # window. The caller's load (a concurrent seeder) ends here, or
+                # what it writes during the stop is counted as seeded and
+                # never as archived — a backlog the engine was never behind on.
+                if on_window_closed is not None:
+                    on_window_closed()
             finally:
-                stopped_by = proc.stop(stop_grace)
+                try:
+                    if recorder is not None:
+                        recorder.close()
+                finally:
+                    stopped_by = proc.stop(stop_grace)
     final = os.path.join(results_dir, ENGINE_METRICS_CSV)
     os.replace(partial, final)
     return EngineWindow(
