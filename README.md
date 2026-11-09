@@ -438,7 +438,10 @@ Kubernetes pod termination, `systemctl stop`) are both orderly stops. The
 engine finishes the source pass in progress (it never cuts a batch off
 mid-way, and skips the rest of that cycle), force-flushes every buffered batch
 through upload, verification and source commit, logs
-`shutdown flush complete`, and exits 0. Send the signal once and wait: a
+`shutdown flush complete`, and exits 0. If the flush cannot archive
+everything (a batch fails verification, or a source pass errors), it still
+tries every source type, then logs `shutdown flush incomplete` and exits 1.
+Send the signal once and wait: a
 SECOND signal while that flush runs abandons it and exits 1. That is the way
 out of a flush stuck on an unreachable object store, and it is no worse than
 SIGKILL — source progress is only committed after a batch verifies, so the

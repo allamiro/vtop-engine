@@ -2578,9 +2578,11 @@ impl Engine {
     ///
     /// SIGINT and, on Unix, SIGTERM are both orderly stops: the source pass in
     /// progress finishes, every buffered-but-unsealed batch is force-flushed,
-    /// and `run` returns `Ok` (exit 0). A SECOND signal while that flush runs
-    /// abandons it and returns an error (exit 1); [`Engine::run_until`] says
-    /// why that is safe.
+    /// and `run` returns `Ok` (exit 0). A flush that leaves anything
+    /// unarchived (a source pass that errors, or a batch that ends FAILED)
+    /// returns an error (exit 1) once every source type has been tried. A
+    /// SECOND signal while that flush runs abandons it and returns an error
+    /// (exit 1); [`Engine::run_until`] says why that is safe.
     ///
     /// The listeners are registered HERE, once, before recovery, and live for
     /// the whole run. The shape this replaced created a fresh `ctrl_c()`
@@ -2608,10 +2610,11 @@ impl Engine {
     /// first; and an engine with several adapters (a Kafka poll wait among
     /// them) stops after the pass in progress rather than after all of them.
     /// Skipping the rest of a cycle loses nothing: the shutdown flush runs
-    /// every source type's pass anyway. After the cycle, the backoff
-    /// `select!` is `biased` toward a stop so a productive loop's zero
-    /// backoff cannot outrun it, and an idle engine's sleep is interrupted
-    /// at once.
+    /// every source type's pass anyway. An idle cycle checks once more before
+    /// its ledger-retention prune, which can spend a state-store timeout. After
+    /// the cycle, the backoff `select!` is `biased` toward a stop so a
+    /// productive loop's zero backoff cannot outrun it, and an idle engine's
+    /// sleep is interrupted at once.
     ///
     /// A second request during the shutdown flush abandons the flush and
     /// returns an error. It is the operator's way out when the flush itself
@@ -2665,6 +2668,12 @@ impl Engine {
             } else if self.cycle_had_data {
                 Duration::ZERO
             } else {
+                // Housekeeping can spend a state-store timeout plus digest
+                // I/O; a stop that landed during the last pass must not wait
+                // for it.
+                if let Some(cause) = shutdown.pending_request() {
+                    break 'run cause;
+                }
                 self.maybe_prune_ledger().await;
                 idle
             };
@@ -2685,12 +2694,41 @@ impl Engine {
             "shutdown signal received; flushing and exiting"
         );
         // Force-flush any buffered-but-unsealed data so it is not left for
-        // the next start to re-read.
+        // the next start to re-read. Every source type is attempted even
+        // after one fails, but a failure is not a complete flush: a pass that
+        // returned `Err`, or a batch that ended FAILED (which `run_source`
+        // reports as `Ok` with that outcome), left data unarchived, and
+        // exiting 0 would tell a supervisor otherwise. The first such failure
+        // is returned once every type has been tried.
         let flush = async {
+            let mut first_failure: Option<String> = None;
             for st in &types {
-                if let Err(e) = self.run_source(st.clone(), true).await {
-                    tracing::error!(error = %e, source_type = %st, "shutdown flush error");
+                match self.run_source(st.clone(), true).await {
+                    Ok(outcomes) => {
+                        let failed = outcomes
+                            .iter()
+                            .filter(|o| o.final_state == BatchState::Failed)
+                            .count();
+                        if failed > 0 {
+                            tracing::error!(
+                                source_type = %st,
+                                failed,
+                                "shutdown flush: batch(es) did not verify"
+                            );
+                            first_failure.get_or_insert_with(|| {
+                                format!("{failed} {st} batch(es) did not verify")
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, source_type = %st, "shutdown flush error");
+                        first_failure.get_or_insert_with(|| format!("{st} pass failed: {e}"));
+                    }
                 }
+            }
+            match first_failure {
+                None => Ok(()),
+                Some(cause) => Err(cause),
             }
         };
         tokio::select! {
@@ -2705,9 +2743,19 @@ impl Engine {
                     "shutdown flush abandoned by a second signal ({second})"
                 )))
             }
-            () = flush => {
-                tracing::info!("shutdown flush complete; exiting");
-                Ok(())
+            flushed = flush => match flushed {
+                Ok(()) => {
+                    tracing::info!("shutdown flush complete; exiting");
+                    Ok(())
+                }
+                Err(cause) => {
+                    tracing::error!(
+                        %cause,
+                        "shutdown flush incomplete; exiting with an error \
+                         (unflushed data is recovered or re-read on the next start)"
+                    );
+                    Err(VtopError::Other(format!("shutdown flush incomplete: {cause}")))
+                }
             }
         }
     }
@@ -4938,6 +4986,173 @@ mod tests {
             engine.store.list_batches().await.unwrap().len(),
             1,
             "the one pass must have been the flush, sealing the buffered record"
+        );
+    }
+
+    /// Run `engine` with a stop already pending, granting every pass, and
+    /// return what `run_until` returned. Only the shutdown flush runs.
+    async fn run_straight_to_the_flush(
+        engine: &mut Engine,
+        mut arrivals: tokio::sync::mpsc::UnboundedReceiver<()>,
+        permits: Arc<tokio::sync::Semaphore>,
+    ) -> Result<(), VtopError> {
+        let (stop, requests) = tokio::sync::mpsc::unbounded_channel();
+        stop.send("test-stop").unwrap();
+        let driver = async {
+            while arrivals.recv().await.is_some() {
+                permits.add_permits(1);
+            }
+            std::future::pending::<()>().await
+        };
+        tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::select! {
+                result = engine.run_until(ChannelShutdown(requests)) => result,
+                () = driver => unreachable!("the driver never finishes"),
+            }
+        })
+        .await
+        .expect("a stop pending at start must end the run")
+    }
+
+    /// REGRESSION (#532 review): a batch the shutdown flush could not archive
+    /// (here verification fails, as it would against a store that keeps
+    /// refusing it) ends FAILED and `run_source` returns `Ok` with that
+    /// outcome. The flush ignored outcomes, so it logged `shutdown flush
+    /// complete` and `run` exited 0 with the buffered data unarchived: a
+    /// supervisor read an incomplete shutdown as a clean one.
+    #[tokio::test]
+    async fn a_batch_that_fails_in_the_shutdown_flush_is_not_a_clean_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, arrivals, permits) =
+            gated_engine(dir.path(), &["refused by the store at shutdown"], 60_000).await;
+        engine.backend = Arc::new(vtop_upload::MockBackend::failing());
+
+        let result = run_straight_to_the_flush(&mut engine, arrivals, permits).await;
+
+        let error = result.expect_err(
+            "a flush that left a batch FAILED did not flush the buffered data; \
+             exiting 0 tells a supervisor it did",
+        );
+        assert!(
+            error.to_string().contains("shutdown flush incomplete"),
+            "the error must say the flush did not complete, got: {error}"
+        );
+        let batches = engine.store.list_batches().await.unwrap();
+        assert_eq!(batches.len(), 1, "the flush sealed the buffered record");
+        assert_eq!(
+            batches[0].state,
+            BatchState::Failed,
+            "the batch never verified, so its source progress must not commit"
+        );
+    }
+
+    /// Delegates to the real adapter except that discovery always fails, so
+    /// `run_source` itself returns `Err`.
+    struct DiscoveryFails(Box<dyn SourceAdapter>);
+
+    #[async_trait::async_trait]
+    impl SourceAdapter for DiscoveryFails {
+        async fn discover_sources(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
+            Err(VtopError::Source("test: discovery unavailable".into()))
+        }
+        async fn read_batch_candidates(
+            &mut self,
+            source: &DiscoveredSource,
+            max_records: usize,
+            max_bytes: usize,
+            max_wait: Duration,
+        ) -> Result<Vec<ReadResult>, VtopError> {
+            self.0
+                .read_batch_candidates(source, max_records, max_bytes, max_wait)
+                .await
+        }
+        async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            self.0.commit_progress(marker).await
+        }
+        async fn replay_from_marker(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            self.0.replay_from_marker(marker).await
+        }
+        fn source_type(&self) -> SourceType {
+            self.0.source_type()
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self.0.as_any_mut()
+        }
+    }
+
+    /// REGRESSION (#532 review): a source type whose flush pass returned
+    /// `Err` was only logged, and the flush still reported complete and
+    /// exited 0. The error must be returned, naming its cause.
+    #[tokio::test]
+    async fn a_source_pass_that_errors_in_the_shutdown_flush_is_not_a_clean_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, arrivals, permits) =
+            gated_engine(dir.path(), &["never read at shutdown"], 60_000).await;
+        // Discovery fails before the gate, so no pass ever arrives: the
+        // driver only needs to exist.
+        let inner = engine.adapters.remove(&SourceType::File).unwrap();
+        engine
+            .adapters
+            .insert(SourceType::File, Box::new(DiscoveryFails(inner)));
+
+        let result = run_straight_to_the_flush(&mut engine, arrivals, permits).await;
+
+        let error = result.expect_err(
+            "a source pass that failed during the flush flushed nothing; exiting 0 \
+             tells a supervisor it did",
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains("shutdown flush incomplete") && text.contains("discovery unavailable"),
+            "the error must say the flush did not complete and why, got: {text}"
+        );
+    }
+
+    /// REGRESSION (#532 review): with ledger retention on, a stop that
+    /// arrived during the last pass of an IDLE cycle was not looked at until
+    /// the backoff `select!`, after `maybe_prune_ledger` — housekeeping that
+    /// can spend a state-store timeout plus digest I/O — had run. A stop
+    /// already pending must skip the prune and go to the flush.
+    #[tokio::test]
+    async fn a_stop_during_an_idle_pass_does_not_wait_for_ledger_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, mut arrivals, permits) = gated_engine(dir.path(), &[], 60_000).await;
+        engine.config.engine.ledger_retention_days = Some(1);
+        engine.config.engine.ledger_digest_dir =
+            Some(dir.path().join("digests").to_string_lossy().into_owned());
+        let (stop, requests) = tokio::sync::mpsc::unbounded_channel();
+
+        let driver = async {
+            arrivals
+                .recv()
+                .await
+                .expect("the first (idle) cycle starts");
+            // The only adapter's pass is held open: this is the last pass of
+            // the cycle, and it will read nothing.
+            stop.send("test-stop").unwrap();
+            permits.add_permits(1);
+            while arrivals.recv().await.is_some() {
+                permits.add_permits(1);
+            }
+            std::future::pending::<()>().await
+        };
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::select! {
+                result = engine.run_until(ChannelShutdown(requests)) => result,
+                () = driver => unreachable!("the driver never finishes"),
+            }
+        })
+        .await
+        .expect("a stop during an idle pass must end the run");
+
+        assert!(
+            result.is_ok(),
+            "an orderly idle stop exits cleanly: {result:?}"
+        );
+        assert!(
+            engine.last_ledger_prune.is_none(),
+            "the ledger prune ran after the stop was already pending; it can take \
+             the state-store timeout and push the stop past its grace period"
         );
     }
 }
