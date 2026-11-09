@@ -66,8 +66,17 @@ impl TelemetryBatch {
     /// Seal the batch: transition `Batching -> Sealed`, stamp `sealed_at`, and
     /// finalize the record count. A sealed batch is immutable.
     pub fn seal(&mut self) -> Result<(), VtopError> {
+        self.seal_at(Utc::now())
+    }
+
+    /// [`Self::seal`], stamping `at` - the instant the batch's contents were
+    /// fixed, which the engine takes when it drains the batch from its buffer.
+    /// Sealing can run later than that (the batch waits for an upload slot and
+    /// for its first ledger write), and the time partition is taken from this
+    /// instant, so it must be the one recorded (#559).
+    pub fn seal_at(&mut self, at: chrono::DateTime<Utc>) -> Result<(), VtopError> {
         self.state = transition(self.state, BatchState::Sealed)?;
-        self.sealed_at = Some(Utc::now().to_rfc3339());
+        self.sealed_at = Some(at.to_rfc3339());
         self.record_count = self.records.len();
         Ok(())
     }

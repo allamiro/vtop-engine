@@ -5,6 +5,7 @@
 //! tests; [`commands`] wires it to the CLI.
 
 pub mod commands;
+pub mod coverage;
 pub mod engine;
 pub mod meta_tools;
 pub mod metrics_server;

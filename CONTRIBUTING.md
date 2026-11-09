@@ -42,23 +42,37 @@ The pull request must be green before it merges. Locally, the checks that fail
 most often are cheap to run first:
 
 ```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
-Shell changes are linted with the same pinned shellcheck CI uses:
+Shell changes are linted with the same pinned shellcheck CI uses, in two steps:
 
 ```bash
-# The same file list CI lints — a shorter one gives a false green.
+# The same file lists CI lints — a shorter one gives a false green.
+docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 \
+  docker/*.sh scripts/release-notes.sh scripts/k8s-smoke.sh \
+  scripts/e2e-smoke.sh scripts/upgrade-compat.sh scripts/traffic-snapshot.sh \
+  scripts/test-progress.sh scripts/check-naming.sh scripts/check-egress-claims.sh
+
 docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 \
   -x -P scripts/live-chaos/scenarios \
   scripts/live-chaos/lib.sh scripts/live-chaos/run-all.sh \
   scripts/live-chaos/gen-certs.sh scripts/live-chaos/scenarios/*.sh
 ```
 
-Chart changes need `helm lint` and a render of both value files in
-`helm/vtop/ci/`.
+and the bats tests:
+
+```bash
+docker run --rm -v "$PWD:/code" -w /code bats/bats:1.13.0 docker/tests/ scripts/tests/
+```
+
+Chart changes need `helm lint` and a render (`helm template`) of every values
+file in `helm/vtop/ci/` — `default-values.yaml`, `separated-values.yaml`,
+`plaintext-values.yaml` and `replicated-values.yaml`; the Helm jobs in
+`.github/workflows/ci.yml` assert on the rendered output as well as the exit
+code.
 
 ## What a change is expected to carry
 

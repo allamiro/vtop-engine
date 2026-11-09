@@ -8,6 +8,11 @@
 # the harness is 119. Chosen to fit the code as written rather than to force a
 # reformat of files this lint was added to protect.
 line-length = 120
+# The harness supports Python 3.9 (README). Without a stated target, ruff 0.17
+# assumed a newer one and its UP rules asked for `datetime.UTC` and a bare
+# `TimeoutError` for asyncio - both 3.11-only - turning a ruff release into a
+# red job and the "fix" into a break for 3.9/3.10 users.
+target-version = "py39"
 
 [lint]
 # E/F: pycodestyle errors + pyflakes (unused imports, undefined names).

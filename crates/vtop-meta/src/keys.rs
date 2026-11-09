@@ -42,6 +42,7 @@ const CATEGORY_SEGMENT_TIER_COPY: u8 = 16;
 const CATEGORY_TOPIC_RETENTION_POLICY: u8 = 17;
 const CATEGORY_RANGE_TRANSITION: u8 = 18;
 const CATEGORY_LINEAGE_TRANSITION: u8 = 19;
+const CATEGORY_RANGE_REPLICA_SET: u8 = 20;
 
 /// Consumer-group names reuse the topic-name bound so group identity stays
 /// allocation-bounded on the wire and in snapshots.
@@ -156,6 +157,11 @@ pub enum MetaKey {
         topic_uuid: Uuid,
         transition_id: Uuid,
     },
+    /// The replica set a range's quorum is counted over (#553).
+    RangeReplicaSet {
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    },
 }
 
 /// Validate a topic name against the shared 249-byte semantics.
@@ -204,6 +210,7 @@ impl MetaKey {
             MetaKey::TopicRetentionPolicy { .. } => CATEGORY_TOPIC_RETENTION_POLICY,
             MetaKey::RangeTransition { .. } => CATEGORY_RANGE_TRANSITION,
             MetaKey::LineageTransition { .. } => CATEGORY_LINEAGE_TRANSITION,
+            MetaKey::RangeReplicaSet { .. } => CATEGORY_RANGE_REPLICA_SET,
         }
     }
 
@@ -307,6 +314,13 @@ impl MetaKey {
             } => {
                 put_uuid(&mut out, *topic_uuid);
                 put_uuid(&mut out, *transition_id);
+            }
+            MetaKey::RangeReplicaSet {
+                topic_uuid,
+                range_uuid,
+            } => {
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
             }
         }
         out
@@ -413,6 +427,10 @@ impl MetaKey {
             CATEGORY_LINEAGE_TRANSITION => MetaKey::LineageTransition {
                 topic_uuid: reader.uuid("topic uuid")?,
                 transition_id: reader.uuid("transition id")?,
+            },
+            CATEGORY_RANGE_REPLICA_SET => MetaKey::RangeReplicaSet {
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
             },
             CATEGORY_TOPIC_RETENTION_POLICY => MetaKey::TopicRetentionPolicy {
                 topic_uuid: reader.uuid("topic uuid")?,
@@ -528,6 +546,13 @@ impl fmt::Display for MetaKey {
                 formatter,
                 "/meta/0/range-transition/{topic_uuid}/{range_uuid}/{fencing_epoch}"
             ),
+            MetaKey::RangeReplicaSet {
+                topic_uuid,
+                range_uuid,
+            } => write!(
+                formatter,
+                "/meta/0/range-replica-set/{topic_uuid}/{range_uuid}"
+            ),
         }
     }
 }
@@ -539,6 +564,10 @@ mod tests {
     fn every_key() -> Vec<MetaKey> {
         vec![
             MetaKey::ClusterConfig,
+            MetaKey::RangeReplicaSet {
+                topic_uuid: Uuid::from_u128(2),
+                range_uuid: Uuid::from_u128(3),
+            },
             MetaKey::Node {
                 node_uuid: Uuid::from_u128(1),
             },

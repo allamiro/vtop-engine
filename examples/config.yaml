@@ -13,6 +13,10 @@ engine:
   # for a private CA that is not in the bundled public trust roots). Inline
   # PostgreSQL URLs are rejected so credentials never enter serializable config.
   state_store: "sqlite:///data/state/vtop-state.db"
+  # Wall-clock limit for one state-store request (#556); whole-ledger scans such
+  # as startup recovery get ten times it. A blackholed Postgres then fails the
+  # request instead of hanging the engine.
+  # state_store_timeout_seconds: 30
   work_dir: /data/work
   # Successful batches remove staging files immediately. These limits clean up
   # artifacts left by a crash and cap their aggregate disk use on restart.
@@ -173,6 +177,10 @@ upload:
   # every invocation has bounded time/output and an otherwise empty environment.
   # command_binary: /usr/local/bin/aws
   # command_timeout_seconds: 300
+  # Wall-clock limit for ONE attempt of ONE request on the native S3 backend
+  # (#556). Without it a store that accepts a connection and never answers
+  # blocks the engine forever. Size it for the slowest link a part crosses.
+  # request_timeout_seconds: 300
   # command_max_output_bytes: 1048576
   # command_env_allowlist:
   #   - AWS_CONFIG_FILE
@@ -185,3 +193,7 @@ upload:
 
 partitioning:
   template: "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/"
+  # Which clock fills {yyyy}..{hh} (#559): seal (default) = when the batch was
+  # sealed, before upload; event = the earliest record time the source
+  # reported (Kafka message timestamps), falling back to the seal time.
+  # time_source: seal

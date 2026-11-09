@@ -205,6 +205,16 @@ teardown() {
     [ "$status" -eq 1 ]
 }
 
+@test "an assistant skill under .claude is scanned like any other document" {
+    # The skills are authored prose about this product, so they are inside
+    # the rule. Before this surface was listed, a mark in a skill passed.
+    mkdir -p "$ROOT/.claude/skills/demo"
+    printf 'Prefer the %s transport.\n' "$TERM" > "$ROOT/.claude/skills/demo/SKILL.md"
+    run bash "$NAMING" "$ROOT"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *".claude/skills/demo/SKILL.md"* ]]
+}
+
 @test "a path-enumeration error fails closed, never as a clean pass" {
     # DETERMINISTIC in every environment (review): the chmod-000 approach
     # cannot produce a traversal error under root — and the CI bats

@@ -36,6 +36,12 @@ first boot of a fresh volume, let it exit before starting a run
 `Exited (0)`) or the first upload can fail with `NoSuchBucket`. The buckets
 live in the named volume from then on, so this is a first-boot wait only.
 
+MinIO is built from source (`docker/minio/Dockerfile`) the first time and runs
+as an unprivileged user. A `bench-minio-data` volume left by the older
+root-run image is root-owned, and MinIO fails its health check on it: recreate
+it once with `docker compose -f benchmarks/docker-compose.benchmark.yml down
+-v`, which **deletes the volume and its objects**.
+
 ## 2. Generate seed data
 
 Seed data is generated automatically per scenario, but you can also produce it

@@ -113,6 +113,19 @@ impl MetaRaftStore {
         let guard = self.lock();
         f(&guard.storage)
     }
+
+    /// [`Self::with_storage`] without waiting: `None` while another holder
+    /// (an apply, a snapshot) has the lock. For readers - a metrics scrape -
+    /// that must never queue behind the state machine.
+    pub fn try_with_storage<R>(&self, f: impl FnOnce(&MetaStorage) -> R) -> Option<R> {
+        match self.inner.try_lock() {
+            Ok(guard) => Some(f(&guard.storage)),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                Some(f(&poisoned.into_inner().storage))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
 }
 
 fn recover_membership(

@@ -150,11 +150,44 @@ pub struct RetentionPolicy {
     pub max_total_bytes: u64,
 }
 
-/// What one retention pass reclaimed.
+/// What one retention pass reclaimed, and what it left (#561).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RetentionOutcome {
     pub segments_removed: usize,
     pub bytes_removed: u64,
+    /// Content bytes the range holds after the pass.
+    pub retained_bytes: u64,
+    /// Why the pass left the range above its bound, if it did. A pass that
+    /// reclaims nothing returns quietly either way; this is what tells a
+    /// healthy range from one that has stopped being reclaimed.
+    pub blocked: Option<RetentionBlocked>,
+}
+
+/// Why retention could not bring a range under its bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetentionBlocked {
+    /// The oldest sealed segment holds records above the committed floor (a
+    /// follower has not acknowledged them, or the quorum mark has not moved):
+    /// reclaiming it could drop data a replica still needs.
+    CommittedFloor,
+    /// No sealed segment is left; the bytes are in the active segment, which
+    /// retention never removes. The bound is smaller than one segment.
+    ActiveSegment,
+}
+
+impl RetentionBlocked {
+    pub const ALL: [RetentionBlocked; 2] = [
+        RetentionBlocked::CommittedFloor,
+        RetentionBlocked::ActiveSegment,
+    ];
+
+    /// A stable label for metrics and logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RetentionBlocked::CommittedFloor => "committed_floor",
+            RetentionBlocked::ActiveSegment => "active_segment",
+        }
+    }
 }
 
 /// Every segment in a range directory must belong to the SAME range.
@@ -1149,7 +1182,10 @@ impl SegmentSet {
             .sum();
         let total = sealed_bytes + self.tail().content_bytes();
         if total <= policy.max_total_bytes {
-            return Ok(RetentionOutcome::default());
+            return Ok(RetentionOutcome {
+                retained_bytes: total,
+                ..RetentionOutcome::default()
+            });
         }
         let mut cut = 0_usize;
         let mut bytes_removed = 0_u64;
@@ -1163,8 +1199,19 @@ impl SegmentSet {
             bytes_removed += reader.manifest().content_bytes;
             cut += 1;
         }
+        let retained_bytes = total - bytes_removed;
+        let blocked =
+            (retained_bytes > policy.max_total_bytes).then_some(if cut < self.sealed.len() {
+                RetentionBlocked::CommittedFloor
+            } else {
+                RetentionBlocked::ActiveSegment
+            });
         if cut == 0 {
-            return Ok(RetentionOutcome::default());
+            return Ok(RetentionOutcome {
+                retained_bytes,
+                blocked,
+                ..RetentionOutcome::default()
+            });
         }
         let doomed: Vec<RetainedSegment> = self.sealed[..cut]
             .iter()
@@ -1194,6 +1241,8 @@ impl SegmentSet {
         Ok(RetentionOutcome {
             segments_removed: cut,
             bytes_removed,
+            retained_bytes,
+            blocked,
         })
     }
 
@@ -3051,6 +3100,31 @@ mod tests {
             "nothing below the policy bound is eligible above the floor"
         );
         assert_eq!(set.sealed().len(), before);
+        // And the pass SAYS so, instead of returning the same empty outcome
+        // as a range comfortably under its bound (#561).
+        assert_eq!(outcome.blocked, Some(RetentionBlocked::CommittedFloor));
+        assert!(outcome.retained_bytes > 0);
+
+        // With the floor out of the way, the sealed prefix goes and what is
+        // left over the bound is the active segment, which is never removed.
+        let outcome = set
+            .retain(&RetentionPolicy { max_total_bytes: 0 }, u64::MAX)
+            .unwrap();
+        assert_eq!(outcome.segments_removed, before);
+        assert_eq!(outcome.blocked, Some(RetentionBlocked::ActiveSegment));
+
+        // Under the bound: not blocked, and the retained size is reported.
+        let outcome = set
+            .retain(
+                &RetentionPolicy {
+                    max_total_bytes: u64::MAX,
+                },
+                u64::MAX,
+            )
+            .unwrap();
+        assert_eq!(outcome.blocked, None);
+        assert_eq!(outcome.segments_removed, 0);
+        assert!(outcome.retained_bytes > 0);
     }
 
     /// A crash between the marker and the unlinks must finish on the next
