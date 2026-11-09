@@ -13,6 +13,7 @@ about what the engine costs its neighbour — so those are what these tests read
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -1414,7 +1415,10 @@ def test_the_runner_stamps_a_cycles_end_when_process_once_returns_not_after_its_
                         classmethod(lambda cls, sc, shape: object()))
     monkeypatch.setattr(run_benchmark.competitor, "contended", contended)
     monkeypatch.setattr(run_benchmark, "ResultsWriter", SlowWriter)
-    monkeypatch.setattr(run_benchmark.engine, "vtopctl_path", lambda *a, **k: "/bin/true")
+    # This test reaches engine.replay, which EXECUTES the path, so it must be a
+    # real `true`: /bin/true does not exist on macOS (only /usr/bin/true).
+    monkeypatch.setattr(run_benchmark.engine, "vtopctl_path",
+                        lambda *a, **k: shutil.which("true") or "/bin/true")
     monkeypatch.setattr(run_benchmark.engine, "write_engine_config", lambda *a, **k: None)
     monkeypatch.setattr(run_benchmark.engine, "effective_endpoint", lambda *a, **k: "")
     monkeypatch.setattr(run_benchmark.engine, "process_once", process_once)
