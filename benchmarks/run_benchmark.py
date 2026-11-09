@@ -15,6 +15,7 @@ Never overwrites a prior run.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import os
 import shutil
@@ -330,7 +331,8 @@ def _measure(args, sc, mode, shape, contention_spec, emulator_validation_mbps, r
             shaping.shaped_run(sc, shape=shape,
                                endpoint=engine.effective_endpoint(sc)), \
             competitor.contended(contention_spec,
-                                 vtop_bytes=lambda: out_bytes) as contention:
+                                 vtop_bytes=lambda: out_bytes) as contention, \
+            contextlib.ExitStack() as on_exit:
         # A CONTENDED RUN'S SOLO WINDOWS BELONG TO THE HARNESS, NOT TO THE
         # ENGINE (#478). The competitor measures the empty link twice — once as
         # this block opens, once as it closes — and the engine is deliberately
@@ -381,6 +383,12 @@ def _measure(args, sc, mode, shape, contention_spec, emulator_validation_mbps, r
         stop_seeding = threading.Event()
         seeder = None
         seeder_error: list[BaseException] = []
+
+        def _stop_seeder():
+            stop_seeding.set()
+            if seeder is not None:
+                seeder.join()
+
         if duration > 0 and sc.get("seed_concurrently", False):
             per_round = reseed_count(int(sc.volume),
                                      float(sc.get("backlog_multiplier", 0.25)))
@@ -425,6 +433,15 @@ def _measure(args, sc, mode, shape, contention_spec, emulator_validation_mbps, r
 
             seeder = threading.Thread(target=_seed_loop, name="seeder", daemon=True)
             seeder.start()
+            # STOPPED ON EVERY WAY OUT, not only the loop's normal one (review).
+            # An engine or a CSV write that raised left this block with the
+            # seeder still running, and main()'s finally then removed the seed
+            # dir under it: the next round's makedirs recreated an owned one,
+            # and a caller-supplied one kept filling for as long as the process
+            # lived. Entered last, so it runs before the competitor and the
+            # shape are torn down; the explicit stop below still comes first on
+            # the normal path, and a second set()/join() is a no-op.
+            on_exit.callback(_stop_seeder)
             print(f"[bench] seeding concurrently: {per_round} files every {interval}s")
 
         # THE CONTENDED WINDOW OPENS HERE (#478): after the seed exists, after
@@ -632,9 +649,7 @@ def _measure(args, sc, mode, shape, contention_spec, emulator_validation_mbps, r
         # backlog (review). Joined without a timeout, too: a bounded join left
         # a daemon thread writing into a seed directory the cleanup was about
         # to remove.
-        stop_seeding.set()
-        if seeder is not None:
-            seeder.join()
+        _stop_seeder()
         if seeder_error:
             # Reported, not swallowed. A run whose load generation died
             # half-way is not a shorter run, it is a different experiment, and

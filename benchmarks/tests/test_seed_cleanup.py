@@ -245,3 +245,76 @@ def test_a_contended_runs_duration_excludes_everything_closing_the_contention_to
     assert duration < 0.3 + 0.4, (
         f"duration_seconds is {duration}: the 0.6 s close() spent after the engine's window "
         "ended — 0.5 s of it collection tail, not solo window — was billed to the engine")
+
+
+@pytest.mark.parametrize("caller_seed_dir", [False, True],
+                         ids=["owned-seed-dir", "caller-seed-dir"])
+def test_an_engine_that_raises_stops_the_concurrent_seeder_before_scratch_goes(
+        tmp_path, monkeypatch, caller_seed_dir):
+    # The seeder was stopped and joined only on the loop's normal way out, so
+    # an engine that RAISED left main() through its finally with the daemon
+    # thread still writing: the owned seed dir was removed and then recreated
+    # by the next round's makedirs, and a caller-supplied one kept filling for
+    # as long as an embedding process lived (review).
+    import threading
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(run_benchmark.tempfile, "tempdir", str(scratch))
+    results = tmp_path / "results"
+    scenario = tmp_path / "engine-raises.yaml"
+    scenario.write_text(
+        "name: engine-raises\nbackend: s3_native\nendpoint_url: http://localhost:9000\n"
+        "volume: 2\nduration_seconds: 30\nseed_concurrently: true\n"
+        "seed_interval_seconds: 0.02\nsys_sample_interval: 0.1\n", encoding="utf-8")
+    monkeypatch.setattr(run_benchmark.engine, "vtopctl_path", lambda *a, **k: "/bin/true")
+    monkeypatch.setattr(run_benchmark.engine, "write_engine_config", lambda *a, **k: None)
+    monkeypatch.setattr(run_benchmark.engine, "effective_endpoint", lambda *a, **k: "")
+
+    rounds = []
+
+    def generate_dataset(out_dir, *_a, prefix="evt", **_k):
+        # What the real generator does to the directory: create it, then write.
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, f"{prefix}-{len(rounds)}.log"), "w") as fh:
+            fh.write("x\n")
+        rounds.append(1)
+        return {"files": 1, "bytes": 2}
+
+    monkeypatch.setattr(run_benchmark.seed, "generate_dataset", generate_dataset)
+
+    def process_once(*_a, **_k):
+        # Held until the seeder has written twice, so it is mid-run when the
+        # engine dies rather than not yet started.
+        deadline = time.monotonic() + 5
+        while len(rounds) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        raise RuntimeError("the engine binary vanished mid-run")
+
+    monkeypatch.setattr(run_benchmark.engine, "process_once", process_once)
+
+    argv = ["run_benchmark.py", str(scenario), "--results-dir", str(results)]
+    precious = None
+    if caller_seed_dir:
+        supplied = tmp_path / "callers-data"
+        supplied.mkdir()
+        precious = supplied / "keep-me.txt"
+        precious.write_text("real data")
+        argv += ["--seed-dir", str(supplied)]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(RuntimeError, match="vanished"):
+        run_benchmark.main()
+
+    alive = [t for t in threading.enumerate() if t.name == "seeder" and t.is_alive()]
+    rounds_at_exit = len(rounds)
+    time.sleep(0.2)  # ten seeding intervals
+    written_after = len(rounds) - rounds_at_exit
+    assert not alive and not written_after, (
+        f"{len(alive)} seeder thread(s) still running after main() raised, and "
+        f"{written_after} round(s) written in the 0.2 s after it: the run's scratch was "
+        "removed with its load generator still writing into it")
+    leaked = sorted(name for name in os.listdir(scratch) if name.startswith(SCRATCH_PREFIXES))
+    assert not leaked, f"the owned seed dir came back after the cleanup removed it: {leaked}"
+    if precious is not None:
+        assert precious.exists(), "a caller-supplied seed dir is never removed, refused or not"
