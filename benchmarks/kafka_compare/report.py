@@ -62,7 +62,8 @@ GATEWAY_GAPS = (
      "does not decompress",
      "compression.type=none for both systems; compression is out of phase 1."),
     ("Gateway on followers", "vtop-node with a `kafka` block on a follower",
-     "the node refuses `kafka` on any role but leader or standalone",
+     "the node refuses a kafka block on any role but leader or standalone (the gateway is served by a leader or "
+     "standalone only)",
      "The gateway runs on the range's leader only; one partition means one gateway."),
 )
 
@@ -195,6 +196,10 @@ def _style_axes(ax) -> None:
     ax.set_axisbelow(True)
 
 
+def _mib(value: float) -> str:
+    return f"{value:,.0f}" if value >= 10 else f"{value:.2f}"
+
+
 def _tick(value: float) -> str:
     if value == 0:
         return "0"
@@ -205,7 +210,8 @@ def _tick(value: float) -> str:
     return f"{value:g}"
 
 
-def throughput_chart(plt, rows, env, run_id, mode: str, title: str, name: str, img_dir: str) -> list[str]:
+def throughput_chart(plt, rows, env, run_id, mode: str, title: str, subtitle: str, name: str,
+                     img_dir: str) -> list[str]:
     sizes = env["matrix"]["record_sizes"]
     width_in, height_in = 10.0, 5.0
     fig, axes = plt.subplots(1, 2, figsize=(width_in, height_in))
@@ -233,7 +239,7 @@ def throughput_chart(plt, rows, env, run_id, mode: str, title: str, name: str, i
                        label=style["label"] if position == 0 else None)
                 ax.errorbar(x, summary.median, yerr=[[summary.median - summary.low], [summary.high - summary.median]],
                             fmt="none", ecolor=INK_2, elinewidth=1, capsize=3, capthick=1)
-                label = compact(summary.median)
+                label = compact(summary.median) if column == "records_per_sec" else _mib(summary.median)
                 if cell["ok"] < cell["n"]:
                     label += f"\n({cell['ok']}/{cell['n']} reps)"
                 ax.annotate(label, (x, summary.high), xytext=(0, 4), textcoords="offset points", ha="center",
@@ -251,8 +257,7 @@ def throughput_chart(plt, rows, env, run_id, mode: str, title: str, name: str, i
                for s in ("kafka", "vtop")]
     fig.legend(handles=handles, loc="upper left", ncol=2, fontsize=8.5,
                bbox_to_anchor=(0.07, 1 - 0.88 / height_in), handlelength=1.2, columnspacing=1.6)
-    _header(fig, height_in, title, "1 partition, 1 producer, acks=all, RF 3 / min ISR 2 (VTOP: write quorum 2 of 3). "
-            "Same JVM client container for both systems.")
+    _header(fig, height_in, title, subtitle)
     _footer(fig, footer_text(env, run_id), 190)
     paths = _save(fig, img_dir, name)
     plt.close(fig)
@@ -463,6 +468,20 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
                     f"{SYSTEM_STYLE[system]['label']} | {achieved} | {sustained} | {_summary_cell(p50)} | "
                     f"{_summary_cell(p99)} | {_summary_cell(p999)} |")
     add("")
+    for size in sizes:
+        for system in ("kafka", "vtop"):
+            cells = [cell_summary(rows, system, "fixed_rate", size, "lat_p50_ms", pct) for pct in pcts]
+            held = [pct for pct, cell in zip(pcts, cells) if cell["summary"] is not None and cell["sustained"]]
+            add(f"- {size_label(size)} records, {SYSTEM_STYLE[system]['label']}: sustained "
+                f"{len(held)} of {len(pcts)} offered rates in every repetition"
+                + (f" ({', '.join(f'{p}%' for p in held)})." if held else "."))
+        vtop_sat = cell_summary(rows, "vtop", "saturation", size, "records_per_sec")["summary"]
+        lowest = cell_summary(rows, "kafka", "fixed_rate", size, "lat_p50_ms", pcts[0])["offered"]
+        if vtop_sat is not None and lowest and vtop_sat.high < lowest:
+            add(f"- {size_label(size)} records: VTOP's fastest saturation repetition ({_fmt(vtop_sat.high)} "
+                f"records/s) is below the lowest offered rate ({_fmt(lowest)} records/s), so none of its "
+                "fixed-rate runs could be open-loop; see *Reading the results*.")
+    add("")
     if any(row["mode"] == "consume" for row in rows):
         add("## Consume throughput")
         add("")
@@ -508,40 +527,53 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
     add(f"| run | `{run_id}`, started {env['started_at']}, finished {env.get('finished_at', '?')} |")
     add(f"| charts | matplotlib {matplotlib.__version__} |")
     add("")
-    add("Other containers were running on the same Docker host during the run (recorded in "
-        "`environment.json` as `other_containers_at_start`); they shared the VM with both systems equally, "
-        "one system at a time, but they are noise neither system chose.")
+    others = env.get("other_containers_at_start_count")
+    if others:
+        add(f"{others} unrelated containers were running on the same Docker host when the run started "
+            "(`environment.json`, `other_containers_at_start_count`). Both systems shared the VM with them, one "
+            "system at a time; they are noise neither system chose, and part of why these are laptop numbers.")
     add("")
     with open(doc_path, "w") as handle:
         handle.write("\n".join(lines))
 
 
 READING = """\
-Where Kafka is faster, the reasons known from the code and the configuration are:
+Where Kafka is faster, the reasons known from the code and the configuration are these. None of them was
+isolated by a separate measurement in this phase; they are the explanation the code supports, not a proof.
 
 1. **What an acknowledgement costs.** Under `defaults`, a Kafka `acks=all` acknowledgement waits for the
-   in-sync replicas to *receive* the batch; nothing is fsynced. A VTOP quorum acknowledgement waits for two
-   replicas to make the append *durable* (fsync) and for the leader to advance the committed high-water mark.
-   Each produce request therefore pays at least one fsync on the leader and one on a follower, in series with
-   the replication round trip. This is the largest single difference, and it is a difference in the
-   guarantee, not only in speed; the `fsync-parity` profile (phase 2) prices the same guarantee on Kafka.
+   in-sync replicas to have the batch in their logs (page cache); nothing is fsynced. A VTOP quorum
+   acknowledgement waits until a majority of the three replicas, the leader counted, has made the append
+   *durable* (fsync), and the leader has advanced the committed high-water mark. Every produce request pays
+   for fsyncs and a replication round trip before it is answered. This is the largest single difference, and
+   it is a difference in the guarantee as much as in speed; the `fsync-parity` profile (phase 2) prices the
+   same guarantee on Kafka.
 2. **No group commit on the gateway path.** `vtop-node data` appends each produce request as its own durability
-   barrier; the broker's group-commit mode (one fsync and replication round for many concurrent sessions) is not
-   wired into the node. With one producer, one partition and the client's default of five in-flight requests,
-   the throughput ceiling is roughly (records per request) / (fsync + replicate round trip).
+   barrier: the broker's group-commit mode (one fsync and replication round shared by many concurrent
+   requests) exists in `vtop-broker` but is not wired into the node. The client caps a request at
+   `batch.size` (16 KiB by default) whatever the record size, so a ceiling set per request shows up as a
+   roughly constant MiB/s across record sizes and a record rate that falls as records grow, which is the shape
+   of VTOP's two cells here.
 3. **Translation in the gateway.** Every Kafka record batch is decoded, validated (CRC, attributes) and
    re-appended through the native broker, which frames it again for the replica plane; Kafka validates the
    batch and appends it with offsets assigned in place, without taking its records apart. The cost is CPU and
    copies, not round trips.
-4. **Fetch path.** Kafka serves a fetch as a zero-copy file transfer of stored batches; the gateway reads
+4. **Fetch path.** Kafka serves a fetch from stored batches with a zero-copy file transfer; the gateway reads
    records through the native broker and re-encodes them as a Kafka record batch.
 
 A separate, unrecorded probe during development showed the VTOP nodes far below their CPU limit while
 saturated, which fits (1) and (2): the produce path is bound by durability round trips, not CPU. Per-node CPU
 and bytes written are not in this run's CSV; recording them is #596's resource metric (phase 2).
 
-Nothing here measures what VTOP adds over Kafka on this path - fenced epochs, the verified commit rule, the
-evidence chain (see [COMPARISON.md](../COMPARISON.md)) - and nothing here is a failover, archive or crash
+**On the latency chart:** where VTOP's saturation is below the lowest offered rate (25% of Kafka's), no VTOP
+fixed-rate run can be sustained, and the perf tool's throttle degenerates into a closed loop against a full
+producer buffer. Those VTOP latencies are queueing in the client (seconds), not VTOP's service latency at that
+load; they are drawn hollow and must not be read as "VTOP's p99 at 25% load". A fair open-loop VTOP latency
+curve needs offered rates below VTOP's own saturation, which the issue's Kafka-relative rule does not produce
+here; adding VTOP-relative rates is a phase-2 item.
+
+Nothing here measures what VTOP adds over Kafka on this path (fenced epochs, the verified commit rule, the
+evidence chain; see [COMPARISON.md](../COMPARISON.md)), and nothing here is a failover, archive or crash
 measurement (#597, #598, #599)."""
 
 KNOWN_GAPS = """\
@@ -572,11 +604,15 @@ def build(run_dir: str, img_dir: str, doc_path: str) -> list[str]:
     written = []
     written += throughput_chart(plt, run.rows, run.environment, run_id, "saturation",
                                 "Produce throughput at saturation, VTOP vs Apache Kafka",
+                                "1 partition, 1 producer, acks=all, RF 3 / min ISR 2 (VTOP: write quorum 2 of 3). "
+                                "Same JVM client container for both systems.",
                                 "kafka-compare-produce-throughput", img_dir)
     written += latency_chart(plt, run.rows, run.environment, run_id, img_dir)
     if run.environment["matrix"].get("consume"):
         written += throughput_chart(plt, run.rows, run.environment, run_id, "consume",
                                     "Consume throughput, VTOP vs Apache Kafka",
+                                    "1 partition, 1 consumer in a fresh group, offset commits off for both; the tool's "
+                                    "fetch rate, which excludes the group join. Same JVM client container for both.",
                                     "kafka-compare-consume-throughput", img_dir)
     doc_dir = os.path.dirname(os.path.abspath(doc_path))
     images = {

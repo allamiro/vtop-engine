@@ -12,7 +12,7 @@ measurements [#596](https://github.com/allamiro/vtop-engine/issues/596), charts 
 Needs Docker (with Compose v2) and Python 3.9+. `report.py` also needs matplotlib.
 
 ```bash
-# The whole matrix, both systems, one at a time (about an hour on a laptop).
+# The whole matrix, both systems, one at a time (about 1.5 to 2 hours on a laptop; VTOP runs are the long ones).
 # Builds vtop-bench:<HEAD sha> from docker/Dockerfile if it is not there yet.
 python3 benchmarks/kafka_compare/run.py
 

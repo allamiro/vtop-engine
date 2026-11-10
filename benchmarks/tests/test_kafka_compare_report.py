@@ -36,7 +36,7 @@ COMPARABLE = {
 def environment():
     return {"run_id": "test-run", "run_state": "complete", "started_at": "2026-11-09T00:00:00+00:00",
             "finished_at": "2026-11-09T01:00:00+00:00", "comparable": copy.deepcopy(COMPARABLE),
-            "matrix": copy.deepcopy(MATRIX), "observed": {}, "events": [], "other_containers_at_start": []}
+            "matrix": copy.deepcopy(MATRIX), "observed": {}, "events": [], "other_containers_at_start_count": 0}
 
 
 def complete_rows(env):

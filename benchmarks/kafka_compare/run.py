@@ -164,7 +164,9 @@ def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, li
         "comparable": comparable,
         "matrix": matrix,
         "worktree_dirty": bool(git("status", "--porcelain")),
-        "other_containers_at_start": others,
+        # A count, not names: the names are other people's projects and do not
+        # belong in a committed result; the count says the VM was not idle.
+        "other_containers_at_start_count": len(others),
         "configs": {
             "kafka_compose": _read(os.path.join(HERE, "compose.kafka.yml")),
             "vtop_compose": _read(os.path.join(HERE, "compose.vtop.yml")),
