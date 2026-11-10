@@ -103,14 +103,9 @@ pub struct CommittedCursor {
 /// the comparisons are of hex text, so an uppercase digest would call the
 /// unchanged file a replacement.
 pub(crate) fn parse_content_fingerprint(json: &str) -> Option<ContentFingerprint> {
-    let fingerprint: ContentFingerprint = serde_json::from_str(json).ok()?;
-    let plausible = (1..=ContentFingerprint::MAX_LEN as u64).contains(&fingerprint.len)
-        && fingerprint.sha256.len() == 64
-        && fingerprint
-            .sha256
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
-    plausible.then_some(fingerprint)
+    serde_json::from_str::<ContentFingerprint>(json)
+        .ok()
+        .filter(ContentFingerprint::is_plausible)
 }
 
 /// Patch applied when advancing a batch's state. Fields set to `Some` are

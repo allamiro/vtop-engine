@@ -346,12 +346,14 @@ What follows from that, in the engine:
   from the bytes it consumed, and the next read - and a seed after a
   restart - checks that the file still holds those bytes there, through the
   descriptor it reads from (one extra read of at most a page; two after a
-  rewind moved the position off the page's end). A file
-  rewritten in place with the same first page, or a reused inode whose new
-  file starts like the old one, fails it and is read from byte 0. A late or
-  recovered commit is judged the same way against its range's end, so one
-  whose generation record was evicted (more than 256 ranges issued since)
-  or lost to a restart cannot carry the cursor into the rewritten content.
+  rewind moved the position off the page's end). A file rewritten in place
+  with the same first page, or a reused inode whose new file starts like
+  the old one, fails it - and is read from byte 0 - when its bytes in that
+  page differ from the old file's; one that repeats them too is not caught
+  (see the limits below). A late or recovered commit is judged the same way
+  against its range's end, so one whose generation record was evicted (more
+  than 256 ranges issued since) or lost to a restart cannot carry the
+  cursor into rewritten content whose page below that end differs.
 - **Late commits, rewinds and `delete_after_commit` judge content too**
   (#578, #620): a range whose marker fingerprinted other first bytes - or
   other bytes below its end - than the file at the path now holds does not
@@ -394,9 +396,10 @@ Limits, stated plainly:
   one, or a range recovered from one, is judged by inode and length alone,
   exactly as before. The first read after an upgrade that finds the file
   non-empty takes a fingerprint, and from there the check applies. Rows
-  written before #620 carry no tail fingerprint and are judged by inode,
-  length and first page, exactly as before; the first read after the
-  upgrade takes one.
+  written before #620 carry no tail fingerprint and are judged exactly as
+  before, by the fields they do carry: inode and length, and the first page
+  for a row written since #578. The first read after the upgrade takes
+  one.
 - History pruning keeps one row per path, so a file untouched for longer than
   the retention window can lose the rows that name its inode. The restart then
   reads it from byte 0 again: duplicates, bounded by the file.
@@ -446,9 +449,17 @@ backend: the restart seed reads the new field out of the stored
   marker's `end_byte`. Absent for a marker at byte 0 and for a read the stat
   proved unchanged (it does not open the file).
 - Rows written before it decode with the field absent and are judged exactly
-  as before (inode, length, first page); a marker without it serializes byte
-  for byte as before. A stored value no writer could produce (a zero length,
-  a digest that is not 64 lowercase hex digits) reads as absent.
+  as before, by the fields they carry (inode and length, and the first page
+  for a row written since #578). Leaving the field out changes nothing else
+  about a marker: one without it serializes byte for byte as the code before
+  #620 wrote the same marker - and as the code before #578 did only when it
+  carries no `content_fingerprint` either (see the note above).
+- A stored fingerprint no writer could produce - a zero length, a length
+  over 4 KiB, a digest that is not 64 lowercase hex digits, or a value that
+  is not a fingerprint at all - decodes as absent, for `tail_fingerprint`
+  and `content_fingerprint` alike, both in the restart seed and in markers
+  decoded whole (recovery's commits and rewinds). Absent only forgoes a
+  check; a malformed value used to force a re-read, or a large read.
 - The manifest's `source_progress` never carries it, for the reason above.
   The coverage audit does not use it.
 - An older binary ignores it, as above.

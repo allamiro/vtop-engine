@@ -286,7 +286,6 @@ impl SyslogSpoolSource {
             opened.inode,
             opened.file_size,
             &head,
-            b"",
             start,
         );
         let start = if discontinuity.is_some() { 0 } else { start };

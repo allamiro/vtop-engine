@@ -143,18 +143,13 @@ impl Tail {
 /// file that was empty) cannot prove a replacement this way, exactly as an
 /// unknown inode cannot prove a rotation.
 ///
-/// Nor does the first page see a rewrite that keeps it (#620), so
-/// `current_tail` - the bytes the file now holds where the cursor's [`Tail`]
-/// was taken, read through the same descriptor ([`read_ending_at`]) - is
-/// checked against it. A file too short to hold them yields fewer bytes,
-/// which never match. A cursor with no tail (a legacy seed, a read that
-/// ended at byte 0) is judged as before.
+/// Nor does the first page see a rewrite that keeps it (#620): that is
+/// [`check_tail`], made only when this finds nothing.
 pub fn check(
     last_seen: Option<&Observed>,
     current_inode: Option<u64>,
     current_size: u64,
     current_head: &[u8],
-    current_tail: &[u8],
     read_byte: u64,
 ) -> Option<Discontinuity> {
     if let Some(Observed {
@@ -180,6 +175,21 @@ pub fn check(
             return Some(Discontinuity::Replaced { len: content.len });
         }
     }
+    None
+}
+
+/// The test [`check`] cannot make (#620): a rewrite that kept the first page.
+/// `current_tail` is what the file now holds where the cursor's [`Tail`] was
+/// taken, read through the descriptor the next read uses
+/// ([`read_ending_at`]); a file too short to hold it yields fewer bytes,
+/// which never match. A cursor with no tail (a legacy seed, a read that
+/// ended at byte 0) proves nothing this way.
+///
+/// Separate from [`check`] so the tail is read only once the other tests have
+/// passed: reading it can fail, and a failure must not take a rotation,
+/// truncation or replacement those tests had already found with it (review
+/// of #632).
+pub fn check_tail(last_seen: Option<&Observed>, current_tail: &[u8]) -> Option<Discontinuity> {
     if let Some(tail) = last_seen.and_then(|seen| seen.tail.as_ref()) {
         if !tail.fingerprint.matches_bytes(current_tail) {
             return Some(Discontinuity::Rewritten {
@@ -211,7 +221,11 @@ pub async fn read_ending_at(
 ) -> std::io::Result<Vec<u8>> {
     let from = end.saturating_sub(len);
     file.seek(std::io::SeekFrom::Start(from)).await?;
-    let mut bytes = Vec::with_capacity(usize::try_from(end - from).unwrap_or(0));
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(end - from)
+            .unwrap_or(0)
+            .min(ContentFingerprint::MAX_LEN),
+    );
     (&mut *file)
         .take(end - from)
         .read_to_end(&mut bytes)
@@ -431,7 +445,6 @@ mod tests {
             current_inode,
             current_size,
             b"",
-            b"",
             read_byte,
         )
     }
@@ -474,7 +487,6 @@ mod tests {
                 Some(7),
                 new.len() as u64,
                 new,
-                b"",
                 old.len() as u64
             ),
             Some(Discontinuity::Replaced {
@@ -500,7 +512,6 @@ mod tests {
                 Some(7),
                 grown.len() as u64,
                 &grown,
-                b"",
                 old.len() as u64
             ),
             None
@@ -508,7 +519,7 @@ mod tests {
         // A cursor that saw the file empty took no fingerprint, and proves
         // nothing about what was written since.
         assert_eq!(
-            super::check(Some(&seen_with(b"")), Some(7), 5, b"abcd\n", b"", 0),
+            super::check(Some(&seen_with(b"")), Some(7), 5, b"abcd\n", 0),
             None
         );
     }
@@ -540,9 +551,9 @@ mod tests {
                 Some(7),
                 file.len() as u64,
                 &file[..ContentFingerprint::MAX_LEN],
-                &below(file),
                 end,
             )
+            .or_else(|| check_tail(Some(&seen), &below(file)))
         };
         assert_eq!(
             judge(&new),
@@ -559,17 +570,7 @@ mod tests {
             tail: None,
             ..seen.clone()
         };
-        assert_eq!(
-            super::check(
-                Some(&legacy),
-                Some(7),
-                new.len() as u64,
-                &new[..ContentFingerprint::MAX_LEN],
-                b"",
-                end
-            ),
-            None
-        );
+        assert_eq!(check_tail(Some(&legacy), b""), None);
         // And a commit whose range ends at `end` is current for the same
         // file only.
         assert!(tail_is_current(Some(&tail), &below(&grown)));

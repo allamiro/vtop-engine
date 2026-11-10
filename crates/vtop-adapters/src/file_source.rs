@@ -228,16 +228,10 @@ impl FileSource {
     /// descriptor's identity. The first bytes tell a replacement at the same
     /// inode from the file a marker was read from (#578). A file that cannot
     /// be opened reads as gone.
-    fn probe(path: &Path) -> (Option<u64>, u64, Vec<u8>) {
-        match continuity::probe(path) {
-            Some((md, head)) => (inode_of(&md), md.len(), head),
-            None => (None, 0, Vec::new()),
-        }
-    }
-
-    /// [`Self::probe`], and the bytes the file now holds where a marker
-    /// ending at `end` took its tail fingerprint (#620) - empty when it took
-    /// none, or when the file cannot be read (which fails any fingerprint).
+    ///
+    /// And the bytes the file now holds where a marker ending at `end` took
+    /// its tail fingerprint (#620) - empty when it took none, or when the
+    /// file cannot be read (which fails any fingerprint).
     fn probe_with_tail(
         path: &Path,
         end: u64,
@@ -371,25 +365,26 @@ impl FileSource {
             .await
             .map_err(SliceError::before_judged)?;
         opened.content = ContentFingerprint::of(&head);
-        // And the bytes the cursor last fingerprinted below its position, as
-        // the file holds them now (#620): a rewrite that kept the first page,
-        // or a reused inode whose new file starts like the old one, is told
-        // apart only by them.
-        let seen_tail = last_seen.as_ref().and_then(|seen| seen.tail.as_ref());
-        let at_seen_tail = match seen_tail {
-            Some(tail) => continuity::read_ending_at(&mut file, tail.end, tail.fingerprint.len)
-                .await
-                .map_err(SliceError::before_judged)?,
-            None => Vec::new(),
-        };
-        let discontinuity = continuity::check(
+        let mut discontinuity = continuity::check(
             last_seen.as_ref(),
             opened.inode,
             opened.file_size,
             &head,
-            &at_seen_tail,
             start,
         );
+        // Then the bytes the cursor last fingerprinted below its position, as
+        // the file holds them now (#620): a rewrite that kept the first page,
+        // or a reused inode whose new file starts like the old one, is told
+        // apart only by them. Read only when nothing else was found, so a
+        // failure here has no finding to lose (review of #632).
+        let seen_tail = last_seen.as_ref().and_then(|seen| seen.tail.as_ref());
+        let mut at_seen_tail = Vec::new();
+        if let (None, Some(tail)) = (discontinuity, seen_tail) {
+            at_seen_tail = continuity::read_ending_at(&mut file, tail.end, tail.fingerprint.len)
+                .await
+                .map_err(SliceError::before_judged)?;
+            discontinuity = continuity::check_tail(last_seen.as_ref(), &at_seen_tail);
+        }
         let start = if discontinuity.is_some() { 0 } else { start };
         // From here a failure still reports what the judgement found: a read
         // that saw the file truncated and then failed (a first record over
@@ -568,6 +563,28 @@ impl FileSource {
     }
 }
 
+/// The identity test `delete_after_commit` makes on its own probe of the
+/// path, just before the unlink: the batch's inode, and the content its
+/// marker fingerprinted - the first page (#578) and the bytes below its end
+/// (#620, `current_tail` being what the file holds there now).
+fn delete_identity_ok(
+    marker_inode: Option<u64>,
+    marker_content: Option<&ContentFingerprint>,
+    marker_tail: Option<&ContentFingerprint>,
+    current_inode: Option<u64>,
+    current_head: &[u8],
+    current_tail: &[u8],
+) -> bool {
+    let same_inode = match (marker_inode, current_inode) {
+        (Some(m), Some(cur)) => m == cur,
+        (None, None) => true, // platform without inode support: size-only
+        _ => false,
+    };
+    same_inode
+        && marker_content.is_none_or(|content| content.matches_head(current_head))
+        && continuity::tail_is_current(marker_tail, current_tail)
+}
+
 /// The fingerprint of the page that ends where a read stopped (#620), from
 /// the bytes it actually consumed: `below`, the page before it started, then
 /// its records - each followed by the newline it was read with, unless they
@@ -577,23 +594,37 @@ fn tail_of_read(
     records: &[Vec<u8>],
     newline_terminated: bool,
 ) -> Option<ContentFingerprint> {
-    let terminator = usize::from(newline_terminated);
-    // Only the records that reach into the last page are needed.
+    ContentFingerprint::of_tail(&tail_window(below, records, newline_terminated))
+}
+
+/// The bytes [`tail_of_read`] hashes: the last page of `below` followed by
+/// the records as they were read - only that page, never a whole record
+/// (review of #632): a whole-file record or a long line can be as large as
+/// the batch limit, and copying it to hash its last 4 KiB doubled the read's
+/// peak memory.
+fn tail_window(below: &[u8], records: &[Vec<u8>], newline_terminated: bool) -> Vec<u8> {
+    // Walk back from the end, taking what each piece contributes to the last
+    // page; then lay the pieces out forwards.
     let mut wanted = ContentFingerprint::MAX_LEN;
-    let mut first = records.len();
-    while first > 0 && wanted > 0 {
-        first -= 1;
-        wanted = wanted.saturating_sub(records[first].len() + terminator);
-    }
-    let mut bytes = Vec::with_capacity(ContentFingerprint::MAX_LEN + 1);
-    bytes.extend_from_slice(&below[below.len().saturating_sub(wanted)..]);
-    for record in &records[first..] {
-        bytes.extend_from_slice(record);
-        if newline_terminated {
-            bytes.push(b'\n');
+    let mut pieces: Vec<&[u8]> = Vec::new();
+    for record in records.iter().rev() {
+        if wanted == 0 {
+            break;
         }
+        if newline_terminated {
+            pieces.push(b"\n");
+            wanted -= 1;
+        }
+        let take = wanted.min(record.len());
+        pieces.push(&record[record.len() - take..]);
+        wanted -= take;
     }
-    ContentFingerprint::of_tail(&bytes)
+    pieces.push(&below[below.len().saturating_sub(wanted)..]);
+    let mut bytes = Vec::with_capacity(ContentFingerprint::MAX_LEN);
+    for piece in pieces.iter().rev() {
+        bytes.extend_from_slice(piece);
+    }
+    bytes
 }
 
 /// Inode / size / mtime of the file a read actually consumed, taken from the
@@ -1221,14 +1252,18 @@ impl SourceAdapter for FileSource {
             //
             // And for a replacement that reuses the inode and is no shorter
             // (#578): only its first bytes differ from the batch's file.
-            let (cur_inode, size, head) = Self::probe(Path::new(path));
-            let identity_ok = match (marker_inode, cur_inode) {
-                (Some(m), Some(cur)) => *m == cur,
-                (None, None) => true, // platform without inode support: size-only
-                _ => false,
-            } && marker_content
-                .as_ref()
-                .is_none_or(|content| content.matches_head(&head));
+            // And for a rewrite that kept the first page (#620): only the
+            // bytes below the batch's end differ.
+            let (cur_inode, size, head, tail) =
+                Self::probe_with_tail(Path::new(path), *end_byte, marker_tail.as_ref());
+            let identity_ok = delete_identity_ok(
+                *marker_inode,
+                marker_content.as_ref(),
+                marker_tail.as_ref(),
+                cur_inode,
+                &head,
+                &tail,
+            );
             if !still_current {
                 tracing::warn!(
                     path,
@@ -1338,7 +1373,9 @@ impl SourceAdapter for FileSource {
         let ProgressMarker::File {
             path,
             inode: marker_inode,
+            end_byte,
             content_fingerprint: marker_content,
+            tail_fingerprint: marker_tail,
             ..
         } = marker
         else {
@@ -1365,6 +1402,17 @@ impl SourceAdapter for FileSource {
             .is_some_and(|(seen, marker)| seen.same_content(marker) != Some(true))
         {
             return None;
+        }
+        // Nor is it this content when the bytes below the range's end are no
+        // longer at the path (#620): a rewrite that kept the first page,
+        // whose replay was refused for exactly that (review of #632). Read,
+        // not compared with the cursor's own tail, which sits at another
+        // offset; unreadable answers unknown.
+        if let Some(tail) = marker_tail {
+            let (_, _, _, below) = Self::probe_with_tail(Path::new(path), *end_byte, Some(tail));
+            if !tail.matches_bytes(&below) {
+                return None;
+            }
         }
         Some(i128::from(c.read_byte))
     }
@@ -3629,5 +3677,135 @@ mod tests {
         fs.replay_from_marker(&legacy(&read[0].progress_end))
             .await
             .unwrap();
+    }
+
+    /// Review of #632: the last identity test before `delete_after_commit`
+    /// unlinks the file is a probe of its own, after `still_current`. It
+    /// judged the inode and the first page only, so a rewrite that kept the
+    /// first page between the two probes passed it and was deleted unread.
+    #[test]
+    fn the_final_delete_check_refuses_a_rewrite_that_kept_the_first_page() {
+        let old = header() + &body("old", 0..50);
+        let new = header() + &body("NEW", 0..80);
+        let end = old.len();
+        let head = |file: &str| file.as_bytes()[..ContentFingerprint::MAX_LEN].to_vec();
+        let below = |file: &str| file.as_bytes()[end - ContentFingerprint::MAX_LEN..end].to_vec();
+        let content = ContentFingerprint::of(old.as_bytes());
+        let tail = ContentFingerprint::of_tail(old.as_bytes());
+        let judge = |file: &str, tail: Option<&ContentFingerprint>| {
+            delete_identity_ok(
+                Some(7),
+                content.as_ref(),
+                tail,
+                Some(7),
+                &head(file),
+                &below(file),
+            )
+        };
+        assert!(judge(&old, tail.as_ref()), "the batch's own file");
+        assert!(
+            !judge(&new, tail.as_ref()),
+            "rewritten below the batch's end, same first page: must not be deleted"
+        );
+        assert!(
+            judge(&new, None),
+            "a legacy marker is judged by inode and first page, as before"
+        );
+    }
+
+    /// Review of #632: a replay refused because the bytes below the range's
+    /// end changed must not report where the rewind "landed" for that range:
+    /// recovery would take the range as handled at the cursor's position in
+    /// content it was never read from.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_range_whose_tail_is_gone_has_no_read_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, header() + &body("old", 0..50)).unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let old = fs
+            .read_batch_candidates(&src(&path), 100_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap()[0]
+            .progress_end
+            .clone();
+        assert!(fs.read_position(&old).is_some(), "the cursor's own file");
+
+        std::fs::write(&path, header() + &body("NEW", 0..80)).unwrap();
+        assert!(fs.replay_from_marker(&old).await.is_err());
+        assert_eq!(
+            fs.read_position(&old),
+            None,
+            "the range's bytes are no longer at the path; its position is unknown"
+        );
+        // A legacy marker cannot tell, and is answered as before.
+        assert!(fs.read_position(&legacy(&old)).is_some());
+    }
+
+    /// Review of #632: reading the bytes under the cursor's tail can fail.
+    /// It used to happen before the inode, length and first-page tests ran,
+    /// so a rotation those tests had found was dropped with the error: the
+    /// cursor kept the old position and the old identity. Here the tail's
+    /// range cannot even be sought to (past `i64::MAX`), and the file at the
+    /// path is another inode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_tail_read_does_not_lose_a_rotation_already_found() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "new one\nnew two\n").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        fs.seed_committed_from(
+            &path,
+            u64::MAX,
+            Some(inode.wrapping_add(1)),
+            Some(16),
+            None,
+            ContentFingerprint::of(b"x"),
+        );
+        let reads = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .expect("the rotation is decided before the tail is read");
+        assert_eq!(lines(&reads), ["new one", "new two"]);
+    }
+
+    /// Review of #632: the tail is one page, but the buffer it was hashed
+    /// from held every record that reached into that page in full - a
+    /// whole-file record or a long line up to the batch limit, copied to
+    /// fingerprint 4 KiB of it. The window is a page; its hash is unchanged.
+    #[test]
+    fn the_tail_window_is_one_page_whatever_the_record_size() {
+        let big = vec![b'a'; 1 << 20];
+        for records in [
+            vec![b"short".to_vec(), big.clone()],
+            vec![big.clone(), b"short".to_vec()],
+            vec![b"one".to_vec(), b"two".to_vec()],
+            vec![],
+        ] {
+            for newline_terminated in [true, false] {
+                let below = vec![b'b'; ContentFingerprint::MAX_LEN];
+                let window = tail_window(&below, &records, newline_terminated);
+                let mut read = below.clone();
+                for record in &records {
+                    read.extend_from_slice(record);
+                    if newline_terminated {
+                        read.push(b'\n');
+                    }
+                }
+                assert!(
+                    window.len() <= ContentFingerprint::MAX_LEN,
+                    "{} bytes copied to fingerprint one page",
+                    window.len()
+                );
+                assert_eq!(
+                    ContentFingerprint::of(&window),
+                    ContentFingerprint::of_tail(&read)
+                );
+            }
+        }
     }
 }

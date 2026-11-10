@@ -215,7 +215,11 @@ pub enum ProgressMarker {
         /// (judged by inode and length alone, as it always was) and for a
         /// file that was empty at the read. Omitted when `None`, so such a
         /// marker serializes byte for byte as it did before.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "plausible_fingerprint",
+            skip_serializing_if = "Option::is_none"
+        )]
         content_fingerprint: Option<ContentFingerprint>,
         /// What the bytes just below `end_byte` were when this read ended
         /// (#620): the SHA-256 of the `len` bytes that END at `end_byte`
@@ -223,11 +227,15 @@ pub enum ProgressMarker {
         /// A file rewritten in place with the same first page, or a reused
         /// inode whose first page is the old file's, agrees with
         /// `content_fingerprint`; the bytes under the read position do not.
-        /// `None` on a row written before the field existed (judged by
-        /// inode, length and first page, exactly as before) and for a marker
-        /// at byte 0. Omitted when `None`, so such a marker serializes byte
-        /// for byte as it did before.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// `None` on a row written before the field existed (judged exactly
+        /// as before, by the fields it carries) and for a marker at byte 0.
+        /// Omitted when `None`, so such a marker serializes byte for byte as
+        /// the code before #620 wrote it.
+        #[serde(
+            default,
+            deserialize_with = "plausible_fingerprint",
+            skip_serializing_if = "Option::is_none"
+        )]
         tail_fingerprint: Option<ContentFingerprint>,
     },
     SyslogSpool {
@@ -248,7 +256,11 @@ pub enum ProgressMarker {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         file_size: Option<u64>,
         /// See [`ProgressMarker::File`]'s field of the same name.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "plausible_fingerprint",
+            skip_serializing_if = "Option::is_none"
+        )]
         content_fingerprint: Option<ContentFingerprint>,
     },
 }
@@ -314,12 +326,50 @@ impl ContentFingerprint {
         bytes.len() as u64 == self.len && crate::checksum::sha256_bytes(bytes) == self.sha256
     }
 
+    /// Whether a writer could have produced this fingerprint: a length of
+    /// 1..=[`Self::MAX_LEN`] and a digest of 64 LOWERCASE hex digits, which
+    /// is what every writer emits. Anything else was corrupted or forged in
+    /// storage: a zero length hashes nothing and would match every file, an
+    /// uppercase digest matches none (the comparisons are of hex text), and
+    /// a length over a page would have a check read that much of the file.
+    pub fn is_plausible(&self) -> bool {
+        (1..=Self::MAX_LEN as u64).contains(&self.len)
+            && self.sha256.len() == 64
+            && self
+                .sha256
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
     /// Whether two fingerprints show the same content: `Some` when they
     /// cover the same number of bytes, `None` when they do not and so cannot
     /// be compared.
     pub fn same_content(&self, other: &Self) -> Option<bool> {
         (self.len == other.len).then(|| self.sha256 == other.sha256)
     }
+}
+
+/// A marker's stored fingerprint, or `None` - "unknown" - when it is not one
+/// a writer could have produced ([`ContentFingerprint::is_plausible`]) or is
+/// not a fingerprint at all (review of #632). Unknown only forgoes a check;
+/// a wrong value would invent a replacement (a forced re-read) or, for a
+/// length over a page, a large read. The restart seed's parser in the state
+/// store already answered this way; markers decoded whole (recovery's
+/// commits and rewinds) did not.
+fn plausible_fingerprint<'de, D>(deserializer: D) -> Result<Option<ContentFingerprint>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Fingerprint(ContentFingerprint),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Stored>::deserialize(deserializer)? {
+        Some(Stored::Fingerprint(fingerprint)) => Some(fingerprint).filter(|f| f.is_plausible()),
+        Some(Stored::Other(_)) | None => None,
+    })
 }
 
 impl ProgressMarker {
@@ -528,6 +578,54 @@ mod tests {
             "an older verify-manifest drops what it does not know and would fail the \
              self-hash: {manifest}"
         );
+    }
+
+    /// Review of #632: a stored fingerprint no writer could produce is
+    /// unknown, never a fingerprint. An uppercase digest matches no file (the
+    /// comparison is of hex text), so it made unchanged content look
+    /// rewritten and forced a re-read; a length over a page drove a read of
+    /// up to `end_byte` bytes; a zero length hashes nothing. The ledger
+    /// rows go through this decode in recovery, the seed's own parser
+    /// already refused them.
+    #[test]
+    fn an_implausible_stored_fingerprint_decodes_as_unknown() {
+        let good = ContentFingerprint::of(b"abc\n").unwrap();
+        let empty_digest = crate::checksum::sha256_bytes(b"");
+        for bad in [
+            format!(r#"{{"len":0,"sha256":"{empty_digest}"}}"#),
+            format!(r#"{{"len":4097,"sha256":"{}"}}"#, good.sha256),
+            format!(
+                r#"{{"len":18446744073709551615,"sha256":"{}"}}"#,
+                good.sha256
+            ),
+            format!(
+                r#"{{"len":4,"sha256":"{}"}}"#,
+                good.sha256.to_ascii_uppercase()
+            ),
+            format!(r#"{{"len":4,"sha256":"{}"}}"#, &good.sha256[..63]),
+            r#"{"len":4,"sha256":"not-a-digest"}"#.to_owned(),
+            r#""a string""#.to_owned(),
+        ] {
+            let row = format!(
+                r#"{{"source_type":"file","path":"/a","inode":1,"start_byte":0,"end_byte":4,"file_size":4,"mtime":"","content_fingerprint":{bad},"tail_fingerprint":{bad}}}"#
+            );
+            let marker: ProgressMarker = serde_json::from_str(&row)
+                .unwrap_or_else(|e| panic!("a bad fingerprint failed the whole row: {e}: {row}"));
+            assert_eq!(marker.content_fingerprint(), None, "{bad}");
+            assert_eq!(marker.tail_fingerprint(), None, "{bad}");
+            let spool = format!(
+                r#"{{"source_type":"syslog_spool","spool_id":"s","path":"/s","inode":1,"start_byte":0,"end_byte":4,"received_time_start":null,"received_time_end":null,"content_fingerprint":{bad}}}"#
+            );
+            let spool: ProgressMarker = serde_json::from_str(&spool).unwrap();
+            assert_eq!(spool.content_fingerprint(), None, "{bad}");
+        }
+        let json = serde_json::to_string(&good).unwrap();
+        let row = format!(
+            r#"{{"source_type":"file","path":"/a","inode":1,"start_byte":0,"end_byte":4,"file_size":4,"mtime":"","content_fingerprint":{json},"tail_fingerprint":{json}}}"#
+        );
+        let marker: ProgressMarker = serde_json::from_str(&row).unwrap();
+        assert_eq!(marker.content_fingerprint(), Some(&good));
+        assert_eq!(marker.tail_fingerprint(), Some(&good));
     }
 
     /// A tail fingerprint covers the LAST page of what it is given, and
