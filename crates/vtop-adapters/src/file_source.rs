@@ -1024,33 +1024,50 @@ impl SourceAdapter for FileSource {
         if still_current {
             let c = self.cursors.entry(path.clone()).or_default();
             c.committed_byte = *end_byte;
+            // A commit with no in-process record is recovery after a restart.
+            let recovered = generation == continuity::Settled::Unknown;
             if c.read_byte < *end_byte {
                 c.read_byte = *end_byte;
-            } else if generation == continuity::Settled::Unknown && c.read_byte > *end_byte {
-                // A commit with no in-process record is recovery after a
-                // restart, and a read head ABOVE it came from the startup
+            } else if recovered && c.read_byte > *end_byte {
+                // A read head ABOVE a recovered commit came from the startup
                 // seed - the newest COMMITTED row, which can be the previous
                 // generation's when this batch (read after a copytruncate)
                 // was only VERIFIED at the crash. Keeping that head, and the
                 // longer length it observed, would resume above this range
                 // in a file that has since regrown, skipping the bytes in
-                // between (review of #564). Restart from this batch's end
-                // and the length it saw: a same-generation batch recovered
-                // out of order costs a re-read, never a skip. In-process
-                // commits keep the head - there it is ahead because later
-                // reads are buffered, not because it is stale.
+                // between (review of #564). Restart from this batch's end:
+                // a same-generation batch recovered out of order costs a
+                // re-read, never a skip. In-process commits keep the head -
+                // there it is ahead because later reads are buffered, not
+                // because it is stale.
                 c.read_byte = *end_byte;
+            }
+            if recovered {
+                // Whatever its end, a recovered commit judged current
+                // describes the file now at the path, and the seed may
+                // describe the one it replaced at the same inode (review of
+                // #578): kept, the seed's fingerprint made the next read take
+                // this file for another replacement and archive its
+                // committed prefix again. So the cursor adopts the identity
+                // this batch saw.
+                //
+                // A legacy marker names no inode; the commit was judged
+                // current against the file at the path, so that file's inode
+                // stands - dropping it would blind the next read to a
+                // rotation (review of #564). Nor does it name content: the
+                // seed's fingerprint of that inode is kept, which can cost a
+                // re-read, never a skip.
+                let inode = (*marker_inode).or(current_inode);
+                let kept = c
+                    .seen
+                    .as_ref()
+                    .filter(|seen| seen.inode == inode)
+                    .and_then(|seen| seen.content.clone());
                 c.seen = Some(FileIdentity {
-                    // A legacy marker names no inode; the commit was judged
-                    // current against the file at the path, so that file's
-                    // inode stands - dropping it would blind the next read
-                    // to a rotation (review of #564).
-                    inode: (*marker_inode).or(current_inode),
+                    inode,
                     file_size: *marker_file_size,
                     mtime: String::new(),
-                    // The content the batch read, already checked against
-                    // the file above; a legacy marker's unknown stays unknown.
-                    content: marker_content.clone(),
+                    content: marker_content.clone().or(kept),
                 });
             }
             tracing::info!(path, end_byte, "file source progress committed");
@@ -2972,5 +2989,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fs.read_position(&read[0].progress_end), None);
+    }
+
+    /// Review of #578 (Codex): startup seeds the cursor from file A, then
+    /// recovers a VERIFIED batch read from B, A's replacement at the same
+    /// inode, ending AT or ABOVE the seed. The commit is current (B is the
+    /// file at the path), but the cursor kept A's fingerprint, so the next
+    /// read took B for another replacement and archived its committed
+    /// prefix again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_recovered_commit_at_or_above_the_seed_adopts_the_replacements_fingerprint() {
+        use std::os::unix::fs::MetadataExt;
+        let a = "old one\nold two\n"; // 16 bytes
+        let b = "NEW one\nNEW two\nNEW three\n"; // lines end at 8, 16, 26
+        for end in [16u64, 26] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("app.log").to_string_lossy().into_owned();
+            std::fs::write(&path, b).unwrap();
+            let inode = std::fs::metadata(&path).unwrap().ino();
+            let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+            fs.seed_committed_from(
+                &path,
+                16,
+                Some(inode),
+                Some(16),
+                ContentFingerprint::of(a.as_bytes()),
+            );
+            let recovered = ProgressMarker::File {
+                path: path.clone(),
+                inode: Some(inode),
+                start_byte: 0,
+                end_byte: end,
+                file_size: b.len() as u64,
+                mtime: String::new(),
+                content_fingerprint: ContentFingerprint::of(b.as_bytes()),
+            };
+            fs.commit_progress(&recovered).await.unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"NEW four\n")
+                .unwrap();
+            let reads = fs
+                .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            let expected: &[&str] = if end == 16 {
+                &["NEW three", "NEW four"]
+            } else {
+                &["NEW four"]
+            };
+            assert_eq!(
+                lines(&reads),
+                expected,
+                "recovered end {end}: B's committed prefix [0,{end}) must not be read again"
+            );
+        }
     }
 }

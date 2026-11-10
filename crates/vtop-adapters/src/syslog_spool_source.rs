@@ -616,20 +616,28 @@ impl SourceAdapter for SyslogSpoolSource {
         {
             let c = self.cursors.entry(path.clone()).or_default();
             c.committed_byte = *end_byte;
-            if c.read_byte < *end_byte {
+            // See `FileSource::commit_progress`: a recovered commit below the
+            // seeded head restarts the head there; and, whatever its end, the
+            // cursor adopts the identity the batch saw - the seed may be of
+            // the spool it replaced at the same inode (review of #578). A
+            // legacy marker keeps the current inode (review of #564) and the
+            // seed's fingerprint of it: a re-read, never a skip.
+            let recovered = generation == continuity::Settled::Unknown;
+            if c.read_byte < *end_byte || (recovered && c.read_byte > *end_byte) {
                 c.read_byte = *end_byte;
-            } else if generation == continuity::Settled::Unknown && c.read_byte > *end_byte {
-                // See `FileSource::commit_progress`: a recovered commit below
-                // the seeded head restarts the head here, with the length
-                // and content this batch saw (none from a legacy marker).
-                c.read_byte = *end_byte;
+            }
+            if recovered {
+                let inode = (*marker_inode).or(current_inode);
+                let kept = c
+                    .seen
+                    .as_ref()
+                    .filter(|seen| seen.inode == inode)
+                    .and_then(|seen| seen.content.clone());
                 c.seen = Some(SpoolSeen {
-                    // A legacy marker names no inode; keep the current one,
-                    // or the next rotation goes unseen (review of #564).
-                    inode: (*marker_inode).or(current_inode),
+                    inode,
                     file_size: marker_file_size.unwrap_or(0),
                     mtime: String::new(),
-                    content: marker_content.clone(),
+                    content: marker_content.clone().or(kept),
                 });
             }
             tracing::info!(path, end_byte, "syslog spool progress committed");
@@ -1616,5 +1624,61 @@ mod tests {
             ["<13>NEW one", "<13>NEW two", "<13>NEW three"],
             "the old range's end must not become the replacement's read position"
         );
+    }
+
+    /// Review of #578 (Codex), for the spool: see the file source's
+    /// `a_recovered_commit_at_or_above_the_seed_adopts_the_replacements_fingerprint`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_recovered_commit_at_or_above_the_seed_adopts_the_replacements_fingerprint() {
+        use std::os::unix::fs::MetadataExt;
+        let a = "<13>old one\n<13>old two\n"; // 24 bytes
+        let b = "<13>NEW one\n<13>NEW two\n<13>NEW three\n"; // lines end at 12, 24, 38
+        for end in [24u64, 38] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("spool.log").to_string_lossy().into_owned();
+            std::fs::write(&path, b).unwrap();
+            let inode = std::fs::metadata(&path).unwrap().ino();
+            let mut spool = SyslogSpoolSource::new(vec![path.clone()]);
+            spool.seed_committed_from(
+                &path,
+                24,
+                Some(inode),
+                Some(24),
+                ContentFingerprint::of(a.as_bytes()),
+            );
+            let recovered = ProgressMarker::SyslogSpool {
+                spool_id: "spool.log".into(),
+                path: path.clone(),
+                inode: Some(inode),
+                start_byte: 0,
+                end_byte: end,
+                received_time_start: None,
+                received_time_end: None,
+                file_size: Some(b.len() as u64),
+                content_fingerprint: ContentFingerprint::of(b.as_bytes()),
+            };
+            spool.commit_progress(&recovered).await.unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"<13>NEW four\n")
+                .unwrap();
+            let reads = spool
+                .read_batch_candidates(&spool_source(&path), 100, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            let expected: &[&str] = if end == 24 {
+                &["<13>NEW three", "<13>NEW four"]
+            } else {
+                &["<13>NEW four"]
+            };
+            assert_eq!(
+                spool_lines(&reads),
+                expected,
+                "recovered end {end}: B's committed prefix [0,{end}) must not be read again"
+            );
+        }
     }
 }
