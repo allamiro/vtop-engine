@@ -132,7 +132,14 @@ pub const BASELINE_FEATURE_LEVEL: u32 = 3;
 /// behaviour on the recorded level, so every replica applies the same
 /// thing). `every_kind_newer_than_the_baseline_release_is_gated` catches a
 /// kind that forgets; the other two are on the author.
-pub const SUPPORTED_FEATURE_LEVEL: u32 = 5;
+pub const SUPPORTED_FEATURE_LEVEL: u32 = 6;
+
+/// The level at which a promotion report may carry a lineage verdict on each
+/// quorum answer (#577). Gated by PAYLOAD rather than by kind: the command is
+/// still `ReportPromotionOutcome` (kind 30), but its lineage-carrying outcome
+/// is a tag an older voter does not know, so it is held back exactly as a new
+/// kind is (see [`MetadataCommand::feature_level`]).
+pub const LINEAGE_VERDICTS_FEATURE_LEVEL: u32 = 6;
 
 /// Why a fenced cursor commit is refused (#457 slice 2b): the commit did not
 /// come from the range's current leaseholder at its current fencing epoch. A
@@ -361,6 +368,49 @@ pub const MAX_TRANSITION_QUORUM: usize = 32;
 pub struct QuorumAnswer {
     pub node_uuid: Uuid,
     pub offset: u64,
+    /// Whether the offset describes the CANDIDATE's history (#577). `None`
+    /// is a record written before verdicts existed (or at a feature level
+    /// below [`LINEAGE_VERDICTS_FEATURE_LEVEL`]): judged exactly as it always
+    /// was, by offset.
+    pub lineage: Option<AnswerLineage>,
+}
+
+/// What the candidate could prove about one fenced replica's history, next
+/// to the offset it answered with (#577).
+///
+/// An offset is a count of records, not an identity: two replicas at 90 need
+/// not hold the same 90 records. The fence reconciles each replica against
+/// the candidate's epoch vector before it answers, so where lineage is
+/// provable the offset describes the candidate's history - but where it is
+/// not (a replica with no epoch history, a broken journal, a candidate that
+/// cannot vouch for its own) nothing is reconciled and the offset describes
+/// whatever wrote it. Readers count only the first two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnswerLineage {
+    /// The replica's history agrees with the candidate's for every record it
+    /// holds. Nothing was discarded.
+    Agreed,
+    /// The replica diverged, discarded the records written under a
+    /// leadership the candidate does not share, and then agreed.
+    Reconciled { truncated_records: u64 },
+    /// Nothing could be proven either way. The offset is not counted.
+    Unknown,
+}
+
+impl AnswerLineage {
+    /// Whether an answer with this verdict counts toward a quorum.
+    pub fn is_provable(self) -> bool {
+        !matches!(self, AnswerLineage::Unknown)
+    }
+}
+
+impl QuorumAnswer {
+    /// Whether this answer counts toward a quorum: a verdict that proves the
+    /// candidate's lineage, or no verdict at all - a record that predates
+    /// verdicts is judged as it always was (#577).
+    pub fn counts(&self) -> bool {
+        self.lineage.is_none_or(AnswerLineage::is_provable)
+    }
 }
 
 /// Why a promotion was refused, as the transition record keeps it.
@@ -432,6 +482,69 @@ pub enum PromotionOutcome {
     },
 }
 
+impl PromotionOutcome {
+    /// Whether this outcome carries lineage verdicts on its quorum answers -
+    /// the payload only a cluster at [`LINEAGE_VERDICTS_FEATURE_LEVEL`] may
+    /// record (#577).
+    pub fn records_lineage(&self) -> bool {
+        matches!(
+            self,
+            PromotionOutcome::Established { quorum, .. }
+                if quorum.iter().any(|answer| answer.lineage.is_some())
+        )
+    }
+
+    /// This outcome as a cluster below [`LINEAGE_VERDICTS_FEATURE_LEVEL`] can
+    /// record it: no verdicts, and NO Unknown answers (#577).
+    ///
+    /// Dropping the Unknown answers is what keeps the legacy form safe, not a
+    /// loss of evidence that matters to a reader: every reader of a record
+    /// without verdicts counts every answer by its offset, which is the
+    /// exact mistake verdicts exist to prevent. Left in, an Unknown answer
+    /// would vote in the recomputed §5.4.1 count and in the replica-set gate
+    /// (`established_under`) as though it held the candidate's log. The
+    /// promoter never counted them, so `votes`, `required` and the boundary
+    /// recompute from what remains exactly as they were computed.
+    pub fn without_lineage(&self) -> PromotionOutcome {
+        match self {
+            PromotionOutcome::Established {
+                boundary_offset,
+                sealed_prefix_end,
+                quorum,
+                votes,
+                required,
+            } => PromotionOutcome::Established {
+                boundary_offset: *boundary_offset,
+                sealed_prefix_end: *sealed_prefix_end,
+                quorum: quorum
+                    .iter()
+                    .filter(|answer| answer.counts())
+                    .map(|answer| QuorumAnswer {
+                        lineage: None,
+                        ..*answer
+                    })
+                    .collect(),
+                votes: *votes,
+                required: *required,
+            },
+            refused @ PromotionOutcome::Refused { .. } => refused.clone(),
+        }
+    }
+}
+
+/// `PromotionOutcome::Established` without lineage verdicts: the form every
+/// release since v0.5.0 reads.
+const PROMOTION_OUTCOME_ESTABLISHED: u8 = 1;
+const PROMOTION_OUTCOME_REFUSED: u8 = 2;
+/// `PromotionOutcome::Established` with a lineage verdict after each quorum
+/// answer (#577). A new tag rather than a new field, so every existing record
+/// keeps its bytes; recorded only at [`LINEAGE_VERDICTS_FEATURE_LEVEL`].
+const PROMOTION_OUTCOME_ESTABLISHED_WITH_LINEAGE: u8 = 3;
+
+const ANSWER_LINEAGE_AGREED: u8 = 1;
+const ANSWER_LINEAGE_RECONCILED: u8 = 2;
+const ANSWER_LINEAGE_UNKNOWN: u8 = 3;
+
 pub(crate) fn encode_promotion_outcome(
     out: &mut Vec<u8>,
     outcome: &PromotionOutcome,
@@ -444,7 +557,23 @@ pub(crate) fn encode_promotion_outcome(
             votes,
             required,
         } => {
-            put_u8(out, 1);
+            // Verdicts on every answer or on none: a record half of whose
+            // answers carry one would be read by no reader correctly.
+            let with_lineage = outcome.records_lineage();
+            if with_lineage && quorum.iter().any(|answer| answer.lineage.is_none()) {
+                return Err(CodecError::InvalidValue {
+                    what: "promotion quorum answers",
+                    reason: "a lineage verdict must be on every answer or on none",
+                });
+            }
+            put_u8(
+                out,
+                if with_lineage {
+                    PROMOTION_OUTCOME_ESTABLISHED_WITH_LINEAGE
+                } else {
+                    PROMOTION_OUTCOME_ESTABLISHED
+                },
+            );
             encode_optional_u64(out, *boundary_offset);
             encode_optional_u64(out, *sealed_prefix_end);
             if quorum.len() > MAX_TRANSITION_QUORUM {
@@ -458,12 +587,21 @@ pub(crate) fn encode_promotion_outcome(
             for answer in quorum {
                 put_uuid(out, answer.node_uuid);
                 put_u64(out, answer.offset);
+                match answer.lineage {
+                    None => {}
+                    Some(AnswerLineage::Agreed) => put_u8(out, ANSWER_LINEAGE_AGREED),
+                    Some(AnswerLineage::Reconciled { truncated_records }) => {
+                        put_u8(out, ANSWER_LINEAGE_RECONCILED);
+                        put_u64(out, truncated_records);
+                    }
+                    Some(AnswerLineage::Unknown) => put_u8(out, ANSWER_LINEAGE_UNKNOWN),
+                }
             }
             put_u32(out, *votes);
             put_u32(out, *required);
         }
         PromotionOutcome::Refused { reason } => {
-            put_u8(out, 2);
+            put_u8(out, PROMOTION_OUTCOME_REFUSED);
             put_u8(out, reason.wire_tag());
         }
     }
@@ -474,7 +612,8 @@ pub(crate) fn decode_promotion_outcome(
     reader: &mut Reader<'_>,
 ) -> Result<PromotionOutcome, CodecError> {
     match reader.u8("promotion outcome")? {
-        1 => {
+        tag @ (PROMOTION_OUTCOME_ESTABLISHED | PROMOTION_OUTCOME_ESTABLISHED_WITH_LINEAGE) => {
+            let with_lineage = tag == PROMOTION_OUTCOME_ESTABLISHED_WITH_LINEAGE;
             let boundary_offset = decode_optional_u64(reader, "promotion boundary offset")?;
             let sealed_prefix_end = decode_optional_u64(reader, "promotion sealed prefix end")?;
             let count = reader.u16("promotion quorum answer count")? as usize;
@@ -487,9 +626,38 @@ pub(crate) fn decode_promotion_outcome(
             }
             let mut quorum = Vec::with_capacity(count);
             for _ in 0..count {
+                let node_uuid = reader.uuid("promotion quorum node")?;
+                let offset = reader.u64("promotion quorum offset")?;
+                let lineage = if with_lineage {
+                    Some(match reader.u8("quorum answer lineage")? {
+                        ANSWER_LINEAGE_AGREED => AnswerLineage::Agreed,
+                        ANSWER_LINEAGE_RECONCILED => AnswerLineage::Reconciled {
+                            truncated_records: reader.u64("quorum answer truncated records")?,
+                        },
+                        ANSWER_LINEAGE_UNKNOWN => AnswerLineage::Unknown,
+                        other => {
+                            return Err(CodecError::UnknownTag {
+                                what: "quorum answer lineage",
+                                tag: u32::from(other),
+                            })
+                        }
+                    })
+                } else {
+                    None
+                };
                 quorum.push(QuorumAnswer {
-                    node_uuid: reader.uuid("promotion quorum node")?,
-                    offset: reader.u64("promotion quorum offset")?,
+                    node_uuid,
+                    offset,
+                    lineage,
+                });
+            }
+            // A lineage-tagged outcome with no answers would decode to the
+            // same value as the legacy tag and re-encode differently, so a
+            // MAC over the re-encoding (#240 item 5) could not verify it.
+            if with_lineage && quorum.is_empty() {
+                return Err(CodecError::InvalidValue {
+                    what: "promotion quorum answers",
+                    reason: "a lineage-carrying outcome must carry at least one answer",
                 });
             }
             Ok(PromotionOutcome::Established {
@@ -500,7 +668,7 @@ pub(crate) fn decode_promotion_outcome(
                 required: reader.u32("promotion required votes")?,
             })
         }
-        2 => Ok(PromotionOutcome::Refused {
+        PROMOTION_OUTCOME_REFUSED => Ok(PromotionOutcome::Refused {
             reason: PromotionRefusal::from_wire(reader.u8("promotion refusal")?)?,
         }),
         other => Err(CodecError::UnknownTag {
@@ -1029,6 +1197,14 @@ impl MetadataCommand {
     /// the log (#554): the level of the release that introduced its kind.
     pub fn feature_level(&self) -> u32 {
         match self {
+            // A lineage verdict on each quorum answer (#577) is the same kind
+            // with a payload an older voter cannot decode, so it is gated by
+            // what it carries; the report without one is still v0.5.0's.
+            MetadataCommand::ReportPromotionOutcome { outcome, .. }
+                if outcome.records_lineage() =>
+            {
+                LINEAGE_VERDICTS_FEATURE_LEVEL
+            }
             // v0.5.0 (#240 item 5).
             MetadataCommand::ReportPromotionOutcome { .. } => 2,
             // v0.6.0 (#457 slices 2b and 4a).
@@ -3079,10 +3255,12 @@ mod tests {
                         QuorumAnswer {
                             node_uuid: Uuid::from_u128(10),
                             offset: 401,
+                            lineage: None,
                         },
                         QuorumAnswer {
                             node_uuid: Uuid::from_u128(11),
                             offset: 400,
+                            lineage: None,
                         },
                     ],
                     votes: 2,
@@ -3098,6 +3276,17 @@ mod tests {
                 outcome: PromotionOutcome::Refused {
                     reason: PromotionRefusal::LeaderBehind,
                 },
+            },
+            // The same kind with a lineage verdict on every answer (#577):
+            // every verdict, so the round-trip, trailing-byte and truncation
+            // cases cover each arm of the new tag.
+            MetadataCommand::ReportPromotionOutcome {
+                env: envelope(39),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                holder_node_uuid: Uuid::from_u128(10),
+                fencing_epoch: 6,
+                outcome: lineage_outcome(),
             },
             // The four group commands a gateway sends (#457). They were not
             // in this list when they landed, so the round-trip, the
@@ -3209,11 +3398,156 @@ mod tests {
         ]
     }
 
+    /// A lineage-carrying outcome (#577) with every verdict: the candidate
+    /// itself (agreed), a replica that discarded two records to agree, and
+    /// one whose history could not be compared - which is not counted, so
+    /// the boundary and the votes are those of the first two.
+    fn lineage_outcome() -> PromotionOutcome {
+        PromotionOutcome::Established {
+            boundary_offset: Some(400),
+            sealed_prefix_end: None,
+            quorum: vec![
+                QuorumAnswer {
+                    node_uuid: Uuid::from_u128(10),
+                    offset: 401,
+                    lineage: Some(AnswerLineage::Agreed),
+                },
+                QuorumAnswer {
+                    node_uuid: Uuid::from_u128(11),
+                    offset: 400,
+                    lineage: Some(AnswerLineage::Reconciled {
+                        truncated_records: 2,
+                    }),
+                },
+                QuorumAnswer {
+                    node_uuid: Uuid::from_u128(12),
+                    offset: 500,
+                    lineage: Some(AnswerLineage::Unknown),
+                },
+            ],
+            votes: 2,
+            required: 2,
+        }
+    }
+
+    /// #577: a promotion report carrying lineage verdicts is a payload an
+    /// older voter cannot decode, so it needs its own feature level, and the
+    /// form a lower level records instead carries no verdict and NO answer
+    /// whose lineage was unknown - every reader of the legacy form counts
+    /// every answer by its offset.
+    #[test]
+    fn a_lineage_carrying_report_is_gated_and_its_legacy_form_drops_unknown_answers() {
+        let report = |outcome: PromotionOutcome| MetadataCommand::ReportPromotionOutcome {
+            env: envelope(40),
+            topic_uuid: Uuid::from_u128(20),
+            range_uuid: Uuid::from_u128(21),
+            holder_node_uuid: Uuid::from_u128(10),
+            fencing_epoch: 6,
+            outcome,
+        };
+        let with = lineage_outcome();
+        assert!(with.records_lineage());
+        assert_eq!(
+            report(with.clone()).feature_level(),
+            LINEAGE_VERDICTS_FEATURE_LEVEL,
+            "verdicts are a payload v0.6.0 cannot decode"
+        );
+        const { assert!(LINEAGE_VERDICTS_FEATURE_LEVEL > BASELINE_FEATURE_LEVEL) };
+
+        let legacy = with.without_lineage();
+        assert!(!legacy.records_lineage());
+        assert_eq!(report(legacy.clone()).feature_level(), 2);
+        let PromotionOutcome::Established {
+            quorum,
+            votes,
+            required,
+            boundary_offset,
+            ..
+        } = &legacy
+        else {
+            panic!("{legacy:?}")
+        };
+        assert_eq!(
+            quorum
+                .iter()
+                .map(|answer| (answer.node_uuid.as_u128(), answer.offset, answer.lineage))
+                .collect::<Vec<_>>(),
+            vec![(10, 401, None), (11, 400, None)],
+            "the unknown answer at 500 would count by its offset in every legacy reader"
+        );
+        assert_eq!((*votes, *required, *boundary_offset), (2, 2, Some(400)));
+        // The legacy form is byte-for-byte what a v0.5.0 report is.
+        let mut bytes = Vec::new();
+        encode_promotion_outcome(&mut bytes, &legacy).unwrap();
+        assert_eq!(bytes[0], PROMOTION_OUTCOME_ESTABLISHED);
+
+        // A refusal has no answers to judge and is unchanged.
+        let refused = PromotionOutcome::Refused {
+            reason: PromotionRefusal::QuorumUnavailable,
+        };
+        assert_eq!(refused.without_lineage(), refused);
+        assert_eq!(report(refused).feature_level(), 2);
+    }
+
+    /// #577: verdicts are on every answer or on none, and an unknown verdict
+    /// tag is a newer writer, not corruption.
+    #[test]
+    fn lineage_verdicts_are_all_or_nothing_and_an_unknown_one_reads_as_newer() {
+        let PromotionOutcome::Established {
+            boundary_offset,
+            sealed_prefix_end,
+            mut quorum,
+            votes,
+            required,
+        } = lineage_outcome()
+        else {
+            unreachable!()
+        };
+        quorum[1].lineage = None;
+        let mixed = PromotionOutcome::Established {
+            boundary_offset,
+            sealed_prefix_end,
+            quorum,
+            votes,
+            required,
+        };
+        let mut out = Vec::new();
+        assert!(matches!(
+            encode_promotion_outcome(&mut out, &mixed),
+            Err(CodecError::InvalidValue { .. })
+        ));
+
+        let mut bytes = Vec::new();
+        encode_promotion_outcome(&mut bytes, &lineage_outcome()).unwrap();
+        // outcome tag, boundary (1 + 8), sealed prefix (1), count (2), then
+        // the first answer's uuid and offset: its verdict byte follows.
+        let verdict_at = 1 + 9 + 1 + 2 + 16 + 8;
+        assert_eq!(bytes[verdict_at], ANSWER_LINEAGE_AGREED);
+        bytes[verdict_at] = 0x7f;
+        let error = decode_promotion_outcome(&mut Reader::new(&bytes)).unwrap_err();
+        assert_eq!(
+            error,
+            CodecError::UnknownTag {
+                what: "quorum answer lineage",
+                tag: 0x7f
+            }
+        );
+        assert!(crate::storage::is_newer_format(&error));
+        let mut unknown_outcome = bytes.clone();
+        unknown_outcome[0] = 0x7f;
+        assert!(crate::storage::is_newer_format(
+            &decode_promotion_outcome(&mut Reader::new(&unknown_outcome)).unwrap_err()
+        ));
+    }
+
     /// #554: a command kind an older voter does not know must not enter the
     /// log until the cluster's level says every voter does. So every kind
     /// added after v0.6.0 (the last release before levels: kinds 1..=34)
     /// carries a level above the baseline, and a future kind that forgets
-    /// one fails here rather than stalling a rolling upgrade.
+    /// one fails here rather than stalling a rolling upgrade. The one older
+    /// kind with a newer PAYLOAD - a promotion report carrying lineage
+    /// verdicts (#577), an outcome tag v0.6.0 cannot decode - is gated too,
+    /// and nothing else of an older kind may be.
     #[test]
     fn every_kind_newer_than_the_baseline_release_is_gated() {
         const LAST_BASELINE_KIND: u16 = 34;
@@ -3227,6 +3561,15 @@ mod tests {
                 (1..=SUPPORTED_FEATURE_LEVEL).contains(&level),
                 "kind {kind}: level {level}"
             );
+            let newer_payload = matches!(
+                &command,
+                MetadataCommand::ReportPromotionOutcome { outcome, .. }
+                    if outcome.records_lineage()
+            );
+            if newer_payload {
+                assert_eq!(level, LINEAGE_VERDICTS_FEATURE_LEVEL, "kind {kind}");
+                continue;
+            }
             assert_eq!(
                 kind > LAST_BASELINE_KIND,
                 level > BASELINE_FEATURE_LEVEL,
@@ -3538,10 +3881,12 @@ mod tests {
                     QuorumAnswer {
                         node_uuid: Uuid::from_u128(10),
                         offset: 401,
+                        lineage: None,
                     },
                     QuorumAnswer {
                         node_uuid: Uuid::from_u128(11),
                         offset: 400,
+                        lineage: None,
                     },
                 ],
                 votes: 2,
@@ -3576,6 +3921,7 @@ mod tests {
                 .map(|node| QuorumAnswer {
                     node_uuid: Uuid::from_u128(node),
                     offset: 0,
+                    lineage: None,
                 })
                 .collect();
         }

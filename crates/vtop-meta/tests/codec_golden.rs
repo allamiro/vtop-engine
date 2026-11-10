@@ -10,9 +10,9 @@ use uuid::Uuid;
 use vtop_log::env::{Env, OpenMode};
 use vtop_log::sim::SimStorage;
 use vtop_meta::{
-    CommandEnvelope, HardState, HardStateFile, MetaLog, MetaLogConfig, MetaLogEntry,
+    AnswerLineage, CommandEnvelope, HardState, HardStateFile, MetaLog, MetaLogConfig, MetaLogEntry,
     MetaLogPayload, MetaMembership, MetaNodeId, MetaSnapshots, MetaStateMachine, MetaStoreError,
-    MetadataCommand,
+    MetadataCommand, PromotionOutcome, QuorumAnswer, LINEAGE_VERDICTS_FEATURE_LEVEL,
 };
 
 const ROOT: &str = "/meta";
@@ -40,6 +40,63 @@ const GOLDEN_SET_RANGE_REPLICA_SET_HEX: &str = concat!(
     "bbbbbbbb000000000000000000000031", // member
     "bbbbbbbb000000000000000000000032", // member
     "0000000000000003",                 // expected generation 3
+);
+
+/// ReportPromotionOutcome (kind 30) as every release since v0.5.0 writes it -
+/// derived by hand from the v0.5.0 layout, NOT taken from the encoder under
+/// test, so a change that moved these bytes would fail here rather than agree
+/// with itself (#577): kind, envelope, topic, range, holder, epoch, outcome
+/// tag 1 (established), boundary present, no sealed prefix, two answers of
+/// (node, offset), votes, required.
+const GOLDEN_REPORT_PROMOTION_V050_HEX: &str = concat!(
+    "001e",                             // kind 30
+    "00112233445566778899aabbccddee06", // request id
+    "0102030405060708",                 // issued_at_ms
+    "ffeeddccbbaa99887766554433221100", // topic
+    "0f1e2d3c4b5a69788796a5b4c3d2e1f0", // range
+    "bbbbbbbb000000000000000000000031", // holder
+    "0000000000000007",                 // fencing epoch 7
+    "01",                               // established, no verdicts
+    "01",
+    "0000000000000190", // boundary 400
+    "00",               // no sealed prefix end
+    "0002",             // two answers
+    "bbbbbbbb000000000000000000000031",
+    "0000000000000191", // the holder at 401
+    "bbbbbbbb000000000000000000000032",
+    "0000000000000190", // a replica at 400
+    "00000002",         // votes
+    "00000002",         // required
+);
+
+/// The same report with a lineage verdict after each answer (#577), derived
+/// by hand: outcome tag 3, then per answer (node, offset, verdict) where the
+/// verdict is 1 agreed, 2 reconciled + u64 records discarded, 3 unknown.
+const GOLDEN_REPORT_PROMOTION_WITH_LINEAGE_HEX: &str = concat!(
+    "001e",                             // kind 30
+    "00112233445566778899aabbccddee07", // request id
+    "0102030405060708",                 // issued_at_ms
+    "ffeeddccbbaa99887766554433221100", // topic
+    "0f1e2d3c4b5a69788796a5b4c3d2e1f0", // range
+    "bbbbbbbb000000000000000000000031", // holder
+    "0000000000000007",                 // fencing epoch 7
+    "03",                               // established, with verdicts
+    "01",
+    "0000000000000190", // boundary 400
+    "00",               // no sealed prefix end
+    "0003",             // three answers
+    "bbbbbbbb000000000000000000000031",
+    "0000000000000191", // the holder at 401
+    "01",               // agreed
+    "bbbbbbbb000000000000000000000032",
+    "0000000000000190", // a replica at 400
+    "02",               // reconciled
+    "0000000000000002", // after discarding two records
+    "bbbbbbbb000000000000000000000033",
+    "00000000000001f4", // a replica at 500
+    "03",               // unknown: not counted
+    "00000002",         // votes
+    "00000002",         // required
 );
 
 /// The pinned SplitRange command (#473): request ...ee02, barrier 0x280,
@@ -304,6 +361,92 @@ fn set_range_replica_set_command_matches_golden_vector() {
     assert_eq!(
         command.feature_level(),
         5,
+        "gated: older voters cannot decode it"
+    );
+}
+
+fn golden_report(request: &str, quorum: Vec<QuorumAnswer>) -> MetadataCommand {
+    MetadataCommand::ReportPromotionOutcome {
+        env: CommandEnvelope {
+            request_id: Uuid::parse_str(request).unwrap(),
+            issued_at_ms: 0x0102_0304_0506_0708,
+        },
+        topic_uuid: Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap(),
+        range_uuid: Uuid::parse_str("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0").unwrap(),
+        holder_node_uuid: Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000031").unwrap(),
+        fencing_epoch: 7,
+        outcome: PromotionOutcome::Established {
+            boundary_offset: Some(400),
+            sealed_prefix_end: None,
+            quorum,
+            votes: 2,
+            required: 2,
+        },
+    }
+}
+
+fn answer(node: &str, offset: u64, lineage: Option<AnswerLineage>) -> QuorumAnswer {
+    QuorumAnswer {
+        node_uuid: Uuid::parse_str(node).unwrap(),
+        offset,
+        lineage,
+    }
+}
+
+/// #577: a report written before lineage verdicts existed still decodes -
+/// every answer with NO verdict, which readers judge by offset exactly as
+/// they always did - re-encodes to the same bytes, and needs only the
+/// level that introduced the kind.
+#[test]
+fn a_promotion_report_without_verdicts_decodes_as_it_was_written() {
+    let bytes = from_hex(GOLDEN_REPORT_PROMOTION_V050_HEX);
+    let decoded = MetadataCommand::decode(&bytes).unwrap();
+    let expected = golden_report(
+        "00112233-4455-6677-8899-aabbccddee06",
+        vec![
+            answer("bbbbbbbb-0000-0000-0000-000000000031", 401, None),
+            answer("bbbbbbbb-0000-0000-0000-000000000032", 400, None),
+        ],
+    );
+    assert_eq!(decoded, expected);
+    assert_eq!(
+        to_hex(&expected.encode().unwrap()),
+        GOLDEN_REPORT_PROMOTION_V050_HEX
+    );
+    assert_eq!(decoded.feature_level(), 2);
+}
+
+/// #577: the verdict-carrying report, pinned, and gated at its own level.
+#[test]
+fn a_promotion_report_with_verdicts_matches_golden_vector() {
+    let command = golden_report(
+        "00112233-4455-6677-8899-aabbccddee07",
+        vec![
+            answer(
+                "bbbbbbbb-0000-0000-0000-000000000031",
+                401,
+                Some(AnswerLineage::Agreed),
+            ),
+            answer(
+                "bbbbbbbb-0000-0000-0000-000000000032",
+                400,
+                Some(AnswerLineage::Reconciled {
+                    truncated_records: 2,
+                }),
+            ),
+            answer(
+                "bbbbbbbb-0000-0000-0000-000000000033",
+                500,
+                Some(AnswerLineage::Unknown),
+            ),
+        ],
+    );
+    let encoded = command.encode().unwrap();
+    assert_eq!(to_hex(&encoded), GOLDEN_REPORT_PROMOTION_WITH_LINEAGE_HEX);
+    assert_eq!(MetadataCommand::decode(&encoded).unwrap(), command);
+    assert_eq!(
+        command.feature_level(),
+        LINEAGE_VERDICTS_FEATURE_LEVEL,
         "gated: older voters cannot decode it"
     );
 }

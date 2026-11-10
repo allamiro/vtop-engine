@@ -836,9 +836,14 @@ impl InProcessFollower {
             }
         };
         let divergence = match verdict {
-            // Agreed and Unknown are different facts with the same action:
-            // touch nothing. One says there is nothing to discard, the other
-            // says we cannot prove there is.
+            // Agreed and Unknown are different facts with the same action
+            // HERE: touch nothing. One says there is nothing to discard, the
+            // other says we cannot prove there is. They are NOT the same fact
+            // to the candidate counting this replica's answer, and it tells
+            // them apart from the history this fence returns (#577,
+            // `promotion::fenced_lineage` in vtop-node): an Unknown answer's
+            // offset counts records whatever wrote them, so it is recorded
+            // but never counted toward the quorum.
             crate::fencing_epochs::Lineage::Agreed | crate::fencing_epochs::Lineage::Unknown => {
                 return Ok(0)
             }

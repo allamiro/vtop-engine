@@ -199,6 +199,26 @@ reopen quietly.
   is the leader (an older leader cannot hold a set), and otherwise asks the
   leader it names - so data nodes may be upgraded ahead of the metadata
   tier without one stale endpoint switching the check off.
+- **#577** - a promotion's quorum answers were bare offsets. The fence
+  reconciles each replica against the candidate's epoch vector before it
+  answers, but where lineage cannot be proven (a replica with records and no
+  epoch history, a broken journal, a candidate with no history of its own)
+  it reconciles nothing, and that replica's offset was still counted - toward
+  the majority, the boundary, the §5.4.1 vote and the replica-set gate -
+  whatever leadership wrote its records. The candidate now judges each
+  answer from the history the fence returned: Agreed, Reconciled (it
+  discarded n records first) or Unknown, and only the first two count,
+  even when nothing else is available - falling back to offsets then would
+  be a fence that fails open exactly when needed. A range whose replicas
+  cannot prove lineage is repaired (`vtopctl node repair`, #315), not
+  promoted on a guess; a candidate with no history stands aside for one that
+  has it. The verdicts are recorded with the quorum and the replica-set gate
+  and `vtopctl meta transitions` count only the proven answers. Recording
+  them is a new outcome tag inside the promotion report, so it is gated at
+  feature level 6: below it (or against a metadata tier that predates
+  levels) a data node records the report without verdicts AND without the
+  Unknown answers, which that form's readers would count by offset. Records
+  written before verdicts carry none and are judged exactly as before.
 
 One observation rode along without becoming a fix: scenario 09 once left a
 promotion unacquired within its deadline (#318). The flake has not recurred —

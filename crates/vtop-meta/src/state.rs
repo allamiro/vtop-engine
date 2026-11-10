@@ -1461,9 +1461,17 @@ impl MetaStateMachine {
             if !set.members.contains(holder_to) {
                 return false;
             }
+            // ONLY ANSWERS WHOSE LINEAGE WAS PROVEN COUNT (#577). An offset
+            // is a count of records, not an identity: a replica whose
+            // history could not be compared with the holder's answered with
+            // a number that says nothing about whether it holds the
+            // holder's log, and counting it here would let the set change
+            // while that log is on a minority of the set. A record written
+            // before verdicts existed carries none and is judged as it
+            // always was (`QuorumAnswer::counts`).
             let Some(own) = quorum
                 .iter()
-                .find(|answer| answer.node_uuid == *holder_to)
+                .find(|answer| answer.node_uuid == *holder_to && answer.counts())
                 .map(|answer| answer.offset)
             else {
                 return false;
@@ -1472,9 +1480,9 @@ impl MetaStateMachine {
                 .members
                 .iter()
                 .filter(|member| {
-                    quorum
-                        .iter()
-                        .any(|answer| answer.node_uuid == **member && answer.offset >= own)
+                    quorum.iter().any(|answer| {
+                        answer.node_uuid == **member && answer.counts() && answer.offset >= own
+                    })
                 })
                 .count();
             holding >= majority
@@ -6104,6 +6112,183 @@ mod tests {
         assert_eq!(restored.range_replica_set(topic, range), Some(&grown));
     }
 
+    /// Whether a replica-set change from {1,2,3} to {1,2,3,4} is allowed
+    /// after ONE promotion under {1,2,3} reported `outcome` (#577).
+    fn set_change_allowed_after(outcome: PromotionOutcome) -> bool {
+        let (mut machine, first, topic, range) = leaseable_range(1);
+        for (index, node) in (3..).zip(2..=4u128) {
+            machine.apply(
+                index,
+                &MetadataCommand::RegisterNode {
+                    env: envelope(u128::from(index)),
+                    node_uuid: Uuid::from_u128(node),
+                    addr: format!("n{node}:9200"),
+                    expected_generation: None,
+                },
+            );
+        }
+        let mut index = 10;
+        let mut next = || {
+            index += 1;
+            index
+        };
+        assert_eq!(
+            set_replica_set(&mut machine, next(), topic, range, &[1, 2, 3], 0),
+            MetadataResponse::Ack { generation: 1 }
+        );
+        let generation = range_of(&machine, topic, range).generation;
+        let acquired = acquire(
+            &mut machine,
+            next(),
+            501,
+            2_000,
+            first,
+            topic,
+            range,
+            generation,
+            10_000,
+        );
+        assert!(!is_rejected(&acquired), "{acquired:?}");
+        let epoch = range_of(&machine, topic, range).fencing_epoch;
+        let reported = report(
+            &mut machine,
+            next(),
+            502,
+            2_100,
+            first,
+            topic,
+            range,
+            epoch,
+            outcome,
+        );
+        assert!(!is_rejected(&reported), "{reported:?}");
+        !is_rejected(&set_replica_set(
+            &mut machine,
+            next(),
+            topic,
+            range,
+            &[1, 2, 3, 4],
+            1,
+        ))
+    }
+
+    fn established_with(
+        boundary: u64,
+        quorum: &[(u128, u64, Option<crate::command::AnswerLineage>)],
+        votes: u32,
+        required: u32,
+    ) -> PromotionOutcome {
+        PromotionOutcome::Established {
+            boundary_offset: Some(boundary),
+            sealed_prefix_end: None,
+            quorum: quorum
+                .iter()
+                .map(|(node, offset, lineage)| crate::command::QuorumAnswer {
+                    node_uuid: Uuid::from_u128(*node),
+                    offset: *offset,
+                    lineage: *lineage,
+                })
+                .collect(),
+            votes,
+            required,
+        }
+    }
+
+    /// #577: the replica-set gate counts a replica as holding the leader's
+    /// log only when the promotion PROVED that replica's lineage. Here the
+    /// leader (1) is at 60, replica 2 answered 60 but its history could not
+    /// be compared with the leader's, and replica 3 is behind at 10: by
+    /// offset, 2 of 3 hold the leader's log; by lineage, only the leader
+    /// does - so the set must not change on this evidence.
+    #[test]
+    fn the_replica_set_gate_does_not_count_an_answer_whose_lineage_is_unknown() {
+        use crate::command::AnswerLineage::{Agreed, Unknown};
+        assert!(
+            !set_change_allowed_after(established_with(
+                10,
+                &[
+                    (1, 60, Some(Agreed)),
+                    (2, 60, Some(Unknown)),
+                    (3, 10, Some(Agreed))
+                ],
+                3,
+                2,
+            )),
+            "an unknown-lineage answer at the leader's offset completed the majority"
+        );
+        // The leader's own answer counts only if proven too: a holder whose
+        // history is unknown cannot vouch that anyone holds ITS log.
+        assert!(
+            !set_change_allowed_after(established_with(
+                60,
+                &[
+                    (1, 60, Some(Unknown)),
+                    (2, 60, Some(Agreed)),
+                    (3, 60, Some(Agreed))
+                ],
+                3,
+                2,
+            )),
+            "the holder's own unknown-lineage answer was counted"
+        );
+    }
+
+    /// #577: a replica that discarded a diverged suffix and then agreed
+    /// holds the leader's log as surely as one that never diverged, so a
+    /// Reconciled answer counts exactly like an Agreed one.
+    #[test]
+    fn the_replica_set_gate_counts_a_reconciled_answer() {
+        use crate::command::AnswerLineage::{Agreed, Reconciled};
+        assert!(set_change_allowed_after(established_with(
+            10,
+            &[
+                (1, 60, Some(Agreed)),
+                (
+                    2,
+                    60,
+                    Some(Reconciled {
+                        truncated_records: 3
+                    })
+                ),
+                (3, 10, Some(Agreed)),
+            ],
+            3,
+            2,
+        )));
+    }
+
+    /// #577: a record written before verdicts existed - or at a feature
+    /// level below them - carries none, and is judged EXACTLY as before:
+    /// every answer by its offset. The same numbers as the unknown case
+    /// above open the gate here, which is the old behaviour preserved, not
+    /// endorsed: a new data node never writes an unknown answer into this
+    /// form (`PromotionOutcome::without_lineage`).
+    #[test]
+    fn a_report_without_verdicts_is_judged_as_before() {
+        assert!(set_change_allowed_after(established_with(
+            10,
+            &[(1, 60, None), (2, 60, None), (3, 10, None)],
+            3,
+            2,
+        )));
+        // And the legacy form of the unknown case does NOT open it: the
+        // unknown answer is dropped, not laundered into an offset vote.
+        use crate::command::AnswerLineage::{Agreed, Unknown};
+        let legacy = established_with(
+            10,
+            &[
+                (1, 60, Some(Agreed)),
+                (2, 60, Some(Unknown)),
+                (3, 10, Some(Agreed)),
+            ],
+            3,
+            2,
+        )
+        .without_lineage();
+        assert!(!legacy.records_lineage());
+        assert!(!set_change_allowed_after(legacy));
+    }
+
     /// Release the range's lease and take it again, for a fresh epoch.
     fn release_and_reacquire(
         machine: &mut MetaStateMachine,
@@ -7110,6 +7295,7 @@ mod tests {
                 .map(|(node, offset)| crate::command::QuorumAnswer {
                     node_uuid: Uuid::from_u128(*node),
                     offset: *offset,
+                    lineage: None,
                 })
                 .collect(),
             votes,

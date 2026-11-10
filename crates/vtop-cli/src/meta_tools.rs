@@ -2846,21 +2846,35 @@ pub fn audit_transitions(
                 let mut answers = std::collections::BTreeMap::new();
                 let mut duplicated = false;
                 for answer in quorum {
-                    if answers.insert(answer.node_uuid, answer.offset).is_some() {
+                    if answers.insert(answer.node_uuid, *answer).is_some() {
                         duplicated = true;
                     }
                 }
+                let distinct_answers = answers.len();
+                // Only the answers the promoter COUNTED are recounted
+                // (#577): one whose lineage was Unknown is in the record so
+                // an operator can see it was set aside, and recounting it
+                // would report a correct promotion's vote as a mismatch. A
+                // record without verdicts counts every answer, as it always
+                // did.
+                let answers: std::collections::BTreeMap<Uuid, u64> = answers
+                    .into_iter()
+                    .filter(|(_, answer)| answer.counts())
+                    .map(|(node, answer)| (node, answer.offset))
+                    .collect();
                 // The holder's own offset, as the promoter used it: its
                 // answer in the quorum. A standalone promotion (no quorum,
                 // nothing required) has no answer to give; a replicated one
-                // without the holder's answer is not evidence at all.
+                // without the holder's answer is not evidence at all - nor
+                // is one whose holder's own lineage was Unknown (#577),
+                // which the promoter never establishes on.
                 let standalone = quorum.is_empty() && *required == 0;
                 // A replicated promotion always records the majority it
                 // needed (review): the replication factor is at least the
                 // number of replicas that answered and the majority grows
                 // with it, so `required` below a majority of the answers is
                 // evidence no promotion could produce — and so is zero.
-                let majority_recorded = standalone || (*required as usize) > answers.len() / 2;
+                let majority_recorded = standalone || (*required as usize) > distinct_answers / 2;
                 let holder_answer = answers.get(&view.holder_to).copied();
                 let holder_answered = standalone || holder_answer.is_some();
                 let candidate_offset = holder_answer.or(*boundary_offset).unwrap_or(0);
@@ -2929,6 +2943,16 @@ pub fn audit_transitions(
     Ok(audit)
 }
 
+/// A quorum answer's lineage verdict as the transition listing prints it
+/// (#577); an Unknown answer is printed so it reads as not counted.
+fn lineage_word(lineage: vtop_meta::AnswerLineage) -> &'static str {
+    match lineage {
+        vtop_meta::AnswerLineage::Agreed => "agreed",
+        vtop_meta::AnswerLineage::Reconciled { .. } => "reconciled",
+        vtop_meta::AnswerLineage::Unknown => "unknown-not-counted",
+    }
+}
+
 fn grant_word(grant: GrantKind) -> &'static str {
     match grant {
         GrantKind::Election => "election",
@@ -2973,7 +2997,15 @@ fn outcome_text(view: &AdminTransitionView, record: &TransitionAudit) -> String 
                     .unwrap_or_default();
                 let quorum = quorum
                     .iter()
-                    .map(|answer| format!("{}:{}", answer.node_uuid, answer.offset))
+                    .map(|answer| match answer.lineage {
+                        None => format!("{}:{}", answer.node_uuid, answer.offset),
+                        Some(lineage) => format!(
+                            "{}:{}:{}",
+                            answer.node_uuid,
+                            answer.offset,
+                            lineage_word(lineage)
+                        ),
+                    })
                     .collect::<Vec<_>>()
                     .join(",");
                 let regression = record
@@ -3088,7 +3120,19 @@ fn transition_json(view: &AdminTransitionView, record: &TransitionAudit) -> serd
                 "kind": "established",
                 "boundary_offset": boundary_offset,
                 "sealed_prefix_end": sealed_prefix_end,
-                "quorum": quorum.iter().map(|answer| serde_json::json!({ "node_uuid": answer.node_uuid, "offset": answer.offset })).collect::<Vec<_>>(),
+                "quorum": quorum.iter().map(|answer| {
+                    let mut json = serde_json::json!({ "node_uuid": answer.node_uuid, "offset": answer.offset });
+                    // Absent for a record without verdicts (#577), so a
+                    // consumer cannot mistake "not recorded" for a verdict.
+                    if let Some(lineage) = answer.lineage {
+                        json["lineage"] = serde_json::json!(lineage_word(lineage));
+                        json["counted"] = serde_json::json!(answer.counts());
+                        if let vtop_meta::AnswerLineage::Reconciled { truncated_records } = lineage {
+                            json["truncated_records"] = serde_json::json!(truncated_records);
+                        }
+                    }
+                    json
+                }).collect::<Vec<_>>(),
                 "votes": votes,
                 "required": required,
                 "reported_at_ms": reported_at_ms,
@@ -3858,14 +3902,17 @@ transport: plaintext
                             QuorumAnswer {
                                 node_uuid: holder_a,
                                 offset: 90,
+                                lineage: None,
                             },
                             QuorumAnswer {
                                 node_uuid: holder_b,
                                 offset: 80,
+                                lineage: None,
                             },
                             QuorumAnswer {
                                 node_uuid: Uuid::from_u128(0xa3),
                                 offset: 95,
+                                lineage: None,
                             },
                         ],
                         votes: 2,
@@ -4189,6 +4236,90 @@ transport: plaintext
                 .count(),
             1
         );
+    }
+
+    /// #577: a promotion recorded with lineage verdicts is audited the way
+    /// the promoter counted it - the answer whose lineage was Unknown is
+    /// shown, marked as not counted, and left out of the recomputed vote and
+    /// boundary. Recounting it would call a correct promotion's boundary
+    /// wrong (the second highest of {95, 90, 80} is 90, not 80); counting it
+    /// as proven is exactly that mismatch.
+    #[test]
+    fn an_audit_recounts_only_the_answers_the_promoter_counted() {
+        use vtop_meta::{AnswerLineage, QuorumAnswer};
+        let topic = Uuid::from_u128(0x70);
+        let range = Uuid::from_u128(0x71);
+        let key = [0x11_u8; 32];
+        let holder = Uuid::from_u128(0xa1);
+        let view = |third: AnswerLineage| {
+            let mut view = AdminTransitionView {
+                epoch_from: 0,
+                epoch_to: 1,
+                holder_from: None,
+                holder_to: holder,
+                grant: GrantKind::Election,
+                granted_at_ms: 1_000,
+                granted_apply_index: 10,
+                outcome: TransitionOutcome::Reported {
+                    outcome: PromotionOutcome::Established {
+                        boundary_offset: Some(80),
+                        sealed_prefix_end: None,
+                        quorum: vec![
+                            QuorumAnswer {
+                                node_uuid: holder,
+                                offset: 90,
+                                lineage: Some(AnswerLineage::Agreed),
+                            },
+                            QuorumAnswer {
+                                node_uuid: Uuid::from_u128(0xa2),
+                                offset: 80,
+                                lineage: Some(AnswerLineage::Reconciled {
+                                    truncated_records: 2,
+                                }),
+                            },
+                            QuorumAnswer {
+                                node_uuid: Uuid::from_u128(0xa3),
+                                offset: 95,
+                                lineage: Some(third),
+                            },
+                        ],
+                        votes: 2,
+                        required: 2,
+                    },
+                    reported_at_ms: 1_500,
+                    reported_apply_index: 12,
+                },
+                mac: None,
+            };
+            // Signed over the verdict-carrying encoding: the MAC re-encodes
+            // the record, so the new tag must verify too.
+            view.mac = Some(view.record().mac(&key, topic, range).unwrap());
+            vec![view]
+        };
+
+        let views = view(AnswerLineage::Unknown);
+        let audit =
+            audit_transitions(&views, Some(&key), topic, range, 1, None, Some(None)).unwrap();
+        assert!(audit.verdict().is_ok(), "{audit:?}");
+        assert_eq!(audit.verified, 1);
+        let vote = audit.records[0].vote.as_ref().unwrap();
+        assert!(vote.ok && vote.boundary_ok, "{vote:?}");
+        let line = transition_line(&views[0], &audit.records[0]);
+        assert!(line.contains(":95:unknown-not-counted"), "{line}");
+        assert!(line.contains(":80:reconciled"), "{line}");
+        let json = transition_json(&views[0], &audit.records[0]);
+        let answers = json["outcome"]["quorum"].as_array().unwrap();
+        assert_eq!(answers[2]["lineage"], "unknown-not-counted");
+        assert_eq!(answers[2]["counted"], false);
+        assert_eq!(answers[1]["truncated_records"], 2);
+
+        // The same numbers with the third answer PROVEN: then it does count,
+        // and 80 is not the boundary this quorum proves.
+        let views = view(AnswerLineage::Agreed);
+        let audit =
+            audit_transitions(&views, Some(&key), topic, range, 1, None, Some(None)).unwrap();
+        let vote = audit.records[0].vote.as_ref().unwrap();
+        assert!(!vote.boundary_ok && !vote.ok, "{vote:?}");
     }
 
     /// The key comes from the environment as 64 hex characters, or not at all.
