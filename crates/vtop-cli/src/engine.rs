@@ -2940,12 +2940,12 @@ impl ShutdownRequests for OsShutdownSignals {
 ///
 /// The inode is part of the unit: a path that was rotated has incomplete
 /// ranges for the old file and for the current one, and a lower offset in the
-/// old file must not hide the current file's range from the plan. So, within
-/// an inode, is content PROVEN to be another file's (#578): a replacement at
-/// the same inode. Each such generation keeps its own lowest start, so the
-/// replacement's rewind is attempted (and lands) even though the old
-/// content's, lower, is refused; content that cannot be told apart stays one
-/// generation, so one file is never rewound twice.
+/// old file must not hide the current file's range from the plan. The same
+/// holds within one inode (#578): content proven to belong to another file -
+/// a replacement at the same inode - is its own generation with its own
+/// lowest start, so the replacement's rewind is attempted (and lands) even
+/// though the old content's lower one is refused. Content that cannot be told
+/// apart stays one generation, so one file is never rewound twice.
 #[derive(Default)]
 struct RewindPlan {
     /// Per unit, one rewind per proven content generation.
