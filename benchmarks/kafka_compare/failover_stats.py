@@ -183,13 +183,16 @@ def kafka_loss_check(acked_sequences: Iterable[int], consumed_values: Iterable[s
 
 def kafka_time_to_leader(probe_lines: Iterable[str], fault_ms: float, old_leader: int,
                          tolerance_ms: float = 0.0) -> tuple[float, int] | None:
-    """(ms from the fault, new leader id) at the first Metadata answer, from any broker,
+    """(ms from the fault, new leader id) at the EARLIEST Metadata answer, from any broker,
     naming a leader other than `old_leader`, or None if none did.
 
     Observations up to `tolerance_ms` before the fault count (the probe's clock and
     the fault's are aligned only that well); an answer naming -1 (no leader) is not
-    a new leader.
+    a new leader. The earliest by timestamp, not the first line: the probe's
+    per-broker threads append in turn, so file order is not guaranteed to be time
+    order.
     """
+    best = None
     for line in probe_lines:
         if not line.strip():
             continue
@@ -198,9 +201,9 @@ def kafka_time_to_leader(probe_lines: Iterable[str], fault_ms: float, old_leader
         if t_ms < fault_ms - tolerance_ms or not event.get("ok"):
             continue
         leader = event.get("leader")
-        if leader is not None and leader >= 0 and leader != old_leader:
-            return t_ms - fault_ms, leader
-    return None
+        if leader is not None and leader >= 0 and leader != old_leader and (best is None or t_ms < best[0]):
+            best = (t_ms, leader)
+    return None if best is None else (best[0] - fault_ms, best[1])
 
 
 # ------------------------------------------------------------------------- VTOP side

@@ -37,7 +37,7 @@ Every repetition that reached its read-back found every acknowledged record, onc
 
 Median (min - max) over the repetitions that ran, each system at its shipped timeouts.
 
-| fault | system | unavailability window | time to new leader | p99 latency, 30 s after | p99 latency, 30 s before | client retries (each client's own count, not comparable) | acked lost | duplicates |
+| fault | system | unavailability window (longest ack gap after the fault) | time to new leader | p99 latency, 30 s after | p99 latency, 30 s before | client retries (each client's own count, not comparable) | acked lost | duplicates |
 |---|---|---|---|---|---|---|---|---|
 | kill -9 of the leader | Kafka | 9.18 s (8.91 s - 13.5 s) | 8.45 s (7.89 s - 12.5 s) | 8.88 s (8.61 s - 13.2 s) | 8 ms (6 ms - 8 ms) | 4 (2 - 4) | 0 (0 - 0) | 0 (0 - 0) |
 | kill -9 of the leader | VTOP | 28.9 s (28.6 s - 29.0 s) | 13.4 s (13.2 s - 13.6 s) | 28.7 s (28.3 s - 28.8 s) | 8 ms (8 ms - 9 ms) | 256 (231 - 258) | 0 (0 - 0) | 0 (0 - 0) |
@@ -45,6 +45,10 @@ Median (min - max) over the repetitions that ran, each system at its shipped tim
 | orderly stop of the leader | VTOP | 15.5 s (13.3 s - 16.9 s) | 1.51 s (937 ms - 3.13 s) | 15.3 s (13.0 s - 16.7 s) | 8 ms (8 ms - 8 ms) | 111 (108 - 145) | 0 (0 - 0) | 0 (0 - 0) |
 | network partition of the leader | Kafka | 30.0 s (30.0 s - 30.0 s) | 11.7 s (8.84 s - 12.8 s) | 29.7 s (29.7 s - 29.8 s) | 8 ms (7 ms - 9 ms) | 5 (5 - 5) | 0 (0 - 0) | 0 (0 - 0) |
 | network partition of the leader | VTOP | 30.1 s (30.1 s - 30.1 s) | 13.5 s (12.9 s - 13.6 s) | 29.9 s (29.9 s - 29.9 s) | 8 ms (8 ms - 9 ms) | 13 (7 - 29) | 0 (0 - 0) | 0 (0 - 0) |
+
+The unavailability window is the longest gap between acknowledgements after the fault, so a repetition with no outage still reports one: its longest ordinary gap. In Kafka stop_leader repetition 2 (35 ms, starting 615 ms after the fault, against a 30 ms steady-state longest gap) the gap is within twice the steady-state one: the producer saw no outage, and that value is jitter, not a failover time. It is still counted in the median and range above.
+
+**VTOP latency in this run is understated by up to 19.8 ms.** Its producer (`vtop-node produce --rate`, batches of 100) sent each batch when the batch's FIRST record was due, so the batch's other records left up to 19.8 ms before their scheduled send time, and a latency measured from the schedule is short by up to that much. Against VTOP's 30 s-before p99 (at most 9 ms here) that is not a small error, so that column is not comparable with Kafka's; against its 30 s-after p99 (at least 13.0 s here) it is. The unavailability window and the time to new leader do not use the schedule. The producer now waits until a batch's last record is due; a VTOP p99 before that is comparable needs a re-run.
 
 ![Unavailability and time to leader](img/kafka-failover-unavailability.png)
 
@@ -91,8 +95,9 @@ Median (min - max) over the repetitions that ran, each system at its shipped tim
   (`compose.kafka.yml`), the topic created with one partition, RF=3, `min.insync.replicas=2`. VTOP: three
   co-located nodes, each a metadata Raft voter and a candidate replica of one range
   (`compose.vtop-ha.yml`, `vtop/ha-node-*.yaml`), quorum acknowledgement (2 of 3), TLS on every plane
-  (promotion is refused on a plaintext replica plane). Every node 2 CPUs, 2g, no swap, a named volume
-  on `/dev/vda1 ext4`. Each repetition starts from empty volumes, one system at a time.
+  (promotion is refused on a plaintext replica plane); Kafka's listeners are PLAINTEXT, as `compose.kafka.yml`
+  ships them, so the VTOP side also pays TLS handshakes on every reconnect. Every node 2 CPUs, 2g, no
+  swap, a named volume on `/dev/vda1 ext4`. Each repetition starts from empty volumes, one system at a time.
 - **Load.** 5,000 records/s offered for 475,000 records, `acks=all`, one partition, one producer. The
   rate is well under both systems' saturation (phase 1: about 24K records/s for VTOP at 100 B through the
   gateway; its native client reached about 16K records/s closed-loop in batches of 100 while this
@@ -146,7 +151,7 @@ Median (min - max) over the repetitions that ran, each system at its shipped tim
 | VTOP metadata Raft | `election_timeout_min_ms` | `300` | binary defaults |
 | VTOP metadata Raft | `heartbeat_interval_ms` | `60` | binary defaults |
 | VTOP native driver | `backoff_ms` | `100` | vtop/failover-driver.sh, set to the JVM client's request.timeout.ms and retry.backoff.ms defaults |
-| VTOP native driver | `lease_observer_poll_ms` | `100` | vtop/failover-driver.sh, set to the JVM client's request.timeout.ms and retry.backoff.ms defaults |
+| VTOP native driver | `lease_observer_poll_ms` | `100` | vtop/failover-driver.sh `LEASE_POLL_SECONDS`: the lease observer's poll, which feeds only the time to new leader, never the producer |
 | VTOP native driver | `request_timeout_ms` | `30000` | vtop/failover-driver.sh, set to the JVM client's request.timeout.ms and retry.backoff.ms defaults |
 | both observers | poll interval | `100 ms` | `metadata_probe.py`, `failover-driver.sh` |
 
@@ -192,7 +197,7 @@ No `matched-timeouts` profile was run: these are the shipped defaults, and the f
   metadata names one; the native driver re-reads the lease only after its produce ends (connection lost,
   refused, or a 30 s request timeout). Part of every VTOP window is that client's behaviour, not the cluster's.
 
-- **Produce refused by a serving leader.** In partition_leader repetition 2 (16 attempts), the new VTOP leader answered produce attempts with a refusal rather than an acknowledgement for a short stretch, then acknowledged again; the read-back found nothing lost. The driver log of each such repetition (`logs/vtop-<fault>-<rep>/driver.log`) has the exact lines; in this run they read `produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3`, just after the partitioned old leader was reconnected.
+- **Produce refused by a serving leader.** In partition_leader repetition 2 (16 attempts), a VTOP leader answered produce attempts with a refusal rather than an acknowledgement. The read-back of it passed: 0 acknowledged records lost, 0 duplicated. The driver log of each such repetition (`logs/vtop-<fault>-<rep>/driver.log`) has the exact lines.
 
 ## Not measured here
 

@@ -31,11 +31,13 @@ import argparse
 import datetime as dt
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -94,6 +96,24 @@ class Refused(Exception):
     """The repetition could not run as specified; the message goes in `note`."""
 
 
+class Incomplete(Exception):
+    """The producer did not acknowledge every record it was asked to send: a failed
+    repetition, whose truncated latencies and gaps are not a measurement."""
+
+
+def check_complete(row: dict[str, Any], producer_finished: bool, how: str) -> None:
+    """Refuse to summarise a repetition whose producer did not finish, or finished short.
+
+    A producer stopped at the drain deadline leaves its last outage unresolved
+    (no acknowledgement ends the gap) and its unsent records out of the latency
+    percentiles, so the numbers would describe a better run than the one that
+    happened. The read-back still ran and stays in the row.
+    """
+    acked, target = row.get("records_acked"), row["records_target"]
+    if not producer_finished or acked != target:
+        raise Incomplete(f"producer incomplete ({how}): {acked} of {target} records acknowledged")
+
+
 # ----------------------------------------------------------------------- environment
 
 
@@ -112,6 +132,10 @@ def engine_commit() -> str:
 
 
 def ensure_vtop_image(rebuild: bool) -> str:
+    dirty = phase1.dirty_build_inputs()
+    if dirty:
+        raise SystemExit(f"the engine's build inputs differ from HEAD ({'; '.join(dirty[:5])}): "
+                         "commit or stash them, so the image benchmarked is the commit recorded")
     image = f"vtop-bench:{engine_commit()[:12]}"
     exists = sh(["docker", "image", "inspect", image], check=False).returncode == 0
     if rebuild or not exists:
@@ -130,6 +154,13 @@ def capture_environment(run_id: str, matrix: dict, vtop_image: str, limits: dict
     c["client_kafka"] = f"kafka-verifiable-producer.sh {KAFKA_IMAGE.split('@')[0].split(':')[-1]} (JVM)"
     c["client_vtop"] = "vtop-node produce (native protocol, TLS) via vtop/failover-driver.sh"
     c["observer_image"] = PYTHON_IMAGE
+    # The two transports differ, and reconnect timings carry it: every VTOP
+    # plane is mutual TLS (promotion is refused on a plaintext replica plane),
+    # Kafka's listeners are PLAINTEXT as compose.kafka.yml ships them.
+    c["transport"] = "Kafka: PLAINTEXT on every listener; VTOP: mutual TLS on every plane"
+    # How `vtop-node produce --rate` paces a batch: it goes out once its LAST
+    # record is due (#613 review), so no record leaves before its schedule.
+    c["vtop_pacing"] = "last-record-due"
     c["producer_props"] = ["acks=all (--acks -1)", *KAFKA_PRODUCER_PROPS,
                            "every other producer setting at the client default"]
     c.pop("consumer_props", None)
@@ -150,9 +181,12 @@ def capture_environment(run_id: str, matrix: dict, vtop_image: str, limits: dict
                                  "vtop/ha-node-*.yaml"},
         "vtop_raft": {"election_timeout_min_ms": 300, "election_timeout_max_ms": 600, "heartbeat_interval_ms": 60,
                       "source": "binary defaults"},
-        "vtop_driver": {"request_timeout_ms": 30000, "backoff_ms": 100, "lease_observer_poll_ms": 100,
+        "vtop_driver": {"request_timeout_ms": 30000, "backoff_ms": 100,
                         "source": "vtop/failover-driver.sh, set to the JVM client's request.timeout.ms and "
                                   "retry.backoff.ms defaults"},
+        "vtop_lease_observer": {"poll_ms": 100,
+                                "source": "vtop/failover-driver.sh LEASE_POLL_SECONDS: the lease observer, which "
+                                          "feeds only the time to new leader, never the producer"},
         "kafka_observer_poll_ms": 100,
     }
     return env
@@ -411,6 +445,7 @@ def run_kafka(ctx: dict, fault: str, raw: str, logs: str, row: dict) -> tuple[li
     out_path = os.path.join(raw, "producer.out")
     err_path = os.path.join(raw, "producer.err")
     command = verifiable_producer(raw, "--throughput", str(ctx["rate"]), "--max-messages", str(ctx["total"]))
+    stopped = False
     with open(out_path, "w") as out, open(err_path, "w") as err:
         producer = subprocess.Popen(command, stdout=out, stderr=err)
     launched = time.time()
@@ -430,6 +465,7 @@ def run_kafka(ctx: dict, fault: str, raw: str, logs: str, row: dict) -> tuple[li
             sh(["docker", "rm", "-f", PRODUCER], check=False)
             producer.wait()
             row["note"] = f"producer still running {POST_S + DRAIN_DEADLINE_S} s after the fault; stopped"
+            stopped = True
     finally:
         if producer.poll() is None:
             sh(["docker", "rm", "-f", PRODUCER], check=False)
@@ -459,11 +495,9 @@ def run_kafka(ctx: dict, fault: str, raw: str, logs: str, row: dict) -> tuple[li
     else:
         row["note"] = (row.get("note", "") + "; no broker named a new leader during the run").lstrip("; ")
     row.update(send_errors=len(run.errors), retries=warnings["retries"], reroutes=None,
-               error_classes="; ".join(f"{k}={v}" for k, v in warnings.items() if v)
-               + ("; " if run.errors and any(warnings.values()) else "")
-               + "; ".join(sorted({f"send_error:{e[1]}" for e in run.errors})),
+               error_classes=kafka_error_classes(warnings, run.errors),
                acked_lost=check.acked_lost, duplicates=check.duplicates, unacked_present=check.unacked_present,
-               records_acked=len(run.acks))
+               records_acked=len({a.first_seq for a in run.acks}))
     if check.acked_lost or check.duplicates or check.unexpected:
         row["verify"] = (f"FAILED: {check.acked_lost} acknowledged records missing (first {check.first_lost}), "
                          f"{check.duplicates} duplicates, {check.unexpected} unexpected values, "
@@ -485,7 +519,18 @@ def run_kafka(ctx: dict, fault: str, raw: str, logs: str, row: dict) -> tuple[li
         json.dump({"tool_data": run.tool_data, "non_json_stdout_lines": run.non_json_lines,
                    "records_read": len(records), "loss_check": check._asdict(),
                    "first_send_errors": run.errors[:5]}, handle, indent=2, sort_keys=True)
-    return run.acks, {"origin_ms": run.startup_ms, "fault_vm_ms": fault_vm_ms}
+    finished = not stopped and producer.returncode == 0
+    how = "stopped at the drain deadline" if stopped else f"exit {producer.returncode}"
+    return run.acks, {"origin_ms": run.startup_ms, "fault_vm_ms": fault_vm_ms, "finished": finished, "how": how}
+
+
+def kafka_error_classes(warnings: dict[str, int], errors: list[tuple[float, str, str]]) -> str:
+    """The Kafka row's `error_classes` cell: the client's warning counts, then each
+    exception class the producer reported a failed send with, all as `label=count`,
+    the form `failover_report.error_classes` reads (a bare label is dropped there)."""
+    sends = Counter(f"send_error:{exception}" for _, exception, _ in errors)
+    classes = [f"{k}={v}" for k, v in warnings.items() if v] + [f"{k}={v}" for k, v in sorted(sends.items())]
+    return "; ".join(classes)
 
 
 def observe_kafka_producer_config(ctx: dict, raw: str) -> None:
@@ -526,7 +571,8 @@ def run_vtop(ctx: dict, fault: str, raw: str, logs: str, row: dict) -> tuple[lis
         sh(["docker", "wait", PRODUCER], check=False, timeout=POST_S + DRAIN_DEADLINE_S)
     except subprocess.TimeoutExpired:
         pass  # judged by the `done` marker below; the driver is removed either way
-    if not os.path.exists(os.path.join(raw, "done")):
+    finished = os.path.exists(os.path.join(raw, "done"))
+    if not finished:
         row["note"] = f"driver did not finish within {POST_S + DRAIN_DEADLINE_S} s after the fault"
     sh(["docker", "rm", "-f", PRODUCER], check=False)
 
@@ -565,7 +611,7 @@ def run_vtop(ctx: dict, fault: str, raw: str, logs: str, row: dict) -> tuple[lis
                          f"key: /etc/vtop/tls/data-1-key.pem }}\n")
         done = vtop_tool(ctx, raw, "verify", "--client-config", "/out/verify-client.yaml", "--addr",
                          f"vtop-{node}:9400", "--expect-at-least", str(acked), "--max-offset-gaps",
-                         str(current_epoch), "--value-bytes", str(ctx["vtop_value_bytes"]), "--batch", "512",
+                         "0", "--value-bytes", str(ctx["vtop_value_bytes"]), "--batch", "512",
                          entrypoint="vtop-node", timeout=600)
         result = fstats.parse_vtop_verify(done.stdout, done.stderr, done.returncode)
         with open(os.path.join(logs, "verify.out"), "w") as handle:
@@ -581,7 +627,8 @@ def run_vtop(ctx: dict, fault: str, raw: str, logs: str, row: dict) -> tuple[lis
         log(f"VTOP READ-BACK FAILED ({row['verify']}): keeping the run's data in full")
         save_vtop_evidence(ctx, raw, os.path.join(logs, "evidence"))
     origin_ms = anchor_us / 1000.0
-    return acks, {"origin_ms": origin_ms, "fault_vm_ms": fault_vm_ms}
+    how = "driver finished" if finished else "driver stopped at the drain deadline"
+    return acks, {"origin_ms": origin_ms, "fault_vm_ms": fault_vm_ms, "finished": finished, "how": how}
 
 
 def run_rep(ctx: dict, system: str, fault: str, rep: int) -> None:
@@ -597,6 +644,7 @@ def run_rep(ctx: dict, system: str, fault: str, rep: int) -> None:
     try:
         runner = run_kafka if system == "kafka" else run_vtop
         acks, times = runner(ctx, fault, raw, logs, row)
+        check_complete(row, times["finished"], times["how"])
         fault_vm_ms = times["fault_vm_ms"]
         ack_times = [event.t_ms for event in acks]
         gap = fstats.unavailability(ack_times, fault_vm_ms, POST_S * 1000)
@@ -617,6 +665,9 @@ def run_rep(ctx: dict, system: str, fault: str, rep: int) -> None:
                              "fault": fault, "repetition": rep, "t_ms": t_ms, "records": records})
         log(f"{tag}: unavailable {row['unavailability_ms']} ms, leader in {row.get('time_to_leader_ms')} ms, "
             f"lost {row.get('acked_lost')}, dups {row.get('duplicates')}, verify {row.get('verify')}")
+    except Incomplete as exc:
+        row.update(status="failed", note=(str(exc) + ("; " + row["note"] if row.get("note") else ""))[:900])
+        log(f"{tag}: failed: {exc}")
     except Refused as exc:
         row.update(status="refused" if "acknowledged after the fault" not in str(exc) else "failed",
                    note=(str(exc) + ("; " + row["note"] if row.get("note") else ""))[:900])
@@ -646,11 +697,25 @@ def run_rep(ctx: dict, system: str, fault: str, rep: int) -> None:
 # ------------------------------------------------------------------------------- main
 
 
+def key_mode() -> int:
+    """The mode a private key needs for the containers (user vtop, uid 10001) to read it.
+
+    Docker Desktop's file sharing presents a bind-mounted file as owned by the
+    user reading it, so an owner-only key is readable in the container (checked
+    with a uid-10001 container on Docker Desktop 4.99). A native Linux daemon
+    keeps the host owner, so there the key must be world-readable; the per-run
+    work directory (mkdtemp, 0700) is what keeps other host users out.
+    """
+    return 0o644 if platform.system() == "Linux" else 0o600
+
+
 def mint_certs(directory: str) -> None:
     sh(["bash", os.path.join(REPO, "scripts", "live-chaos", "gen-certs.sh"), directory, "1", "2", "3", "--",
         NODE_UUID[1], NODE_UUID[2], NODE_UUID[3]])
+    # The CA key signs nothing after minting; removed, no container can see it.
+    os.remove(os.path.join(directory, "ca-key.pem"))
     for name in os.listdir(directory):
-        os.chmod(os.path.join(directory, name), 0o644)
+        os.chmod(os.path.join(directory, name), key_mode() if name.endswith("-key.pem") else 0o644)
 
 
 def main(argv: list[str] | None = None) -> int:

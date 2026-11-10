@@ -417,3 +417,182 @@ def test_the_committed_run_renders_byte_identically_twice(tmp_path):
     assert sorted(outputs[0]) == ["doc", "kafka-failover-timeline.png", "kafka-failover-timeline.svg",
                                   "kafka-failover-unavailability.png", "kafka-failover-unavailability.svg"]
     assert outputs[0] == outputs[1]
+
+
+# ------------------------------------------------------------ review follow-ups (#613)
+
+
+def test_kafka_time_to_leader_is_the_earliest_answer_whatever_the_file_order():
+    lines = [probe_line(1300, "kafka-2:9092", leader=3), probe_line(1200, "kafka-1:9092", leader=3),
+             probe_line(1250, "kafka-3:9092", leader=3)]
+    assert fstats.kafka_time_to_leader(lines, 1000, old_leader=1) == (200.0, 3)
+
+
+def test_a_run_with_no_ok_repetition_loads_with_a_header_only_timeline(tmp_path):
+    env = environment()
+    rows, _ = rows_for(env)
+    for row in rows:
+        row.update(status="failed", note="producer incomplete (exit 1): 10 of 9500 records acknowledged")
+    run = fschema.load_failover_run(write_run(tmp_path / "r", env, rows, []))
+    assert run.timeline == [] and all(row["status"] == "failed" for row in run.rows)
+
+
+def test_a_header_only_timeline_is_still_refused_when_a_repetition_is_ok(tmp_path):
+    env = environment()
+    rows, _ = rows_for(env)
+    with pytest.raises(schema.ReportRefused, match="header and no rows"):
+        fschema.load_failover_run(write_run(tmp_path / "r", env, rows, []))
+
+
+def test_kafka_send_errors_are_counted_in_the_form_the_report_reads():
+    from kafka_compare import failover, failover_report
+
+    errors = [(1.0, "org.apache.kafka.common.errors.TimeoutException", "x"),
+              (2.0, "org.apache.kafka.common.errors.TimeoutException", "y"),
+              (3.0, "org.apache.kafka.common.errors.NotLeaderOrFollowerException", "z")]
+    cell = failover.kafka_error_classes({"retries": 4, "connect_failures": 0}, errors)
+    assert cell == ("retries=4; send_error:org.apache.kafka.common.errors.NotLeaderOrFollowerException=1; "
+                    "send_error:org.apache.kafka.common.errors.TimeoutException=2")
+    parsed = failover_report.error_classes(cell)
+    assert parsed["send_error:org.apache.kafka.common.errors.TimeoutException"] == 2
+    assert parsed["retries"] == 4
+
+
+@pytest.mark.parametrize("finished, acked, ok", [(True, 9500, True), (False, 9500, False), (True, 9400, False)])
+def test_a_repetition_is_summarised_only_when_the_producer_finished_every_record(finished, acked, ok):
+    from kafka_compare import failover
+
+    row = {"records_acked": acked, "records_target": 9500}
+    if ok:
+        failover.check_complete(row, finished, "exit 0")
+    else:
+        with pytest.raises(failover.Incomplete, match=f"{acked} of 9500"):
+            failover.check_complete(row, finished, "stopped at the drain deadline")
+
+
+def test_minted_private_keys_are_owner_only_and_the_ca_key_is_gone(tmp_path, monkeypatch):
+    from kafka_compare import failover
+
+    def fake_gen_certs(args, **_kwargs):
+        directory = args[2]
+        os.makedirs(directory, exist_ok=True)
+        for base in ("ca", "meta-1", "data-1", "admin"):
+            for suffix in (".pem", "-key.pem"):
+                with open(os.path.join(directory, base + suffix), "w") as handle:
+                    handle.write(base)
+
+    monkeypatch.setattr(failover, "sh", fake_gen_certs)
+    monkeypatch.setattr(failover.platform, "system", lambda: "Darwin")
+    directory = str(tmp_path / "certs")
+    failover.mint_certs(directory)
+    modes = {name: os.stat(os.path.join(directory, name)).st_mode & 0o777 for name in os.listdir(directory)}
+    assert "ca-key.pem" not in modes
+    assert {name: mode for name, mode in modes.items() if name.endswith("-key.pem")} == \
+        {"meta-1-key.pem": 0o600, "data-1-key.pem": 0o600, "admin-key.pem": 0o600}
+    assert all(mode == 0o644 for name, mode in modes.items() if not name.endswith("-key.pem"))
+
+
+def test_a_native_linux_daemon_gets_keys_the_container_user_can_read(monkeypatch):
+    from kafka_compare import failover
+
+    monkeypatch.setattr(failover.platform, "system", lambda: "Linux")
+    assert failover.key_mode() == 0o644
+
+
+def test_ha_nodes_mount_only_their_own_keys_and_never_the_ca_key():
+    path = os.path.join(os.path.dirname(__file__), "..", "kafka_compare", "compose.vtop-ha.yml")
+    with open(path) as handle:
+        text = handle.read()
+    assert "ca-key.pem" not in text
+    assert ":/etc/vtop/tls:ro" not in text  # no whole-directory mount
+    for n in (1, 2, 3):
+        block = text.split(f"  vtop-{n}:\n", 1)[1].split("\n  vtop-", 1)[0]
+        others = [m for m in (1, 2, 3) if m != n]
+        assert f"meta-{n}-key.pem" in block and f"data-{n}-key.pem" in block
+        assert not any(f"-{m}-key.pem" in block for m in others)
+
+
+def test_readback_sentence_comes_from_the_rows():
+    from kafka_compare import failover_report
+
+    passed = {"verify": "passed", "acked_lost": "0", "duplicates": "0"}
+    assert failover_report.readback_sentence([passed]) == \
+        "The read-back of it passed: 0 acknowledged records lost, 0 duplicated."
+    failed = {"verify": "FAILED: record at offset 7 content mismatch", "acked_lost": "", "duplicates": ""}
+    assert "FAILED in 1 of them" in failover_report.readback_sentence([passed, failed])
+    assert "nothing lost" not in failover_report.readback_sentence([passed, failed])
+
+
+def test_footer_renders_unknown_host_memory():
+    from kafka_compare import failover_report
+
+    env = json.load(open(os.path.join(COMMITTED_RUN, "environment.json")))
+    env["comparable"]["host_memory_bytes"] = ""
+    assert "logical CPUs, unknown)" in failover_report.footer_text(env)
+
+
+def test_the_pacing_caveat_is_derived_and_absent_for_a_run_paced_on_the_last_record():
+    from kafka_compare import failover_report
+
+    env = json.load(open(os.path.join(COMMITTED_RUN, "environment.json")))
+    rows = fschema.load_failover_run(COMMITTED_RUN).rows
+    note = failover_report.vtop_batch_pacing_note(env, rows)
+    assert "understated by up to 19.8 ms" in note  # (100 - 1) / 5000 s
+    env["comparable"]["vtop_pacing"] = "last-record-due"
+    assert failover_report.vtop_batch_pacing_note(env, rows) == ""
+
+
+def _copy_committed(tmp_path):
+    import shutil
+
+    target = tmp_path / "run"
+    os.makedirs(target)
+    for name in ("environment.json", "failover.csv", "timeline.csv"):
+        shutil.copy2(os.path.join(COMMITTED_RUN, name), target / name)
+    return target
+
+
+def test_the_box_chart_labels_the_unclamped_median(tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    import csv
+
+    from kafka_compare import failover_report, report
+
+    run = _copy_committed(tmp_path)
+    with open(run / "failover.csv", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    target = next(r for r in rows if r["system"] == "kafka" and r["fault"] == "stop_leader")
+    target["time_to_leader_ms"] = "0.4"  # under the old 1.0 ms clamp
+    with open(run / "failover.csv", "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fschema.COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    seen = []
+    real_median = failover_report.stats.median
+    monkeypatch.setattr(failover_report.stats, "median", lambda values: seen.append(list(values)) or
+                        real_median(values))
+    assert report.main([str(run), "--img-dir", str(tmp_path / "img"), "--doc", str(tmp_path / "d.md")]) == 0
+    assert any(0.4 in values for values in seen)
+    assert not any(1.0 in values for values in seen)
+
+
+def test_the_report_names_a_repetition_whose_gap_is_steady_state_jitter(tmp_path):
+    pytest.importorskip("matplotlib")
+    from kafka_compare import report
+
+    doc = tmp_path / "d.md"
+    assert report.main([COMMITTED_RUN, "--img-dir", str(tmp_path / "img"), "--doc", str(doc)]) == 0
+    text = doc.read_text()
+    # Kafka stop_leader repetition 2: 35 ms, 615 ms after the fault, against a 30 ms steady-state gap.
+    assert "In Kafka stop_leader repetition 2 (35 ms, starting 615 ms after the fault, against a 30 ms " \
+           "steady-state longest gap)" in text
+    assert "Kafka kill9_leader repetition" not in text.split("the producer saw no outage")[0]
+
+
+def test_the_failover_report_writes_a_doc_given_as_a_bare_file_name(tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    from kafka_compare import report
+
+    monkeypatch.chdir(tmp_path)
+    assert report.main([COMMITTED_RUN, "--img-dir", str(tmp_path / "img"), "--doc", "failover.md"]) == 0
+    assert (tmp_path / "failover.md").is_file()

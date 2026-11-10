@@ -6,7 +6,7 @@
         --topic bench --out /out/metadata.jsonl --stop-file /out/stop
 
 One thread per broker sends a Metadata request (v4, the oldest version Kafka 4
-still serves, and the last before the flexible encoding) every `--interval`
+still serves) every `--interval`
 seconds and writes a JSON line whenever that broker's answer CHANGES: reachable
 or not, the partition's leader, its ISR. Standard library only, so it runs in a
 stock python image on the cluster's network, where the brokers' advertised
@@ -156,8 +156,11 @@ def _poll(address: str, topic: str, out_path: str, stop_file: str, interval: flo
                 sock = None
             observed = {"ok": False, "leader": None, "isr": None, "error": type(exc).__name__}
         if observed != last:
-            line = {"t_us": int(time.time() * 1e6), "broker": address, **observed}
+            # Stamped under the lock, so the file is in time order across the
+            # per-broker threads (a stamp taken before waiting for the lock
+            # could land after a later one).
             with lock, open(out_path, "a") as handle:
+                line = {"t_us": int(time.time() * 1e6), "broker": address, **observed}
                 handle.write(json.dumps(line, sort_keys=True) + "\n")
             last = observed
         time.sleep(max(0.0, interval - (time.time() - started)))

@@ -5,10 +5,10 @@ Called by report.py when the run directory holds a failover.csv:
     python3 benchmarks/kafka_compare/report.py benchmarks/kafka_compare/results/<failover-run-id>
 
 Writes PNG + SVG to docs/benchmarks/img/ and docs/benchmarks/kafka-failover.md.
-Every number comes from failover.csv / timeline.csv; `failover_schema` refuses
-a missing, partial or mixed run before anything is drawn. Correctness (lost and
-duplicated acknowledged records) is a table at the top of the report, never
-only a chart.
+Every measured number comes from failover.csv / timeline.csv, the conditions
+from environment.json; `failover_schema` refuses a missing, partial or mixed
+run before anything is drawn. Correctness (lost and duplicated acknowledged
+records) is a table at the top of the report, never only a chart.
 """
 from __future__ import annotations
 
@@ -26,6 +26,9 @@ STYLE = {
     "vtop": {**base.SYSTEM_STYLE["vtop"], "label": "VTOP (native client, NOT the Kafka path)"},
 }
 SHORT = {"kafka": "Kafka", "vtop": "VTOP"}
+
+LEASE_OBSERVER_SOURCE = ("vtop/failover-driver.sh `LEASE_POLL_SECONDS`: the lease observer's poll, which feeds "
+                         "only the time to new leader, never the producer")
 
 CANDIDATE_GATEWAY_ERROR = (
     "error: `kafka` is configured on a Candidate node: the gateway is served by a leader or standalone only "
@@ -90,6 +93,28 @@ def fmt_classes(text: str) -> str:
     return "; ".join(f"{label} {count}" for label, count in sorted(classes.items())) or "-"
 
 
+def readback_sentence(rows: list[dict[str, str]]) -> str:
+    """What the read-back of these repetitions found, from their `verify` and correctness columns."""
+    failed = [row for row in rows if row["verify"].startswith("FAILED")]
+    missing = [row for row in rows if not row["verify"]]
+    lost = sum(int(float(row["acked_lost"])) for row in rows if row["acked_lost"])
+    dups = sum(int(float(row["duplicates"])) for row in rows if row["duplicates"])
+    if failed:
+        return (f"The read-back FAILED in {len(failed)} of them; see the correctness table at the top.")
+    if missing:
+        return f"{len(missing)} of them never reached a read-back; see the correctness table at the top."
+    return (f"The read-back of {'each' if len(rows) > 1 else 'it'} passed: {lost} acknowledged records lost, "
+            f"{dups} duplicated.")
+
+
+def no_outage(row: dict[str, str]) -> bool:
+    """Whether the longest acknowledgement gap after the fault is within twice the longest gap of
+    the steady 30 s before it: then the producer saw no outage that steady-state jitter does not
+    also produce, and the "window" is that jitter, not a failover."""
+    gap, steady = _f(row["unavailability_ms"]), _f(row["baseline_max_gap_ms"])
+    return gap is not None and steady is not None and gap <= 2 * steady
+
+
 def fmt_summary(s: stats.Summary | None, n_all: int, unit=fmt_ms) -> str:
     if s is None:
         return "no result"
@@ -102,12 +127,12 @@ def fmt_summary(s: stats.Summary | None, n_all: int, unit=fmt_ms) -> str:
 def footer_text(env: dict[str, Any]) -> str:
     c = env["comparable"]
     m = env["matrix"]
-    mem_gib = int(c["host_memory_bytes"]) / 2**30
-    vm_gib = int(c["docker_vm_memory_bytes"]) / 2**30
     limits = c["node_limits"]
     return (
-        f"{c['host_cpu']} ({c['host_logical_cpus']} logical CPUs, {mem_gib:.0f} GiB), {c['host_os']} | "
-        f"{c['docker_platform']}, VM {c['docker_vm_cpus']} CPUs / {vm_gib:.0f} GiB, kernel {c['docker_vm_kernel']}, "
+        f"{c['host_cpu']} ({c['host_logical_cpus']} logical CPUs, {base.gib(c.get('host_memory_bytes'))}), "
+        f"{c['host_os']} | "
+        f"{c['docker_platform']}, VM {c['docker_vm_cpus']} CPUs / {base.gib(c.get('docker_vm_memory_bytes'))}, "
+        f"kernel {c['docker_vm_kernel']}, "
         f"volumes {c['volume_filesystem']}\n"
         f"per node: {limits['cpus']} CPUs, {limits['mem_limit']} RAM | Kafka {c['kafka_image'].split('@')[0]} "
         f"(KRaft, 3 combined nodes) | VTOP {c['vtop_commit'][:12]} (3 co-located candidates) | clients: "
@@ -208,9 +233,13 @@ def box_chart(plt, run: fschema.FailoverRun, img_dir: str) -> list[str]:
         for i, fault in enumerate(faults):
             for system in SYSTEMS:
                 style = STYLE[system]
-                values = [_f(row[column]) for row in ok_rows(run.rows, system, fault)]
-                values = [max(v, 1.0) for v in values if v is not None]
+                measured = [_f(row[column]) for row in ok_rows(run.rows, system, fault)]
+                measured = [v for v in measured if v is not None]
+                values = [v for v in measured if v > 0]
                 x = i + offsets[system]
+                if len(values) < len(measured):
+                    ax.text(x, 0.01, f"{len(measured) - len(values)} at <= 0 ms\nnot drawn", ha="center",
+                            va="bottom", transform=ax.get_xaxis_transform(), fontsize=6.5, color=base.INK_2)
                 if not values:
                     ax.text(x, 0.03, "no\nresult", transform=ax.get_xaxis_transform(), ha="center", fontsize=6.5,
                             color=base.INK_2)
@@ -226,7 +255,9 @@ def box_chart(plt, run: fschema.FailoverRun, img_dir: str) -> list[str]:
                 spread = [x + (j - (len(values) - 1) / 2) * 0.035 for j in range(len(values))]
                 ax.scatter(spread, values, marker=style["marker"], s=22, color=style["color"],
                            edgecolors=base.SURFACE, linewidths=0.8, zorder=4)
-                median = stats.median(values)
+                # The label is the median of every measured value, as in the
+                # headline table, whether or not each one could be drawn.
+                median = stats.median(measured)
                 ax.annotate(fmt_ms(median), (x, max(values)), xytext=(0, 5), textcoords="offset points",
                             ha="center", fontsize=7.5, color=base.INK)
         ax.set_xticks(range(len(faults)))
@@ -350,7 +381,8 @@ def write_markdown(run: fschema.FailoverRun, images: dict[str, str], csv_rel: di
     add("")
     add("Median (min - max) over the repetitions that ran, each system at its shipped timeouts.")
     add("")
-    add("| fault | system | unavailability window | time to new leader | p99 latency, 30 s after | p99 latency, "
+    add("| fault | system | unavailability window (longest ack gap after the fault) | time to new leader | "
+        "p99 latency, 30 s after | p99 latency, "
         "30 s before | client retries (each client's own count, not comparable) | acked lost | duplicates |")
     add("|---|---|---|---|---|---|---|---|---|")
     for fault in faults:
@@ -365,6 +397,21 @@ def write_markdown(run: fschema.FailoverRun, images: dict[str, str], csv_rel: di
                 f"{cell('retries', fmt_count)} | {cell('acked_lost', fmt_count)} | "
                 f"{cell('duplicates', fmt_count)} |")
     add("")
+    quiet = [row for row in rows if row["status"] == "ok" and no_outage(row)]
+    if quiet:
+        add("The unavailability window is the longest gap between acknowledgements after the fault, so a "
+            "repetition with no outage still reports one: its longest ordinary gap. In "
+            + ", ".join(f"{SHORT[row['system']]} {row['fault']} repetition {row['repetition']} "
+                        f"({fmt_ms(float(row['unavailability_ms']))}, starting {fmt_ms(float(row['gap_start_ms']))} "
+                        f"after the fault, against a {fmt_ms(float(row['baseline_max_gap_ms']))} steady-state "
+                        "longest gap)" for row in quiet)
+            + " the gap is within twice the steady-state one: the producer saw no outage, and that value is "
+            "jitter, not a failover time. It is still counted in the median and range above.")
+        add("")
+    batch_note = vtop_batch_pacing_note(env, rows)
+    if batch_note:
+        add(batch_note)
+        add("")
     add(f"![Unavailability and time to leader]({images['unavailability']})")
     add("")
     add(f"![Acknowledgement rate around the fault]({images['timeline']})")
@@ -415,8 +462,16 @@ def write_markdown(run: fschema.FailoverRun, images: dict[str, str], csv_rel: di
         if key != "source":
             add(f"| VTOP metadata Raft | `{key}` | `{value}` | {t['vtop_raft']['source']} |")
     for key, value in t["vtop_driver"].items():
+        if key == "source":
+            continue
+        # Runs before the #613 review filed the lease observer's poll under
+        # the driver's shared source, which names only the JVM client
+        # defaults the request timeout and back-off copy.
+        source = LEASE_OBSERVER_SOURCE if key == "lease_observer_poll_ms" else t["vtop_driver"]["source"]
+        add(f"| VTOP native driver | `{key}` | `{value}` | {source} |")
+    for key, value in t.get("vtop_lease_observer", {}).items():
         if key != "source":
-            add(f"| VTOP native driver | `{key}` | `{value}` | {t['vtop_driver']['source']} |")
+            add(f"| VTOP lease observer | `{key}` | `{value}` | {t['vtop_lease_observer']['source']} |")
     add(f"| both observers | poll interval | `{t['kafka_observer_poll_ms']} ms` | `metadata_probe.py`, "
         "`failover-driver.sh` |")
     add("")
@@ -436,11 +491,9 @@ def write_markdown(run: fschema.FailoverRun, images: dict[str, str], csv_rel: di
     if refused:
         add("- **Produce refused by a serving leader.** In " + ", ".join(
             f"{row['fault']} repetition {row['repetition']} ({count} attempts)" for row, count in refused)
-            + ", the new VTOP leader answered produce attempts with a refusal rather than an acknowledgement for "
-            "a short stretch, then acknowledged again; the read-back found nothing lost. The driver log of each "
-            "such repetition (`logs/vtop-<fault>-<rep>/driver.log`) has the exact lines; in this run they read "
-            "`produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3`, just after "
-            "the partitioned old leader was reconnected.")
+            + ", a VTOP leader answered produce attempts with a refusal rather than an acknowledgement. "
+            + readback_sentence([row for row, _ in refused])
+            + " The driver log of each such repetition (`logs/vtop-<fault>-<rep>/driver.log`) has the exact lines.")
     add("")
     add("## Not measured here")
     add("")
@@ -469,13 +522,42 @@ def write_markdown(run: fschema.FailoverRun, images: dict[str, str], csv_rel: di
         handle.write("\n".join(lines))
 
 
+def vtop_batch_pacing_note(env: dict[str, Any], rows: list[dict[str, str]]) -> str:
+    """The run's VTOP latency caveat, when its producer sent batches early.
+
+    Until the #613 review, `vtop-node produce --rate` sent a batch when its FIRST record was due, so
+    the other records of the batch were on the wire before their scheduled time, and a latency taken
+    from each record's schedule came out short by up to (batch - 1) / rate. Runs whose environment
+    records `vtop_pacing: "last-record-due"` were taken after the fix and carry no caveat.
+    """
+    if env.get("comparable", {}).get("vtop_pacing") == "last-record-due":
+        return ""
+    m = env["matrix"]
+    early_ms = (int(m["vtop_batch"]) - 1) / int(m["offered_rate"]) * 1000
+    vtop = [row for row in rows if row["system"] == "vtop" and row["status"] == "ok"]
+    if not vtop:
+        return ""
+    before = max(float(row["p99_before_ms"]) for row in vtop)
+    after = min(float(row["p99_after_ms"]) for row in vtop)
+    return (f"**VTOP latency in this run is understated by up to {early_ms:.1f} ms.** Its producer "
+            f"(`vtop-node produce --rate`, batches of {m['vtop_batch']}) sent each batch when the batch's FIRST "
+            f"record was due, so the batch's other records left up to {early_ms:.1f} ms before their scheduled "
+            "send time, and a latency measured from the schedule is short by up to that much. Against VTOP's "
+            f"30 s-before p99 (at most {fmt_ms(before)} here) that is not a small error, so that column is not "
+            "comparable with Kafka's; against its 30 s-after p99 (at least "
+            f"{fmt_ms(after)} here) it is. The unavailability window and the time to new leader do not use the "
+            "schedule. The producer now waits until a batch's last record is due; a VTOP p99 before that is "
+            "comparable needs a re-run.")
+
+
 METHOD = """\
 - **Clusters (rule 1).** Kafka: three combined broker+controller nodes in KRaft mode
   (`compose.kafka.yml`), the topic created with one partition, RF=3, `min.insync.replicas=2`. VTOP: three
   co-located nodes, each a metadata Raft voter and a candidate replica of one range
   (`compose.vtop-ha.yml`, `vtop/ha-node-*.yaml`), quorum acknowledgement (2 of 3), TLS on every plane
-  (promotion is refused on a plaintext replica plane). Every node {cpus} CPUs, {mem}, no swap, a named volume
-  on `{fs}`. Each repetition starts from empty volumes, one system at a time.
+  (promotion is refused on a plaintext replica plane); Kafka's listeners are PLAINTEXT, as `compose.kafka.yml`
+  ships them, so the VTOP side also pays TLS handshakes on every reconnect. Every node {cpus} CPUs, {mem}, no
+  swap, a named volume on `{fs}`. Each repetition starts from empty volumes, one system at a time.
 - **Load.** {rate:,} records/s offered for {total:,} records, `acks=all`, one partition, one producer. The
   rate is well under both systems' saturation (phase 1: about 24K records/s for VTOP at 100 B through the
   gateway; its native client reached about 16K records/s closed-loop in batches of {batch} while this
@@ -562,7 +644,7 @@ def build(run_dir: str, img_dir: str, doc_path: str, setup_matplotlib) -> list[s
     run = fschema.load_failover_run(run_dir)  # raises ReportRefused before anything is written
     plt = setup_matplotlib()
     os.makedirs(img_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(doc_path), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(doc_path)), exist_ok=True)
     written = []
     written += box_chart(plt, run, img_dir)
     written += timeline_chart(plt, run, img_dir)

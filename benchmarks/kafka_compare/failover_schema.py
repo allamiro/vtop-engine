@@ -100,7 +100,7 @@ def append_rows(path: str, rows: list[dict[str, Any]], columns: tuple[str, ...] 
         os.fsync(handle.fileno())
 
 
-def _read(path: str, columns: tuple[str, ...]) -> list[dict[str, str]]:
+def _read(path: str, columns: tuple[str, ...], allow_empty: bool = False) -> list[dict[str, str]]:
     if not os.path.isfile(path):
         raise schema.ReportRefused(f"no {os.path.basename(path)} at {path}")
     with open(path, newline="") as handle:
@@ -108,7 +108,7 @@ def _read(path: str, columns: tuple[str, ...]) -> list[dict[str, str]]:
         if tuple(reader.fieldnames or ()) != columns:
             raise schema.ReportRefused(f"{path} has columns {reader.fieldnames}, expected {list(columns)}")
         rows = list(reader)
-    if not rows:
+    if not rows and not allow_empty:
         raise schema.ReportRefused(f"{path} has a header and no rows")
     for line, row in enumerate(rows, start=2):
         if None in row or any(value is None for value in row.values()):
@@ -253,6 +253,10 @@ def load_failover_run(run_dir: str) -> FailoverRun:
             f"but environment.json fingerprints to {fingerprint}"
         )
     check_complete(rows, matrix)
-    timeline = _read(os.path.join(run_dir, "timeline.csv"), TIMELINE_COLUMNS)
+    # Only ok repetitions have timeline points, so a run in which none was ok
+    # has a header-only timeline.csv; check_timeline still requires a point
+    # set for every ok row, and none for any other.
+    any_ok = any(row["status"] == "ok" for row in rows)
+    timeline = _read(os.path.join(run_dir, "timeline.csv"), TIMELINE_COLUMNS, allow_empty=not any_ok)
     check_timeline(timeline, rows, fingerprint)
     return FailoverRun(rows, timeline, environment, run_dir)

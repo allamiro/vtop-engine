@@ -9,7 +9,9 @@
 #
 # VTOP_IMAGE is the image failover.py built from the commit under test;
 # VTOP_TLS_DIR is the per-run certificate directory it minted (never
-# committed). No healthcheck gates `up`: a co-located node is ready only once
+# committed). Each node mounts only the CA certificate and its OWN two key
+# pairs, file by file: never another node's key, and the CA key is deleted
+# once the leaves are minted. No healthcheck gates `up`: a co-located node is ready only once
 # its metadata group is initialised, which failover.py does after `up`.
 name: kc-vtop-ha
 
@@ -21,6 +23,10 @@ x-node: &node
   memswap_limit: 2g
   ulimits:
     nofile: { soft: 65536, hard: 65536 }
+  # The same hardening as compose.kafka.yml's brokers (fairness rule 1): no
+  # capabilities (the node listens above 1024 as user vtop), no setuid gain.
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
   networks: [bench]
 
 services:
@@ -29,21 +35,33 @@ services:
     hostname: vtop-1
     volumes:
       - "./vtop/ha-node-1.yaml:/etc/vtop/node.yaml:ro"
-      - "${VTOP_TLS_DIR:?set VTOP_TLS_DIR to the minted certificate directory}:/etc/vtop/tls:ro"
+      - "${VTOP_TLS_DIR:?set VTOP_TLS_DIR to the minted certificate directory}/ca.pem:/etc/vtop/tls/ca.pem:ro"
+      - "${VTOP_TLS_DIR}/meta-1.pem:/etc/vtop/tls/meta-1.pem:ro"
+      - "${VTOP_TLS_DIR}/meta-1-key.pem:/etc/vtop/tls/meta-1-key.pem:ro"
+      - "${VTOP_TLS_DIR}/data-1.pem:/etc/vtop/tls/data-1.pem:ro"
+      - "${VTOP_TLS_DIR}/data-1-key.pem:/etc/vtop/tls/data-1-key.pem:ro"
       - "vtop-1-data:/home/vtop"
   vtop-2:
     <<: *node
     hostname: vtop-2
     volumes:
       - "./vtop/ha-node-2.yaml:/etc/vtop/node.yaml:ro"
-      - "${VTOP_TLS_DIR:?set VTOP_TLS_DIR to the minted certificate directory}:/etc/vtop/tls:ro"
+      - "${VTOP_TLS_DIR:?set VTOP_TLS_DIR to the minted certificate directory}/ca.pem:/etc/vtop/tls/ca.pem:ro"
+      - "${VTOP_TLS_DIR}/meta-2.pem:/etc/vtop/tls/meta-2.pem:ro"
+      - "${VTOP_TLS_DIR}/meta-2-key.pem:/etc/vtop/tls/meta-2-key.pem:ro"
+      - "${VTOP_TLS_DIR}/data-2.pem:/etc/vtop/tls/data-2.pem:ro"
+      - "${VTOP_TLS_DIR}/data-2-key.pem:/etc/vtop/tls/data-2-key.pem:ro"
       - "vtop-2-data:/home/vtop"
   vtop-3:
     <<: *node
     hostname: vtop-3
     volumes:
       - "./vtop/ha-node-3.yaml:/etc/vtop/node.yaml:ro"
-      - "${VTOP_TLS_DIR:?set VTOP_TLS_DIR to the minted certificate directory}:/etc/vtop/tls:ro"
+      - "${VTOP_TLS_DIR:?set VTOP_TLS_DIR to the minted certificate directory}/ca.pem:/etc/vtop/tls/ca.pem:ro"
+      - "${VTOP_TLS_DIR}/meta-3.pem:/etc/vtop/tls/meta-3.pem:ro"
+      - "${VTOP_TLS_DIR}/meta-3-key.pem:/etc/vtop/tls/meta-3-key.pem:ro"
+      - "${VTOP_TLS_DIR}/data-3.pem:/etc/vtop/tls/data-3.pem:ro"
+      - "${VTOP_TLS_DIR}/data-3-key.pem:/etc/vtop/tls/data-3-key.pem:ro"
       - "vtop-3-data:/home/vtop"
 
 volumes:

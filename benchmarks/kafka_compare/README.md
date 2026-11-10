@@ -26,7 +26,10 @@ python3 benchmarks/kafka_compare/report.py benchmarks/kafka_compare/results/<run
 Useful knobs: `--sizes 100,1024`, `--reps 3`, `--sat-records 100:3000000,1024:1000000` (records per
 saturation run AND per consume run, per record size), `--fixed-seconds 30` (length of a fixed-rate run),
 `--smoke-records`, `--no-consume`, `--rebuild`, `--run-id` (one path component). Every one is checked
-before any Docker work. A run writes `results/<run-id>/` and never overwrites another.
+before any Docker work. A run writes `results/<run-id>/` and never overwrites another. Unlike
+`benchmarks/results/` (git-ignored by `benchmarks/.gitignore`, whose `results/*` is anchored to that
+directory), `kafka_compare/results/<run-id>/` is committed on purpose: the published reports are generated
+from it, and a reader can check every number against it.
 
 ## What it does
 
@@ -139,6 +142,10 @@ default) and the VTOP side by its native client (`vtop-node produce` via
   [`compose.vtop-ha.yml`](compose.vtop-ha.yml), three co-located nodes ([`vtop/ha-node-*.yaml`](vtop/)),
   each a metadata Raft voter and a candidate replica, TLS on every plane (promotion is refused on a plaintext
   replica plane; certificates are minted per run with `scripts/live-chaos/gen-certs.sh` and never committed).
+  The CA key is deleted once the leaves are minted, private keys are owner-only (on Docker Desktop; a native
+  Linux daemon needs them readable by the container's uid 10001), and each node mounts only `ca.pem` and its
+  own two key pairs. Kafka's listeners are PLAINTEXT. Both stacks drop every capability and set
+  `no-new-privileges`.
   Same per-node limits, enforced as in phase 1. Shipped timeouts on both (profile `defaults`).
 - **Per repetition.** Fresh cluster; producer at `--rate` (default 5,000 records/s), `acks=all`; at 35 s the
   partition leader gets `kill9_leader`, `stop_leader` (`docker stop -t 30`) or `partition_leader`
@@ -151,7 +158,13 @@ default) and the VTOP side by its native client (`vtop-node produce` via
   errors and retries, acknowledged records lost, duplicates, the read-back verdict), `timeline.csv` (records
   acknowledged per 100 ms around the fault), `environment.json`, and `logs/` per repetition. A read-back that
   finds a lost or duplicated acknowledged record keeps the run's raw data under `logs/<rep>/evidence/` and
-  makes `failover.py` exit 1.
+  makes `failover.py` exit 1. A repetition whose producer did not acknowledge every record (stopped at the
+  drain deadline, or exited non-zero) is a `failed` row: its gaps and latencies would leave out the unresolved
+  end of the outage. Its read-back verdict is still recorded.
+- **Expected noise in `logs/`.** Every Kafka `consumer.err` holds `ERROR Error processing message, terminating
+  consumer process: ... TimeoutException`: that is how `kafka-console-consumer.sh` ends a read with
+  `--timeout-ms` once no record arrives for 20 s, not a failed read-back. The next line,
+  `Processed a total of N messages`, is the read; the verdict is the `verify` column.
 
 ## Known gaps
 
