@@ -10,7 +10,7 @@
 //! trait (Phase 1 of the HA plan). The Postgres implementation (Phase 3) lives
 //! behind a Cargo feature and implements the same trait.
 
-use crate::models::{BatchPatch, BatchRecord, CommittedCursor};
+use crate::models::{parse_content_fingerprint, BatchPatch, BatchRecord, CommittedCursor};
 use crate::store::StateStore;
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -486,14 +486,15 @@ impl StateStore for SqliteStateStore {
                         CAST(progress_end_json -> '$.inode' AS TEXT) AS inode, \
                         CAST(json_extract(progress_end_json, '$.end_byte') AS INTEGER) AS end_byte, \
                         CAST(json_extract(progress_end_json, '$.file_size') AS INTEGER) AS file_size, \
+                        CAST(progress_end_json -> '$.content_fingerprint' AS TEXT) AS content, \
                         created_at, batch_id \
                  FROM batches WHERE state = ? AND source_type = ? \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, ROW_NUMBER() OVER ( \
+                 SELECT path, inode, end_byte, file_size, content, ROW_NUMBER() OVER ( \
                             PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size FROM latest WHERE rn = 1",
+             SELECT path, inode, end_byte, file_size, content FROM latest WHERE rn = 1",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(source_type.as_str())
@@ -507,11 +508,13 @@ impl StateStore for SqliteStateStore {
                 let inode: Option<String> = r.get("inode");
                 let end: Option<i64> = r.get("end_byte");
                 let size: Option<i64> = r.get("file_size");
+                let content: Option<String> = r.get("content");
                 Some(CommittedCursor {
                     path: path?,
                     inode: inode.and_then(|i| i.parse().ok()),
                     end_byte: end?.max(0) as u64,
                     observed_size: size.map(|s| s.max(0) as u64),
+                    content_fingerprint: content.as_deref().and_then(parse_content_fingerprint),
                 })
             })
             .collect())

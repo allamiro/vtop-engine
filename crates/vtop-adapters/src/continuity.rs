@@ -12,9 +12,22 @@
 //! - **Truncation** (an in-place truncate, or `copytruncate`). The inode is
 //!   the same, but the file is now shorter than the read position.
 //!
-//! In both cases the right move for the NEW content is to read it from byte
+//! - **Replacement at the same inode** (#578). A filesystem can hand a freed
+//!   inode number to the next file created, and a file can be rewritten in
+//!   place (a `copytruncate` that regrows before the next read). When the new
+//!   content is already at least as long as the old read position, inode and
+//!   length both agree with the old file. Its first bytes do not: a read
+//!   fingerprints the file's first page ([`ContentFingerprint`]) and the next
+//!   read checks it.
+//!
+//! In every case the right move for the NEW content is to read it from byte
 //! zero. What this module decides is only whether a discontinuity happened;
 //! the adapters decide what to do about their cursors.
+
+use std::io::Read;
+
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use vtop_core::types::ContentFingerprint;
 
 /// A change of identity or length under a read position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +41,9 @@ pub enum Discontinuity {
         observed: u64,
         size: u64,
     },
+    /// The same inode, no shorter, but its first `len` bytes are not the ones
+    /// the cursor last read (#578).
+    Replaced { len: u64 },
 }
 
 impl std::fmt::Display for Discontinuity {
@@ -46,6 +62,11 @@ impl std::fmt::Display for Discontinuity {
                 "file truncated (length {size} is below the read position {read_byte} \
                  or the length last observed, {observed}); it is read from byte 0"
             ),
+            Discontinuity::Replaced { len } => write!(
+                f,
+                "file content replaced at the same inode (its first {len} bytes changed); \
+                 the new file is read from byte 0"
+            ),
         }
     }
 }
@@ -53,10 +74,13 @@ impl std::fmt::Display for Discontinuity {
 /// What a cursor last observed of its file: the identity and the length the
 /// last read saw. An append-only file never gets shorter, so the length is
 /// evidence in its own right, independent of how far the cursor has read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Nor does it change its first bytes, so `content` - the fingerprint the
+/// last read took, `None` when it knows none - is evidence too (#578).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observed {
     pub inode: Option<u64>,
     pub size: u64,
+    pub content: Option<ContentFingerprint>,
 }
 
 /// Decide whether `read_byte` can still be applied to the file now at the
@@ -76,10 +100,18 @@ pub struct Observed {
 /// file longer than `read_byte` but shorter than before would pass the first
 /// test and resume in the middle of new content. So a file now shorter than
 /// the length the cursor last saw is a truncation too.
+///
+/// Neither test sees a replacement that keeps the inode and is already as
+/// long as the old file (#578), so `current_head` - the file's first bytes,
+/// read through the same descriptor ([`read_head`]) - is checked against the
+/// fingerprint the cursor last took. A cursor with none (a legacy seed, a
+/// file that was empty) cannot prove a replacement this way, exactly as an
+/// unknown inode cannot prove a rotation.
 pub fn check(
-    last_seen: Option<Observed>,
+    last_seen: Option<&Observed>,
     current_inode: Option<u64>,
     current_size: u64,
+    current_head: &[u8],
     read_byte: u64,
 ) -> Option<Discontinuity> {
     if let Some(Observed {
@@ -87,8 +119,8 @@ pub fn check(
     }) = last_seen
     {
         if let Some(to) = current_inode {
-            if from != to {
-                return Some(Discontinuity::Rotated { from, to });
+            if *from != to {
+                return Some(Discontinuity::Rotated { from: *from, to });
             }
         }
     }
@@ -100,7 +132,38 @@ pub fn check(
             size: current_size,
         });
     }
+    if let Some(content) = last_seen.and_then(|seen| seen.content.as_ref()) {
+        if !content.matches_head(current_head) {
+            return Some(Discontinuity::Replaced { len: content.len });
+        }
+    }
     None
+}
+
+/// The first bytes of an open file, up to [`ContentFingerprint::MAX_LEN`]:
+/// what [`check`] compares and a marker fingerprints. Leaves the descriptor
+/// at an arbitrary position; the caller seeks before reading on.
+pub async fn read_head(file: &mut tokio::fs::File) -> std::io::Result<Vec<u8>> {
+    file.seek(std::io::SeekFrom::Start(0)).await?;
+    let mut head = Vec::with_capacity(ContentFingerprint::MAX_LEN);
+    (&mut *file)
+        .take(ContentFingerprint::MAX_LEN as u64)
+        .read_to_end(&mut head)
+        .await?;
+    Ok(head)
+}
+
+/// The file now at `path` - its metadata and first bytes, through ONE open
+/// descriptor - for judging a commit or a rewind against it. `None` when it
+/// cannot be opened or read.
+pub fn probe(path: &std::path::Path) -> Option<(std::fs::Metadata, Vec<u8>)> {
+    let file = std::fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    let mut head = Vec::with_capacity(ContentFingerprint::MAX_LEN);
+    file.take(ContentFingerprint::MAX_LEN as u64)
+        .read_to_end(&mut head)
+        .ok()?;
+    Some((metadata, head))
 }
 
 /// Whether a commit for a range ending at `end_byte` still describes the file
@@ -111,17 +174,25 @@ pub fn check(
 /// carry the cursor to an offset in a file that no longer exists, past data
 /// that was never read. A range that ends beyond the current length, or that
 /// was read from a different inode, is stale: the batch is archived and its
-/// ledger row is committed, but the cursor must not move.
+/// ledger row is committed, but the cursor must not move. So is one whose
+/// marker fingerprinted content the file at the path no longer starts with
+/// (#578): `current_head` is that file's first bytes, empty when it could not
+/// be read - which fails any fingerprint, the conservative answer.
 pub fn commit_is_current(
     marker_inode: Option<u64>,
+    marker_content: Option<&ContentFingerprint>,
     current_inode: Option<u64>,
     current_size: u64,
+    current_head: &[u8],
     end_byte: u64,
 ) -> bool {
     if let (Some(marker), Some(current)) = (marker_inode, current_inode) {
         if marker != current {
             return false;
         }
+    }
+    if marker_content.is_some_and(|content| !content.matches_head(current_head)) {
+        return false;
     }
     end_byte <= current_size
 }
@@ -238,7 +309,116 @@ mod tests {
     use super::*;
 
     fn seen(inode: Option<u64>, size: u64) -> Option<Observed> {
-        Some(Observed { inode, size })
+        Some(Observed {
+            inode,
+            size,
+            content: None,
+        })
+    }
+
+    /// The inode and length tests, with no content on either side: what every
+    /// judgement before #578 had, and what a legacy marker still has.
+    fn check(
+        last_seen: Option<Observed>,
+        current_inode: Option<u64>,
+        current_size: u64,
+        read_byte: u64,
+    ) -> Option<Discontinuity> {
+        super::check(
+            last_seen.as_ref(),
+            current_inode,
+            current_size,
+            b"",
+            read_byte,
+        )
+    }
+
+    fn commit_is_current(
+        marker_inode: Option<u64>,
+        current_inode: Option<u64>,
+        current_size: u64,
+        end_byte: u64,
+    ) -> bool {
+        super::commit_is_current(
+            marker_inode,
+            None,
+            current_inode,
+            current_size,
+            b"",
+            end_byte,
+        )
+    }
+
+    fn seen_with(head: &[u8]) -> Observed {
+        Observed {
+            inode: Some(7),
+            size: head.len() as u64,
+            content: ContentFingerprint::of(head),
+        }
+    }
+
+    /// #578: a file rewritten at the same inode, already longer than the old
+    /// read position when next opened. Inode and length agree with the old
+    /// file; only its first bytes tell it apart.
+    #[test]
+    fn a_same_inode_replacement_that_is_no_shorter_is_a_replacement() {
+        let old = b"old line one\nold line two\n";
+        let new = b"NEW line one\nNEW line two\nNEW line three\n";
+        assert_eq!(
+            super::check(
+                Some(&seen_with(old)),
+                Some(7),
+                new.len() as u64,
+                new,
+                old.len() as u64
+            ),
+            Some(Discontinuity::Replaced {
+                len: old.len() as u64
+            })
+        );
+        // Without a fingerprint the same file is, as before, a continuation.
+        assert_eq!(
+            check(
+                seen(Some(7), old.len() as u64),
+                Some(7),
+                new.len() as u64,
+                old.len() as u64
+            ),
+            None
+        );
+        // The same file, appended to, is not a replacement - including a
+        // file under one page whose fingerprint covered all of it then.
+        let grown = [&old[..], b"old line three\n"].concat();
+        assert_eq!(
+            super::check(
+                Some(&seen_with(old)),
+                Some(7),
+                grown.len() as u64,
+                &grown,
+                old.len() as u64
+            ),
+            None
+        );
+        // A cursor that saw the file empty took no fingerprint, and proves
+        // nothing about what was written since.
+        assert_eq!(
+            super::check(Some(&seen_with(b"")), Some(7), 5, b"abcd\n", 0),
+            None
+        );
+    }
+
+    #[test]
+    fn a_commit_is_not_current_once_the_file_starts_with_other_bytes() {
+        let read = ContentFingerprint::of(b"old line one\n").unwrap();
+        let commit =
+            |head: &[u8]| super::commit_is_current(Some(7), Some(&read), Some(7), 5_000, head, 13);
+        assert!(commit(b"old line one\nand more"));
+        assert!(!commit(b"NEW line one\nand more"), "replaced in place");
+        assert!(!commit(b""), "unreadable: the conservative answer");
+        assert!(
+            super::commit_is_current(Some(7), None, Some(7), 5_000, b"", 13),
+            "a legacy marker is judged by inode and length alone"
+        );
     }
 
     #[test]

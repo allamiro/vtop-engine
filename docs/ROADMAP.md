@@ -488,12 +488,76 @@ landed on `main` after v0.5.0 ride this tag too.
 - **The benchmark numbers still carry the busy-laptop caveat** from
   v0.5.0; a quiet-machine run would tighten them, not change their shape.
 
-## v0.7.0 and beyond
+## v0.7.0 — an engine that keeps its word across restarts, deadlines and stops
 
-The theme is **splitting a range the formats already expect**: one broker
-leading several Kafka partitions (#473), then whatever of FIPS (#296) and
-the adaptive source side (#100, #101) still sits behind a design, not a
-slice.
+The roadmap above promised range splits for this tag; the first slice of
+that landed, but most of what `main` gathered after v0.6.0 is the archive
+engine's own failure modes, found by asking what happens at each edge and
+fixing the answer. The theme is **the engine never claims more than it
+did**: a stop, a rotation, a lost claim, a throttle or a hung call each end
+in a state replay can explain.
+
+- **A range splits at a barrier its leaseholder names (#473, slice 1).**
+  `SplitRange` on the metadata plane, fenced like a sealed-segment
+  registration, into children the formats already expected. One broker
+  serving several Kafka partitions is not in this tag.
+- **The archive engine's object-store and state-store calls have deadlines
+  (#556)**, including the upload body, so a stalled endpoint cannot hold a
+  batch forever. `vtopctl migrate` is not covered: its Postgres connection
+  and schema statements are still unbounded.
+- **A stop signal that arrives mid-cycle is honoured (#526)**, and SIGTERM
+  flushes like Ctrl-C.
+- **A failed batch hands its range back to the source (#552)**; recovery
+  resumes from the lowest incomplete range.
+- **A rotated or truncated file is read from byte zero (#558)**, and a
+  restart knows which file its offset belongs to.
+- **A claim generation fences an engine that lost its claim (#557).**
+- **The time partition is the seal time, or event time on request (#559).**
+- **An archive coverage audit, and a prune that keeps its anchor (#560).**
+- **On the native S3 backend, a large object uploads as resumable
+  multipart (#482)**, and the verification gap that path walked into is
+  closed. The command backends (AWS CLI, s3cmd, `mc`) and LocalFS still
+  hand the object over in one call, with no resume.
+- **A store throttle during a command backend's read-back or verify is a
+  throttle (#529)**, not a failure, on every backend.
+- **Upload transports are a trait and a registry (#479, #480)**, one tuning
+  shape for both paths, with the scheme policy proved at every door (#488).
+- **Metadata plane:** a lease request from a skewed proposer is refused
+  rather than trusted (#555); a feature level gates new command kinds so a
+  rolling upgrade cannot stall the tier (#554); each range records its
+  replica set and counts quorums only over it (#553).
+- **Observability:** blocked retention is visible and replication health
+  alerts (#561); per-group cursors sit beside the log start, with alerts
+  before a group is evicted (#571).
+- **Helm refuses an even replicated data tier (#562)** — chart 0.5.0.
+- **Benchmarks:** a long-lived engine with its own metrics scraped, so a
+  rate reads per second (#510); what an upload costs the flow beside it,
+  measured (#478); a netem link that bites, with queues somebody sized
+  (#477, #516).
+- **Supply chain:** the November 2026 advisory wave fixed by lockfile
+  bumps where a fix existed, documented ignores where none did.
+
+### Known limitations in v0.7.0
+
+- **One gateway still serves one range.** Range split's plane slice is in;
+  serving the children as separate Kafka partitions is not.
+- **The operator egress ceiling (#481) is not in this tag**; it waits on
+  its competitor-goodput measurement.
+- **The Kafka gateway is far slower than Apache Kafka on the same machine.**
+  The first same-client comparison (#596) measured produce throughput
+  about 12–14x below a 3-broker Kafka at `acks=all`, and the gateway lacks
+  CreateTopics, DescribeConfigs, OffsetCommit without a metadata plane and
+  zstd. Failover and crash-durability comparisons (#597, #599) are not run.
+- **Transactions remain out of scope**, and the v0.6.0 RemoteBridge
+  limitations still hold.
+
+## v0.8.0 and beyond
+
+The theme is **the gateway at the speed its durability allows**: wire the
+broker's group commit into the gateway path and close the compatibility
+gaps the Kafka comparison found (#596), measure failover and crash
+durability against Kafka (#597, #599), serve split children as Kafka
+partitions (#473), and ship the egress ceiling once measured (#481).
 
 ---
 
