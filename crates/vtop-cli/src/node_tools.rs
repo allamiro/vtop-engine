@@ -1232,17 +1232,12 @@ async fn repair(
     }
     if history.is_empty() {
         // A legal answer (the client's contract maps a peer that does not
-        // know the request to an empty vector), but it leaves this replica
-        // unable to prove lineage; say so now instead of letting the
-        // operator find out at the next failover.
-        eprintln!(
-            "warning: {from} reported no epoch history, so none was installed; the repaired \
-             replica will answer \"unknown\" at its next reconciliation instead of proving \
-             its lineage, and promotion never counts an unknown answer (#577). Repair from a \
-             replica that has epoch history. If no replica of this range has one, repair \
-             cannot restore it and the range cannot promote; there is no in-product remedy \
-             yet (#612)"
-        );
+        // know the request to an empty vector), but it leaves a replica that
+        // received records unable to prove lineage; say so now instead of
+        // letting the operator find out at the next failover.
+        if let Some(warning) = empty_history_warning(&from.to_string(), transferred_end) {
+            eprintln!("{warning}");
+        }
     } else if let Some(tail) = transferred_end {
         let entries: Vec<vtop_broker::fencing_epochs::EpochStart> = history
             .iter()
@@ -1425,6 +1420,26 @@ async fn repair(
 
 fn common_config_hint() -> &'static str {
     "the node client config"
+}
+
+/// What `vtopctl node repair` says when the source reported no epoch history
+/// (#612). Nothing when no records were transferred: a replica holding none
+/// disputes nothing, and its answer of 0 is Agreed at the next fence (#577).
+/// With records, the answer is Unknown, and the message must not promise a
+/// remedy that cannot run.
+fn empty_history_warning(from: &str, transferred_end: Option<u64>) -> Option<String> {
+    if transferred_end.unwrap_or(0) == 0 {
+        return None;
+    }
+    Some(format!(
+        "warning: {from} reported no epoch history, so none was installed; the repaired \
+         replica holds records it cannot vouch for and will answer \"unknown\" at its next \
+         reconciliation. A lineage-aware promotion (feature level 6, every data node on a \
+         release with #577) never counts such an answer; a promotion recorded without \
+         verdicts counts it by offset. Repair from a replica that has epoch history. If no \
+         replica of this range has one, repair cannot restore it and a range holding records \
+         cannot promote; there is no in-product remedy yet (#612)"
+    ))
 }
 
 #[cfg(test)]
@@ -1902,5 +1917,21 @@ replicas: []
             error.contains("node YAML"),
             "the refusal must point a not-yet-created range at the YAML path, got: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod empty_history_warning_tests {
+    use super::empty_history_warning;
+
+    /// #618 review: the warning holds only when records were transferred.
+    #[test]
+    fn the_empty_history_warning_is_only_for_a_repair_that_moved_records() {
+        assert_eq!(empty_history_warning("peer", None), None);
+        assert_eq!(empty_history_warning("peer", Some(0)), None);
+        let warning = empty_history_warning("peer", Some(40)).expect("records moved");
+        assert!(warning.contains("\"unknown\""), "{warning}");
+        assert!(warning.contains("recorded without verdicts"), "{warning}");
+        assert!(warning.contains("no in-product remedy"), "{warning}");
     }
 }

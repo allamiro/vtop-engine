@@ -56,8 +56,9 @@
 //! that cannot prove lineage is repaired from one that can (`vtopctl node
 //! repair` installs the source's history, #315), not promoted on a guess.
 //! That costs liveness, and the costs are stated rather than hidden (#612):
-//! a range where NO replica has epoch history (data written by v0.2.0 or
-//! earlier, journals lost everywhere) cannot promote at all, and repair
+//! a range that holds records but where NO replica has epoch history
+//! (records that predate the journal everywhere, journals lost everywhere)
+//! cannot promote at all, and repair
 //! cannot fix it, because a history-less source has none to install. A
 //! dispute confined to records retention reclaimed (#290/#408) also leaves
 //! the replica's answer Unknown, because the candidate cannot see the

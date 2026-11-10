@@ -214,9 +214,10 @@ reopen quietly.
   not promoted on a guess. A candidate with no history stands aside for a
   replica that has records: a candidate holding records it cannot vouch
   for always did, and one holding none now does too (#612). The costs
-  (#612): a range where NO replica has epoch history (data from v0.2.0 or
-  earlier, or journals lost on every replica) cannot promote, and repair
-  cannot fix it, since a history-less source has nothing to install; and a
+  (#612): a range that holds records but where NO replica has epoch
+  history (records that predate the journal on every replica, or journals
+  lost on every replica) cannot promote, and repair cannot fix it, since a
+  history-less source has nothing to install; and a
   replica whose only dispute is below its retained base (#408) is not
   counted. The verdicts are recorded with the quorum and the replica-set gate
   and `vtopctl meta transitions` count only the proven answers. Recording

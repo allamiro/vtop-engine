@@ -944,11 +944,14 @@ Short procedures now; expand into a full ops runbook before go-live.
   restarted empty). Repair those replicas from a replica that HAS epoch
   history (`vtopctl node repair` installs the source's history), rather than
   lowering anything. Three costs to plan for (#612):
-  - **A range where no replica has epoch history cannot promote, and repair
-    cannot fix it.** That means data written by v0.2.0 or earlier, or
-    journals lost on every replica. A repair whose source has no history
-    installs none and warns. Every candidate is Unknown to itself and
-    stands aside, so the range goes unled. The transition record shows
+  - **A range that holds records but where no replica has epoch history
+    cannot promote, and repair cannot fix it.** That means logs whose
+    records predate their epoch journal on every replica, or journals lost
+    on every replica. A repair whose source has no history installs none
+    and warns. Every candidate holding records is Unknown to itself and
+    stands aside, and a candidate holding none stands aside for them, so
+    the range goes unled. (A fresh, empty range is not affected: a
+    candidate at 0 disputes nothing and promotes.) The transition record shows
     `Refused{QuorumUnavailable}`, the same as an ordinary missing quorum;
     the data node's warning names the lineage cause. There is no
     in-product remedy yet.
@@ -958,9 +961,10 @@ Short procedures now; expand into a full ops runbook before go-live.
     is Unknown. With one replica of three down, that replica is needed for
     the majority, and promotion waits until it is repaired or the other
     replica returns.
-  - **A candidate holding no records stands aside** when a replica holding
-    records answers Unknown to it (a wiped disk at epoch 0, for example).
-    The replica with history wins the range instead.
+  - **A candidate holding no records stands aside** only when a replica
+    holding records answers Unknown to it (a wiped disk at epoch 0, for
+    example). The replica with history wins the range instead. Facing
+    replicas that hold nothing either, it promotes as before.
 
   Recording the verdicts needs
   `vtopctl meta enable-features --level 6` once every metadata voter runs
