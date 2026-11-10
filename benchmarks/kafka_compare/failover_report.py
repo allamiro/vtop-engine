@@ -522,32 +522,49 @@ def write_markdown(run: fschema.FailoverRun, images: dict[str, str], csv_rel: di
         handle.write("\n".join(lines))
 
 
-def vtop_batch_pacing_note(env: dict[str, Any], rows: list[dict[str, str]]) -> str:
-    """The run's VTOP latency caveat, when its producer sent batches early.
+def _sentence(text: str) -> str:
+    return text[:1].upper() + text[1:] + "."
 
-    Until the #613 review, `vtop-node produce --rate` sent a batch when its FIRST record was due, so
-    the other records of the batch were on the wire before their scheduled time, and a latency taken
-    from each record's schedule came out short by up to (batch - 1) / rate. Runs whose environment
-    records `vtop_pacing: "last-record-due"` were taken after the fix and carry no caveat.
+
+def vtop_batch_pacing_note(env: dict[str, Any], rows: list[dict[str, str]]) -> str:
+    """The run's VTOP latency caveats, for the producer timing faults the #613 review found.
+
+    Until then, `vtop-node produce --rate` (1) sent a batch when its FIRST record was due, so
+    the batch's other records left before their scheduled time and a latency taken from each
+    record's schedule came out short by up to (batch - 1) / rate; and (2) stamped each
+    acknowledgement in its ack log only after fsyncing the acked-floor file, which adds that
+    local fsync to every latency and gap. A run whose environment records the fixed behaviour
+    (`vtop_pacing: last-record-due`, `vtop_ack_stamp: on-answer`) carries no caveat for it.
     """
-    if env.get("comparable", {}).get("vtop_pacing") == "last-record-due":
+    c = env.get("comparable", {})
+    early = c.get("vtop_pacing") != "last-record-due"
+    late = c.get("vtop_ack_stamp") != "on-answer"
+    vtop = [row for row in rows if row["system"] == "vtop" and row["status"] == "ok"]
+    if not vtop or not (early or late):
         return ""
     m = env["matrix"]
     early_ms = (int(m["vtop_batch"]) - 1) / int(m["offered_rate"]) * 1000
-    vtop = [row for row in rows if row["system"] == "vtop" and row["status"] == "ok"]
-    if not vtop:
-        return ""
     before = max(float(row["p99_before_ms"]) for row in vtop)
     after = min(float(row["p99_after_ms"]) for row in vtop)
-    return (f"**VTOP latency in this run is understated by up to {early_ms:.1f} ms.** Its producer "
-            f"(`vtop-node produce --rate`, batches of {m['vtop_batch']}) sent each batch when the batch's FIRST "
-            f"record was due, so the batch's other records left up to {early_ms:.1f} ms before their scheduled "
-            "send time, and a latency measured from the schedule is short by up to that much. Against VTOP's "
-            f"30 s-before p99 (at most {fmt_ms(before)} here) that is not a small error, so that column is not "
-            "comparable with Kafka's; against its 30 s-after p99 (at least "
-            f"{fmt_ms(after)} here) it is. The unavailability window and the time to new leader do not use the "
-            "schedule. The producer now waits until a batch's last record is due; a VTOP p99 before that is "
-            "comparable needs a re-run.")
+    causes = []
+    if early:
+        causes.append(f"its producer (`vtop-node produce --rate`, batches of {m['vtop_batch']}) sent each batch "
+                      f"when the batch's FIRST record was due, so the other records left up to {early_ms:.1f} ms "
+                      "before their scheduled send time, which makes a latency measured from the schedule short "
+                      "by up to that much")
+    if late:
+        causes.append("it stamped each acknowledgement only after fsyncing its acked-floor file to the bind-mounted "
+                      "output directory, which makes every latency long by that fsync, a time this run did not "
+                      "record")
+    return ("**VTOP's latency in this run is off in a way the run cannot correct.** "
+            + _sentence("; and ".join(causes)) + " "
+            f"Against VTOP's 30 s-before p99 (at most {fmt_ms(before)} here) these are not small errors, so that "
+            "column is not comparable with Kafka's. "
+            + (f"Against its 30 s-after p99 (at least {fmt_ms(after)} here) the early send is small. " if early
+               else "")
+            + "The unavailability window and the time to new leader do not use the schedule"
+            + (" (the window's ends can each move by one fsync)" if late else "")
+            + ". The producer has been fixed; a VTOP p99 before that is comparable needs a re-run.")
 
 
 METHOD = """\

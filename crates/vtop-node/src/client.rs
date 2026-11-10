@@ -391,13 +391,18 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
         match outcome {
             Ok(committed_next_offset) => {
                 let latency = sent_at.elapsed();
+                // Stamped on the answer, before the floor's fsync below: the
+                // ack log is the benchmark's acknowledgement time, and local
+                // checkpoint I/O is not the cluster's latency (#613 review).
+                let acked_at = u128::from(unix_micros()?);
                 expected_next_offset = Some(committed_next_offset);
                 acked += count;
                 persist_acked(args.acked_file.as_ref(), args.first_sequence + acked)?;
                 if let Some(file) = ack_log.as_mut() {
-                    let now = u128::from(unix_micros()?);
-                    file.write_all(ack_line(now, args.first_sequence + acked, latency).as_bytes())
-                        .map_err(|error| format!("ack log: {error}"))?;
+                    file.write_all(
+                        ack_line(acked_at, args.first_sequence + acked, latency).as_bytes(),
+                    )
+                    .map_err(|error| format!("ack log: {error}"))?;
                 }
                 if request_id.is_multiple_of(20) {
                     println!(

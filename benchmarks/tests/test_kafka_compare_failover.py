@@ -531,14 +531,19 @@ def test_footer_renders_unknown_host_memory():
     assert "logical CPUs, unknown)" in failover_report.footer_text(env)
 
 
-def test_the_pacing_caveat_is_derived_and_absent_for_a_run_paced_on_the_last_record():
+def test_the_latency_caveat_is_derived_and_absent_for_a_run_with_the_fixed_producer():
     from kafka_compare import failover_report
 
     env = json.load(open(os.path.join(COMMITTED_RUN, "environment.json")))
     rows = fschema.load_failover_run(COMMITTED_RUN).rows
     note = failover_report.vtop_batch_pacing_note(env, rows)
-    assert "understated by up to 19.8 ms" in note  # (100 - 1) / 5000 s
+    assert "up to 19.8 ms before their scheduled send time" in note  # (100 - 1) / 5000 s
+    assert "after fsyncing its acked-floor file" in note
+    assert "FIRST record" in note  # case kept inside the sentence
     env["comparable"]["vtop_pacing"] = "last-record-due"
+    note = failover_report.vtop_batch_pacing_note(env, rows)
+    assert "19.8 ms" not in note and note.startswith("**VTOP's latency") and "It stamped" in note
+    env["comparable"]["vtop_ack_stamp"] = "on-answer"
     assert failover_report.vtop_batch_pacing_note(env, rows) == ""
 
 

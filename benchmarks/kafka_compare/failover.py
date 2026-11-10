@@ -161,6 +161,9 @@ def capture_environment(run_id: str, matrix: dict, vtop_image: str, limits: dict
     # How `vtop-node produce --rate` paces a batch: it goes out once its LAST
     # record is due (#613 review), so no record leaves before its schedule.
     c["vtop_pacing"] = "last-record-due"
+    # Where its ack log stamps an acknowledgement: on the answer, before the
+    # acked-floor file's fsync (#613 review), not after it.
+    c["vtop_ack_stamp"] = "on-answer"
     c["producer_props"] = ["acks=all (--acks -1)", *KAFKA_PRODUCER_PROPS,
                            "every other producer setting at the client default"]
     c.pop("consumer_props", None)
