@@ -658,8 +658,16 @@ impl InProcessFollower {
         Ok(outcome)
     }
 
-    /// Discard a suffix an earlier fence kept in dispute, once an append
-    /// under that fence's epoch reaches it (#611; see [`KeptDispute`]).
+    /// Discard a suffix an earlier fence kept in dispute, once an append or
+    /// a committed high-water mark under that fence's epoch reaches it (#611;
+    /// see [`KeptDispute`]).
+    ///
+    /// The high-water mark counts as much as an append (#616 review): a
+    /// reconnecting session sends the leader's current mark BEFORE any
+    /// append, and a mark past `from` both proves the leader established and
+    /// committed its own record at `from`, and would otherwise expose the
+    /// kept records as committed and leave them below a mark no truncation
+    /// may cross.
     ///
     /// Called with the meta lock held and the state lock NOT held: the
     /// meta lock is the append's critical section, so nothing else appends
@@ -670,7 +678,7 @@ impl InProcessFollower {
     /// letting it be acked. The mark says those records were acknowledged,
     /// and then the leader sending over them is the inconsistency, not this
     /// replica.
-    fn settle_kept_dispute(&self, epoch: u64, batch_end: u64) -> Result<(), (ErrorCode, String)> {
+    fn settle_kept_dispute(&self, epoch: u64, reaches: u64) -> Result<(), (ErrorCode, String)> {
         let kept = *self
             .kept_dispute
             .lock()
@@ -678,7 +686,7 @@ impl InProcessFollower {
         let Some(dispute) = kept else {
             return Ok(());
         };
-        if dispute.epoch != epoch || batch_end <= dispute.from {
+        if dispute.epoch != epoch || reaches <= dispute.from {
             return Ok(());
         }
         if self.next_offset() <= dispute.from {
@@ -1310,13 +1318,17 @@ impl InProcessFollower {
             return Err((code, message.to_owned()));
         }
         // Before the duplicate check below can ack a record this replica
-        // does not hold (#611, #261).
-        self.settle_kept_dispute(
-            request.fencing_epoch,
-            request
-                .expected_base_offset
-                .saturating_add(request.records.len() as u64),
-        )?;
+        // does not hold (#611, #261). The batch end is validated FIRST: a
+        // malformed request must be refused before it can discard anything
+        // (#616 review).
+        let batch_end = request
+            .expected_base_offset
+            .checked_add(request.records.len() as u64)
+            .ok_or((
+                ErrorCode::InvalidRequest,
+                "replica append batch end overflows u64".to_owned(),
+            ))?;
+        self.settle_kept_dispute(request.fencing_epoch, batch_end)?;
         let mut state = self
             .state
             .lock()
@@ -1324,14 +1336,8 @@ impl InProcessFollower {
         let tip = state.segment.next_offset();
         if tip > request.expected_base_offset {
             // Idempotent retry / catch-up: this follower already applied through
-            // the batch. Ack when local durability covers the batch end.
-            let batch_end = request
-                .expected_base_offset
-                .checked_add(request.records.len() as u64)
-                .ok_or((
-                    ErrorCode::InvalidRequest,
-                    "replica append batch end overflows u64".to_owned(),
-                ))?;
+            // the batch. Ack when local durability covers the batch end
+            // (validated above, before the kept-dispute guard).
             // NOTE (#240): durability through the batch end is not the same
             // question as holding the SAME records, and this path cannot yet
             // tell them apart — see #261. An earlier attempt compared the epoch that wrote
@@ -1493,15 +1499,19 @@ impl InProcessFollower {
         }) && check_follower_fencing(&meta, self.held_fencing_epoch(), first.fencing_epoch)
             .is_ok()
         {
-            let group_end = requests
-                .iter()
-                .map(|request| {
-                    request
-                        .expected_base_offset
-                        .saturating_add(request.records.len() as u64)
-                })
-                .max()
-                .unwrap_or(first.expected_base_offset);
+            // Every member's end validated before anything is discarded
+            // (#616 review): a malformed group is refused, not half-acted on.
+            let mut group_end = first.expected_base_offset;
+            for request in requests {
+                let end = request
+                    .expected_base_offset
+                    .checked_add(request.records.len() as u64)
+                    .ok_or((
+                        ErrorCode::InvalidRequest,
+                        "replica append batch end overflows u64".to_owned(),
+                    ))?;
+                group_end = group_end.max(end);
+            }
             self.settle_kept_dispute(first.fencing_epoch, group_end)?;
         }
         let mut state = self
@@ -1655,6 +1665,11 @@ impl InProcessFollower {
         {
             return Err((code, message.to_owned()));
         }
+        // A mark past a kept dispute's start discards the suffix first
+        // (#611, #616 review). Applied over it, the mark would expose the
+        // kept records as committed and put them below a mark no truncation
+        // may cross, wedging the replica.
+        self.settle_kept_dispute(update.fencing_epoch, update.committed_high_watermark)?;
         // Never advertise above local durability.
         let local = self.local_committed_offset();
         let visible = update.committed_high_watermark.min(local);

@@ -140,6 +140,16 @@ pub trait CandidateLocalView: Send + Sync {
     fn sealed_prefix_end(&self) -> Option<u64> {
         None
     }
+    /// Where this view's log ENDS: every record it holds, durable or not
+    /// (#611, #616 review). The candidate judges whether a replica's
+    /// divergence concerns a record the candidate holds, and records past
+    /// its durable vote are still records it holds. `None` when the view
+    /// cannot say, which keeps every dispute below a replica's tail unproven.
+    /// Read after the fence: the log is stopped then, and a later read can
+    /// only be larger, which only makes the judgement stricter.
+    fn local_next_offset(&self) -> Option<u64> {
+        None
+    }
     /// Stop this view's log at `fencing_epoch` and return the vote — the
     /// committed offset AS STOPPED (review, #410, twice). Every REMOTE
     /// vote in the promotion probe is read from a log the fence RPC has
@@ -165,6 +175,10 @@ impl CandidateLocalView for LocalBroker {
         self.local_offsets().0
     }
 
+    fn local_next_offset(&self) -> Option<u64> {
+        Some(self.local_offsets().1)
+    }
+
     fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
         self.epoch_starts()
     }
@@ -179,6 +193,10 @@ impl CandidateLocalView for LocalBroker {
 impl CandidateLocalView for vtop_broker::replication::InProcessFollower {
     fn local_committed_offset(&self) -> u64 {
         self.local_committed_offset()
+    }
+
+    fn local_next_offset(&self) -> Option<u64> {
+        Some(self.next_offset())
     }
 
     fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
@@ -371,11 +389,19 @@ impl ReplicaPlaneProbe {
             .collect();
         let leader_epoch_starts = &leader_epoch_starts;
         let candidate_lineage = &candidate_lineage;
-        // What the candidate holds, for judging which disputes concern its
-        // records at all (#611). A candidate that could not stop its own log
-        // has no tail to judge by; MAX keeps every dispute below a replica's
-        // tail unproven, as before.
-        let candidate_tail = local_committed_offset.unwrap_or(u64::MAX);
+        // What the candidate HOLDS, for judging which disputes concern its
+        // records at all (#611): its next offset, not its durable vote (#616
+        // review), since a record past the vote is still a record it holds.
+        // A candidate that could not stop its own log, or a view that cannot
+        // say where its log ends, has no tail to judge by; MAX keeps every
+        // dispute below a replica's tail unproven, as before.
+        let candidate_tail = match local_committed_offset {
+            Some(committed) => self
+                .view
+                .local_next_offset()
+                .map_or(u64::MAX, |next| next.max(committed)),
+            None => u64::MAX,
+        };
         // ONE deadline per follower for the lookup AND the fence (review of
         // #566): a fence timeout that started only after a slow lookup let
         // one follower outlast the round, and the round's own deadline then
@@ -5833,6 +5859,70 @@ mod tests {
             },
             "a candidate missing acknowledged records 5..10 must be refused, and \
              the replica holding them named"
+        );
+    }
+
+    /// #616 review (cubic P1): "the candidate holds nothing at or above the
+    /// divergence" must be judged against what the candidate HOLDS (its next
+    /// offset), not its durable frontier.
+    ///
+    /// The candidate holds epoch-18 records to 5 durably and its own epoch-19
+    /// records 5..8 not yet durable (fsync held), so it votes 5 but holds
+    /// 8. The replica holds epoch-18 records to 5 durably, a different
+    /// epoch-18 record at 5 and epoch-19 records 6..10, none durable. It
+    /// keeps them (nothing proves them unacknowledged) and answers 5.
+    /// Divergence at 5 is inside the candidate's held suffix, so the answer
+    /// is NOT proven. Judged against the vote of 5 it came back Agreed and
+    /// counted as a grant: a replica holding a different record at 5 than
+    /// the candidate would have established it.
+    #[tokio::test]
+    async fn a_divergence_inside_the_candidates_undurable_suffix_is_not_proven() {
+        let candidate_dir = tempfile::tempdir().unwrap();
+        let (candidate, candidate_meta) =
+            lineage_replica(candidate_dir.path(), Uuid::from_u128(1), 5);
+        candidate_meta.set(LINEAGE_RIVAL_EPOCH);
+        candidate.adopt_fencing_epoch(LINEAGE_RIVAL_EPOCH);
+        candidate.set_hold_fsync(true);
+        append_lineage_records(&candidate, LINEAGE_RIVAL_EPOCH, 5..8);
+        assert_eq!(
+            (candidate.local_committed_offset(), candidate.next_offset()),
+            (5, 8),
+            "precondition: the candidate holds more than it votes"
+        );
+
+        let follower_dir = tempfile::tempdir().unwrap();
+        let (follower, meta) = lineage_replica(follower_dir.path(), Uuid::from_u128(2), 5);
+        follower.set_hold_fsync(true);
+        append_lineage_records(&follower, LINEAGE_OLD_EPOCH, 5..6);
+        meta.set(LINEAGE_RIVAL_EPOCH);
+        follower.adopt_fencing_epoch(LINEAGE_RIVAL_EPOCH);
+        append_lineage_records(&follower, LINEAGE_RIVAL_EPOCH, 6..10);
+        meta.set(LINEAGE_NEW_EPOCH);
+        let follower_view = follower.clone();
+
+        let (probes, _stop) =
+            probe_with_one_reachable_follower(candidate as Arc<dyn CandidateLocalView>, follower)
+                .await;
+        assert_eq!(
+            follower_view.next_offset(),
+            10,
+            "precondition: the replica kept its records"
+        );
+        let answer = probes
+            .iter()
+            .find(|probe| probe.node_id == Uuid::from_u128(2))
+            .expect("replica 2 answers");
+        assert_eq!(
+            answer.lineage,
+            vtop_meta::AnswerLineage::Unknown,
+            "a replica disagreeing about a record the candidate holds was judged \
+             {:?}: {answer:?}",
+            answer.lineage
+        );
+        let promotion = crate::promotion::establish(&probes, 3, Uuid::from_u128(1), None);
+        assert!(
+            !matches!(promotion, crate::promotion::Promotion::Established { .. }),
+            "{promotion:?}"
         );
     }
 

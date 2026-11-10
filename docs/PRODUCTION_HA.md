@@ -930,6 +930,23 @@ Short procedures now; expand into a full ops runbook before go-live.
   remains is the one way to stall the tier - that voter cannot decode the
   raise itself. A node that refuses to start with "written by a newer
   release" is an old binary on a newer log: upgrade it.
+- **Upgrading data nodes past #611:** the fix lives in the FENCED replica,
+  which keeps records a promotion candidate merely lacks instead of
+  truncating them. A replica still on an older release truncates as before,
+  and nothing on the wire tells the candidate which kind answered. So until
+  every data node of a range runs this release, a failover can still lose an
+  acknowledged write. That needs a replica holding acknowledged records
+  above its own committed mark, which it has not learned yet because the
+  leader acknowledges the producer before the mark reaches followers. A
+  rolling upgrade causes failovers, so keep it from triggering that:
+  1. Upgrade a range's followers before the node that leads it.
+  2. Before restarting the leader (or any node whose restart moves a
+     lease), stop producers to the range and wait until every follower's
+     `vtop_broker_cluster_committed_offset{topic,range}` equals the
+     leader's. A fence then cannot
+     truncate an acknowledged record on any replica, old or new: the
+     truncation guard refuses below the mark.
+  3. Resume producers once the new leader is serving.
 - **Lineage verdicts on promotion records (#577), feature level 6:** a
   promotion counts a fenced replica's answer only when the candidate could
   prove the replica's epoch history agrees with its own (or the replica

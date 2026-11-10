@@ -387,8 +387,8 @@ pub struct ReplicaFenceRequest {
     ///
     /// Sent with the fence rather than fetched afterwards because reconciling
     /// is only sound against a log that cannot move. A replica compares this
-    /// with its own vector and discards what lies above the point where the
-    /// two stop agreeing, but only when this history PROVES those records
+    /// with its own vector and discards the records at and above the offset
+    /// where the two stop agreeing, but only when this history PROVES those records
     /// were never acknowledged (#611). The caller must hold a record there,
     /// written under an epoch newer than every record discarded. A caller
     /// that merely lacks records, including through its own adoption of the

@@ -465,6 +465,115 @@ fn a_kept_suffix_goes_before_a_group_append_over_it_and_not_for_a_stale_epoch() 
     assert_eq!(h.node.next_offset(), 7);
 }
 
+/// Fence a harness follower holding ten epoch-18 records (high-water mark 5)
+/// for a caller that never received 5..10: the #611 shape, which keeps them.
+fn kept_extension() -> Harness {
+    let h = follower();
+    for offset in 0..10 {
+        append_at(&h, OLD_EPOCH, OLD_LEADER, offset).unwrap();
+    }
+    h.node.cluster_committed().advance_to(5);
+    h.meta.set(NEW_EPOCH);
+    let fenced = h
+        .node
+        .fence(
+            NEW_EPOCH,
+            &[
+                EpochStart {
+                    epoch: OLD_EPOCH,
+                    start_offset: 0,
+                },
+                EpochStart {
+                    epoch: NEW_EPOCH,
+                    start_offset: 5,
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!((fenced.truncated_records, fenced.next_offset), (0, 10));
+    h
+}
+
+/// #616 review (codex P1, cubic P1). An outvoted follower reconnects after
+/// the new leader committed past the kept suffix's start, and the session
+/// sends the current high-water mark BEFORE any append. That mark must
+/// neither expose the old records as committed nor make the suffix
+/// impossible to discard. The epoch-19 leader committing past 5 proves it
+/// was established and holds its own record at 5, so the suffix is
+/// discarded before the mark is applied, and the mark never exceeds what
+/// this replica holds in agreement. The leader's append at 5 then lands.
+#[test]
+fn a_high_water_mark_past_a_kept_suffix_discards_it_before_it_is_applied() {
+    let h = kept_extension();
+    h.node
+        .observe_hwm(&CommittedHwmUpdate {
+            range: h.range.clone(),
+            fencing_epoch: NEW_EPOCH,
+            committed_high_watermark: 7,
+        })
+        .expect("the leader's mark on reconnect");
+    assert!(
+        h.node.cluster_committed().get() <= 5,
+        "the mark exposed the kept epoch-18 records as committed: cluster \
+         committed {} over a suffix disputed from 5",
+        h.node.cluster_committed().get()
+    );
+    let ack = h
+        .node
+        .apply_append(&append_request(
+            &h.range,
+            NEW_EPOCH,
+            Uuid::from_u128(0xA9),
+            5,
+        ))
+        .expect("the follower must still be able to catch up after the mark");
+    assert_eq!(ack.local_committed_offset, 6);
+    assert_eq!(h.node.next_offset(), 6);
+}
+
+/// The same mark at or below the dispute's start proves nothing about the
+/// suffix and discards nothing.
+#[test]
+fn a_high_water_mark_at_a_kept_suffix_start_discards_nothing() {
+    let h = kept_extension();
+    h.node
+        .observe_hwm(&CommittedHwmUpdate {
+            range: h.range.clone(),
+            fencing_epoch: NEW_EPOCH,
+            committed_high_watermark: 5,
+        })
+        .unwrap();
+    assert_eq!(h.node.next_offset(), 10);
+    assert_eq!(h.node.cluster_committed().get(), 5);
+}
+
+/// #616 review (cubic P1). A request whose batch end overflows is malformed
+/// and refused; it must be refused BEFORE the kept suffix is discarded, not
+/// after.
+#[test]
+fn an_overflowing_append_is_refused_without_discarding_a_kept_suffix() {
+    let h = kept_extension();
+    let mut request = append_request(&h.range, NEW_EPOCH, Uuid::from_u128(0xA9), 5);
+    request.expected_base_offset = u64::MAX;
+    let refused = h
+        .node
+        .apply_append(&request)
+        .expect_err("an overflowing batch end is malformed");
+    assert_eq!(refused.0, ErrorCode::InvalidRequest);
+    assert_eq!(
+        h.node.next_offset(),
+        10,
+        "the malformed request discarded the kept suffix before it was refused"
+    );
+
+    let refused = h
+        .node
+        .apply_append_batch(&[request.clone(), request])
+        .expect_err("an overflowing group is malformed");
+    assert_eq!(refused.0, ErrorCode::InvalidRequest);
+    assert_eq!(h.node.next_offset(), 10);
+}
+
 /// #611, the other way a fence can be told to discard records that may be
 /// acknowledged: the replica's disputed records come from a leadership NEWER
 /// than the caller's at the divergence point. Here the caller holds epoch-19

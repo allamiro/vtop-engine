@@ -171,7 +171,9 @@ pub struct ReplicaProbe {
 /// scenarios 09 and 11-13 caught a first draft that refused it).
 ///
 /// The mirror rule holds for the candidate's own tail (#611):
-/// `candidate_tail` is the candidate's offset. A divergence at or above it
+/// `candidate_tail` is where the candidate's log ENDS, every record it holds
+/// whether durable or not (#616 review: its durable vote can sit below
+/// records it holds, and a dispute about those is real). A divergence at or above it
 /// concerns records only the REPLICA holds. Typically that is the
 /// candidate's adoption of the new epoch at its tail, against records the
 /// candidate never received. The replica agrees with every record the
