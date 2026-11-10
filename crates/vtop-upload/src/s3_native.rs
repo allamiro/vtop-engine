@@ -125,9 +125,10 @@ pub fn request_timeouts(request_timeout_seconds: u64) -> aws_smithy_types::timeo
 
 pub struct S3NativeBackend {
     client: Client,
-    /// Present only when a cap is configured (#481). Shared by every object,
-    /// manifest and part this backend sends — one backend per process, so one
-    /// budget per process.
+    /// Present only when a cap is configured (#481). The PROCESS's shaper
+    /// (`transport::process_egress_shaper`), not this backend's own: every
+    /// object, manifest and part sent by any backend in the process draws on
+    /// the same budget.
     shaper: Option<Arc<transport::EgressShaper>>,
     /// The bound on reading a response BODY (review of #568). The SDK's
     /// timeouts end when `send()` returns the headers; a body consumed after
@@ -536,7 +537,7 @@ fn egress_shaper_for(
             transport.name()
         )));
     }
-    transport::EgressShaper::new(cap).map(Some)
+    transport::process_egress_shaper(cap).map(Some)
 }
 
 impl S3NativeBackend {
@@ -3094,6 +3095,29 @@ mod egress_ceiling {
         assert_eq!(
             capped.egress_shaper().map(|s| s.rate_bytes_per_second()),
             Some(4 * 1024 * 1024)
+        );
+        // One budget per PROCESS (review): a second backend built with the
+        // cap gets the very same shaper, and one built with a different cap
+        // while it is live is refused naming both. This is the only test that
+        // builds a capped backend through the process-global slot, so no other
+        // test can hold a conflicting budget while it runs.
+        let second = S3NativeBackend::new(&build(Some(4 * 1024 * 1024)))
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(
+                capped.egress_shaper().unwrap(),
+                second.egress_shaper().unwrap()
+            ),
+            "two backends in one process must draw on one egress budget"
+        );
+        let msg = match S3NativeBackend::new(&build(Some(1024 * 1024))).await {
+            Ok(_) => panic!("a different cap while one is in force must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("1048576") && msg.contains("4194304"),
+            "the refusal names both caps: {msg}"
         );
     }
 

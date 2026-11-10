@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use vtop_core::errors::VtopError;
@@ -253,9 +253,14 @@ const BUCKET_DEPTH_DIVISOR: u64 = 32;
 
 /// A process-wide token bucket over request-body bytes (#481).
 ///
-/// ONE per constructed backend, shared by every object, manifest and part the
-/// backend sends; each `vtopctl` process builds exactly one backend, so this
-/// is the process's total upload egress, not a per-object budget.
+/// ONE per PROCESS, not one per backend: [`process_egress_shaper`] hands every
+/// backend constructed in the process the same bucket, so every object,
+/// manifest and part any of them sends draws on one budget. The engine and
+/// each `vtopctl tier` command build a single backend today, but that is a
+/// property of today's callers, not of this type — a second backend built in
+/// the same process (a library caller, a future command that copies between
+/// two stores) would otherwise get a second full budget and the process could
+/// send twice the cap.
 ///
 /// THE BOUND, AND WHY THE BUCKET IS THIS DEEP. For a cap `R`:
 ///
@@ -439,6 +444,46 @@ impl EgressShaper {
             }
         }
     }
+}
+
+/// The process's one egress budget (#481): the shaper every backend in this
+/// process shares, held weakly so that a process whose backends have all been
+/// dropped can configure a fresh one. A body in flight holds a strong
+/// reference, so the budget cannot be replaced while bytes are still passing
+/// through it.
+static PROCESS_SHAPER: Mutex<Weak<EgressShaper>> = Mutex::new(Weak::new());
+
+/// The shaper for a cap of `rate_bytes_per_second`, shared by the whole
+/// process (#481). The first backend to ask creates it; every later backend
+/// asking for the same cap gets the SAME bucket, so their bytes share one
+/// budget. A different cap while that budget is live is refused naming both
+/// numbers: a process has one ceiling, and silently keeping either value would
+/// leave one of the two configurations recorded and not enforced.
+pub fn process_egress_shaper(rate_bytes_per_second: u64) -> Result<Arc<EgressShaper>, VtopError> {
+    shared_shaper(&PROCESS_SHAPER, rate_bytes_per_second)
+}
+
+/// [`process_egress_shaper`] over an explicit slot, so the sharing rule is
+/// tested without the process-global one other tests may be using.
+fn shared_shaper(
+    slot: &Mutex<Weak<EgressShaper>>,
+    rate_bytes_per_second: u64,
+) -> Result<Arc<EgressShaper>, VtopError> {
+    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(live) = slot.upgrade() {
+        if live.rate_bytes_per_second() == rate_bytes_per_second {
+            return Ok(live);
+        }
+        return Err(VtopError::Config(format!(
+            "upload.max_egress_bytes_per_second = {rate_bytes_per_second} conflicts with the \
+             {} bytes/second cap already in force in this process; the cap is one budget for \
+             the whole process, so a second backend may not bring a different one",
+            live.rate_bytes_per_second()
+        )));
+    }
+    let shaper = EgressShaper::new(rate_bytes_per_second)?;
+    *slot = Arc::downgrade(&shaper);
+    Ok(shaper)
 }
 
 /// A pending admission, held so the body stays `Sync` (the SDK requires it):
@@ -745,6 +790,104 @@ mod shaper_tests {
                 );
             }
         }
+    }
+
+    /// Bytes released per whole second since `start`, across several logs.
+    fn per_second(logs: &[&ReleaseLog], start: Instant, seconds: u64) -> Vec<u64> {
+        let mut buckets = vec![0_u64; seconds as usize];
+        for log in logs {
+            for (at, len) in log.lock().unwrap().iter() {
+                let second = at.duration_since(start).as_secs();
+                if second < seconds {
+                    buckets[second as usize] += len;
+                }
+            }
+        }
+        buckets
+    }
+
+    /// Drain one saturating body through each shaper for `seconds` of
+    /// virtual time and return the bytes released per second, summed over
+    /// both — what the process as a whole put on the wire.
+    async fn two_bodies_per_second(
+        first: &Arc<EgressShaper>,
+        second: &Arc<EgressShaper>,
+        seconds: u64,
+    ) -> Vec<u64> {
+        let start = Instant::now();
+        let (a, b): (ReleaseLog, ReleaseLog) = (Arc::default(), Arc::default());
+        let tasks = [
+            tokio::spawn(drain_logged(
+                shape_body(first, repeat_body(MIB as usize, 64)),
+                Arc::clone(&a),
+            )),
+            tokio::spawn(drain_logged(
+                shape_body(second, repeat_body(MIB as usize, 64)),
+                Arc::clone(&b),
+            )),
+        ];
+        tokio::time::sleep_until(start + Duration::from_secs(seconds)).await;
+        for task in &tasks {
+            task.abort();
+        }
+        per_second(&[&a, &b], start, seconds)
+    }
+
+    /// The cap is the PROCESS's budget, not a backend's (#481, review): two
+    /// backends that each ask for the same cap get the same bucket, so their
+    /// bodies together stay under it. The contrast run — two independent
+    /// shapers, which is what one-shaper-per-backend amounted to — sends
+    /// nearly twice the cap, so this test fails against that construction.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn two_backends_with_the_cap_share_one_budget() {
+        let slot = Mutex::new(Weak::new());
+        let first = shared_shaper(&slot, MIB).unwrap();
+        let second = shared_shaper(&slot, MIB).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second backend in the process must get the same shaper, not a fresh budget"
+        );
+        let shared = two_bodies_per_second(&first, &second, 10).await;
+        for (i, bytes) in shared.iter().enumerate() {
+            assert!(
+                *bytes <= MIB,
+                "second {i}: two backends sharing the cap released {bytes} bytes, above the \
+                 {MIB}-byte cap"
+            );
+        }
+
+        let independent = two_bodies_per_second(
+            &EgressShaper::new(MIB).unwrap(),
+            &EgressShaper::new(MIB).unwrap(),
+            10,
+        )
+        .await;
+        let worst = independent.iter().copied().max().unwrap();
+        assert!(
+            worst > MIB * 3 / 2,
+            "the contrast must show what a per-backend budget does, or the shared run proves \
+             nothing: two independent shapers released at most {worst} bytes in a second"
+        );
+    }
+
+    /// A process has ONE cap (#481, review): a second backend asking for a
+    /// different one while the first budget is live is refused naming both
+    /// numbers, and once every holder of the old budget is gone a new cap is
+    /// accepted rather than refused forever.
+    #[test]
+    fn a_different_cap_while_one_is_live_is_refused_naming_both() {
+        let slot = Mutex::new(Weak::new());
+        let live = shared_shaper(&slot, 4 * MIB).unwrap();
+        let msg = shared_shaper(&slot, MIB)
+            .expect_err("a second, different cap in the same process must be refused")
+            .to_string();
+        assert!(
+            msg.contains(&MIB.to_string()) && msg.contains(&(4 * MIB).to_string()),
+            "the refusal names both caps: {msg}"
+        );
+        drop(live);
+        let fresh = shared_shaper(&slot, MIB).expect("no live budget, so a new cap is accepted");
+        assert_eq!(fresh.rate_bytes_per_second(), MIB);
     }
 
     /// A large body cannot starve a small one (#481): the bucket's lock is

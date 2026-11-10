@@ -147,10 +147,14 @@ upload:
   #
   # max_egress_bytes_per_second: a ceiling on this PROCESS's total upload body
   # bytes per second, across every object and part in flight — not per object.
-  # Enforced by a token bucket in front of each request body the s3_native
-  # backend sends; it is application-layer rate policy over kernel TCP, and it
-  # infers nothing about the network. No one-second window admits more than
-  # the cap; a saturated run sustains about 97% of it. Minimum 1024. Any backend
+  # Enforced by one token bucket per process in front of each object, manifest
+  # and multipart-part body the s3_native backend sends (headers and the small
+  # multipart create/complete bodies are not shaped); it is application-layer
+  # rate policy over kernel TCP, and it infers nothing about the network. No
+  # one-second window admits more than the cap. 97% of the cap is the shaper's
+  # own sustained rate under continuous load; an engine run lands lower,
+  # because startup and the gaps between cycles leave the bucket idle (the
+  # recorded runs sustained 93-94%). Minimum 1024. Any backend
   # other than s3_native refuses it at startup (a CLI backend's bytes never pass
   # through VTOP). Counted in vtop_upload_egress_bytes_total, which is exported
   # only when a cap is set. Retries pass the bucket again.
