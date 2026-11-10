@@ -905,10 +905,13 @@ def test_a_scrape_that_fails_while_the_engine_runs_is_still_a_stopped_scrape(
     engine = EngineExitingMidScrape(exits_during=None)
     with pytest.raises(engine_run.ScrapeStopped, match="connection refused"):
         engine.run(tmp_path, monkeypatch)
+    # Pinned from both sides (review): past the grace, the refusal is late;
+    # short of it (no wait, or one that stops a poll early), an engine that
+    # is still being reaped is misfiled as a stopped scrape again.
     waited = engine.now - engine.failed_at
-    assert waited <= 0.05 + 1e-9, (
-        f"waited {waited:.3f}s of fake time for an exit after the failed scrape, past the "
-        "0.05s grace: the wait for an exit must end at ENGINE_EXIT_GRACE_SECONDS")
+    assert abs(waited - 0.05) <= 1e-9, (
+        f"waited {waited:.3f}s of fake time for an exit after the failed scrape against a "
+        "0.05s grace: the wait must run to ENGINE_EXIT_GRACE_SECONDS and end there")
 
 
 def test_a_long_lived_run_with_a_competitor_is_refused_before_it_costs_anything(
