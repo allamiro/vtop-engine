@@ -206,6 +206,53 @@ pub struct ProduceArgs {
     pub first_sequence: u64,
     pub durability: Durability,
     pub acked_file: Option<PathBuf>,
+    /// Records per second offered, averaged from the start; 0 is unpaced.
+    pub rate: u64,
+    /// Wall-clock origin of the rate schedule (unix micros); unset is this
+    /// invocation's start.
+    pub rate_anchor_unix_micros: Option<u64>,
+    /// One `<unix_micros> <acked_total> <latency_micros>` line per ack.
+    pub ack_log: Option<PathBuf>,
+    /// A batch unanswered this long is an interruption; 0 waits forever.
+    pub request_timeout_ms: u64,
+}
+
+/// When the batch after `sent` records may go out, at `rate` records per
+/// second from `started`; `None` when unpaced. Averaged from the start, as
+/// the JVM perf tools' throttle is, so one slow acknowledgement is caught up
+/// rather than lowering the offered rate for the rest of the run.
+fn paced_send_at(started: Instant, sent: u64, rate: u64) -> Option<Instant> {
+    if rate == 0 {
+        return None;
+    }
+    Some(started + std::time::Duration::from_secs_f64(sent as f64 / rate as f64))
+}
+
+/// The monotonic instant standing for wall-clock `anchor_micros`, given that
+/// `now` is wall-clock `now_micros`: an anchor in the past maps to before
+/// `now` (or to `now` itself if the monotonic clock cannot reach back that
+/// far, rather than panicking on an underflow).
+fn instant_of_wall(now: Instant, now_micros: u64, anchor_micros: u64) -> Instant {
+    if anchor_micros >= now_micros {
+        now + std::time::Duration::from_micros(anchor_micros - now_micros)
+    } else {
+        let back = std::time::Duration::from_micros(now_micros - anchor_micros);
+        now.checked_sub(back).unwrap_or(now)
+    }
+}
+
+fn unix_micros() -> Result<u64, String> {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?;
+    u64::try_from(since.as_micros()).map_err(|error| error.to_string())
+}
+
+/// One acknowledgement-timeline line: wall-clock micros (comparable across
+/// processes on one host, which a monotonic clock is not), the acknowledged
+/// total after this batch, and the batch's round trip.
+fn ack_line(unix_micros: u128, acked_total: u64, latency: std::time::Duration) -> String {
+    format!("{unix_micros} {acked_total} {}\n", latency.as_micros())
 }
 
 enum ProduceBatchError {
@@ -236,7 +283,30 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
     // without assuming the range started empty or that this producer owns it.
     let mut expected_next_offset: Option<u64> = None;
     persist_acked(args.acked_file.as_ref(), args.first_sequence)?;
+    let mut ack_log = match args.ack_log.as_ref() {
+        Some(path) => Some(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|error| format!("ack log {}: {error}", path.display()))?,
+        ),
+        None => None,
+    };
+    // The schedule's origin and how far along it this invocation starts: a
+    // run anchored at the shared origin is due at `first_sequence / rate`
+    // past it, so a restarted producer picks the schedule up where it is.
+    let (schedule_origin, schedule_offset) = match args.rate_anchor_unix_micros {
+        Some(anchor) => (
+            instant_of_wall(Instant::now(), unix_micros()?, anchor),
+            args.first_sequence,
+        ),
+        None => (started, 0),
+    };
     while acked < args.records {
+        if let Some(at) = paced_send_at(schedule_origin, schedule_offset + acked, args.rate) {
+            tokio::time::sleep_until(at.into()).await;
+        }
         let count = u64::from(args.batch).min(args.records - acked);
         let first = args.first_sequence + acked;
         let records = (first..first + count)
@@ -248,7 +318,8 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
             .collect();
         request_id += 1;
         let expected_offset = expected_next_offset.map(|next| next + count);
-        let outcome: Result<u64, ProduceBatchError> = async {
+        let sent_at = Instant::now();
+        let exchange = async {
             write_frame(
                 &mut session,
                 &WireFrame {
@@ -294,13 +365,30 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
                     "unexpected produce reply: {other:?}"
                 ))),
             }
-        }
-        .await;
+        };
+        let outcome: Result<u64, ProduceBatchError> = if args.request_timeout_ms == 0 {
+            exchange.await
+        } else {
+            let limit = std::time::Duration::from_millis(args.request_timeout_ms);
+            match tokio::time::timeout(limit, exchange).await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(ProduceBatchError::Interrupted(format!(
+                    "no answer to a {count}-record batch within {} ms",
+                    args.request_timeout_ms
+                ))),
+            }
+        };
         match outcome {
             Ok(committed_next_offset) => {
+                let latency = sent_at.elapsed();
                 expected_next_offset = Some(committed_next_offset);
                 acked += count;
                 persist_acked(args.acked_file.as_ref(), args.first_sequence + acked)?;
+                if let Some(file) = ack_log.as_mut() {
+                    let now = u128::from(unix_micros()?);
+                    file.write_all(ack_line(now, args.first_sequence + acked, latency).as_bytes())
+                        .map_err(|error| format!("ack log: {error}"))?;
+                }
                 if request_id.is_multiple_of(20) {
                     println!(
                         "acked_total={} rate={:.0}rec/s",
@@ -572,6 +660,58 @@ pub async fn replica_status(
             Err(format!("status rejected: {code:?} {message}"))
         }
         other => Err(format!("unexpected status reply: {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// #597: the offered rate is a schedule from the start, so the batch
+    /// after N records waits until N/rate seconds have passed, and an
+    /// unpaced run never waits.
+    #[test]
+    fn a_paced_batch_goes_out_at_its_share_of_the_schedule() {
+        let started = Instant::now();
+        assert_eq!(paced_send_at(started, 0, 1000), Some(started));
+        assert_eq!(
+            paced_send_at(started, 500, 1000),
+            Some(started + Duration::from_millis(500))
+        );
+        assert_eq!(
+            paced_send_at(started, 30_000, 10_000),
+            Some(started + Duration::from_secs(3))
+        );
+        assert_eq!(paced_send_at(started, 500, 0), None);
+    }
+
+    /// A restarted producer anchored at the run's origin resumes the one
+    /// schedule: the wall-clock anchor maps onto the monotonic clock in
+    /// both directions, and a sequence past the anchor is due that much
+    /// later.
+    #[test]
+    fn an_anchored_schedule_maps_wall_clock_onto_the_monotonic_clock() {
+        let now = Instant::now() + Duration::from_secs(3600);
+        assert_eq!(
+            instant_of_wall(now, 10_000_000, 12_500_000),
+            now + Duration::from_millis(2500)
+        );
+        assert_eq!(
+            instant_of_wall(now, 10_000_000, 9_000_000),
+            now - Duration::from_secs(1)
+        );
+        let origin = instant_of_wall(now, 10_000_000, 4_000_000);
+        // 6 s ago at 1,000 records/s: sequence 6,000 is due right now.
+        assert_eq!(paced_send_at(origin, 6000, 1000), Some(now));
+    }
+
+    #[test]
+    fn an_ack_line_carries_wall_clock_total_and_round_trip() {
+        assert_eq!(
+            ack_line(1_700_000_000_123_456, 4200, Duration::from_micros(3_517)),
+            "1700000000123456 4200 3517\n"
+        );
     }
 }
 
