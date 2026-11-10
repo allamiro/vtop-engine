@@ -18,6 +18,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -109,8 +110,38 @@ def _sysctl(name: str) -> str:
         return ""
 
 
+def host_memory_bytes() -> str:
+    """Physical RAM in bytes: the macOS sysctl, else POSIX sysconf (Linux), else ""."""
+    value = _sysctl("hw.memsize")
+    if value:
+        return value
+    try:
+        pages, page_size = os.sysconf("SC_PHYS_PAGES"), os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):
+        return ""
+    return str(pages * page_size) if pages > 0 and page_size > 0 else ""
+
+
+def volume_filesystem_command() -> list[str]:
+    """`df -T` on a fresh ANONYMOUS volume. `docker run --rm` removes an
+    anonymous volume with its container, so the probe never names, and never
+    deletes, a volume that this run did not create."""
+    return ["docker", "run", "--rm", "--mount", "type=volume,destination=/probe", "--entrypoint", "df",
+            KAFKA_IMAGE, "-T", "/probe"]
+
+
 def git(*args: str) -> str:
     return sh(["git", "-C", REPO, *args]).stdout.strip()
+
+
+# What docker/Dockerfile compiles the image from. A change here that is not
+# committed would be built into an image tagged, and recorded, as HEAD.
+BUILD_INPUTS = ("Cargo.toml", "Cargo.lock", ".cargo", "crates", "docker")
+
+
+def dirty_build_inputs() -> list[str]:
+    status = git("status", "--porcelain", "--untracked-files=all", "--", *BUILD_INPUTS)
+    return [line for line in status.splitlines() if line.strip()]
 
 
 def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, limits: dict[str, str]) -> dict:
@@ -119,11 +150,9 @@ def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, li
     kafka_inspect = json.loads(sh(["docker", "image", "inspect", KAFKA_IMAGE]).stdout)[0]
     vtop_inspect = json.loads(sh(["docker", "image", "inspect", vtop_image]).stdout)[0]
     java = sh(["docker", "run", "--rm", "--entrypoint", "java", KAFKA_IMAGE, "-version"]).stderr.strip()
-    volume_fs = sh(["docker", "run", "--rm", "-v", "kc-fsprobe:/probe", "--entrypoint", "df", KAFKA_IMAGE,
-                    "-T", "/probe"], check=False).stdout.strip().splitlines()
-    sh(["docker", "volume", "rm", "-f", "kc-fsprobe"], check=False)
+    volume_fs = sh(volume_filesystem_command(), check=False).stdout.strip().splitlines()
     others = [name for name in sh(["docker", "ps", "--format", "{{.Names}}"]).stdout.split() if name]
-    host_mem = _sysctl("hw.memsize")
+    host_mem = host_memory_bytes()
     comparable = {
         "host_cpu": _sysctl("machdep.cpu.brand_string") or platform.processor(),
         "host_model": _sysctl("hw.model"),
@@ -434,6 +463,10 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
             try:
                 done = client(system, command, timeout=ctx["sat_timeout"], check=False)
                 _save_output(logs, f"{tag}-consume-{rep}.log", done.stdout + done.stderr)
+                # A summary printed by a tool that then failed is not a
+                # measurement, as on the producer path.
+                if done.returncode != 0:
+                    raise perftool.PerfParseError("the consumer perf tool exited nonzero")
                 result = perftool.parse_consumer(done.stdout, sat_records)
                 row.update(status="ok", records=result.records, records_per_sec=result.records_per_sec,
                            mib_per_sec=result.mib_per_sec,
@@ -491,6 +524,16 @@ def _observe_kafka(ctx: dict) -> None:
 
 
 def ensure_vtop_image(rebuild: bool) -> str:
+    """The image of HEAD's engine, built if absent or asked for.
+
+    Refuses when the build inputs differ from HEAD: an existing image would be
+    stale, and a rebuilt one would put uncommitted code under HEAD's tag and
+    in the results as HEAD's commit. Commit (or stash) first.
+    """
+    dirty = dirty_build_inputs()
+    if dirty:
+        raise SystemExit(f"the engine's build inputs differ from HEAD ({'; '.join(dirty[:5])}): "
+                         "commit or stash them, so the image benchmarked is the commit recorded")
     sha = git("rev-parse", "--short=12", "HEAD")
     image = f"vtop-bench:{sha}"
     exists = sh(["docker", "image", "inspect", image], check=False).returncode == 0
@@ -504,11 +547,53 @@ def parse_sat_records(text: str, sizes: list[int]) -> dict[int, int]:
     table = {}
     for item in text.split(","):
         size, _, count = item.partition(":")
-        table[int(size)] = int(count)
+        try:
+            size_n, count_n = int(size), int(count)
+        except ValueError:
+            raise SystemExit(f"--sat-records entry {item!r} is not SIZE:COUNT") from None
+        if count_n < 1:
+            raise SystemExit(f"--sat-records gives {count_n} records for {size_n} B: must be positive")
+        table[size_n] = count_n
     missing = [size for size in sizes if size not in table]
     if missing:
         raise SystemExit(f"--sat-records names no count for record sizes {missing}")
     return table
+
+
+def parse_sizes(text: str) -> list[int]:
+    try:
+        sizes = [int(size) for size in text.split(",")]
+    except ValueError:
+        raise SystemExit(f"--sizes {text!r} is not a comma-separated list of byte counts") from None
+    if any(size < 1 for size in sizes) or len(set(sizes)) != len(sizes):
+        raise SystemExit(f"--sizes {text!r}: record sizes must be positive and distinct")
+    return sizes
+
+
+# One path component: a run id names a directory under results/, never a path.
+_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def check_run_id(run_id: str) -> str:
+    if not _RUN_ID.match(run_id) or ".." in run_id:
+        raise SystemExit(f"--run-id {run_id!r} must be one path component of letters, digits, '.', '_' or '-'")
+    return run_id
+
+
+def check_args(args: argparse.Namespace) -> tuple[list[int], dict[int, int]]:
+    """Every matrix argument, refused up front before any Docker work."""
+    sizes = parse_sizes(args.sizes)
+    sat_records = parse_sat_records(args.sat_records, sizes)
+    if args.reps < 1:
+        raise SystemExit(f"--reps {args.reps}: at least one repetition is needed")
+    for name, value in (("--fixed-seconds", args.fixed_seconds), ("--sat-timeout", args.sat_timeout)):
+        if not math.isfinite(value) or value <= 0:
+            raise SystemExit(f"{name} {value}: must be a positive, finite number of seconds")
+    if args.smoke_records < 1:
+        raise SystemExit(f"--smoke-records {args.smoke_records}: the smoke must read back at least one record")
+    if args.run_id is not None:
+        check_run_id(args.run_id)
+    return sizes, sat_records
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -525,7 +610,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rebuild", action="store_true", help="rebuild the vtop image even if it exists")
     args = parser.parse_args(argv)
 
-    sizes = [int(size) for size in args.sizes.split(",")]
+    sizes, sat_records = check_args(args)
     if args.reps < 3:
         log(f"warning: {args.reps} repetitions is below #595 rule 7's minimum of 3")
     limits = check_equal_limits()
@@ -543,12 +628,12 @@ def main(argv: list[str] | None = None) -> int:
     os.makedirs(run_dir)
     matrix = {"record_sizes": sizes, "partitions": [1], "producers": [1], "acks": ["all"], "profile": PROFILE,
               "repetitions": args.reps, "load_pcts": list(stats.LOAD_FRACTIONS), "consume": not args.no_consume,
-              "sat_records": {str(k): v for k, v in parse_sat_records(args.sat_records, sizes).items()},
+              "sat_records": {str(k): v for k, v in sat_records.items()},
               "fixed_seconds": args.fixed_seconds, "warmup_fraction": 0.2, "smoke_records": args.smoke_records}
     env = capture_environment(run_id, matrix, vtop_image, limits)
     ctx = {"run_id": run_id, "run_dir": run_dir, "csv": os.path.join(run_dir, "results.csv"), "env": env,
            "fingerprint": schema.fingerprint(env), "vtop_image": vtop_image, "reps": args.reps,
-           "sat_records": parse_sat_records(args.sat_records, sizes), "fixed_seconds": args.fixed_seconds,
+           "sat_records": sat_records, "fixed_seconds": args.fixed_seconds,
            "smoke_records": args.smoke_records, "sat_timeout": args.sat_timeout, "consume": not args.no_consume}
     schema.write_header(ctx["csv"])
     save_environment(run_dir, env)

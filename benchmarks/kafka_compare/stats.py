@@ -91,7 +91,7 @@ def derive_offered_rates(kafka_saturation_records_per_sec: Sequence[float],
 
 def records_for_duration(rate: int, seconds: float, minimum: int = 1000) -> int:
     """How many records a fixed-rate run sends to last about `seconds`."""
-    if rate < 1 or seconds <= 0:
+    if rate < 1 or not math.isfinite(seconds) or seconds <= 0:
         raise ValueError(f"rate and duration must be positive, got rate={rate} seconds={seconds}")
     return max(minimum, int(rate * seconds))
 

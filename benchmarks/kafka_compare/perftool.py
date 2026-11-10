@@ -137,12 +137,21 @@ def parse_consumer(output: str, expected_records: int) -> ConsumerResult:
         raise PerfParseError(f"consumer summary does not parse: {lines[index + 1]!r}") from exc
     if records < expected_records:
         raise PerfParseError(f"consumed {records} records, asked for {expected_records}")
-    if fetch_ms <= 0 or not math.isfinite(fetch_rps):
-        raise PerfParseError(f"consumer fetch time {fetch_ms} ms gives no rate")
+    numeric = {"data.consumed.in.MB": mib, "rebalance.time.ms": rebalance_ms, "fetch.time.ms": fetch_ms,
+               "fetch.MB.sec": fetch_mibps, "fetch.nMsg.sec": fetch_rps}
+    for name, value in numeric.items():
+        if not math.isfinite(value) or value < 0:
+            raise PerfParseError(f"consumer {name} is {value}: not a finite, non-negative number")
+    if fetch_ms <= 0 or fetch_rps <= 0:
+        raise PerfParseError(f"consumer fetch time {fetch_ms} ms at {fetch_rps} records/s gives no rate")
     return ConsumerResult(records, mib, fetch_rps, fetch_mibps, rebalance_ms, fetch_ms)
 
 
 _CONFIG_LINE = re.compile(r"^\s+([a-z0-9._-]+) = (.*)$")
+# The pinned image's log4j2 layout is `%m (%c)%n`, so the multi-line config
+# message ends with the logger that wrote it on a line of its own. That line,
+# and only that line, closes a complete dump.
+_CONFIG_END = re.compile(r"^\s*\(org\.apache\.kafka\.common\.config\.AbstractConfig\)\s*$")
 
 
 def parse_client_config(output: str, banner: str = "ProducerConfig values:") -> dict[str, str]:
@@ -150,20 +159,24 @@ def parse_client_config(output: str, banner: str = "ProducerConfig values:") -> 
 
     Recorded in environment.json (#595 rule 8) so the producer settings both
     systems ran with are the client's own word, not the harness's assumption.
+    A dump cut off before its closing logger line, or broken by a line that is
+    neither a setting nor that close, is an error, never a partial config.
     """
-    values: dict[str, str] = {}
+    values: dict[str, str] | None = None
     inside = False
     for line in output.splitlines():
         if banner in line:
-            inside = True
-            values = {}
+            inside, values = True, {}
             continue
-        if inside:
-            match = _CONFIG_LINE.match(line)
-            if match:
-                values[match.group(1)] = match.group(2).strip()
-            elif values:
-                break
-    if not values:
+        if not inside:
+            continue
+        match = _CONFIG_LINE.match(line)
+        if match:
+            values[match.group(1)] = match.group(2).strip()
+        elif _CONFIG_END.match(line) and values:
+            return values
+        else:
+            raise PerfParseError(f"'{banner}' block is malformed at {line.strip()[:80]!r}")
+    if values is None:
         raise PerfParseError(f"no '{banner}' block in the client's output")
-    return values
+    raise PerfParseError(f"'{banner}' block is truncated: no closing logger line after {len(values)} settings")

@@ -120,6 +120,9 @@ def test_fixed_rate_run_length_refuses_non_positive_inputs():
         stats.records_for_duration(0, 30)
     with pytest.raises(ValueError):
         stats.records_for_duration(100, 0)
+    for seconds in (float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            stats.records_for_duration(100, seconds)
 
 
 def test_sustained_allows_five_percent_and_no_more():

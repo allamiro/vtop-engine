@@ -107,6 +107,7 @@ def test_the_client_config_dump_is_read_from_its_banner():
     text = (
         "[2026-11-09 23:12:01,000] INFO ProducerConfig values: \n"
         "\tacks = -1\n\tbatch.size = 16384\n\tenable.idempotence = true\n\tlinger.ms = 5\n"
+        " (org.apache.kafka.common.config.AbstractConfig)\n"
         "[2026-11-09 23:12:01,100] INFO something else\n\tunrelated = 1\n"
     )
     assert perftool.parse_client_config(text) == {
@@ -117,3 +118,35 @@ def test_the_client_config_dump_is_read_from_its_banner():
 def test_no_config_banner_is_an_error():
     with pytest.raises(perftool.PerfParseError):
         perftool.parse_client_config("nothing here")
+
+
+def test_a_config_dump_cut_off_before_its_close_is_refused():
+    text = "[2026-11-09 23:12:01,000] INFO ProducerConfig values: \n\tacks = -1\n\tbatch.size = 16384\n"
+    with pytest.raises(perftool.PerfParseError, match="truncated"):
+        perftool.parse_client_config(text)
+
+
+def test_a_config_dump_broken_by_another_line_is_refused():
+    text = (
+        "[2026-11-09 23:12:01,000] INFO ProducerConfig values: \n\tacks = -1\n"
+        "[2026-11-09 23:12:01,100] INFO something else\n\tlinger.ms = 5\n"
+        " (org.apache.kafka.common.config.AbstractConfig)\n"
+    )
+    with pytest.raises(perftool.PerfParseError, match="malformed"):
+        perftool.parse_client_config(text)
+
+
+def _consumer_with(fields: dict[int, str]) -> str:
+    header, line = CONSUMER.strip().split("\n")
+    values = [value.strip() for value in line.split(",")]
+    for index, value in fields.items():
+        values[index] = value
+    return header + "\n" + ", ".join(values) + "\n"
+
+
+@pytest.mark.parametrize("fields", [
+    {7: "NaN"}, {6: "NaN"}, {8: "Infinity"}, {9: "-5.0"}, {2: "-1"}, {9: "0.0"}, {7: "0"},
+])
+def test_a_consumer_summary_with_a_non_finite_negative_or_zero_rate_is_refused(fields):
+    with pytest.raises(perftool.PerfParseError):
+        perftool.parse_consumer(_consumer_with(fields), expected_records=1)

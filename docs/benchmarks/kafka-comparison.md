@@ -4,7 +4,7 @@
 
 > **Single host, Apple M5 Max (Mac17,6), Docker Desktop 4.99.0 (245822); indicative, not a production benchmark.** Both clusters ran as Linux containers in the same Docker Desktop VM, one at a time, with identical per-node limits. Treat the numbers as a relative reading on a laptop, not as capacity figures for either system.
 
-Phase 1 of [#595](https://github.com/allamiro/vtop-engine/issues/595) ([#596](https://github.com/allamiro/vtop-engine/issues/596) throughput and latency, [#600](https://github.com/allamiro/vtop-engine/issues/600) charts). Raw data: [`results.csv`](../../benchmarks/kafka_compare/results/20261109T232328Z/results.csv) and [`environment.json`](../../benchmarks/kafka_compare/results/20261109T232328Z/environment.json), run `20261109T232328Z`. Every number on this page and in the images is generated from that CSV by `benchmarks/kafka_compare/report.py`.
+Phase 1 of [#595](https://github.com/allamiro/vtop-engine/issues/595) ([#596](https://github.com/allamiro/vtop-engine/issues/596) throughput and latency, [#600](https://github.com/allamiro/vtop-engine/issues/600) charts). Raw data: [`results.csv`](../../benchmarks/kafka_compare/results/20261109T232328Z/results.csv) and [`environment.json`](../../benchmarks/kafka_compare/results/20261109T232328Z/environment.json), run `20261109T232328Z`. Every measured number on this page and in the images (tables, charts, ratios) is generated from that CSV, and the stated conditions (machine, limits, images, commit, matrix, dates) from that `environment.json`, by `benchmarks/kafka_compare/report.py`.
 
 ## Method
 
@@ -115,7 +115,7 @@ measurement (#597, #598, #599).
 |---|---|---|---|
 | CreateTopics | kafka-topics.sh --create | `UnsupportedVersionException: The node does not support CREATE_TOPICS` | The VTOP topic is the range in the node config; Kafka's is created by run.py with kafka-topics.sh. |
 | DescribeConfigs | kafka-topics.sh --describe | `UnsupportedVersionException: The node does not support DESCRIBE_CONFIGS` | Not needed by the perf tools; the topic layout is recorded from the node config instead. |
-| OffsetCommit (no metadata plane) | kafka-consumer-perf-test.sh with auto-commit on | `Offset commit failed on partition bench-0 at offset 150447: The message format version on the broker does not support the request (gateway: "kafka OffsetCommit refused: this gateway has no durable offset store")` | enable.auto.commit=false for BOTH systems; reads are measured, commits are not. |
+| OffsetCommit (no metadata plane) | kafka-consumer-perf-test.sh with auto-commit on | `Offset commit failed on partition bench-0 at offset <n>: The message format version on the broker does not support the request (gateway: "kafka OffsetCommit refused: this gateway has no durable offset store")` | enable.auto.commit=false for BOTH systems; reads are measured, commits are not. |
 | Compressed batches | producer with compression.type=zstd | `UnsupportedCompressionTypeException: batch 0: record batch is compressed (codec 4), which this gateway does not decompress` | compression.type=none for both systems; compression is out of phase 1. |
 | Gateway on followers | vtop-node with a `kafka` block on a follower | `the node refuses a kafka block on any role but leader or standalone (the gateway is served by a leader or standalone only)` | The gateway runs on the range's leader only; one partition means one gateway. |
 

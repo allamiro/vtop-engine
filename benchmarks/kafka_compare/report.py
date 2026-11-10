@@ -6,14 +6,17 @@
 Reads `results.csv` and `environment.json`, refuses (exit 2, the reason on
 stderr) a missing, partial or mixed-environment run (#595 rule 9), and writes
 PNG + SVG charts to docs/benchmarks/img/ and docs/benchmarks/kafka-comparison.md.
-Every number in them comes from the CSV; none is typed here.
+Every measured number in them (tables, charts, ratios) comes from the CSV; the
+run's conditions (machine, limits, images, commit, matrix, dates) come from
+environment.json. None is typed here.
 
 A failover run (#597; its directory holds `failover.csv`) is handed to
 failover_report.py, which writes docs/benchmarks/kafka-failover.md under the
 same rules.
 
-Output is deterministic for a given CSV and matplotlib version: fixed rcParams,
-a fixed SVG hash salt, and no timestamps or software banners in the metadata.
+Output is deterministic for a given CSV, environment.json and matplotlib
+version: fixed rcParams, a fixed SVG hash salt, and no timestamps or software
+banners in the metadata.
 """
 from __future__ import annotations
 
@@ -58,7 +61,7 @@ GATEWAY_GAPS = (
      "UnsupportedVersionException: The node does not support DESCRIBE_CONFIGS",
      "Not needed by the perf tools; the topic layout is recorded from the node config instead."),
     ("OffsetCommit (no metadata plane)", "kafka-consumer-perf-test.sh with auto-commit on",
-     "Offset commit failed on partition bench-0 at offset 150447: The message format version on the broker "
+     "Offset commit failed on partition bench-0 at offset <n>: The message format version on the broker "
      "does not support the request (gateway: \"kafka OffsetCommit refused: this gateway has no durable offset "
      "store\")",
      "enable.auto.commit=false for BOTH systems; reads are measured, commits are not."),
@@ -80,6 +83,15 @@ def _float(row: dict[str, str], column: str) -> float:
     return float(row[column])
 
 
+def _all_sustained(selected: list[dict[str, str]]) -> bool:
+    """Whether the offered rate held in EVERY repetition of the cell.
+
+    A failed or refused repetition did not hold it either, so it counts
+    against the cell rather than dropping out of the judgement.
+    """
+    return bool(selected) and all(row["status"] == "ok" and row.get("sustained") == "true" for row in selected)
+
+
 def cell_summary(rows: list[dict[str, str]], system: str, mode: str, size: int, column: str,
                  load_pct: int | None = None) -> dict[str, Any]:
     """Median/min/max of `column` over the ok repetitions, plus what did not run."""
@@ -90,7 +102,7 @@ def cell_summary(rows: list[dict[str, str]], system: str, mode: str, size: int, 
     ok = [row for row in selected if row["status"] == "ok"]
     not_ok = [row for row in selected if row["status"] != "ok"]
     out: dict[str, Any] = {"n": len(selected), "ok": len(ok), "not_ok": not_ok, "summary": None,
-                           "sustained": all(row.get("sustained") == "true" for row in ok) if ok else False,
+                           "sustained": _all_sustained(selected),
                            "offered": None}
     if ok:
         out["summary"] = stats.summarize([_float(row, column) for row in ok])
@@ -118,14 +130,24 @@ def compact(value: float) -> str:
     return f"{value:.2f}"
 
 
+def gib(value: Any) -> str:
+    """Bytes as whole GiB, or `unknown` when the run could not read them
+    (e.g. `host_memory_bytes` is empty on a host without the macOS sysctl)."""
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    return f"{size / 2**30:.0f} GiB" if size > 0 else "unknown"
+
+
 def footer_text(env: dict[str, Any], run_id: str) -> str:
     c = env["comparable"]
-    mem_gib = int(c["host_memory_bytes"]) / 2**30
-    vm_gib = int(c["docker_vm_memory_bytes"]) / 2**30
     limits = c["node_limits"]
     return (
-        f"{c['host_cpu']} ({c['host_logical_cpus']} logical CPUs, {mem_gib:.0f} GiB), {c['host_os']} | "
-        f"{c['docker_platform']}, VM {c['docker_vm_cpus']} CPUs / {vm_gib:.0f} GiB, kernel {c['docker_vm_kernel']}, "
+        f"{c['host_cpu']} ({c['host_logical_cpus']} logical CPUs, {gib(c.get('host_memory_bytes'))}), "
+        f"{c['host_os']} | "
+        f"{c['docker_platform']}, VM {c['docker_vm_cpus']} CPUs / {gib(c.get('docker_vm_memory_bytes'))}, "
+        f"kernel {c['docker_vm_kernel']}, "
         f"volumes {c['volume_filesystem']}\n"
         f"per node: {limits['cpus']} CPUs, {limits['mem_limit']} RAM | Kafka {c['kafka_image'].split('@')[0]} "
         f"(KRaft, 3 brokers) | VTOP {c['vtop_commit'][:12]} | client {c['client']} | "
@@ -360,11 +382,20 @@ def _fmt(value: float, digits: int = 0) -> str:
     return f"{value:,.{digits}f}"
 
 
+def md_cell(text: str) -> str:
+    """Free text made safe for one Markdown table cell: line breaks flattened,
+    and the characters that end a cell, open a tag or a code span escaped."""
+    flat = " ".join(text.split())
+    for char in ("\\", "|", "`", "*", "_", "[", "]", "<", ">"):
+        flat = flat.replace(char, "\\" + char)
+    return flat
+
+
 def _summary_cell(cell: dict[str, Any], digits: int = 0) -> str:
     summary = cell["summary"]
     if summary is None:
         reason = cell["not_ok"][0]["note"] if cell["not_ok"] else "no rows"
-        return f"no result ({reason[:60]})"
+        return f"no result ({md_cell(reason[:60])})"
     text = f"{_fmt(summary.median, digits)} ({_fmt(summary.low, digits)}-{_fmt(summary.high, digits)})"
     if cell["ok"] < cell["n"]:
         text += f" [{cell['ok']}/{cell['n']} reps ok]"
@@ -372,7 +403,9 @@ def _summary_cell(cell: dict[str, Any], digits: int = 0) -> str:
 
 
 def _ratio(a: dict[str, Any], b: dict[str, Any]) -> float | None:
-    if a["summary"] is None or b["summary"] is None or b["summary"].median == 0:
+    # Either side at zero has no ratio: a/0 is undefined, and 0/b would later
+    # be inverted to say which system is faster.
+    if a["summary"] is None or b["summary"] is None or a["summary"].median == 0 or b["summary"].median == 0:
         return None
     return a["summary"].median / b["summary"].median
 
@@ -399,8 +432,10 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
     add(f"Phase 1 of [#595](https://github.com/allamiro/vtop-engine/issues/595) "
         f"([#596](https://github.com/allamiro/vtop-engine/issues/596) throughput and latency, "
         f"[#600](https://github.com/allamiro/vtop-engine/issues/600) charts). Raw data: [`{os.path.basename(csv_rel)}`]"
-        f"({csv_rel}) and [`{os.path.basename(env_rel)}`]({env_rel}), run `{run_id}`. Every number on this page "
-        "and in the images is generated from that CSV by `benchmarks/kafka_compare/report.py`.")
+        f"({csv_rel}) and [`{os.path.basename(env_rel)}`]({env_rel}), run `{run_id}`. Every measured number on "
+        "this page and in the images (tables, charts, ratios) is generated from that CSV, and the stated "
+        "conditions (machine, limits, images, commit, matrix, dates) from that `environment.json`, by "
+        "`benchmarks/kafka_compare/report.py`.")
     add("")
     add("## Method")
     add("")
@@ -604,7 +639,7 @@ def build(run_dir: str, img_dir: str, doc_path: str) -> list[str]:
     run = schema.load_run(run_dir)  # raises ReportRefused before anything is written
     plt = _setup_matplotlib()
     os.makedirs(img_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(doc_path), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(doc_path)), exist_ok=True)
     run_id = run.environment["run_id"]
     written = []
     written += throughput_chart(plt, run.rows, run.environment, run_id, "saturation",

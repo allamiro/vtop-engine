@@ -9,7 +9,9 @@ measurements [#596](https://github.com/allamiro/vtop-engine/issues/596), charts 
 
 ## Run it
 
-Needs Docker (with Compose v2) and Python 3.9+. `report.py` also needs matplotlib.
+Needs Docker (with Compose v2) and Python 3.10+ (matplotlib 3.10, which `report.py` needs, requires it).
+`run.py` refuses to start when `Cargo.toml`, `Cargo.lock`, `.cargo/`, `crates/` or `docker/` differ from
+`HEAD`: the image it benchmarks is tagged and recorded as `HEAD`, so it must be built from `HEAD`.
 
 ```bash
 # The whole matrix, both systems, one at a time (about 1.5 to 2 hours on a laptop; VTOP runs are the long ones).
@@ -22,8 +24,9 @@ python3 benchmarks/kafka_compare/report.py benchmarks/kafka_compare/results/<run
 ```
 
 Useful knobs: `--sizes 100,1024`, `--reps 3`, `--sat-records 100:3000000,1024:1000000` (records per
-saturation run, per record size), `--fixed-seconds 30` (length of a fixed-rate run), `--smoke-records`,
-`--no-consume`, `--rebuild`. A run writes `results/<run-id>/` and never overwrites another.
+saturation run AND per consume run, per record size), `--fixed-seconds 30` (length of a fixed-rate run),
+`--smoke-records`, `--no-consume`, `--rebuild`, `--run-id` (one path component). Every one is checked
+before any Docker work. A run writes `results/<run-id>/` and never overwrites another.
 
 ## What it does
 
@@ -42,8 +45,9 @@ For each record size, Kafka first and then VTOP:
 4. **Saturation.** `kafka-producer-perf-test --throughput -1`, `--reps` times. The first 20% of each run's
    records are `--warmup-records` and excluded from its steady-state line, which is the one recorded.
 5. **Fixed rate.** 25 / 50 / 75 % of **Kafka's** median saturation for the cell, offered to both systems with
-   `--throughput` (open loop, rule 6), about `--fixed-seconds` long each, `--reps` times, interleaved. A run
-   whose achieved rate is more than 5% under its offer is recorded with `sustained=false`.
+   `--throughput` (open loop, rule 6), about `--fixed-seconds` long each: the three rates in turn, and that
+   round `--reps` times. The systems are not interleaved: Kafka's whole cell runs before VTOP's. A run whose
+   achieved rate is more than 5% under its offer is recorded with `sustained=false`.
 6. **Consume.** `kafka-consumer-perf-test` reads `--sat-records` records from the start of the log with a
    fresh group, `--reps` times; the recorded rates are its `fetch.*` columns, which exclude the group join.
 7. **Down.** The leader's log is saved under `logs/`, the cluster is removed with its volumes.
@@ -59,10 +63,12 @@ percentiles in whole milliseconds; MiB/s is the tool's "MB/sec" (2^20 bytes).
 `results/<run-id>/environment.json`: host CPU/model/RAM and OS, Docker Desktop version, the VM's CPUs,
 memory, kernel and storage driver, the volume filesystem, per-node and client limits, both image references
 with digests, the VTOP commit and engine tree hash, the client and its JVM, the producer and consumer
-properties passed, the client's resolved `ProducerConfig` per system, Kafka's broker configuration as Kafka
-reports it (`kafka-configs --describe --all`) and topic layout, the derived offered rates, every config file
-verbatim, and the other containers running on the Docker host at start. The `comparable` block is hashed into
-`env_fingerprint`; `run_state` is `complete` only when the run finished.
+properties passed, the client's resolved `ProducerConfig` per system, selected settings from Kafka's broker
+configuration as Kafka reports it (`kafka-configs --describe --all`, filtered to the flush, replication,
+timeout, thread, socket, fetch, segment and group settings `run.py` names) and the topic layout, the derived
+offered rates, the two Compose files and three VTOP node configs verbatim, and the COUNT of other containers
+running on the Docker host at start (not their names). The `comparable` block is hashed into `env_fingerprint`; `run_state` is `complete`
+only when the run finished.
 
 `logs/`: every perf tool's output and each cluster's node-1 log.
 
@@ -70,14 +76,17 @@ verbatim, and the other containers running on the Docker host at start. The `com
 
 `report.py` refuses (exit 2, the reason on stderr, nothing written) when the CSV or `environment.json` is
 missing, the run did not finish, a row is malformed or a `failed`/`refused` row gives no reason, any expected
-row is missing or duplicated, rows come from more than one environment, commit, image, client or profile, or
-the CSV's fingerprint does not match `environment.json` (rule 9). A cell that did not run is not a refusal:
-it is a row, and the chart shows "no result" in its place.
+row is missing or duplicated, rows come from more than one environment, commit, image, client or profile,
+the CSV's run id, commit, image, client, profile or `acks` differ from what `environment.json` records, or
+the CSV's fingerprint does not match `environment.json` (rule 9). A cell that did not run is a row with
+status `refused` (or `failed`, if it ran and gave no usable result); the report accepts such a row, does not
+refuse the run over it, and the chart shows "no result" in its place.
 
 Charts use one colour per system everywhere (Kafka blue `#2a78d6`, VTOP orange `#eb6834`; validated for
 colour-vision-deficiency separation, never red vs green), marker shape as a second channel, and a footer with
-the environment, profile, repetitions and run date. Output is deterministic for a given CSV and matplotlib
-version (fixed rcParams, fixed SVG hash salt, no timestamps in metadata).
+the environment, profile, repetitions and run date. Measured numbers come from the CSV; the conditions,
+run id, dates and matrix come from `environment.json`. Output is deterministic for a given CSV,
+`environment.json` and matplotlib version (fixed rcParams, fixed SVG hash salt, no timestamps in metadata).
 
 ## Fairness rules applied (#595)
 
@@ -91,7 +100,7 @@ version (fixed rcParams, fixed SVG hash salt, no timestamps in metadata).
 | 6 open loop | latency only from `--throughput` runs at fixed fractions of Kafka's saturation; unsustained runs flagged |
 | 7 repetition | 3 repetitions, warm-up run plus `--warmup-records` excluded, median with min-max |
 | 8 pinned and recorded | image digests, commit, client, host and every config in `environment.json` |
-| 9 no hand-entered numbers | `report.py` generates every chart and table from the CSV and refuses partial or mixed data |
+| 9 no hand-entered numbers | `report.py` generates every chart and table from the CSV (conditions from `environment.json`) and refuses partial or mixed data |
 | 10 gateway gaps listed | in the report and below |
 
 ## Gateway gaps met
@@ -100,7 +109,7 @@ version (fixed rcParams, fixed SVG hash salt, no timestamps in metadata).
 |---|---|---|
 | CreateTopics | `UnsupportedVersionException: The node does not support CREATE_TOPICS` (`kafka-topics.sh --create`) | VTOP's topic is the range in the node config |
 | DescribeConfigs | `UnsupportedVersionException: The node does not support DESCRIBE_CONFIGS` (`kafka-topics.sh --describe`) | not needed by the perf tools |
-| OffsetCommit without a metadata plane | client: `Offset commit failed on partition bench-0 at offset 150447: The message format version on the broker does not support the request`; gateway: `kafka OffsetCommit refused: this gateway has no durable offset store` | `enable.auto.commit=false` for both systems |
+| OffsetCommit without a metadata plane | client: `Offset commit failed on partition bench-0 at offset <n>: The message format version on the broker does not support the request`; gateway: `kafka OffsetCommit refused: this gateway has no durable offset store` | `enable.auto.commit=false` for both systems |
 | compressed batches | `UnsupportedCompressionTypeException: batch 0: record batch is compressed (codec 4), which this gateway does not decompress` (zstd) | `compression.type=none` for both systems |
 | gateway on followers | the node refuses `kafka` on any role but leader or standalone | one gateway, on the range's leader |
 | gateway on a candidate (failover, #597) | ``error: `kafka` is configured on a Candidate node: the gateway is served by a leader or standalone only — it holds one broker, and a candidate's changes with the lease (#225)`` | no Kafka client can follow a VTOP failover; `failover.py` measures VTOP through its native client, labelled as such |

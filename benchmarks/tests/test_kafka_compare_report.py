@@ -306,3 +306,148 @@ def test_report_tables_come_from_the_csv(run_dir, tmp_path):
     assert "| 100 B | Apache Kafka | 306,000 (303,000-309,000) |" in text
     assert "indicative, not a production benchmark" in text
     assert "**Kafka** saturates at 10.0x" in text
+
+
+# ------------------------------------------------------------ review follow-ups
+
+
+def test_refuses_an_environment_that_is_not_an_object(run_dir):
+    with open(os.path.join(run_dir, "environment.json"), "w") as handle:
+        json.dump(["complete"], handle)
+    refused(run_dir, "not an object")
+
+
+@pytest.mark.parametrize("key, value", [
+    ("record_sizes", "100"), ("record_sizes", [100, 100]), ("partitions", []), ("producers", [0]),
+    ("repetitions", "3"), ("repetitions", 0), ("load_pcts", [25, 100]), ("acks", "all"), ("consume", "yes"),
+    ("smoke_records", None),
+])
+def test_refuses_a_malformed_matrix_instead_of_a_traceback(run_dir, key, value):
+    env = environment()
+    env["matrix"][key] = value
+    with open(os.path.join(run_dir, "environment.json"), "w") as handle:
+        json.dump(env, handle)
+    refused(run_dir, f"matrix.{key}")
+
+
+def test_report_refuses_a_malformed_matrix_with_exit_2(run_dir, tmp_path, capsys):
+    env = environment()
+    del env["matrix"]["repetitions"]
+    with open(os.path.join(run_dir, "environment.json"), "w") as handle:
+        json.dump(env, handle)
+    assert report.main([run_dir, "--img-dir", str(tmp_path / "img"), "--doc", str(tmp_path / "d.md")]) == 2
+    assert "matrix.repetitions" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("column, spelling", [
+    ("record_size", "100.0"), ("record_size", "1e2"), ("repetition", "01"), ("partitions", "1.5"),
+])
+def test_refuses_a_key_column_that_is_not_a_canonical_integer(run_dir, column, spelling):
+    def respell(rows):
+        rows[0][column] = spelling  # the same number, written another way
+        return rows
+
+    rewrite(run_dir, respell)
+    refused(run_dir, f"{column} is '{spelling}', not a positive whole number")
+
+
+def test_refuses_a_non_canonical_load_pct(run_dir):
+    def respell(rows):
+        next(row for row in rows if row["load_pct"] == "25")["load_pct"] = "25.0"
+        return rows
+
+    rewrite(run_dir, respell)
+    refused(run_dir, "load_pct is '25.0'")
+
+
+def test_refuses_a_malformed_offered_rate_on_a_failed_row(run_dir):
+    def bad_offer(rows):
+        row = next(row for row in rows if row["mode"] == "fixed_rate")
+        row.update(status="failed", note="timed out after 1800 s", offered_rate="fast")
+        return rows
+
+    rewrite(run_dir, bad_offer)
+    refused(run_dir, "offered_rate is 'fast'")
+
+
+def test_refuses_rows_under_another_acks_mode(run_dir):
+    def acks_one(rows):
+        for row in rows:
+            row["acks"] = "1"
+        return rows
+
+    rewrite(run_dir, acks_one)
+    refused(run_dir, "acks='1'")
+
+
+@pytest.mark.parametrize("column, value", [
+    ("vtop_commit", "c" * 40), ("kafka_image", "apache/kafka:9.9.9@sha256:ff"), ("client", "other client"),
+    ("profile", "fsync-parity"), ("run_id", "another-run"),
+])
+def test_refuses_csv_identity_columns_that_do_not_match_the_environment(run_dir, column, value):
+    def relabel(rows):
+        for row in rows:
+            row[column] = value
+        return rows
+
+    rewrite(run_dir, relabel)
+    refused(run_dir, f"{column}=")
+
+
+def _fail_one_repetition(rows):
+    row = next(row for row in rows if row["system"] == "kafka" and row["mode"] == "fixed_rate"
+               and row["record_size"] == "100" and row["load_pct"] == "25" and row["repetition"] == "2")
+    for column in ("records", "records_per_sec", "mib_per_sec", "lat_avg_ms", "lat_max_ms", "lat_p50_ms",
+                   "lat_p95_ms", "lat_p99_ms", "lat_p999_ms", "sustained"):
+        row[column] = ""
+    row.update(status="failed", note="timed out | after\nretry `x`")
+    return rows
+
+
+def test_a_failed_repetition_means_the_rate_was_not_held_in_every_repetition(run_dir):
+    run = schema.load_run(run_dir)
+    assert report.cell_summary(run.rows, "kafka", "fixed_rate", 100, "lat_p50_ms", 25)["sustained"]
+    rewrite(run_dir, _fail_one_repetition)
+    run = schema.load_run(run_dir)
+    cell = report.cell_summary(run.rows, "kafka", "fixed_rate", 100, "lat_p50_ms", 25)
+    assert cell["ok"] == 2 and cell["n"] == 3
+    assert not cell["sustained"]
+
+
+def test_failure_notes_cannot_break_a_markdown_table():
+    assert report.md_cell("a | b\nc `d` <e>") == "a \\| b c \\`d\\` \\<e\\>"
+    cell = {"summary": None, "not_ok": [{"note": "exit 1 | broken\npipe"}], "ok": 0, "n": 1}
+    text = report._summary_cell(cell)
+    assert "\n" not in text and "|" not in text.replace("\\|", "") and "\\| broken" in text
+
+
+def test_no_ratio_when_either_saturation_is_zero():
+    zero = {"summary": report.stats.Summary(0.0, 0.0, 0.0, 3)}
+    some = {"summary": report.stats.Summary(5.0, 4.0, 6.0, 3)}
+    assert report._ratio(zero, some) is None
+    assert report._ratio(some, zero) is None
+    assert report._ratio(some, some) == 1.0
+
+
+@pytest.mark.parametrize("value", ["", None, "n/a", "0"])
+def test_footer_renders_unknown_host_memory_instead_of_crashing(value):
+    env = environment()
+    env["comparable"]["host_memory_bytes"] = value
+    assert "logical CPUs, unknown)" in report.footer_text(env, "test-run")
+
+
+def test_report_writes_a_doc_given_as_a_bare_file_name(run_dir, tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    monkeypatch.chdir(tmp_path)
+    assert report.main([run_dir, "--img-dir", str(tmp_path / "img"), "--doc", "kafka-comparison.md"]) == 0
+    assert (tmp_path / "kafka-comparison.md").is_file()
+
+
+def test_report_marks_a_failed_repetition_in_the_tables(run_dir, tmp_path):
+    pytest.importorskip("matplotlib")
+    rewrite(run_dir, _fail_one_repetition)
+    doc = tmp_path / "kafka-comparison.md"
+    assert report.main([run_dir, "--img-dir", str(tmp_path / "img"), "--doc", str(doc)]) == 0
+    text = doc.read_text()
+    assert "[2/3 reps ok]" in text
+    assert "- 100 B records, Apache Kafka: sustained 2 of 3 offered rates in every repetition (50%, 75%)." in text
