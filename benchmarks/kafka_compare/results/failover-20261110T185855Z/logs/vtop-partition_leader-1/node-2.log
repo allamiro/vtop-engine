@@ -1,0 +1,61 @@
+2026-11-10T19:48:02.095777792Z data_node_ready role=candidate node=aaaaaaaa-0000-0000-0000-0000000000a2 native=0.0.0.0:9400 replica=0.0.0.0:9300 metrics=0.0.0.0:9600
+2026-11-10T19:48:02.102722292Z meta_node_ready id=2 peer=0.0.0.0:9100 admin=0.0.0.0:9200 metrics=0.0.0.0:9600
+2026-11-10T19:49:11.642985130Z data_node_role_changed role=leader node=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=2
+2026-11-10T19:48:02.077064876Z 2026-11-10T19:48:02.076873Z  INFO vtop_observe::server: observability endpoint listening (/metrics, /healthz, /readyz) bound=0.0.0.0:9600 transport="plaintext"
+2026-11-10T19:48:02.095851292Z 2026-11-10T19:48:02.095656Z  INFO vtop_node::lease_agent: lease agent running range=aaaaaaaa-0000-0000-0000-0000000000c1 node=aaaaaaaa-0000-0000-0000-0000000000a2
+2026-11-10T19:48:02.100111209Z 2026-11-10T19:48:02.100046Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 192.168.208.2:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:48:02.101913334Z 2026-11-10T19:48:02.101824Z  INFO openraft::engine::engine_impl: startup begin: state: RaftState { vote: UTime { data: Vote { leader_id: LeaderId { term: 0, voted_for: None }, committed: false }, utime: Some(Instant { tv_sec: 93110, tv_nsec: 940772210 }) }, committed: None, purged_next: 0, log_ids: LogIdList { key_log_ids: [] }, membership_state: MembershipState { committed: EffectiveMembership { log_id: None, membership: Membership { configs: [], nodes: {} }, voter_ids: {} }, effective: EffectiveMembership { log_id: None, membership: Membership { configs: [], nodes: {} }, voter_ids: {} } }, snapshot_meta: SnapshotMeta { last_log_id: None, last_membership: StoredMembership { log_id: None, membership: Membership { configs: [], nodes: {} } }, snapshot_id: "" }, server_state: Learner, accepted: Accepted { leader_id: LeaderId { term: 0, voted_for: None }, log_id: None }, io_state: IOState { building_snapshot: false, vote: Vote { leader_id: LeaderId { term: 0, voted_for: None }, committed: false }, flushed: LogIOId { committed_leader_id: CommittedLeaderId { term: 0, p: PhantomData<u64> }, log_id: None }, applied: None, snapshot: None, purged: None }, purge_upto: None }, is_leader: false, is_voter: false
+2026-11-10T19:48:02.102688501Z warning: admin endpoint 0.0.0.0:9200 is authenticated but NOT authorized: any client holding a certificate signed by this CA — including every data node — may change cluster membership and grant range leases. Set `admin_authorization` to restrict cluster-scoped commands to named operator CNs.
+2026-11-10T19:48:02.334482501Z 2026-11-10T19:48:02.334337Z  INFO openraft::engine::engine_impl: now; 19:48:02.334334, vote is updated at: 19:48:02.101760, vote is updated before 232.5745ms, leader lease(600ms) will expire after 367.4255ms
+2026-11-10T19:48:02.335974793Z 2026-11-10T19:48:02.335855Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T1-N1:uncommitted; current my vote: None; when (VoteResponse)
+2026-11-10T19:48:02.342763001Z 2026-11-10T19:48:02.342643Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T1-N1:committed; current my vote: None; when (VoteResponse)
+2026-11-10T19:48:58.667108972Z 2026-11-10T19:48:58.667023Z  WARN vtop_node::lease_agent: refusing promotion: too few replicas could confirm the committed boundary range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 answered=1 required=2
+2026-11-10T19:48:58.671239972Z 2026-11-10T19:48:58.671162Z  INFO vtop_node::lease_agent: promotion outcome recorded against the epoch's transition range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 attempt=1
+2026-11-10T19:49:01.232361584Z 2026-11-10T19:49:01.232166Z  INFO vtop_node::lease_agent: verified promotion: committed boundary established by quorum range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 committed_offset=175200 replicas=2 uncounted_unknown_lineage=0
+2026-11-10T19:49:01.232880084Z 2026-11-10T19:49:01.232793Z  WARN vtop_node::lease_agent: metadata does not record lineage verdicts yet (feature level below 6); recording this promotion without them, and without the answers whose lineage was unknown range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 error=this command needs metadata feature level 6 and the cluster runs at 3; finish upgrading every metadata voter, then raise the level (vtopctl meta enable-features --level 6)
+2026-11-10T19:49:01.238102625Z 2026-11-10T19:49:01.238013Z  INFO vtop_node::lease_agent: promotion outcome recorded against the epoch's transition range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2 attempt=2
+2026-11-10T19:49:01.238121250Z 2026-11-10T19:49:01.238034Z  INFO vtop_node::lease_agent: range lease held range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=2
+2026-11-10T19:49:13.414934465Z 2026-11-10T19:49:13.414807Z  INFO openraft::engine::engine_impl: now; 19:49:13.414804, vote is updated at: 19:49:12.995035, vote is updated before 419.768959ms, leader lease(600ms) will expire after 180.231041ms
+2026-11-10T19:49:13.414935506Z 2026-11-10T19:49:13.414809Z  INFO openraft::engine::engine_impl: reject vote-request: leader lease has not yet expire; now; Instant { tv_sec: 93182, tv_nsec: 253606577 }, vote is updatd at: Instant { tv_sec: 93181, tv_nsec: 833837618 }, leader lease(600ms) will expire after 180.231041ms
+2026-11-10T19:49:13.419412131Z 2026-11-10T19:49:13.419369Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T48-N1:committed; current my vote: None; when (VoteResponse)
+--- tail ---
+2026-11-10T19:49:04.797600752Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:05.061801336Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:05.326598669Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:05.595931752Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:05.862121044Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:06.123139086Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:06.390276128Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:06.652852753Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:06.916324920Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:07.181909462Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:07.447317087Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:07.706532337Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:07.965639170Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:08.227709670Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:08.490654712Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:08.754379837Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:09.018244004Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:09.285167379Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:09.546446338Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:09.812096713Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:10.079849046Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:10.340032755Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:10.603056338Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:10.866417755Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:11.128723338Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:11.390986089Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:11.655257672Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:11.924372714Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:12.188041339Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:12.449461256Z could not resolve replica peer "vtop-3:9300": failed to lookup address information: Name or service not known
+2026-11-10T19:49:13.414928923Z 2026-11-10T19:49:13.414780Z  INFO openraft::raft: Raft::vote() rpc={vote:T48-N1:uncommitted, last_log:1-24}
+2026-11-10T19:49:13.414932381Z 2026-11-10T19:49:13.414794Z  INFO openraft::core::raft_core: received RaftMsg::RequestVote: openraft::core::raft_core::RaftCore<_, _, _, _>::handle_api_msg now=19:49:13.414793 vote_request={vote:T48-N1:uncommitted, last_log:1-24}
+2026-11-10T19:49:13.414933006Z 2026-11-10T19:49:13.414803Z  INFO openraft::core::raft_core: req={vote:T48-N1:uncommitted, last_log:1-24} func="openraft::core::raft_core::RaftCore<_, _, _, _>::handle_vote_request"
+2026-11-10T19:49:13.414933548Z 2026-11-10T19:49:13.414805Z  INFO openraft::engine::engine_impl: Engine::handle_vote_req req={vote:T48-N1:uncommitted, last_log:1-24}
+2026-11-10T19:49:13.414934048Z 2026-11-10T19:49:13.414806Z  INFO openraft::engine::engine_impl: Engine::handle_vote_req my_vote=T1-N1:committed my_last_log_id=Some(1-24)
+2026-11-10T19:49:13.414934465Z 2026-11-10T19:49:13.414807Z  INFO openraft::engine::engine_impl: now; 19:49:13.414804, vote is updated at: 19:49:12.995035, vote is updated before 419.768959ms, leader lease(600ms) will expire after 180.231041ms
+2026-11-10T19:49:13.414935506Z 2026-11-10T19:49:13.414809Z  INFO openraft::engine::engine_impl: reject vote-request: leader lease has not yet expire; now; Instant { tv_sec: 93182, tv_nsec: 253606577 }, vote is updatd at: Instant { tv_sec: 93181, tv_nsec: 833837618 }, leader lease(600ms) will expire after 180.231041ms
+2026-11-10T19:49:13.418076673Z 2026-11-10T19:49:13.418024Z  INFO openraft::engine::handler::vote_handler: vote is changing from T1-N1:committed to T48-N1:committed
+2026-11-10T19:49:13.419409215Z 2026-11-10T19:49:13.419360Z  INFO openraft::core::raft_core: received Notify::VoteResponse: openraft::core::raft_core::RaftCore<_, _, _, _>::handle_notify now=19:49:13.419359 resp={T48-N1:committed, last_log:None}
+2026-11-10T19:49:13.419412131Z 2026-11-10T19:49:13.419369Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T48-N1:committed; current my vote: None; when (VoteResponse)

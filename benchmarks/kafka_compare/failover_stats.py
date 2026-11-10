@@ -284,6 +284,8 @@ def driver_summary(driver_log: str) -> dict[str, object]:
 def classify_vtop_reason(reason: str) -> str:
     text = reason.lower()
     for needle, label in (("no answer to a", "request timeout"), ("failed to lookup", "name not resolvable"),
+                          ("tls handshake eof", "node not serving (handshake closed)"),
+                          ("quorum not reached", "quorum not reached (Overloaded)"),
                           ("connection refused", "connection refused"), ("fenced", "fenced epoch"),
                           ("not the leader", "not leader"), ("notleader", "not leader"),
                           ("interrupted", "connection lost"), ("reset", "connection lost"),

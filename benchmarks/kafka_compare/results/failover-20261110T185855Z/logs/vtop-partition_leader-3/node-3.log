@@ -1,0 +1,403 @@
+2026-11-10T19:57:13.965235673Z data_node_ready role=candidate node=aaaaaaaa-0000-0000-0000-0000000000a3 native=0.0.0.0:9400 replica=0.0.0.0:9300 metrics=0.0.0.0:9600
+2026-11-10T19:57:13.978141090Z meta_node_ready id=3 peer=0.0.0.0:9100 admin=0.0.0.0:9200 metrics=0.0.0.0:9600
+2026-11-10T19:57:18.037066633Z data_node_role_changed role=leader node=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1
+2026-11-10T19:58:08.353403337Z data_node_role_changed role=follower node=aaaaaaaa-0000-0000-0000-0000000000a3
+2026-11-10T19:57:13.916471923Z 2026-11-10T19:57:13.916272Z  INFO vtop_observe::server: observability endpoint listening (/metrics, /healthz, /readyz) bound=0.0.0.0:9600 transport="plaintext"
+2026-11-10T19:57:13.965228631Z 2026-11-10T19:57:13.964977Z  INFO vtop_node::lease_agent: lease agent running range=aaaaaaaa-0000-0000-0000-0000000000c1 node=aaaaaaaa-0000-0000-0000-0000000000a3
+2026-11-10T19:57:13.972043548Z 2026-11-10T19:57:13.971905Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: io: Connection refused (os error 111) range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:57:13.976977923Z 2026-11-10T19:57:13.976888Z  INFO openraft::engine::engine_impl: startup begin: state: RaftState { vote: UTime { data: Vote { leader_id: LeaderId { term: 0, voted_for: None }, committed: false }, utime: Some(Instant { tv_sec: 93662, tv_nsec: 814776755 }) }, committed: None, purged_next: 0, log_ids: LogIdList { key_log_ids: [] }, membership_state: MembershipState { committed: EffectiveMembership { log_id: None, membership: Membership { configs: [], nodes: {} }, voter_ids: {} }, effective: EffectiveMembership { log_id: None, membership: Membership { configs: [], nodes: {} }, voter_ids: {} } }, snapshot_meta: SnapshotMeta { last_log_id: None, last_membership: StoredMembership { log_id: None, membership: Membership { configs: [], nodes: {} } }, snapshot_id: "" }, server_state: Learner, accepted: Accepted { leader_id: LeaderId { term: 0, voted_for: None }, log_id: None }, io_state: IOState { building_snapshot: false, vote: Vote { leader_id: LeaderId { term: 0, voted_for: None }, committed: false }, flushed: LogIOId { committed_leader_id: CommittedLeaderId { term: 0, p: PhantomData<u64> }, log_id: None }, applied: None, snapshot: None, purged: None }, purge_upto: None }, is_leader: false, is_voter: false
+2026-11-10T19:57:13.978125673Z warning: admin endpoint 0.0.0.0:9200 is authenticated but NOT authorized: any client holding a certificate signed by this CA — including every data node — may change cluster membership and grant range leases. Set `admin_authorization` to restrict cluster-scoped commands to named operator CNs.
+2026-11-10T19:57:14.256867965Z 2026-11-10T19:57:14.256837Z  INFO openraft::engine::engine_impl: now; 19:57:14.256833, vote is updated at: 19:57:13.976846, vote is updated before 279.986792ms, leader lease(600ms) will expire after 320.013208ms
+2026-11-10T19:57:14.259049632Z 2026-11-10T19:57:14.259012Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T1-N1:uncommitted; current my vote: None; when (VoteResponse)
+2026-11-10T19:57:14.266267632Z 2026-11-10T19:57:14.266161Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T1-N1:committed; current my vote: None; when (VoteResponse)
+2026-11-10T19:57:15.982214882Z 2026-11-10T19:57:15.982038Z  WARN vtop_node::lease_agent: refusing promotion: too few replicas could confirm the committed boundary range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=1 answered=1 required=2
+2026-11-10T19:57:15.986305799Z 2026-11-10T19:57:15.986189Z  INFO vtop_node::lease_agent: promotion outcome recorded against the epoch's transition range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=1 attempt=1
+2026-11-10T19:57:17.977804258Z 2026-11-10T19:57:17.977738Z  INFO vtop_node::lease_agent: verified promotion: committed boundary established by quorum range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=1 committed_offset=0 replicas=3 uncounted_unknown_lineage=0
+2026-11-10T19:57:17.978145925Z 2026-11-10T19:57:17.978041Z  WARN vtop_node::lease_agent: metadata does not record lineage verdicts yet (feature level below 6); recording this promotion without them, and without the answers whose lineage was unknown range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=1 error=this command needs metadata feature level 6 and the cluster runs at 3; finish upgrading every metadata voter, then raise the level (vtopctl meta enable-features --level 6)
+2026-11-10T19:57:17.982966925Z 2026-11-10T19:57:17.982909Z  INFO vtop_node::lease_agent: promotion outcome recorded against the epoch's transition range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=1 attempt=2
+2026-11-10T19:57:17.982976633Z 2026-11-10T19:57:17.982930Z  INFO vtop_node::lease_agent: range lease held range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=1
+2026-11-10T19:57:55.688563887Z 2026-11-10T19:57:55.688499Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:57:55.688584470Z 2026-11-10T19:57:55.688513Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:57:55.688585512Z 2026-11-10T19:57:55.688518Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T2-N3:uncommitted@19:57:55.688513, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:57:55.690306345Z 2026-11-10T19:57:55.690221Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:57:55.690308220Z 2026-11-10T19:57:55.690242Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:57:56.144239137Z 2026-11-10T19:57:56.144114Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:57:56.144270637Z 2026-11-10T19:57:56.144170Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:57:56.144273512Z 2026-11-10T19:57:56.144187Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T3-N3:uncommitted@19:57:56.144180, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:57:56.146172762Z 2026-11-10T19:57:56.146029Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:57:56.146173512Z 2026-11-10T19:57:56.146052Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:57:56.600749304Z 2026-11-10T19:57:56.600638Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:57:56.600767471Z 2026-11-10T19:57:56.600656Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:57:56.600768596Z 2026-11-10T19:57:56.600665Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T4-N3:uncommitted@19:57:56.600658, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:57:56.605388887Z 2026-11-10T19:57:56.605305Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:57:56.605390054Z 2026-11-10T19:57:56.605316Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:57:57.061499846Z 2026-11-10T19:57:57.061305Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:57:57.061523013Z 2026-11-10T19:57:57.061335Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:57:57.061525638Z 2026-11-10T19:57:57.061348Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T5-N3:uncommitted@19:57:57.061336, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:57:57.063661054Z 2026-11-10T19:57:57.063594Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:57:57.063663263Z 2026-11-10T19:57:57.063622Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:57:57.524150388Z 2026-11-10T19:57:57.524037Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:57:57.524170971Z 2026-11-10T19:57:57.524050Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:57:57.524172138Z 2026-11-10T19:57:57.524058Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T6-N3:uncommitted@19:57:57.524052, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:57:57.525410055Z 2026-11-10T19:57:57.525335Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:57:57.525411888Z 2026-11-10T19:57:57.525347Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:57:57.984705638Z 2026-11-10T19:57:57.984610Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:57:57.984715888Z 2026-11-10T19:57:57.984627Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:57:57.984717346Z 2026-11-10T19:57:57.984633Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T7-N3:uncommitted@19:57:57.984628, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:57:57.986173221Z 2026-11-10T19:57:57.986100Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:57:57.986174846Z 2026-11-10T19:57:57.986112Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:57:57.988626471Z 2026-11-10T19:57:57.988564Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 127.0.0.1:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:57:58.445819055Z 2026-11-10T19:57:58.445701Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:57:58.445832180Z 2026-11-10T19:57:58.445721Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:57:58.445833972Z 2026-11-10T19:57:58.445731Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T8-N3:uncommitted@19:57:58.445722, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:57:58.447870222Z 2026-11-10T19:57:58.447783Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:57:58.447871638Z 2026-11-10T19:57:58.447799Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:57:58.916356014Z 2026-11-10T19:57:58.916246Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:57:58.916369930Z 2026-11-10T19:57:58.916265Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:57:58.916371180Z 2026-11-10T19:57:58.916274Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T9-N3:uncommitted@19:57:58.916266, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:57:58.917860389Z 2026-11-10T19:57:58.917793Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:57:58.917861430Z 2026-11-10T19:57:58.917803Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:57:59.382974583Z 2026-11-10T19:57:59.382877Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:57:59.382994416Z 2026-11-10T19:57:59.382891Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:57:59.382995916Z 2026-11-10T19:57:59.382900Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T10-N3:uncommitted@19:57:59.382892, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:57:59.384404208Z 2026-11-10T19:57:59.384324Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:57:59.384410708Z 2026-11-10T19:57:59.384337Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:57:59.844247708Z 2026-11-10T19:57:59.844145Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:57:59.844258791Z 2026-11-10T19:57:59.844163Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:57:59.844260125Z 2026-11-10T19:57:59.844175Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T11-N3:uncommitted@19:57:59.844165, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:57:59.845976500Z 2026-11-10T19:57:59.845910Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:57:59.845977666Z 2026-11-10T19:57:59.845918Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:57:59.994676208Z 2026-11-10T19:57:59.994583Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 127.0.0.1:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:58:00.308024167Z 2026-11-10T19:58:00.307873Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:00.308041208Z 2026-11-10T19:58:00.307901Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:00.308042625Z 2026-11-10T19:58:00.307915Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T12-N3:uncommitted@19:58:00.307902, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:00.313205250Z 2026-11-10T19:58:00.313098Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:00.313207875Z 2026-11-10T19:58:00.313116Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:00.767995000Z 2026-11-10T19:58:00.767870Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:00.768016042Z 2026-11-10T19:58:00.767892Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:00.768017459Z 2026-11-10T19:58:00.767902Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T13-N3:uncommitted@19:58:00.767893, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:00.769946167Z 2026-11-10T19:58:00.769884Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:00.769947417Z 2026-11-10T19:58:00.769889Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:01.232360709Z 2026-11-10T19:58:01.232104Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:01.232407500Z 2026-11-10T19:58:01.232148Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:01.232410500Z 2026-11-10T19:58:01.232167Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T14-N3:uncommitted@19:58:01.232150, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:01.238220417Z 2026-11-10T19:58:01.238070Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:01.238228709Z 2026-11-10T19:58:01.238095Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:01.694791542Z 2026-11-10T19:58:01.694703Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:01.694803667Z 2026-11-10T19:58:01.694718Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:01.694804834Z 2026-11-10T19:58:01.694727Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T15-N3:uncommitted@19:58:01.694719, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:01.696120459Z 2026-11-10T19:58:01.696069Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:01.696121167Z 2026-11-10T19:58:01.696078Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:01.998150792Z 2026-11-10T19:58:01.998048Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 127.0.0.1:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:58:02.155715084Z 2026-11-10T19:58:02.155472Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:02.155752501Z 2026-11-10T19:58:02.155511Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:02.155757292Z 2026-11-10T19:58:02.155531Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T16-N3:uncommitted@19:58:02.155515, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:02.161195667Z 2026-11-10T19:58:02.161043Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:02.161203209Z 2026-11-10T19:58:02.161075Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:02.623520668Z 2026-11-10T19:58:02.623343Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:02.623555459Z 2026-11-10T19:58:02.623378Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:02.623561209Z 2026-11-10T19:58:02.623397Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T17-N3:uncommitted@19:58:02.623381, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:02.629394126Z 2026-11-10T19:58:02.629262Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:02.629442334Z 2026-11-10T19:58:02.629291Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:03.081111001Z 2026-11-10T19:58:03.080985Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:03.081125460Z 2026-11-10T19:58:03.081007Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:03.081126751Z 2026-11-10T19:58:03.081019Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T18-N3:uncommitted@19:58:03.081009, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:03.085734460Z 2026-11-10T19:58:03.085664Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:03.085736210Z 2026-11-10T19:58:03.085689Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:03.537994168Z 2026-11-10T19:58:03.537855Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:03.538007168Z 2026-11-10T19:58:03.537873Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:03.538008543Z 2026-11-10T19:58:03.537883Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T19-N3:uncommitted@19:58:03.537875, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:03.539444751Z 2026-11-10T19:58:03.539363Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:03.539446668Z 2026-11-10T19:58:03.539379Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:03.999689543Z 2026-11-10T19:58:03.999536Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:03.999705293Z 2026-11-10T19:58:03.999563Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:03.999706877Z 2026-11-10T19:58:03.999573Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T20-N3:uncommitted@19:58:03.999564, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:04.002003752Z 2026-11-10T19:58:04.001902Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:04.002007752Z 2026-11-10T19:58:04.001921Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:04.002048377Z 2026-11-10T19:58:04.001991Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 127.0.0.1:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:58:04.464649377Z 2026-11-10T19:58:04.464528Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:04.464667169Z 2026-11-10T19:58:04.464552Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:04.464684002Z 2026-11-10T19:58:04.464564Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T21-N3:uncommitted@19:58:04.464553, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:04.466864044Z 2026-11-10T19:58:04.466758Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:04.466866544Z 2026-11-10T19:58:04.466780Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:04.922849502Z 2026-11-10T19:58:04.922776Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:04.922859419Z 2026-11-10T19:58:04.922789Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:04.922860669Z 2026-11-10T19:58:04.922797Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T22-N3:uncommitted@19:58:04.922790, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:04.923933377Z 2026-11-10T19:58:04.923887Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:04.923934669Z 2026-11-10T19:58:04.923898Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:05.386812127Z 2026-11-10T19:58:05.386608Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:05.386841877Z 2026-11-10T19:58:05.386639Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:05.386844919Z 2026-11-10T19:58:05.386654Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T23-N3:uncommitted@19:58:05.386641, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:05.389473086Z 2026-11-10T19:58:05.389250Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:05.389478669Z 2026-11-10T19:58:05.389283Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:05.851776961Z 2026-11-10T19:58:05.851637Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:05.851791878Z 2026-11-10T19:58:05.851662Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:05.851793503Z 2026-11-10T19:58:05.851677Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T24-N3:uncommitted@19:58:05.851664, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:05.854079669Z 2026-11-10T19:58:05.853984Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:05.854081211Z 2026-11-10T19:58:05.853998Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:06.004853628Z 2026-11-10T19:58:06.004804Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 127.0.0.1:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:58:06.312151878Z 2026-11-10T19:58:06.311992Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:06.312167294Z 2026-11-10T19:58:06.312017Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:06.312169169Z 2026-11-10T19:58:06.312030Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T25-N3:uncommitted@19:58:06.312018, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:06.313588836Z 2026-11-10T19:58:06.313437Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:06.313590669Z 2026-11-10T19:58:06.313446Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:06.780704836Z 2026-11-10T19:58:06.780569Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:06.780721461Z 2026-11-10T19:58:06.780594Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:06.780723920Z 2026-11-10T19:58:06.780606Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T26-N3:uncommitted@19:58:06.780596, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:06.782959711Z 2026-11-10T19:58:06.782848Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:06.782962336Z 2026-11-10T19:58:06.782866Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:07.239905170Z 2026-11-10T19:58:07.239791Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:07.239924795Z 2026-11-10T19:58:07.239815Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:07.239926295Z 2026-11-10T19:58:07.239830Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T27-N3:uncommitted@19:58:07.239816, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:07.245014670Z 2026-11-10T19:58:07.244942Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:07.245016587Z 2026-11-10T19:58:07.244954Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:07.701503420Z 2026-11-10T19:58:07.701406Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:07.701520170Z 2026-11-10T19:58:07.701422Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:07.701522378Z 2026-11-10T19:58:07.701432Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T28-N3:uncommitted@19:58:07.701423, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:07.706325045Z 2026-11-10T19:58:07.706238Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:07.706327337Z 2026-11-10T19:58:07.706253Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:08.007675087Z 2026-11-10T19:58:08.007628Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 127.0.0.1:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:58:08.007682337Z 2026-11-10T19:58:08.007641Z  WARN vtop_node::lease_agent: metadata unreachable past the lease deadline; demoting locally range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=1
+2026-11-10T19:58:08.007683254Z 2026-11-10T19:58:08.007643Z  WARN vtop_node::lease_agent: range lease lost; the broker will refuse writes under this epoch range=aaaaaaaa-0000-0000-0000-0000000000c1 fencing_epoch=1
+2026-11-10T19:58:08.159549795Z 2026-11-10T19:58:08.159463Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:08.159558295Z 2026-11-10T19:58:08.159475Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:08.159559504Z 2026-11-10T19:58:08.159481Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T29-N3:uncommitted@19:58:08.159476, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:08.160632545Z 2026-11-10T19:58:08.160530Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:08.160640504Z 2026-11-10T19:58:08.160583Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:08.624281296Z 2026-11-10T19:58:08.624166Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:08.624295129Z 2026-11-10T19:58:08.624187Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:08.624296379Z 2026-11-10T19:58:08.624197Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T30-N3:uncommitted@19:58:08.624188, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:08.628889129Z 2026-11-10T19:58:08.628820Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:08.628890171Z 2026-11-10T19:58:08.628828Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:09.082337004Z 2026-11-10T19:58:09.082164Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:09.082350087Z 2026-11-10T19:58:09.082179Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:09.082351379Z 2026-11-10T19:58:09.082187Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T31-N3:uncommitted@19:58:09.082180, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:09.084622629Z 2026-11-10T19:58:09.084502Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:09.084645629Z 2026-11-10T19:58:09.084523Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:09.536898671Z 2026-11-10T19:58:09.536773Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:09.536935963Z 2026-11-10T19:58:09.536785Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:09.536941171Z 2026-11-10T19:58:09.536792Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T32-N3:uncommitted@19:58:09.536786, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:09.538597004Z 2026-11-10T19:58:09.538532Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:09.538597754Z 2026-11-10T19:58:09.538533Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:09.993231213Z 2026-11-10T19:58:09.993096Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:09.993241796Z 2026-11-10T19:58:09.993112Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:09.993242671Z 2026-11-10T19:58:09.993118Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T33-N3:uncommitted@19:58:09.993113, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:09.994993296Z 2026-11-10T19:58:09.994885Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:09.994996671Z 2026-11-10T19:58:09.994901Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:10.010180380Z 2026-11-10T19:58:10.010047Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 127.0.0.1:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:58:10.448253463Z 2026-11-10T19:58:10.448173Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:10.448285463Z 2026-11-10T19:58:10.448190Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:10.448288963Z 2026-11-10T19:58:10.448198Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T34-N3:uncommitted@19:58:10.448191, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:10.453110130Z 2026-11-10T19:58:10.453042Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:10.453110755Z 2026-11-10T19:58:10.453064Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:10.903911588Z 2026-11-10T19:58:10.903829Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:10.903923797Z 2026-11-10T19:58:10.903844Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:10.903925047Z 2026-11-10T19:58:10.903852Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T35-N3:uncommitted@19:58:10.903845, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:10.905256213Z 2026-11-10T19:58:10.905158Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:10.905268338Z 2026-11-10T19:58:10.905216Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:11.361588172Z 2026-11-10T19:58:11.361465Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:11.361605422Z 2026-11-10T19:58:11.361495Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:11.361606714Z 2026-11-10T19:58:11.361508Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T36-N3:uncommitted@19:58:11.361502, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:11.363184464Z 2026-11-10T19:58:11.363085Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:11.363187380Z 2026-11-10T19:58:11.363099Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:11.816913380Z 2026-11-10T19:58:11.816842Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:11.816933339Z 2026-11-10T19:58:11.816863Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:11.816934839Z 2026-11-10T19:58:11.816869Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T37-N3:uncommitted@19:58:11.816864, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:11.821549714Z 2026-11-10T19:58:11.821407Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:11.821550547Z 2026-11-10T19:58:11.821415Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:12.013532881Z 2026-11-10T19:58:12.013503Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 127.0.0.1:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:58:12.273799506Z 2026-11-10T19:58:12.273701Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:12.273809464Z 2026-11-10T19:58:12.273720Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:12.273810339Z 2026-11-10T19:58:12.273734Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T38-N3:uncommitted@19:58:12.273721, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:12.274945922Z 2026-11-10T19:58:12.274851Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:12.274951422Z 2026-11-10T19:58:12.274821Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:12.732376798Z 2026-11-10T19:58:12.732233Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:12.732398131Z 2026-11-10T19:58:12.732250Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:12.732399631Z 2026-11-10T19:58:12.732260Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T39-N3:uncommitted@19:58:12.732252, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:12.733728506Z 2026-11-10T19:58:12.733651Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:12.733733423Z 2026-11-10T19:58:12.733667Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:13.190473048Z 2026-11-10T19:58:13.190399Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:13.190482048Z 2026-11-10T19:58:13.190410Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:13.190482964Z 2026-11-10T19:58:13.190416Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T40-N3:uncommitted@19:58:13.190411, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:13.191436089Z 2026-11-10T19:58:13.191341Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:13.191436881Z 2026-11-10T19:58:13.191348Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:13.647977506Z 2026-11-10T19:58:13.647889Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:13.647986715Z 2026-11-10T19:58:13.647905Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:13.647987673Z 2026-11-10T19:58:13.647912Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T41-N3:uncommitted@19:58:13.647906, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:13.649316006Z 2026-11-10T19:58:13.649266Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:13.649316881Z 2026-11-10T19:58:13.649271Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:14.018141673Z 2026-11-10T19:58:14.018049Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 127.0.0.1:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:58:14.110483590Z 2026-11-10T19:58:14.110189Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:14.110493257Z 2026-11-10T19:58:14.110231Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:14.110495507Z 2026-11-10T19:58:14.110249Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T42-N3:uncommitted@19:58:14.110237, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:14.112870007Z 2026-11-10T19:58:14.112552Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:14.112872257Z 2026-11-10T19:58:14.112558Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:14.568333798Z 2026-11-10T19:58:14.568270Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:14.568341965Z 2026-11-10T19:58:14.568280Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:14.568343048Z 2026-11-10T19:58:14.568286Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T43-N3:uncommitted@19:58:14.568281, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:14.572620673Z 2026-11-10T19:58:14.572542Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:14.572627632Z 2026-11-10T19:58:14.572559Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:15.033013632Z 2026-11-10T19:58:15.032912Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:15.033024257Z 2026-11-10T19:58:15.032940Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:15.033025465Z 2026-11-10T19:58:15.032952Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T44-N3:uncommitted@19:58:15.032943, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:15.034580632Z 2026-11-10T19:58:15.034516Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:15.034581424Z 2026-11-10T19:58:15.034524Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:15.507081757Z 2026-11-10T19:58:15.506965Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:15.507099132Z 2026-11-10T19:58:15.506984Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:15.507100716Z 2026-11-10T19:58:15.506992Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T45-N3:uncommitted@19:58:15.506985, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:15.508693466Z 2026-11-10T19:58:15.508558Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:15.508701632Z 2026-11-10T19:58:15.508610Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:15.967910716Z 2026-11-10T19:58:15.967809Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:15.967921424Z 2026-11-10T19:58:15.967831Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:15.967922966Z 2026-11-10T19:58:15.967840Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T46-N3:uncommitted@19:58:15.967833, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:15.969588674Z 2026-11-10T19:58:15.969486Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:15.969590007Z 2026-11-10T19:58:15.969490Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:16.020217757Z 2026-11-10T19:58:16.020146Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 127.0.0.1:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:58:16.427870008Z 2026-11-10T19:58:16.427713Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:16.427887299Z 2026-11-10T19:58:16.427765Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:16.427889466Z 2026-11-10T19:58:16.427780Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T47-N3:uncommitted@19:58:16.427770, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:16.433123383Z 2026-11-10T19:58:16.432897Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:16.433125508Z 2026-11-10T19:58:16.432923Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:16.889698675Z 2026-11-10T19:58:16.889565Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:16.889725341Z 2026-11-10T19:58:16.889586Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:16.889727341Z 2026-11-10T19:58:16.889597Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T48-N3:uncommitted@19:58:16.889587, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:16.891992091Z 2026-11-10T19:58:16.891891Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:16.891994050Z 2026-11-10T19:58:16.891903Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:17.352484716Z 2026-11-10T19:58:17.352379Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:17.352498216Z 2026-11-10T19:58:17.352397Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:17.352507008Z 2026-11-10T19:58:17.352407Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T49-N3:uncommitted@19:58:17.352398, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:17.353912466Z 2026-11-10T19:58:17.353846Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:17.353913341Z 2026-11-10T19:58:17.353843Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:17.815199300Z 2026-11-10T19:58:17.815114Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:17.815208550Z 2026-11-10T19:58:17.815129Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:17.815209508Z 2026-11-10T19:58:17.815135Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T50-N3:uncommitted@19:58:17.815129, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:17.816715550Z 2026-11-10T19:58:17.816656Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:17.816716383Z 2026-11-10T19:58:17.816662Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:18.023001300Z 2026-11-10T19:58:18.022920Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 127.0.0.1:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:58:18.275607967Z 2026-11-10T19:58:18.275486Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:18.275618967Z 2026-11-10T19:58:18.275513Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:18.275622675Z 2026-11-10T19:58:18.275526Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T51-N3:uncommitted@19:58:18.275515, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:18.277104009Z 2026-11-10T19:58:18.277026Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:18.277105884Z 2026-11-10T19:58:18.277037Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:18.732574800Z 2026-11-10T19:58:18.732424Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:18.732601175Z 2026-11-10T19:58:18.732437Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:18.732604259Z 2026-11-10T19:58:18.732445Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T52-N3:uncommitted@19:58:18.732438, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:18.734284134Z 2026-11-10T19:58:18.734199Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:18.734292050Z 2026-11-10T19:58:18.734234Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:19.192815509Z 2026-11-10T19:58:19.192648Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:19.192833842Z 2026-11-10T19:58:19.192674Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:19.192839384Z 2026-11-10T19:58:19.192691Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T53-N3:uncommitted@19:58:19.192676, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:19.198333051Z 2026-11-10T19:58:19.198198Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:19.198335342Z 2026-11-10T19:58:19.198203Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:19.654818093Z 2026-11-10T19:58:19.654734Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:19.654825426Z 2026-11-10T19:58:19.654754Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:19.654826759Z 2026-11-10T19:58:19.654762Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T54-N3:uncommitted@19:58:19.654754, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:19.655812676Z 2026-11-10T19:58:19.655751Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:19.655813634Z 2026-11-10T19:58:19.655758Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:20.026191384Z 2026-11-10T19:58:20.026129Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 127.0.0.1:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:58:20.121602384Z 2026-11-10T19:58:20.121512Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:20.121611593Z 2026-11-10T19:58:20.121527Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:20.121612926Z 2026-11-10T19:58:20.121534Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T55-N3:uncommitted@19:58:20.121528, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:20.123021134Z 2026-11-10T19:58:20.122935Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:20.123022468Z 2026-11-10T19:58:20.122944Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:20.589909968Z 2026-11-10T19:58:20.589750Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:20.589945718Z 2026-11-10T19:58:20.589777Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:20.589947426Z 2026-11-10T19:58:20.589793Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T56-N3:uncommitted@19:58:20.589779, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:20.595627426Z 2026-11-10T19:58:20.595295Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:20.595632510Z 2026-11-10T19:58:20.595476Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:21.056743635Z 2026-11-10T19:58:21.056640Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:21.056751760Z 2026-11-10T19:58:21.056663Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:21.056752802Z 2026-11-10T19:58:21.056675Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T57-N3:uncommitted@19:58:21.056664, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:21.058335552Z 2026-11-10T19:58:21.058252Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:21.058336552Z 2026-11-10T19:58:21.058252Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:21.517405343Z 2026-11-10T19:58:21.517291Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:21.517418260Z 2026-11-10T19:58:21.517313Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:21.517420135Z 2026-11-10T19:58:21.517323Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T58-N3:uncommitted@19:58:21.517315, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:21.519556343Z 2026-11-10T19:58:21.519443Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:21.519558010Z 2026-11-10T19:58:21.519457Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:21.973460219Z 2026-11-10T19:58:21.973378Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:21.973468885Z 2026-11-10T19:58:21.973390Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:21.973469969Z 2026-11-10T19:58:21.973396Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T59-N3:uncommitted@19:58:21.973390, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:21.974715427Z 2026-11-10T19:58:21.974670Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:21.974716344Z 2026-11-10T19:58:21.974678Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:22.029649219Z 2026-11-10T19:58:22.029597Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 127.0.0.1:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:58:22.433539844Z 2026-11-10T19:58:22.433418Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:22.433554260Z 2026-11-10T19:58:22.433439Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:22.433556010Z 2026-11-10T19:58:22.433448Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T60-N3:uncommitted@19:58:22.433440, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:22.438442094Z 2026-11-10T19:58:22.438243Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:22.438444094Z 2026-11-10T19:58:22.438260Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:22.891223302Z 2026-11-10T19:58:22.890963Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:22.891278719Z 2026-11-10T19:58:22.890992Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:22.891281052Z 2026-11-10T19:58:22.891008Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T61-N3:uncommitted@19:58:22.890994, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:22.894536469Z 2026-11-10T19:58:22.894313Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:22.894548469Z 2026-11-10T19:58:22.894340Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:23.349924511Z 2026-11-10T19:58:23.349863Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:23.349933219Z 2026-11-10T19:58:23.349872Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:23.349934053Z 2026-11-10T19:58:23.349879Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T62-N3:uncommitted@19:58:23.349873, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:23.354138928Z 2026-11-10T19:58:23.354073Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:23.354139886Z 2026-11-10T19:58:23.354079Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:23.812708636Z 2026-11-10T19:58:23.812538Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:23.812733261Z 2026-11-10T19:58:23.812566Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:23.812735469Z 2026-11-10T19:58:23.812581Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T63-N3:uncommitted@19:58:23.812568, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:23.817922219Z 2026-11-10T19:58:23.817843Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:23.817923886Z 2026-11-10T19:58:23.817856Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:24.032174720Z 2026-11-10T19:58:24.032101Z  WARN vtop_node::lease_agent: lease agent round failed; retrying error=read range lease: 127.0.0.1:9200 is not the metadata leader; and knows of no leader range=aaaaaaaa-0000-0000-0000-0000000000c1
+2026-11-10T19:58:24.271217261Z 2026-11-10T19:58:24.271112Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:24.271229095Z 2026-11-10T19:58:24.271129Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:24.271230845Z 2026-11-10T19:58:24.271138Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T64-N3:uncommitted@19:58:24.271130, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:24.272426678Z 2026-11-10T19:58:24.272321Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:24.272428386Z 2026-11-10T19:58:24.272330Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:24.729031845Z 2026-11-10T19:58:24.728941Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:24.729036928Z 2026-11-10T19:58:24.728952Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:24.729037928Z 2026-11-10T19:58:24.728957Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T65-N3:uncommitted@19:58:24.728953, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:24.730151470Z 2026-11-10T19:58:24.730000Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 2: no peer address in directory target=2
+2026-11-10T19:58:24.730152553Z 2026-11-10T19:58:24.730000Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:25.183834720Z 2026-11-10T19:58:25.183756Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:25.183841887Z 2026-11-10T19:58:25.183766Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:25.183842845Z 2026-11-10T19:58:25.183770Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T66-N3:uncommitted@19:58:25.183766, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:25.186343345Z 2026-11-10T19:58:25.186286Z  INFO openraft::engine::engine_impl: now; 19:58:25.186283, vote is updated at: 19:58:25.183786, vote is updated before 2.497167ms, leader lease(600ms) will expire after 597.502833ms
+2026-11-10T19:58:25.186344512Z 2026-11-10T19:58:25.186290Z  INFO openraft::engine::engine_impl: handle vote request result req={vote:T66-N1:uncommitted, last_log:1-24} result=Err(ByVote(Vote { leader_id: LeaderId { term: 66, voted_for: Some(3) }, committed: false }))
+2026-11-10T19:58:25.551118054Z 2026-11-10T19:58:25.551070Z  INFO openraft::engine::engine_impl: now; 19:58:25.551067, vote is updated at: 19:58:25.183786, vote is updated before 367.281084ms, leader lease(600ms) will expire after 232.718916ms
+2026-11-10T19:58:25.552494095Z 2026-11-10T19:58:25.552426Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T67-N1:uncommitted; current my vote: None; when (VoteResponse)
+2026-11-10T19:58:25.555253304Z 2026-11-10T19:58:25.555213Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T67-N1:committed; current my vote: None; when (VoteResponse)
+--- tail ---
+2026-11-10T19:58:24.730152553Z 2026-11-10T19:58:24.730000Z ERROR openraft::core::raft_core: while requesting vote error=Unreachable node: std::io::error::Error: meta peer 3 -> 1: no peer address in directory target=1
+2026-11-10T19:58:24.763855720Z 2026-11-10T19:58:24.763797Z  INFO openraft::engine::handler::vote_handler: vote T1-N1:committed is rejected by local vote: T65-N3:uncommitted
+2026-11-10T19:58:24.869644012Z 2026-11-10T19:58:24.869584Z  INFO openraft::engine::handler::vote_handler: vote T1-N1:committed is rejected by local vote: T65-N3:uncommitted
+2026-11-10T19:58:25.102346053Z 2026-11-10T19:58:25.102272Z  INFO openraft::engine::handler::vote_handler: vote T1-N1:committed is rejected by local vote: T65-N3:uncommitted
+2026-11-10T19:58:25.183834720Z 2026-11-10T19:58:25.183756Z  INFO openraft::core::raft_core: election timeout passed, check if it is a voter for election
+2026-11-10T19:58:25.183841887Z 2026-11-10T19:58:25.183766Z  INFO openraft::core::raft_core: do trigger election
+2026-11-10T19:58:25.183842845Z 2026-11-10T19:58:25.183770Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::elect, new candidate: {T66-N3:uncommitted@19:58:25.183766, last_log_id:1-17 progress:{1: false, 2: false, 3: false}}
+2026-11-10T19:58:25.183845553Z 2026-11-10T19:58:25.183785Z  INFO openraft::engine::handler::vote_handler: vote is changing from T65-N3:uncommitted to T66-N3:uncommitted
+2026-11-10T19:58:25.185454678Z 2026-11-10T19:58:25.185388Z  INFO openraft::core::raft_core: received Notify::VoteResponse: openraft::core::raft_core::RaftCore<_, _, _, _>::handle_notify now=19:58:25.185387 resp={T66-N3:uncommitted, last_log:None}
+2026-11-10T19:58:25.185460470Z 2026-11-10T19:58:25.185398Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::handle_vote_resp resp={T66-N3:uncommitted, last_log:None} target=3 my_vote=T66-N3:uncommitted my_last_log_id=Some(1-17)
+2026-11-10T19:58:25.185462303Z 2026-11-10T19:58:25.185400Z  INFO openraft::proposer::candidate: openraft::proposer::candidate::Candidate<_, _>::grant_by voting={T66-N3:uncommitted@19:58:25.183766, last_log_id:1-17 progress:{3: true, 1: false, 2: false}}
+2026-11-10T19:58:25.186338137Z 2026-11-10T19:58:25.186267Z  INFO openraft::raft: Raft::vote() rpc={vote:T66-N1:uncommitted, last_log:1-24}
+2026-11-10T19:58:25.186340470Z 2026-11-10T19:58:25.186278Z  INFO openraft::core::raft_core: received RaftMsg::RequestVote: openraft::core::raft_core::RaftCore<_, _, _, _>::handle_api_msg now=19:58:25.186277 vote_request={vote:T66-N1:uncommitted, last_log:1-24}
+2026-11-10T19:58:25.186341303Z 2026-11-10T19:58:25.186282Z  INFO openraft::core::raft_core: req={vote:T66-N1:uncommitted, last_log:1-24} func="openraft::core::raft_core::RaftCore<_, _, _, _>::handle_vote_request"
+2026-11-10T19:58:25.186342137Z 2026-11-10T19:58:25.186284Z  INFO openraft::engine::engine_impl: Engine::handle_vote_req req={vote:T66-N1:uncommitted, last_log:1-24}
+2026-11-10T19:58:25.186342720Z 2026-11-10T19:58:25.186285Z  INFO openraft::engine::engine_impl: Engine::handle_vote_req my_vote=T66-N3:uncommitted my_last_log_id=Some(1-17)
+2026-11-10T19:58:25.186343345Z 2026-11-10T19:58:25.186286Z  INFO openraft::engine::engine_impl: now; 19:58:25.186283, vote is updated at: 19:58:25.183786, vote is updated before 2.497167ms, leader lease(600ms) will expire after 597.502833ms
+2026-11-10T19:58:25.186344053Z 2026-11-10T19:58:25.186289Z  INFO openraft::engine::handler::vote_handler: vote T66-N1:uncommitted is rejected by local vote: T66-N3:uncommitted
+2026-11-10T19:58:25.186344512Z 2026-11-10T19:58:25.186290Z  INFO openraft::engine::engine_impl: handle vote request result req={vote:T66-N1:uncommitted, last_log:1-24} result=Err(ByVote(Vote { leader_id: LeaderId { term: 66, voted_for: Some(3) }, committed: false }))
+2026-11-10T19:58:25.186395220Z 2026-11-10T19:58:25.186332Z  INFO openraft::core::raft_core: received Notify::VoteResponse: openraft::core::raft_core::RaftCore<_, _, _, _>::handle_notify now=19:58:25.186332 resp={T66-N1:uncommitted, last_log:Some("1-24")}
+2026-11-10T19:58:25.186399303Z 2026-11-10T19:58:25.186340Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::handle_vote_resp resp={T66-N1:uncommitted, last_log:Some("1-24")} target=1 my_vote=T66-N3:uncommitted my_last_log_id=Some(1-17)
+2026-11-10T19:58:25.186400595Z 2026-11-10T19:58:25.186342Z  INFO openraft::engine::engine_impl: seen a greater log id when openraft::engine::engine_impl::Engine<_>::handle_vote_resp greater_log_id=Some(1-24)
+2026-11-10T19:58:25.186401803Z 2026-11-10T19:58:25.186342Z  INFO openraft::engine::handler::vote_handler: vote T66-N1:uncommitted is rejected by local vote: T66-N3:uncommitted
+2026-11-10T19:58:25.186628887Z 2026-11-10T19:58:25.186580Z  INFO openraft::core::raft_core: received Notify::VoteResponse: openraft::core::raft_core::RaftCore<_, _, _, _>::handle_notify now=19:58:25.186579 resp={T1-N1:committed, last_log:Some("1-24")}
+2026-11-10T19:58:25.186630345Z 2026-11-10T19:58:25.186588Z  INFO openraft::engine::engine_impl: openraft::engine::engine_impl::Engine<_>::handle_vote_resp resp={T1-N1:committed, last_log:Some("1-24")} target=2 my_vote=T66-N3:uncommitted my_last_log_id=Some(1-17)
+2026-11-10T19:58:25.186630970Z 2026-11-10T19:58:25.186590Z  INFO openraft::engine::engine_impl: seen a greater log id when openraft::engine::engine_impl::Engine<_>::handle_vote_resp greater_log_id=Some(1-24)
+2026-11-10T19:58:25.186631595Z 2026-11-10T19:58:25.186591Z  INFO openraft::engine::handler::vote_handler: vote T1-N1:uncommitted is rejected by local vote: T66-N3:uncommitted
+2026-11-10T19:58:25.551103179Z 2026-11-10T19:58:25.551043Z  INFO openraft::raft: Raft::vote() rpc={vote:T67-N1:uncommitted, last_log:1-24}
+2026-11-10T19:58:25.551110470Z 2026-11-10T19:58:25.551055Z  INFO openraft::core::raft_core: received RaftMsg::RequestVote: openraft::core::raft_core::RaftCore<_, _, _, _>::handle_api_msg now=19:58:25.551054 vote_request={vote:T67-N1:uncommitted, last_log:1-24}
+2026-11-10T19:58:25.551115595Z 2026-11-10T19:58:25.551066Z  INFO openraft::core::raft_core: req={vote:T67-N1:uncommitted, last_log:1-24} func="openraft::core::raft_core::RaftCore<_, _, _, _>::handle_vote_request"
+2026-11-10T19:58:25.551116595Z 2026-11-10T19:58:25.551068Z  INFO openraft::engine::engine_impl: Engine::handle_vote_req req={vote:T67-N1:uncommitted, last_log:1-24}
+2026-11-10T19:58:25.551117512Z 2026-11-10T19:58:25.551069Z  INFO openraft::engine::engine_impl: Engine::handle_vote_req my_vote=T66-N3:uncommitted my_last_log_id=Some(1-17)
+2026-11-10T19:58:25.551118054Z 2026-11-10T19:58:25.551070Z  INFO openraft::engine::engine_impl: now; 19:58:25.551067, vote is updated at: 19:58:25.183786, vote is updated before 367.281084ms, leader lease(600ms) will expire after 232.718916ms
+2026-11-10T19:58:25.551118762Z 2026-11-10T19:58:25.551073Z  INFO openraft::engine::handler::vote_handler: vote is changing from T66-N3:uncommitted to T67-N1:uncommitted
+2026-11-10T19:58:25.551119179Z 2026-11-10T19:58:25.551075Z  INFO openraft::engine::engine_impl: handle vote request result req={vote:T67-N1:uncommitted, last_log:1-24} result=Ok(())
+2026-11-10T19:58:25.552489637Z 2026-11-10T19:58:25.552412Z  INFO openraft::core::raft_core: received Notify::VoteResponse: openraft::core::raft_core::RaftCore<_, _, _, _>::handle_notify now=19:58:25.552410 resp={T67-N1:uncommitted, last_log:None}
+2026-11-10T19:58:25.552494095Z 2026-11-10T19:58:25.552426Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T67-N1:uncommitted; current my vote: None; when (VoteResponse)
+2026-11-10T19:58:25.554093220Z 2026-11-10T19:58:25.554047Z  INFO openraft::engine::handler::vote_handler: vote is changing from T67-N1:uncommitted to T67-N1:committed
+2026-11-10T19:58:25.555250054Z 2026-11-10T19:58:25.555204Z  INFO openraft::core::raft_core: received Notify::VoteResponse: openraft::core::raft_core::RaftCore<_, _, _, _>::handle_notify now=19:58:25.555203 resp={T67-N1:committed, last_log:None}
+2026-11-10T19:58:25.555253304Z 2026-11-10T19:58:25.555213Z  WARN openraft::core::raft_core: A message will be ignored because vote changed: msg sent by vote: T67-N1:committed; current my vote: None; when (VoteResponse)

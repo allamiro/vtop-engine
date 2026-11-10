@@ -18,7 +18,7 @@ from typing import Any
 from kafka_compare import failover_schema as fschema
 from kafka_compare import report as base
 from kafka_compare import stats
-from kafka_compare.failover_stats import FAULT_LABELS
+from kafka_compare.failover_stats import FAULT_LABELS, classify_vtop_reason
 
 SYSTEMS = ("kafka", "vtop")
 STYLE = {
@@ -64,6 +64,30 @@ def fmt_ms(value: float) -> str:
 
 def fmt_count(value: float) -> str:
     return f"{value:,.0f}"
+
+
+def error_classes(text: str) -> dict[str, int]:
+    """The `label=count` pairs of an error_classes cell, labels normalised for display
+    (the run classified some VTOP refusals as `other: <first 60 chars>`; the same refusal
+    from different nodes is one class here), counts summed."""
+    out: dict[str, int] = {}
+    for part in (text or "").split("; "):
+        label, _, count = part.rpartition("=")
+        if not label or not count.isdigit():
+            continue
+        out[classify_label(label)] = out.get(classify_label(label), 0) + int(count)
+    return out
+
+
+def classify_label(label: str) -> str:
+    if label.startswith("other:"):
+        return classify_vtop_reason(label[len("other:"):])
+    return label
+
+
+def fmt_classes(text: str) -> str:
+    classes = error_classes(text)
+    return "; ".join(f"{label} {count}" for label, count in sorted(classes.items())) or "-"
 
 
 def fmt_summary(s: stats.Summary | None, n_all: int, unit=fmt_ms) -> str:
@@ -327,7 +351,7 @@ def write_markdown(run: fschema.FailoverRun, images: dict[str, str], csv_rel: di
     add("Median (min - max) over the repetitions that ran, each system at its shipped timeouts.")
     add("")
     add("| fault | system | unavailability window | time to new leader | p99 latency, 30 s after | p99 latency, "
-        "30 s before | client retries | acked lost | duplicates |")
+        "30 s before | client retries (each client's own count, not comparable) | acked lost | duplicates |")
     add("|---|---|---|---|---|---|---|---|---|")
     for fault in faults:
         for system in SYSTEMS:
@@ -362,7 +386,7 @@ def write_markdown(run: fschema.FailoverRun, images: dict[str, str], csv_rel: di
                     f"{ms('unavailability_ms')} | {ms('gap_start_ms')} | {ms('baseline_max_gap_ms')} | "
                     f"{ms('time_to_leader_ms')} | {row['new_leader_node'] or '-'} | {ms('p99_after_ms')} | "
                     f"{row['send_errors'] or '-'} | {row['retries'] or '-'} | {row['reroutes'] or '-'} | "
-                    f"{(row['error_classes'] or '-').replace('|', '/')} | {row['verify'] or '-'} |")
+                    f"{fmt_classes(row['error_classes']).replace('|', '/')} | {row['verify'] or '-'} |")
     add("")
     add("## Method")
     add("")
@@ -402,6 +426,21 @@ def write_markdown(run: fschema.FailoverRun, images: dict[str, str], csv_rel: di
     add("## Reading the results")
     add("")
     add(READING)
+    add("")
+    # Produce attempts the VTOP leader answered with a refusal (rather than a lost
+    # connection): the run classed them "produce rejected", later runs by their reason.
+    rejected_labels = ("produce rejected", "quorum not reached (Overloaded)")
+    refused = [(row, sum(error_classes(row["error_classes"]).get(label, 0) for label in rejected_labels))
+               for row in rows if row["system"] == "vtop"]
+    refused = [(row, count) for row, count in refused if count]
+    if refused:
+        add("- **Produce refused by a serving leader.** In " + ", ".join(
+            f"{row['fault']} repetition {row['repetition']} ({count} attempts)" for row, count in refused)
+            + ", the new VTOP leader answered produce attempts with a refusal rather than an acknowledgement for "
+            "a short stretch, then acknowledged again; the read-back found nothing lost. The driver log of each "
+            "such repetition (`logs/vtop-<fault>-<rep>/driver.log`) has the exact lines; in this run they read "
+            "`produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3`, just after "
+            "the partitioned old leader was reconnected.")
     add("")
     add("## Not measured here")
     add("")
@@ -473,10 +512,26 @@ READING = """\
   fences the dead broker after `broker.session.timeout.ms` (9 s) and elects a leader from the ISR; the client
   finds it on its next metadata refresh. VTOP's survivors cannot take the range until the dead holder's lease
   expires (15 s), then the winner fences the replicas at a new epoch and establishes the committed boundary
-  from a quorum before serving. Under these defaults the difference in the window is mostly 9 s vs 15 s,
-  i.e. configuration, not mechanism; a matched-timeouts profile would separate the two.
-- **Orderly stop.** Kafka's controlled shutdown moves leadership before the broker exits; VTOP releases its
-  lease on SIGTERM (#280) so a survivor can acquire it at once, without waiting for expiry.
+  from a quorum before serving. The node logs of every VTOP crash repetition (`logs/vtop-kill9_leader-*/`)
+  show three steps after the fault, in order: (1) the lease lapses and a survivor is granted it (the time-to-
+  leader column; the dead holder's last renewal sets how much of the 15 s remains); (2) the first promotion
+  attempt is refused with `too few replicas could confirm the committed boundary ... answered=1 required=2`,
+  because the other survivor has not yet adopted the new epoch from its own lease poll (2 s), and the retry
+  succeeds (`verified promotion`); (3) **`range lease held` is followed about 10 s later by
+  `data_node_role_changed role=leader`**: on taking the range, a candidate waits up to 10 s for a replica
+  stream to EVERY peer before it serves (`crates/vtop-node/src/data_node.rs`, the wait before
+  `LocalBroker::with_replication` in the candidate's leader build), and after a crash one peer is the dead
+  node, so the full 10 s always elapses although a quorum (itself plus the live follower) is already
+  there. Step 3 is a third or more of every VTOP crash window here and is not a safety requirement;
+  waiting for a quorum of streams instead of all of them would remove it. Kafka has no counterpart: its
+  window is the 9 s session timeout plus the election and the client's metadata refresh. Part of the
+  remaining difference is 9 s vs 15 s, i.e. configuration; a matched-timeouts profile would separate the two.
+- **Orderly stop.** Kafka's controlled shutdown moves leadership before the broker exits. VTOP releases its
+  lease on SIGTERM (#280; the node logs `range lease released for shutdown`), so a survivor acquires it
+  within its next lease poll instead of waiting out the expiry, which is why its time to new leader is short.
+  The same two steps as after a crash then follow (a refused first promotion attempt, then the ~10 s wait for
+  a replica stream to the node that has just stopped), so the producer's window is much longer than the
+  leader handover itself.
 - **Partition.** The isolated leader cannot be told it is deposed. Kafka's controller fences it after the
   session timeout and elects another leader, but the JVM producer holds its in-flight request to the isolated
   broker until `request.timeout.ms` (30 s) before it refreshes metadata; VTOP's isolated holder cannot renew its

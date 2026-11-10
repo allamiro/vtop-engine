@@ -1,0 +1,512 @@
+1794337559880688 start total=475000 rate=5000 batch=100 request_timeout_ms=30000
+1794337559896027 attempt=1 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1794337559906241 attempt=1 exit=1 acked=0 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337560018667 attempt=2 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1794337560026077 attempt=2 exit=1 acked=0 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337560137586 attempt=3 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1794337560145419 attempt=3 exit=1 acked=0 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337560256238 attempt=4 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1794337560264506 attempt=4 exit=1 acked=0 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337560376318 attempt=5 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1794337560384325 attempt=5 exit=1 acked=0 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337560496588 attempt=6 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1794337560505464 attempt=6 exit=1 acked=0 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337560616887 attempt=7 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1794337560625225 attempt=7 exit=1 acked=0 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337560739112 attempt=8 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1794337560746846 attempt=8 exit=1 acked=0 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337560857019 attempt=9 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1794337560866355 attempt=9 exit=1 acked=0 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337560977495 attempt=10 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=0
+1794337597731690 attempt=10 exit=3 acked=175200 reason=produce interrupted: wire I/O: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof 
+1794337597841579 attempt=11 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337597866510 attempt=11 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337597973513 attempt=12 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337597981191 attempt=12 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337598091616 attempt=13 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337598100023 attempt=13 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337598207849 attempt=14 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337598215455 attempt=14 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337598325646 attempt=15 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337598334708 attempt=15 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337598443267 attempt=16 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337598452112 attempt=16 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337598562843 attempt=17 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337598570790 attempt=17 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337598680063 attempt=18 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337598687853 attempt=18 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337598799092 attempt=19 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337598807581 attempt=19 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337598915322 attempt=20 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337598922097 attempt=20 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337599030314 attempt=21 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337599037636 attempt=21 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337599147722 attempt=22 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337599156563 attempt=22 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337599265386 attempt=23 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337599273678 attempt=23 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337599382259 attempt=24 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337599389981 attempt=24 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337599499754 attempt=25 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337599507326 attempt=25 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337599615826 attempt=26 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337599624570 attempt=26 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337599733952 attempt=27 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337599741248 attempt=27 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337599853018 attempt=28 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337599860621 attempt=28 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337599969783 attempt=29 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337599976878 attempt=29 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337600084496 attempt=30 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337600091552 attempt=30 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337600204866 attempt=31 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337600214997 attempt=31 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337600324158 attempt=32 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337600331408 attempt=32 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337600439903 attempt=33 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337600446782 attempt=33 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337600555302 attempt=34 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337600563216 attempt=34 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337600671141 attempt=35 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337600680222 attempt=35 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337600788578 attempt=36 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337600796059 attempt=36 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337600905703 attempt=37 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337600912298 attempt=37 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337601022038 attempt=38 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337601030490 attempt=38 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337601140804 attempt=39 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337601148050 attempt=39 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337601257333 attempt=40 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337601265045 attempt=40 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337601373322 attempt=41 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337601379560 attempt=41 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337601491567 attempt=42 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337601499999 attempt=42 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337601609223 attempt=43 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337601616897 attempt=43 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337601726363 attempt=44 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337601734148 attempt=44 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337601842210 attempt=45 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337601851640 attempt=45 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337601958509 attempt=46 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337601966489 attempt=46 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337602076140 attempt=47 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337602083854 attempt=47 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337602192651 attempt=48 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337602201224 attempt=48 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337602312489 attempt=49 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337602323719 attempt=49 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337602432460 attempt=50 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337602438872 attempt=50 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337602549212 attempt=51 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337602557752 attempt=51 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337602667421 attempt=52 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337602675202 attempt=52 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337602790825 attempt=53 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337602799245 attempt=53 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337602908416 attempt=54 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337602915791 attempt=54 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337603024792 attempt=55 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337603033311 attempt=55 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337603141500 attempt=56 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337603149101 attempt=56 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337603258363 attempt=57 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337603266287 attempt=57 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337603377254 attempt=58 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337603386365 attempt=58 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337603495031 attempt=59 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337603502244 attempt=59 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337603611520 attempt=60 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337603618060 attempt=60 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337603730001 attempt=61 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337603736917 attempt=61 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337603847744 attempt=62 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337603856399 attempt=62 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337603964081 attempt=63 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337603971146 attempt=63 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337604082777 attempt=64 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337604089604 attempt=64 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337604203478 attempt=65 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337604212635 attempt=65 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337604321088 attempt=66 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337604329658 attempt=66 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337604450025 attempt=67 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337604471801 attempt=67 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337604582296 attempt=68 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337604591385 attempt=68 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337604700690 attempt=69 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337604707681 attempt=69 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337604816325 attempt=70 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337604823296 attempt=70 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337604931961 attempt=71 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337604939003 attempt=71 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337605047094 attempt=72 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337605054139 attempt=72 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337605163639 attempt=73 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337605169996 attempt=73 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337605281462 attempt=74 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337605288596 attempt=74 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337605400559 attempt=75 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337605407229 attempt=75 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337605519607 attempt=76 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337605531409 attempt=76 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337605640980 attempt=77 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337605648015 attempt=77 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337605757475 attempt=78 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337605766638 attempt=78 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337605879180 attempt=79 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337605887603 attempt=79 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337605999062 attempt=80 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337606006674 attempt=80 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337606118180 attempt=81 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337606126223 attempt=81 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337606236517 attempt=82 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337606245767 attempt=82 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337606357668 attempt=83 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337606365612 attempt=83 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337606475952 attempt=84 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337606484590 attempt=84 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337606595047 attempt=85 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337606604686 attempt=85 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337606713925 attempt=86 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337606721454 attempt=86 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337606829578 attempt=87 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337606837154 attempt=87 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337606946388 attempt=88 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337606953334 attempt=88 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337607059763 attempt=89 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337607067200 attempt=89 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337607174163 attempt=90 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337607181005 attempt=90 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337607287749 attempt=91 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337607294973 attempt=91 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337607404987 attempt=92 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337607410857 attempt=92 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337607517247 attempt=93 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337607523541 attempt=93 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337607630587 attempt=94 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337607638841 attempt=94 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337607750492 attempt=95 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337607756323 attempt=95 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337607863725 attempt=96 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337607870250 attempt=96 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337607976503 attempt=97 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337607983645 attempt=97 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337608090927 attempt=98 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337608096945 attempt=98 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337608203388 attempt=99 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337608209397 attempt=99 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337608317207 attempt=100 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337608324291 attempt=100 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337608430755 attempt=101 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337608438582 attempt=101 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337608545937 attempt=102 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337608551543 attempt=102 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337608660524 attempt=103 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337608667436 attempt=103 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337608774074 attempt=104 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337608779704 attempt=104 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337608891652 attempt=105 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337608900011 attempt=105 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337609006706 attempt=106 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337609013027 attempt=106 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337609122198 attempt=107 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337609129486 attempt=107 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337609240879 attempt=108 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337609248030 attempt=108 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337609357505 attempt=109 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337609365606 attempt=109 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337609475718 attempt=110 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337609484123 attempt=110 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337609595130 attempt=111 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337609603527 attempt=111 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337609712936 attempt=112 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337609721826 attempt=112 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337609829368 attempt=113 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337609837209 attempt=113 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337609945424 attempt=114 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337609953058 attempt=114 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337610063540 attempt=115 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337610072092 attempt=115 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337610181192 attempt=116 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337610189480 attempt=116 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337610299487 attempt=117 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337610309829 attempt=117 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337610419305 attempt=118 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337610427518 attempt=118 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337610538341 attempt=119 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337610546931 attempt=119 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337610657205 attempt=120 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337610666633 attempt=120 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337610777085 attempt=121 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337610786446 attempt=121 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337610896174 attempt=122 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337610903946 attempt=122 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337611012332 attempt=123 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=1 addr=vtop-3:9400 first=175200
+1794337611021119 attempt=123 exit=1 acked=175200 reason=error: connect vtop-3:9400: failed to lookup address information: Name or service not known 
+1794337611129706 attempt=124 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337611134361 attempt=124 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337611242486 attempt=125 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337611247013 attempt=125 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337611354492 attempt=126 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337611358697 attempt=126 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337611466191 attempt=127 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337611470208 attempt=127 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337611578321 attempt=128 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337611582623 attempt=128 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337611691651 attempt=129 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337611696554 attempt=129 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337611804893 attempt=130 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337611809554 attempt=130 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337611917808 attempt=131 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337611922017 attempt=131 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337612030163 attempt=132 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337612034644 attempt=132 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337612144812 attempt=133 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337612149725 attempt=133 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337612260745 attempt=134 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337612265945 attempt=134 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337612378961 attempt=135 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337612384789 attempt=135 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337612495253 attempt=136 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337612500293 attempt=136 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337612611169 attempt=137 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337612616639 attempt=137 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337612726837 attempt=138 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337612731367 attempt=138 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337612844233 attempt=139 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337612849409 attempt=139 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337612955593 attempt=140 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337612959153 attempt=140 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337613066393 attempt=141 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337613070857 attempt=141 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337613178865 attempt=142 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337613183267 attempt=142 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337613291936 attempt=143 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337613296769 attempt=143 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337613405142 attempt=144 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337613410013 attempt=144 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337613519758 attempt=145 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337613524688 attempt=145 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337613633362 attempt=146 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337613637885 attempt=146 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337613748264 attempt=147 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337613753580 attempt=147 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337613862138 attempt=148 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337613866983 attempt=148 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337613976751 attempt=149 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337613982761 attempt=149 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337614095706 attempt=150 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337614100091 attempt=150 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337614208769 attempt=151 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337614213549 attempt=151 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337614327233 attempt=152 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337614332547 attempt=152 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337614441718 attempt=153 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337614446390 attempt=153 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337614558131 attempt=154 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337614563668 attempt=154 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337614676543 attempt=155 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337614681407 attempt=155 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337614789679 attempt=156 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337614794073 attempt=156 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337614903758 attempt=157 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337614908553 attempt=157 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337615019093 attempt=158 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337615026100 attempt=158 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337615133890 attempt=159 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337615138055 attempt=159 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337615246033 attempt=160 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337615250616 attempt=160 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337615359117 attempt=161 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337615363745 attempt=161 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337615472657 attempt=162 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337615477468 attempt=162 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337615586354 attempt=163 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337615591350 attempt=163 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337615702417 attempt=164 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337615707898 attempt=164 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337615817601 attempt=165 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337615822829 attempt=165 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337615933956 attempt=166 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337615939231 attempt=166 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337616052769 attempt=167 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337616058210 attempt=167 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337616464729 attempt=168 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337616468475 attempt=168 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337616576763 attempt=169 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337616581479 attempt=169 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337616690333 attempt=170 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337616695824 attempt=170 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337616806594 attempt=171 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337616813586 attempt=171 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337616926751 attempt=172 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337616933845 attempt=172 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337617044370 attempt=173 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337617050934 attempt=173 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337617161111 attempt=174 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337617168580 attempt=174 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337617279949 attempt=175 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337617287278 attempt=175 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337617397362 attempt=176 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337617405368 attempt=176 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337617515737 attempt=177 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337617522872 attempt=177 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337617632235 attempt=178 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337617639849 attempt=178 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337617750854 attempt=179 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337617757845 attempt=179 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337617870986 attempt=180 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337617878426 attempt=180 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337617988815 attempt=181 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337617995300 attempt=181 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337618106037 attempt=182 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337618112357 attempt=182 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337618221647 attempt=183 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337618229288 attempt=183 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337618339431 attempt=184 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337618347097 attempt=184 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337618459452 attempt=185 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337618465873 attempt=185 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337618576302 attempt=186 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337618583608 attempt=186 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337618693314 attempt=187 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337618700482 attempt=187 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337618810654 attempt=188 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337618819192 attempt=188 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337618934870 attempt=189 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337618941961 attempt=189 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337619054426 attempt=190 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337619061620 attempt=190 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337619171803 attempt=191 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337619180266 attempt=191 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337619290766 attempt=192 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337619297958 attempt=192 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337619408973 attempt=193 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337619417637 attempt=193 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337619528737 attempt=194 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337619536544 attempt=194 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337619647159 attempt=195 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337619654238 attempt=195 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337619765195 attempt=196 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337619771849 attempt=196 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337619879228 attempt=197 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337619885578 attempt=197 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337619996089 attempt=198 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337620000458 attempt=198 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337620111829 attempt=199 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337620116165 attempt=199 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337620224671 attempt=200 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337620229408 attempt=200 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337620338276 attempt=201 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337620343141 attempt=201 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337620451720 attempt=202 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337620456468 attempt=202 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337620563760 attempt=203 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337620567564 attempt=203 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337620676683 attempt=204 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337620681768 attempt=204 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337620789504 attempt=205 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337620794210 attempt=205 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337620903608 attempt=206 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337620908353 attempt=206 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337621016381 attempt=207 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337621020756 attempt=207 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337621130123 attempt=208 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337621135219 attempt=208 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337621242895 attempt=209 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337621247428 attempt=209 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337621354471 attempt=210 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337621359242 attempt=210 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337621467494 attempt=211 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337621471574 attempt=211 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337621578990 attempt=212 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337621582683 attempt=212 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337621689639 attempt=213 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337621693813 attempt=213 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337621801855 attempt=214 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337621806063 attempt=214 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337621916848 attempt=215 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337621921323 attempt=215 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337622030799 attempt=216 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337622035731 attempt=216 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337622148011 attempt=217 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337622153418 attempt=217 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337622263264 attempt=218 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337622268191 attempt=218 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337622377198 attempt=219 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337622382232 attempt=219 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337622493842 attempt=220 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337622499392 attempt=220 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337622609310 attempt=221 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337622615882 attempt=221 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337622724368 attempt=222 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337622729309 attempt=222 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337622837127 attempt=223 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337622841349 attempt=223 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337622948778 attempt=224 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337622953068 attempt=224 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337623060495 attempt=225 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337623064959 attempt=225 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337623173564 attempt=226 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337623178332 attempt=226 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337623286749 attempt=227 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337623291055 attempt=227 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337623401231 attempt=228 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337623406611 attempt=228 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337623515351 attempt=229 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337623519926 attempt=229 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337623630396 attempt=230 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337623640116 attempt=230 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337623748559 attempt=231 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337623752670 attempt=231 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337623863068 attempt=232 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337623867570 attempt=232 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337623978552 attempt=233 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337623983454 attempt=233 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337624094088 attempt=234 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337624098944 attempt=234 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337624212356 attempt=235 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337624217523 attempt=235 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337624330515 attempt=236 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337624335306 attempt=236 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337624444852 attempt=237 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337624450565 attempt=237 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337624563436 attempt=238 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337624568325 attempt=238 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337624678328 attempt=239 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337624686231 attempt=239 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337624794385 attempt=240 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337624798590 attempt=240 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337624906939 attempt=241 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337624911480 attempt=241 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337625019155 attempt=242 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337625024118 attempt=242 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337625132747 attempt=243 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337625137402 attempt=243 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337625245580 attempt=244 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337625250444 attempt=244 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337625362251 attempt=245 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337625368879 attempt=245 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337625477054 attempt=246 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337625481619 attempt=246 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337625590522 attempt=247 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337625595471 attempt=247 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337625704570 attempt=248 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337625709567 attempt=248 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337625818468 attempt=249 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337625822450 attempt=249 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337625930185 attempt=250 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337625934578 attempt=250 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337626043488 attempt=251 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337626048125 attempt=251 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337626159292 attempt=252 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337626164811 attempt=252 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337626274440 attempt=253 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337626281559 attempt=253 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337626391690 attempt=254 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337626396718 attempt=254 exit=1 acked=175200 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794337626504537 attempt=255 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175200
+1794337657805260 attempt=255 exit=0 acked=475000 reason=
+1794337657805608 done acked=475000 attempts=255

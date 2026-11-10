@@ -60,6 +60,13 @@ CSV; read it with its stated conditions, including that under `defaults` a
 Kafka acknowledgement does not wait for an fsync and a VTOP quorum
 acknowledgement does.
 
+Failover under load is in
+[`benchmarks/kafka-failover.md`](benchmarks/kafka-failover.md) (#597). Its
+first finding is a gap, not a number: a Kafka client cannot follow a VTOP
+failover, because the gateway is refused on the candidate nodes that fail over
+in place, so VTOP's failover there is measured through its native client and
+labelled as a different client path.
+
 ## VTOP vs LinkedIn Northguard/Xinfra
 
 Northguard is LinkedIn's closed-source log storage successor to Kafka;

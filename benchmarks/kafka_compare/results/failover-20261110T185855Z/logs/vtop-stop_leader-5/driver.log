@@ -1,0 +1,246 @@
+1794339807299766 start total=475000 rate=5000 batch=100 request_timeout_ms=30000
+1794339807312128 attempt=1 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794339807323318 attempt=1 exit=1 acked=0 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339807434923 attempt=2 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794339807443928 attempt=2 exit=1 acked=0 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339807555359 attempt=3 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794339807563366 attempt=3 exit=1 acked=0 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339807674449 attempt=4 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794339807682189 attempt=4 exit=1 acked=0 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339807792195 attempt=5 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794339807799506 attempt=5 exit=1 acked=0 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339807909105 attempt=6 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794339807915432 attempt=6 exit=1 acked=0 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339808025001 attempt=7 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794339808030423 attempt=7 exit=1 acked=0 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339808140610 attempt=8 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794339808146279 attempt=8 exit=1 acked=0 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339808258056 attempt=9 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794339845145881 attempt=9 exit=3 acked=175200 reason=produce interrupted: wire I/O: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof 
+1794339845267726 attempt=10 lease_unreadable
+1794339845383090 attempt=11 lease_unreadable
+1794339845498395 attempt=12 lease_unreadable
+1794339845617350 attempt=13 lease_unreadable
+1794339845734203 attempt=14 lease_unreadable
+1794339845852013 attempt=15 lease_unreadable
+1794339845968112 attempt=16 lease_unreadable
+1794339846086399 attempt=17 lease_unreadable
+1794339846201063 attempt=18 lease_unreadable
+1794339846317147 attempt=19 lease_unreadable
+1794339846432596 attempt=20 lease_unreadable
+1794339846549712 attempt=21 lease_unreadable
+1794339846666344 attempt=22 lease_unreadable
+1794339846782756 attempt=23 lease_unreadable
+1794339846903804 attempt=24 lease_unreadable
+1794339847021220 attempt=25 lease_unreadable
+1794339847146601 attempt=26 lease_unreadable
+1794339847268996 attempt=27 lease_unreadable
+1794339847391622 attempt=28 lease_unreadable
+1794339847512611 attempt=29 lease_unreadable
+1794339847635425 attempt=30 lease_unreadable
+1794339847757953 attempt=31 lease_unreadable
+1794339847880405 attempt=32 lease_unreadable
+1794339847999378 attempt=33 lease_unreadable
+1794339848127784 attempt=34 lease_unreadable
+1794339848244260 attempt=35 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339848247961 attempt=35 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339848361876 attempt=36 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339848365932 attempt=36 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339848479930 attempt=37 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339848484038 attempt=37 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339848596505 attempt=38 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339848600751 attempt=38 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339848714551 attempt=39 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339848718620 attempt=39 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339848832178 attempt=40 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339848836351 attempt=40 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339848949095 attempt=41 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339848952873 attempt=41 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339849067239 attempt=42 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339849071380 attempt=42 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339849185710 attempt=43 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339849189889 attempt=43 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339849302552 attempt=44 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339849306084 attempt=44 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339849420005 attempt=45 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339849423899 attempt=45 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339849537737 attempt=46 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339849541896 attempt=46 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339849656984 attempt=47 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339849661040 attempt=47 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339849776557 attempt=48 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339849780708 attempt=48 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339849894679 attempt=49 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339849898726 attempt=49 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339850014844 attempt=50 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339850018981 attempt=50 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339850134071 attempt=51 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339850138738 attempt=51 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339850609610 attempt=52 lease_unreadable
+1794339850728294 attempt=53 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339850732627 attempt=53 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339850846964 attempt=54 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339850850944 attempt=54 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339850964369 attempt=55 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339850968410 attempt=55 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339851082811 attempt=56 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339851087099 attempt=56 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339851201998 attempt=57 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339851206288 attempt=57 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339851319907 attempt=58 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339851326053 attempt=58 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339851439536 attempt=59 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339851443459 attempt=59 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339851557935 attempt=60 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339851561960 attempt=60 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339851676249 attempt=61 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339851680365 attempt=61 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339851794654 attempt=62 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339851798679 attempt=62 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339851915472 attempt=63 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339851919630 attempt=63 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339852033436 attempt=64 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339852037867 attempt=64 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339852154941 attempt=65 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339852159335 attempt=65 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339852275036 attempt=66 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339852279222 attempt=66 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339852397564 attempt=67 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339852404141 attempt=67 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339852528319 attempt=68 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339852532298 attempt=68 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339852646929 attempt=69 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339852651981 attempt=69 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339852766554 attempt=70 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339852770731 attempt=70 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339852884695 attempt=71 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339852890530 attempt=71 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339853012850 attempt=72 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339853017184 attempt=72 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339853131134 attempt=73 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339853135281 attempt=73 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339853249351 attempt=74 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339853253459 attempt=74 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339853370333 attempt=75 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339853374607 attempt=75 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339853486794 attempt=76 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339853490481 attempt=76 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339853603315 attempt=77 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339853607456 attempt=77 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339853722217 attempt=78 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339853726634 attempt=78 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339853841030 attempt=79 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339853845281 attempt=79 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339853959932 attempt=80 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339853964198 attempt=80 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339854076361 attempt=81 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339854080230 attempt=81 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339854194275 attempt=82 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339854198237 attempt=82 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339854311105 attempt=83 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339854314906 attempt=83 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339854428471 attempt=84 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339854432510 attempt=84 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339854544954 attempt=85 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339854548570 attempt=85 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339854661653 attempt=86 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339854665620 attempt=86 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339854778046 attempt=87 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339854782097 attempt=87 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339854900725 attempt=88 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339854905776 attempt=88 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339855020173 attempt=89 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339855024307 attempt=89 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339855138336 attempt=90 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339855142507 attempt=90 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339855256728 attempt=91 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339855261160 attempt=91 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339855375878 attempt=92 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339855379887 attempt=92 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339855493217 attempt=93 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339855497187 attempt=93 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339855614693 attempt=94 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339855618279 attempt=94 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339855736251 attempt=95 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339855742976 attempt=95 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339855860172 attempt=96 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339855867891 attempt=96 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339855986734 attempt=97 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339855994392 attempt=97 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339856111052 attempt=98 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339856118962 attempt=98 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339856236097 attempt=99 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339856243020 attempt=99 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339856360449 attempt=100 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339856368848 attempt=100 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339856487139 attempt=101 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339856493171 attempt=101 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339856611452 attempt=102 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339856621255 attempt=102 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339856740150 attempt=103 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339856747598 attempt=103 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339856864642 attempt=104 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339856871577 attempt=104 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339856990947 attempt=105 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339856997586 attempt=105 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339857114730 attempt=106 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339857122505 attempt=106 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339857240736 attempt=107 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339857247649 attempt=107 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339857366900 attempt=108 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339857374080 attempt=108 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339857491449 attempt=109 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339857497347 attempt=109 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339857614509 attempt=110 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339857622003 attempt=110 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339857742040 attempt=111 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339857750647 attempt=111 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339857869226 attempt=112 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339857876323 attempt=112 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339857992817 attempt=113 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339858001304 attempt=113 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339858118619 attempt=114 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339858125164 attempt=114 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339858242373 attempt=115 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339858249973 attempt=115 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339858368355 attempt=116 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339858374981 attempt=116 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339858493100 attempt=117 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339858499652 attempt=117 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339858614622 attempt=118 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339858619879 attempt=118 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339858735800 attempt=119 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339858739872 attempt=119 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339858858682 attempt=120 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339858864062 attempt=120 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339858977270 attempt=121 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339858981043 attempt=121 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339859097338 attempt=122 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339859104039 attempt=122 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339859221779 attempt=123 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339859226247 attempt=123 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339859342000 attempt=124 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339859346073 attempt=124 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339859463370 attempt=125 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339859468401 attempt=125 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339859587009 attempt=126 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339859591331 attempt=126 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339859705074 attempt=127 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339859709442 attempt=127 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339859823286 attempt=128 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339859827285 attempt=128 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339859939250 attempt=129 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339859943001 attempt=129 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339860054974 attempt=130 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339860058855 attempt=130 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339860172409 attempt=131 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339860176502 attempt=131 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339860289080 attempt=132 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339860293091 attempt=132 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339860406470 attempt=133 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339860410678 attempt=133 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339860525522 attempt=134 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339860530519 attempt=134 exit=1 acked=175200 reason=error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794339860644451 attempt=135 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794339905093480 attempt=135 exit=0 acked=475000 reason=
+1794339905094304 done acked=475000 attempts=135

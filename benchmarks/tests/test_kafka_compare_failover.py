@@ -149,6 +149,29 @@ def test_driver_log_summary_counts_attempts_failures_and_leaders():
         "reasons": {"connection lost": 1, "name not resolvable": 1}}
 
 
+def test_refusals_from_the_run_are_classed_by_their_reason():
+    # The exact texts the full run's driver logs carry.
+    assert fstats.classify_vtop_reason(
+        "error: tls vtop-3:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext "
+        "plane does to a TLS client)") == "node not serving (handshake closed)"
+    assert fstats.classify_vtop_reason(
+        "error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3") == \
+        "quorum not reached (Overloaded)"
+    assert fstats.classify_vtop_reason("produce interrupted: no answer to a 100-record batch within 30000 ms") == \
+        "request timeout"
+    assert fstats.classify_vtop_reason("something new") == "other: something new"
+
+
+def test_the_report_merges_the_same_refusal_from_different_nodes():
+    from kafka_compare import failover_report
+
+    cell = ("connection lost=1; name not resolvable=98; other: error: tls vtop-1:9400: tls handshake eof (the peer "
+            "closed t=8; other: error: tls vtop-3:9400: tls handshake eof (the peer closed t=124")
+    assert failover_report.error_classes(cell) == {
+        "connection lost": 1, "name not resolvable": 98, "node not serving (handshake closed)": 132}
+    assert failover_report.fmt_classes("") == "-"
+
+
 def test_verify_output_passes_only_with_its_done_line_and_exit_zero():
     done = "verify_done records=1000 next_offset=1001 gaps=1 high_watermark=1001\n"
     assert fstats.parse_vtop_verify(done, "", 0) == fstats.VerifyResult(True, 1000, 1, 1001, "")
@@ -374,3 +397,23 @@ def test_unknown_columns_are_refused_at_write_time(tmp_path):
     fschema.write_header(path)
     with pytest.raises(ValueError, match="unknown columns"):
         fschema.append_rows(path, [{"bogus": 1}])
+
+
+# ------------------------------------------------------------------ rendering (#600)
+
+COMMITTED_RUN = os.path.join(os.path.dirname(__file__), "..", "kafka_compare", "results", "failover-20261110T185855Z")
+
+
+def test_the_committed_run_renders_byte_identically_twice(tmp_path):
+    pytest.importorskip("matplotlib")
+    from kafka_compare import report
+
+    outputs = []
+    for attempt in ("a", "b"):
+        img, doc = tmp_path / attempt / "img", tmp_path / attempt / "kafka-failover.md"
+        assert report.main([COMMITTED_RUN, "--img-dir", str(img), "--doc", str(doc)]) == 0
+        outputs.append({name: (img / name).read_bytes() for name in sorted(os.listdir(img))})
+        outputs[-1]["doc"] = doc.read_bytes().replace(str(tmp_path / attempt).encode(), b"")
+    assert sorted(outputs[0]) == ["doc", "kafka-failover-timeline.png", "kafka-failover-timeline.svg",
+                                  "kafka-failover-unavailability.png", "kafka-failover-unavailability.svg"]
+    assert outputs[0] == outputs[1]
