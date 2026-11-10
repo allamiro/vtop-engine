@@ -1014,12 +1014,15 @@ def _observe(proc, endpoint: MetricsEndpoint, recorder: SeriesRecorder, duration
         # little), so the exit is waited for briefly rather than read once. An
         # engine still running after the grace is alive and its endpoint is
         # what stopped.
+        # The last sleep is clamped to what remains, so the wait never runs
+        # past the grace and still ends on a read at its deadline (review).
         give_up = clock() + ENGINE_EXIT_GRACE_SECONDS
         while True:
             rc = proc.exit_code()
-            if rc is not None or clock() >= give_up:
+            remaining = give_up - clock()
+            if rc is not None or remaining <= 0:
                 return rc
-            sleep(READY_POLL_SECONDS)
+            sleep(min(READY_POLL_SECONDS, remaining))
 
     # A reading is stamped when its answer ARRIVES, and its scrape's latency
     # is bounded — see MAX_SCRAPE_LATENCY_FRACTION. Stamped at the request's

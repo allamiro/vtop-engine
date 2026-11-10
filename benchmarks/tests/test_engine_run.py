@@ -862,6 +862,7 @@ class EngineExitingMidScrape:
             raise engine_run.ScrapeFailed("nothing answers before launch")
         self.scrapes += 1
         if self.exits_during is None and self.scrapes > 3:
+            self.failed_at = self.now
             raise engine_run.ScrapeFailed("connection refused")
         if self.scrapes == self.exits_during:
             self.exited = True
@@ -897,15 +898,17 @@ def test_an_engine_that_exits_during_a_scrape_is_refused_for_its_exit_not_the_sc
 def test_a_scrape_that_fails_while_the_engine_runs_is_still_a_stopped_scrape(
         tmp_path, monkeypatch):
     # The control: the endpoint stops answering and the engine never exits.
-    # The wait for an exit is bounded, and the refusal is the endpoint's.
+    # The wait for an exit ends AT the grace, not a poll past it (review): a
+    # 0.05 s grace is not a whole number of 0.02 s polls, so a loop that
+    # always sleeps a full poll would wait 0.06 s here.
+    monkeypatch.setattr(engine_run, "ENGINE_EXIT_GRACE_SECONDS", 0.05)
     engine = EngineExitingMidScrape(exits_during=None)
-    started = engine.now
     with pytest.raises(engine_run.ScrapeStopped, match="connection refused"):
         engine.run(tmp_path, monkeypatch)
-    waited = engine.now - started
-    assert waited < 0.3 + engine_run.ENGINE_EXIT_GRACE_SECONDS + 0.1, (
-        f"the refusal took {waited:.2f}s of fake time: the wait for an exit must be bounded "
-        f"by ENGINE_EXIT_GRACE_SECONDS ({engine_run.ENGINE_EXIT_GRACE_SECONDS}s)")
+    waited = engine.now - engine.failed_at
+    assert waited <= 0.05 + 1e-9, (
+        f"waited {waited:.3f}s of fake time for an exit after the failed scrape, past the "
+        "0.05s grace: the wait for an exit must end at ENGINE_EXIT_GRACE_SECONDS")
 
 
 def test_a_long_lived_run_with_a_competitor_is_refused_before_it_costs_anything(
