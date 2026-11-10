@@ -105,6 +105,11 @@ impl Drop for StagedFiles {
 /// Result of the verify phase: either the batch is ready to commit, or it
 /// already reached a terminal outcome (empty read, or FAILED) and there is
 /// nothing left to do.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one step per batch, consumed at once; the gap is the progress marker, which \
+              grew with the content fingerprint (#578), and boxing either side only moves it"
+)]
 pub enum VerifyStep {
     Verified(VerifiedBatch),
     Finished(BatchOutcome),
@@ -656,7 +661,9 @@ impl<'a> Pipeline<'a> {
             record_count: batch.record_count,
             first_timestamp: batch.first_timestamp.clone(),
             last_timestamp: batch.last_timestamp.clone(),
-            source_progress: read.progress_end.clone(),
+            // Without the #578 fields: an older verifier would drop them
+            // and fail the self-hash (see `ProgressMarker::for_manifest`).
+            source_progress: read.progress_end.for_manifest(),
             object_uri: object_uri.clone(),
             object_size: compressed.size_bytes,
             object_checksum_algorithm: algo.as_str().to_string(),
@@ -2509,7 +2516,9 @@ impl Engine {
         //
         // Each cursor names the inode its offset was read from, so a file
         // that was rotated while the engine was down is started at byte 0
-        // instead of at the old file's high-water mark (#558).
+        // instead of at the old file's high-water mark (#558) - and the
+        // fingerprint of its first bytes, for a replacement that kept the
+        // inode (#578).
         let file_cursors = self.store.committed_cursors(SourceType::File).await?;
         let spool_cursors = self
             .store
@@ -2518,14 +2527,26 @@ impl Engine {
         if let Some(a) = self.adapters.get_mut(&SourceType::File) {
             if let Some(fs) = a.as_any_mut().downcast_mut::<FileSource>() {
                 for c in file_cursors {
-                    fs.seed_committed_from(&c.path, c.end_byte, c.inode, c.observed_size);
+                    fs.seed_committed_from(
+                        &c.path,
+                        c.end_byte,
+                        c.inode,
+                        c.observed_size,
+                        c.content_fingerprint,
+                    );
                 }
             }
         }
         if let Some(a) = self.adapters.get_mut(&SourceType::SyslogSpool) {
             if let Some(ss) = a.as_any_mut().downcast_mut::<SyslogSpoolSource>() {
                 for c in spool_cursors {
-                    ss.seed_committed_from(&c.path, c.end_byte, c.inode);
+                    ss.seed_committed_from(
+                        &c.path,
+                        c.end_byte,
+                        c.inode,
+                        c.observed_size,
+                        c.content_fingerprint,
+                    );
                 }
             }
         }
@@ -3374,6 +3395,7 @@ mod tests {
             end_byte: 0,
             file_size: 0,
             mtime: String::new(),
+            content_fingerprint: None,
         };
         assert_eq!(buffer_key(&file, &fm).1, "/a.log");
     }
@@ -3594,6 +3616,7 @@ mod tests {
             end_byte: 4,
             file_size: 4,
             mtime: String::new(),
+            content_fingerprint: None,
         };
         let read = ReadResult {
             records: vec![b"one".to_vec()],
@@ -4081,6 +4104,7 @@ mod tests {
             end_byte: start + 10,
             file_size: 0,
             mtime: String::new(),
+            content_fingerprint: None,
         };
         let inodes = |plan: &RewindPlan| -> Vec<Option<u64>> {
             plan.markers().iter().map(marker_inode).collect()
@@ -4113,6 +4137,7 @@ mod tests {
             end_byte: start + 10,
             file_size: 0,
             mtime: String::new(),
+            content_fingerprint: None,
         };
         let kafka = |partition: i32, start: i64| ProgressMarker::Kafka {
             topic: "t".into(),
@@ -4171,6 +4196,7 @@ mod tests {
             end_byte: end,
             file_size: 0,
             mtime: String::new(),
+            content_fingerprint: None,
         };
         let mut plan = RewindPlan::default();
         plan.add(&file(0, 100));
@@ -4204,6 +4230,7 @@ mod tests {
             end_byte: end,
             file_size: 0,
             mtime: String::new(),
+            content_fingerprint: None,
         };
         let mut plan = RewindPlan::default();
         plan.add(&file("/a", 1, 100, 150));
@@ -4262,6 +4289,8 @@ mod tests {
             end_byte: end,
             received_time_start: None,
             received_time_end: None,
+            file_size: None,
+            content_fingerprint: None,
         };
         // Pending range with an inode, VERIFIED range from a legacy marker.
         let mut plan = RewindPlan::default();
@@ -4582,6 +4611,7 @@ mod tests {
             end_byte: end,
             file_size: 0,
             mtime: String::new(),
+            content_fingerprint: None,
         };
         let limits = BatchLimits::default();
         let src = DiscoveredSource {

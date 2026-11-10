@@ -272,6 +272,17 @@ descriptor (`fstat`) rather than a second path lookup:
   the cursor last read.
 - **Truncation** (`copytruncate`, an in-place truncate): the same inode, now
   shorter than the read position.
+- **Replacement at the same inode** (#578): a freed inode number handed to the
+  next file created, or a file rewritten in place that has already regrown
+  past the read position. Inode and length both agree with the old file;
+  its first bytes do not. Every read fingerprints the file's first page
+  (SHA-256 of its first `min(length, 4096)` bytes, read through the same
+  descriptor), records it in its markers (`content_fingerprint`), and checks
+  the fingerprint the previous read took against the file's first bytes. A
+  file under one page fingerprints all of itself, so the fingerprint grows
+  with the file; the check compares the old fingerprint's length of the new
+  file, so an append is never taken for a replacement. A file that was empty
+  at a read takes no fingerprint and proves nothing at the next one.
 
 In either case the new content is read from **byte 0**, and the cursor's
 committed point returns to 0 with it. Before this was handled, a read position
@@ -324,8 +335,16 @@ What follows from that, in the engine:
   any prune. The seed also carries the length the
   most recent committed batch saw its file at (`file_size` in the marker), so a
   `copytruncate` while the engine was down is caught even when the file is
-  still longer than the committed offset. A syslog-spool marker records no
-  length, so a spool seed has the inode and the offset only.
+  still longer than the committed offset, and the content fingerprint, so a
+  replacement at the same inode is caught too. Syslog-spool markers record
+  their length and fingerprint since #578; a spool seeded from an older row
+  has the inode and the offset only.
+- **Late commits, rewinds and `delete_after_commit` judge content too**
+  (#578): a range whose marker fingerprinted other first bytes than the file
+  at the path now holds does not move the cursor, is not replayed into the
+  new file, and does not delete it. Before, a same-length replacement at the
+  same inode satisfied every test of `delete_after_commit`
+  (`end_byte >= size`) and was deleted unread.
 
 Limits, stated plainly:
 
@@ -338,22 +357,25 @@ Limits, stated plainly:
   truncate are lost by the rotation tool before the engine can see them. If the
   file also regrows beyond the old read position before the next read, the
   truncation is invisible to the adapter.
-- A file is identified by its **inode number alone**, and a number can be
-  reused. On a *different* filesystem a replacement that happens to carry the
-  number is not seen as a rotation (markers do not record the device). On the
-  *same* filesystem the number of a file that was **unlinked** is free to be
-  handed to the next file created, so a path that is deleted and recreated
-  (rather than renamed and recreated, which keeps the old inode alive) can
-  present a new file under the old number; if that file is also longer than
-  the old read position it looks like a continuation. The engine's own
-  `delete_after_commit` removes the cursor with the file for exactly this
-  reason, so the common route to reuse is closed; a file removed by anything
-  else is not. Rotation by rename, which is what log rotation does, is
-  detected.
-- Late commits are judged against the file as it is NOW (another inode, or an
-  end beyond its length). A `copytruncate` followed by a regrow past the old
-  end before the late commit lands cannot be told from the original; that is
-  the same invisible case as a regrow before the next read, above.
+- A file is identified by its **inode number and its first page**. An inode
+  number can be reused: on a *different* filesystem by a replacement that
+  happens to carry it (markers do not record the device), and on the *same*
+  filesystem by the next file created after one is **unlinked**. Since #578
+  such a file is caught by its first bytes, whatever its length. What is
+  still not caught is a replacement whose first page is byte for byte the
+  old file's - a fixed header longer than 4 KiB, or a file restored from a
+  copy - and, for a file under one page, one whose first bytes repeat all of
+  the old, shorter file. Those look like a continuation, as every
+  replacement at a reused inode did before.
+- Late commits are judged against the file as it is NOW (another inode, an
+  end beyond its length, or other first bytes than the batch read). A
+  `copytruncate` whose new content starts with the same first page as the
+  old (see above) and regrows past the old end before the late commit lands
+  cannot be told from the original.
+- **Rows written before #578 carry no fingerprint**, and a cursor seeded from
+  one, or a range recovered from one, is judged by inode and length alone,
+  exactly as before. The first read after an upgrade takes a fingerprint, and
+  from there the check applies.
 - History pruning keeps one row per path, so a file untouched for longer than
   the retention window can lose the rows that name its inode. The restart then
   reads it from byte 0 again: duplicates, bounded by the file.
@@ -362,6 +384,32 @@ Tracked as #361, which also carries the question of whether the adapter should
 refuse rather than resume when it detects the jump — a refusal is only useful
 if an operator can act on it, and a source that stops archiving because it fell
 behind may be worse than one that archives what remains.
+
+#### Ledger format note: content fingerprints (#578)
+
+The change is to the JSON of the `progress_start` / `progress_end` markers the
+ledger stores, on both backends; no table changes, so there is no DDL and
+`vtopctl migrate` has nothing new to apply (PostgreSQL), and a SQLite ledger
+needs nothing either.
+
+- New, all optional and omitted when unknown: `content_fingerprint`
+  (`{"len": <bytes covered>, "sha256": "<hex>"}`) on file and syslog-spool
+  markers, and `file_size` on syslog-spool markers.
+- Rows written before the change decode with the fields absent, and every
+  reader judges them exactly as before: the adapters and the restart seed by
+  inode and length (spool rows, which recorded no length, by inode and read
+  position), the coverage audit by inode and size (files) or inode alone
+  (spools). Rows from before and after the change at one path and inode are
+  judged together: a fingerprint is compared only with another of the same
+  length, so a row without one never splits a file.
+- A marker with no fingerprint serializes byte for byte as before. The
+  manifest's `source_progress` never carries the new fields: an older
+  `verify-manifest` decodes a manifest and hashes it re-encoded, and would
+  drop them and report a mismatch, so manifests stay in the format every
+  released reader verifies.
+- An older binary reading a newer ledger ignores the fields (serde skips
+  unknown keys) and judges as it always did. Downgrade is still not
+  supported (see the roadmap's versioning note); this is what it would do.
 
 ---
 

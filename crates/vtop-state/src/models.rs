@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use vtop_core::manifest::VtopManifest;
 use vtop_core::state_machine::BatchState;
-use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
+use vtop_core::types::{ContentFingerprint, ProgressMarker, SourceType, TelemetryFormat};
 
 /// A persisted batch record. This is the durable journal entry that makes the
 /// engine crash-recoverable: every state transition is written here.
@@ -70,10 +70,25 @@ pub struct CommittedCursor {
     pub end_byte: u64,
     /// The length of the file as the MOST RECENT committed batch observed it
     /// (`file_size` in its marker); `None` where the marker records none (a
-    /// syslog spool marker, or a row that predates the field). It is the
-    /// newest row's, not a maximum: after a `copytruncate` the file legitimately
-    /// gets shorter, and a maximum would flag every restart as a truncation.
+    /// row that predates the field - every syslog spool row before #578). It
+    /// is the newest row's, not a maximum: after a `copytruncate` the file
+    /// legitimately gets shorter, and a maximum would flag every restart as a
+    /// truncation.
     pub observed_size: Option<u64>,
+    /// The fingerprint of the file's first bytes that the MOST RECENT
+    /// committed batch took (#578): a file replaced at the same inode while
+    /// the engine was down, already longer than the offset, is caught by it
+    /// alone. `None` for a row that predates the field, or a file that was
+    /// empty when read.
+    pub content_fingerprint: Option<ContentFingerprint>,
+}
+
+/// A `content_fingerprint` read out of a stored marker as JSON text. Anything
+/// that does not parse reads as "unknown", never as some other fingerprint:
+/// an unknown fingerprint only forgoes a check, a wrong one would invent a
+/// replacement.
+pub(crate) fn parse_content_fingerprint(json: &str) -> Option<ContentFingerprint> {
+    serde_json::from_str(json).ok()
 }
 
 /// Patch applied when advancing a batch's state. Fields set to `Some` are

@@ -33,6 +33,6 @@ pub mod work_dir;
 pub use errors::{VtopError, VtopResult};
 pub use state_machine::{can_transition, transition, BatchState};
 pub use types::{
-    BatchId, ChecksumAlgorithm, CompressionType, ManifestUri, ObjectUri, ProgressMarker,
-    SourceName, SourceType, TelemetryFormat, TenantId,
+    BatchId, ChecksumAlgorithm, CompressionType, ContentFingerprint, ManifestUri, ObjectUri,
+    ProgressMarker, SourceName, SourceType, TelemetryFormat, TenantId,
 };

@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
 use vtop_core::errors::VtopError;
-use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
+use vtop_core::types::{ContentFingerprint, ProgressMarker, SourceType, TelemetryFormat};
 
 /// Per-file read/commit cursor.
 #[derive(Debug, Clone, Default)]
@@ -104,21 +104,29 @@ impl FileSource {
     /// shorter than it was: without the size, a restart compares the shrunken
     /// file with the offset alone and resumes in the middle of new content
     /// (review of #564). `None` (an unknown size) leaves only the offset test.
+    ///
+    /// `content` is the fingerprint that batch took of the file's first bytes
+    /// (#578): a file replaced at the same inode while the engine was down,
+    /// already longer than the offset, agrees with the inode and the size and
+    /// is caught only by its content. `None` (a row from before the
+    /// fingerprint) leaves the inode and size tests.
     pub fn seed_committed_from(
         &mut self,
         path: &str,
         committed_byte: u64,
         inode: Option<u64>,
         observed_size: Option<u64>,
+        content: Option<ContentFingerprint>,
     ) {
         self.seed_committed(path, committed_byte);
-        if inode.is_some() || observed_size.is_some() {
+        if inode.is_some() || observed_size.is_some() || content.is_some() {
             // The size feeds the truncation test; the empty mtime keeps
             // `can_skip` false, so a seeded cursor always reads first.
             self.cursors.get_mut(path).expect("seeded above").seen = Some(FileIdentity {
                 inode,
                 file_size: observed_size.unwrap_or(0),
                 mtime: String::new(),
+                content,
             });
         }
     }
@@ -185,6 +193,7 @@ impl FileSource {
             .map(|md| Self::identity_of(&md))
     }
 
+    /// What a stat can say: everything but the content, which takes a read.
     fn identity_of(md: &std::fs::Metadata) -> FileIdentity {
         FileIdentity {
             inode: inode_of(md),
@@ -197,20 +206,22 @@ impl FileSource {
                     dt.to_rfc3339()
                 })
                 .unwrap_or_default(),
+            content: None,
         }
     }
 
-    /// Identity of whatever the PATH names right now. Only for comparing the
-    /// current file against a previously recorded marker (the delete guard in
-    /// `commit_progress`) — never for building a marker, which must describe
-    /// the file actually READ (#65): use the open descriptor's identity.
-    fn file_identity(path: &Path) -> (Option<u64>, u64, String) {
-        match std::fs::metadata(path) {
-            Ok(md) => {
-                let id = Self::identity_of(&md);
-                (id.inode, id.file_size, id.mtime)
-            }
-            Err(_) => (None, 0, String::new()),
+    /// Identity of whatever the PATH names right now - inode, length and
+    /// first bytes, through one descriptor. Only for comparing the current
+    /// file against a previously recorded marker (the commit and delete
+    /// guards in `commit_progress`, a rewind) — never for building a marker,
+    /// which must describe the file actually READ (#65): use the open
+    /// descriptor's identity. The first bytes tell a replacement at the same
+    /// inode from the file a marker was read from (#578). A file that cannot
+    /// be opened reads as gone.
+    fn probe(path: &Path) -> (Option<u64>, u64, Vec<u8>) {
+        match continuity::probe(path) {
+            Some((md, head)) => (inode_of(&md), md.len(), head),
+            None => (None, 0, Vec::new()),
         }
     }
 
@@ -227,6 +238,7 @@ impl FileSource {
             end_byte: end,
             file_size: id.file_size,
             mtime: id.mtime.clone(),
+            content_fingerprint: id.content.clone(),
         }
     }
 
@@ -310,11 +322,25 @@ impl FileSource {
         // "read the bytes" and "stat the path" would otherwise mix the old
         // file's offsets with the NEW file's identity (#65). The descriptor is
         // judged before any byte is read.
-        let file = tokio::fs::File::open(&path)
+        let mut file = tokio::fs::File::open(&path)
             .await
             .map_err(SliceError::before_judged)?;
-        let opened = Self::identity_of(&file.metadata().await.map_err(SliceError::before_judged)?);
-        let discontinuity = continuity::check(last_seen, opened.inode, opened.file_size, start);
+        let mut opened =
+            Self::identity_of(&file.metadata().await.map_err(SliceError::before_judged)?);
+        // The first page, through the same descriptor: what tells a file from
+        // a replacement at the same inode that is no shorter (#578), and what
+        // the markers of this read record for the next one to check.
+        let head = continuity::read_head(&mut file)
+            .await
+            .map_err(SliceError::before_judged)?;
+        opened.content = ContentFingerprint::of(&head);
+        let discontinuity = continuity::check(
+            last_seen.as_ref(),
+            opened.inode,
+            opened.file_size,
+            &head,
+            start,
+        );
         let start = if discontinuity.is_some() { 0 } else { start };
         // From here a failure still reports what the judgement found: a read
         // that saw the file truncated and then failed (a first record over
@@ -333,6 +359,12 @@ impl FileSource {
             discontinuity,
         )
         .await
+        .map(|mut slice| {
+            // The size and mtime are the descriptor's after the read; the
+            // content is what it held at open, which an append cannot change.
+            slice.identity.content = opened.content;
+            slice
+        })
         .map_err(|error| SliceError { error, restart })
     }
 
@@ -457,12 +489,27 @@ impl FileSource {
 }
 
 /// Inode / size / mtime of the file a read actually consumed, taken from the
-/// OPEN descriptor (`fstat`), never from a second path lookup.
+/// OPEN descriptor (`fstat`), never from a second path lookup - and the
+/// fingerprint of its first bytes, read through it (#578).
 #[derive(Debug, Clone)]
 struct FileIdentity {
     inode: Option<u64>,
     file_size: u64,
     mtime: String,
+    /// `None` from a stat (which reads no content), for an empty file, and
+    /// for a cursor seeded from a row that recorded none.
+    content: Option<ContentFingerprint>,
+}
+
+impl FileIdentity {
+    /// What the next read is judged against.
+    fn observed(&self) -> Observed {
+        Observed {
+            inode: self.inode,
+            size: self.file_size,
+            content: self.content.clone(),
+        }
+    }
 }
 
 /// The path with `.` components removed, for comparing two spellings of it.
@@ -774,10 +821,7 @@ impl SourceAdapter for FileSource {
             .cursors
             .get(&path)
             .and_then(|c| c.seen.as_ref())
-            .map(|seen| Observed {
-                inode: seen.inode,
-                size: seen.file_size,
-            });
+            .map(FileIdentity::observed);
         match Self::read_slice(
             path.clone(),
             start,
@@ -849,10 +893,7 @@ impl SourceAdapter for FileSource {
                         PassOutcome::SkippedUnchanged(current)
                     }
                     _ => {
-                        let last_seen = snapshot.seen.as_ref().map(|seen| Observed {
-                            inode: seen.inode,
-                            size: seen.file_size,
-                        });
+                        let last_seen = snapshot.seen.as_ref().map(FileIdentity::observed);
                         PassOutcome::Read(
                             Self::read_slice(
                                 path.clone(),
@@ -948,6 +989,7 @@ impl SourceAdapter for FileSource {
             end_byte,
             inode: marker_inode,
             file_size: marker_file_size,
+            content_fingerprint: marker_content,
             ..
         } = marker
         else {
@@ -959,8 +1001,9 @@ impl SourceAdapter for FileSource {
         // cursor has already restarted on the new content. Moving the cursor
         // to its offset would carry it past bytes of a file that were never
         // read. The batch is archived and its ledger row commits; only the
-        // cursor stays put (#558).
-        let (current_inode, current_size, _) = Self::file_identity(Path::new(path));
+        // cursor stays put (#558). A replacement at the same inode is told
+        // apart by its first bytes (#578).
+        let (current_inode, current_size, current_head) = Self::probe(Path::new(path));
         // The length test cannot see a truncation that has since regrown past
         // this range; the record of which generation it was read in can.
         let generation = self
@@ -970,7 +1013,14 @@ impl SourceAdapter for FileSource {
             .generations
             .settle(*start_byte, *end_byte);
         let still_current = generation != continuity::Settled::Stale
-            && continuity::commit_is_current(*marker_inode, current_inode, current_size, *end_byte);
+            && continuity::commit_is_current(
+                *marker_inode,
+                marker_content.as_ref(),
+                current_inode,
+                current_size,
+                &current_head,
+                *end_byte,
+            );
         if still_current {
             let c = self.cursors.entry(path.clone()).or_default();
             c.committed_byte = *end_byte;
@@ -998,6 +1048,9 @@ impl SourceAdapter for FileSource {
                     inode: (*marker_inode).or(current_inode),
                     file_size: *marker_file_size,
                     mtime: String::new(),
+                    // The content the batch read, already checked against
+                    // the file above; a legacy marker's unknown stays unknown.
+                    content: marker_content.clone(),
                 });
             }
             tracing::info!(path, end_byte, "file source progress committed");
@@ -1019,12 +1072,17 @@ impl SourceAdapter for FileSource {
             // read: the inode is unchanged and the old range ends beyond the
             // new length, so `end_byte >= size` below would hold for a stale
             // commit and delete the new, unarchived content (#558).
-            let (cur_inode, size, _) = Self::file_identity(Path::new(path));
+            //
+            // And for a replacement that reuses the inode and is no shorter
+            // (#578): only its first bytes differ from the batch's file.
+            let (cur_inode, size, head) = Self::probe(Path::new(path));
             let identity_ok = match (marker_inode, cur_inode) {
                 (Some(m), Some(cur)) => *m == cur,
                 (None, None) => true, // platform without inode support: size-only
                 _ => false,
-            };
+            } && marker_content
+                .as_ref()
+                .is_none_or(|content| content.matches_head(&head));
             if !still_current {
                 tracing::warn!(
                     path,
@@ -1052,6 +1110,7 @@ impl SourceAdapter for FileSource {
             start_byte,
             inode: marker_inode,
             file_size: size_when_read,
+            content_fingerprint: marker_content,
             ..
         } = marker
         else {
@@ -1067,7 +1126,7 @@ impl SourceAdapter for FileSource {
         // those offsets to re-read, and rewinding the NEW file there would
         // archive its middle as though it were the lost range. Refuse, so the
         // engine reports that the range will not be re-read (#558).
-        let (current_inode, current_size, _) = Self::file_identity(Path::new(path));
+        let (current_inode, current_size, current_head) = Self::probe(Path::new(path));
         if let Some(marker) = marker_inode {
             if current_inode.is_some() && current_inode != Some(*marker) {
                 return Err(VtopError::Source(format!(
@@ -1085,6 +1144,18 @@ impl SourceAdapter for FileSource {
                 "cannot replay file {path} at byte {start_byte}: file length is {current_size} \
                  (truncated; it was {size_when_read} when this range was read)"
             )));
+        }
+        // The same inode and no shorter, but other first bytes: a
+        // replacement that reused the inode (#578). Its offsets are not the
+        // range's either.
+        if let Some(content) = marker_content {
+            if !content.matches_head(&current_head) {
+                return Err(VtopError::Source(format!(
+                    "cannot replay file {path}: its first {} bytes are not the ones this \
+                     range was read after (replaced at the same inode)",
+                    content.len
+                )));
+            }
         }
         let c = self.cursors.entry(path.clone()).or_default();
         c.read_byte = (*start_byte).max(c.committed_byte);
@@ -1110,17 +1181,29 @@ impl SourceAdapter for FileSource {
         let ProgressMarker::File {
             path,
             inode: marker_inode,
+            content_fingerprint: marker_content,
             ..
         } = marker
         else {
             return None;
         };
         let c = self.cursors.get(path)?;
-        let identity = match c.rewound_for {
-            Some((inode, at)) if at == c.read_byte => Some(inode),
-            _ => c.seen.as_ref().and_then(|seen| seen.inode),
+        let (identity, content) = match c.rewound_for {
+            // A rewind checked the marker against the file it rewound.
+            Some((inode, at)) if at == c.read_byte => (Some(inode), None),
+            _ => (
+                c.seen.as_ref().and_then(|seen| seen.inode),
+                c.seen.as_ref().and_then(|seen| seen.content.as_ref()),
+            ),
         };
         if marker_inode.is_some() && identity != *marker_inode {
+            return None;
+        }
+        // The cursor read other content at that inode since (#578).
+        if content
+            .zip(marker_content.as_ref())
+            .is_some_and(|(seen, marker)| seen.same_content(marker) == Some(false))
+        {
             return None;
         }
         Some(i128::from(c.read_byte))
@@ -1725,6 +1808,7 @@ mod tests {
             inode: Some(42),
             file_size: 7,
             mtime: String::new(),
+            content: None,
         };
         let cursor = FileCursor {
             read_byte: 7,
@@ -1981,6 +2065,7 @@ mod tests {
             end_byte: 2,
             file_size: 2,
             mtime: String::new(),
+            content_fingerprint: None,
         };
         fs.commit_progress(&marker).await.unwrap();
         assert!(
@@ -2203,6 +2288,7 @@ mod tests {
             end_byte: 12,
             file_size,
             mtime: mtime.clone(),
+            content_fingerprint: None,
         };
         std::fs::write(&path, "z\n").unwrap();
         let err = fs
@@ -2484,7 +2570,7 @@ mod tests {
         let inode = std::fs::metadata(&path).unwrap().ino();
 
         let mut with_size = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
-        with_size.seed_committed_from(&path, 12, Some(inode), Some(60));
+        with_size.seed_committed_from(&path, 12, Some(inode), Some(60), None);
         let got = with_size
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
             .await
@@ -2498,7 +2584,7 @@ mod tests {
         // Without the size the offset alone cannot tell: this is the old,
         // lossy behaviour, kept for markers that record no size.
         let mut without = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
-        without.seed_committed_from(&path, 12, Some(inode), None);
+        without.seed_committed_from(&path, 12, Some(inode), None, None);
         let got = without
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
             .await
@@ -2524,7 +2610,7 @@ mod tests {
 
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
         // The previous generation's committed row: byte 60 of a 60-byte file.
-        fs.seed_committed_from(&path, 60, Some(inode), Some(60));
+        fs.seed_committed_from(&path, 60, Some(inode), Some(60), None);
         // The newer generation's VERIFIED batch: bytes 0..21 of a 21-byte file.
         let recovered = ProgressMarker::File {
             path: path.clone(),
@@ -2533,6 +2619,7 @@ mod tests {
             end_byte: 21,
             file_size: 21,
             mtime: String::new(),
+            content_fingerprint: None,
         };
         fs.commit_progress(&recovered).await.unwrap();
 
@@ -2564,7 +2651,7 @@ mod tests {
         let inode = std::fs::metadata(&path).unwrap().ino();
 
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
-        fs.seed_committed_from(&path, 60, Some(inode), Some(60));
+        fs.seed_committed_from(&path, 60, Some(inode), Some(60), None);
         let recovered = ProgressMarker::File {
             path: path.clone(),
             inode: None,
@@ -2572,6 +2659,7 @@ mod tests {
             end_byte: 21,
             file_size: 21,
             mtime: String::new(),
+            content_fingerprint: None,
         };
         fs.commit_progress(&recovered).await.unwrap();
 
@@ -2606,7 +2694,7 @@ mod tests {
 
         // Same file: resume after the committed 8 bytes.
         let mut same = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
-        same.seed_committed_from(&path, 8, Some(inode), None);
+        same.seed_committed_from(&path, 8, Some(inode), None, None);
         let got = same
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
             .await
@@ -2619,7 +2707,7 @@ mod tests {
 
         // The ledger remembers a different inode: the file at the path is new.
         let mut replaced = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
-        replaced.seed_committed_from(&path, 8, Some(inode + 1_000_000), None);
+        replaced.seed_committed_from(&path, 8, Some(inode + 1_000_000), None, None);
         let got = replaced
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
             .await
@@ -2632,7 +2720,7 @@ mod tests {
 
         // A legacy row with no inode behaves as before.
         let mut legacy = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
-        legacy.seed_committed_from(&path, 8, None, None);
+        legacy.seed_committed_from(&path, 8, None, None, None);
         let got = legacy
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
             .await
@@ -2657,6 +2745,7 @@ mod tests {
             end_byte: 8,
             file_size: 12,
             mtime: String::new(),
+            content_fingerprint: None,
         };
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
         // Nothing replayed or read yet: no identity, so nothing to report for a
@@ -2674,5 +2763,198 @@ mod tests {
             Some(4),
             "a marker with no inode cannot be told apart, so it is placed"
         );
+    }
+
+    // ---- replacement at the same inode (#578) -------------------------------
+
+    fn lines(reads: &[ReadResult]) -> Vec<String> {
+        reads
+            .iter()
+            .flat_map(|read| &read.records)
+            .map(|record| String::from_utf8_lossy(record).into_owned())
+            .collect()
+    }
+
+    /// #578: a file rewritten in place - the same inode, and already as long
+    /// as the old read position by the time it is next read - agrees with
+    /// the old file by inode and by length. Resuming it at the old offset
+    /// skipped its first lines. Its first bytes are what differ.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_same_inode_replacement_that_is_no_shorter_is_read_from_byte_zero() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "old one\nold two\n").unwrap(); // 16 bytes
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(lines(&first), ["old one", "old two"]);
+
+        // `std::fs::write` truncates and rewrites the SAME inode; by the next
+        // read the new content is longer than the 16 bytes read.
+        std::fs::write(&path, "NEW one\nNEW two\nNEW three\n").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            inode,
+            "the case under test keeps the inode"
+        );
+        let next = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            lines(&next),
+            ["NEW one", "NEW two", "NEW three"],
+            "the replacement must be read from byte 0, not resumed at the old file's \
+             offset 16 (which hands out only its third line)"
+        );
+        assert_eq!(
+            next[0].progress_end.content_fingerprint().map(|c| c.len),
+            Some(26)
+        );
+    }
+
+    /// #578, the irreversible half: the old batch commits after the file was
+    /// replaced at the same inode by content of the same length. Inode,
+    /// length and `end_byte >= size` all agree with the batch, and
+    /// `delete_after_commit` deleted the unarchived replacement.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_commit_never_deletes_a_same_inode_replacement() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "old one\nold two\n").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+
+        std::fs::write(&path, "NEW one\nNEW two\n").unwrap(); // same length
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("NEW one\nNEW two\n"),
+            "the replacement was never read; deleting it after the old batch's commit \
+             loses it"
+        );
+    }
+
+    /// #578, across a restart: the seed carries the fingerprint the last
+    /// committed batch took, so a file replaced at the same inode while the
+    /// engine was down - longer than the offset and than the length that
+    /// batch saw - is read from byte 0. A seed from a row that recorded no
+    /// fingerprint resumes as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_seed_with_a_fingerprint_restarts_a_file_replaced_at_the_same_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "NEW one\nNEW two\nNEW three\n").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let old = ContentFingerprint::of(b"old one\nold two\n");
+
+        let mut seeded = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        seeded.seed_committed_from(&path, 16, Some(inode), Some(16), old);
+        let reads = seeded
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(lines(&reads), ["NEW one", "NEW two", "NEW three"]);
+
+        let mut legacy = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        legacy.seed_committed_from(&path, 16, Some(inode), Some(16), None);
+        let reads = legacy
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            lines(&reads),
+            ["NEW three"],
+            "a legacy row is judged by inode and length, exactly as before"
+        );
+    }
+
+    /// A file under one page fingerprints all of itself, so the fingerprint
+    /// grows with it; each read checks the last one against the file's first
+    /// bytes, and an append is never mistaken for a replacement. A file that
+    /// was empty at a read has no fingerprint and proves nothing.
+    #[tokio::test]
+    async fn a_small_file_that_grows_is_one_file_and_an_empty_one_has_no_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        async fn read(fs: &mut FileSource, path: &str) -> (Vec<String>, ProgressMarker) {
+            let reads = fs
+                .read_batch_candidates(&src(path), 100, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            (lines(&reads), reads[0].progress_end.clone())
+        }
+        let (got, marker) = read(&mut fs, &path).await;
+        assert!(got.is_empty());
+        assert_eq!(marker.content_fingerprint(), None, "an empty file");
+
+        let mut expected = Vec::new();
+        for i in 0..300 {
+            // Grows past one page over the loop.
+            let line = format!("line {i:04} padding padding\n");
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(line.as_bytes())
+                .unwrap();
+            expected.push(line.trim_end().to_owned());
+            let (got, marker) = read(&mut fs, &path).await;
+            assert_eq!(got, [expected.last().unwrap().clone()], "append {i}");
+            let len = marker.content_fingerprint().unwrap().len;
+            let size = std::fs::metadata(&path).unwrap().len();
+            assert_eq!(len, size.min(ContentFingerprint::MAX_LEN as u64));
+        }
+    }
+
+    /// The rewind guard also judges content (#578): a range read before an
+    /// in-place replacement is never replayed into the new file, and once a
+    /// read has seen the replacement the range's position is not reported
+    /// for it. Both files are over a page, so their fingerprints cover the
+    /// same length and compare; under a page they would not (see
+    /// `ContentFingerprint::same_content`) and the position falls back to
+    /// the inode, as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replay_refuses_a_range_from_before_a_same_inode_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let page = |tag: &str, n: usize| -> String {
+            (0..n).map(|i| format!("{tag} line {i:05}\n")).collect()
+        };
+        std::fs::write(&path, page("old", 400)).unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let start = read[0].progress_start.clone();
+
+        std::fs::write(&path, page("NEW", 500)).unwrap();
+        let err = fs.replay_from_marker(&start).await.unwrap_err().to_string();
+        assert!(err.contains("replaced at the same inode"), "{err}");
+
+        // Once a read has seen the replacement, the old range's position is
+        // not this cursor's to report.
+        fs.read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(fs.read_position(&read[0].progress_end), None);
     }
 }

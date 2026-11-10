@@ -99,5 +99,9 @@ migration job per database; engine replicas should start only after it succeeds.
 - A runtime rollback may use the upgraded backward-compatible schema. Do not
   drop columns or the invariant trigger while any VTOP process can access the
   database.
+- Changes to the JSON inside ledger rows need no migration step. The content
+  fingerprint added to file and spool markers (#578) is such a change: no
+  DDL, older rows keep being read and judged as before. See the ledger format
+  note in [`ARCHITECTURE.md`](ARCHITECTURE.md) §7.2.
 - Test grants after role changes: runtime must be able to read/write ledger
   rows but must fail `CREATE TABLE`, `ALTER TABLE`, `DELETE`, and `TRUNCATE`.
