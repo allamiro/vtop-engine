@@ -211,12 +211,16 @@ impl CommandPolicy {
                 let until = tokio::time::Instant::now()
                     .checked_add(crate::base::EXITED_DRAIN_GRACE)
                     .map_or(deadline, |grace| grace.min(deadline));
+                // Both unfinished drains are polled TOGETHER (review of
+                // #615): awaiting one and then the other let a descendant
+                // holding stdout spend the whole grace while the tool's last
+                // stderr line sat unread in the pipe.
                 let _ = tokio::time::timeout_at(until, async {
-                    if stdout_end.is_none() {
-                        stdout_end = Some((&mut stdout_drain).await);
-                    }
-                    if stderr_end.is_none() {
-                        stderr_end = Some((&mut stderr_drain).await);
+                    while stdout_end.is_none() || stderr_end.is_none() {
+                        tokio::select! {
+                            end = &mut stdout_drain, if stdout_end.is_none() => stdout_end = Some(end),
+                            end = &mut stderr_drain, if stderr_end.is_none() => stderr_end = Some(end),
+                        }
                     }
                 })
                 .await;
@@ -253,10 +257,10 @@ impl CommandPolicy {
                 ));
             }
         };
-        if stdout_end.is_none() || stderr_end.is_none() {
-            // The tool has exited, yet a pipe is still open past the grace:
-            // a descendant inherited it. End the group rather than leave it
-            // running with nobody reading its output.
+        if !reached_eof(&stdout_end) || !reached_eof(&stderr_end) {
+            // The tool has exited, yet a pipe was not read to its end: a
+            // descendant may still hold it. End the group rather than leave
+            // it running with nobody reading its output.
             group.kill();
         }
         let status = status.map_err(|error| {
@@ -291,9 +295,11 @@ struct CapturedOutput {
 /// whatever is still holding its stdout or stderr.
 ///
 /// While the tool is unreaped its pid, and so the group id, cannot be
-/// reused. After it is reaped the group is killed only when a pipe is still
-/// held, i.e. when a descendant is alive — almost always in that group, which
-/// then still exists and still pins the id.
+/// reused. After it is reaped the group is killed only when a pipe was not
+/// read to EOF — normally because a descendant still holds it, almost always
+/// from inside that group, which then still exists and still pins the id.
+///
+/// Unix only: elsewhere there is no group, and only the tool is killed.
 struct ToolGroup {
     #[cfg(unix)]
     leader: Option<rustix::process::Pid>,
@@ -386,6 +392,14 @@ fn failure_with_evidence(detail: String, stdout: &[u8], stderr: &[u8]) -> VtopEr
         format!("{detail}: {shown}")
     };
     crate::base::upload_failure(detail, &evidence)
+}
+
+/// Whether a drain read its pipe to EOF, which proves nothing else holds it.
+/// A drain cut off by the grace (`None`) proves nothing, and neither does one
+/// that FAILED (review of #615): it stopped reading with the pipe possibly
+/// still held, and treating it as finished skipped the group kill.
+fn reached_eof(end: &Option<std::io::Result<()>>) -> bool {
+    matches!(end, Some(Ok(())))
 }
 
 /// One pipe's output as far as it has been read: the first `max_bytes`, and
@@ -1064,6 +1078,81 @@ mod tests {
         assert!(
             error.to_string().contains("SlowDown"),
             "the throttle line is the evidence and must be in the message: {error}"
+        );
+    }
+
+    /// Review of #615: the post-exit grace awaited the stdout drain and THEN
+    /// the stderr drain. When the tool's exit won the race against the read
+    /// of its last stderr bytes, and a descendant held stdout, the stdout
+    /// wait spent the whole grace, stderr was never polled again, and the
+    /// throttle line sitting in the pipe was dropped. Whether the exit wins
+    /// is a coin flip per call (`select!` picks among ready branches at
+    /// random), so one call proves little; many concurrent calls make the
+    /// old order fail essentially every run, while each call still costs only
+    /// the one shared 1 s grace.
+    #[tokio::test]
+    async fn a_descendant_holding_stdout_cannot_cost_a_write_its_final_stderr_line() {
+        use crate::base::UploadBackend;
+        const CALLS: usize = 24;
+        let (dir, path) = script_with_descendant(
+            "{bg}\n\
+             printf '%s\\n' 'An error occurred (SlowDown) when calling the PutObject operation' >&2\n\
+             exit 1",
+            "sleep 30 2>/dev/null",
+        );
+        let mut cfg = config(&path);
+        cfg.command_timeout_seconds = 20;
+        let backend = crate::awscli_backend::AwsCliBackend::new(
+            CommandPolicy::from_config(&cfg, "test").unwrap(),
+            None,
+            None,
+        );
+        let object = tempfile::NamedTempFile::new().unwrap();
+        let started = std::time::Instant::now();
+        let outcomes = futures::future::join_all(
+            (0..CALLS).map(|_| backend.put_object(object.path(), "s3://bucket/key", None)),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let descendants = kill_descendants(&dir);
+        assert_eq!(
+            descendants, CALLS,
+            "each call's tool must have left its descendant"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "{CALLS} concurrent calls took {elapsed:?} against a 20 s command timeout"
+        );
+        let lost: Vec<String> = outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect_err("a tool that exited 1 must fail the upload"))
+            .filter(|error| !error.is_upload_throttle() || !error.to_string().contains("SlowDown"))
+            .map(|error| error.to_string())
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "{} of {CALLS} calls lost the tool's final stderr line while a descendant held \
+             stdout through the grace; first: {:?}",
+            lost.len(),
+            lost.first()
+        );
+    }
+
+    /// Review of #615: only a drain that read its pipe to EOF lets the
+    /// tool's group live. A failed read used to count as finished, so the
+    /// group kill was skipped with the pipe's holder possibly alive. A pipe
+    /// read error cannot be provoked from a shell fixture, so the rule is
+    /// pinned here, on the predicate `capture` uses.
+    #[test]
+    fn only_a_drain_that_reached_eof_spares_the_tools_group() {
+        assert!(reached_eof(&Some(Ok(()))));
+        assert!(
+            !reached_eof(&None),
+            "a drain cut off by the grace left the pipe held"
+        );
+        assert!(
+            !reached_eof(&Some(Err(std::io::Error::other("read failed")))),
+            "a failed drain stopped reading with the pipe possibly still held"
         );
     }
 

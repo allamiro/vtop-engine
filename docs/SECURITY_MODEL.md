@@ -335,9 +335,16 @@ starts with an empty environment plus `LC_ALL=C`; only exact names declared in
 Invocations are killed and reaped after `upload.command_timeout_seconds`, and
 captured stdout/stderr is bounded by `upload.command_max_output_bytes`.
 Invocations that do not stream an object back (uploads, manifest writes,
-deletes, heads, downloads to a file, the `--version` probe) run in their own
-process group: it is killed on the timeout, and when something the tool
-started still holds its stdout or stderr after the tool has exited (#593).
+deletes, heads, downloads to a file, the `--version` probe) end when the tool
+exits: its output pipes then get a grace of up to 1 s (never past the
+timeout) to be read to the end, and the output read by then is the result
+(#593). On Unix these invocations also run in their own process group, which
+is killed on the timeout, when the call is cancelled before the tool has
+exited (engine shutdown, a caller's own deadline), and when a pipe has not
+been read to its end once the grace is over, which normally means something
+the tool started still holds it. On other platforms there is no process
+group: only the tool itself is killed, and a descendant it started can
+outlive the call.
 
 ### 5.2 On-demand bucket creation (`CreateBucket`) implications
 
