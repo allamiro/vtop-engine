@@ -71,6 +71,7 @@ def test_a_timestamp_run_id_is_accepted():
     (["--sat-records", "100:0,1024:5"], "must be positive"),
     (["--sat-records", "100:many,1024:5"], "SIZE:COUNT"),
     (["--sat-records", "100:5"], "no count for record sizes"),
+    (["--sat-records", "100:5,1024:6,100:7"], "100 B twice"),
     (["--fixed-seconds", "nan"], "--fixed-seconds"),
     (["--fixed-seconds", "inf"], "--fixed-seconds"),
     (["--fixed-seconds", "0"], "--fixed-seconds"),
@@ -85,6 +86,11 @@ def test_matrix_arguments_are_refused_before_any_docker_work(monkeypatch, argv, 
     monkeypatch.setattr(run, "sh", no_docker)
     with pytest.raises(SystemExit, match=match):
         run.main(argv)
+
+
+def test_sat_records_for_sizes_not_run_are_dropped_from_the_matrix():
+    assert run.parse_sat_records("100:3000000,1024:1000000", [100]) == {100: 3000000}
+    assert run.parse_sat_records("1024:5,100:6", [100, 1024]) == {100: 6, 1024: 5}
 
 
 def test_a_dirty_engine_tree_is_refused_not_benchmarked_as_head(monkeypatch):

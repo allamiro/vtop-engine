@@ -24,7 +24,7 @@ python3 benchmarks/kafka_compare/report.py benchmarks/kafka_compare/results/<run
 ```
 
 Useful knobs: `--sizes 100,1024`, `--reps 3`, `--sat-records 100:3000000,1024:1000000` (records per
-saturation run AND per consume run, per record size), `--fixed-seconds 30` (length of a fixed-rate run),
+saturation run AND per consume run, per record size), `--fixed-seconds 30` (a fixed-rate run sends rate x this many records),
 `--smoke-records`, `--no-consume`, `--rebuild`, `--run-id` (one path component). Every one is checked
 before any Docker work. A run writes `results/<run-id>/` and never overwrites another.
 
@@ -45,9 +45,11 @@ For each record size, Kafka first and then VTOP:
 4. **Saturation.** `kafka-producer-perf-test --throughput -1`, `--reps` times. The first 20% of each run's
    records are `--warmup-records` and excluded from its steady-state line, which is the one recorded.
 5. **Fixed rate.** 25 / 50 / 75 % of **Kafka's** median saturation for the cell, offered to both systems with
-   `--throughput` (open loop, rule 6), about `--fixed-seconds` long each: the three rates in turn, and that
-   round `--reps` times. The systems are not interleaved: Kafka's whole cell runs before VTOP's. A run whose
-   achieved rate is more than 5% under its offer is recorded with `sustained=false`.
+   `--throughput` (open loop, rule 6), each sending about `rate x --fixed-seconds` records. That is a target
+   length, not a time limit: a system that cannot keep up takes longer to send them, and the CSV's
+   `wall_seconds` says how long each run took. The three rates run in turn, and that round `--reps` times.
+   The systems are not interleaved: Kafka's whole cell runs before VTOP's. A run whose achieved rate is more
+   than 5% under its offer is recorded with `sustained=false`.
 6. **Consume.** `kafka-consumer-perf-test` reads `--sat-records` records from the start of the log with a
    fresh group, `--reps` times; the recorded rates are its `fetch.*` columns, which exclude the group join.
 7. **Down.** The leader's log is saved under `logs/`, the cluster is removed with its volumes.
