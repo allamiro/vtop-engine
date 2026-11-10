@@ -334,6 +334,10 @@ starts with an empty environment plus `LC_ALL=C`; only exact names declared in
 `upload.command_env_allowlist` are copied from the runtime environment.
 Invocations are killed and reaped after `upload.command_timeout_seconds`, and
 captured stdout/stderr is bounded by `upload.command_max_output_bytes`.
+Invocations that do not stream an object back (uploads, manifest writes,
+deletes, heads, downloads to a file, the `--version` probe) run in their own
+process group: it is killed on the timeout, and when something the tool
+started still holds its stdout or stderr after the tool has exited (#593).
 
 ### 5.2 On-demand bucket creation (`CreateBucket`) implications
 
