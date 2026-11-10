@@ -1,0 +1,66 @@
+{
+  "with_cap": {
+    "measured": false,
+    "refused_attempts": [
+      {
+        "competitor_alone_before_mbps": 9.551,
+        "competitor_window_sync_spread_seconds": 0.349,
+        "emulator_validation_mbps": 9.573,
+        "run_id": "competing-flow-bulk-capped-20261110T014003Z-uj67y2",
+        "runner_exit_code": 2,
+        "runner_output": [
+          "[bench] runner_mode=container: the engine runs inside the compose stack (profile `containerized` must be up)",
+          "[bench] emulator calibration: 9.573 Mbit/s through the shaped path (configured 10.0 Mbit/s)",
+          "[bench] scenario=competing-flow-bulk-capped run_id=competing-flow-bulk-capped-20261110T014003Z-uj67y2",
+          "[bench] results -> <repo>/benchmarks/results/competing-flow-bulk-capped-20261110T014003Z-uj67y2",
+          "[bench] netem on vtop-bench-netem: 100 ms round trip \u00b10 ms, 0.0% loss (random), 10000 kbit/s bottleneck at 1.0x BDP",
+          "[bench] competitor alone before: 9.551 Mbit/s over 60.164s on the empty link",
+          "[bench] seeded 250 files (8020803 bytes) format=jsonl size=small",
+          "[bench] competitor beside VTOP: bulk for 60s (+3s ramp)",
+          "[bench] netem removed from vtop-bench-netem",
+          "[bench] the contended competitor's interval lines place its window's opening 0.349s apart from one another, beyond the 0.25s a stream read live stays within: the lines were buffered somewhere between iperf3 and this process and arrived in bursts, so their arrival no longer dates the seconds they report. Placing the window from them would pair VTOP's span with the wrong seconds of the flow. Check that the competitor runs through `docker exec` without a wrapper that buffers its output, and that the middlebox was not starved of CPU"
+        ],
+        "scenario": "competing-flow-bulk-capped",
+        "stream_sync_tolerance_seconds": 0.25,
+        "upload_max_egress_bytes_per_second": 262144
+      },
+      {
+        "competitor_alone_before_mbps": 9.568,
+        "competitor_window_sync_spread_seconds": 0.285,
+        "emulator_validation_mbps": 9.56,
+        "run_id": "competing-flow-bulk-capped-20261110T014433Z-sdf0fx",
+        "runner_exit_code": 2,
+        "runner_output": [
+          "[bench] runner_mode=container: the engine runs inside the compose stack (profile `containerized` must be up)",
+          "[bench] emulator calibration: 9.56 Mbit/s through the shaped path (configured 10.0 Mbit/s)",
+          "[bench] scenario=competing-flow-bulk-capped run_id=competing-flow-bulk-capped-20261110T014433Z-sdf0fx",
+          "[bench] results -> <repo>/benchmarks/results/competing-flow-bulk-capped-20261110T014433Z-sdf0fx",
+          "[bench] netem on vtop-bench-netem: 100 ms round trip \u00b10 ms, 0.0% loss (random), 10000 kbit/s bottleneck at 1.0x BDP",
+          "[bench] competitor alone before: 9.568 Mbit/s over 60.166s on the empty link",
+          "[bench] seeded 250 files (8314324 bytes) format=jsonl size=small",
+          "[bench] competitor beside VTOP: bulk for 60s (+3s ramp)",
+          "[bench] netem removed from vtop-bench-netem",
+          "[bench] the contended competitor's interval lines place its window's opening 0.285s apart from one another, beyond the 0.25s a stream read live stays within: the lines were buffered somewhere between iperf3 and this process and arrived in bursts, so their arrival no longer dates the seconds they report. Placing the window from them would pair VTOP's span with the wrong seconds of the flow. Check that the competitor runs through `docker exec` without a wrapper that buffers its output, and that the middlebox was not starved of CPU"
+        ],
+        "scenario": "competing-flow-bulk-capped",
+        "stream_sync_tolerance_seconds": 0.25,
+        "upload_max_egress_bytes_per_second": 262144
+      }
+    ],
+    "why": "both attempts were refused by the harness's stream-placement check (lib/competitor.py STREAM_SYNC_TOLERANCE_SECONDS) before any contended number was recorded; no competitor goodput with the cap exists from this lab session"
+  },
+  "without_cap": {
+    "competitor_goodput_mbps_over_vtop_window": 6.073,
+    "competitor_goodput_mbps_with": 5.06,
+    "competitor_goodput_mbps_without": 9.558,
+    "competitor_jain_index": 0.8779,
+    "emulator_validation_mbps": 9.569,
+    "failed_batches": 0,
+    "run_id": "competing-flow-bulk-uncapped-20261110T013359Z-20tal5",
+    "successful_batches": 2250,
+    "upload_max_egress_bytes_per_second": "",
+    "vtop_attributed_cycles": 1,
+    "vtop_goodput_mbps_with": 2.774,
+    "vtop_window_seconds": 23.402
+  }
+}

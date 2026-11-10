@@ -255,7 +255,8 @@ scenario only: `engine_mode`, `engine_metrics_address`,
 `engine_<name>_window` and `engine_<name>_max_per_second` for a counter,
 `engine_<name>_min` and `engine_<name>_max` for a gauge. Surfaced today:
 `commits_total`, `failed_total`, `records_total`, `bytes_in_total`,
-`bytes_out_total`, `upload_throttled_total` (counters) and
+`bytes_out_total`, `upload_throttled_total`, `upload_egress_bytes_total`
+(counters; the last exists only when an egress cap is set, #481) and
 `inflight_batches`, `upload_width` (gauges). A counter column the endpoint
 never exposed is **blank**: "never incremented" and "this binary does not
 have the series" cannot be told apart from the endpoint. The run-level
@@ -263,8 +264,8 @@ have the series" cannot be told apart from the endpoint. The run-level
 `total_output_bytes` come from the same counters' increase inside the window.
 
 **Adding a column for a new series is one line**: an entry in
-`SUMMARY_SERIES` in `lib/engine_run.py`, e.g.
-`("vtop_upload_egress_bytes_total", "counter")` when #481 adds it. The
+`SUMMARY_SERIES` in `lib/engine_run.py`, as
+`("vtop_upload_egress_bytes_total", "counter")` was for #481. The
 declared kind is checked against the endpoint's `# TYPE` line, and a mismatch
 refuses the run.
 
@@ -835,6 +836,78 @@ against that one, on the same driver, on the same machine, close together in
 time. It does not say what the engine would do over a real WAN of the same
 nominal rate, and the ±10% calibration band bounds the emulator's error, not
 the claim.
+
+### The operator egress ceiling (#481)
+
+`upload_max_egress_bytes_per_second` writes the engine's
+`upload.max_egress_bytes_per_second` through, as given; unset writes nothing.
+It is recorded as a flat column of the same name in `metrics.csv`,
+`summary.json` and the matrix, and the engine's own counter
+`vtop_upload_egress_bytes_total` is a surfaced series (§3). Only `s3_native`
+can honour a cap; every other backend refuses one at startup.
+
+| scenario | engine | what it measures |
+|---|---|---|
+| `19`/`20`/`21-egress-cap-rate-{1,4,16}mib` | `run` | the rate criterion: every one-second bucket of the shaper's counter at or below R, and the window's total within 10% of R × 60 s (the bucket's design predicts 31/32 of R) |
+| `22-competing-flow-bulk-uncapped` / `23-…-capped` | `process-once` | scenario 18's link and competitor with a load that actually contends (≈8 MB of uncompressed JSONL per cycle, eight 1 MiB batches in flight); the pair differs in the cap alone |
+
+Judge a rate run with:
+
+```bash
+python3 benchmarks/egress_cap_check.py benchmarks/results/<run_id>
+```
+
+It writes `egress_buckets.csv` (one row per scheduled bucket, with the scrape
+latencies that bound it) and `egress_verdict.json`, and exits 1 on a failed
+criterion. Seconds before the counter first appears count as zero bytes, not
+as missing: the engine creates it on the shaper's first admission.
+
+Two things about the rate workload were found on the lab rather than reasoned
+about. A long-lived engine commits a cycle's sources only after **every** batch
+of that cycle has verified, so a large pre-seeded input becomes one cycle that
+commits nothing inside a minute and the run is refused. The scenarios
+therefore start small and seed concurrently at about 1.3 × R. That needs a line
+format, because the runner refuses a concurrent seeder over whole-file input.
+The seeder alone could not hold 16 MiB/s through a Docker Desktop bind mount,
+so scenario 21 also pre-seeds a backlog (its comment has the numbers).
+
+The netem lab needs a kernel with the `ifb` driver. Docker Desktop's linuxkit
+kernel has none, and `lib/netem.py` now says so instead of reporting the
+middlebox as claimed. On macOS, run the pair in a Linux VM with a stock
+kernel. The runner must then run on that VM's kernel too, for example in a
+container with the docker socket mounted, or the competitor's stamps are read
+against another kernel's clock.
+
+**Recorded** in [`measurements/481-egress-ceiling/`](measurements/481-egress-ceiling/)
+(local `results/` are never committed, so that directory is the record:
+`environment.json` names the machine, the binary and the noise).
+
+| run | R | worst 1 s bucket / R | 60 s total / R | verdict |
+|---|---|---|---|---|
+| `egress-cap-rate-1mib-20261110T012508Z-ukqkoq` | 1 MiB/s | 0.9785 | 0.9336 | pass |
+| `egress-cap-rate-4mib-20261110T012635Z-nr8xv2` | 4 MiB/s | 0.9815 | 0.9270 | pass |
+| `egress-cap-rate-16mib-20261110T012737Z-nvmv45` | 16 MiB/s | 0.9914 | 0.8700 | **fail** (total): the seeder delivered 888 MB, under R × 60 s, so the window measured the seeder |
+| `egress-cap-rate-16mib-20261110T012926Z-681a6q` | 16 MiB/s | 0.9723 | 0.9362 | pass, with the pre-seeded backlog |
+
+No bucket in any run exceeded R. The median bucket of each passing run is
+0.968–0.969 of R, the predicted 0.969; single buckets scatter to ±0.01 of
+that, which is the scrape-edge uncertainty (§3). Every total sits below that prediction because of the
+engine's own gaps (startup, and the seconds between a cycle's last verify and
+the next cycle's first upload, visible as dips in `egress_buckets.csv`), not
+because of the shaper.
+
+The competitor pair is **half recorded**. Uncapped (scenario 22), the
+competing flow got 5.06 Mbit/s beside VTOP against 9.558 Mbit/s alone. Over the
+one engine cycle the window wholly contained (23.4 s), VTOP took 2.774 Mbit/s
+of committed bytes against the flow's 6.073 (Jain 0.878). The capped run
+(scenario 23, 256 KiB/s) was refused **twice** by the stream-placement check,
+with spreads of 0.349 s and 0.285 s against its 0.25 s bound, before any
+contended number was written. So no with-cap goodput exists from this session.
+A paced, unshaped iperf3 on the same VM placed every line at a spread of
+0.000 s, so the late lines appear only under the shaped, contended link. That
+needs explaining before the pair can be completed. It was not retried until it
+passed. The refusals are recorded in `competitor_pair.json`.
+
 ### The HTTP/3 counterparty, and the topology it adds (#484)
 
 Neither the lab's MinIO nor AWS S3's own endpoint serves HTTP/3, so the
@@ -1015,7 +1088,8 @@ automatically picks it up.
 | Runtime duration | ✅ any (`duration_seconds`) | 5 min / 30 min / 1 h presets easy to add |
 | Sustained backpressure | ✅ `seed_concurrently` + `backlog_multiplier` | a real deficit, not just sustained load — scenario `11-backpressure-soak` (#98) |
 | Bandwidth-shaped upload | ✅ toxiproxy on the `shaped` profile, `shaping_*` keys | the upload link as the bottleneck — scenario `13-backpressure-soak-shaped` (#403) |
-| Engine's own metrics | ⚠️ `engine_mode: run` (implemented; no bundled scenario yet) | one long-lived `vtopctl run` per window, `/metrics` scraped per second into `engine_metrics.csv` (#510). Not bundled on purpose: `run_matrix.py --all` refuses a matrix that mixes engine modes, so one run-mode file among the per-cycle ones would stop `--all`; #481 adds the first |
+| Engine's own metrics | ✅ `engine_mode: run` | one long-lived `vtopctl run` per window, `/metrics` scraped per second into `engine_metrics.csv` (#510) — scenarios `19`-`21` (#481's rate criterion). `run_matrix.py --all` refuses a matrix that mixes engine modes, so run those three as their own matrix |
+| Operator egress ceiling | ✅ `upload_max_egress_bytes_per_second` | the cap's rate from the engine's own counter (`19`-`21`, judged by `egress_cap_check.py`) and the competitor's goodput with and without it (`22`/`23`) — see [The operator egress ceiling](#the-operator-egress-ceiling-481) |
 | Proxy hop in front of the store | ✅ nginx on the `h3` profile, `h3_proxy: true` | the topology control a transport comparison needs, and the lab's only HTTP/3 counterparty — scenario `17-proxy-hop-tcp-baseline` (#484) |
 | Lossy / policed / queued link | ✅ the netem middlebox on the `netem` profile | loss, a policer and a real bottleneck queue, which a TCP-terminating proxy cannot produce — scenarios `14-lossy-wan`, `15-policed-uplink`, `16-contended-bottleneck` (#477) |
 | What the upload costs a neighbour | ✅ `shaping_competitor`, netem only | one plain-TCP bulk flow in the same queue, measured alone / with VTOP / alone again — scenario `18-competing-flow` (#478). The competitor's goodput, not VTOP's, is what authorises a concurrency or rate knob |

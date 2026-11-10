@@ -1,0 +1,33 @@
+{
+  "issue": 481,
+  "date_utc": "2026-11-10",
+  "what": "Live measurements for the operator egress ceiling: the rate criterion from the shaper's own counter (scenarios 19-21, engine_mode run) and the competitor's goodput with and without a cap (scenarios 22/23, process-once, netem).",
+  "host": {
+    "machine": "Apple M5 Max, 18 cores, 128 GiB",
+    "os": "macOS 27.0.1 (26A434)"
+  },
+  "engine_binary": {
+    "name": "vtopctl 0.6.0",
+    "source": "this branch at the merge of main 5408a45 into feat/481-egress-ceiling (engine code identical to the pushed head; the benchmark changes are Python only)",
+    "built_with": "rust:latest (rustc 1.99.1) in Docker, aarch64-unknown-linux-gnu, cargo build --release --locked --no-default-features --bin vtopctl",
+    "why_no_default_features": "the only default feature is the Kafka source adapter, which links libsasl2; the lab's engine image (ubuntu:26.04) does not ship libsasl2, so the default build cannot start in it. The file source, the batching pipeline and the s3_native upload path measured here do not depend on that feature.",
+    "sha256": "cf56bce00dbdf53563170e1f9741a6f307e74dca9d2aa0b563a34a0673187bd4"
+  },
+  "harness": "benchmarks/run_benchmark.py run inside a python:3.11-slim container (docker CLI 29.9.3 + compose v5.7.0) on the same Linux kernel as the lab containers, with the docker socket mounted, so the runner's monotonic clock is the one the netem probe's stamper reads. Verdicts by benchmarks/egress_cap_check.py.",
+  "rate_runs": {
+    "scenarios": ["19-egress-cap-rate-1mib", "20-egress-cap-rate-4mib", "21-egress-cap-rate-16mib"],
+    "docker_host": "Docker Desktop, engine 29.9.3, linuxkit kernel 7.0.14, 18 vCPU, 55 GiB",
+    "store": "the lab MinIO (vtop-minio:RELEASE.2025-09-07T16-13-09Z, built from docker/minio) on the compose network, unshaped; engine in vtop-bench-engine (ubuntu:26.04), runner_mode container",
+    "run_root": "a macOS directory bind-mounted into the runner and engine containers (Docker Desktop file sharing)",
+    "noise": "9 unrelated containers belonging to other projects were running on the same Docker Desktop VM throughout; they were not stopped. Their load is not separated from these numbers.",
+    "scrape_latency_max_seconds": 0.005292
+  },
+  "competitor_runs": {
+    "scenarios": ["22-competing-flow-bulk-uncapped", "23-competing-flow-bulk-capped"],
+    "why_not_docker_desktop": "Docker Desktop's linuxkit kernel is built without CONFIG_IFB, and the netem middlebox shapes the upload on an ifb device: `ip link add ifb0 type ifb` answers 'Unknown device type'. The netem lab cannot run on it.",
+    "docker_host": "a dedicated Lima 2.3.0 VM (vz, 6 vCPU, 8 GiB) running Ubuntu 24.04.5 LTS, kernel 6.8.0-142-generic (ifb available), Docker 29.9.3; no other containers in it. The VM shares the Mac with Docker Desktop and its unrelated containers, and with other VMs.",
+    "lab_images": "the same image IDs as the rate runs, copied with docker save/load; nicolaka/netshoot:v0.16 (iperf 3.21)",
+    "run_root": "a directory on the VM's own disk",
+    "link": "netem: 100 ms round trip, no jitter, no loss, 10000 kbit/s tbf bottleneck at 1.0 BDP; competitor bulk:60"
+  }
+}
