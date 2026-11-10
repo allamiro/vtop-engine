@@ -558,8 +558,12 @@ def vtop_batch_pacing_note(env: dict[str, Any], rows: list[dict[str, str]]) -> s
                       "record")
     return ("**VTOP's latency in this run is off in a way the run cannot correct.** "
             + _sentence("; and ".join(causes)) + " "
-            f"Against VTOP's 30 s-before p99 (at most {fmt_ms(before)} here) these are not small errors, so that "
-            "column is not comparable with Kafka's. "
+            # Only the early send has a known size; the fsync was never timed.
+            + (f"The early send alone (up to {early_ms:.1f} ms) is not small against VTOP's 30 s-before p99 "
+               f"(at most {fmt_ms(before)} here)" if early else
+               "The fsync's effect cannot be quantified from this run")
+            + (", and the fsync's effect cannot be quantified" if early and late else "")
+            + ", so that column is not comparable with Kafka's. "
             + (f"Against its 30 s-after p99 (at least {fmt_ms(after)} here) the early send is small. " if early
                else "")
             + "The unavailability window and the time to new leader do not use the schedule"

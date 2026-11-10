@@ -543,6 +543,8 @@ def test_the_latency_caveat_is_derived_and_absent_for_a_run_with_the_fixed_produ
     env["comparable"]["vtop_pacing"] = "last-record-due"
     note = failover_report.vtop_batch_pacing_note(env, rows)
     assert "19.8 ms" not in note and note.startswith("**VTOP's latency") and "It stamped" in note
+    # With only the unmeasured fsync left, the note claims no size for it.
+    assert "not small" not in note and "cannot be quantified" in note
     env["comparable"]["vtop_ack_stamp"] = "on-answer"
     assert failover_report.vtop_batch_pacing_note(env, rows) == ""
 
