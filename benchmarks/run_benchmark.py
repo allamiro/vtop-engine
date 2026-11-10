@@ -160,8 +160,18 @@ def main() -> int:
     # The shape is judged HERE, before a seed byte exists (#403): a bad knob
     # fails the run before it costs anything, and a shaped scenario never
     # runs unshaped under its own name. Which SHAPER is the scenario's own
-    # choice (#477); the dispatch answers for both.
-    shape = shaping.shape_from_scenario(sc)
+    # choice (#477); the dispatch answers for both. A malformed knob
+    # (`shaping_bandwidth_kbps: fast`, a negative rate, an unknown driver) is a
+    # scenario typo raised as ValueError, and __main__ turns only ShapingError
+    # into a one-line refusal, so it used to leave as a traceback (#601). It is
+    # refused here like every other pre-run check; a ShapingError (a stack that
+    # is not up, a competitor under toxiproxy) is not a ValueError and still
+    # reaches __main__'s handler unchanged.
+    try:
+        shape = shaping.shape_from_scenario(sc)
+    except ValueError as bad:
+        print(f"[bench] {bad}", file=sys.stderr)
+        return 2
     # The flow beside the upload (#478), judged with the same
     # before-it-costs-anything timing as the shape — and BEFORE the calibration
     # probe below, because a typo in a scenario key should not first cost a
