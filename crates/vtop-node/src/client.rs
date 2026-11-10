@@ -217,15 +217,24 @@ pub struct ProduceArgs {
     pub request_timeout_ms: u64,
 }
 
-/// When the batch after `sent` records may go out, at `rate` records per
+/// When record number `index` of the schedule is due, at `rate` records per
 /// second from `started`; `None` when unpaced. Averaged from the start, as
 /// the JVM perf tools' throttle is, so one slow acknowledgement is caught up
 /// rather than lowering the offered rate for the rest of the run.
-fn paced_send_at(started: Instant, sent: u64, rate: u64) -> Option<Instant> {
+fn paced_send_at(started: Instant, index: u64, rate: u64) -> Option<Instant> {
     if rate == 0 {
         return None;
     }
-    Some(started + std::time::Duration::from_secs_f64(sent as f64 / rate as f64))
+    Some(started + std::time::Duration::from_secs_f64(index as f64 / rate as f64))
+}
+
+/// When a batch of `count` records starting at schedule index `first` may go
+/// out: once its LAST record is due. Sending when the first is due would put
+/// the rest on the wire before their scheduled time, and a latency measured
+/// from each record's schedule (#597) would then come out short by up to
+/// `(count - 1) / rate` (19.8 ms for 100 records at 5,000/s), or negative.
+fn batch_send_at(started: Instant, first: u64, count: u64, rate: u64) -> Option<Instant> {
+    paced_send_at(started, first + count.saturating_sub(1), rate)
 }
 
 /// The monotonic instant standing for wall-clock `anchor_micros`, given that
@@ -304,10 +313,11 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
         None => (started, 0),
     };
     while acked < args.records {
-        if let Some(at) = paced_send_at(schedule_origin, schedule_offset + acked, args.rate) {
+        let count = u64::from(args.batch).min(args.records - acked);
+        if let Some(at) = batch_send_at(schedule_origin, schedule_offset + acked, count, args.rate)
+        {
             tokio::time::sleep_until(at.into()).await;
         }
-        let count = u64::from(args.batch).min(args.records - acked);
         let first = args.first_sequence + acked;
         let records = (first..first + count)
             .map(|sequence| ProduceRecord {
@@ -668,9 +678,8 @@ mod pacing_tests {
     use super::*;
     use std::time::Duration;
 
-    /// #597: the offered rate is a schedule from the start, so the batch
-    /// after N records waits until N/rate seconds have passed, and an
-    /// unpaced run never waits.
+    /// #597: the offered rate is a schedule from the start, so record N is
+    /// due N/rate seconds in, and an unpaced run never waits.
     #[test]
     fn a_paced_batch_goes_out_at_its_share_of_the_schedule() {
         let started = Instant::now();
@@ -684,6 +693,31 @@ mod pacing_tests {
             Some(started + Duration::from_secs(3))
         );
         assert_eq!(paced_send_at(started, 500, 0), None);
+    }
+
+    /// #597 review: a batch goes out when its LAST record is due, never
+    /// before, so no record is on the wire ahead of its scheduled send time
+    /// and a latency measured from the schedule cannot come out negative.
+    /// 100 records from index 0 at 5,000/s: the last (index 99) is due at
+    /// 19.8 ms, not at 0 as the first-record schedule sent it.
+    #[test]
+    fn a_paced_batch_waits_until_its_last_record_is_due() {
+        let started = Instant::now();
+        let at = |first, count, rate| batch_send_at(started, first, count, rate);
+        assert_eq!(at(0, 100, 5000), paced_send_at(started, 99, 5000));
+        assert_eq!(
+            at(0, 100, 5000),
+            Some(started + Duration::from_secs_f64(99.0 / 5000.0))
+        );
+        assert!(at(0, 100, 5000) > paced_send_at(started, 0, 5000));
+        // Every record of the batch is due at or before the send.
+        for index in 0..100 {
+            assert!(paced_send_at(started, index, 5000) <= at(0, 100, 5000));
+        }
+        // One record is due at its own index; a resumed batch at its own.
+        assert_eq!(at(7, 1, 1000), paced_send_at(started, 7, 1000));
+        assert_eq!(at(1000, 100, 1000), paced_send_at(started, 1099, 1000));
+        assert_eq!(at(0, 100, 0), None);
     }
 
     /// A restarted producer anchored at the run's origin resumes the one
