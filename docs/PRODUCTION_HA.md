@@ -524,7 +524,13 @@ The audit reads ranges from the ledger, never from manifests, and the ledger
 has always recorded a batch's first read's start. A reconciliation built from
 manifests alone must know their version (#622): from `0.3` a manifest's
 `source_progress` runs from the batch's first read's start to its last read's
-end, and the `batch_id` carries the same range; a manifest of `0.2` or earlier
+end, and the `batch_id` carries the same range - when both reads name the same
+unit (topic, partition and group; path, spool and inode). A batch whose reads
+name two units (one that spans a rotation; the engine seals at the
+discontinuity, so this is not expected) keeps the last read's range in its
+manifest and id, and its start is only in the ledger's `progress_start`; treat
+it as a `0.2` manifest below, and the audit reports the stretch as unproven,
+as it does any rotation-spanning window. A manifest of `0.2` or earlier
 (and its batch id) carries the LAST read's start, so for a batch built from
 several reads it claims less than the object holds and shows a false hole
 below it. For those, take the start from the ledger row with the manifest's
