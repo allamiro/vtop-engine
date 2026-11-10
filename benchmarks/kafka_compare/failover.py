@@ -398,7 +398,14 @@ class EvidenceKept(Exception):
 def save_vtop_evidence(ctx: dict, raw: str, evidence: str) -> list[str]:
     """Everything a VTOP run with a failed read-back left: raw client data and each node's
     volume. Returns the volumes whose archive is missing or empty (none when all were saved).
+
+    Every volume is marked kept (`ctx["kept_volumes"]`) BEFORE any of this runs, and a mark
+    is cleared only once that volume's archive is verified. So an exception, the archiver's
+    timeout or an interrupt anywhere in here leaves the marks set, and nothing tears the
+    volumes down (#613 review): `run_rep` and `main` skip `down -v` while any mark is set.
     """
+    volumes = [f"{SPEC['vtop']['project']}_vtop-{n}-data" for n in (1, 2, 3)]
+    ctx["kept_volumes"] = [f"{volume} (not archived yet)" for volume in volumes]
     os.makedirs(evidence, exist_ok=True)
     # The archiver runs as the image's user (vtop, uid 10001). On a native Linux
     # daemon a host-owned 0755 directory is not writable by it, so the archive
@@ -409,13 +416,14 @@ def save_vtop_evidence(ctx: dict, raw: str, evidence: str) -> list[str]:
         if os.path.isfile(path):
             shutil.copy2(path, evidence)
     failed = []
-    for n in (1, 2, 3):
-        volume = f"{SPEC['vtop']['project']}_vtop-{n}-data"
+    for n, volume in enumerate(volumes, start=1):
         archive = os.path.join(evidence, f"vtop-{n}-volume.tgz")
         done = sh(["docker", "run", "--rm", "-v", f"{volume}:/d:ro", "-v", f"{evidence}:/e", "--entrypoint", "tar",
                    ctx["vtop_image"], "czf", f"/e/vtop-{n}-volume.tgz", "-C", "/d", "."], check=False, timeout=600)
         if done.returncode != 0 or not os.path.isfile(archive) or os.path.getsize(archive) == 0:
             failed.append(f"{volume} (tar exit {done.returncode}: {(done.stderr or '').strip()[-200:]})")
+    # Only now, with every archive checked, do the marks drop to what was not saved.
+    ctx["kept_volumes"] = failed
     return failed
 
 
@@ -644,10 +652,9 @@ def run_vtop(ctx: dict, fault: str, raw: str, logs: str, row: dict) -> tuple[lis
         shutil.copy2(os.path.join(raw, name), os.path.join(logs, name))
     if row.get("verify", "").startswith("FAILED"):
         log(f"VTOP READ-BACK FAILED ({row['verify']}): keeping the run's data in full")
+        # Keeps the volumes (ctx["kept_volumes"]) unless every archive is verified.
         unsaved = save_vtop_evidence(ctx, raw, os.path.join(logs, "evidence"))
         if unsaved:
-            # Keep the volumes rather than lose the only copy of the failure.
-            ctx["kept_volumes"] = unsaved
             row["verify"] += f"; volumes NOT archived, left in place: {'; '.join(unsaved)}"
     origin_ms = anchor_us / 1000.0
     how = "driver finished" if finished else "driver stopped at the drain deadline"
