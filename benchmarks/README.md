@@ -776,7 +776,14 @@ number, because each of them produces a plausible result:
   seconds of the flow. Those two ends are kept as a consistency check: stamps
   that place the window outside them are refused, and so is a stream whose
   per-line estimates disagree by more than 0.25 s — lines stamped in a burst
-  were buffered before the stamper and date nothing. A competitor whose iperf3
+  were buffered before the stamper and date nothing. The report's **final**
+  interval line is left out of both the placement and that check (#481):
+  iperf3 prints it only after its end-of-test exchange with the server, which
+  crosses the shaped link, so it is late by about two round trips plus the
+  queue (0.21–0.75 s measured with iperf 3.21 on 100 ms links, against at most
+  2.5 ms for every other line; `measurements/481-egress-ceiling/stream_placement/`).
+  Its lateness is recorded as `competitor_window_final_line_delay_seconds`.
+  A competitor whose iperf3
   lacks `--json-stream` is refused by name, and a whole-document `-J` report
   is refused rather than read without a placement. Cycles are then attributed
   to the placed window: one that ran while `docker exec` was still starting or
@@ -784,8 +791,9 @@ number, because each of them produces a plausible result:
   the stream's last measured second. `summary.json` records
   `competitor_window_unaccounted_seconds` (the plumbing's overhead around the
   window), `competitor_window_setup_seconds` (how much of it fell before
-  measuring began) and `competitor_window_sync_spread_seconds` (how far the
-  per-line estimates disagreed).
+  measuring began), `competitor_window_sync_spread_seconds` (how far the
+  per-line estimates disagreed, final line excluded) and
+  `competitor_window_final_line_delay_seconds`.
 - An iperf3 report with **no `intervals` stream** is refused, at the first solo
   window rather than after all three have run. Without it the competing flow
   has only a whole-window average, and the index would be back to comparing
