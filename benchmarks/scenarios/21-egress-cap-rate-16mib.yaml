@@ -6,11 +6,18 @@ description: >-
   vtop_upload_egress_bytes_total is scraped once a second. Pass: every
   one-second bucket at or below R, and the 60 s total within 10% of R x 60
   (the shaper's design predicts about 31/32 of R). The workload exists only
-  to keep the shaper saturated: a concurrent seeder offers about 1.3 x R, so
-  there is always an object waiting on the shaper. Judged by
-  benchmarks/egress_cap_check.py on the run directory.
-  Scenarios 19 and 20 are this file at 1 and 4 MiB/s, with the
-  seeder sized to their own R; nothing else differs. Requires the
+  to keep the shaper saturated, and is sized to offer more than R on average;
+  it does not guarantee it every second. The volume seeded before launch is
+  drawn at random (medium files are 1-10 MiB), the concurrent rounds are
+  seeded deterministically (seed 10000 + round number), and the engine has
+  its own gaps (startup, cycle boundaries), so a run can hold zero-byte or
+  under-cap buckets: the recorded passing runs of scenarios 19, 20 and 21
+  hold 1, 2 and 0. The 10% tolerance on the total is what absorbs them.
+  Judged by benchmarks/egress_cap_check.py on the run directory.
+  Scenarios 19 and 20 are this file at 1 and 4 MiB/s, except for the
+  seeding: they start from 2 files and add one per round, while this one
+  pre-seeds 60 and, because the runner adds round(volume x
+  backlog_multiplier) files per round, adds 30 per round. Requires the
   containerized profile, docker compose -f
   benchmarks/docker-compose.benchmark.yml --profile containerized up -d.
 # WHY A CONCURRENT SEEDER, measured rather than reasoned about: a long-lived
@@ -56,8 +63,13 @@ batch_max_records: 1000000
 batch_max_bytes: 2097152
 batch_max_age_seconds: 1
 max_concurrent_batches: 4
-# 4 file(s) of ~5.5 MB every 1 s: about 22.0 MB/s offered against
-# 16.78 MB/s of cap.
+# round(60 x 0.5) = 30 files of ~5.5 MB a round (the runner's reseed_count),
+# about 165 MB asked for every second against 16.78 MB/s of cap. The seed
+# directory cannot be written that fast, so each round takes as long as the
+# disk needs, plus the one-second wait between rounds: the recorded passing run seeded 360 files, 2,097,715,195
+# bytes in all, the 60 pre-seeded ones included (its summary.json). An earlier
+# draft of this comment said 4 files a second; that was the first run's
+# seeding (8 files x 0.5), not this file's.
 seed_concurrently: true
 backlog_multiplier: 0.5
 seed_interval_seconds: 1.0

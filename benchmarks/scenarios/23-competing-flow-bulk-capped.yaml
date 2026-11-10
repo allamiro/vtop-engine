@@ -12,8 +12,12 @@ description: >-
 volume: 250
 file_size: small
 format: jsonl
-# Uncompressed, so the bytes a cycle offers the link are the bytes seeded and
-# the two runs of the pair offer the same load.
+# Uncompressed, so the bytes a cycle offers the link are the bytes seeded.
+# COMPARABLE, NOT IDENTICAL, between the two runs: each cycle's 250 file sizes
+# are drawn afresh (1-64 KiB), so a cycle offers about 8.4 MB give or take a
+# few percent. The recorded pair seeded 8.333 MB per cycle uncapped and 8.364
+# MB capped (competitor_pair.json). Pinning the draw would change this file
+# after the pair was measured with it, so it is stated rather than changed.
 compression: none
 checksum: sha256
 backend: s3_native

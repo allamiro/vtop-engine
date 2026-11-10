@@ -665,11 +665,28 @@ def egress_cap_of(scenario) -> str:
     zero included: the engine owns the refusal (below 1024 B/s, or on a backend
     that cannot shape its bytes), and a truthiness test here would run a zero
     cap uncapped while the summary recorded 0 — the mislabel the
-    max_concurrent_batches write-through above was fixed for."""
+    max_concurrent_batches write-through above was fixed for.
+
+    Anything that is not an integer is REFUSED here (review): the value is
+    pasted into YAML, so a quoted "null" or "~" would reach the engine as YAML
+    null - unset - and run uncapped while summary.json recorded a cap, and any
+    other text could change the YAML around it. A negative integer still goes
+    through for the engine to refuse as it would refuse an operator's."""
     value = scenario.get("upload_max_egress_bytes_per_second", "")
     if value is None:
         return ""
-    return str(value).strip()
+    if isinstance(value, bool):
+        raise ValueError(f"upload_max_egress_bytes_per_second must be an integer, got {value!r}")
+    text = str(value).strip()
+    if text == "":
+        return ""
+    digits = text[1:] if text.startswith("-") else text
+    if not (digits.isascii() and digits.isdigit()):
+        raise ValueError(
+            f"upload_max_egress_bytes_per_second must be an integer number of bytes per second "
+            f"or unset, got {value!r}: it is written into the engine's YAML as given, and a "
+            "spelling YAML reads as null would run the engine uncapped under a capped label")
+    return text
 
 
 def write_engine_config(scenario, work_dir: str, state_db: str,

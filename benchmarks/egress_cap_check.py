@@ -3,7 +3,9 @@
 
   python3 benchmarks/egress_cap_check.py benchmarks/results/<run_id>
 
-Reads the run's engine_metrics.csv and the cap its summary.json recorded,
+Reads the run's engine_metrics.csv (or, for a committed record that kept only
+the selected series, engine_metrics_selected.csv) and the cap its summary.json
+recorded,
 and writes beside them (or under --out):
 
   egress_buckets.csv   every one-second bucket of vtop_upload_egress_bytes_total
@@ -25,6 +27,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import egress_cap  # noqa: E402
 from lib.engine_run import ENGINE_METRICS_CSV  # noqa: E402
 
+# What a committed record keeps instead of the full series: the same columns,
+# only the rows of the series a verdict reads (benchmarks/measurements/). Used
+# only when the full file is absent, so a fresh run is always judged on its own.
+SELECTED_METRICS_CSV = "engine_metrics_selected.csv"
+
+
+def metrics_path(run_dir: str) -> str:
+    full = os.path.join(run_dir, ENGINE_METRICS_CSV)
+    selected = os.path.join(run_dir, SELECTED_METRICS_CSV)
+    if not os.path.exists(full) and os.path.exists(selected):
+        return selected
+    return full
+
 
 def recorded_cap(run_dir: str) -> float:
     with open(os.path.join(run_dir, "summary.json"), encoding="utf-8") as fh:
@@ -44,9 +59,9 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = args.out or args.run_dir
     try:
         cap = recorded_cap(args.run_dir)
-        buckets = egress_cap.read_buckets(os.path.join(args.run_dir, ENGINE_METRICS_CSV))
+        buckets = egress_cap.read_buckets(metrics_path(args.run_dir))
         verdict = egress_cap.evaluate(buckets, cap)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         print(f"egress_cap_check: {exc}", file=sys.stderr)
         return 2
     os.makedirs(out_dir, exist_ok=True)

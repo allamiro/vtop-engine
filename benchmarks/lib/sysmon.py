@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 
@@ -230,6 +231,15 @@ class SystemMonitor:
                 psutil.Process(self.root_pid).cpu_percent(interval=None)
             except Exception:
                 pass
+        # SCHEDULED FROM DEADLINES, not "sample, then wait an interval" (#481,
+        # review): a sample is not free - container mode runs `docker stats
+        # --no-stream`, which itself takes about a second - and waiting a full
+        # interval after it stretched every period by that much (rows 2 s apart
+        # at a 1 s interval, 3 s apart at 2 s). Now each sample starts on the
+        # next grid point; one that overran its slot skips the grid points it
+        # covered rather than firing a burst to catch up, so the cadence is the
+        # configured interval whenever a sample fits inside it.
+        next_due = time.monotonic()
         while not self._stop.is_set():
             s = self._sample()
             self.samples.append(s)
@@ -238,7 +248,11 @@ class SystemMonitor:
             if self._stop.is_set():
                 break
             self.emit(s)
-            self._stop.wait(self.interval)
+            next_due += self.interval
+            now = time.monotonic()
+            while next_due <= now:
+                next_due += self.interval
+            self._stop.wait(next_due - now)
 
     def __enter__(self) -> SystemMonitor:
         self._thread = threading.Thread(target=self._run, daemon=True)

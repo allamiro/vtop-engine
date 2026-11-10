@@ -150,6 +150,10 @@ def main() -> int:
     # and nothing in the numbers would give it away.
     try:
         engine.require_endpoint_through_h3_proxy(sc)
+        # The egress cap's spelling too (#481, review): a non-integer cap is
+        # refused before anything runs, not as a traceback from the config
+        # writer after the shape and the seed have been paid for.
+        engine.egress_cap_of(sc)
     except ValueError as bad:
         print(f"[bench] {bad}", file=sys.stderr)
         return 2
@@ -861,6 +865,11 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
         "run_id": run_id, "scenario_name": sc.name, "scenario": sc.values,
         "start_time": start_iso, "end_time": iso_now(),
         "duration_seconds": duration_s,
+        # end_time - start_time is NOT duration_seconds on a contended run
+        # (review): the competitor's closing solo window and collection tail
+        # are excluded from the duration (above) but fall between the two
+        # timestamps. Recorded so the gap is in the record, not inferred.
+        "harness_close_seconds": round(harness_close_seconds, 3),
         "total_input_files": files_seen, "total_input_bytes": in_bytes,
         "total_output_objects": out_objects, "total_output_bytes": out_bytes,
         "successful_files": success, "failed_files": failed,

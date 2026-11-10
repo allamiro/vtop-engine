@@ -6,11 +6,19 @@ description: >-
   vtop_upload_egress_bytes_total is scraped once a second. Pass: every
   one-second bucket at or below R, and the 60 s total within 10% of R x 60
   (the shaper's design predicts about 31/32 of R). The workload exists only
-  to keep the shaper saturated: a concurrent seeder offers about 1.3 x R, so
-  there is always an object waiting on the shaper. Judged by
-  benchmarks/egress_cap_check.py on the run directory.
-  Scenarios 20 and 21 are this file at 4 and 16 MiB/s, with the
-  seeder sized to their own R; nothing else differs. Requires the
+  to keep the shaper saturated, and is sized to offer more than R on average;
+  it does not guarantee it every second. The volume seeded before launch is
+  drawn at random (medium files are 1-10 MiB), the concurrent rounds are
+  seeded deterministically (seed 10000 + round number), and the engine has
+  its own gaps (startup, cycle boundaries), so a run can hold zero-byte or
+  under-cap buckets: the recorded passing runs of scenarios 19, 20 and 21
+  hold 1, 2 and 0. The 10% tolerance on the total is what absorbs them.
+  Judged by benchmarks/egress_cap_check.py on the run directory.
+  Scenario 20 is this file at 4 MiB/s with one file seeded every second.
+  Scenario 21 differs in its seeding as well as R: it pre-seeds a 60-file
+  backlog, and the runner's per-round count, round(volume x
+  backlog_multiplier), is then 30 files, not this file's one (its comments
+  have the numbers). Requires the
   containerized profile, docker compose -f
   benchmarks/docker-compose.benchmark.yml --profile containerized up -d.
 # WHY A CONCURRENT SEEDER, measured rather than reasoned about: a long-lived

@@ -272,3 +272,125 @@ def test_the_checker_refuses_an_uncapped_run(tmp_path, capsys):
     (run_dir / "summary.json").write_text(json.dumps({"upload_max_egress_bytes_per_second": ""}))
     assert egress_cap_check.main([str(run_dir)]) == 2
     assert "uncapped" in capsys.readouterr().err
+
+
+# --- review fixes (#481) -------------------------------------------------------
+
+
+def test_a_yaml_null_spelling_of_the_cap_is_refused_not_written():
+    # Written through as given, "null" or "~" reaches the engine as YAML null,
+    # which is unset: the run would go uncapped under a capped label.
+    for spelling in ("null", "Null", "NULL", "~", "1e6", "4 MiB", "4194304\n  x: 1", True):
+        with pytest.raises(ValueError, match="upload_max_egress_bytes_per_second"):
+            egress_cap_of({"upload_max_egress_bytes_per_second": spelling})
+    assert egress_cap_of({"upload_max_egress_bytes_per_second": " 4194304 "}) == "4194304"
+    assert egress_cap_of({"upload_max_egress_bytes_per_second": -5}) == "-5", (
+        "a negative cap still goes through for the engine to refuse")
+
+
+def test_the_matrix_takes_the_cap_the_run_recorded_not_the_scenarios_spelling():
+    assert "upload_max_egress_bytes_per_second" in run_matrix.RESOLVED_COLUMNS
+    row = run_matrix.matrix_row({
+        "upload_max_egress_bytes_per_second": "",
+        "scenario": {"upload_max_egress_bytes_per_second": None},
+    })
+    assert row["upload_max_egress_bytes_per_second"] == "", row
+
+
+def test_a_sub_second_bucket_is_refused_rather_than_judged(tmp_path):
+    # A 0.1 s bucket may legitimately read above R while every one-second
+    # window holding it stays below R; judging it would fail compliant runs.
+    path = str(tmp_path / "engine_metrics.csv")
+    samples = [(0.05, 0.05, 0.002, None)]
+    for tick in range(1, 101):
+        samples.append((0.05 + tick / 10, 0.1, 0.002, tick * MIB * 31 / 32 / 10))
+    write_metrics(path, samples)
+    with pytest.raises(ValueError, match="shorter than"):
+        egress_cap.evaluate(egress_cap.read_buckets(path), MIB)
+
+
+def test_a_bucket_is_judged_at_the_runners_precision_not_the_rounded_interval(tmp_path):
+    # interval_seconds is rounded to milliseconds in the CSV; delta_per_second
+    # was computed from the unrounded interval and is what the run recorded.
+    path = str(tmp_path / "engine_metrics.csv")
+    precise = 0.99951
+    delta = MIB * 0.9998
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        out = csv.writer(fh)
+        out.writerow(engine_run.ENGINE_METRICS_COLUMNS)
+        out.writerow(["t", "0.050", "0.050", "0.001", egress_cap.COUNTER, "", "counter",
+                      "0", "0", ""])
+        out.writerow(["t", "1.050", f"{precise:.3f}", "0.001", egress_cap.COUNTER, "",
+                      "counter", repr(delta), repr(delta), repr(round(delta / precise, 6))])
+    (bucket,) = egress_cap.read_buckets(path)
+    assert bucket.interval_seconds == pytest.approx(precise, rel=1e-9)
+    assert bucket.rate > MIB, "the rate the run recorded is over the cap..."
+    assert delta / round(precise, 3) <= MIB, "...and the rounded interval would have hidden it"
+    assert egress_cap.evaluate([bucket], MIB)["buckets_over_cap"] == [1]
+
+
+@pytest.mark.parametrize("body", [
+    "not,a,metrics,file\n1,2,3,4\n",
+    ",".join(engine_run.ENGINE_METRICS_COLUMNS) + "\n0.05,0.05\n",
+    ",".join(engine_run.ENGINE_METRICS_COLUMNS) + "\nt,x,1.0,0.001,"
+    + egress_cap.COUNTER + ",,counter,1,1,1\n",
+])
+def test_a_malformed_metrics_file_cannot_be_judged_and_says_so(tmp_path, capsys, body):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / engine_run.ENGINE_METRICS_CSV).write_text(body)
+    (run_dir / "summary.json").write_text(json.dumps(
+        {"upload_max_egress_bytes_per_second": str(MIB)}))
+    assert egress_cap_check.main([str(run_dir)]) == 2
+    assert "egress_cap_check:" in capsys.readouterr().err
+
+
+def test_a_committed_record_is_judged_from_its_selected_series(tmp_path):
+    # benchmarks/measurements/ keeps engine_metrics_selected.csv, not the full
+    # file; the checker must still be able to re-judge such a record.
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_metrics(str(run_dir / egress_cap_check.SELECTED_METRICS_CSV), steady(MIB, 60))
+    (run_dir / "summary.json").write_text(json.dumps(
+        {"upload_max_egress_bytes_per_second": str(MIB)}))
+    assert egress_cap_check.main([str(run_dir), "--out", str(tmp_path / "out")]) == 0
+
+
+def test_system_samples_keep_the_configured_cadence_when_a_sample_takes_time():
+    # Container mode's `docker stats --no-stream` takes about a second, and
+    # "sample, then wait an interval" stretched every period by that much: the
+    # rate runs' rows were 2 s apart at a 1 s interval (review). Scheduled from
+    # deadlines, a 0.2 s sample inside a 0.3 s interval keeps the 0.3 s grid —
+    # five starts in 1.4 s, where the old loop managed three.
+    import time
+
+    from lib.sysmon import SystemMonitor
+
+    starts = []
+    monitor = SystemMonitor(lambda sample: None, interval=0.3)
+
+    def slow_sample():
+        starts.append(time.monotonic())
+        time.sleep(0.2)
+        return {}
+
+    monitor._sample = slow_sample
+    with monitor:
+        time.sleep(1.4)
+    assert len(starts) >= 5, (
+        f"{len(starts)} samples in 1.4 s at a 0.3 s interval: the sample's own time is "
+        "being added to every period")
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    assert max(gaps) < 0.45, gaps
+
+
+def test_every_committed_rate_record_rejudges_to_its_committed_verdict(tmp_path):
+    root = os.path.join(HERE, "measurements", "481-egress-ceiling", "rate")
+    runs = sorted(glob.glob(os.path.join(root, "*")))
+    assert len(runs) == 4, runs
+    for run in runs:
+        out = tmp_path / os.path.basename(run)
+        egress_cap_check.main([run, "--out", str(out)])
+        with open(os.path.join(run, "egress_verdict.json"), encoding="utf-8") as fh:
+            committed = json.load(fh)
+        assert json.loads((out / "egress_verdict.json").read_text()) == committed, run

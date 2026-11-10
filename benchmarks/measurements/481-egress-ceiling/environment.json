@@ -8,7 +8,7 @@
   },
   "engine_binary": {
     "name": "vtopctl 0.6.0",
-    "source": "this branch at the merge of main 5408a45 into feat/481-egress-ceiling (engine code identical to the pushed head; the benchmark changes are Python only)",
+    "source": "commit 7b5331d, the merge of main 5408a45 into this branch (workspace version 0.6.0). crates/ is unchanged from 7b5331d through 79bfbee, the last commit that recorded measurements here. It PREDATES the branch head: 4aa5233 merged a later main (version 0.7.0, 14 files under crates/ differ), and the review fix after it made the egress shaper one budget per process instead of one per backend. Neither later change was measured. The engine under test built one backend, so the per-process change does not alter what that binary did; it is stated so the binary is not read as the head's.",
     "built_with": "rust:latest (rustc 1.99.1) in Docker, aarch64-unknown-linux-gnu, cargo build --release --locked --no-default-features --bin vtopctl",
     "why_no_default_features": "the only default feature is the Kafka source adapter, which links libsasl2; the lab's engine image (ubuntu:26.04) does not ship libsasl2, so the default build cannot start in it. The file source, the batching pipeline and the s3_native upload path measured here do not depend on that feature.",
     "sha256": "cf56bce00dbdf53563170e1f9741a6f307e74dca9d2aa0b563a34a0673187bd4"
@@ -41,5 +41,6 @@
       "second": "the pair in competitor_pair.json. A new Lima 2.3.0 VM from the same configuration (vz, 6 vCPU, 8 GiB, Ubuntu 24.04.5 LTS, kernel 6.8.0-142-generic, Docker 29.9.3), the same image IDs loaded with docker save/load (vtop-minio 6fe0199af114, netshoot:v0.16 b09d9b21381f, iperf 3.21; ubuntu:26.04 6a06111c3b0a), the same engine binary (sha256 above), the harness at this branch's commit that leaves the competitor's final interval line out of the window placement, scenarios 22/23 at bulk:120 / duration 300. Only the lab's containers ran in the VM; the Mac also ran Docker Desktop with about 10 unrelated containers and the stopped VMs of other projects."
     }
   },
+  "system_metrics_cadence": "Every committed system_metrics.csv was sampled more slowly than its scenario asked: the rate runs (sys_sample_interval 1.0) have rows 2.012-2.031 s apart, the competitor runs (2.0) 3.008-3.063 s apart. The sampler waited a full interval AFTER each sample, and in container mode a sample is a docker stats --no-stream call of about a second. lib/sysmon.py now schedules samples from deadlines. The rows are kept as recorded; their timestamps give the true cadence, and no #481 criterion reads system_metrics.csv (the rate is judged on the engine's own counter, the competitor on iperf3).",
   "stream_placement_probe": "stream_placement/: which competitor interval lines are late on a shaped link, measured on Docker Desktop with netem on container veths (not the lab middlebox)"
 }

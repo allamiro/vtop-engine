@@ -9,7 +9,9 @@ a promise about the bodies VTOP hands its HTTP client.
 
 Every number here comes from rows the runner already wrote (lib/engine_run.py);
 nothing is re-measured. A bucket is one scheduled scrape interval — the row's
-`interval_seconds` — and the opening span (launch to first answer) is left out,
+`interval_seconds`, recovered at the runner's precision from `delta /
+delta_per_second` where both exist — and a run scraped more often than once a
+second is refused rather than judged per sub-second interval. The opening span (launch to first answer) is left out,
 as the runner leaves it out of `engine_<name>_max_per_second`: its length is
 whatever the start took, not a one-second bucket.
 
@@ -60,12 +62,43 @@ class Bucket:
         return self.bytes / span if span > 0 else float("inf")
 
 
+# The criterion is about one-second windows. A bucket shorter than that is not
+# one: the shaper legitimately admits up to R/32 in a burst, so a 0.1 s bucket
+# can read above R while every one-second window holding it stays below R.
+# Judging such buckets would fail compliant runs, so they are refused instead.
+# The floor sits a little under 1 s because a scheduled one-second scrape
+# lands a few milliseconds either side of its deadline.
+MIN_BUCKET_SECONDS = 0.95
+
+# The columns read here. A file missing one is not an engine_metrics.csv.
+REQUIRED_COLUMNS = ("elapsed_seconds", "interval_seconds", "scrape_latency_seconds",
+                    "metric", "type", "delta", "delta_per_second")
+
+
 def _float(value: str, what: str, row: dict) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
         raise ValueError(f"engine_metrics.csv row has no numeric {what} ({value!r}): {row}") \
             from None
+
+
+def _precise_interval(rounded: float, delta: str, per_second: str, row: dict) -> float:
+    """The bucket's interval at the runner's own precision.
+
+    The CSV rounds `interval_seconds` to milliseconds, but the runner computed
+    `delta_per_second` from the unrounded interval (lib/engine_run.py), so
+    delta / delta_per_second recovers that interval to the precision the rate
+    was recorded at. A bucket near the cap must be judged on the rate the run
+    recorded, not on one recomputed from a rounded denominator.
+    """
+    if delta in ("", None) or per_second in ("", None):
+        return rounded
+    d = _float(delta, "delta", row)
+    rate = _float(per_second, "delta_per_second", row)
+    if d > 0 and rate > 0:
+        return d / rate
+    return rounded
 
 
 def read_buckets(path: str, counter: str = COUNTER) -> list[Bucket]:
@@ -76,20 +109,35 @@ def read_buckets(path: str, counter: str = COUNTER) -> list[Bucket]:
     """
     samples: dict[str, dict] = {}
     order: list[str] = []
-    with open(path, newline="", encoding="utf-8") as fh:
-        for row in csv.DictReader(fh):
-            key = row["elapsed_seconds"]
-            sample = samples.get(key)
-            if sample is None:
-                sample = {"row": row, "bytes": 0.0, "counter_seen": False}
-                samples[key] = sample
-                order.append(key)
-            if row["metric"] == counter:
-                if row["type"] != "counter":
-                    raise ValueError(f"{counter} is typed {row['type']!r}, not counter: {row}")
-                if row["delta"] != "":
-                    sample["bytes"] += _float(row["delta"], "delta", row)
-                sample["counter_seen"] = True
+    try:
+        with open(path, newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            missing = [c for c in REQUIRED_COLUMNS if c not in (reader.fieldnames or ())]
+            if missing:
+                raise ValueError(f"{path} is not an engine_metrics.csv: no {', '.join(missing)} "
+                                 "column")
+            for row in reader:
+                if None in row or any(row[c] is None for c in REQUIRED_COLUMNS):
+                    raise ValueError(f"{path} has a truncated row: {row}")
+                key = row["elapsed_seconds"]
+                sample = samples.get(key)
+                if sample is None:
+                    sample = {"row": row, "bytes": 0.0, "counter_seen": False,
+                              "interval": None}
+                    samples[key] = sample
+                    order.append(key)
+                if row["metric"] == counter:
+                    if row["type"] != "counter":
+                        raise ValueError(f"{counter} is typed {row['type']!r}, not counter: "
+                                         f"{row}")
+                    if row["delta"] != "":
+                        sample["bytes"] += _float(row["delta"], "delta", row)
+                    sample["interval"] = _precise_interval(
+                        _float(row["interval_seconds"], "interval_seconds", row),
+                        row["delta"], row["delta_per_second"], row)
+                    sample["counter_seen"] = True
+    except (csv.Error, UnicodeDecodeError) as exc:
+        raise ValueError(f"{path} cannot be read as CSV: {exc}") from None
     if not order:
         raise ValueError(f"{path} holds no samples")
     if not any(samples[key]["counter_seen"] for key in order):
@@ -104,10 +152,16 @@ def read_buckets(path: str, counter: str = COUNTER) -> list[Bucket]:
         if position == 0:
             previous_latency = latency
             continue
+        interval = samples[key]["interval"]
+        if interval is None:
+            interval = _float(row["interval_seconds"], "interval_seconds", row)
+        if interval <= 0:
+            raise ValueError(f"{path} has a non-positive interval at elapsed "
+                             f"{row['elapsed_seconds']}: {row}")
         buckets.append(Bucket(
             index=len(buckets) + 1,
             elapsed_seconds=_float(row["elapsed_seconds"], "elapsed_seconds", row),
-            interval_seconds=_float(row["interval_seconds"], "interval_seconds", row),
+            interval_seconds=interval,
             previous_latency_seconds=previous_latency,
             latency_seconds=latency,
             bytes=samples[key]["bytes"],
@@ -122,6 +176,13 @@ def evaluate(buckets: list[Bucket], cap: float) -> dict:
         raise ValueError(f"a cap of {cap} cannot be evaluated")
     if not buckets:
         raise ValueError("no scheduled buckets to evaluate")
+    short = [b.index for b in buckets if b.interval_seconds < MIN_BUCKET_SECONDS]
+    if short:
+        raise ValueError(
+            f"{len(short)} bucket(s) are shorter than {MIN_BUCKET_SECONDS} s (first: bucket "
+            f"{short[0]}); the criterion is about one-second windows and the shaper may burst "
+            "R/32 inside a shorter one, so a sub-second scrape interval cannot be judged here - "
+            "rerun with engine_scrape_interval_seconds of at least 1")
     worst = max(buckets, key=lambda b: b.rate)
     largest = max(buckets, key=lambda b: b.bytes)
     over = [b.index for b in buckets if b.rate > cap]

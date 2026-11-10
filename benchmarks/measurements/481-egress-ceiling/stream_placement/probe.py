@@ -21,10 +21,18 @@ It isolates the one question - which lines are late, and by how much.
 
 Usage, from benchmarks/:  python measurements/481-egress-ceiling/stream_placement/probe.py
 Needs docker and nicolaka/netshoot:v0.16; creates and removes its own network
-and two containers (NET_ADMIN, for tc).
+and two containers (NET_ADMIN, for tc). Their names carry a per-run suffix, and
+teardown removes only what this invocation created, so two probes can run at
+once without one deleting the other's containers.
+
+results.json beside this file was produced before those three guards (unique
+names, setup under the cleanup, the competing flow checked alive) were added;
+its contended runs show the second flow was alive (0.96 and 0.82 Mbit/s for the
+measured flow against 9.57 alone on the same link).
 """
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -33,7 +41,11 @@ sys.path.insert(0, os.getcwd())
 from lib import competitor  # noqa: E402
 
 IMAGE = "nicolaka/netshoot:v0.16"
-NET, CLI, SRV = "vtop-placement-probe", "vtop-placement-probe-cli", "vtop-placement-probe-srv"
+# Unique per invocation: fixed names plus an unconditional teardown made a
+# second probe delete the first one's containers mid-measurement.
+RUN = f"{os.getpid()}-{secrets.token_hex(3)}"
+NET = f"vtop-placement-probe-{RUN}"
+CLI, SRV = f"{NET}-cli", f"{NET}-srv"
 SECONDS = 15
 PLAN = [("none", False), ("rtt100", False), ("rtt100-10mbit", False),
         ("rtt100-10mbit", True), ("rtt100-10mbit", True), ("none", False)]
@@ -44,20 +56,31 @@ def sh(container, script):
                           capture_output=True, text=True, check=True).stdout
 
 
+# What this invocation created, so teardown removes exactly that and nothing a
+# concurrent probe owns - and so a setup that fails half-way still has its
+# earlier steps undone.
+CREATED_CONTAINERS: list[str] = []
+CREATED_NETWORKS: list[str] = []
+
+
 def setup():
     subprocess.run(["docker", "network", "create", NET], check=True, capture_output=True)
+    CREATED_NETWORKS.append(NET)
     for name in (SRV, CLI):
         subprocess.run(["docker", "run", "-d", "--rm", "--name", name, "--network", NET,
                         "--cap-add", "NET_ADMIN", IMAGE, "sleep", "3600"],
                        check=True, capture_output=True)
+        CREATED_CONTAINERS.append(name)
     for port in (5201, 5202):
         subprocess.run(["docker", "exec", "-d", SRV, "iperf3", "-s", "-p", str(port)], check=True)
     time.sleep(1)
 
 
 def teardown():
-    subprocess.run(["docker", "rm", "-f", CLI, SRV], capture_output=True)
-    subprocess.run(["docker", "network", "rm", NET], capture_output=True)
+    if CREATED_CONTAINERS:
+        subprocess.run(["docker", "rm", "-f", *CREATED_CONTAINERS], capture_output=True)
+    for net in CREATED_NETWORKS:
+        subprocess.run(["docker", "network", "rm", net], capture_output=True)
 
 
 def shape(link):
@@ -80,8 +103,13 @@ def measure(link, contended):
     if contended:
         rival = subprocess.Popen(["docker", "exec", CLI, "iperf3", "-c", SRV, "-p", "5202",
                                   "-t", str(SECONDS + 15), "-P", "4"],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         time.sleep(3)
+        # A rival that failed to connect would leave the "contended" run
+        # measuring an empty queue under a contended name.
+        if rival.poll() is not None:
+            raise RuntimeError(f"the competing flow exited with {rival.returncode} before the "
+                               f"measurement began: {rival.stderr.read().strip()}")
     wrapped = ["sh", "-c", 'set -o pipefail; s="$1"; shift; "$@" | python3 -c "$s"',
                "competitor", competitor.SOURCE_STAMPER, *spec.argv()]
     done = subprocess.run(["docker", "exec", CLI, *wrapped], capture_output=True, text=True,
@@ -109,9 +137,8 @@ def measure(link, contended):
 
 
 def main():
-    teardown()
-    setup()
     try:
+        setup()
         record = {
             "iperf3": sh(CLI, "iperf3 --version").splitlines()[0],
             "kernel": sh(CLI, "uname -r").strip(),

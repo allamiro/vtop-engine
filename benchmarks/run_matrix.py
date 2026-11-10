@@ -92,6 +92,10 @@ RESOLVED_COLUMNS = (
     # taking the scenario's here would relabel an overridden run as the wire it
     # asked for, and the tuning beside it belongs to the transport that ran.
     "transport", "transport_tuning_flat",
+    # #481 (review): the summary records the cap as written to the engine
+    # (`egress_cap_of`: unset is blank); the scenario's own value, e.g. None,
+    # must not overwrite it in the matrix.
+    "upload_max_egress_bytes_per_second",
     # #476: the summary's value is the NORMALIZED mode, so a scenario that
     # leaves it blank is filed as the `host` it ran in rather than as nothing.
     "runner_mode",

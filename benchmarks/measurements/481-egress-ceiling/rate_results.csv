@@ -1,5 +1,5 @@
 run_id,scenario,cap_bytes_per_second,volume_preseeded,total_seeded_bytes,buckets,window_seconds,worst_bucket_ratio,worst_bucket_index,largest_bucket_bytes_ratio,total_ratio,predicted_ratio,zero_byte_buckets,buckets_over_cap,max_scrape_latency_seconds,engine_commits_in_window,engine_stopped_by,pass_every_bucket,pass_total,pass
-egress-cap-rate-1mib-20261110T012508Z-ukqkoq,egress-cap-rate-1mib,1048576,2,104214161,60,60.017,0.978535,21,0.984375,0.933596,0.96875,1,0,0.005211,18,sigkill,True,True,True
-egress-cap-rate-4mib-20261110T012635Z-nr8xv2,egress-cap-rate-4mib,4194304,2,341843090,60,60.007,0.981538,15,0.987008,0.927026,0.96875,2,0,0.005034,61,sigint,True,True,True
-egress-cap-rate-16mib-20261110T012737Z-nvmv45,egress-cap-rate-16mib,16777216,8,888257459,60,60.001,0.991381,41,0.992373,0.870034,0.96875,2,0,0.005292,278,sigint,True,False,False
-egress-cap-rate-16mib-20261110T012926Z-681a6q,egress-cap-rate-16mib,16777216,60,2097715195,60,60.004,0.972305,56,0.972331,0.936192,0.96875,0,0,0.003724,177,sigint,True,True,True
+egress-cap-rate-1mib-20261110T012508Z-ukqkoq,egress-cap-rate-1mib,1048576,2,104214161,60,60.015,0.978527,21,0.984375,0.933634,0.96875,1,0,0.005211,18,sigkill,True,True,True
+egress-cap-rate-4mib-20261110T012635Z-nr8xv2,egress-cap-rate-4mib,4194304,2,341843090,60,60.005,0.981169,15,0.987008,0.927051,0.96875,2,0,0.005034,61,sigint,True,True,True
+egress-cap-rate-16mib-20261110T012737Z-nvmv45,egress-cap-rate-16mib,16777216,8,888257459,60,60.002,0.991836,41,0.992373,0.870013,0.96875,2,0,0.005292,278,sigint,True,False,False
+egress-cap-rate-16mib-20261110T012926Z-681a6q,egress-cap-rate-16mib,16777216,60,2097715195,60,60.004,0.972457,56,0.972331,0.936195,0.96875,0,0,0.003724,177,sigint,True,True,True

@@ -893,28 +893,39 @@ against another kernel's clock.
 | run | R | worst 1 s bucket / R | 60 s total / R | verdict |
 |---|---|---|---|---|
 | `egress-cap-rate-1mib-20261110T012508Z-ukqkoq` | 1 MiB/s | 0.9785 | 0.9336 | pass |
-| `egress-cap-rate-4mib-20261110T012635Z-nr8xv2` | 4 MiB/s | 0.9815 | 0.9270 | pass |
-| `egress-cap-rate-16mib-20261110T012737Z-nvmv45` | 16 MiB/s | 0.9914 | 0.8700 | **fail** (total): the seeder delivered 888 MB, under R × 60 s, so the window measured the seeder |
-| `egress-cap-rate-16mib-20261110T012926Z-681a6q` | 16 MiB/s | 0.9723 | 0.9362 | pass, with the pre-seeded backlog |
+| `egress-cap-rate-4mib-20261110T012635Z-nr8xv2` | 4 MiB/s | 0.9812 | 0.9271 | pass |
+| `egress-cap-rate-16mib-20261110T012737Z-nvmv45` | 16 MiB/s | 0.9918 | 0.8700 | **fail** (total): the seeder delivered 888 MB, under R × 60 s, so the window measured the seeder |
+| `egress-cap-rate-16mib-20261110T012926Z-681a6q` | 16 MiB/s | 0.9725 | 0.9362 | pass, with the pre-seeded backlog |
 
-No bucket in any run exceeded R. The median bucket of each passing run is
-0.968–0.969 of R, the predicted 0.969; single buckets scatter to ±0.01 of
+The ratios are `egress_cap_check.py`'s, re-run over the committed
+`engine_metrics_selected.csv` after the checker learned to recover each
+bucket's interval at the runner's precision (`delta / delta_per_second`)
+rather than from the millisecond-rounded `interval_seconds`; that moved
+them in the fourth decimal and no verdict. No bucket in any run exceeded R.
+The median bucket of each passing run is 0.968–0.969 of R, the predicted
+0.969; single buckets scatter to ±0.01 of
 that, which is the scrape-edge uncertainty (§3). Every total sits below that prediction because of the
 engine's own gaps (startup, and the seconds between a cycle's last verify and
 the next cycle's first upload, visible as dips in `egress_buckets.csv`), not
 because of the shaper.
 
-The competitor pair is **half recorded**. Uncapped (scenario 22), the
-competing flow got 5.06 Mbit/s beside VTOP against 9.558 Mbit/s alone. Over the
-one engine cycle the window wholly contained (23.4 s), VTOP took 2.774 Mbit/s
-of committed bytes against the flow's 6.073 (Jain 0.878). The capped run
-(scenario 23, 256 KiB/s) was refused **twice** by the stream-placement check,
-with spreads of 0.349 s and 0.285 s against its 0.25 s bound, before any
-contended number was written. So no with-cap goodput exists from this session.
-A paced, unshaped iperf3 on the same VM placed every line at a spread of
-0.000 s, so the late lines appear only under the shaped, contended link. That
-needs explaining before the pair can be completed. It was not retried until it
-passed. The refusals are recorded in `competitor_pair.json`.
+The competitor pair is recorded in `competitor_pair.json`, from a second lab
+session at `bulk:120` / `duration_seconds: 300` (scenarios 22 and 23 as they
+are now). Beside an uncapped VTOP the competing flow got **4.723 Mbit/s**
+against 9.55 alone (49%); beside VTOP capped at 256 KiB/s it got **7.759
+Mbit/s** against 9.547 alone (81%). Over the engine cycles each window wholly
+contained, VTOP's committed-body rate was 3.184 Mbit/s uncapped (4 cycles,
+82.9 s) and 1.741 Mbit/s capped (1 cycle, 37.3 s). The two solo windows of
+each run agreed within 0.08% and 0.21%. One session on one host, one link
+shape and one cap; the capped run's share rests on a single contained cycle.
+
+History, kept in the same file and not current results: the first session's
+uncapped control at `bulk:60` (5.06 Mbit/s beside VTOP against 9.558 alone),
+two capped `bulk:60` attempts refused by the stream-placement check (spreads
+0.349 s and 0.285 s, from iperf3's final interval line, which is now left out
+of the placement — see above), and two more capped `bulk:60` attempts refused
+because no ~40 s capped cycle fitted wholly inside a 60 s window, which is why
+the pair moved to 120 s windows.
 
 ### The HTTP/3 counterparty, and the topology it adds (#484)
 

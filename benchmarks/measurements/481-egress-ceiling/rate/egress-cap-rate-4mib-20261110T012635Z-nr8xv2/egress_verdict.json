@@ -7,7 +7,7 @@
   "largest_bucket_bytes": {
     "bytes": 4139811.0,
     "index": 20,
-    "interval_seconds": 1.01,
+    "interval_seconds": 1.0095366669994386,
     "ratio_to_cap": 0.987008
   },
   "max_scrape_latency_seconds": 0.005034,
@@ -15,18 +15,18 @@
   "pass_every_bucket_at_or_below_cap": true,
   "pass_total_within_tolerance": true,
   "predicted_ratio": 0.96875,
-  "ratio_to_cap": 0.927026,
+  "ratio_to_cap": 0.927051,
   "total_bytes": 233320947.0,
   "total_tolerance": 0.1,
-  "window_seconds": 60.007,
+  "window_seconds": 60.005,
   "worst_bucket": {
     "bytes": 4129218.0,
     "elapsed_seconds": 15.067,
     "index": 15,
-    "interval_seconds": 1.003,
-    "rate": 4116867.398,
-    "rate_upper_bound": 4130564.564,
-    "ratio_to_cap": 0.981538
+    "interval_seconds": 1.0033767919993872,
+    "rate": 4115321.416,
+    "rate_upper_bound": 4129008.279,
+    "ratio_to_cap": 0.981169
   },
   "zero_byte_buckets": 2
 }
