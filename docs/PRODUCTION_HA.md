@@ -924,11 +924,14 @@ Short procedures now; expand into a full ops runbook before go-live.
   promotion counts a fenced replica's answer only when the candidate could
   prove the replica's epoch history agrees with its own (or the replica
   reconciled to it); an answer whose lineage is unknown is recorded and not
-  counted, whatever its offset. A range whose surviving majority includes
-  replicas with records but no epoch history (a log that predates its
-  journal, a journal restarted empty) therefore refuses to promote with
-  "too few replicas answered with a lineage this candidate could prove":
-  repair those replicas (`vtopctl node repair` installs the source's
+  counted, whatever its offset. An Unknown replica does not by itself block
+  promotion: the candidate still promotes when a majority of the replica
+  set answers with a proven lineage (the candidate plus one Agreed follower
+  of three, say). It refuses with "too few replicas answered with a lineage
+  this candidate could prove" only when the proven answers fall short of
+  that majority - for example when the reachable replicas include ones with
+  records but no epoch history (a log that predates its journal, a journal
+  restarted empty). Repair those replicas (`vtopctl node repair` installs the source's
   history) rather than lowering anything. Recording the verdicts needs
   `vtopctl meta enable-features --level 6` once every metadata voter runs
   this release; until then promotions are recorded without them (and
