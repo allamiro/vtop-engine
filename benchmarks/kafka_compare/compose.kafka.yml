@@ -1,0 +1,83 @@
+# Apache Kafka for the head-to-head comparison (#595, #596): three brokers in
+# KRaft mode, each a combined broker+controller, RF=3, min.insync.replicas=2.
+#
+# Fairness rule 1: every broker gets EXACTLY the limits each VTOP node gets in
+# compose.vtop.yml (2 CPUs, 2 GiB, no swap, a named volume on the same Docker
+# VM disk). Change one file, change the other; run.py records both in
+# environment.json and refuses to start when they differ.
+#
+# Everything else is Kafka as shipped (profile `defaults`, #595 rule 4): no
+# flush.messages, so a broker acknowledges on replication, not on fsync.
+#
+# The image is pinned by tag AND digest (rule 8); KAFKA_IMAGE overrides both.
+name: kc-kafka
+
+x-broker: &broker
+  image: ${KAFKA_IMAGE:-apache/kafka:4.3.2@sha256:852a0d49fc4e656b022e7f23785411802c9a088c78a7c5e39f33969de9c227a7}
+  cpus: 2
+  mem_limit: 2g
+  memswap_limit: 2g
+  ulimits:
+    nofile: { soft: 65536, hard: 65536 }
+  networks: [bench]
+  healthcheck:
+    test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+    interval: 5s
+    timeout: 20s
+    retries: 30
+    start_period: 10s
+
+x-env: &env
+  # One fixed id: KRaft formats every log dir with it on first start.
+  CLUSTER_ID: "a2NvbXBhcmUtcGhhc2UtMQ"
+  KAFKA_PROCESS_ROLES: "broker,controller"
+  KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+  KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+  KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+  KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093"
+  KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+  # The replication contract (#595 rule 3).
+  KAFKA_DEFAULT_REPLICATION_FACTOR: "3"
+  KAFKA_MIN_INSYNC_REPLICAS: "2"
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "2"
+  # The benchmark topic is created explicitly by run.py with these settings;
+  # a typo'd topic must not be auto-created with others.
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+services:
+  kafka-1:
+    <<: *broker
+    hostname: kafka-1
+    environment:
+      <<: *env
+      KAFKA_NODE_ID: "1"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-1:9092"
+    volumes: ["kafka-1-data:/var/lib/kafka/data"]
+  kafka-2:
+    <<: *broker
+    hostname: kafka-2
+    environment:
+      <<: *env
+      KAFKA_NODE_ID: "2"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-2:9092"
+    volumes: ["kafka-2-data:/var/lib/kafka/data"]
+  kafka-3:
+    <<: *broker
+    hostname: kafka-3
+    environment:
+      <<: *env
+      KAFKA_NODE_ID: "3"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-3:9092"
+    volumes: ["kafka-3-data:/var/lib/kafka/data"]
+
+volumes:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:
+
+networks:
+  bench:
+    name: kc-kafka-bench

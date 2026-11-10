@@ -1,0 +1,40 @@
+# VTOP node 1: the range's static leader, with the Kafka gateway (#225).
+#
+# The shape scripts/live-chaos scenario 17 drives with a stock librdkafka
+# client (a static leader at a fixed fencing epoch, two followers, quorum
+# acknowledgement), moved into containers. Plaintext planes, as Kafka's
+# PLAINTEXT listeners on the other side, so neither system pays for TLS; the
+# `-on-any-interface` spelling is the node's own opt-in for leaving loopback.
+#
+# Every engine knob not written here is the binary's default (profile
+# `defaults`, #595 rule 4): the gateway appends with Durability::Quorum, which
+# acknowledges after a majority of the three replicas (leader included) has
+# made the append locally durable (fsync) — 2 of 3, the write quorum the
+# comparison asks for. Kafka under `defaults` acknowledges on replication
+# without fsync; that difference is stated in the report, never hidden.
+role: leader
+node_uuid: aaaaaaaa-0000-0000-0000-0000000000a1
+cluster_id: 11111111-2222-3333-4444-555555555555
+data_dir: /home/vtop/data
+fencing_epoch: 18
+range: { topic: "bench", topic_epoch: 1, range_id: aaaaaaaa-0000-0000-0000-0000000000c1, range_generation: 0 }
+segment_id: aaaaaaaa-0000-0000-0000-0000000000d1
+native_listen: "0.0.0.0:9400"
+replica_listen: "0.0.0.0:9300"
+followers:
+  - { node_uuid: aaaaaaaa-0000-0000-0000-0000000000a2, addr: "vtop-2:9300", server_name: "vtop-2" }
+  - { node_uuid: aaaaaaaa-0000-0000-0000-0000000000a3, addr: "vtop-3:9300", server_name: "vtop-3" }
+replica_transport: plaintext-on-any-interface
+native_transport: plaintext-on-any-interface
+principal_id: aaaaaaaa-0000-0000-0000-0000000000ce
+observability: { listen: "0.0.0.0:9600" }
+kafka:
+  # Off loopback because the client runs in its own container; the gateway
+  # demands that be said by name (`any_interface`), and Metadata must name a
+  # host the client container resolves (`advertised_host`).
+  listen: "0.0.0.0:9092"
+  any_interface: true
+  advertised_host: "vtop-1"
+  advertised_port: 9092
+  topic: "bench"
+  node_id: 1

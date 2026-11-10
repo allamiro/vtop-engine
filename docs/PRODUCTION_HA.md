@@ -313,14 +313,21 @@ secret reference so credentials never enter serializable config.
 
 ### 6.4 Backend-switching policy (NOT "no migration ever")
 The state store is a replay ledger, **but the file/syslog byte cursor lives only in
-it** (rebuilt from `SOURCE_COMMITTED` rows by `seed_committed_offsets`). Kafka
-offsets live in the broker. Therefore:
+it** (rebuilt from `SOURCE_COMMITTED` rows by `seed_committed_offsets`). The Kafka
+resume position is the ledger's too, but only when the store holds a committed
+batch for the partition AND the broker reports a committed offset for the
+consumer group on it (#614; ARCHITECTURE §7.1). Otherwise - a fresh store, no
+committed batch yet, no group offset, or a broker that cannot be asked at
+startup - the partition resumes at `Offset::Stored`: the group's committed
+offset, or `auto.offset.reset` when there is none. Therefore:
 
 ```text
 Backend switching policy:
 - Dev/test:                a fresh state store is acceptable.
 - Production, Kafka-only:   may be safe AFTER engine DRAIN + offset verification
-                           (offsets are broker-side, so resume is safe).
+                           (a fresh store resumes from the group's committed
+                           offset, so verify it equals the old ledger's
+                           position for every partition before switching).
 - Production, file/syslog:  REQUIRES cursor migration OR a controlled drain,
                            else files reprocess from byte 0 (duplicates) and
                            spool position is lost.
@@ -332,9 +339,12 @@ Backend switching policy:
 import into the new store (or accept Kafka reprocessing for Kafka-only) → validate →
 keep the old store until validation passes (rollback path).
 
-**Why no row migration for the *Kafka* path:** resume position is broker-side
-committed offsets, so a fresh store does not lose Kafka progress (it
-re-discovers). This is the *only* path where "no migration" holds.
+**Why no row migration for the *Kafka* path:** a store with no committed
+batch for a partition resumes it from the broker-side committed offset, so a
+fresh store does not lose Kafka progress (it re-discovers). This is the *only*
+path where "no migration" holds. Once the store has committed a batch for the
+partition and the group has a committed offset for it, the ledger decides where
+it resumes, not the group's offset (#614).
 
 ### 6.5 Database schema & constraints (defense in depth) **[IMPLEMENTED — with one gap]**
 
