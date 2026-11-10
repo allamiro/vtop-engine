@@ -219,6 +219,25 @@ reopen quietly.
   levels) a data node records the report without verdicts AND without the
   Unknown answers, which that form's readers would count by offset. Records
   written before verdicts carry none and are judged exactly as before.
+- **#611** - the fence discarded acknowledged records before the vote was
+  read. A candidate adopts the new epoch at its own tail before it sends its
+  history, so a replica holding records the candidate never received compared
+  the two as diverged at the candidate's tail and truncated down to it,
+  provided its own high-water mark was still below that. In a three-replica
+  range a record the dead leader and that replica had acknowledged was lost,
+  and the replica then
+  voted for the candidate that lacked it. A fence now discards a suffix only
+  when the candidate holds a record at the divergence point written under an
+  epoch newer than every record discarded, which is proof that none of them
+  was acknowledged. Otherwise the replica keeps the records, answers with its
+  full offset, the candidate counts that answer, and the election restriction
+  refuses the candidate and names the replica as the one to lead. A replica
+  that kept such a suffix and was outvoted discards it on the established
+  leader's first append over it instead of acking a record it does not hold
+  (#261). That memory does not survive a restart, which leaves it in the same
+  position as a replica that was absent from the fence. No wire or feature
+  level change: an older replica still truncates as before, and an older
+  candidate judges the kept answer Unknown or refused, never as a grant.
 
 One observation rode along without becoming a fix: scenario 09 once left a
 promotion unacquired within its deadline (#318). The flake has not recurred —

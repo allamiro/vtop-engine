@@ -35,6 +35,8 @@ const OLD_LEADER: Uuid = Uuid::from_u128(0xA1);
 const PRODUCER: Uuid = Uuid::from_u128(0xB1);
 const OLD_EPOCH: u64 = 18;
 const NEW_EPOCH: u64 = 19;
+const NEWER_EPOCH: u64 = 20;
+const NEWEST_EPOCH: u64 = 21;
 
 fn range_identity() -> RangeIdentity {
     RangeIdentity {
@@ -290,17 +292,23 @@ fn the_fence_reports_offsets_and_history_from_one_instant() {
     );
 }
 
-/// THE POINT OF THE WHOLE ARC (#261). A replica that took records from a leader
-/// deposed before those records reached a quorum discards them during the
-/// fence, so it is already in agreement by the time the new leader reads it.
+/// THE POINT OF THE WHOLE ARC (#261), and its bound (#611). A replica that
+/// took records from a leader deposed before those records reached a quorum
+/// discards them during the fence. It is then already in agreement by the
+/// time the new leader reads it.
 ///
-/// Before this, that replica would ACK the new leader's writes as duplicates —
-/// answering "I have something at offset 5" when the question was "do you have
-/// THAT record at offset 5?" — and be counted toward a quorum for bytes it did
-/// not hold. Reconciling while stopped means the catch-up path is never reached
-/// in a diverged state and never has to answer a question it cannot.
+/// Before this, that replica would ACK the new leader's writes as duplicates.
+/// It answered "I have something at offset 5" when the question was "do you
+/// have THAT record at offset 5?", and was counted toward a quorum for bytes
+/// it did not hold. Reconciling while stopped means the catch-up path is never
+/// reached in a diverged state and never has to answer a question it cannot.
+///
+/// The discard needs proof that the records were never acknowledged (#611).
+/// Here the caller holds records from offset 5 written under epoch 19. That
+/// leadership was established after 18 and holds something else at 5, so
+/// epoch 18's records from 5 never reached a quorum.
 #[test]
-fn a_diverged_replica_discards_the_deposed_leaders_records_while_fenced() {
+fn a_diverged_replica_discards_records_a_newer_leadership_superseded_while_fenced() {
     let h = follower();
     for offset in 0..10 {
         append_at(&h, OLD_EPOCH, OLD_LEADER, offset).unwrap();
@@ -308,9 +316,62 @@ fn a_diverged_replica_discards_the_deposed_leaders_records_while_fenced() {
     // Only the first five reached a quorum.
     h.node.cluster_committed().advance_to(5);
 
-    // The new leader shares epoch 18 from 0, but its own epoch 19 began at 5 —
-    // it never saw the five records this replica took after the quorum stopped
-    // following.
+    // The caller shares epoch 18 from 0. Under epoch 19 it holds its own
+    // records from 5 to 8, and it adopted 20, the epoch it fences at, at 8.
+    let leader_history = [
+        EpochStart {
+            epoch: OLD_EPOCH,
+            start_offset: 0,
+        },
+        EpochStart {
+            epoch: NEW_EPOCH,
+            start_offset: 5,
+        },
+        EpochStart {
+            epoch: NEWER_EPOCH,
+            start_offset: 8,
+        },
+    ];
+
+    h.meta.set(NEWER_EPOCH);
+    let fenced = h.node.fence(NEWER_EPOCH, &leader_history).unwrap();
+
+    assert_eq!(fenced.truncated_records, 5, "the disputed tail is gone");
+    assert_eq!(
+        fenced.next_offset, 5,
+        "and the offset the caller counts is the reconciled one, not the \
+         pre-truncation one"
+    );
+
+    // The new leader's write at 5 now lands as a genuine append rather than
+    // being swallowed as a duplicate.
+    assert!(append_at(&h, NEWER_EPOCH, Uuid::from_u128(0xA9), 5).is_ok());
+    assert_eq!(h.node.next_offset(), 6);
+}
+
+/// #611. The same replica, fenced by a caller that never received 5..10 and
+/// adopted the new epoch at its own tail, 5. The divergence point is that
+/// adoption, which owns no record, so nothing proves 5..10 unacknowledged.
+/// In a three-replica range they were acknowledged: the deposed leader and
+/// this replica are a quorum. The replica keeps them and answers 10, and
+/// the vote restriction refuses the caller.
+///
+/// This used to discard them, since the high-water mark the replica knew was
+/// only 5. A test of this name pinned that loss as the point of the arc.
+///
+/// If the caller is established anyway, by a majority that outvoted this
+/// replica, the suffix is provably unacknowledged. Its first append over it
+/// then discards the suffix before applying, instead of acking a record this
+/// replica does not hold (#261).
+#[test]
+fn a_replica_ahead_of_the_caller_in_its_own_epoch_keeps_its_records_through_the_fence() {
+    let h = follower();
+    for offset in 0..10 {
+        append_at(&h, OLD_EPOCH, OLD_LEADER, offset).unwrap();
+    }
+    // The leader learned that 5..10 committed; this replica never did.
+    h.node.cluster_committed().advance_to(5);
+
     let leader_history = [
         EpochStart {
             epoch: OLD_EPOCH,
@@ -324,18 +385,123 @@ fn a_diverged_replica_discards_the_deposed_leaders_records_while_fenced() {
 
     h.meta.set(NEW_EPOCH);
     let fenced = h.node.fence(NEW_EPOCH, &leader_history).unwrap();
-
-    assert_eq!(fenced.truncated_records, 5, "the disputed tail is gone");
     assert_eq!(
-        fenced.next_offset, 5,
-        "and the offset the caller counts is the reconciled one, not the \
-         pre-truncation one"
+        fenced.truncated_records, 0,
+        "records the caller merely lacks are not evidence against them"
+    );
+    assert_eq!(
+        fenced.next_offset, 10,
+        "the answer carries everything held, which is the vote against the caller"
     );
 
-    // The new leader's write at 5 now lands as a genuine append rather than
-    // being swallowed as a duplicate.
-    assert!(append_at(&h, NEW_EPOCH, Uuid::from_u128(0xA9), 5).is_ok());
-    assert_eq!(h.node.next_offset(), 6);
+    // A retry of the same fence changes nothing.
+    let again = h.node.fence(NEW_EPOCH, &leader_history).unwrap();
+    assert_eq!((again.truncated_records, again.next_offset), (0, 10));
+
+    // Outvoted: the epoch-19 leader appends its own record at 5. Acking it
+    // as a duplicate would count this replica for a record it does not
+    // hold; instead the kept suffix goes and the record lands.
+    let ack = h
+        .node
+        .apply_append(&append_request(
+            &h.range,
+            NEW_EPOCH,
+            Uuid::from_u128(0xA9),
+            5,
+        ))
+        .expect("the established leader's append lands once the kept suffix is gone");
+    assert_eq!(ack.local_committed_offset, 6);
+    assert_eq!(
+        h.node.next_offset(),
+        6,
+        "the append was applied, not acked over the old record at 5"
+    );
+}
+
+/// #611 through the group-commit path: a kept suffix goes before a GROUP is
+/// applied over it, exactly as before a single append. A group the fencing
+/// check refuses (a stale epoch) discards nothing.
+#[test]
+fn a_kept_suffix_goes_before_a_group_append_over_it_and_not_for_a_stale_epoch() {
+    let h = follower();
+    for offset in 0..10 {
+        append_at(&h, OLD_EPOCH, OLD_LEADER, offset).unwrap();
+    }
+    h.node.cluster_committed().advance_to(5);
+    let leader_history = [
+        EpochStart {
+            epoch: OLD_EPOCH,
+            start_offset: 0,
+        },
+        EpochStart {
+            epoch: NEW_EPOCH,
+            start_offset: 5,
+        },
+    ];
+    h.meta.set(NEW_EPOCH);
+    let fenced = h.node.fence(NEW_EPOCH, &leader_history).unwrap();
+    assert_eq!((fenced.truncated_records, fenced.next_offset), (0, 10));
+
+    let stale = h.node.apply_append_batch(&[
+        append_request(&h.range, OLD_EPOCH, OLD_LEADER, 5),
+        append_request(&h.range, OLD_EPOCH, OLD_LEADER, 6),
+    ]);
+    assert_eq!(stale.map_err(|error| error.0), Err(ErrorCode::Fenced));
+    assert_eq!(
+        h.node.next_offset(),
+        10,
+        "a refused group must not discard the kept suffix"
+    );
+
+    let leader = Uuid::from_u128(0xA9);
+    let ack = h
+        .node
+        .apply_append_batch(&[
+            append_request(&h.range, NEW_EPOCH, leader, 5),
+            append_request(&h.range, NEW_EPOCH, leader, 6),
+        ])
+        .expect("the established leader's group lands once the kept suffix is gone");
+    assert_eq!(ack.local_committed_offset, 7);
+    assert_eq!(h.node.next_offset(), 7);
+}
+
+/// #611, the other way a fence can be told to discard records that may be
+/// acknowledged: the replica's disputed records come from a leadership NEWER
+/// than the caller's at the divergence point. Here the caller holds epoch-19
+/// records from 5, but this replica's records from 5 were written under
+/// epoch 20, a leadership the caller never followed. Nothing shows those were
+/// unacknowledged, so the replica keeps them.
+#[test]
+fn a_replica_holding_a_newer_leaderships_records_keeps_them_through_the_fence() {
+    let h = follower();
+    for offset in 0..5 {
+        append_at(&h, OLD_EPOCH, OLD_LEADER, offset).unwrap();
+    }
+    h.meta.set(NEWER_EPOCH);
+    h.node.adopt_fencing_epoch(NEWER_EPOCH);
+    for offset in 5..7 {
+        append_at(&h, NEWER_EPOCH, Uuid::from_u128(0xA7), offset).unwrap();
+    }
+    h.node.cluster_committed().advance_to(5);
+
+    let leader_history = [
+        EpochStart {
+            epoch: OLD_EPOCH,
+            start_offset: 0,
+        },
+        EpochStart {
+            epoch: NEW_EPOCH,
+            start_offset: 5,
+        },
+        EpochStart {
+            epoch: NEWEST_EPOCH,
+            start_offset: 9,
+        },
+    ];
+    h.meta.set(NEWEST_EPOCH);
+    let fenced = h.node.fence(NEWEST_EPOCH, &leader_history).unwrap();
+    assert_eq!(fenced.truncated_records, 0);
+    assert_eq!(fenced.next_offset, 7);
 }
 
 /// A divergence verdict BELOW the retained base is unprovable, not fatal
@@ -661,7 +827,9 @@ fn a_reconciliation_below_the_acknowledged_mark_fails_the_fence() {
     // Everything through 8 was acknowledged.
     h.node.cluster_committed().advance_to(8);
 
-    // A caller claiming its own epoch 19 began at 2 puts divergence below that.
+    // A caller holding its own epoch-19 records from 2 (fencing at 20) puts
+    // divergence below that, and claims to supersede them (#611: a caller
+    // that merely LACKS them would not be obeyed at all).
     let leader_history = [
         EpochStart {
             epoch: OLD_EPOCH,
@@ -671,12 +839,16 @@ fn a_reconciliation_below_the_acknowledged_mark_fails_the_fence() {
             epoch: NEW_EPOCH,
             start_offset: 2,
         },
+        EpochStart {
+            epoch: NEWER_EPOCH,
+            start_offset: 4,
+        },
     ];
 
-    h.meta.set(NEW_EPOCH);
+    h.meta.set(NEWER_EPOCH);
     let refused = h
         .node
-        .fence(NEW_EPOCH, &leader_history)
+        .fence(NEWER_EPOCH, &leader_history)
         .expect_err("must not discard acknowledged records");
     assert!(
         refused.1.contains("acknowledged"),
@@ -757,7 +929,7 @@ fn a_restarted_follower_still_refuses_to_discard_what_it_acknowledged() {
         "precondition: the floor survived the restart and seeded the cell"
     );
 
-    // A new leader whose history puts divergence at 2 — beneath the eight
+    // A new leader whose epoch-19 records from 2 put divergence there — beneath the eight
     // acknowledged records.
     let leader_history = [
         EpochStart {
@@ -768,9 +940,13 @@ fn a_restarted_follower_still_refuses_to_discard_what_it_acknowledged() {
             epoch: NEW_EPOCH,
             start_offset: 2,
         },
+        EpochStart {
+            epoch: NEWER_EPOCH,
+            start_offset: 4,
+        },
     ];
-    meta.set(NEW_EPOCH);
-    let refused = node.fence(NEW_EPOCH, &leader_history).expect_err(
+    meta.set(NEWER_EPOCH);
+    let refused = node.fence(NEWER_EPOCH, &leader_history).expect_err(
         "before the floor was persisted, this exact sequence rebuilt the guard at zero and \
          the fence SILENTLY TRUNCATED eight acknowledged records; it must refuse instead",
     );
@@ -858,10 +1034,14 @@ fn a_replica_without_a_floor_file_reconciles_exactly_as_before() {
             epoch: NEW_EPOCH,
             start_offset: 2,
         },
+        EpochStart {
+            epoch: NEWER_EPOCH,
+            start_offset: 4,
+        },
     ];
-    meta.set(NEW_EPOCH);
+    meta.set(NEWER_EPOCH);
     let fenced = node
-        .fence(NEW_EPOCH, &leader_history)
+        .fence(NEWER_EPOCH, &leader_history)
         .expect("an absent floor must not refuse anything the old behaviour allowed");
     assert_eq!(
         fenced.truncated_records, 8,
