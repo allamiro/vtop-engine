@@ -7,10 +7,11 @@ description: >-
   one-second bucket at or below R, and the 60 s total within 10% of R x 60
   (the shaper's design predicts about 31/32 of R). The workload exists only
   to keep the shaper saturated, and is sized to offer more than R on average;
-  it does not guarantee it every second. The volume seeded before launch is
-  drawn at random (medium files are 1-10 MiB), the concurrent rounds are
-  seeded deterministically (seed 10000 + round number), and the engine has
-  its own gaps (startup, cycle boundaries), so a run can hold zero-byte or
+  it does not guarantee it every second. The dataset is reproducible (the
+  up-front volume by initial_seed, the concurrent rounds by seed 10000 +
+  round number; the recorded runs predate initial_seed and drew the up-front
+  volume from OS entropy), but the engine has its own gaps (startup, cycle
+  boundaries), so a run can hold zero-byte or
   under-cap buckets: the recorded passing runs of scenarios 19, 20 and 21
   hold 1, 2 and 0. The 10% tolerance on the total is what absorbs them.
   Judged by benchmarks/egress_cap_check.py on the run directory.
@@ -28,10 +29,24 @@ description: >-
 # the cap for the whole minute, eight batches verified, and the cycle - which
 # needed about 27 minutes - committed nothing, so the run was refused as having
 # measured nothing. Here the first cycle is a few seconds of work, and each
-# later one takes what the seeder added during the last: about 1.3x longer
-# each time, so cycles commit inside the window while the shaper is never
-# without an object to send.
+# later one takes what the seeder added during the last, so cycles commit
+# inside the window. That keeps an object waiting on the shaper for most of the
+# window, not all of it: the engine's own gaps (startup, the seconds between a
+# cycle's last verify and the next cycle's first upload) leave the shaper idle,
+# and the recorded runs show them as dips and zero-byte buckets in
+# egress_buckets.csv.
 volume: 2
+# THE UP-FRONT DATASET IS PINNED (#481, review): the concurrent rounds were
+# already reproducible (seed 10000 + round), but the volume generated before
+# launch came from OS entropy. At 1 MiB/s two medium files drawn at their
+# 1 MiB minimum cannot feed the shaper through the first rounds: replaying the
+# deterministic rounds against an ideal shaper, that workload alone caps the
+# 60 s total at 0.864 of R, below the criterion's 0.9, whatever the cap does.
+# Seed 481 seeds about 11.9 MB up front, and the same replay is then limited by
+# the shaper (0.969 of R) in scenarios 19 and 20. Added AFTER the runs recorded
+# in benchmarks/measurements/481-egress-ceiling/, which used OS entropy here;
+# they are not re-labelled, and their summary.json carries no initial_seed.
+initial_seed: 481
 file_size: medium
 # JSONL, not whole-file binary: the runner refuses a concurrent seeder over
 # whole-file input, since the engine could commit a file still being written.

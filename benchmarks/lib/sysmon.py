@@ -123,6 +123,12 @@ class SystemMonitor:
         # _counters is called from the sampler thread AND from counters_now();
         # the first call on either side sets the baseline, so it is serialised.
         self._counter_lock = threading.Lock()
+        # The schedule's clock and its wait, as attributes so a test can drive
+        # the loop in virtual time (review): a cadence test on the wall clock
+        # fails whenever a busy worker delays the thread, which says nothing
+        # about the schedule. `_wait` returns early when stop is set.
+        self._clock: Callable[[], float] = time.monotonic
+        self._wait: Callable[[float], object] = self._stop.wait
 
     def counters_now(self) -> dict[str, float]:
         """The cumulative counters as of THIS instant, on the samples' own basis.
@@ -239,7 +245,7 @@ class SystemMonitor:
         # next grid point; one that overran its slot skips the grid points it
         # covered rather than firing a burst to catch up, so the cadence is the
         # configured interval whenever a sample fits inside it.
-        next_due = time.monotonic()
+        next_due = self._clock()
         while not self._stop.is_set():
             s = self._sample()
             self.samples.append(s)
@@ -249,10 +255,10 @@ class SystemMonitor:
                 break
             self.emit(s)
             next_due += self.interval
-            now = time.monotonic()
+            now = self._clock()
             while next_due <= now:
                 next_due += self.interval
-            self._stop.wait(next_due - now)
+            self._wait(next_due - now)
 
     def __enter__(self) -> SystemMonitor:
         self._thread = threading.Thread(target=self._run, daemon=True)

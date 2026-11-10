@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib import competitor, engine, engine_run, seed, shaping  # noqa: E402
 from lib.metrics import ResultsWriter, iso_now, new_run_id, percentile  # noqa: E402
-from lib.scenario import load_scenario, reseed_count  # noqa: E402
+from lib.scenario import initial_seed, load_scenario, reseed_count  # noqa: E402
 from lib.sysmon import SystemMonitor  # noqa: E402
 
 STAGES = [
@@ -154,6 +154,7 @@ def main() -> int:
         # refused before anything runs, not as a traceback from the config
         # writer after the shape and the seed have been paid for.
         engine.egress_cap_of(sc)
+        initial_seed(sc)
     except ValueError as bad:
         print(f"[bench] {bad}", file=sys.stderr)
         return 2
@@ -402,7 +403,8 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
         if files_seen:
             print(f"[bench] seed dir already held {files_seen} file(s); counted "
                   "into the seeded baseline")
-        totals = seed.generate_dataset(seed_dir, sc.format, int(sc.volume), sc.file_size)
+        totals = seed.generate_dataset(seed_dir, sc.format, int(sc.volume), sc.file_size,
+                                       seed=initial_seed(sc))
         files_seen += totals["files"]
         seeded_bytes += totals["bytes"]
         print(f"[bench] seeded {totals['files']} files ({totals['bytes']} bytes) "

@@ -288,6 +288,83 @@ def test_a_yaml_null_spelling_of_the_cap_is_refused_not_written():
         "a negative cap still goes through for the engine to refuse")
 
 
+def test_a_signed_or_zero_padded_cap_is_written_in_canonical_form(tmp_path):
+    # "+4194304" is the same cap the scenario parser reads as int 4194304; the
+    # engine config and the recorded column carry one spelling of it.
+    for spelling in ("+4194304", "004194304", "+004194304", 4194304):
+        assert egress_cap_of({"upload_max_egress_bytes_per_second": spelling}) == "4194304"
+    text = config_text(tmp_path, {"backend": "s3_native",
+                                  "upload_max_egress_bytes_per_second": "+4194304"})
+    assert "  max_egress_bytes_per_second: 4194304\n" in text, text
+
+
+def test_initial_seed_is_a_non_negative_integer_or_entropy():
+    from lib.scenario import initial_seed
+
+    assert initial_seed({}) == 0, "absent keeps OS entropy, every older scenario's behaviour"
+    assert initial_seed({"initial_seed": 481}) == 481
+    assert initial_seed({"initial_seed": "481"}) == 481
+    for bad in (-1, "abc", True, 1.5):
+        with pytest.raises(ValueError, match="initial_seed"):
+            initial_seed({"initial_seed": bad})
+
+
+def _ideal_total_ratio(cap, up_front, interval, rounds):
+    """The 60 s total an IDEAL shaper (refill R - R/32, no engine gaps) could
+    reach on this supply, as a fraction of R x 60, in 10 ms steps."""
+    arrivals = {round(k * interval * 100): b for k, b in enumerate(rounds, 1)}
+    supply, sent, refill = float(up_front), 0.0, (cap - cap // 32) / 100
+    for tick in range(6000):
+        supply += arrivals.get(tick, 0)
+        sent += min(refill, supply - sent)
+    return sent / (cap * 60)
+
+
+def test_the_rate_scenarios_pin_a_dataset_that_cannot_starve_the_criterion(tmp_path,
+                                                                            monkeypatch):
+    # Replays scenarios 19 and 20's seeding - the pinned up-front volume, then
+    # the concurrent rounds at their deterministic seeds - against an ideal
+    # shaper, and asserts the workload alone cannot pull the 60 s total under
+    # the 0.9 criterion. With OS entropy, two up-front files drawn at their
+    # 1 MiB minimum limit scenario 19 to 0.864 of R x 60 (review). Scenario 21
+    # is checked for the pin only: its up-front volume is 60 files, which no
+    # draw makes small, and generating it here would write ~350 MB.
+    from lib import seed as seed_lib
+    from lib.scenario import initial_seed, reseed_count
+
+    for name in RATE_SCENARIOS:
+        sc = load_scenario(os.path.join(SCENARIOS, name))
+        assert initial_seed(sc) != 0, f"{name} must pin its up-front dataset"
+
+    # The up-front volume is generated for real: its second file's size
+    # depends on the randomness the first file's content consumed.
+    up_front = {}
+    for name in ("19-egress-cap-rate-1mib.yaml", "20-egress-cap-rate-4mib.yaml"):
+        sc = load_scenario(os.path.join(SCENARIOS, name))
+        up_front[name] = seed_lib.generate_dataset(
+            str(tmp_path / name), sc.format, int(sc.volume), sc.file_size,
+            seed=initial_seed(sc))["bytes"]
+
+    # A round is ONE file, whose size is drawn right after its seed, before any
+    # content: the target is exact without writing it (a written file is at
+    # least its target, so this is the conservative side).
+    monkeypatch.setattr(seed_lib, "_write_text_file", lambda path, target, fmt: target)
+    for name in ("19-egress-cap-rate-1mib.yaml", "20-egress-cap-rate-4mib.yaml"):
+        sc = load_scenario(os.path.join(SCENARIOS, name))
+        assert reseed_count(int(sc.volume), float(sc.get("backlog_multiplier"))) == 1, name
+        interval = float(sc.get("seed_interval_seconds"))
+        rounds = [seed_lib.generate_dataset(str(tmp_path / "r"), sc.format, 1, sc.file_size,
+                                            seed=10_000 + k, prefix=f"evt{k}")["bytes"]
+                  for k in range(1, int(60 / interval) + 1)]
+        ratio = _ideal_total_ratio(RATE_SCENARIOS[name], up_front[name], interval, rounds)
+        assert ratio >= 0.95, (
+            f"{name}: its own seeding limits even an ideal shaper to {ratio:.4f} of R x 60")
+        if name.startswith("19"):
+            # The check can fail: the smallest entropy draw does starve it.
+            starved = _ideal_total_ratio(RATE_SCENARIOS[name], 2 * MIB, interval, rounds)
+            assert starved < 0.9, starved
+
+
 def test_the_matrix_takes_the_cap_the_run_recorded_not_the_scenarios_spelling():
     assert "upload_max_egress_bytes_per_second" in run_matrix.RESOLVED_COLUMNS
     row = run_matrix.matrix_row({
@@ -356,32 +433,50 @@ def test_a_committed_record_is_judged_from_its_selected_series(tmp_path):
     assert egress_cap_check.main([str(run_dir), "--out", str(tmp_path / "out")]) == 0
 
 
+def _sample_starts(interval: float, sample_seconds: float, samples: int) -> list[float]:
+    """Drive SystemMonitor's loop in VIRTUAL time, synchronously, and return
+    when each sample started. Nothing here reads the wall clock, so a busy
+    worker cannot move a start (review: the first version slept for real)."""
+    from lib.sysmon import SystemMonitor
+
+    clock = [0.0]
+    starts: list[float] = []
+    monitor = SystemMonitor(lambda sample: None, interval=interval)
+
+    def sample():
+        starts.append(clock[0])
+        clock[0] += sample_seconds
+        if len(starts) == samples:
+            monitor._stop.set()
+        return {}
+
+    def wait(seconds):
+        assert seconds > 0, f"the loop asked to wait {seconds} s: a burst, not a schedule"
+        clock[0] += seconds
+
+    monitor._sample = sample
+    monitor._clock = lambda: clock[0]
+    monitor._wait = wait
+    monitor._run()
+    return starts
+
+
 def test_system_samples_keep_the_configured_cadence_when_a_sample_takes_time():
     # Container mode's `docker stats --no-stream` takes about a second, and
     # "sample, then wait an interval" stretched every period by that much: the
     # rate runs' rows were 2 s apart at a 1 s interval (review). Scheduled from
-    # deadlines, a 0.2 s sample inside a 0.3 s interval keeps the 0.3 s grid —
-    # five starts in 1.4 s, where the old loop managed three.
-    import time
+    # deadlines, a 0.2 s sample inside a 0.3 s interval keeps the 0.3 s grid;
+    # the old loop started one every 0.5 s.
+    starts = _sample_starts(interval=0.3, sample_seconds=0.2, samples=6)
+    assert starts == pytest.approx([0.0, 0.3, 0.6, 0.9, 1.2, 1.5]), starts
 
-    from lib.sysmon import SystemMonitor
 
-    starts = []
-    monitor = SystemMonitor(lambda sample: None, interval=0.3)
-
-    def slow_sample():
-        starts.append(time.monotonic())
-        time.sleep(0.2)
-        return {}
-
-    monitor._sample = slow_sample
-    with monitor:
-        time.sleep(1.4)
-    assert len(starts) >= 5, (
-        f"{len(starts)} samples in 1.4 s at a 0.3 s interval: the sample's own time is "
-        "being added to every period")
-    gaps = [b - a for a, b in zip(starts, starts[1:])]
-    assert max(gaps) < 0.45, gaps
+def test_a_sample_longer_than_the_interval_skips_to_the_next_slot_without_a_burst():
+    # A 0.5 s sample at a 0.3 s interval cannot keep the grid; it must land on
+    # the next free grid point (0.6, 1.2, ...) rather than fire immediately to
+    # catch up on the slots it covered.
+    starts = _sample_starts(interval=0.3, sample_seconds=0.5, samples=4)
+    assert starts == pytest.approx([0.0, 0.6, 1.2, 1.8]), starts
 
 
 def test_every_committed_rate_record_rejudges_to_its_committed_verdict(tmp_path):

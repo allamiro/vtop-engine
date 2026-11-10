@@ -878,6 +878,11 @@ therefore start small and seed concurrently at about 1.3 × R. That needs a line
 format, because the runner refuses a concurrent seeder over whole-file input.
 The seeder alone could not hold 16 MiB/s through a Docker Desktop bind mount,
 so scenario 21 also pre-seeds a backlog (its comment has the numbers).
+The dataset generated before launch is pinned by the scenario key
+`initial_seed` (0, the default, keeps OS entropy for every other scenario):
+with two up-front files, an unlucky draw alone limits scenario 19 to 0.864 of
+R × 60 before the cap does anything. The key postdates the runs recorded
+below, which drew that volume from OS entropy.
 
 The netem lab needs a kernel with the `ifb` driver. Docker Desktop's linuxkit
 kernel has none, and `lib/netem.py` now says so instead of reporting the

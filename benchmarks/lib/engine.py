@@ -671,7 +671,12 @@ def egress_cap_of(scenario) -> str:
     pasted into YAML, so a quoted "null" or "~" would reach the engine as YAML
     null - unset - and run uncapped while summary.json recorded a cap, and any
     other text could change the YAML around it. A negative integer still goes
-    through for the engine to refuse as it would refuse an operator's."""
+    through for the engine to refuse as it would refuse an operator's.
+
+    An integer is returned in its CANONICAL decimal form (review): "+4194304"
+    and "004194304" are the same cap as 4194304, the scenario parser already
+    reads them so, and the engine config and the recorded column must carry
+    one spelling of one number rather than whatever the scenario typed."""
     value = scenario.get("upload_max_egress_bytes_per_second", "")
     if value is None:
         return ""
@@ -680,13 +685,13 @@ def egress_cap_of(scenario) -> str:
     text = str(value).strip()
     if text == "":
         return ""
-    digits = text[1:] if text.startswith("-") else text
+    digits = text[1:] if text[:1] in ("+", "-") else text
     if not (digits.isascii() and digits.isdigit()):
         raise ValueError(
             f"upload_max_egress_bytes_per_second must be an integer number of bytes per second "
             f"or unset, got {value!r}: it is written into the engine's YAML as given, and a "
             "spelling YAML reads as null would run the engine uncapped under a capped label")
-    return text
+    return str(int(text))
 
 
 def write_engine_config(scenario, work_dir: str, state_db: str,
