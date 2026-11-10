@@ -206,7 +206,9 @@ jobs:
           # Evidence for the next runner-image change: which OpenSSL builds
           # this image carries, and where a default -L would find them.
           brew list --versions | grep -i -E '^openssl' || true
-          ls -l "$(brew --prefix)/lib" | grep -E 'lib(ssl|crypto)\.' || true
+          for lib in "$(brew --prefix)"/lib/libssl.* "$(brew --prefix)"/lib/libcrypto.*; do
+            if [ -e "$lib" ] || [ -L "$lib" ]; then ls -l "$lib"; fi
+          done
           echo "LIBRARY_PATH=${LIBRARY_PATH:-<unset>}"
           # cyrus-sasl is keg-only: expose it to pkg-config/cmake explicitly.
           echo "PKG_CONFIG_PATH=$(brew --prefix cyrus-sasl)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
