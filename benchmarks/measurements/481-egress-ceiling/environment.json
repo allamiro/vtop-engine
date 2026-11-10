@@ -15,7 +15,11 @@
   },
   "harness": "benchmarks/run_benchmark.py run inside a python:3.11-slim container (docker CLI 29.9.3 + compose v5.7.0) on the same Linux kernel as the lab containers, with the docker socket mounted, so the runner's monotonic clock is the one the netem probe's stamper reads. Verdicts by benchmarks/egress_cap_check.py.",
   "rate_runs": {
-    "scenarios": ["19-egress-cap-rate-1mib", "20-egress-cap-rate-4mib", "21-egress-cap-rate-16mib"],
+    "scenarios": [
+      "19-egress-cap-rate-1mib",
+      "20-egress-cap-rate-4mib",
+      "21-egress-cap-rate-16mib"
+    ],
     "docker_host": "Docker Desktop, engine 29.9.3, linuxkit kernel 7.0.14, 18 vCPU, 55 GiB",
     "store": "the lab MinIO (vtop-minio:RELEASE.2025-09-07T16-13-09Z, built from docker/minio) on the compose network, unshaped; engine in vtop-bench-engine (ubuntu:26.04), runner_mode container",
     "run_root": "a macOS directory bind-mounted into the runner and engine containers (Docker Desktop file sharing)",
@@ -23,11 +27,19 @@
     "scrape_latency_max_seconds": 0.005292
   },
   "competitor_runs": {
-    "scenarios": ["22-competing-flow-bulk-uncapped", "23-competing-flow-bulk-capped"],
+    "scenarios": [
+      "22-competing-flow-bulk-uncapped",
+      "23-competing-flow-bulk-capped"
+    ],
     "why_not_docker_desktop": "Docker Desktop's linuxkit kernel is built without CONFIG_IFB, and the netem middlebox shapes the upload on an ifb device: `ip link add ifb0 type ifb` answers 'Unknown device type'. The netem lab cannot run on it.",
     "docker_host": "a dedicated Lima 2.3.0 VM (vz, 6 vCPU, 8 GiB) running Ubuntu 24.04.5 LTS, kernel 6.8.0-142-generic (ifb available), Docker 29.9.3; no other containers in it. The VM shares the Mac with Docker Desktop and its unrelated containers, and with other VMs.",
     "lab_images": "the same image IDs as the rate runs, copied with docker save/load; nicolaka/netshoot:v0.16 (iperf 3.21)",
     "run_root": "a directory on the VM's own disk",
-    "link": "netem: 100 ms round trip, no jitter, no loss, 10000 kbit/s tbf bottleneck at 1.0 BDP; competitor bulk:60"
-  }
+    "link": "netem: 100 ms round trip, no jitter, no loss, 10000 kbit/s tbf bottleneck at 1.0 BDP; competitor bulk:60",
+    "sessions": {
+      "first": "the VM described above, at bulk:60 / duration 150; deleted after the session. Its uncapped run is kept in competitor/ and as history in competitor_pair.json",
+      "second": "the pair in competitor_pair.json. A new Lima 2.3.0 VM from the same configuration (vz, 6 vCPU, 8 GiB, Ubuntu 24.04.5 LTS, kernel 6.8.0-142-generic, Docker 29.9.3), the same image IDs loaded with docker save/load (vtop-minio 6fe0199af114, netshoot:v0.16 b09d9b21381f, iperf 3.21; ubuntu:26.04 6a06111c3b0a), the same engine binary (sha256 above), the harness at this branch's commit that leaves the competitor's final interval line out of the window placement, scenarios 22/23 at bulk:120 / duration 300. Only the lab's containers ran in the VM; the Mac also ran Docker Desktop with about 10 unrelated containers and the stopped VMs of other projects."
+    }
+  },
+  "stream_placement_probe": "stream_placement/: which competitor interval lines are late on a shaped link, measured on Docker Desktop with netem on container veths (not the lab middlebox)"
 }

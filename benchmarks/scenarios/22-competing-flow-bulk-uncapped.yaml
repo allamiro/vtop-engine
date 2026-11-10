@@ -29,7 +29,7 @@ shaping_latency_ms: 100
 shaping_jitter_ms: 0
 shaping_bottleneck_kbps: 10000
 shaping_buffer_bdp: 1.0
-shaping_competitor: "bulk:60"
+shaping_competitor: "bulk:120"
 # About eight 1 MiB batches per cycle, all in flight at the shipped default
 # width: eight connections against the competitor's one.
 batch_max_records: 100000
@@ -38,11 +38,15 @@ batch_max_age_seconds: 5
 max_concurrent_batches: 8
 # Each cycle re-seeds the original volume, so every cycle offers the same
 # ~8 MB. Uncapped, a cycle is about the time the link takes to drain it beside
-# the competitor (23 s measured); capped at 256 KiB/s it is about 31 s, so the
-# 60 s contended window can wholly contain a cycle in both runs (scenario 18
-# explains why it must).
+# the competitor (23 s measured); capped at 256 KiB/s it measured about 40 s.
+# The window is 120 s, not 60: the contended window opens a few seconds into
+# the first cycle, so that cycle always straddles its opening and a 60 s window
+# has to wholly contain the SECOND one. Two capped attempts at bulk:60 were
+# refused for exactly that (no engine cycle wholly inside the window; both
+# cycles that overlapped it crossed an edge). Both halves of the pair use the same
+# window, and scenario 18 explains why a whole cycle must fit.
 backlog_multiplier: 1.0
 seed_concurrently: false
-duration_seconds: 150
+duration_seconds: 300
 fault: none
 sys_sample_interval: 2.0
