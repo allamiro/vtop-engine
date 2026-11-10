@@ -464,3 +464,445 @@ async fn commit_advances_progress_for_a_new_consumer() {
          take effect, which would mean duplicate archiving"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #614: a stale engine's offset commit. The adapter reads with assign(), so its
+// commit carries no group generation and Kafka accepts it from an engine whose
+// claim on the batch has moved on. These tests make that commit for real and
+// then restart an engine on the ledger, which is what decides where it reads.
+// ---------------------------------------------------------------------------
+
+/// A NEW single-partition topic holding `records` records at offsets
+/// `0..records`, so every offset a test names is exact.
+async fn fresh_topic(tag: &str, records: usize) -> String {
+    use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+    use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let topic = format!("it_{tag}_{nanos}");
+    let admin: AdminClient<_> = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-admin"))
+        .unwrap()
+        .create()
+        .expect("admin client");
+    admin
+        .create_topics(
+            &[NewTopic::new(&topic, 1, TopicReplication::Fixed(1))],
+            &AdminOptions::new(),
+        )
+        .await
+        .expect("create_topics call failed")
+        .pop()
+        .expect("one topic result")
+        .expect("topic creation failed");
+    let producer: BaseProducer = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-producer"))
+        .unwrap()
+        .create()
+        .expect("producer");
+    for i in 0..records {
+        let payload = format!("CEF:0|VTOP|IT|1.0|{i}|StaleCommit|3|src=10.0.0.{}", i % 250);
+        producer
+            .send(BaseRecord::<(), str>::to(&topic).payload(&payload))
+            .expect("enqueue produce");
+    }
+    producer
+        .flush(std::time::Duration::from_secs(10))
+        .expect("flush produce");
+    topic
+}
+
+fn kafka_marker(topic: &str, group: &str, start: i64, end: i64) -> ProgressMarker {
+    ProgressMarker::Kafka {
+        topic: topic.into(),
+        partition: 0,
+        start_offset: start,
+        end_offset: end,
+        consumer_group: group.into(),
+    }
+}
+
+/// Put a batch for `[start, end]` into the ledger the way the engine moves it:
+/// every step of the legal walk up to VERIFIED, then either committed, or sent
+/// back for replay as recovery does when a re-check of the stored object
+/// fails (FAILED, then REPLAY_REQUIRED).
+async fn ledger_batch(
+    store: &dyn vtop_state::StateStore,
+    id: &str,
+    topic: &str,
+    group: &str,
+    (start, end): (i64, i64),
+    committed: bool,
+) {
+    use vtop_core::state_machine::BatchState;
+    let now = chrono::Utc::now().to_rfc3339();
+    store
+        .save_batch_state(&vtop_state::BatchRecord {
+            batch_id: id.into(),
+            tenant: "default".into(),
+            source_type: vtop_core::types::SourceType::Kafka,
+            source_name: topic.into(),
+            format: TelemetryFormat::Raw,
+            state: BatchState::Batching,
+            progress_start: kafka_marker(topic, group, start, start),
+            progress_end: kafka_marker(topic, group, start, end),
+            object_uri: None,
+            manifest_uri: None,
+            object_sha256: None,
+            manifest_sha256: None,
+            manifest_version_id: None,
+            object_size_bytes: None,
+            record_count: Some(end - start + 1),
+            error_message: None,
+            owner: None,
+            lease_expires_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    for st in [
+        BatchState::Sealed,
+        BatchState::Compressed,
+        BatchState::Checksummed,
+        BatchState::ObjectUploaded,
+        BatchState::ManifestUploaded,
+        BatchState::Verified,
+    ] {
+        store
+            .update_batch_state(id, st, &vtop_state::BatchPatch::default())
+            .await
+            .unwrap();
+    }
+    if committed {
+        store.mark_source_committed(id).await.unwrap();
+    } else {
+        store
+            .mark_failed(id, "re-check of the stored object failed")
+            .await
+            .unwrap();
+        store
+            .update_batch_state(
+                id,
+                BatchState::ReplayRequired,
+                &vtop_state::BatchPatch::default(),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// What engine A does when it resumes after its claim moved on: commit the
+/// offset after ITS batch's range to the group. Returns the group's committed
+/// offset as the broker reports it afterwards, which proves Kafka accepted it.
+async fn stale_commit(topic: &str, group: &str, end: i64) -> i64 {
+    let mut a = KafkaSource::new(kafka_cfg(&bootstrap(), group), TelemetryFormat::Raw).unwrap();
+    a.commit_progress(&kafka_marker(topic, group, 0, end))
+        .await
+        .expect("Kafka refused the stale commit; the premise of #614 no longer holds");
+    group_offset(topic, group)
+}
+
+/// The group's committed offset for partition 0 of `topic`, from the broker.
+fn group_offset(topic: &str, group: &str) -> i64 {
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use rdkafka::topic_partition_list::TopicPartitionList;
+
+    let probe: BaseConsumer = build_client_config(&kafka_cfg(&bootstrap(), group))
+        .unwrap()
+        .create()
+        .unwrap();
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition(topic, 0);
+    let committed = probe
+        .committed_offsets(tpl, std::time::Duration::from_secs(10))
+        .expect("read the group's committed offset");
+    match committed.find_partition(topic, 0).map(|e| e.offset()) {
+        Some(rdkafka::Offset::Offset(at)) => at,
+        other => panic!("the group has no committed offset: {other:?}"),
+    }
+}
+
+/// An engine B on `db` reading only `topic` as `group`: recover (the restart),
+/// then run passes until it has committed a batch the ledger did not hold, and
+/// return the start offsets of the batches it committed, lowest first.
+async fn restart_and_read(db: &str, work: &std::path::Path, topic: &str, group: &str) -> Vec<i64> {
+    let mut engine = engine_on(db, work, topic, group).await;
+    engine.recover().await.expect("recovery");
+    read_until_a_new_commit(&mut engine).await
+}
+
+/// An engine on `db` that reads only `topic`, as `group`, into the mock store.
+async fn engine_on(db: &str, work: &std::path::Path, topic: &str, group: &str) -> vtop_cli::Engine {
+    let mut cfg = vtop_cli::testkit::file_config(work.to_str().unwrap(), db, vec![], "mock");
+    cfg.sources.file = None;
+    let mut kafka = kafka_cfg(&bootstrap(), group);
+    kafka.topic_include_regex = format!("^{topic}$");
+    cfg.sources.kafka = Some(kafka);
+    cfg.batching.source_poll_wait_ms = 2_000;
+    vtop_cli::Engine::new(cfg, vtop_core::config::StreamsConfig { streams: vec![] })
+        .await
+        .expect("engine B starts")
+}
+
+/// Run passes until `engine` commits a batch the ledger did not hold before;
+/// the start offsets of the new committed batches, lowest first.
+async fn read_until_a_new_commit(engine: &mut vtop_cli::Engine) -> Vec<i64> {
+    use vtop_core::state_machine::BatchState;
+    let ledger_ids: std::collections::HashSet<String> = engine
+        .store
+        .list_batches()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|b| b.batch_id)
+        .collect();
+    for _ in 0..15 {
+        engine
+            .process_once(vtop_core::types::SourceType::Kafka)
+            .await
+            .expect("a read pass");
+        let mut starts: Vec<i64> = engine
+            .store
+            .list_batches()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.state == BatchState::SourceCommitted && !ledger_ids.contains(&b.batch_id))
+            .map(|b| match b.progress_start {
+                ProgressMarker::Kafka { start_offset, .. } => start_offset,
+                other => panic!("a Kafka batch carries a Kafka marker: {other:?}"),
+            })
+            .collect();
+        if !starts.is_empty() {
+            starts.sort_unstable();
+            return starts;
+        }
+    }
+    panic!("engine B committed nothing in 15 passes over a topic with unread records");
+}
+
+/// #614, the confirmed consequence. Engine B has archived and committed
+/// `[0, 19]`; engine A, which lost its claim on the batch `[0, 4]`, then
+/// commits offset 5. Kafka accepts it - the group's offset goes BACKWARDS - but
+/// a restarted engine reads on from the ledger's 20, not from the group's 5.
+///
+/// Against the code before #614 this fails: the restart resumed from the
+/// group's offset and archived `[5, 19]` again.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_stale_commit_behind_the_ledger_does_not_move_where_a_restart_reads() {
+    let topic = fresh_topic("stale_back", 40).await;
+    let group = unique_group("stale-back");
+    let dir = tempfile::tempdir().unwrap();
+    let db = format!("sqlite://{}", dir.path().join("state.db").display());
+    {
+        let store = vtop_state::SqliteStateStore::connect(&db).await.unwrap();
+        ledger_batch(&store, "b-0-19", &topic, &group, (0, 19), true).await;
+    }
+    assert_eq!(
+        stale_commit(&topic, &group, 4).await,
+        5,
+        "precondition: Kafka took the stale commit and moved the group's offset back"
+    );
+
+    let starts = restart_and_read(&db, &dir.path().join("work"), &topic, &group).await;
+    assert_eq!(
+        starts[0], 20,
+        "the restart read from offset {} - the stale group offset decided, not the ledger, \
+         and records the ledger holds as archived were archived again (committed starts: \
+         {starts:?})",
+        starts[0]
+    );
+}
+
+/// #614, the open question: can a stale commit move the offset FORWARD past a
+/// range that is not intact? On Kafka's side, yes. Engine B committed `[0, 9]`,
+/// re-checked engine A's verified batch `[10, 19]`, found its object damaged
+/// and sent it back for replay (REPLAY_REQUIRED). A then resumes and commits
+/// offset 20 for that batch, and Kafka accepts it. Before #614 the restart's
+/// rewind to 10 was clamped to the group's 20 and `[10, 19]` was never
+/// archived. With the ledger deciding, the range is re-read.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_stale_commit_past_a_range_sent_back_for_replay_does_not_skip_it() {
+    let topic = fresh_topic("stale_fwd", 40).await;
+    let group = unique_group("stale-fwd");
+    let dir = tempfile::tempdir().unwrap();
+    let db = format!("sqlite://{}", dir.path().join("state.db").display());
+    {
+        let store = vtop_state::SqliteStateStore::connect(&db).await.unwrap();
+        ledger_batch(&store, "b-0-9", &topic, &group, (0, 9), true).await;
+        ledger_batch(&store, "b-10-19", &topic, &group, (10, 19), false).await;
+    }
+    assert_eq!(
+        stale_commit(&topic, &group, 19).await,
+        20,
+        "precondition: Kafka took the stale commit and moved the group's offset past [10, 19]"
+    );
+
+    let starts = restart_and_read(&db, &dir.path().join("work"), &topic, &group).await;
+    assert_eq!(
+        starts[0], 10,
+        "the restart read from offset {} - a range sent back for replay was skipped because \
+         a stale commit moved the group's offset past it (committed starts: {starts:?})",
+        starts[0]
+    );
+}
+
+/// #614 with ONE engine, no stale engine involved. Batch `[0, 9]` reached
+/// VERIFIED but its Kafka commit failed, so it stayed VERIFIED; the next batch
+/// `[10, 19]` committed (the group's offset went to 20). On restart recovery
+/// re-checks `[0, 9]` against storage and commits it. Before #614 that commit
+/// was sent to Kafka and moved the group's offset BACK to 10, and the restart
+/// read `[10, 19]` again. Now the range is recorded SOURCE_COMMITTED as
+/// superseded, the group's offset stays at 20, and reading resumes at 20.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn recovering_an_older_verified_batch_does_not_move_the_group_offset_back() {
+    use vtop_core::manifest::ManifestBuilder;
+    use vtop_core::state_machine::BatchState;
+    use vtop_core::types::{CompressionType, SourceType};
+    use vtop_state::StateStore;
+
+    let topic = fresh_topic("superseded", 40).await;
+    let group = unique_group("superseded");
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let db = format!("sqlite://{}", dir.path().join("state.db").display());
+
+    // The VERIFIED batch [0, 9]: an object and a manifest the re-check will
+    // find intact.
+    let marker = kafka_marker(&topic, &group, 0, 9);
+    let object_uri = "s3://telemetry-data/x/b-0-9.raw.gz";
+    let manifest_uri = "s3://telemetry-data/x/b-0-9.manifest.json";
+    let object_bytes = b"archived-bytes";
+    let object_digest = vtop_core::checksum::sha256_bytes(object_bytes);
+    let manifest = ManifestBuilder {
+        batch_id: "b-0-9".into(),
+        tenant: "default".into(),
+        source_type: SourceType::Kafka,
+        source_name: topic.clone(),
+        format: TelemetryFormat::Raw,
+        compression: CompressionType::None,
+        record_count: 10,
+        first_timestamp: None,
+        last_timestamp: None,
+        source_progress: marker.clone(),
+        object_uri: object_uri.into(),
+        object_size: object_bytes.len() as u64,
+        object_checksum_algorithm: "sha256".into(),
+        object_checksum: object_digest.clone(),
+        manifest_uri: manifest_uri.into(),
+        path_template: "test".into(),
+        resolved_prefix: "x".into(),
+        upload_backend: "mock".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    }
+    .build()
+    .unwrap();
+    let manifest_path = manifest.write_to_file(&work).unwrap();
+    {
+        let store = vtop_state::SqliteStateStore::connect(&db).await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .save_batch_state(&vtop_state::BatchRecord {
+                batch_id: "b-0-9".into(),
+                tenant: "default".into(),
+                source_type: SourceType::Kafka,
+                source_name: topic.clone(),
+                format: TelemetryFormat::Raw,
+                state: BatchState::Batching,
+                progress_start: kafka_marker(&topic, &group, 0, 0),
+                progress_end: marker,
+                object_uri: Some(object_uri.into()),
+                manifest_uri: Some(manifest_uri.into()),
+                object_sha256: Some(object_digest.clone()),
+                manifest_sha256: Some(manifest.manifest.sha256.clone()),
+                manifest_version_id: None,
+                object_size_bytes: Some(object_bytes.len() as i64),
+                record_count: Some(10),
+                error_message: None,
+                owner: None,
+                lease_expires_at: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        for st in [
+            BatchState::Sealed,
+            BatchState::Compressed,
+            BatchState::Checksummed,
+            BatchState::ObjectUploaded,
+            BatchState::ManifestUploaded,
+            BatchState::Verified,
+        ] {
+            store
+                .update_batch_state("b-0-9", st, &vtop_state::BatchPatch::default())
+                .await
+                .unwrap();
+        }
+        // The next batch, read after it and committed - Kafka's offset with it.
+        ledger_batch(&store, "b-10-19", &topic, &group, (10, 19), true).await;
+    }
+    assert_eq!(
+        stale_commit(&topic, &group, 19).await,
+        20,
+        "precondition: the later batch's commit put the group at 20"
+    );
+
+    let mut engine = engine_on(&db, &work, &topic, &group).await;
+    let staged = dir.path().join("staged-object");
+    std::fs::write(&staged, object_bytes).unwrap();
+    engine
+        .backend
+        .put_object(
+            &staged,
+            object_uri,
+            Some(vtop_upload::ObjectChecksum::new("sha256", &object_digest)),
+        )
+        .await
+        .unwrap();
+    engine
+        .backend
+        .put_manifest(
+            &manifest_path,
+            manifest_uri,
+            Some(vtop_upload::ObjectChecksum::new(
+                "sha256",
+                &manifest.manifest.sha256,
+            )),
+        )
+        .await
+        .unwrap();
+    let summary = engine.recover().await.expect("recovery");
+    assert_eq!(
+        summary.committed, 1,
+        "the VERIFIED batch is committed: {summary:?}"
+    );
+    assert_eq!(
+        engine
+            .store
+            .get_batch("b-0-9")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        BatchState::SourceCommitted
+    );
+    assert_eq!(
+        group_offset(&topic, &group),
+        20,
+        "recovery's commit of the older range moved the group's offset backwards"
+    );
+    let starts = read_until_a_new_commit(&mut engine).await;
+    assert_eq!(
+        starts[0], 20,
+        "the restart read from offset {} - recovering an older batch moved where this \
+         engine resumes, and archived records were read again (committed starts: {starts:?})",
+        starts[0]
+    );
+}

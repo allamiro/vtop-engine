@@ -10,7 +10,9 @@
 //! trait (Phase 1 of the HA plan). The Postgres implementation (Phase 3) lives
 //! behind a Cargo feature and implements the same trait.
 
-use crate::models::{parse_content_fingerprint, BatchPatch, BatchRecord, CommittedCursor};
+use crate::models::{
+    parse_content_fingerprint, BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset,
+};
 use crate::store::StateStore;
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -80,6 +82,20 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
 /// offset instead, and after a rotation or a copytruncate that is the old
 /// content's row: pruning deleted the restart cursor (review of #564).
 ///
+/// A Kafka row's successor must also be of its partition and consumer group:
+/// those rows are where the partition resumes (#614), and a topic's newest
+/// row on another partition says nothing about this one. Neither field exists
+/// on a file or spool marker, and `IS` compares the two NULLs as equal, so
+/// those rows are grouped by path alone, as before. The two comparisons
+/// filter the rows the index range seek finds; they do not replace it.
+///
+/// "Newer" is a row-value comparison on `(created_at, batch_id)`: the same
+/// order as `created_at >, or equal and batch_id >`, written so the planner
+/// can serve it as a range on the index's last two columns. With the OR form,
+/// adding the two comparisons above tipped SQLite onto
+/// `idx_batches_commit_cursor`, which seeks on the path only, and the plan
+/// test below caught it.
+///
 /// The successor probe expressions must stay textually identical to the
 /// `idx_batches_commit_newest` expressions above: SQLite matches expression
 /// indexes structurally, and without the index every candidate row rescans
@@ -93,8 +109,11 @@ macro_rules! prune_predicate_sql {
                   AND n.source_type = b.source_type \
                   AND COALESCE(json_extract(n.progress_end_json, '$.path'), n.source_name) \
                       = COALESCE(json_extract(b.progress_end_json, '$.path'), b.source_name) \
-                  AND (n.created_at > b.created_at \
-                       OR (n.created_at = b.created_at AND n.batch_id > b.batch_id)) \
+                  AND json_extract(n.progress_end_json, '$.partition') \
+                      IS json_extract(b.progress_end_json, '$.partition') \
+                  AND json_extract(n.progress_end_json, '$.consumer_group') \
+                      IS json_extract(b.progress_end_json, '$.consumer_group') \
+                  AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
               )"
     };
 }
@@ -375,6 +394,48 @@ impl StateStore for SqliteStateStore {
             .await
             .map_err(map_sqlx)?;
         row.map(row_to_record).transpose()
+    }
+
+    async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
+        // Aggregated in SQL (#77): per (topic, partition, consumer group), the
+        // NEWEST committed row's end offset, in the order `committed_cursors`
+        // and pruning use - so the row read here always survives a prune.
+        let rows = sqlx::query(
+            "WITH committed AS ( \
+                 SELECT json_extract(progress_end_json, '$.topic') AS topic, \
+                        CAST(json_extract(progress_end_json, '$.partition') AS INTEGER) AS part, \
+                        json_extract(progress_end_json, '$.consumer_group') AS grp, \
+                        CAST(json_extract(progress_end_json, '$.end_offset') AS INTEGER) AS end_offset, \
+                        created_at, batch_id \
+                 FROM batches WHERE state = ? AND source_type = ? \
+             ), latest AS ( \
+                 SELECT topic, part, grp, end_offset, ROW_NUMBER() OVER ( \
+                            PARTITION BY topic, part, grp \
+                            ORDER BY created_at DESC, batch_id DESC) AS rn \
+                 FROM committed \
+             ) \
+             SELECT topic, part, grp, end_offset FROM latest WHERE rn = 1",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(SourceType::Kafka.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let topic: Option<String> = r.get("topic");
+                let partition: Option<i64> = r.get("part");
+                let group: Option<String> = r.get("grp");
+                let end: Option<i64> = r.get("end_offset");
+                Some(CommittedKafkaOffset {
+                    topic: topic?,
+                    partition: i32::try_from(partition?).ok()?,
+                    consumer_group: group?,
+                    end_offset: end?,
+                })
+            })
+            .collect())
     }
 
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {

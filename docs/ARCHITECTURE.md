@@ -240,10 +240,18 @@ is a real and silent condition.
 (`kafka_source.rs`). It reaches that default by two different routes, and both
 end the same way:
 
-- **After a restart** — a fresh process has no in-memory cursor, so the
-  partition is assigned at `Offset::Stored` and librdkafka resolves it from the
-  committed offset, or from `auto.offset.reset` when that offset no longer
-  exists.
+- **After a restart** — a fresh process has no in-memory cursor. A partition
+  the ledger holds a committed batch for resumes after that batch's last
+  offset (the newest committed batch of that topic, partition and consumer
+  group), not at the group's committed offset: the offset commit carries no
+  group generation, so Kafka accepts it from an engine whose claim on the
+  batch has moved on, and only the ledger's commit is fenced (#614). The
+  group's offset is still committed, for lag monitoring. Every other
+  partition — a fresh store, no committed batch yet, or a group that has no
+  committed offset for it (deleting a topic deletes its group offsets, and the
+  ledger cannot tell a recreated topic from the old one) — is assigned at
+  `Offset::Stored`, and librdkafka resolves it from the committed offset, or
+  from `auto.offset.reset` when that offset no longer exists.
 - **While still running** — the assignment is sticky and ordinary lag does not
   seek at all; the pass seeks only where the desired offset diverges from what
   librdkafka would deliver next. A consumer that simply falls behind therefore
@@ -540,7 +548,7 @@ On startup, the `replay` module inspects `vtop-state` and maps each incomplete b
 
    A `VERIFIED` row is committed only after that, and not at all while a range of the same source unit that **starts below it** is about to be re-read: a commit moves the unit's committed point to the end of the committed range, the file adapters clamp a rewind to the committed point, and a `VERIFIED` range archives only its own bytes — so pending bytes below its start would be skipped. Such a row stays `VERIFIED` (its object is in the archive) until a later pass commits it. A `VERIFIED` row that starts where the pending range starts — the object that replaced a stale row for the same bytes — commits normally. A marker with no inode (a legacy row) is compared against every inode at its path.
 
-   **A rewind never goes below what the source has already committed.** The file and spool adapters have always clamped to their committed byte; the Kafka adapter now clamps to the consumer group's committed offset, asked of the broker, so a stale `FAILED` row left behind by a failure that has since been repaired no longer rewinds the group to its start and re-archives everything since on each restart. The stale rows themselves stay in the ledger and are re-visited at every restart (a no-op rewind and a ledger write each); retiring them needs a new durable state and is tracked in #567.
+   **A rewind never goes below what the source has already committed.** The file and spool adapters have always clamped to their committed byte; the Kafka adapter clamps to the ledger's committed frontier for the partition (its newest committed batch, or what the process committed since it started), and asks the broker for the consumer group's committed offset only for a partition it knows neither of (#614) — a stale engine's commit can move the group's offset past a range recovery is about to re-read, and clamping to it skipped that range for good. Either way, a stale `FAILED` row left behind by a failure that has since been repaired no longer rewinds the group to its start and re-archives everything since on each restart. The stale rows themselves stay in the ledger and are re-visited at every restart (a no-op rewind and a ledger write each); retiring them needs a new durable state and is tracked in #567.
 3. Replay currently produces a **new** object key: the `batch_id` is derived from wall-clock time plus a random suffix, and the `year/…/hour` path components from the replayed batch's own partition time (§11, `partitioning.time_source`) - under `seal`, the hour the replay was sealed in, so a replay of yesterday's range is filed under today; under `event`, the earliest record time, so a Kafka replay usually lands in the original hour but under a new key. Either way a replayed batch writes a duplicate object (at-least-once, no data loss). Protocol §14/§15.1/§16 specify deterministic naming so that replay is idempotent — this is the open gap tracked as [PRODUCTION_HA.md](PRODUCTION_HA.md) Phase 4.
 4. A state/storage mismatch (e.g., an object present but unverified) is resolved by re-verifying or re-uploading **before** any commit.
 5. **The same rule holds while the engine is running.** Adapters advance their read position when they *read*, not when a batch commits, so a batch that fails (or errors before `VERIFIED`) is handed back to its source at the end of the cycle that failed it, not at the next restart. Otherwise the next cycle reads on from the end of the failed range and the first later range to verify commits past it, leaving those bytes unarchived (#552). A cycle in which a batch failed waits before reading again — the idle interval, doubling per consecutive failing cycle up to a minute, plus jitter — because the failed range is now read again and a tight loop would hammer a store that is down.

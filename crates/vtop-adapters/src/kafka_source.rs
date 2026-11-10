@@ -62,16 +62,42 @@ const RETENTION_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 /// Where a rewind to `start_offset` should actually land.
 ///
-/// The consumer group's committed offset is the frontier everything below which
-/// is archived: it is only ever advanced after a batch is VERIFIED. A rewind
-/// below it would re-read, and re-archive, records that are already safe, and
-/// recovery asks for exactly that on every restart for a ledger row that a
-/// later batch has long since superseded. So a rewind never moves below the
-/// committed frontier, the same rule the file and spool adapters apply to
-/// their committed byte. When the frontier is not known (the broker could not
-/// be asked) the requested start is used unchanged.
-fn clamp_rewind(start_offset: i64, group_committed: Option<i64>) -> i64 {
-    group_committed.map_or(start_offset, |committed| start_offset.max(committed))
+/// The committed frontier is the offset everything below which is archived. A
+/// rewind below it would re-read, and re-archive, records that are already
+/// safe, and recovery asks for exactly that on every restart for a ledger row
+/// that a later batch has long since superseded. So a rewind never moves below
+/// the committed frontier, the same rule the file and spool adapters apply to
+/// their committed byte. When the frontier is not known the requested start is
+/// used unchanged.
+fn clamp_rewind(start_offset: i64, frontier: Option<i64>) -> i64 {
+    frontier.map_or(start_offset, |committed| start_offset.max(committed))
+}
+
+/// The committed frontier a rewind is clamped to (#614).
+///
+/// `known` is what the ledger recorded for this partition and group, or what
+/// this process committed since it started; `in_memory` is the cursor's own
+/// committed position. When either is there, the broker is not consulted: the
+/// group's committed offset is written by any engine that reaches
+/// `commit_progress`, including one whose claim on the batch has moved on, and
+/// Kafka cannot refuse it (the adapter reads with `assign()`, so the commit
+/// carries no group generation). A stale commit that lands AHEAD of a range
+/// recovery is about to re-read would clamp that rewind past the range, and
+/// the range would never be archived: the clamp must come from the fenced
+/// ledger, not from the broker.
+///
+/// Only a partition this process knows nothing about - no committed row in the
+/// ledger, nothing committed this session - falls back to the broker, as
+/// every partition did before.
+fn rewind_frontier(known: Option<i64>, in_memory: Option<i64>, broker: Option<i64>) -> Option<i64> {
+    match (known, in_memory) {
+        (Some(k), Some(m)) => Some(k.max(m)),
+        (Some(k), None) => Some(k),
+        (None, m) => match (broker, m) {
+            (Some(b), Some(m)) => Some(b.max(m)),
+            (b, m) => b.or(m),
+        },
+    }
 }
 
 /// Records that retention removed between where this cursor wanted to resume
@@ -341,6 +367,12 @@ pub struct KafkaSource {
     consumer: Option<BaseConsumer>,
     // key: (topic, partition)
     cursors: HashMap<(String, i32), PartitionCursor>,
+    /// Where each partition resumes according to the LEDGER, for this
+    /// consumer group: seeded from its committed rows at startup
+    /// (`seed_committed_from_ledger`) and raised by every commit this process
+    /// makes (#614). A partition in here never asks the broker for its
+    /// frontier (see `rewind_frontier`).
+    known_committed: HashMap<(String, i32), i64>,
     /// The (topic, partition) set currently assigned on the consumer, sorted.
     ///
     /// Assignment is STICKY: calling assign() resets librdkafka's fetchers,
@@ -420,6 +452,7 @@ impl KafkaSource {
             exclude,
             consumer: None,
             cursors: HashMap::new(),
+            known_committed: HashMap::new(),
             assigned: Vec::new(),
             delivered: HashMap::new(),
             last_retention_check: None,
@@ -564,6 +597,95 @@ impl KafkaSource {
                 records,
             })
             .collect()
+    }
+
+    /// Resume each partition where the LEDGER says it was committed, not where
+    /// the consumer group's committed offset on the broker says (#614).
+    ///
+    /// `committed` is the ledger's newest committed batch per (topic,
+    /// partition, consumer group), as `(topic, partition, consumer_group,
+    /// end_offset)`. Rows of another consumer group are ignored: this group
+    /// resumes from its own progress, as `foreign_group` requires (#563).
+    ///
+    /// Why not the group's committed offset: the adapter reads with
+    /// `assign()`, so it is never a group member and its commits carry no
+    /// generation Kafka could check. An engine that stalled past its claim
+    /// and resumed can still commit, after the batch was reclaimed and
+    /// committed further by another engine - Kafka accepts it, and only the
+    /// ledger's write is fenced (#557). Resuming from the broker then
+    /// re-reads everything after the stale offset, or, if the stale offset is
+    /// ahead of a range that failed its re-check, skips that range for good.
+    /// The ledger records only commits whose claim was still held, so neither
+    /// can happen when it decides. The group's offset is still committed, for
+    /// lag monitoring.
+    ///
+    /// The ledger is NOT trusted for a partition whose group has no committed
+    /// offset at all (or when the broker cannot be asked): that partition
+    /// follows `auto.offset.reset`, exactly as before. Deleting a topic
+    /// deletes its group offsets, and the ledger, which names topics and not
+    /// topic ids, cannot tell a recreated topic from the old one - its
+    /// offset would skip the new topic's first records. A stale commit cannot
+    /// cause this case: it would create an offset, not remove one.
+    ///
+    /// Call before any read. A partition this process has already read or
+    /// committed keeps its in-memory position.
+    pub fn seed_committed_from_ledger<'a>(
+        &mut self,
+        committed: impl IntoIterator<Item = (&'a str, i32, &'a str, i64)>,
+    ) {
+        let own: Vec<((String, i32), i64)> = committed
+            .into_iter()
+            .filter(|(_, _, group, _)| *group == self.cfg.consumer_group)
+            .map(|(topic, partition, _, end)| ((topic.to_owned(), partition), end))
+            .collect();
+        if own.is_empty() {
+            return;
+        }
+        let partitions: Vec<(String, i32)> = own.iter().map(|(key, _)| key.clone()).collect();
+        let broker = self.group_committed_offsets(&partitions);
+        for ((topic, partition), end) in own {
+            let resume_at = end.saturating_add(1);
+            let key = (topic, partition);
+            let Some(&group_at) = broker.get(&key) else {
+                tracing::warn!(
+                    topic = %key.0,
+                    partition,
+                    ledger_resume_at = resume_at,
+                    group = %self.cfg.consumer_group,
+                    "the ledger has a resume point for this partition, but the consumer group has \
+                     no committed offset for it (or the broker could not be asked): following \
+                     auto.offset.reset, because a deleted and recreated topic looks exactly like \
+                     this and the ledger's offset would skip its first records"
+                );
+                continue;
+            };
+            if group_at < resume_at {
+                tracing::warn!(
+                    topic = %key.0,
+                    partition,
+                    ledger_resume_at = resume_at,
+                    group_committed = group_at,
+                    "the consumer group's committed offset is BEHIND the ledger (a commit the \
+                     ledger did not accept, or an older range committed after a newer one): \
+                     resuming from the ledger instead of re-reading archived records"
+                );
+            } else if group_at > resume_at {
+                tracing::info!(
+                    topic = %key.0,
+                    partition,
+                    ledger_resume_at = resume_at,
+                    group_committed = group_at,
+                    "the consumer group's committed offset is ahead of the ledger (a commit whose \
+                     ledger write did not land): resuming from the ledger; recovery decides the \
+                     range in between"
+                );
+            }
+            self.known_committed.insert(key.clone(), resume_at);
+            let cur = self.cursors.entry(key).or_default();
+            if cur.last_read_offset.is_none() && cur.committed_offset.is_none() {
+                cur.committed_offset = Some(resume_at);
+            }
+        }
     }
 
     /// The marker's consumer group, when it is not the one this adapter
@@ -808,12 +930,17 @@ impl SourceAdapter for KafkaSource {
                     // Continue from our in-session read head.
                     Some(lr) => Offset::Offset(lr + 1),
                     None => match cur.committed_offset {
-                        // Resume from a position we committed this session.
+                        // Resume from a position we committed this session,
+                        // a rewind, or the ledger's resume point (#614).
                         Some(c) => Offset::Offset(c),
                         // Nothing in memory (fresh process / first read for
                         // this partition): resolve the GROUP'S COMMITTED offset
                         // from the broker, falling back to `auto.offset.reset`
-                        // when the group has never committed.
+                        // when the group has never committed. Only a partition
+                        // the ledger did not seed gets here: a fresh
+                        // deployment, a partition with no committed batch, or
+                        // one whose group offset is gone (#614,
+                        // `seed_committed_from_ledger`).
                         //
                         // This must not be Offset::Beginning: subscribe() used
                         // to resume from the committed offset implicitly, and
@@ -1190,6 +1317,32 @@ impl SourceAdapter for KafkaSource {
 
         // Committed offset is "next to read" = last consumed + 1.
         let commit_at = end_offset + 1;
+        let key = (topic.clone(), *partition);
+
+        // A range the known frontier already covers is SUPERSEDED, not
+        // committed again. One engine reaches this on its own: a batch whose
+        // Kafka commit failed stays VERIFIED with no rewind, later batches
+        // commit past it, and recovery then commits the older row - which
+        // moved the group's offset BACKWARDS, so anything that still read it
+        // (lag monitoring, a rollback to an older build) saw the archived
+        // range as unread. The frontier is the ledger's or this process's own
+        // commits (`known_committed`), never a rewind's landing. Success is
+        // reported so the row is marked SOURCE_COMMITTED: it is VERIFIED, and
+        // everything up to the frontier is committed already.
+        if let Some(&frontier) = self.known_committed.get(&key) {
+            if commit_at <= frontier {
+                tracing::info!(
+                    topic,
+                    partition,
+                    commit_at,
+                    frontier,
+                    "kafka commit skipped: the range is superseded by a later committed one, and \
+                     committing it would move the group's offset backwards"
+                );
+                return Ok(());
+            }
+        }
+
         let consumer = self.consumer()?;
         let mut tpl = TopicPartitionList::new();
         tpl.add_partition_offset(topic, *partition, Offset::Offset(commit_at))
@@ -1198,8 +1351,15 @@ impl SourceAdapter for KafkaSource {
             .commit(&tpl, rdkafka::consumer::CommitMode::Sync)
             .map_err(|e| VtopError::Source(format!("kafka commit: {e}")))?;
 
-        let cur = self.cursors.entry((topic.clone(), *partition)).or_default();
-        cur.committed_offset = Some(commit_at);
+        // What THIS process committed: the partition's frontier from now on is
+        // known here, and a stale commit by another engine must not be asked
+        // for (#614). Never lowered: a rewind can leave the cursor above a
+        // range that is committed afterwards, and where this process resumes
+        // must not go back below what it has archived.
+        let known = self.known_committed.entry(key.clone()).or_insert(commit_at);
+        *known = (*known).max(commit_at);
+        let cur = self.cursors.entry(key).or_default();
+        cur.committed_offset = Some(cur.committed_offset.map_or(commit_at, |c| c.max(commit_at)));
         tracing::info!(
             topic,
             partition,
@@ -1216,9 +1376,11 @@ impl SourceAdapter for KafkaSource {
             .unwrap_or_else(|| Err(VtopError::Source("kafka rewind produced no result".into())))
     }
 
-    /// One broker round trip for the whole batch, however many partitions it
-    /// names: each rewind is clamped to the group's committed offset (see
-    /// `clamp_rewind`), and asking per partition would cost a bounded wait each
+    /// Each rewind is clamped to the committed frontier (see `clamp_rewind`):
+    /// the ledger's, for a partition it has a committed row for (#614; see
+    /// `rewind_frontier`), and the group's committed offset otherwise. The
+    /// broker is asked in ONE round trip for the whole batch, however many
+    /// partitions it names: asking per partition would cost a bounded wait each
     /// when the broker is slow or down, stalling startup in proportion to the
     /// number of partitions being replayed.
     async fn replay_from_markers(
@@ -1234,6 +1396,7 @@ impl SourceAdapter for KafkaSource {
                 } => Some((topic.clone(), *partition)),
                 _ => None,
             })
+            .filter(|key| !self.known_committed.contains_key(key))
             .collect();
         let broker = self.group_committed_offsets(&partitions);
         markers
@@ -1273,16 +1436,16 @@ impl SourceAdapter for KafkaSource {
                 // the cursor: clear the in-memory read head and pin the resume
                 // position. The next read assigns the partition at that offset.
                 //
-                // Never below the group's committed offset: see
-                // `clamp_rewind`. The in-memory committed offset is only a
-                // lower bound of the broker's, and after a restart this
-                // process holds none of its own.
+                // Never below the committed frontier: see `clamp_rewind`, and
+                // `rewind_frontier` for why it is the ledger's and not the
+                // broker's wherever the ledger knows the partition (#614).
                 let key = (topic.clone(), *partition);
                 let in_memory = self.cursors.get(&key).and_then(|cur| cur.committed_offset);
-                let frontier = match (broker.get(&key).copied(), in_memory) {
-                    (Some(b), Some(m)) => Some(b.max(m)),
-                    (b, m) => b.or(m),
-                };
+                let frontier = rewind_frontier(
+                    self.known_committed.get(&key).copied(),
+                    in_memory,
+                    broker.get(&key).copied(),
+                );
                 let resume_at = clamp_rewind(*start_offset, frontier);
                 let cur = self.cursors.entry(key).or_default();
                 cur.last_read_offset = None;
@@ -1293,7 +1456,7 @@ impl SourceAdapter for KafkaSource {
                         partition,
                         requested = start_offset,
                         committed = resume_at,
-                        "kafka rewind clamped to the group's committed offset: the range is already archived"
+                        "kafka rewind clamped to the committed frontier: the range is already archived"
                     );
                 }
                 tracing::warn!(topic, partition, resume_at, "kafka rewound for replay");
@@ -1350,6 +1513,116 @@ mod tests {
         // Nothing known: the request is honoured.
         assert_eq!(clamp_rewind(100, None), 100);
         assert_eq!(clamp_rewind(0, Some(0)), 0);
+    }
+
+    /// #614: where the ledger knows a partition, the broker's committed offset
+    /// has no say in the frontier - in either direction. An engine whose claim
+    /// moved on can still commit it, and Kafka accepts that commit.
+    #[test]
+    fn the_ledger_decides_the_frontier_and_a_stale_group_offset_does_not() {
+        // A stale commit moved the group BACK to 5: the frontier stays at the
+        // ledger's 20, so nothing archived is read again.
+        assert_eq!(rewind_frontier(Some(20), None, Some(5)), Some(20));
+        // A stale commit moved the group FORWARD to 20, past a range at 10
+        // that recovery is about to re-read: the frontier stays at 10, so the
+        // rewind to 10 lands at 10 instead of being clamped past the range.
+        assert_eq!(rewind_frontier(Some(10), None, Some(20)), Some(10));
+        assert_eq!(
+            clamp_rewind(10, rewind_frontier(Some(10), None, Some(20))),
+            10
+        );
+        // This process's own position counts as known too.
+        assert_eq!(rewind_frontier(Some(10), Some(30), Some(99)), Some(30));
+        assert_eq!(rewind_frontier(None, Some(30), Some(5)), Some(30));
+        // A partition known nowhere falls back to the broker, as before.
+        assert_eq!(rewind_frontier(None, None, Some(7)), Some(7));
+        assert_eq!(rewind_frontier(None, None, None), None);
+    }
+
+    /// #614: a rewind of a partition the ledger knows is clamped to the
+    /// ledger's frontier, and never asks the broker (there is none here: the
+    /// test would hang on a broker round trip if it did, and a broker that
+    /// cannot be asked must not change the answer).
+    #[tokio::test]
+    async fn a_rewind_of_a_partition_the_ledger_knows_is_clamped_to_the_ledger() {
+        let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
+        src.known_committed.insert(("t".into(), 0), 20);
+        let marker = |start: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition: 0,
+            start_offset: start,
+            end_offset: start + 9,
+            consumer_group: "vtop-engine".into(),
+        };
+        // A superseded row below the ledger's frontier: already archived.
+        src.replay_from_marker(&marker(0)).await.unwrap();
+        assert_eq!(src.read_position(&marker(0)), Some(20));
+        // A range at the frontier is re-read from its first offset.
+        src.cursors.clear();
+        src.replay_from_marker(&marker(20)).await.unwrap();
+        assert_eq!(src.read_position(&marker(20)), Some(20));
+    }
+
+    /// #614, one engine on its own: a batch whose Kafka commit failed stays
+    /// VERIFIED, later batches commit past it, and recovery commits it last.
+    /// That commit is superseded - reported as done, so the row is marked
+    /// SOURCE_COMMITTED, but never sent to the broker, where it would move the
+    /// group's offset backwards. No broker exists here: sending it would fail.
+    #[tokio::test]
+    async fn a_commit_below_the_known_frontier_is_superseded_not_sent() {
+        let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
+        src.known_committed.insert(("t".into(), 0), 20);
+        let older = ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition: 0,
+            start_offset: 0,
+            end_offset: 9,
+            consumer_group: "vtop-engine".into(),
+        };
+        src.commit_progress(&older)
+            .await
+            .expect("a superseded range is committed already: success, not an error");
+        assert!(
+            src.consumer.is_none(),
+            "the superseded commit reached for the broker"
+        );
+        assert_eq!(src.known_committed[&("t".to_string(), 0)], 20);
+        assert!(
+            !src.cursors.contains_key(&("t".to_string(), 0)),
+            "a superseded commit must not move where the partition resumes"
+        );
+    }
+
+    /// #614, #563: the ledger's rows of another consumer group never seed this
+    /// group's position - and seeding nothing must not ask the broker.
+    #[test]
+    fn another_groups_ledger_rows_never_seed_this_groups_position() {
+        let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
+        src.seed_committed_from_ledger([("t", 0, "vtop-engine-old", 700)]);
+        assert!(src.known_committed.is_empty());
+        assert!(src.cursors.is_empty());
+        assert!(
+            src.consumer.is_none(),
+            "nothing to seed must not even build a consumer"
+        );
+    }
+
+    /// #614: the ledger is trusted only where the consumer group has a
+    /// committed offset. A broker that cannot be asked (none here) leaves the
+    /// partition to `auto.offset.reset`, as before, rather than guessing - a
+    /// recreated topic has no group offset and the ledger's would skip its
+    /// first records.
+    #[test]
+    fn a_ledger_position_is_not_trusted_when_the_group_offset_cannot_be_read() {
+        let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
+        src.seed_committed_from_ledger([("t", 0, "vtop-engine", 19)]);
+        assert!(src.known_committed.is_empty());
+        assert_eq!(
+            src.cursors
+                .get(&("t".to_string(), 0))
+                .and_then(|c| c.committed_offset),
+            None
+        );
     }
 
     fn cfg() -> KafkaSourceConfig {

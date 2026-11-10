@@ -332,9 +332,11 @@ Backend switching policy:
 import into the new store (or accept Kafka reprocessing for Kafka-only) → validate →
 keep the old store until validation passes (rollback path).
 
-**Why no row migration for the *Kafka* path:** resume position is broker-side
-committed offsets, so a fresh store does not lose Kafka progress (it
-re-discovers). This is the *only* path where "no migration" holds.
+**Why no row migration for the *Kafka* path:** a store with no committed
+batch for a partition resumes it from the broker-side committed offset, so a
+fresh store does not lose Kafka progress (it re-discovers). This is the *only*
+path where "no migration" holds. Once the store has committed a batch for the
+partition, the ledger decides where it resumes, not the group's offset (#614).
 
 ### 6.5 Database schema & constraints (defense in depth) **[IMPLEMENTED — with one gap]**
 
