@@ -314,9 +314,12 @@ secret reference so credentials never enter serializable config.
 ### 6.4 Backend-switching policy (NOT "no migration ever")
 The state store is a replay ledger, **but the file/syslog byte cursor lives only in
 it** (rebuilt from `SOURCE_COMMITTED` rows by `seed_committed_offsets`). The Kafka
-resume position is the ledger's too, once it holds a committed batch for the
-partition (#614); a store without one falls back to the consumer group's
-committed offset on the broker. Therefore:
+resume position is the ledger's too, but only when the store holds a committed
+batch for the partition AND the broker reports a committed offset for the
+consumer group on it (#614; ARCHITECTURE §7.1). Otherwise - a fresh store, no
+committed batch yet, no group offset, or a broker that cannot be asked at
+startup - the partition resumes at `Offset::Stored`: the group's committed
+offset, or `auto.offset.reset` when there is none. Therefore:
 
 ```text
 Backend switching policy:
@@ -340,7 +343,8 @@ keep the old store until validation passes (rollback path).
 batch for a partition resumes it from the broker-side committed offset, so a
 fresh store does not lose Kafka progress (it re-discovers). This is the *only*
 path where "no migration" holds. Once the store has committed a batch for the
-partition, the ledger decides where it resumes, not the group's offset (#614).
+partition and the group has a committed offset for it, the ledger decides where
+it resumes, not the group's offset (#614).
 
 ### 6.5 Database schema & constraints (defense in depth) **[IMPLEMENTED — with one gap]**
 
