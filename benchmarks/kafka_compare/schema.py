@@ -12,6 +12,7 @@ import csv
 import json
 import math
 import os
+import re
 from collections.abc import Iterable
 from typing import Any, NamedTuple
 
@@ -130,6 +131,21 @@ def _number(row: dict[str, str], column: str, line: int) -> float:
     return value
 
 
+# A key column is a plain decimal integer, written the way `format_value`
+# writes one: "100", never "100.0" or "1e2". The completeness check and the
+# report's cell selection both compare these as text, so a second spelling of
+# the same number would pass one and vanish from the other.
+_CANONICAL_INT = re.compile(r"^[1-9][0-9]*$")
+KEY_COLUMNS = ("record_size", "partitions", "producers", "repetition")
+
+
+def _key_int(row: dict[str, str], column: str, line: int) -> int:
+    text = row.get(column, "")
+    if not _CANONICAL_INT.match(text):
+        raise ReportRefused(f"results.csv line {line}: {column} is {text!r}, not a positive whole number")
+    return int(text)
+
+
 def read_rows(csv_path: str) -> list[dict[str, str]]:
     if not os.path.isfile(csv_path):
         raise ReportRefused(f"no results CSV at {csv_path}")
@@ -156,15 +172,21 @@ def validate_rows(rows: list[dict[str, str]]) -> None:
             raise ReportRefused(f"results.csv line {line}: unknown mode {row['mode']!r}")
         if row["status"] not in STATUSES:
             raise ReportRefused(f"results.csv line {line}: unknown status {row['status']!r}")
-        for column in ("record_size", "partitions", "producers", "repetition"):
-            _number(row, column, line)
+        for column in KEY_COLUMNS:
+            _key_int(row, column, line)
         if row["mode"] == "fixed_rate":
-            _number(row, "load_pct", line)
+            if not 0 < _key_int(row, "load_pct", line) < 100:
+                raise ReportRefused(f"results.csv line {line}: load_pct is {row['load_pct']!r}")
+            # The report reads the offered rate from any row of the cell, ok or
+            # not, so every row that carries one must hold a positive whole rate.
+            if row["offered_rate"] or row["status"] == "ok":
+                _key_int(row, "offered_rate", line)
+        elif row["load_pct"]:
+            raise ReportRefused(f"results.csv line {line}: a {row['mode']} row has load_pct {row['load_pct']!r}")
         if row["status"] == "ok":
             for column in _NUMERIC_OK[row["mode"]]:
                 _number(row, column, line)
             if row["mode"] == "fixed_rate":
-                _number(row, "offered_rate", line)
                 if row["sustained"] not in ("true", "false"):
                     raise ReportRefused(f"results.csv line {line}: sustained is {row['sustained']!r}")
         elif not row["note"].strip():
@@ -199,15 +221,71 @@ def expected_keys(matrix: dict[str, Any]) -> set[tuple]:
 
 
 def row_key(row: dict[str, str]) -> tuple:
+    """The row's matrix key. `validate_rows` has already required every key
+    column to be a canonical integer, so the key is the same text the report
+    selects cells by."""
     return (
         row["system"],
         row["mode"],
-        int(float(row["record_size"])),
-        int(float(row["partitions"])),
-        int(float(row["producers"])),
-        int(float(row["repetition"])),
-        str(int(float(row["load_pct"]))) if row["load_pct"] else "",
+        int(row["record_size"]),
+        int(row["partitions"]),
+        int(row["producers"]),
+        int(row["repetition"]),
+        row["load_pct"],
     )
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _positive_ints(matrix: dict[str, Any], key: str, upper: int | None = None) -> None:
+    values = matrix.get(key)
+    if (not isinstance(values, list) or not values
+            or any(not _is_int(v) or v < 1 or (upper is not None and v >= upper) for v in values)
+            or len(set(values)) != len(values)):
+        raise ReportRefused(f"environment.json: matrix.{key} is {values!r}, not a list of distinct positive integers")
+
+
+def check_matrix(matrix: dict[str, Any]) -> None:
+    """The recorded matrix has the shape `expected_keys` and the report rely on,
+    so a malformed one is a refusal, not a traceback."""
+    for key in ("record_sizes", "partitions", "producers"):
+        _positive_ints(matrix, key)
+    _positive_ints(matrix, "load_pcts", upper=100)
+    for key in ("repetitions", "smoke_records"):
+        if not _is_int(matrix.get(key)) or matrix[key] < 1:
+            raise ReportRefused(f"environment.json: matrix.{key} is {matrix.get(key)!r}, not a positive integer")
+    acks = matrix.get("acks")
+    if not isinstance(acks, list) or not acks or not all(isinstance(a, str) and a for a in acks):
+        raise ReportRefused(f"environment.json: matrix.acks is {acks!r}, not a list of acknowledgement modes")
+    if not isinstance(matrix.get("consume"), bool):
+        raise ReportRefused(f"environment.json: matrix.consume is {matrix.get('consume')!r}, not true or false")
+
+
+def check_identity(rows: list[dict[str, str]], environment: dict[str, Any]) -> None:
+    """Bind the CSV's identity columns to the run environment.json records.
+
+    The fingerprint covers `comparable` only, while every row carries its own
+    run id, commit, image, client, profile and acks. The report labels its
+    charts from environment.json, so the rows must name that same run, and
+    run with an acknowledgement mode the recorded matrix ran.
+    """
+    comparable = environment["comparable"]
+    recorded = {
+        "run_id": environment.get("run_id"),
+        "vtop_commit": comparable.get("vtop_commit"),
+        "kafka_image": comparable.get("kafka_image"),
+        "client": comparable.get("client"),
+        "profile": comparable.get("profile"),
+    }
+    for column, value in recorded.items():
+        if rows[0][column] != value:
+            raise ReportRefused(f"results.csv has {column}={rows[0][column]!r}, but environment.json records {value!r}")
+    acks = environment["matrix"]["acks"]
+    for line, row in enumerate(rows, start=2):
+        if row["acks"] not in acks:
+            raise ReportRefused(f"results.csv line {line}: acks={row['acks']!r}, but the recorded matrix ran {acks}")
 
 
 def check_complete(rows: list[dict[str, str]], matrix: dict[str, Any]) -> None:
@@ -245,8 +323,10 @@ def load_run(run_dir: str) -> Run:
     with open(env_path) as handle:
         try:
             environment = json.load(handle)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ReportRefused(f"{env_path} is not JSON: {exc}") from exc
+    if not isinstance(environment, dict):
+        raise ReportRefused(f"{env_path} holds a JSON {type(environment).__name__}, not an object")
     if environment.get("run_state") != "complete":
         raise ReportRefused(
             f"{env_path} says run_state={environment.get('run_state')!r}: the run did not finish"
@@ -254,6 +334,7 @@ def load_run(run_dir: str) -> Run:
     matrix = environment.get("matrix")
     if not isinstance(matrix, dict):
         raise ReportRefused(f"{env_path} records no matrix to check the CSV against")
+    check_matrix(matrix)
     rows = read_rows(os.path.join(run_dir, "results.csv"))
     validate_rows(rows)
     expected_fp = fingerprint(environment)
@@ -262,6 +343,7 @@ def load_run(run_dir: str) -> Run:
             f"results.csv was written under environment {rows[0]['env_fingerprint']}, "
             f"but environment.json fingerprints to {expected_fp}"
         )
+    check_identity(rows, environment)
     check_complete(rows, matrix)
     return Run(rows, environment, run_dir)
 
