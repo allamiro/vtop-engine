@@ -29,7 +29,8 @@ pub mod tls;
 pub mod wire;
 
 pub use admin::{
-    resolve_endpoint, stub_status, AdminCandidate, AdminClient, AdminHandler, AdminServer,
+    refuses_lineage_verdicts, resolve_endpoint, stub_status, AdminCandidate, AdminClient,
+    AdminHandler, AdminServer,
 };
 pub use authz::{AdminAuthorizer, AdminIdentity, CommandClass, Refusal};
 pub use maybe_tls::{

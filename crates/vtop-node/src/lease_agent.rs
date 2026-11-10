@@ -341,25 +341,34 @@ impl ReplicaPlaneProbe {
                 None
             }
         };
-        let mut probes = vec![crate::promotion::ReplicaProbe {
-            node_id: self.node_uuid,
-            local_committed_offset,
-        }];
         // This candidate's own lineage, sent with every fence so each replica
         // can reconcile against it while it is stopped. Empty when this node
         // cannot vouch for its own history, in which case no replica truncates
         // anything — the honest outcome, since there is nothing to reconcile
         // against.
-        let leader_epoch_starts: Vec<vtop_protocol::ReplicaEpochStart> = self
-            .view
-            .epoch_starts()
-            .into_iter()
+        let candidate_lineage = self.view.epoch_starts();
+        // The candidate's own answer is its own history by definition - when
+        // it HAS one. A candidate that cannot vouch for its lineage cannot
+        // prove anyone else's either (#577), itself included: every answer,
+        // its own among them, is Unknown and none of them counts.
+        let mut probes = vec![crate::promotion::ReplicaProbe {
+            node_id: self.node_uuid,
+            local_committed_offset,
+            lineage: if candidate_lineage.is_empty() {
+                vtop_meta::AnswerLineage::Unknown
+            } else {
+                vtop_meta::AnswerLineage::Agreed
+            },
+        }];
+        let leader_epoch_starts: Vec<vtop_protocol::ReplicaEpochStart> = candidate_lineage
+            .iter()
             .map(|entry| vtop_protocol::ReplicaEpochStart {
                 epoch: entry.epoch,
                 start_offset: entry.start_offset,
             })
             .collect();
         let leader_epoch_starts = &leader_epoch_starts;
+        let candidate_lineage = &candidate_lineage;
         // ONE deadline per follower for the lookup AND the fence (review of
         // #566): a fence timeout that started only after a slow lookup let
         // one follower outlast the round, and the round's own deadline then
@@ -446,38 +455,74 @@ impl ReplicaPlaneProbe {
                 }
                 _ => fence.await.map_err(|error| error.to_string()),
             };
-            crate::promotion::ReplicaProbe {
-                node_id: follower.node_uuid,
-                local_committed_offset: match fenced {
-                    Ok(response) => {
-                        if response.truncated_records > 0 {
-                            tracing::warn!(
-                                follower = %follower.node_uuid,
-                                fencing_epoch,
-                                records = response.truncated_records,
-                                "replica discarded records written under a leadership this \
-                                 candidate does not share"
-                            );
-                        }
-                        Some(response.local_committed_offset)
-                    }
-                    Err(error) => {
-                        // ABSENT, not "last known offset". A replica that could
-                        // not be fenced may still be taking the deposed
-                        // leader's appends, so its offset is a measurement of
-                        // something still moving. Counting it is exactly the
-                        // bug fencing exists to close, and a replica that has
-                        // simply not yet seen the grant refuses here too —
-                        // correctly, since it is not fenced until it has.
-                        tracing::debug!(
+            // An absent replica counts for nothing, whatever its verdict.
+            let mut lineage = vtop_meta::AnswerLineage::Unknown;
+            let local_committed_offset = match fenced {
+                Ok(response) => {
+                    if response.truncated_records > 0 {
+                        tracing::warn!(
                             follower = %follower.node_uuid,
                             fencing_epoch,
-                            %error,
-                            "replica could not be fenced; excluded from the promotion quorum"
+                            records = response.truncated_records,
+                            "replica discarded records written under a leadership this \
+                             candidate does not share"
                         );
-                        None
                     }
-                },
+                    // Judged HERE, from the history the replica returned
+                    // after reconciling, not taken on the replica's word
+                    // (#577): the reply carries no verdict, and a verdict
+                    // the candidate computes cannot be one an older
+                    // replica forgot to send.
+                    let answered: Vec<vtop_broker::fencing_epochs::EpochStart> = response
+                        .epoch_starts
+                        .iter()
+                        .map(|entry| vtop_broker::fencing_epochs::EpochStart {
+                            epoch: entry.epoch,
+                            start_offset: entry.start_offset,
+                        })
+                        .collect();
+                    lineage = crate::promotion::fenced_lineage(
+                        candidate_lineage,
+                        &answered,
+                        response.next_offset,
+                        response.truncated_records,
+                    );
+                    if lineage == vtop_meta::AnswerLineage::Unknown {
+                        tracing::warn!(
+                            follower = %follower.node_uuid,
+                            fencing_epoch,
+                            offset = response.local_committed_offset,
+                            replica_history = answered.len(),
+                            candidate_history = candidate_lineage.len(),
+                            "replica's lineage could not be proven against this \
+                             candidate's, so its offset does not count toward the \
+                             promotion quorum (#577); a replica with records but no \
+                             epoch history needs `vtopctl node repair`"
+                        );
+                    }
+                    Some(response.local_committed_offset)
+                }
+                Err(error) => {
+                    // ABSENT, not "last known offset". A replica that could
+                    // not be fenced may still be taking the deposed
+                    // leader's appends, so its offset is a measurement of
+                    // something still moving. Counting it is exactly the
+                    // bug fencing exists to close, and a replica that has
+                    // simply not yet seen the grant refuses here too —
+                    // correctly, since it is not fenced until it has.
+                    tracing::debug!(
+                        follower = %follower.node_uuid,
+                        fencing_epoch,
+                        %error,
+                        "replica could not be fenced; excluded from the promotion quorum"
+                    );
+                    None
+                }
+            };
+            crate::promotion::ReplicaProbe {
+                node_id: follower.node_uuid,
+                local_committed_offset,
+                lineage,
             }
         }))
         .await;
@@ -1004,23 +1049,55 @@ impl TransitionReporter for AdminTransitionReporter {
         outcome: vtop_meta::PromotionOutcome,
         request_id: Uuid,
     ) -> Result<(), ReportFailure> {
-        let command = MetadataCommand::ReportPromotionOutcome {
-            env: CommandEnvelope {
-                request_id,
-                issued_at_ms: now_ms(),
-            },
-            topic_uuid: self.topic_uuid,
-            range_uuid: self.range_uuid,
-            holder_node_uuid: self.node_uuid,
-            fencing_epoch,
-            outcome,
+        let env = CommandEnvelope {
+            request_id,
+            issued_at_ms: now_ms(),
         };
+        let report =
+            |outcome: vtop_meta::PromotionOutcome| MetadataCommand::ReportPromotionOutcome {
+                env,
+                topic_uuid: self.topic_uuid,
+                range_uuid: self.range_uuid,
+                holder_node_uuid: self.node_uuid,
+                fencing_epoch,
+                outcome,
+            };
+        let mut command = report(outcome.clone());
+        // Whether the legacy form is what is being sent (#577); a report with
+        // no verdicts to drop starts there.
+        let mut legacy = !outcome.records_lineage();
         let mut backoff = Duration::from_millis(500);
         let mut last = String::new();
         for attempt in 1..=5_u32 {
             match tokio::time::timeout(self.attempt_deadline, self.admin.propose(command.clone()))
                 .await
             {
+                // VERDICTS ARE REFUSED BELOW THEIR FEATURE LEVEL (#577), and
+                // by any metadata node that predates them. Either refusal
+                // happens before replication, so the same request id is
+                // free, and the report goes again at once in the form that
+                // tier records - without verdicts and without the Unknown
+                // answers, which a reader of that form would count by
+                // offset. Not doing this would leave the promotion
+                // unreported, and an unreported boundary is never exposed:
+                // a data node upgraded ahead of its metadata tier would
+                // never serve.
+                Ok(Err(error))
+                    if !legacy && vtop_meta::transport::refuses_lineage_verdicts(&error) =>
+                {
+                    tracing::warn!(
+                        range = %self.range_uuid,
+                        fencing_epoch,
+                        %error,
+                        "metadata does not record lineage verdicts yet (feature level below \
+                         {}); recording this promotion without them, and without the answers \
+                         whose lineage was unknown",
+                        vtop_meta::LINEAGE_VERDICTS_FEATURE_LEVEL
+                    );
+                    legacy = true;
+                    command = report(outcome.without_lineage());
+                    continue;
+                }
                 Ok(Ok(response)) => match response.response {
                     MetadataResponse::TransitionRecorded { .. } => {
                         tracing::info!(
@@ -1283,12 +1360,14 @@ impl Promoter {
                     crate::promotion::Promotion::Established {
                         committed_offset,
                         answered,
+                        unproven,
                     } => {
                         tracing::info!(
                             range = %self.range_uuid,
                             fencing_epoch,
                             committed_offset,
                             replicas = answered.len(),
+                            uncounted_unknown_lineage = unproven.len(),
                             "verified promotion: committed boundary established by quorum"
                         );
                         // The evidence, kept rather than discarded (#240
@@ -1301,16 +1380,47 @@ impl Promoter {
                             .get(&self.node_uuid)
                             .copied()
                             .unwrap_or(committed_offset);
+                        //
+                        // Each answer with its lineage verdict (#577), the
+                        // uncounted Unknown ones included so the record
+                        // shows what was set aside; readers count only the
+                        // proven ones, as `establish` did. Metadata below the
+                        // verdicts' feature level gets the legacy form
+                        // instead (`AdminTransitionReporter`).
+                        let verdict_of = |node: &Uuid| {
+                            probes
+                                .iter()
+                                .find(|answer| answer.node_id == *node)
+                                .map_or(vtop_meta::AnswerLineage::Unknown, |answer| answer.lineage)
+                        };
+                        let mut quorum: std::collections::BTreeMap<Uuid, vtop_meta::QuorumAnswer> =
+                            answered
+                                .iter()
+                                .map(|(node_uuid, offset)| {
+                                    (
+                                        *node_uuid,
+                                        vtop_meta::QuorumAnswer {
+                                            node_uuid: *node_uuid,
+                                            offset: *offset,
+                                            lineage: Some(verdict_of(node_uuid)),
+                                        },
+                                    )
+                                })
+                                .collect();
+                        quorum.extend(unproven.iter().map(|(node_uuid, offset)| {
+                            (
+                                *node_uuid,
+                                vtop_meta::QuorumAnswer {
+                                    node_uuid: *node_uuid,
+                                    offset: *offset,
+                                    lineage: Some(vtop_meta::AnswerLineage::Unknown),
+                                },
+                            )
+                        }));
                         self.evidence = Some(vtop_meta::PromotionOutcome::Established {
                             boundary_offset: Some(committed_offset),
                             sealed_prefix_end: probe.sealed_prefix_end(),
-                            quorum: answered
-                                .iter()
-                                .map(|(node_uuid, offset)| vtop_meta::QuorumAnswer {
-                                    node_uuid: *node_uuid,
-                                    offset: *offset,
-                                })
-                                .collect(),
+                            quorum: quorum.into_values().collect(),
                             votes: answered
                                 .values()
                                 .filter(|offset| **offset <= candidate_offset)
@@ -1319,15 +1429,54 @@ impl Promoter {
                         });
                         Some(committed_offset)
                     }
-                    crate::promotion::Promotion::QuorumUnavailable { answered, required } => {
-                        tracing::warn!(
-                            range = %self.range_uuid,
-                            fencing_epoch,
-                            answered,
-                            required,
-                            "refusing promotion: too few replicas could confirm the \
-                             committed boundary"
-                        );
+                    crate::promotion::Promotion::QuorumUnavailable {
+                        answered,
+                        required,
+                        unproven,
+                    } => {
+                        // A candidate with no history of its own cannot
+                        // prove ANY answer, its own included (#577): no
+                        // retry at this node changes that, while a replica
+                        // that has a history can promote. An eligibility
+                        // verdict, so it stands aside like the others.
+                        let candidate_unproven = probes.iter().any(|answer| {
+                            answer.node_id == self.node_uuid
+                                && answer.local_committed_offset.is_some()
+                                && !answer.lineage.is_provable()
+                        });
+                        if unproven > 0 {
+                            tracing::warn!(
+                                range = %self.range_uuid,
+                                fencing_epoch,
+                                answered,
+                                required,
+                                unproven,
+                                candidate_unproven,
+                                "refusing promotion: too few replicas answered with a lineage \
+                                 this candidate could prove (#577); answers whose epoch \
+                                 history could not be compared are not counted, whatever \
+                                 their offsets. A replica holding records with no epoch \
+                                 history needs `vtopctl node repair`"
+                            );
+                        } else {
+                            tracing::warn!(
+                                range = %self.range_uuid,
+                                fencing_epoch,
+                                answered,
+                                required,
+                                "refusing promotion: too few replicas could confirm the \
+                                 committed boundary"
+                            );
+                        }
+                        if candidate_unproven {
+                            self.stand_aside = true;
+                            self.evidence = Some(vtop_meta::PromotionOutcome::Refused {
+                                reason: vtop_meta::PromotionRefusal::QuorumUnavailable,
+                            });
+                            self.report_refusal(fencing_epoch).await;
+                            self.suspended(fencing_epoch);
+                            return false;
+                        }
                         // Publish the refusal, not merely a local state flip.
                         // Flipping state alone would leave the broker's
                         // metadata view live while the agent stops renewing:
@@ -4191,6 +4340,212 @@ mod tests {
         }
     }
 
+    /// A metadata tier that records promotion reports up to `level`, and
+    /// refuses anything above it the way a release does: with the gate's
+    /// `FeatureNotEnabled`, or - `predates_levels` - with v0.6.0's codec
+    /// error, which cannot even decode the outcome (#577).
+    struct ReportingTier {
+        level: u32,
+        predates_levels: bool,
+        proposals: std::sync::Mutex<Vec<MetadataCommand>>,
+    }
+
+    #[async_trait::async_trait]
+    impl vtop_meta::AdminHandler for ReportingTier {
+        async fn status(
+            &self,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::AdminStatusResponse> {
+            Ok(vtop_meta::transport::stub_status(vtop_meta::MetaNodeId(1)))
+        }
+        async fn propose(
+            &self,
+            command: MetadataCommand,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::transport::AdminProposeResponse>
+        {
+            self.proposals.lock().unwrap().push(command.clone());
+            let needed = command.feature_level();
+            if needed > self.level {
+                return Err(vtop_meta::transport::TransportError::Protocol(
+                    if self.predates_levels {
+                        "unknown promotion outcome tag 3".to_owned()
+                    } else {
+                        vtop_meta::ConsensusError::FeatureNotEnabled {
+                            needed,
+                            enabled: self.level,
+                        }
+                        .to_string()
+                    },
+                ));
+            }
+            let MetadataCommand::ReportPromotionOutcome { fencing_epoch, .. } = command else {
+                return Err(unused());
+            };
+            Ok(vtop_meta::transport::AdminProposeResponse {
+                log_id: vtop_meta::transport::WireLogId { term: 1, index: 1 },
+                response: MetadataResponse::TransitionRecorded { fencing_epoch },
+            })
+        }
+        async fn init(
+            &self,
+            _members: Vec<u64>,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::transport::AdminMembershipResponse>
+        {
+            Err(unused())
+        }
+        async fn add_learner(
+            &self,
+            _node_id: u64,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::transport::AdminMembershipResponse>
+        {
+            Err(unused())
+        }
+        async fn change_membership(
+            &self,
+            _voters: Vec<u64>,
+            _retain: bool,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::transport::AdminMembershipResponse>
+        {
+            Err(unused())
+        }
+        async fn read_range_lease(
+            &self,
+            _request: vtop_meta::AdminReadRangeLeaseRequest,
+        ) -> vtop_meta::transport::TransportResult<vtop_meta::AdminReadRangeLeaseResponse> {
+            Err(unused())
+        }
+        async fn read_segment_placement(
+            &self,
+            _request: vtop_meta::transport::AdminReadSegmentPlacementRequest,
+        ) -> vtop_meta::transport::TransportResult<
+            vtop_meta::transport::AdminReadSegmentPlacementResponse,
+        > {
+            Err(unused())
+        }
+    }
+
+    /// Report `outcome` through the real admin reporter to a `tier`; what it
+    /// returned, and every command the tier was asked to record.
+    async fn report_to(
+        tier: ReportingTier,
+        outcome: vtop_meta::PromotionOutcome,
+    ) -> (Result<(), ReportFailure>, Vec<MetadataCommand>) {
+        let tier = Arc::new(tier);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = vtop_meta::AdminServer::plaintext(
+            Arc::clone(&tier) as Arc<dyn vtop_meta::AdminHandler>,
+            vtop_meta::transport::AdminAuthorizer::permissive(),
+        )
+        .unwrap();
+        let serving = tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        let reporter = AdminTransitionReporter {
+            admin: Arc::new(
+                AdminClient::plaintext(vec![vtop_meta::AdminCandidate {
+                    node_id: Some(vtop_meta::MetaNodeId(1)),
+                    endpoint,
+                    host: None,
+                    server_name: String::new(),
+                    plaintext: true,
+                }])
+                .unwrap(),
+            ),
+            topic_uuid: Uuid::from_u128(20),
+            range_uuid: Uuid::from_u128(21),
+            node_uuid: Uuid::from_u128(1),
+            attempt_deadline: Duration::from_secs(5),
+        };
+        let result = reporter.report(7, outcome, Uuid::from_u128(0x577)).await;
+        serving.abort();
+        let proposals = tier.proposals.lock().unwrap().clone();
+        (result, proposals)
+    }
+
+    fn reported_outcome(command: &MetadataCommand) -> (Uuid, vtop_meta::PromotionOutcome) {
+        let MetadataCommand::ReportPromotionOutcome { env, outcome, .. } = command else {
+            panic!("{command:?}")
+        };
+        (env.request_id, outcome.clone())
+    }
+
+    fn outcome_with_an_unknown_answer() -> vtop_meta::PromotionOutcome {
+        let answer = |node: u128, offset: u64, lineage| vtop_meta::QuorumAnswer {
+            node_uuid: Uuid::from_u128(node),
+            offset,
+            lineage: Some(lineage),
+        };
+        vtop_meta::PromotionOutcome::Established {
+            boundary_offset: Some(90),
+            sealed_prefix_end: None,
+            quorum: vec![
+                answer(1, 100, vtop_meta::AnswerLineage::Agreed),
+                answer(2, 90, vtop_meta::AnswerLineage::Agreed),
+                answer(3, 500, vtop_meta::AnswerLineage::Unknown),
+            ],
+            votes: 2,
+            required: 2,
+        }
+    }
+
+    /// #577: a metadata tier below the verdicts' feature level - or one that
+    /// predates levels altogether - refuses the verdict-carrying report
+    /// before replicating it. The data node must still get its promotion
+    /// recorded (an unrecorded boundary is never exposed), so it sends the
+    /// same request again in the form that tier records: no verdicts, and
+    /// none of the answers whose lineage was unknown, which that tier's
+    /// readers would count by offset.
+    #[tokio::test]
+    async fn an_old_level_tier_records_the_report_without_verdicts() {
+        for predates_levels in [false, true] {
+            let (result, proposals) = report_to(
+                ReportingTier {
+                    level: vtop_meta::LINEAGE_VERDICTS_FEATURE_LEVEL - 1,
+                    predates_levels,
+                    proposals: std::sync::Mutex::new(Vec::new()),
+                },
+                outcome_with_an_unknown_answer(),
+            )
+            .await;
+            assert_eq!(result, Ok(()), "predates_levels={predates_levels}");
+            assert_eq!(
+                proposals.len(),
+                2,
+                "the verdicts, refused, then the legacy form (predates_levels={predates_levels})"
+            );
+            let (first_id, first) = reported_outcome(&proposals[0]);
+            let (second_id, second) = reported_outcome(&proposals[1]);
+            assert!(first.records_lineage());
+            assert!(!second.records_lineage(), "{second:?}");
+            assert_eq!(second, outcome_with_an_unknown_answer().without_lineage());
+            assert_eq!(
+                first_id, second_id,
+                "refused before replication, so the same request id is free"
+            );
+        }
+    }
+
+    /// #577: at the verdicts' level the report is recorded as it was made,
+    /// in one proposal - the fallback is for a refusal, not a habit.
+    #[tokio::test]
+    async fn a_tier_at_the_verdicts_level_records_them() {
+        let (result, proposals) = report_to(
+            ReportingTier {
+                level: vtop_meta::LINEAGE_VERDICTS_FEATURE_LEVEL,
+                predates_levels: false,
+                proposals: std::sync::Mutex::new(Vec::new()),
+            },
+            outcome_with_an_unknown_answer(),
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            reported_outcome(&proposals[0]).1,
+            outcome_with_an_unknown_answer()
+        );
+    }
+
     fn unused() -> vtop_meta::transport::TransportError {
         vtop_meta::transport::TransportError::Protocol("not served by this fake".into())
     }
@@ -4555,6 +4910,19 @@ mod tests {
         crate::promotion::ReplicaProbe {
             node_id: Uuid::from_u128(node),
             local_committed_offset: offset,
+            lineage: vtop_meta::AnswerLineage::Agreed,
+        }
+    }
+
+    fn at_with(
+        node: u128,
+        offset: u64,
+        lineage: vtop_meta::AnswerLineage,
+    ) -> crate::promotion::ReplicaProbe {
+        crate::promotion::ReplicaProbe {
+            node_id: Uuid::from_u128(node),
+            local_committed_offset: Some(offset),
+            lineage,
         }
     }
 
@@ -5062,6 +5430,390 @@ mod tests {
             .find(|entry| entry.node_id == leader_uuid)
             .expect("the leader probes its own disk");
         assert!(leader.local_committed_offset.is_some());
+    }
+
+    // --- #577: lineage verdicts on fenced answers --------------------------
+
+    const LINEAGE_OLD_EPOCH: u64 = 18;
+    /// A leadership between the old and the new one that the candidate never
+    /// followed.
+    const LINEAGE_RIVAL_EPOCH: u64 = 19;
+    const LINEAGE_NEW_EPOCH: u64 = 20;
+
+    fn lineage_range() -> vtop_protocol::RangeIdentity {
+        vtop_protocol::RangeIdentity {
+            topic: "events.v1".to_owned(),
+            topic_epoch: 1,
+            range_id: Uuid::from_u128(0xC1),
+            range_generation: 0,
+        }
+    }
+
+    /// A replica of `lineage_range` with its epoch journal, holding `records`
+    /// records written under the old epoch by the old leader.
+    fn lineage_replica(
+        dir: &std::path::Path,
+        node: Uuid,
+        records: u64,
+    ) -> (
+        Arc<vtop_broker::replication::InProcessFollower>,
+        vtop_broker::MetaFencingEpoch,
+    ) {
+        let range = lineage_range();
+        let segment = vtop_log::ActiveSegment::create(
+            dir.join("range.active"),
+            vtop_log::SegmentDescriptor {
+                segment_id: Uuid::from_u128(0xE1),
+                topic: range.topic.clone(),
+                topic_epoch: range.topic_epoch,
+                lineage: vtop_log::RangeLineage {
+                    range_id: range.range_id,
+                    generation: range.range_generation,
+                    key_range: vtop_log::KeyRange::full(),
+                    parents: Vec::new(),
+                },
+                base_offset: 0,
+            },
+            vtop_log::SegmentConfig::default(),
+        )
+        .unwrap();
+        let meta = vtop_broker::MetaFencingEpoch::new(LINEAGE_OLD_EPOCH);
+        let replica = Arc::new(
+            vtop_broker::replication::InProcessFollower::new(
+                node,
+                segment,
+                vtop_broker::ProducerEpochJournal::open(dir.join("epochs")).unwrap(),
+                range.clone(),
+                LINEAGE_OLD_EPOCH,
+                meta.clone(),
+                vtop_broker::replication::ClusterCommittedOffset::new(0),
+            )
+            .unwrap(),
+        );
+        replica.set_fencing_epoch_journal(
+            vtop_broker::fencing_epochs::FencingEpochJournal::open(dir.join("fencing-epochs"))
+                .unwrap(),
+        );
+        append_lineage_records(&replica, LINEAGE_OLD_EPOCH, 0..records);
+        (replica, meta)
+    }
+
+    /// Append `offsets` to `replica` as the leader of `epoch` would.
+    fn append_lineage_records(
+        replica: &vtop_broker::replication::InProcessFollower,
+        epoch: u64,
+        offsets: std::ops::Range<u64>,
+    ) {
+        for offset in offsets {
+            replica
+                .apply_append(&vtop_protocol::ReplicaAppendRequest {
+                    range: lineage_range(),
+                    fencing_epoch: epoch,
+                    leader_node_id: Uuid::from_u128(0xA0 + u128::from(epoch)),
+                    expected_base_offset: offset,
+                    producer_id: Uuid::from_u128(0xB1),
+                    producer_epoch: 1,
+                    first_sequence: offset,
+                    records: vec![vtop_protocol::ProduceRecord {
+                        timestamp_millis: 1_000,
+                        key: b"k".to_vec(),
+                        value: format!("e{epoch}v{offset}").into_bytes(),
+                    }],
+                })
+                .unwrap();
+        }
+    }
+
+    /// Replica-plane mTLS for the candidate (the client) and one follower
+    /// (the server): the plane names a peer by the UUID in its certificate's
+    /// CN, so each end gets its own self-signed identity and trusts both.
+    fn lineage_tls(
+        candidate: Uuid,
+        follower: Uuid,
+    ) -> (
+        vtop_broker::replication::ReplicaTlsMaterial,
+        vtop_broker::replication::ReplicaTlsMaterial,
+    ) {
+        let identity = |node: Uuid| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec!["replica".to_owned()]).unwrap();
+            params.distinguished_name = rcgen::DistinguishedName::new();
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, node.to_string());
+            let cert = params.self_signed(&key).unwrap();
+            (cert.der().clone(), key.serialize_der())
+        };
+        let ours = identity(candidate);
+        let theirs = identity(follower);
+        let material = |(cert, key): &(rustls::pki_types::CertificateDer<'static>, Vec<u8>)| {
+            let mut trust_roots = rustls::RootCertStore::empty();
+            trust_roots.add(ours.0.clone()).unwrap();
+            trust_roots.add(theirs.0.clone()).unwrap();
+            vtop_broker::replication::ReplicaTlsMaterial {
+                certificate_chain: vec![cert.clone()],
+                private_key: rustls::pki_types::PrivatePkcs8KeyDer::from(key.clone()).into(),
+                trust_roots,
+            }
+        };
+        (material(&ours), material(&theirs))
+    }
+
+    /// Serve `replica` on the replica plane; the address it listens on.
+    async fn serve_replica(
+        material: vtop_broker::replication::ReplicaTlsMaterial,
+        replica: Arc<vtop_broker::replication::InProcessFollower>,
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = vtop_broker::replication::ReplicaPeerServer::new(
+            material,
+            replica.node_id(),
+            replica as Arc<dyn vtop_broker::replication::ReplicaPeerHandler>,
+        )
+        .unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = server.serve(listener, stopped).await;
+        });
+        (addr, stop)
+    }
+
+    /// The candidate (node 1, holding 10 records with its epoch history), the
+    /// served replica 2, and an unreachable replica 3: a 3-replica range in
+    /// which replica 2's answer decides whether a majority answered.
+    async fn probe_with_one_reachable_follower(
+        candidate: Arc<vtop_broker::replication::InProcessFollower>,
+        follower: Arc<vtop_broker::replication::InProcessFollower>,
+    ) -> (
+        Vec<crate::promotion::ReplicaProbe>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (client_material, server_material) =
+            lineage_tls(Uuid::from_u128(1), follower.node_id());
+        let follower_uuid = follower.node_id();
+        let (addr, stop) = serve_replica(server_material, follower).await;
+        let client = vtop_broker::replication::ReplicaStatusClient::new(client_material)
+            .unwrap()
+            .with_timeout(Duration::from_secs(5));
+        let probe = ReplicaPlaneProbe::new(
+            candidate as Arc<dyn CandidateLocalView>,
+            Uuid::from_u128(1),
+            client,
+            vec![
+                FollowerEndpoint {
+                    node_uuid: follower_uuid,
+                    addr,
+                    host: None,
+                    server_name: "replica".to_owned(),
+                },
+                FollowerEndpoint {
+                    node_uuid: Uuid::from_u128(3),
+                    // Port 1 on loopback: reserved, nothing listens.
+                    addr: "127.0.0.1:1".parse().unwrap(),
+                    host: None,
+                    server_name: "replica".to_owned(),
+                },
+            ],
+            lineage_range(),
+        );
+        (probe.probe(LINEAGE_NEW_EPOCH).await, stop)
+    }
+
+    /// #577 through the REAL probe and fence: replica 2 holds the same ten
+    /// records as the candidate but has no epoch history (records written
+    /// before its journal existed, or a journal restarted empty), so its
+    /// fence reconciles nothing and it answers 10 regardless of whose
+    /// writes those are. Replica 3 is down. By offset, {1, 2} is a majority
+    /// of three and the boundary establishes at 10; replica 2's lineage is
+    /// Unknown, so it must not.
+    #[tokio::test]
+    async fn the_real_probe_does_not_count_a_replica_whose_lineage_is_unknown() {
+        let candidate_dir = tempfile::tempdir().unwrap();
+        let (candidate, _) = lineage_replica(candidate_dir.path(), Uuid::from_u128(1), 10);
+        assert!(
+            !candidate.epoch_starts().is_empty(),
+            "precondition: the candidate can vouch for its own history"
+        );
+        let follower_dir = tempfile::tempdir().unwrap();
+        let (follower, meta) = lineage_replica(follower_dir.path(), Uuid::from_u128(2), 10);
+        // Restarted over an empty journal: records without history.
+        let empty = tempfile::tempdir().unwrap();
+        follower.set_fencing_epoch_journal(
+            vtop_broker::fencing_epochs::FencingEpochJournal::open(
+                empty.path().join("fencing-epochs"),
+            )
+            .unwrap(),
+        );
+        assert!(follower.epoch_starts().is_empty(), "precondition");
+        meta.set(LINEAGE_NEW_EPOCH);
+
+        let (probes, _stop) = probe_with_one_reachable_follower(candidate, follower).await;
+        let answer = probes
+            .iter()
+            .find(|probe| probe.node_id == Uuid::from_u128(2))
+            .expect("replica 2 answers");
+        assert_eq!(
+            answer.local_committed_offset,
+            Some(10),
+            "precondition: the replica was fenced and answered with the candidate's offset"
+        );
+
+        let promotion = crate::promotion::establish(&probes, 3, Uuid::from_u128(1), None);
+        assert!(
+            matches!(
+                promotion,
+                crate::promotion::Promotion::QuorumUnavailable { .. }
+            ),
+            "an Unknown-lineage replica completed the majority by its offset alone: \
+             {promotion:?}"
+        );
+    }
+
+    /// #577, the control: a replica that took three records from a rival
+    /// leadership the candidate never followed is reconciled by the fence -
+    /// it discards them - and then answers on the candidate's lineage.
+    /// Reconciled answers count, so the same majority establishes.
+    #[tokio::test]
+    async fn the_real_probe_counts_a_replica_that_reconciled_before_answering() {
+        let candidate_dir = tempfile::tempdir().unwrap();
+        let (candidate, _) = lineage_replica(candidate_dir.path(), Uuid::from_u128(1), 5);
+        let follower_dir = tempfile::tempdir().unwrap();
+        let (follower, meta) = lineage_replica(follower_dir.path(), Uuid::from_u128(2), 5);
+        meta.set(LINEAGE_RIVAL_EPOCH);
+        follower.adopt_fencing_epoch(LINEAGE_RIVAL_EPOCH);
+        append_lineage_records(&follower, LINEAGE_RIVAL_EPOCH, 5..8);
+        assert_eq!(
+            follower.epoch_starts().len(),
+            2,
+            "precondition: the rival's epoch"
+        );
+        meta.set(LINEAGE_NEW_EPOCH);
+
+        let (probes, _stop) = probe_with_one_reachable_follower(candidate, follower).await;
+        let answer = probes
+            .iter()
+            .find(|probe| probe.node_id == Uuid::from_u128(2))
+            .expect("replica 2 answers");
+        assert_eq!(answer.local_committed_offset, Some(5));
+        assert_eq!(
+            answer.lineage,
+            vtop_meta::AnswerLineage::Reconciled {
+                truncated_records: 3
+            }
+        );
+        let promotion = crate::promotion::establish(&probes, 3, Uuid::from_u128(1), None);
+        assert!(
+            matches!(
+                promotion,
+                crate::promotion::Promotion::Established {
+                    committed_offset: 5,
+                    ..
+                }
+            ),
+            "{promotion:?}"
+        );
+    }
+
+    /// #577: the evidence a promotion reports carries each answer's verdict,
+    /// the uncounted Unknown one included, and the vote and boundary are the
+    /// counted answers' - so a reader recomputing them from the record gets
+    /// what `establish` decided.
+    #[tokio::test]
+    async fn the_promotion_record_carries_each_answers_lineage() {
+        let recorder = Arc::new(Recorder::default());
+        let mut promoter = promoter(
+            Arc::clone(&recorder),
+            Some(fixed(
+                vec![
+                    at(1, Some(100)),
+                    at_with(
+                        2,
+                        90,
+                        vtop_meta::AnswerLineage::Reconciled {
+                            truncated_records: 4,
+                        },
+                    ),
+                    at_with(3, 500, vtop_meta::AnswerLineage::Unknown),
+                ],
+                3,
+            )),
+        );
+        assert!(promoter.ensure(7).await);
+        let Some(vtop_meta::PromotionOutcome::Established {
+            boundary_offset,
+            quorum,
+            votes,
+            required,
+            ..
+        }) = recorder.last_reported()
+        else {
+            panic!("{:?}", recorder.last_reported())
+        };
+        assert_eq!(boundary_offset, Some(90), "the unknown 500 is not counted");
+        assert_eq!((votes, required), (2, 2));
+        assert_eq!(
+            quorum
+                .iter()
+                .map(|answer| (answer.node_uuid.as_u128(), answer.offset, answer.lineage))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, 100, Some(vtop_meta::AnswerLineage::Agreed)),
+                (
+                    2,
+                    90,
+                    Some(vtop_meta::AnswerLineage::Reconciled {
+                        truncated_records: 4
+                    })
+                ),
+                (3, 500, Some(vtop_meta::AnswerLineage::Unknown)),
+            ]
+        );
+    }
+
+    /// #577: an Unknown answer that would have completed the quorum leaves a
+    /// quorum MISS (retryable: the replica can be repaired or the missing one
+    /// return) - unless the unknown one is the CANDIDATE, which can prove no
+    /// one's lineage and so stands aside for a replica that can.
+    #[tokio::test]
+    async fn an_unproven_quorum_is_a_miss_and_an_unproven_candidate_stands_aside() {
+        let recorder = Arc::new(Recorder::default());
+        let mut miss = promoter(
+            Arc::clone(&recorder),
+            Some(fixed(
+                vec![
+                    at(1, Some(100)),
+                    at_with(2, 100, vtop_meta::AnswerLineage::Unknown),
+                    at(3, None),
+                ],
+                3,
+            )),
+        );
+        assert!(!miss.ensure(7).await);
+        assert!(miss.take_quorum_miss());
+        assert!(!miss.take_stand_aside());
+        assert_eq!(
+            recorder.last_reported(),
+            Some(vtop_meta::PromotionOutcome::Refused {
+                reason: vtop_meta::PromotionRefusal::QuorumUnavailable,
+            })
+        );
+
+        let recorder = Arc::new(Recorder::default());
+        let mut lost = promoter(
+            Arc::clone(&recorder),
+            Some(fixed(
+                vec![
+                    at_with(1, 100, vtop_meta::AnswerLineage::Unknown),
+                    at_with(2, 100, vtop_meta::AnswerLineage::Unknown),
+                    at_with(3, 100, vtop_meta::AnswerLineage::Unknown),
+                ],
+                3,
+            )),
+        );
+        assert!(!lost.ensure(7).await);
+        assert!(!lost.take_quorum_miss());
+        assert!(lost.take_stand_aside(), "an eligibility verdict");
     }
 
     /// Review of #566: one deadline covers a follower's lookup AND its fence.

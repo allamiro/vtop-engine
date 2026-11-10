@@ -319,6 +319,48 @@ fn predates_replica_set_read() -> String {
     TransportError::UnexpectedKind(KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ).to_string()
 }
 
+/// Whether metadata refused a promotion report BECAUSE it carries lineage
+/// verdicts (#577), so the same report without them is the one to send.
+///
+/// Two releases refuse it, each in its own words, both before anything is
+/// replicated:
+///
+/// * one with feature levels, below [`crate::LINEAGE_VERDICTS_FEATURE_LEVEL`]:
+///   the gate's `FeatureNotEnabled`, from its Display;
+/// * v0.6.0 and older, which cannot decode the outcome tag at all: the
+///   codec's unknown-tag Display, which v0.6.0 renders identically (its
+///   `CodecError::UnknownTag` is `"unknown {what} tag {tag}"` with `what =
+///   "promotion outcome"`, unchanged since v0.5.0).
+///
+/// Recognized by TEXT because that is all the admin wire carries for either;
+/// both strings are pinned by tests, so a rewording fails a test instead of
+/// leaving every promotion on an older tier unreportable - and an
+/// unreportable promotion is one that never serves (persist before expose).
+/// Anything else (a timeout, a lost connection, a redirect) is NOT this: the
+/// report is retried as it was, not downgraded.
+pub fn refuses_lineage_verdicts(error: &TransportError) -> bool {
+    let TransportError::Protocol(message) = error else {
+        return false;
+    };
+    let gate = crate::raft::ConsensusError::FeatureNotEnabled {
+        needed: crate::command::LINEAGE_VERDICTS_FEATURE_LEVEL,
+        enabled: 0,
+    }
+    .to_string();
+    // The gate's text up to the level it needs, so the cluster's current
+    // level (which follows) does not have to match.
+    let gate_prefix = gate
+        .split(" and the cluster runs at")
+        .next()
+        .unwrap_or(&gate);
+    let undecodable = crate::wire::CodecError::UnknownTag {
+        what: "promotion outcome",
+        tag: 3,
+    }
+    .to_string();
+    message.starts_with(gate_prefix) || message.contains(&undecodable)
+}
+
 fn truncate_error(message: &str) -> String {
     let max = crate::command::MAX_ERROR_DETAIL_BYTES;
     if message.len() <= max {
@@ -1711,6 +1753,79 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// #577: the two refusals of a lineage-carrying promotion report, pinned
+    /// to the texts the releases that send them emit - a data node that
+    /// stopped recognizing either would leave every promotion on that tier
+    /// unreportable, and so unserved - and nothing else read as one.
+    #[test]
+    fn a_refusal_of_lineage_verdicts_is_recognized_and_nothing_else_is() {
+        let gate = crate::raft::ConsensusError::FeatureNotEnabled {
+            needed: crate::command::LINEAGE_VERDICTS_FEATURE_LEVEL,
+            enabled: 5,
+        }
+        .to_string();
+        assert_eq!(
+            gate,
+            "this command needs metadata feature level 6 and the cluster runs at 5; finish \
+             upgrading every metadata voter, then raise the level (vtopctl meta enable-features \
+             --level 6)"
+        );
+        assert!(refuses_lineage_verdicts(&TransportError::Protocol(gate)));
+        // v0.6.0's codec, decoding outcome tag 3 inside kind 30: its
+        // `CodecError::UnknownTag` Display, `what = "promotion outcome"`.
+        assert!(refuses_lineage_verdicts(&TransportError::Protocol(
+            "unknown promotion outcome tag 3".to_owned()
+        )));
+
+        for other in [
+            TransportError::Protocol("not the metadata leader; no leader is known yet".to_owned()),
+            TransportError::Protocol(
+                crate::raft::ConsensusError::FeatureNotEnabled {
+                    needed: 5,
+                    enabled: 4,
+                }
+                .to_string(),
+            ),
+            TransportError::Protocol("unknown command kind tag 37".to_owned()),
+            TransportError::Closed,
+            TransportError::UnexpectedKind(99),
+        ] {
+            assert!(!refuses_lineage_verdicts(&other), "{other}");
+        }
+    }
+
+    /// #577, live: a metadata node that predates verdicts refuses the
+    /// report's PROPOSE frame with its codec error, and the client surfaces
+    /// exactly what the data node recognizes.
+    #[tokio::test]
+    async fn an_older_nodes_refusal_of_lineage_verdicts_reaches_the_client_recognizably() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    while let Ok(_request) = read_frame(&mut stream).await {
+                        let reply = VtpmFrame {
+                            kind: KIND_ADMIN_ERROR,
+                            payload: AdminError {
+                                message: "unknown promotion outcome tag 3".to_owned(),
+                                not_leader: None,
+                            }
+                            .encode()
+                            .unwrap(),
+                        };
+                        if write_frame(&mut stream, &reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let client = candidates(&[(1, addr)]);
+        let error = client.propose(acquire(NODE_A)).await.unwrap_err();
+        assert!(refuses_lineage_verdicts(&error), "{error}");
     }
 
     /// A current leader with a set recorded, answering kind 27 directly.

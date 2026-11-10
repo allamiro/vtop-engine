@@ -920,6 +920,24 @@ Short procedures now; expand into a full ops runbook before go-live.
   remains is the one way to stall the tier - that voter cannot decode the
   raise itself. A node that refuses to start with "written by a newer
   release" is an old binary on a newer log: upgrade it.
+- **Lineage verdicts on promotion records (#577), feature level 6:** a
+  promotion counts a fenced replica's answer only when the candidate could
+  prove the replica's epoch history agrees with its own (or the replica
+  reconciled to it); an answer whose lineage is unknown is recorded and not
+  counted, whatever its offset. A range whose surviving majority includes
+  replicas with records but no epoch history (a log that predates its
+  journal, a journal restarted empty) therefore refuses to promote with
+  "too few replicas answered with a lineage this candidate could prove":
+  repair those replicas (`vtopctl node repair` installs the source's
+  history) rather than lowering anything. Recording the verdicts needs
+  `vtopctl meta enable-features --level 6` once every metadata voter runs
+  this release; until then promotions are recorded without them (and
+  without the uncounted answers). Upgrade every data node and the `vtopctl`
+  you audit with BEFORE raising the level: an older one cannot decode a
+  verdict-carrying transition record, so its published-floor read fails
+  closed (the node will not promote) and its `meta transitions` errors.
+  Records written before the raise carry no verdicts and are judged as they
+  always were.
 - **Change a range's replica set (#553):** a range's quorum is counted over
   the set metadata records for it (`vtopctl meta replica-set --config
   meta-admin.yaml --topic-uuid T --range-uuid R`; every `vtopctl meta`
