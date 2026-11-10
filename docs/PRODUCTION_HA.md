@@ -520,6 +520,18 @@ inode only - and a fingerprint is compared only with one of the same length,
 so they never split a unit. See the ledger format note in
 [`ARCHITECTURE.md`](ARCHITECTURE.md) §7.2.
 
+The audit reads ranges from the ledger, never from manifests, and the ledger
+has always recorded a batch's first read's start. A reconciliation built from
+manifests alone must know their version (#622): from `0.3` a manifest's
+`source_progress` runs from the batch's first read's start to its last read's
+end, and the `batch_id` carries the same range; a manifest of `0.2` or earlier
+(and its batch id) carries the LAST read's start, so for a batch built from
+several reads it claims less than the object holds and shows a false hole
+below it. For those, take the start from the ledger row with the manifest's
+`batch_id` (its `progress_start`), or from the prune digest that replaced the
+row; the end is right in both. See
+[`VTOP_PROTOCOL_DRAFT.md`](VTOP_PROTOCOL_DRAFT.md) §11.2.
+
 ---
 
 ## 7. Object storage, idempotency & Object Lock / WORM

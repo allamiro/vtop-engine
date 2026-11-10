@@ -266,7 +266,7 @@ A conformant manifest:
 | Field | Type | Requirement | Description |
 |-------|------|-------------|-------------|
 | `protocol` | string | MUST | Constant `"VTOP"`. |
-| `version` | string | MUST | Protocol version (e.g. `"0.2"`). |
+| `version` | string | MUST | Protocol version (e.g. `"0.3"`). See the `source_progress` note below for what `0.3` changed. |
 | `batch_id` | string | MUST | Unique batch identifier. |
 | `tenant` | string | MUST | Tenant/source-owner identity. |
 | `source_type` | enum | MUST | `kafka` \| `file` \| `syslog_spool`. |
@@ -295,6 +295,20 @@ prove authenticity because anyone who can rewrite the document can recompute
 it. When `manifest.mac` is required by local policy, changing any bound field
 without the secret key fails authentication. A shared-key MAC does not provide
 public verifiability or non-repudiation.
+
+**`source_progress` spans the whole batch (version `0.3`, #622).** A batch is
+often built from several reads of one source unit. Its `source_progress` names
+the unit (and, for a file, the identity the last read saw) with the FIRST
+read's start (`start_byte` / `start_offset`) and the LAST read's end, so the
+range is exactly what the object holds, and the `batch_id` (and so the object
+and manifest keys) carries the same range. Manifests of version `0.2` and
+earlier carry the last read's start instead: for a batch of several reads the
+start is too high, and the batch's first records lie below it. Their bytes
+cannot be rewritten (they are hashed and may be MAC'd), so an audit of them
+**MUST** take a batch's start from the state-store ledger (`progress_start` of
+the row with the manifest's `batch_id`), not from the manifest; their end is
+correct. The field's shape did not change, so every released verifier
+verifies manifests of both versions.
 
 > The manifest is written at the `MANIFEST_UPLOADED` step, before storage-side verification, so its embedded `state`/`verification_status` reflect that point in time and its hash stays stable. The authoritative post-verification state (`VERIFIED` → `SOURCE_COMMITTED`) lives in the state store.
 
