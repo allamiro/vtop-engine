@@ -941,16 +941,41 @@ Short procedures now; expand into a full ops runbook before go-live.
   this candidate could prove" only when the proven answers fall short of
   that majority - for example when the reachable replicas include ones with
   records but no epoch history (a log that predates its journal, a journal
-  restarted empty). Repair those replicas (`vtopctl node repair` installs the source's
-  history) rather than lowering anything. Recording the verdicts needs
+  restarted empty). Repair those replicas from a replica that HAS epoch
+  history (`vtopctl node repair` installs the source's history), rather than
+  lowering anything. Three costs to plan for (#612):
+  - **A range where no replica has epoch history cannot promote, and repair
+    cannot fix it.** That means data written by v0.2.0 or earlier, or
+    journals lost on every replica. A repair whose source has no history
+    installs none and warns. Every candidate is Unknown to itself and
+    stands aside, so the range goes unled. The transition record shows
+    `Refused{QuorumUnavailable}`, the same as an ordinary missing quorum;
+    the data node's warning names the lineage cause. There is no
+    in-product remedy yet.
+  - **A replica whose only dispute with the candidate is below its retained
+    base is not counted.** The replica itself finds the retained records in
+    agreement (#408), but the candidate cannot see its base, so the answer
+    is Unknown. With one replica of three down, that replica is needed for
+    the majority, and promotion waits until it is repaired or the other
+    replica returns.
+  - **A candidate holding no records stands aside** when a replica holding
+    records answers Unknown to it (a wiped disk at epoch 0, for example).
+    The replica with history wins the range instead.
+
+  Recording the verdicts needs
   `vtopctl meta enable-features --level 6` once every metadata voter runs
   this release; until then promotions are recorded without them (and
   without the uncounted answers). Upgrade every data node and the `vtopctl`
   you audit with BEFORE raising the level: an older one cannot decode a
   verdict-carrying transition record, so its published-floor read fails
   closed (the node will not promote) and its `meta transitions` errors.
-  Records written before the raise carry no verdicts and are judged as they
-  always were.
+  Records written without verdicts are judged as they always were, with
+  every answer in them counted by offset. That includes records written
+  before the raise. It also includes records written after it by a data
+  node still on an older release: that node does not judge lineage, so its
+  records count answers this release would mark Unknown. Nothing enforces
+  the upgrade order, so raise the level only after every data node runs this
+  release.
 - **Change a range's replica set (#553):** a range's quorum is counted over
   the set metadata records for it (`vtopctl meta replica-set --config
   meta-admin.yaml --topic-uuid T --range-uuid R`; every `vtopctl meta`

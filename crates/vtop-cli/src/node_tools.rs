@@ -1236,8 +1236,12 @@ async fn repair(
         // unable to prove lineage; say so now instead of letting the
         // operator find out at the next failover.
         eprintln!(
-            "warning: {from} reported no epoch history; the repaired replica will answer \
-             \"unknown\" at its next reconciliation instead of proving its lineage"
+            "warning: {from} reported no epoch history, so none was installed; the repaired \
+             replica will answer \"unknown\" at its next reconciliation instead of proving \
+             its lineage, and promotion never counts an unknown answer (#577). Repair from a \
+             replica that has epoch history. If no replica of this range has one, repair \
+             cannot restore it and the range cannot promote; there is no in-product remedy \
+             yet (#612)"
         );
     } else if let Some(tail) = transferred_end {
         let entries: Vec<vtop_broker::fencing_epochs::EpochStart> = history

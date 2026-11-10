@@ -52,9 +52,16 @@
 //!
 //! The rule is strict on purpose: Unknown answers never count, not even when
 //! no provable answer exists. Falling back to offsets "when nothing better is
-//! available" is a fence that fails open exactly when it is needed, and a
-//! range whose replicas cannot prove lineage is repaired (`vtopctl node
+//! available" is a fence that fails open exactly when it is needed. A replica
+//! that cannot prove lineage is repaired from one that can (`vtopctl node
 //! repair` installs the source's history, #315), not promoted on a guess.
+//! That costs liveness, and the costs are stated rather than hidden (#612):
+//! a range where NO replica has epoch history (data written by v0.2.0 or
+//! earlier, journals lost everywhere) cannot promote at all, and repair
+//! cannot fix it, because a history-less source has none to install. A
+//! dispute confined to records retention reclaimed (#290/#408) also leaves
+//! the replica's answer Unknown, because the candidate cannot see the
+//! replica's retained base.
 //!
 //! **Open: followers are never truncated by an election.** A replica holding
 //! uncommitted records above the established boundary keeps them. This code
