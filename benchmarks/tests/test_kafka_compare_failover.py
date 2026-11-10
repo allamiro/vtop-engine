@@ -603,3 +603,67 @@ def test_the_failover_report_writes_a_doc_given_as_a_bare_file_name(tmp_path, mo
     monkeypatch.chdir(tmp_path)
     assert report.main([COMMITTED_RUN, "--img-dir", str(tmp_path / "img"), "--doc", "failover.md"]) == 0
     assert (tmp_path / "failover.md").is_file()
+
+
+def _fake_archiver(write_for, returncode=0):
+    """A `docker run ... tar czf /e/vtop-N-volume.tgz` stand-in that writes the archive for nodes in
+    `write_for`, into the host directory bound at /e."""
+    import subprocess
+
+    def fake_sh(args, **_kwargs):
+        host_dir = next(a.split(":")[0] for a in args if a.endswith(":/e"))
+        target = next(a for a in args if a.startswith("/e/vtop-"))
+        node = int(target.split("-")[1])
+        if node in write_for:
+            with open(os.path.join(host_dir, os.path.basename(target)), "wb") as handle:
+                handle.write(b"tgz")
+        return subprocess.CompletedProcess(args, returncode if node not in write_for else 0, "", "denied")
+
+    return fake_sh
+
+
+def test_the_evidence_directory_is_writable_by_the_container_user_and_archives_are_checked(tmp_path, monkeypatch):
+    from kafka_compare import failover
+
+    raw, evidence = tmp_path / "raw", tmp_path / "logs" / "evidence"
+    raw.mkdir()
+    (raw / "acks.log").write_text("1 100 5\n")
+    monkeypatch.setattr(failover, "sh", _fake_archiver({1, 2, 3}))
+    assert failover.save_vtop_evidence({"vtop_image": "img"}, str(raw), str(evidence)) == []
+    assert evidence.stat().st_mode & 0o777 == 0o777  # uid 10001 on a native Linux daemon can write
+    assert (evidence / "acks.log").is_file()
+
+
+def test_an_archive_that_was_not_written_is_reported_not_ignored(tmp_path, monkeypatch):
+    from kafka_compare import failover
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    monkeypatch.setattr(failover, "sh", _fake_archiver({1}, returncode=2))
+    failed = failover.save_vtop_evidence({"vtop_image": "img"}, str(raw), str(tmp_path / "evidence"))
+    assert [entry.split(" ")[0] for entry in failed] == ["kc-vtop-ha_vtop-2-data", "kc-vtop-ha_vtop-3-data"]
+    assert "tar exit 2" in failed[0]
+
+
+def test_volumes_that_could_not_be_archived_are_left_in_place_and_the_run_stops(tmp_path, monkeypatch):
+    from kafka_compare import failover
+
+    downs = []
+
+    def failed_readback(ctx, fault, raw, logs, row):
+        ctx["kept_volumes"] = ["kc-vtop-ha_vtop-1-data (tar exit 2: denied)"]
+        row["verify"] = "FAILED: record at offset 7 content mismatch; volumes NOT archived, left in place"
+        raise RuntimeError("stop after the read-back")
+
+    monkeypatch.setattr(failover, "run_vtop", failed_readback)
+    monkeypatch.setattr(failover, "save_node_logs", lambda *_a, **_k: None)
+    monkeypatch.setattr(failover, "cluster_down", lambda system, ctx: downs.append(system))
+    ctx = {"run_id": "r", "run_dir": str(tmp_path / "run"), "work": str(tmp_path / "work"), "fingerprint": "f",
+           "env": {"comparable": {"vtop_commit": "a" * 40}}, "rate": 100, "total": 9500, "keep_raw": True,
+           "csv": str(tmp_path / "f.csv"), "timeline": str(tmp_path / "t.csv"), "losses": []}
+    fschema.write_header(ctx["csv"])
+    with pytest.raises(failover.EvidenceKept, match="left in place"):
+        failover.run_rep(ctx, "vtop", "kill9_leader", 1)
+    assert downs == []  # no `down -v` over the only copy of the failure
+    with open(ctx["csv"]) as handle:
+        assert "volumes NOT archived" in handle.read()  # the row is still written

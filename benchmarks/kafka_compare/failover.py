@@ -390,17 +390,33 @@ def save_node_logs(system: str, logs: str, full: bool) -> None:
             handle.write("\n".join(text) + "\n")
 
 
-def save_vtop_evidence(ctx: dict, raw: str, evidence: str) -> None:
-    """Everything a VTOP run with a failed read-back left: raw client data and each node's volume."""
+class EvidenceKept(Exception):
+    """A failed read-back's node volumes could not be archived, so they are left in place
+    and the run stops: the next repetition's `down -v` would destroy them."""
+
+
+def save_vtop_evidence(ctx: dict, raw: str, evidence: str) -> list[str]:
+    """Everything a VTOP run with a failed read-back left: raw client data and each node's
+    volume. Returns the volumes whose archive is missing or empty (none when all were saved).
+    """
     os.makedirs(evidence, exist_ok=True)
+    # The archiver runs as the image's user (vtop, uid 10001). On a native Linux
+    # daemon a host-owned 0755 directory is not writable by it, so the archive
+    # would fail and the volumes then be removed (#613 review); same as `raw`.
+    os.chmod(evidence, 0o777)
     for name in os.listdir(raw):
         path = os.path.join(raw, name)
         if os.path.isfile(path):
             shutil.copy2(path, evidence)
+    failed = []
     for n in (1, 2, 3):
         volume = f"{SPEC['vtop']['project']}_vtop-{n}-data"
-        sh(["docker", "run", "--rm", "-v", f"{volume}:/d:ro", "-v", f"{evidence}:/e", "--entrypoint", "tar",
-            ctx["vtop_image"], "czf", f"/e/vtop-{n}-volume.tgz", "-C", "/d", "."], check=False, timeout=600)
+        archive = os.path.join(evidence, f"vtop-{n}-volume.tgz")
+        done = sh(["docker", "run", "--rm", "-v", f"{volume}:/d:ro", "-v", f"{evidence}:/e", "--entrypoint", "tar",
+                   ctx["vtop_image"], "czf", f"/e/vtop-{n}-volume.tgz", "-C", "/d", "."], check=False, timeout=600)
+        if done.returncode != 0 or not os.path.isfile(archive) or os.path.getsize(archive) == 0:
+            failed.append(f"{volume} (tar exit {done.returncode}: {(done.stderr or '').strip()[-200:]})")
+    return failed
 
 
 # ------------------------------------------------------------------------ repetitions
@@ -628,7 +644,11 @@ def run_vtop(ctx: dict, fault: str, raw: str, logs: str, row: dict) -> tuple[lis
         shutil.copy2(os.path.join(raw, name), os.path.join(logs, name))
     if row.get("verify", "").startswith("FAILED"):
         log(f"VTOP READ-BACK FAILED ({row['verify']}): keeping the run's data in full")
-        save_vtop_evidence(ctx, raw, os.path.join(logs, "evidence"))
+        unsaved = save_vtop_evidence(ctx, raw, os.path.join(logs, "evidence"))
+        if unsaved:
+            # Keep the volumes rather than lose the only copy of the failure.
+            ctx["kept_volumes"] = unsaved
+            row["verify"] += f"; volumes NOT archived, left in place: {'; '.join(unsaved)}"
     origin_ms = anchor_us / 1000.0
     how = "driver finished" if finished else "driver stopped at the drain deadline"
     return acks, {"origin_ms": origin_ms, "fault_vm_ms": fault_vm_ms, "finished": finished, "how": how}
@@ -683,10 +703,13 @@ def run_rep(ctx: dict, system: str, fault: str, rep: int) -> None:
             save_node_logs(system, logs, full=row.get("verify", "").startswith("FAILED"))
         except Exception as exc:  # the row still records what was measured
             log(f"{tag}: saving node logs failed: {exc}")
-        try:
-            cluster_down(system, ctx)
-        except Exception as exc:  # the next repetition's `up` starts with a down anyway
-            log(f"{tag}: down failed: {exc}")
+        if ctx.get("kept_volumes"):
+            log(f"{tag}: evidence archive failed; leaving the cluster and its volumes for inspection")
+        else:
+            try:
+                cluster_down(system, ctx)
+            except Exception as exc:  # the next repetition's `up` starts with a down anyway
+                log(f"{tag}: down failed: {exc}")
     if row.get("verify", "").startswith("FAILED"):
         ctx["losses"].append(tag)
     row["wall_seconds"] = round(time.monotonic() - started, 1)
@@ -695,6 +718,9 @@ def run_rep(ctx: dict, system: str, fault: str, rep: int) -> None:
         fschema.append_rows(ctx["timeline"], timeline, fschema.TIMELINE_COLUMNS)
     if not ctx["keep_raw"]:
         shutil.rmtree(raw, ignore_errors=True)
+    if ctx.get("kept_volumes"):
+        raise EvidenceKept(f"{tag}: read-back failed and these volumes could not be archived, so they are left in "
+                           f"place and the run stops here: {'; '.join(ctx['kept_volumes'])}")
 
 
 # ------------------------------------------------------------------------------- main
@@ -788,6 +814,8 @@ def main(argv: list[str] | None = None) -> int:
         env["events"].append({"at": utc_now(), "event": f"run interrupted: {exc!r}"[:900]})
         phase1.save_environment(run_dir, env)
         for system in SPEC:
+            if system == "vtop" and ctx.get("kept_volumes"):
+                continue  # the evidence the archive could not save
             try:
                 cluster_down(system, ctx)
             except Exception:  # best effort on the way out
