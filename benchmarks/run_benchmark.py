@@ -931,6 +931,11 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
         # is what is recorded, and the runner has already refused any run whose
         # endpoint did not match it.
         "h3_proxy": engine.H3_PROXY_SERVICE if sc.get("h3_proxy") else "",
+        # The operator egress ceiling the engine ran under (#481), blank when
+        # unset. Flat on every run for the reason the transport is: the
+        # with/without-cap competitor pair differs in this and nothing else, so
+        # a row that omitted it would show two identical conditions.
+        "upload_max_egress_bytes_per_second": engine.egress_cap_of(sc),
     }
     # The long-lived engine's flat counters (#510), and blanks for the columns
     # only per-cycle outcomes can fill. Absent on a per-cycle run, whose

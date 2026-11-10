@@ -73,6 +73,9 @@ COMPARE_COLS = [
     # matrix is exactly where this matters: scenario 17 against scenario 12 IS
     # the proxy hop's price, and the two rows are otherwise indistinguishable.
     "h3_proxy",
+    # The operator egress ceiling (#481): the competitor pair with and without
+    # a cap is otherwise two identical rows.
+    "upload_max_egress_bytes_per_second",
 ]
 
 # The columns a RUN RESOLVES, which the scenario's own keys may never fill in

@@ -1,0 +1,274 @@
+"""The operator egress ceiling (#481) in the harness: the cap reaches the
+engine, the run records it, and the rate criterion is judged on the engine's
+own counter.
+
+The criterion's arithmetic is checked here on hand-built engine_metrics.csv
+files, because the live runs it judges cannot be part of a unit suite and a
+checker that cannot fail would file every run as a pass.
+"""
+from __future__ import annotations
+
+import csv
+import glob
+import json
+import os
+
+import pytest
+
+import egress_cap_check
+import run_matrix
+from lib import egress_cap, engine_run
+from lib.engine import egress_cap_of, write_engine_config
+from lib.metrics import CSV_HEADERS
+from lib.scenario import load_scenario
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCENARIOS = os.path.join(HERE, "scenarios")
+MIB = 1024 * 1024
+
+
+def config_text(tmp_path, scenario) -> str:
+    path = str(tmp_path / "engine.yaml")
+    write_engine_config(scenario, str(tmp_path / "work"), str(tmp_path / "state.db"),
+                        str(tmp_path / "seed" / "*"), path)
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+# --- the cap reaches the engine ----------------------------------------------
+
+
+def test_a_capped_scenario_writes_the_cap_into_the_upload_block(tmp_path):
+    text = config_text(tmp_path, {"backend": "s3_native",
+                                  "upload_max_egress_bytes_per_second": 4 * MIB})
+    upload = text.split("\nupload:\n", 1)[1]
+    assert "  max_egress_bytes_per_second: 4194304\n" in upload, (
+        "a capped scenario must RUN capped: the cap has to land in the engine's upload "
+        f"block, or the run measures the uncapped pipeline under a capped name. Got:\n{text}")
+
+
+def test_an_unset_cap_writes_nothing(tmp_path):
+    for unset in ({}, {"upload_max_egress_bytes_per_second": ""},
+                  {"upload_max_egress_bytes_per_second": None}):
+        text = config_text(tmp_path, {"backend": "s3_native", **unset})
+        assert "max_egress_bytes_per_second" not in text, (
+            f"{unset} is unset, and unset must write today's config exactly: {text}")
+
+
+def test_a_zero_cap_is_written_through_for_the_engine_to_refuse(tmp_path):
+    # A truthiness test would drop 0 and run uncapped while summary.json
+    # recorded 0. The engine refuses a cap below 1024 B/s at load, and that
+    # refusal is the outcome an operator's config would get.
+    text = config_text(tmp_path, {"backend": "s3_native",
+                                  "upload_max_egress_bytes_per_second": 0})
+    assert "  max_egress_bytes_per_second: 0\n" in text, text
+    assert egress_cap_of({"upload_max_egress_bytes_per_second": 0}) == "0"
+
+
+def test_the_cap_is_a_column_wherever_a_run_is_compared():
+    assert "upload_max_egress_bytes_per_second" in CSV_HEADERS["metrics.csv"], (
+        "the with- and without-cap runs of the competitor pair differ in the cap alone; "
+        "metrics.csv without it shows two identical conditions")
+    assert "upload_max_egress_bytes_per_second" in run_matrix.COMPARE_COLS
+
+
+def test_the_shapers_counter_is_a_surfaced_summary_series():
+    assert ("vtop_upload_egress_bytes_total", "counter") in engine_run.SUMMARY_SERIES
+    columns = engine_run.summary_column_names()
+    assert "engine_upload_egress_bytes_total_window" in columns
+    assert "engine_upload_egress_bytes_total_max_per_second" in columns
+
+
+# --- the bundled scenarios ---------------------------------------------------
+
+
+RATE_SCENARIOS = {
+    "19-egress-cap-rate-1mib.yaml": 1 * MIB,
+    "20-egress-cap-rate-4mib.yaml": 4 * MIB,
+    "21-egress-cap-rate-16mib.yaml": 16 * MIB,
+}
+
+
+def _knobs(path: str, *also: str) -> dict:
+    values = dict(load_scenario(path).values)
+    for key in ("name", "description", "upload_max_egress_bytes_per_second", *also):
+        values.pop(key, None)
+    return values
+
+
+# What a rate scenario sizes to its own R: the backlog seeded before launch and
+# the concurrent seeder's pace. Everything else must be identical across R.
+SEEDING_KNOBS = ("volume", "backlog_multiplier", "seed_interval_seconds")
+
+
+def test_the_rate_scenarios_differ_in_the_cap_and_its_seeding_alone():
+    paths = {name: os.path.join(SCENARIOS, name) for name in RATE_SCENARIOS}
+    for name, path in paths.items():
+        sc = load_scenario(path)
+        assert int(sc.get("upload_max_egress_bytes_per_second")) == RATE_SCENARIOS[name], name
+        assert sc.get("engine_mode") == engine_run.LONG_LIVED, (
+            f"{name}: the cap's token bucket lives in the engine process, and only a "
+            "long-lived engine exposes its counter for a minute")
+        assert sc.get("backend") == "s3_native", (
+            f"{name}: every other backend refuses a cap at startup")
+        assert int(sc.get("duration_seconds")) == 60, name
+    baseline = _knobs(paths["19-egress-cap-rate-1mib.yaml"], *SEEDING_KNOBS)
+    for name, path in paths.items():
+        assert _knobs(path, *SEEDING_KNOBS) == baseline, (
+            f"{name} differs from scenario 19 in more than the cap and its seeding")
+
+
+def test_every_rate_scenario_offers_more_than_its_cap():
+    # The ratio half of the criterion is a statement about the shaper only if
+    # the shaper is the bottleneck: the concurrent seeder must offer more than
+    # R, or the window measures the seeder (the first 16 MiB/s lab run did).
+    medium_mean = 5.5 * MIB
+    for name, cap in RATE_SCENARIOS.items():
+        sc = load_scenario(os.path.join(SCENARIOS, name))
+        assert sc.get("seed_concurrently") is True and sc.get("compression") == "none", name
+        assert sc.get("file_size") == "medium", name
+        per_round = max(1, round(int(sc.get("volume")) * float(sc.get("backlog_multiplier"))))
+        offered = per_round * medium_mean / float(sc.get("seed_interval_seconds"))
+        assert offered >= 1.2 * cap, f"{name} offers {offered:.0f} B/s against a cap of {cap}"
+
+
+def test_the_competitor_pair_differs_in_the_cap_alone():
+    uncapped = load_scenario(os.path.join(SCENARIOS, "22-competing-flow-bulk-uncapped.yaml"))
+    capped = load_scenario(os.path.join(SCENARIOS, "23-competing-flow-bulk-capped.yaml"))
+    assert egress_cap_of(uncapped) == ""
+    assert egress_cap_of(capped) == "262144"
+    for sc in (uncapped, capped):
+        assert sc.get("engine_mode") == engine_run.PROCESS_ONCE, (
+            "the competitor refuses a long-lived engine: VTOP's share is attributed per cycle")
+        assert sc.get("shaping_competitor")
+    assert _knobs(os.path.join(SCENARIOS, "22-competing-flow-bulk-uncapped.yaml")) == \
+        _knobs(os.path.join(SCENARIOS, "23-competing-flow-bulk-capped.yaml"))
+
+
+def test_no_bundled_scenario_caps_a_backend_that_refuses_a_cap():
+    for path in sorted(glob.glob(os.path.join(SCENARIOS, "*.yaml"))):
+        sc = load_scenario(path)
+        if egress_cap_of(sc) != "":
+            assert sc.get("backend") == "s3_native", (
+                f"{os.path.basename(path)} caps backend {sc.get('backend')!r}, which refuses "
+                "the cap at startup — the scenario could never run")
+
+
+# --- the criterion -------------------------------------------------------------
+
+
+def write_metrics(path, samples, counter=egress_cap.COUNTER):
+    """`samples`: (elapsed, interval, latency, cumulative counter value or None)."""
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        out = csv.writer(fh)
+        out.writerow(engine_run.ENGINE_METRICS_COLUMNS)
+        previous = None
+        for position, (elapsed, interval, latency, value) in enumerate(samples):
+            common = ["2026-11-10T00:00:00Z", f"{elapsed:.3f}",
+                      f"{interval:.3f}", f"{latency:.6f}"]
+            out.writerow(common + ["vtop_commits_total", "", "counter", "0", "0",
+                                   "" if position == 0 else "0.0"])
+            if value is not None:
+                delta = value - (previous or 0)
+                out.writerow(common + [counter, "", "counter", str(value), str(delta),
+                                       "" if position == 0 else repr(delta / interval)])
+                previous = value
+
+
+def steady(cap, seconds, fraction=31 / 32, absent_first=0):
+    samples = [(0.05, 0.05, 0.002, None)]
+    total = 0.0
+    for second in range(1, seconds + 1):
+        if second <= absent_first:
+            samples.append((0.05 + second, 1.0, 0.002, None))
+            continue
+        total += cap * fraction
+        samples.append((0.05 + second, 1.0, 0.002, total))
+    return samples
+
+
+def test_a_saturated_shaper_passes_at_the_predicted_ratio(tmp_path):
+    path = str(tmp_path / "engine_metrics.csv")
+    write_metrics(path, steady(MIB, 60))
+    verdict = egress_cap.evaluate(egress_cap.read_buckets(path), MIB)
+    assert verdict["buckets"] == 60, "the opening span is not a bucket"
+    assert verdict["ratio_to_cap"] == pytest.approx(31 / 32, abs=1e-6)
+    assert verdict["pass"] is True, verdict
+
+
+def test_one_bucket_over_the_cap_fails_the_bucket_half(tmp_path):
+    samples = steady(MIB, 60)
+    elapsed, interval, latency, value = samples[30]
+    samples[30] = (elapsed, interval, latency, value + 0.1 * MIB)  # +10% in bucket 30 only
+    for i in range(31, len(samples)):
+        e, d, lat, v = samples[i]
+        samples[i] = (e, d, lat, v + 0.1 * MIB)
+    path = str(tmp_path / "engine_metrics.csv")
+    write_metrics(path, samples)
+    verdict = egress_cap.evaluate(egress_cap.read_buckets(path), MIB)
+    assert verdict["buckets_over_cap"] == [30], verdict
+    assert verdict["worst_bucket"]["index"] == 30
+    assert verdict["pass_every_bucket_at_or_below_cap"] is False
+    assert verdict["pass_total_within_tolerance"] is True
+    assert verdict["pass"] is False
+
+
+def test_a_starved_window_fails_the_total_half(tmp_path):
+    path = str(tmp_path / "engine_metrics.csv")
+    write_metrics(path, steady(MIB, 60, fraction=0.8))
+    verdict = egress_cap.evaluate(egress_cap.read_buckets(path), MIB)
+    assert verdict["pass_every_bucket_at_or_below_cap"] is True
+    assert verdict["pass_total_within_tolerance"] is False, verdict
+    assert verdict["pass"] is False
+
+
+def test_seconds_before_the_counter_exists_count_as_zero_not_as_missing(tmp_path):
+    # The engine creates the counter on the shaper's first admission. Skipping
+    # the seconds before it would shrink the denominator and flatter the ratio.
+    path = str(tmp_path / "engine_metrics.csv")
+    write_metrics(path, steady(MIB, 60, absent_first=10))
+    buckets = egress_cap.read_buckets(path)
+    verdict = egress_cap.evaluate(buckets, MIB)
+    assert len(buckets) == 60 and verdict["zero_byte_buckets"] == 10
+    assert verdict["ratio_to_cap"] == pytest.approx(50 / 60 * 31 / 32, abs=1e-6)
+    assert verdict["pass_total_within_tolerance"] is False
+
+
+def test_a_run_without_the_counter_cannot_be_judged(tmp_path):
+    path = str(tmp_path / "engine_metrics.csv")
+    write_metrics(path, steady(MIB, 5), counter="vtop_some_other_total")
+    with pytest.raises(ValueError, match="never carries vtop_upload_egress_bytes_total"):
+        egress_cap.read_buckets(path)
+
+
+def test_the_latency_bound_is_reported_beside_the_bucket(tmp_path):
+    path = str(tmp_path / "engine_metrics.csv")
+    samples = [(0.05, 0.05, 0.002, None), (1.05, 1.0, 0.05, MIB * 0.99)]
+    write_metrics(path, samples)
+    (bucket,) = egress_cap.read_buckets(path)
+    assert bucket.rate == pytest.approx(MIB * 0.99)
+    assert bucket.rate_upper_bound == pytest.approx(MIB * 0.99 / 0.95)
+    verdict = egress_cap.evaluate([bucket], MIB)
+    assert verdict["buckets_over_cap"] == []
+    assert verdict["buckets_whose_latency_bound_exceeds_cap"] == [1]
+
+
+def test_the_checker_writes_its_files_and_exits_by_the_verdict(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    write_metrics(str(run_dir / engine_run.ENGINE_METRICS_CSV), steady(MIB, 60, fraction=0.8))
+    (run_dir / "summary.json").write_text(json.dumps(
+        {"upload_max_egress_bytes_per_second": str(MIB)}))
+    assert egress_cap_check.main([str(run_dir)]) == 1, "a failed criterion must exit nonzero"
+    verdict = json.loads((run_dir / "egress_verdict.json").read_text())
+    assert verdict["pass"] is False and verdict["cap_bytes_per_second"] == MIB
+    with open(run_dir / "egress_buckets.csv", newline="", encoding="utf-8") as fh:
+        assert len(list(csv.DictReader(fh))) == 60
+
+
+def test_the_checker_refuses_an_uncapped_run(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "summary.json").write_text(json.dumps({"upload_max_egress_bytes_per_second": ""}))
+    assert egress_cap_check.main([str(run_dir)]) == 2
+    assert "uncapped" in capsys.readouterr().err

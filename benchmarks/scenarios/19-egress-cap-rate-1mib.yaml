@@ -1,0 +1,60 @@
+name: egress-cap-rate-1mib
+description: >-
+  The operator egress ceiling's rate criterion (#481) at R = 1 MiB/s. One
+  long-lived engine (engine_mode run) uploads to the lab's MinIO through
+  s3_native with upload.max_egress_bytes_per_second set, and its own
+  vtop_upload_egress_bytes_total is scraped once a second. Pass: every
+  one-second bucket at or below R, and the 60 s total within 10% of R x 60
+  (the shaper's design predicts about 31/32 of R). The workload exists only
+  to keep the shaper saturated: a concurrent seeder offers about 1.3 x R, so
+  there is always an object waiting on the shaper. Judged by
+  benchmarks/egress_cap_check.py on the run directory.
+  Scenarios 20 and 21 are this file at 4 and 16 MiB/s, with the
+  seeder sized to their own R; nothing else differs. Requires the
+  containerized profile, docker compose -f
+  benchmarks/docker-compose.benchmark.yml --profile containerized up -d.
+# WHY A CONCURRENT SEEDER, measured rather than reasoned about: a long-lived
+# engine commits a cycle's sources only once EVERY batch of that cycle has
+# verified, and a cycle takes everything it discovered when it began. A first
+# trial seeded 300 whole files (1.7 GB) before launch at 1 MiB/s: the shaper ran at
+# the cap for the whole minute, eight batches verified, and the cycle - which
+# needed about 27 minutes - committed nothing, so the run was refused as having
+# measured nothing. Here the first cycle is a few seconds of work, and each
+# later one takes what the seeder added during the last: about 1.3x longer
+# each time, so cycles commit inside the window while the shaper is never
+# without an object to send.
+volume: 2
+file_size: medium
+# JSONL, not whole-file binary: the runner refuses a concurrent seeder over
+# whole-file input, since the engine could commit a file still being written.
+format: jsonl
+# Uncompressed: what the engine hands its HTTP client is what was seeded, so
+# nothing between the source and the shaper changes the byte count the cap is
+# judged on.
+compression: none
+checksum: sha256
+backend: s3_native
+bucket: "vtop-bench-soak"
+# Container mode: the engine is the same Linux binary the netem scenarios run,
+# and its /metrics is published on the host's loopback (#510). Unshaped - the
+# cap is the only limit on the path.
+runner_mode: container
+endpoint_url: http://localhost:9000
+engine_mode: run
+engine_scrape_interval_seconds: 1.0
+# 2 MiB batches that seal on size, so objects wait on the shaper and not on a
+# batch threshold; a file's sub-2 MiB tail seals on the one-second age.
+batch_max_records: 1000000
+batch_max_bytes: 2097152
+batch_max_age_seconds: 1
+max_concurrent_batches: 4
+# 1 file(s) of ~5.5 MB every 4 s: about 1.4 MB/s offered against
+# 1.05 MB/s of cap.
+seed_concurrently: true
+backlog_multiplier: 0.5
+seed_interval_seconds: 4.0
+# THE CAP: 1 MiB/s of request-body bytes, process-wide.
+upload_max_egress_bytes_per_second: 1048576
+duration_seconds: 60
+fault: none
+sys_sample_interval: 1.0

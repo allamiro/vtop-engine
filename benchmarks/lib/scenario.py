@@ -112,6 +112,16 @@ DEFAULTS: dict[str, Any] = {
     # per-connection toxic gives two flows no shared queue, and lib/shaping.py
     # refuses the combination by name.
     "shaping_competitor": "",
+    # THE OPERATOR EGRESS CEILING (#481): `upload.max_egress_bytes_per_second`,
+    # written through to the engine's config. "" = unset, which is the engine's
+    # own default and today's pipeline. Present — zero and sub-minimum values
+    # included — it is written as given, so the engine refuses what an
+    # operator's config would be refused for, and a backend that cannot shape
+    # its bytes refuses it at startup instead of running uncapped under a
+    # capped name. Measured against the engine's own
+    # vtop_upload_egress_bytes_total, which only `engine_mode: run` can scrape
+    # (benchmarks/egress_cap_check.py reads it).
+    "upload_max_egress_bytes_per_second": "",
 }
 
 

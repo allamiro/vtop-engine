@@ -145,8 +145,9 @@ ENGINE_METRICS_COLUMNS = (
 # the endpoint's own `# TYPE` line, and a mismatch refuses the run: a gauge
 # differenced as a counter is a rate of nothing.
 #
-# `vtop_upload_egress_bytes_total` (#481's rate-cap counter) does not exist yet;
-# when it lands, it is one more ("vtop_upload_egress_bytes_total", "counter").
+# `vtop_upload_egress_bytes_total` is #481's rate-cap counter: the bytes the
+# egress shaper admitted. The engine exports it only when a cap is set, so an
+# uncapped run leaves its two columns blank rather than zero.
 SUMMARY_SERIES: tuple[tuple[str, str], ...] = (
     ("vtop_commits_total", "counter"),
     ("vtop_failed_total", "counter"),
@@ -154,6 +155,7 @@ SUMMARY_SERIES: tuple[tuple[str, str], ...] = (
     ("vtop_bytes_in_total", "counter"),
     ("vtop_bytes_out_total", "counter"),
     ("vtop_upload_throttled_total", "counter"),
+    ("vtop_upload_egress_bytes_total", "counter"),
     ("vtop_inflight_batches", "gauge"),
     ("vtop_upload_width", "gauge"),
 )

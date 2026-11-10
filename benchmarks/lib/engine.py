@@ -657,6 +657,21 @@ def require_endpoint_through_h3_proxy(scenario) -> None:
             "--profile h3 up -d")
 
 
+def egress_cap_of(scenario) -> str:
+    """The scenario's `upload_max_egress_bytes_per_second` (#481) as written to
+    the engine config and recorded beside the run, or "" when unset.
+
+    Absent and None are both unset. Anything else is passed through as given,
+    zero included: the engine owns the refusal (below 1024 B/s, or on a backend
+    that cannot shape its bytes), and a truthiness test here would run a zero
+    cap uncapped while the summary recorded 0 — the mislabel the
+    max_concurrent_batches write-through above was fixed for."""
+    value = scenario.get("upload_max_egress_bytes_per_second", "")
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
 def write_engine_config(scenario, work_dir: str, state_db: str,
                         input_glob: str, config_path: str,
                         key_prefix: str = "") -> str:
@@ -739,6 +754,14 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
         # claims the requested wire. The engine validates this name at load.
         f"  transport: {scenario.get('transport', 'tcp_tls')}",
     ]
+    # The operator egress ceiling (#481), written through rather than recorded:
+    # a capped scenario must run under the cap, and a cap the engine would
+    # refuse (zero, below its minimum, a backend that cannot shape bytes) must
+    # be refused by the engine at load, never dropped here so the run goes
+    # uncapped under a capped name. Unset writes nothing — today's config.
+    egress_cap = egress_cap_of(scenario)
+    if egress_cap != "":
+        lines.append(f"  max_egress_bytes_per_second: {egress_cap}")
     # Thread the scenario's per-transport egress tuning into the engine config
     # (#480), not just the summary: a scenario that tunes a transport must run
     # with that tuning (and be validated/refused by the engine like an
