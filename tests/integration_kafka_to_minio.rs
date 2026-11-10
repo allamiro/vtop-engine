@@ -472,9 +472,46 @@ async fn commit_advances_progress_for_a_new_consumer() {
 // then restart an engine on the ledger, which is what decides where it reads.
 // ---------------------------------------------------------------------------
 
+/// Deletes its topic when dropped, so a test's topic is removed whether the
+/// test passes or panics - every run creates new uniquely named topics, and
+/// leaking them grows the broker's metadata without bound.
+struct TopicCleanup(String);
+
+impl Drop for TopicCleanup {
+    fn drop(&mut self) {
+        use rdkafka::admin::{AdminClient, AdminOptions};
+        use rdkafka::client::DefaultClientContext;
+        let Ok(admin) =
+            build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-admin")).and_then(|cc| {
+                cc.create::<AdminClient<DefaultClientContext>>()
+                    .map_err(|e| vtop_core::errors::VtopError::Source(e.to_string()))
+            })
+        else {
+            eprintln!("could not build an admin client to delete topic {}", self.0);
+            return;
+        };
+        // The admin future is driven by the client's own thread, so it can be
+        // waited on here without the test's runtime - which, on a panic, may
+        // be the one unwinding.
+        let options =
+            AdminOptions::new().operation_timeout(Some(std::time::Duration::from_secs(10)));
+        match futures::executor::block_on(admin.delete_topics(&[self.0.as_str()], &options)) {
+            Ok(results) => {
+                for result in results {
+                    if let Err((topic, code)) = result {
+                        eprintln!("deleting topic {topic} failed: {code}");
+                    }
+                }
+            }
+            Err(e) => eprintln!("deleting topic {} failed: {e}", self.0),
+        }
+    }
+}
+
 /// A NEW single-partition topic holding `records` records at offsets
-/// `0..records`, so every offset a test names is exact.
-async fn fresh_topic(tag: &str, records: usize) -> String {
+/// `0..records`, so every offset a test names is exact. The topic is deleted
+/// when the returned guard is dropped.
+async fn fresh_topic(tag: &str, records: usize) -> (String, TopicCleanup) {
     use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
     use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 
@@ -497,6 +534,7 @@ async fn fresh_topic(tag: &str, records: usize) -> String {
         .pop()
         .expect("one topic result")
         .expect("topic creation failed");
+    let cleanup = TopicCleanup(topic.clone());
     let producer: BaseProducer = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-producer"))
         .unwrap()
         .create()
@@ -510,7 +548,7 @@ async fn fresh_topic(tag: &str, records: usize) -> String {
     producer
         .flush(std::time::Duration::from_secs(10))
         .expect("flush produce");
-    topic
+    (topic, cleanup)
 }
 
 fn kafka_marker(topic: &str, group: &str, start: i64, end: i64) -> ProgressMarker {
@@ -686,14 +724,15 @@ async fn read_until_a_new_commit(engine: &mut vtop_cli::Engine) -> Vec<i64> {
 /// #614, the confirmed consequence. Engine B has archived and committed
 /// `[0, 19]`; engine A, which lost its claim on the batch `[0, 4]`, then
 /// commits offset 5. Kafka accepts it - the group's offset goes BACKWARDS - but
-/// a restarted engine reads on from the ledger's 20, not from the group's 5.
+/// a restarted engine reads on from the ledger's 20, not from the group's 5,
+/// and moves the group's offset back up to 20 so lag monitoring agrees.
 ///
 /// Against the code before #614 this fails: the restart resumed from the
 /// group's offset and archived `[5, 19]` again.
 #[tokio::test]
 #[ignore = "requires a running Kafka broker"]
 async fn a_stale_commit_behind_the_ledger_does_not_move_where_a_restart_reads() {
-    let topic = fresh_topic("stale_back", 40).await;
+    let (topic, _cleanup) = fresh_topic("stale_back", 40).await;
     let group = unique_group("stale-back");
     let dir = tempfile::tempdir().unwrap();
     let db = format!("sqlite://{}", dir.path().join("state.db").display());
@@ -707,7 +746,15 @@ async fn a_stale_commit_behind_the_ledger_does_not_move_where_a_restart_reads() 
         "precondition: Kafka took the stale commit and moved the group's offset back"
     );
 
-    let starts = restart_and_read(&db, &dir.path().join("work"), &topic, &group).await;
+    let mut engine = engine_on(&db, &dir.path().join("work"), &topic, &group).await;
+    engine.recover().await.expect("recovery");
+    assert_eq!(
+        group_offset(&topic, &group),
+        20,
+        "the restart left the group's offset behind the ledger, so lag monitoring reports \
+         archived records as unread"
+    );
+    let starts = read_until_a_new_commit(&mut engine).await;
     assert_eq!(
         starts[0], 20,
         "the restart read from offset {} - the stale group offset decided, not the ledger, \
@@ -727,7 +774,7 @@ async fn a_stale_commit_behind_the_ledger_does_not_move_where_a_restart_reads() 
 #[tokio::test]
 #[ignore = "requires a running Kafka broker"]
 async fn a_stale_commit_past_a_range_sent_back_for_replay_does_not_skip_it() {
-    let topic = fresh_topic("stale_fwd", 40).await;
+    let (topic, _cleanup) = fresh_topic("stale_fwd", 40).await;
     let group = unique_group("stale-fwd");
     let dir = tempfile::tempdir().unwrap();
     let db = format!("sqlite://{}", dir.path().join("state.db").display());
@@ -766,7 +813,7 @@ async fn recovering_an_older_verified_batch_does_not_move_the_group_offset_back(
     use vtop_core::types::{CompressionType, SourceType};
     use vtop_state::StateStore;
 
-    let topic = fresh_topic("superseded", 40).await;
+    let (topic, _cleanup) = fresh_topic("superseded", 40).await;
     let group = unique_group("superseded");
     let dir = tempfile::tempdir().unwrap();
     let work = dir.path().join("work");

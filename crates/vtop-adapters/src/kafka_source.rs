@@ -77,7 +77,8 @@ fn clamp_rewind(start_offset: i64, frontier: Option<i64>) -> i64 {
 ///
 /// `known` is what the ledger recorded for this partition and group, or what
 /// this process committed since it started; `in_memory` is the cursor's own
-/// committed position. When either is there, the broker is not consulted: the
+/// committed position - a commit, the ledger's seed, or where an earlier
+/// rewind landed. When either is there, the broker is not consulted: the
 /// group's committed offset is written by any engine that reaches
 /// `commit_progress`, including one whose claim on the batch has moved on, and
 /// Kafka cannot refuse it (the adapter reads with `assign()`, so the commit
@@ -86,17 +87,21 @@ fn clamp_rewind(start_offset: i64, frontier: Option<i64>) -> i64 {
 /// the range would never be archived: the clamp must come from the fenced
 /// ledger, not from the broker.
 ///
+/// That includes an in-memory position alone. It exists without `known` only
+/// after a rewind of a partition the ledger does not know, and that rewind
+/// already took the broker's offset into account; asking again would let a
+/// stale commit made since raise the clamp past the range being re-read
+/// (review of #614 - recovery rewinds every range twice).
+///
 /// Only a partition this process knows nothing about - no committed row in the
-/// ledger, nothing committed this session - falls back to the broker, as
-/// every partition did before.
+/// ledger, nothing committed or rewound this session - falls back to the
+/// broker, as every partition did before.
 fn rewind_frontier(known: Option<i64>, in_memory: Option<i64>, broker: Option<i64>) -> Option<i64> {
     match (known, in_memory) {
         (Some(k), Some(m)) => Some(k.max(m)),
         (Some(k), None) => Some(k),
-        (None, m) => match (broker, m) {
-            (Some(b), Some(m)) => Some(b.max(m)),
-            (b, m) => b.or(m),
-        },
+        (None, Some(m)) => Some(m),
+        (None, None) => broker,
     }
 }
 
@@ -373,6 +378,11 @@ pub struct KafkaSource {
     /// makes (#614). A partition in here never asks the broker for its
     /// frontier (see `rewind_frontier`).
     known_committed: HashMap<(String, i32), i64>,
+    /// The consumer group's committed offset as this process last read it
+    /// from the broker or wrote it there. Only used to put the group's offset
+    /// back in step with the ledger, for lag monitoring (#614); nothing here
+    /// decides where a partition is read from.
+    group_at: HashMap<(String, i32), i64>,
     /// The (topic, partition) set currently assigned on the consumer, sorted.
     ///
     /// Assignment is STICKY: calling assign() resets librdkafka's fetchers,
@@ -453,6 +463,7 @@ impl KafkaSource {
             consumer: None,
             cursors: HashMap::new(),
             known_committed: HashMap::new(),
+            group_at: HashMap::new(),
             assigned: Vec::new(),
             delivered: HashMap::new(),
             last_retention_check: None,
@@ -659,6 +670,7 @@ impl KafkaSource {
                 );
                 continue;
             };
+            self.group_at.insert(key.clone(), group_at);
             if group_at < resume_at {
                 tracing::warn!(
                     topic = %key.0,
@@ -667,8 +679,10 @@ impl KafkaSource {
                     group_committed = group_at,
                     "the consumer group's committed offset is BEHIND the ledger (a commit the \
                      ledger did not accept, or an older range committed after a newer one): \
-                     resuming from the ledger instead of re-reading archived records"
+                     resuming from the ledger instead of re-reading archived records, and \
+                     moving the group's offset up to it"
                 );
+                self.advance_group_offset(&key, resume_at);
             } else if group_at > resume_at {
                 tracing::info!(
                     topic = %key.0,
@@ -685,6 +699,39 @@ impl KafkaSource {
             if cur.last_read_offset.is_none() && cur.committed_offset.is_none() {
                 cur.committed_offset = Some(resume_at);
             }
+        }
+    }
+
+    /// Move the group's committed offset UP to `to`, the ledger's frontier,
+    /// so lag monitoring stops reporting archived records as unread (#614).
+    ///
+    /// Only forward, and only to a frontier the ledger (or this process's own
+    /// commits) holds as committed: everything below it is archived and
+    /// verified, so this commits nothing the commit rule forbids. A stale
+    /// engine can still move the offset back afterwards; that is cosmetic now,
+    /// and the next restart puts it right again. A failure is logged, never
+    /// returned: the group's offset decides nothing.
+    fn advance_group_offset(&mut self, key: &(String, i32), to: i64) {
+        let result = self.consumer().and_then(|consumer| {
+            let mut tpl = TopicPartitionList::new();
+            tpl.add_partition_offset(&key.0, key.1, Offset::Offset(to))
+                .map_err(|e| VtopError::Source(format!("tpl: {e}")))?;
+            consumer
+                .commit(&tpl, rdkafka::consumer::CommitMode::Sync)
+                .map_err(|e| VtopError::Source(format!("kafka commit: {e}")))
+        });
+        match result {
+            Ok(()) => {
+                self.group_at.insert(key.clone(), to);
+            }
+            Err(e) => tracing::warn!(
+                topic = %key.0,
+                partition = key.1,
+                to,
+                error = %e,
+                "could not move the consumer group's offset up to the ledger; lag monitoring \
+                 reads it behind until the next commit"
+            ),
         }
     }
 
@@ -1328,7 +1375,9 @@ impl SourceAdapter for KafkaSource {
         // range as unread. The frontier is the ledger's or this process's own
         // commits (`known_committed`), never a rewind's landing. Success is
         // reported so the row is marked SOURCE_COMMITTED: it is VERIFIED, and
-        // everything up to the frontier is committed already.
+        // everything up to the frontier is committed already. Where the
+        // group's offset is known to be behind the frontier, it is moved up to
+        // the frontier instead (review of #614: lag monitoring).
         if let Some(&frontier) = self.known_committed.get(&key) {
             if commit_at <= frontier {
                 tracing::info!(
@@ -1339,6 +1388,9 @@ impl SourceAdapter for KafkaSource {
                     "kafka commit skipped: the range is superseded by a later committed one, and \
                      committing it would move the group's offset backwards"
                 );
+                if self.group_at.get(&key).is_some_and(|&at| at < frontier) {
+                    self.advance_group_offset(&key, frontier);
+                }
                 return Ok(());
             }
         }
@@ -1356,6 +1408,7 @@ impl SourceAdapter for KafkaSource {
         // for (#614). Never lowered: a rewind can leave the cursor above a
         // range that is committed afterwards, and where this process resumes
         // must not go back below what it has archived.
+        self.group_at.insert(key.clone(), commit_at);
         let known = self.known_committed.entry(key.clone()).or_insert(commit_at);
         *known = (*known).max(commit_at);
         let cur = self.cursors.entry(key).or_default();
@@ -1534,6 +1587,10 @@ mod tests {
         // This process's own position counts as known too.
         assert_eq!(rewind_frontier(Some(10), Some(30), Some(99)), Some(30));
         assert_eq!(rewind_frontier(None, Some(30), Some(5)), Some(30));
+        // A position only an earlier rewind set is not raised by a stale
+        // commit made since: recovery rewinds twice, and the second rewind of
+        // a range at 10 must still land at 10 (review of #614).
+        assert_eq!(rewind_frontier(None, Some(10), Some(20)), Some(10));
         // A partition known nowhere falls back to the broker, as before.
         assert_eq!(rewind_frontier(None, None, Some(7)), Some(7));
         assert_eq!(rewind_frontier(None, None, None), None);

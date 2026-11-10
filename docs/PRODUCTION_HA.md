@@ -313,14 +313,18 @@ secret reference so credentials never enter serializable config.
 
 ### 6.4 Backend-switching policy (NOT "no migration ever")
 The state store is a replay ledger, **but the file/syslog byte cursor lives only in
-it** (rebuilt from `SOURCE_COMMITTED` rows by `seed_committed_offsets`). Kafka
-offsets live in the broker. Therefore:
+it** (rebuilt from `SOURCE_COMMITTED` rows by `seed_committed_offsets`). The Kafka
+resume position is the ledger's too, once it holds a committed batch for the
+partition (#614); a store without one falls back to the consumer group's
+committed offset on the broker. Therefore:
 
 ```text
 Backend switching policy:
 - Dev/test:                a fresh state store is acceptable.
 - Production, Kafka-only:   may be safe AFTER engine DRAIN + offset verification
-                           (offsets are broker-side, so resume is safe).
+                           (a fresh store resumes from the group's committed
+                           offset, so verify it equals the old ledger's
+                           position for every partition before switching).
 - Production, file/syslog:  REQUIRES cursor migration OR a controlled drain,
                            else files reprocess from byte 0 (duplicates) and
                            spool position is lost.
