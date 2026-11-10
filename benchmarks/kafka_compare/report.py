@@ -8,6 +8,10 @@ stderr) a missing, partial or mixed-environment run (#595 rule 9), and writes
 PNG + SVG charts to docs/benchmarks/img/ and docs/benchmarks/kafka-comparison.md.
 Every number in them comes from the CSV; none is typed here.
 
+A failover run (#597; its directory holds `failover.csv`) is handed to
+failover_report.py, which writes docs/benchmarks/kafka-failover.md under the
+same rules.
+
 Output is deterministic for a given CSV and matplotlib version: fixed rcParams,
 a fixed SVG hash salt, and no timestamps or software banners in the metadata.
 """
@@ -26,6 +30,7 @@ from kafka_compare import schema, stats  # noqa: E402
 REPO = os.path.dirname(os.path.dirname(HERE))
 DEFAULT_IMG_DIR = os.path.join(REPO, "docs", "benchmarks", "img")
 DEFAULT_DOC = os.path.join(REPO, "docs", "benchmarks", "kafka-comparison.md")
+DEFAULT_FAILOVER_DOC = os.path.join(REPO, "docs", "benchmarks", "kafka-failover.md")
 
 # One colour per system in every chart: categorical slots 1 and 2 of the
 # reference palette, validated for CVD separation (protan dE 24.7) and
@@ -630,10 +635,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("run_dir", help="benchmarks/kafka_compare/results/<run-id>")
     parser.add_argument("--img-dir", default=DEFAULT_IMG_DIR)
-    parser.add_argument("--doc", default=DEFAULT_DOC)
+    parser.add_argument("--doc", default=None, help="default: kafka-comparison.md, or kafka-failover.md for a "
+                                                     "failover run")
     args = parser.parse_args(argv)
     try:
-        written = build(args.run_dir, args.img_dir, args.doc)
+        if os.path.isfile(os.path.join(args.run_dir, "failover.csv")):
+            from kafka_compare import failover_report
+
+            written = failover_report.build(args.run_dir, args.img_dir, args.doc or DEFAULT_FAILOVER_DOC,
+                                            _setup_matplotlib)
+        else:
+            written = build(args.run_dir, args.img_dir, args.doc or DEFAULT_DOC)
     except schema.ReportRefused as exc:
         print(f"report refused: {exc}", file=sys.stderr)
         return 2

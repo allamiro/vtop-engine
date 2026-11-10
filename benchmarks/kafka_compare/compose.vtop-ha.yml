@@ -1,0 +1,56 @@
+# VTOP for the failover comparison (#597): three co-located nodes, each a
+# metadata Raft voter plus a CANDIDATE replica of the one range (configs in
+# vtop/ha-node-*.yaml), the Helm chart's replicated shape. Leadership follows
+# the metadata lease, so killing the leader is a failover, not a stop.
+#
+# Fairness rule 1: EXACTLY the per-node limits compose.kafka.yml gives each
+# Kafka broker (2 CPUs, 2 GiB, no swap, a named volume on the same Docker VM
+# disk); failover.py refuses to start when they differ, as run.py does.
+#
+# VTOP_IMAGE is the image failover.py built from the commit under test;
+# VTOP_TLS_DIR is the per-run certificate directory it minted (never
+# committed). No healthcheck gates `up`: a co-located node is ready only once
+# its metadata group is initialised, which failover.py does after `up`.
+name: kc-vtop-ha
+
+x-node: &node
+  image: ${VTOP_IMAGE:?set VTOP_IMAGE to the vtop-bench image failover.py built}
+  entrypoint: ["vtop-node", "node", "--config", "/etc/vtop/node.yaml"]
+  cpus: 2
+  mem_limit: 2g
+  memswap_limit: 2g
+  ulimits:
+    nofile: { soft: 65536, hard: 65536 }
+  networks: [bench]
+
+services:
+  vtop-1:
+    <<: *node
+    hostname: vtop-1
+    volumes:
+      - "./vtop/ha-node-1.yaml:/etc/vtop/node.yaml:ro"
+      - "${VTOP_TLS_DIR:?set VTOP_TLS_DIR to the minted certificate directory}:/etc/vtop/tls:ro"
+      - "vtop-1-data:/home/vtop"
+  vtop-2:
+    <<: *node
+    hostname: vtop-2
+    volumes:
+      - "./vtop/ha-node-2.yaml:/etc/vtop/node.yaml:ro"
+      - "${VTOP_TLS_DIR:?set VTOP_TLS_DIR to the minted certificate directory}:/etc/vtop/tls:ro"
+      - "vtop-2-data:/home/vtop"
+  vtop-3:
+    <<: *node
+    hostname: vtop-3
+    volumes:
+      - "./vtop/ha-node-3.yaml:/etc/vtop/node.yaml:ro"
+      - "${VTOP_TLS_DIR:?set VTOP_TLS_DIR to the minted certificate directory}:/etc/vtop/tls:ro"
+      - "vtop-3-data:/home/vtop"
+
+volumes:
+  vtop-1-data:
+  vtop-2-data:
+  vtop-3-data:
+
+networks:
+  bench:
+    name: kc-vtop-ha-bench
