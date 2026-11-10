@@ -544,6 +544,12 @@ def ensure_vtop_image(rebuild: bool) -> str:
 
 
 def parse_sat_records(text: str, sizes: list[int]) -> dict[int, int]:
+    """Records per saturation and consume run, for each of `sizes`.
+
+    A size given twice is refused (which count would run is a guess). A size
+    not in `sizes` is dropped, not refused, so `--sizes 100` works with the
+    default table; either way the recorded matrix holds only what runs.
+    """
     table = {}
     for item in text.split(","):
         size, _, count = item.partition(":")
@@ -553,11 +559,13 @@ def parse_sat_records(text: str, sizes: list[int]) -> dict[int, int]:
             raise SystemExit(f"--sat-records entry {item!r} is not SIZE:COUNT") from None
         if count_n < 1:
             raise SystemExit(f"--sat-records gives {count_n} records for {size_n} B: must be positive")
+        if size_n in table:
+            raise SystemExit(f"--sat-records gives record size {size_n} B twice")
         table[size_n] = count_n
     missing = [size for size in sizes if size not in table]
     if missing:
         raise SystemExit(f"--sat-records names no count for record sizes {missing}")
-    return table
+    return {size: table[size] for size in sizes}
 
 
 def parse_sizes(text: str) -> list[int]:
