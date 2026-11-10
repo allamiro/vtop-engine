@@ -32,7 +32,7 @@ use vtop_core::partitioning::{self, PartitionContext};
 use vtop_core::replay::{next_recovery_action, RecoveryAction};
 use vtop_core::state_machine::BatchState;
 use vtop_core::telemetry;
-use vtop_core::types::{ChecksumAlgorithm, ProgressMarker, SourceType};
+use vtop_core::types::{ChecksumAlgorithm, ContentFingerprint, ProgressMarker, SourceType};
 use vtop_core::work_dir::cleanup_work_dir;
 use vtop_state::{connect_state_store_with_deadline, BatchPatch, BatchRecord, StateStore};
 use vtop_upload::multipart::{self, MultipartFence, MultipartUploadConfig};
@@ -2945,8 +2945,8 @@ impl ShutdownRequests for OsShutdownSignals {
 struct RewindPlan {
     lowest: HashMap<String, ProgressMarker>,
     /// The lowest pending start per source (a path or a topic-partition), per
-    /// inode, for [`RewindPlan::holds_back`].
-    by_source: HashMap<String, Vec<(Option<u64>, i128)>>,
+    /// inode and content fingerprint, for [`RewindPlan::holds_back`].
+    by_source: HashMap<String, Vec<PendingGroup>>,
     /// When each unit was last added. Recovery visits incomplete rows oldest
     /// first, so a higher number is a more recent file; the adapters keep one
     /// cursor per path, so the unit applied LAST at a path decides where it
@@ -2956,16 +2956,33 @@ struct RewindPlan {
     added: u64,
 }
 
+/// Pending ranges of one source read from one file: one inode, one content
+/// fingerprint (#578; `None` for a legacy marker or a file that was empty).
+struct PendingGroup {
+    inode: Option<u64>,
+    content: Option<ContentFingerprint>,
+    lowest: i128,
+}
+
+impl PendingGroup {
+    fn is(&self, marker: &ProgressMarker) -> bool {
+        self.inode == marker_inode(marker) && self.content.as_ref() == marker.content_fingerprint()
+    }
+}
+
 impl RewindPlan {
     /// Record that the range starting at `start` is being handed back to its
     /// source. (Only where it starts matters: see [`RewindPlan::holds_back`].)
     fn add(&mut self, start: &ProgressMarker) {
         let position = start_position(start);
-        let inode = marker_inode(start);
         let groups = self.by_source.entry(source_key(start)).or_default();
-        match groups.iter_mut().find(|(i, _)| *i == inode) {
-            Some((_, lowest)) => *lowest = (*lowest).min(position),
-            None => groups.push((inode, position)),
+        match groups.iter_mut().find(|group| group.is(start)) {
+            Some(group) => group.lowest = group.lowest.min(position),
+            None => groups.push(PendingGroup {
+                inode: marker_inode(start),
+                content: start.content_fingerprint().cloned(),
+                lowest: position,
+            }),
         }
         let unit = unit_key(start);
         self.added += 1;
@@ -2990,13 +3007,12 @@ impl RewindPlan {
             let Some(&landed) = effective.get(unit) else {
                 continue;
             };
-            let inode = marker_inode(marker);
-            if let Some((_, lowest)) = self
+            if let Some(group) = self
                 .by_source
                 .get_mut(&source_key(marker))
-                .and_then(|groups| groups.iter_mut().find(|(i, _)| *i == inode))
+                .and_then(|groups| groups.iter_mut().find(|group| group.is(marker)))
             {
-                *lowest = (*lowest).max(landed);
+                group.lowest = group.lowest.max(landed);
             }
         }
     }
@@ -3021,16 +3037,37 @@ impl RewindPlan {
     /// platform without them) cannot be told apart from any file at its path,
     /// so it is compared against every inode's pending ranges, and a pending
     /// range with no inode counts against every VERIFIED range at the path.
+    ///
+    /// Nor does a pending range of OTHER CONTENT at the same inode (#578): a
+    /// file replaced at the same inode by the one the VERIFIED range was read
+    /// from. The adapter refuses to rewind the replacement to it, so it is
+    /// never re-read and cannot be stranded; holding back for it kept the
+    /// replacement's VERIFIED range uncommitted on every restart (review of
+    /// #578). "Other" means proven: fingerprints of the same length that
+    /// differ. Content that cannot be compared - different lengths, or none -
+    /// holds back as before.
     fn holds_back(&self, start: &ProgressMarker) -> bool {
         let from = start_position(start);
         let inode = marker_inode(start);
+        let content = start.content_fingerprint();
         self.by_source
             .get(&source_key(start))
             .is_some_and(|groups| {
                 groups
                     .iter()
-                    .filter(|(i, _)| inode.is_none() || i.is_none() || *i == inode)
-                    .any(|&(_, lowest)| lowest < from)
+                    .filter(|group| {
+                        inode.is_none() || group.inode.is_none() || group.inode == inode
+                    })
+                    .filter(|group| {
+                        group
+                            .content
+                            .as_ref()
+                            .zip(content)
+                            .is_none_or(|(pending, verified)| {
+                                pending.same_content(verified) != Some(false)
+                            })
+                    })
+                    .any(|group| group.lowest < from)
             })
     }
 
@@ -4306,6 +4343,56 @@ mod tests {
         let mut plan = RewindPlan::default();
         plan.add(&spool(Some(7), 100, 150));
         assert!(!plan.holds_back(&spool(Some(9), 150, 200)));
+    }
+
+    /// Review of #578 (Codex): content A was replaced by B at the same inode.
+    /// A's incomplete range can never be re-read - the adapter refuses to
+    /// rewind B to it - so it must not hold back B's VERIFIED range above it,
+    /// or that range stays VERIFIED on every restart while B's bytes are read
+    /// again behind it. Content proven different is another file; content
+    /// that cannot be compared (fingerprints of different lengths, or none)
+    /// holds back as before.
+    #[test]
+    fn a_pending_range_of_replaced_content_does_not_hold_back_the_replacement() {
+        let page = |tag: u8| ContentFingerprint::of(&[tag; 5_000]);
+        let file = |start: u64, content: Option<ContentFingerprint>| ProgressMarker::File {
+            path: "/a".into(),
+            inode: Some(1),
+            start_byte: start,
+            end_byte: start + 100,
+            file_size: 8_192,
+            mtime: String::new(),
+            content_fingerprint: content,
+        };
+        let spool = |start: u64, content: Option<ContentFingerprint>| ProgressMarker::SyslogSpool {
+            spool_id: "s".into(),
+            path: "/s".into(),
+            inode: Some(1),
+            start_byte: start,
+            end_byte: start + 100,
+            received_time_start: None,
+            received_time_end: None,
+            file_size: Some(8_192),
+            content_fingerprint: content,
+        };
+        for marker in [file, spool] {
+            let mut plan = RewindPlan::default();
+            plan.add(&marker(0, page(b'A')));
+            assert!(
+                !plan.holds_back(&marker(100, page(b'B'))),
+                "A's pending [0,100) cannot strand bytes of B, which replaced it"
+            );
+            // The same content, or content that cannot be compared, still
+            // holds back - and so does a pending range of B's own.
+            assert!(plan.holds_back(&marker(100, page(b'A'))));
+            assert!(plan.holds_back(&marker(100, None)));
+            assert!(plan.holds_back(&marker(100, ContentFingerprint::of(b"short"))));
+            plan.add(&marker(50, page(b'B')));
+            assert!(
+                plan.holds_back(&marker(100, page(b'B'))),
+                "B's own pending [50,150) is below B's VERIFIED range"
+            );
+        }
     }
 
     #[test]

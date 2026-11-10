@@ -620,17 +620,19 @@ impl SourceAdapter for SyslogSpoolSource {
             // seeded head restarts the head there; and, whatever its end, the
             // cursor adopts the identity the batch saw - the seed may be of
             // the spool it replaced at the same inode (review of #578). A
-            // legacy marker keeps the current inode (review of #564) and the
-            // seed's fingerprint of it: a re-read, never a skip.
+            // legacy marker keeps the seed's inode, so a rotation before
+            // recovery is still seen, else the current one (review of #564),
+            // and the seed's fingerprint of it: a re-read, never a skip.
             let recovered = generation == continuity::Settled::Unknown;
             if c.read_byte < *end_byte || (recovered && c.read_byte > *end_byte) {
                 c.read_byte = *end_byte;
             }
             if recovered {
-                let inode = (*marker_inode).or(current_inode);
-                let kept = c
-                    .seen
-                    .as_ref()
+                let prior = c.seen.as_ref();
+                let inode = (*marker_inode)
+                    .or(prior.and_then(|seen| seen.inode))
+                    .or(current_inode);
+                let kept = prior
                     .filter(|seen| seen.inode == inode)
                     .and_then(|seen| seen.content.clone());
                 c.seen = Some(SpoolSeen {
@@ -1679,6 +1681,51 @@ mod tests {
                 expected,
                 "recovered end {end}: B's committed prefix [0,{end}) must not be read again"
             );
+        }
+    }
+
+    /// Review of #578 (cubic), for the spool: see the file source's
+    /// `a_legacy_recovered_commit_after_a_rotation_keeps_the_seeds_inode`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_legacy_recovered_commit_after_a_rotation_keeps_the_seeds_inode() {
+        use std::os::unix::fs::MetadataExt;
+        for (seed, end) in [(12u64, 36u64), (36, 12)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("spool.log").to_string_lossy().into_owned();
+            let old: String = (0..8).map(|i| format!("<13>old-{i:02}\n")).collect(); // 12 bytes each
+            std::fs::write(&path, &old).unwrap();
+            let inode = std::fs::metadata(&path).unwrap().ino();
+            let mut spool = SyslogSpoolSource::new(vec![path.clone()]);
+            spool.seed_committed_from(&path, seed, Some(inode), None, None);
+
+            std::fs::rename(&path, format!("{path}.1")).unwrap();
+            let fresh: String = (0..8).map(|i| format!("<13>new-{i:02}\n")).collect();
+            std::fs::write(&path, &fresh).unwrap();
+            let recovered = ProgressMarker::SyslogSpool {
+                spool_id: "spool.log".into(),
+                path: path.clone(),
+                inode: None,
+                start_byte: 0,
+                end_byte: end,
+                received_time_start: None,
+                received_time_end: None,
+                file_size: None,
+                content_fingerprint: None,
+            };
+            spool.commit_progress(&recovered).await.unwrap();
+
+            let next = spool
+                .read_batch_candidates(&spool_source(&path), 100, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            assert_eq!(
+                spool_lines(&next).first().map(String::as_str),
+                Some("<13>new-00"),
+                "seed {seed}, recovered end {end}: the rotated-in spool must be read from \
+                 byte 0, not resumed at {end}"
+            );
+            assert_eq!(next[0].records.len(), 8);
         }
     }
 }

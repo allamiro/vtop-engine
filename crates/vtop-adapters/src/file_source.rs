@@ -1051,16 +1051,20 @@ impl SourceAdapter for FileSource {
                 // committed prefix again. So the cursor adopts the identity
                 // this batch saw.
                 //
-                // A legacy marker names no inode; the commit was judged
-                // current against the file at the path, so that file's inode
-                // stands - dropping it would blind the next read to a
-                // rotation (review of #564). Nor does it name content: the
-                // seed's fingerprint of that inode is kept, which can cost a
+                // A legacy marker names no inode, and a commit without one
+                // passes whatever file is at the path - including one rotated
+                // in before recovery ran. So the seed's inode stands, and the
+                // next read still sees that rotation (review of #578); only
+                // without one does the current file's (review of #564), since
+                // dropping it would blind the next read to a later rotation.
+                // Nor does a legacy marker name content: the seed's
+                // fingerprint of that inode is kept, which can cost a
                 // re-read, never a skip.
-                let inode = (*marker_inode).or(current_inode);
-                let kept = c
-                    .seen
-                    .as_ref()
+                let prior = c.seen.as_ref();
+                let inode = (*marker_inode)
+                    .or(prior.and_then(|seen| seen.inode))
+                    .or(current_inode);
+                let kept = prior
                     .filter(|seen| seen.inode == inode)
                     .and_then(|seen| seen.content.clone());
                 c.seen = Some(FileIdentity {
@@ -3046,6 +3050,55 @@ mod tests {
                 expected,
                 "recovered end {end}: B's committed prefix [0,{end}) must not be read again"
             );
+        }
+    }
+
+    /// Review of #578 (cubic): a LEGACY recovered commit - no inode in its
+    /// marker - whose file was rotated before recovery ran. The commit cannot
+    /// be judged by identity, so it passes; taking the CURRENT file's inode
+    /// for the cursor then hid the rotation, and the next read resumed the
+    /// new file at the old offset. The seed's inode is kept instead, whether
+    /// the recovered end is below the seeded head or at or above it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_legacy_recovered_commit_after_a_rotation_keeps_the_seeds_inode() {
+        use std::os::unix::fs::MetadataExt;
+        for (seed, end) in [(21u64, 60u64), (60, 21)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("app.log").to_string_lossy().into_owned();
+            let old: String = (0..12).map(|i| format!("old-{i:02}\n")).collect(); // 84 bytes
+            std::fs::write(&path, &old).unwrap();
+            let inode = std::fs::metadata(&path).unwrap().ino();
+            let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+            fs.seed_committed_from(&path, seed, Some(inode), Some(84), None);
+
+            // Rotated while the engine was down: a new file, longer than the
+            // batch, already at the path when recovery commits.
+            std::fs::rename(&path, format!("{path}.1")).unwrap();
+            let fresh: String = (0..12).map(|i| format!("new-{i:02}\n")).collect();
+            std::fs::write(&path, &fresh).unwrap();
+            let recovered = ProgressMarker::File {
+                path: path.clone(),
+                inode: None,
+                start_byte: 0,
+                end_byte: end,
+                file_size: end,
+                mtime: String::new(),
+                content_fingerprint: None,
+            };
+            fs.commit_progress(&recovered).await.unwrap();
+
+            let next = fs
+                .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            assert_eq!(
+                lines(&next).first().map(String::as_str),
+                Some("new-00"),
+                "seed {seed}, recovered end {end}: the rotated-in file must be read from \
+                 byte 0, not resumed at {end}"
+            );
+            assert_eq!(next[0].records.len(), 12);
         }
     }
 }
