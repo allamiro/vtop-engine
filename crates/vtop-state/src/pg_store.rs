@@ -296,6 +296,7 @@ impl PgStateStore {
 #[async_trait]
 impl StateStore for PgStateStore {
     async fn save_batch_state(&self, rec: &BatchRecord) -> Result<(), VtopError> {
+        crate::store::require_batching_insert(rec)?;
         let ps = serde_json::to_string(&rec.progress_start)?;
         let pe = serde_json::to_string(&rec.progress_end)?;
         // Plain INSERT: a duplicate batch_id must fail on the primary key, never

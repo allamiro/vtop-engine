@@ -103,5 +103,11 @@ migration job per database; engine replicas should start only after it succeeds.
   fingerprint added to file and spool markers (#578) is such a change: no
   DDL, older rows keep being read and judged as before. See the ledger format
   note in [`ARCHITECTURE.md`](ARCHITECTURE.md) §7.2.
+- The invariant trigger also refuses an `INSERT` in any state but `batching`
+  (#625). Re-running `vtopctl migrate` replaces the trigger function in
+  place. Every release inserts only `batching`, so an older engine on the
+  upgraded schema is unaffected. A data-only restore into a migrated schema
+  (`pg_restore --data-only`) is refused by this trigger, as it already was
+  for `source_committed` rows; restore with `--disable-triggers`.
 - Test grants after role changes: runtime must be able to read/write ledger
   rows but must fail `CREATE TABLE`, `ALTER TABLE`, `DELETE`, and `TRUNCATE`.

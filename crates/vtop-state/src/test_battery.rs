@@ -69,6 +69,7 @@ pub async fn run_all(store: &dyn StateStore) {
     empty_store_is_empty(store).await;
     save_and_reload(store).await;
     duplicate_save_is_rejected(store).await;
+    insert_refuses_any_state_but_batching(store).await;
     get_missing_returns_none(store).await;
     rejects_commit_before_verified(store).await;
     full_legal_walk_commits(store).await;
@@ -247,6 +248,57 @@ async fn duplicate_save_is_rejected(store: &dyn StateStore) {
     // row that might already be committed.
     let err = store.save_batch_state(&sample_record("dup-1")).await;
     assert!(err.is_err(), "duplicate batch_id must be rejected");
+}
+
+/// #625: the insert is the one write that does not go through the state
+/// machine, so a row born in any state but BATCHING skips every check behind
+/// it - born VERIFIED, it can be committed without ever having been verified.
+async fn insert_refuses_any_state_but_batching(store: &dyn StateStore) {
+    let not_initial = [
+        BatchState::Discovered,
+        BatchState::Sealed,
+        BatchState::Compressed,
+        BatchState::Checksummed,
+        BatchState::ObjectUploaded,
+        BatchState::ManifestUploaded,
+        BatchState::Verified,
+        BatchState::SourceCommitted,
+        BatchState::Failed,
+        BatchState::ReplayRequired,
+    ];
+    for st in not_initial {
+        let id = format!("born-{}", st.as_str());
+        let mut rec = sample_record(&id);
+        rec.state = st;
+        let result = store.save_batch_state(&rec).await;
+        assert!(
+            matches!(
+                result,
+                Err(VtopError::InvalidStateForOperation {
+                    expected: BatchState::Batching,
+                    actual,
+                }) if actual == st
+            ),
+            "an insert as {st:?} must be refused as not BATCHING, got {result:?}"
+        );
+        assert!(
+            store.get_batch(&id).await.unwrap().is_none(),
+            "a refused insert as {st:?} must leave no row"
+        );
+    }
+    store
+        .save_batch_state(&sample_record("born-batching"))
+        .await
+        .expect("an insert as BATCHING must be accepted");
+    assert_eq!(
+        store
+            .get_batch("born-batching")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        BatchState::Batching
+    );
 }
 
 async fn get_missing_returns_none(store: &dyn StateStore) {

@@ -132,6 +132,21 @@ pub(crate) fn canonical_created_at(s: &str) -> String {
         .unwrap_or_else(|_| s.to_owned())
 }
 
+/// Refuse an insert in any state but BATCHING, before any SQL runs (#625).
+/// Every later write goes through the state machine; the insert is the one
+/// that does not, so a row born VERIFIED could be committed without ever
+/// having been verified. The engine only creates rows in BATCHING; this keeps
+/// any other caller (an import or repair tool, a refactor) from doing less.
+pub(crate) fn require_batching_insert(rec: &BatchRecord) -> Result<(), VtopError> {
+    if rec.state == BatchState::Batching {
+        return Ok(());
+    }
+    Err(VtopError::InvalidStateForOperation {
+        expected: BatchState::Batching,
+        actual: rec.state,
+    })
+}
+
 /// A durable, replay-safe ledger of batch state transitions.
 ///
 /// The method set is deliberately small and matches exactly what the engine
@@ -139,7 +154,8 @@ pub(crate) fn canonical_created_at(s: &str) -> String {
 #[async_trait]
 pub trait StateStore: Send + Sync {
     /// Insert a batch when it first enters the store. A duplicate `batch_id`
-    /// MUST fail rather than overwrite an existing — possibly committed — row.
+    /// MUST fail rather than overwrite an existing — possibly committed — row,
+    /// and so MUST a record in any state but BATCHING (#625).
     async fn save_batch_state(&self, rec: &BatchRecord) -> Result<(), VtopError>;
 
     /// Validate and persist a state transition. The transition MUST be checked

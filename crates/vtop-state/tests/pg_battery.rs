@@ -185,4 +185,21 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         err.to_string().contains("commit before verified"),
         "expected the trigger to reject a born-committed insert, got: {err}"
     );
+
+    // ---- 5. Nor born in any other state but batching (#625) ----
+    // Born verified, a row could then be committed without ever having been
+    // verified: the UPDATE to source_committed passes the trigger above.
+    let err = store
+        .execute_raw(
+            "INSERT INTO batches \
+             (batch_id, tenant, source_type, source_name, format, state, \
+              progress_start_json, progress_end_json, created_at, updated_at) \
+             VALUES ('born-verified','default','kafka','app','cef','verified','{}','{}','t','t')",
+        )
+        .await
+        .expect_err("inserting a verified row must be rejected");
+    assert!(
+        err.to_string().contains("must be inserted as batching"),
+        "expected the trigger to reject a born-verified insert, got: {err}"
+    );
 }

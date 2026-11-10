@@ -70,6 +70,11 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
 );
 
 -- Database-level backstop for the verify-before-source-commit invariant.
+--
+-- A row is also born only as batching (#625): born verified, it could be
+-- committed without ever having been verified. Every engine release inserts
+-- only batching, so an older binary on an upgraded database is unaffected.
+-- CREATE OR REPLACE means re-running `vtopctl migrate` installs the new body.
 CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$
 BEGIN
     IF NEW.state = 'source_committed' THEN
@@ -80,6 +85,10 @@ BEGIN
             RAISE EXCEPTION 'commit before verified: batch % is %', OLD.batch_id, OLD.state
                 USING ERRCODE = 'check_violation';
         END IF;
+    END IF;
+    IF TG_OP = 'INSERT' AND NEW.state <> 'batching' THEN
+        RAISE EXCEPTION 'batch % must be inserted as batching, not %', NEW.batch_id, NEW.state
+            USING ERRCODE = 'check_violation';
     END IF;
     RETURN NEW;
 END;
