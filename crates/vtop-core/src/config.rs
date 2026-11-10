@@ -455,8 +455,10 @@ pub struct FileSourceConfig {
     /// taking that writer's lines into an inode no path names. It is a
     /// heuristic, not a proof: no portable check shows that no process holds
     /// a file open, so a writer that keeps the file open, is silent for longer
-    /// than the quiet period and then writes again loses those lines. Point
-    /// this option at files that are finished, not at a live log.
+    /// than the quiet period and then writes again loses those lines - as does
+    /// one whose write, after that silence, lands between the delete's final
+    /// check and the unlink. Point this option at files that are finished, not
+    /// at a live log.
     #[serde(default)]
     pub delete_after_commit: bool,
     /// How long, in seconds, a fully archived file must stay unwritten before
