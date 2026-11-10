@@ -508,7 +508,13 @@ length (#578), starts a new generation, judged on its own, with its start
 below its first read unproven. The fingerprint is what catches a replacement
 that reuses the inode and was already as large as the old read position when
 first read - path, inode and size agree - so the old file's commits no longer
-cover its unread start. Rows written before #578 carry no fingerprint (and,
+cover its unread start. Two limits remain: the fingerprint covers the first
+4 KiB only, so a replacement whose first 4 KiB are byte for byte the old
+file's still looks like the same file; and fingerprints of different lengths
+(a file under 4 KiB fingerprints all of itself, so the length grows with it)
+cannot be compared, so a replacement of a small file is caught here only
+where two reads covered the same length (the adapter, which has the bytes,
+checks the shorter one at read time). Rows written before #578 carry no fingerprint (and,
 for spools, no size): they are judged as before - files by size, spools per
 inode only - and a fingerprint is compared only with one of the same length,
 so they never split a unit. See the ledger format note in

@@ -76,7 +76,9 @@ pub struct CommittedCursor {
     /// truncation.
     pub observed_size: Option<u64>,
     /// The fingerprint of the file's first bytes that the MOST RECENT
-    /// committed batch took (#578): a file replaced at the same inode while
+    /// committed batch took - newest by `(created_at, batch_id)`, the order
+    /// the windows were read, not `updated_at`, as for the fields above
+    /// (#578): a file replaced at the same inode while
     /// the engine was down, already longer than the offset, is caught by it
     /// alone. `None` for a row that predates the field, or a file that was
     /// empty when read.
@@ -87,8 +89,19 @@ pub struct CommittedCursor {
 /// that does not parse reads as "unknown", never as some other fingerprint:
 /// an unknown fingerprint only forgoes a check, a wrong one would invent a
 /// replacement.
+///
+/// Nor is a fingerprint no reader could have written (review of #578): a
+/// zero length would hash nothing and match every file, and a digest that is
+/// not 64 hex digits can match none.
 pub(crate) fn parse_content_fingerprint(json: &str) -> Option<ContentFingerprint> {
-    serde_json::from_str(json).ok()
+    let fingerprint: ContentFingerprint = serde_json::from_str(json).ok()?;
+    let plausible = (1..=ContentFingerprint::MAX_LEN as u64).contains(&fingerprint.len)
+        && fingerprint.sha256.len() == 64
+        && fingerprint
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit());
+    plausible.then_some(fingerprint)
 }
 
 /// Patch applied when advancing a batch's state. Fields set to `Some` are
@@ -120,6 +133,31 @@ impl BatchPatch {
             object_size_bytes: Some(m.object.size_bytes as i64),
             record_count: Some(m.record_count as i64),
             error_message: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review of #578: a stored fingerprint no reader could have written is
+    /// unknown, never a fingerprint - `len: 0` would match every file.
+    #[test]
+    fn an_implausible_stored_fingerprint_reads_as_unknown() {
+        let good = ContentFingerprint::of(b"abc\n").unwrap();
+        let json = serde_json::to_string(&good).unwrap();
+        assert_eq!(parse_content_fingerprint(&json), Some(good.clone()));
+        let empty_digest = vtop_core::checksum::sha256_bytes(b"");
+        for bad in [
+            format!(r#"{{"len":0,"sha256":"{empty_digest}"}}"#),
+            format!(r#"{{"len":4097,"sha256":"{}"}}"#, good.sha256),
+            r#"{"len":4,"sha256":"not-a-digest"}"#.to_owned(),
+            format!(r#"{{"len":4,"sha256":"{}"}}"#, &good.sha256[..63]),
+            "null".to_owned(),
+            "{".to_owned(),
+        ] {
+            assert_eq!(parse_content_fingerprint(&bad), None, "{bad}");
         }
     }
 }

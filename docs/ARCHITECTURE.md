@@ -374,8 +374,8 @@ Limits, stated plainly:
   cannot be told from the original.
 - **Rows written before #578 carry no fingerprint**, and a cursor seeded from
   one, or a range recovered from one, is judged by inode and length alone,
-  exactly as before. The first read after an upgrade takes a fingerprint, and
-  from there the check applies.
+  exactly as before. The first read after an upgrade that finds the file
+  non-empty takes a fingerprint, and from there the check applies.
 - History pruning keeps one row per path, so a file untouched for longer than
   the retention window can lose the rows that name its inode. The restart then
   reads it from byte 0 again: duplicates, bounded by the file.
@@ -401,8 +401,11 @@ needs nothing either.
   position), the coverage audit by inode and size (files) or inode alone
   (spools). Rows from before and after the change at one path and inode are
   judged together: a fingerprint is compared only with another of the same
-  length, so a row without one never splits a file.
-- A marker with no fingerprint serializes byte for byte as before. The
+  length, so a row without one cannot cause a fingerprint split (the size
+  test still applies to it as before).
+- A marker with neither new field set (every file marker without a
+  fingerprint; spool markers now always carry `file_size`) serializes byte
+  for byte as before. The
   manifest's `source_progress` never carries the new fields: an older
   `verify-manifest` decodes a manifest and hashes it re-encoded, and would
   drop them and report a mismatch, so manifests stay in the format every

@@ -413,9 +413,6 @@ async fn max_committed_end_bytes_aggregates_in_store(store: &dyn StateStore) {
     );
 }
 
-/// #558: a restart seeds each file's cursor from the ledger. The ledger's
-/// per-path MAX(end_byte) mixes every file that has ever lived at the path, so
-/// after a rotation it handed the NEW file the OLD file's high-water mark.
 /// #578: the restart cursor carries the content fingerprint (and, for a
 /// spool, the length) the NEWEST committed row recorded - read out of the
 /// stored JSON by both backends - and a newest row from before the field
@@ -518,6 +515,9 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
     );
 }
 
+/// #558: a restart seeds each file's cursor from the ledger. The ledger's
+/// per-path MAX(end_byte) mixes every file that has ever lived at the path, so
+/// after a rotation it handed the NEW file the OLD file's high-water mark.
 /// `committed_cursors` answers with the newest committed batch's inode, end
 /// byte and observed length - the newest by the instant it was created.
 async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateStore) {

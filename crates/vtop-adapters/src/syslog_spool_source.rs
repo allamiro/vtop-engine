@@ -718,10 +718,13 @@ impl SourceAdapter for SyslogSpoolSource {
         if marker_inode.is_some() && identity != *marker_inode {
             return None;
         }
-        // The cursor read other content at that inode since (#578).
+        // The cursor read other content at that inode since (#578) - or
+        // content its fingerprint cannot be compared with (a file under one
+        // page fingerprints a different length as it grows): unverified is
+        // answered as unknown, the conservative answer (review of #578).
         if content
             .zip(marker_content.as_ref())
-            .is_some_and(|(seen, marker)| seen.same_content(marker) == Some(false))
+            .is_some_and(|(seen, marker)| seen.same_content(marker) != Some(true))
         {
             return None;
         }

@@ -1199,10 +1199,13 @@ impl SourceAdapter for FileSource {
         if marker_inode.is_some() && identity != *marker_inode {
             return None;
         }
-        // The cursor read other content at that inode since (#578).
+        // The cursor read other content at that inode since (#578) - or
+        // content its fingerprint cannot be compared with (a file under one
+        // page fingerprints a different length as it grows): unverified is
+        // answered as unknown, the conservative answer (review of #578).
         if content
             .zip(marker_content.as_ref())
-            .is_some_and(|(seen, marker)| seen.same_content(marker) == Some(false))
+            .is_some_and(|(seen, marker)| seen.same_content(marker) != Some(true))
         {
             return None;
         }
@@ -2903,6 +2906,7 @@ mod tests {
         let (got, marker) = read(&mut fs, &path).await;
         assert!(got.is_empty());
         assert_eq!(marker.content_fingerprint(), None, "an empty file");
+        let mut earlier: Option<ProgressMarker> = None;
 
         let mut expected = Vec::new();
         for i in 0..300 {
@@ -2920,6 +2924,18 @@ mod tests {
             let len = marker.content_fingerprint().unwrap().len;
             let size = std::fs::metadata(&path).unwrap().len();
             assert_eq!(len, size.min(ContentFingerprint::MAX_LEN as u64));
+            // Review of #578: an earlier read's fingerprint of another length
+            // cannot be compared with the cursor's, so its position is not
+            // claimed for it; at full length (both one page) it is.
+            if let Some(earlier) = earlier.replace(marker.clone()) {
+                let comparable = earlier.content_fingerprint().unwrap().len == len;
+                assert_eq!(
+                    fs.read_position(&earlier).is_some(),
+                    comparable,
+                    "append {i}: fingerprint lengths {} and {len}",
+                    earlier.content_fingerprint().unwrap().len
+                );
+            }
         }
     }
 
