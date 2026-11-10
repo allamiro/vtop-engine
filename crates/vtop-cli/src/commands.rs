@@ -29,7 +29,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Run the engine continuously (recover, discover, process).
+    /// Run the engine continuously (recover, discover, process). SIGINT
+    /// (Ctrl-C) or, on Unix, SIGTERM stops it after the current source pass
+    /// and a shutdown flush (exit 0; exit 1 if the flush could not archive
+    /// what it had buffered); a second signal during that flush abandons it
+    /// (exit 1).
     Run {
         #[arg(long)]
         config: PathBuf,

@@ -128,13 +128,16 @@ def test_the_runner_writes_a_top_level_value_for_every_protected_column():
     # dict splat — `**shape.flat_columns()`, or a blank one per
     # lib.shaping.SHAPING_COLUMNS — which is the same guarantee expressed in
     # code rather than in a literal, and both sides already splice that one
-    # tuple.
+    # tuple. The competitor columns (#478) are the same case: written as
+    # `**contention.flat_columns()` or `competitor.blank_columns()`, both built
+    # from lib.competitor.COMPETITOR_COLUMNS.
     source = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "run_benchmark.py")
     with open(source, encoding="utf-8") as fh:
         runner = fh.read()
+    from lib.competitor import COMPETITOR_COLUMNS
     for column in (column for column in RESOLVED_COLUMNS
-                   if column not in SHAPING_COLUMNS):
+                   if column not in SHAPING_COLUMNS and column not in COMPETITOR_COLUMNS):
         assert f'"{column}":' in runner, (
             f"run_benchmark.py never writes {column!r} into its summary, so matrix_row has "
             "nothing to protect and the scenario's requested value is what the matrix "

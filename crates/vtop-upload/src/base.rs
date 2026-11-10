@@ -8,6 +8,7 @@
 use async_trait::async_trait;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -228,35 +229,56 @@ pub(crate) async fn verify_command_content(
     backend: &str,
     timeout: Duration,
 ) -> Result<VerificationResult, VtopError> {
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| VtopError::Upload(format!("spawning {backend} verification: {e}")))?;
+    let deadline = command_deadline(timeout);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = spawn_retrying_text_busy(cmd, backend, "verification").await?;
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| VtopError::Upload(format!("{backend} verification stdout unavailable")))?;
-    let completed = tokio::time::timeout(timeout, async {
-        let (result, oversized) =
-            verify_reader_content(stdout, expected_size, expected, backend).await?;
-        if oversized {
-            let _ = child.kill().await;
-        }
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| VtopError::Upload(format!("waiting for {backend} verification: {e}")))?;
+    let evidence = ReadBackEvidence::collect(&mut child, backend, "verification")?;
+    let completed = tokio::time::timeout_at(deadline, async {
+        // The tool's exit is watched WHILE stdout drains (review of #530): a
+        // descendant it left behind can hold stdout open after the tool
+        // itself has failed, and draining first would wait out the deadline
+        // and lose the failure's evidence. A failed exit is classified now;
+        // a successful one still waits for the content.
+        let read = verify_reader_content(stdout, expected_size, expected, backend);
+        tokio::pin!(read);
+        let mut verified = None;
+        let status = loop {
+            tokio::select! {
+                outcome = &mut read, if verified.is_none() => {
+                    let (result, oversized) = outcome?;
+                    if oversized {
+                        let _ = child.kill().await;
+                    }
+                    verified = Some((result, oversized));
+                }
+                status = child.wait() => break status.map_err(|e| {
+                    VtopError::Upload(format!("waiting for {backend} verification: {e}"))
+                })?,
+            }
+        };
+        let oversized = verified.as_ref().is_some_and(|(_, oversized)| *oversized);
         if !status.success() && !oversized {
-            return Err(VtopError::Upload(format!(
-                "{backend} verification command exited with {status}"
-            )));
+            return Ok(Err(status));
         }
-        Ok::<_, VtopError>(result)
+        let (result, _) = match verified {
+            Some(verified) => verified,
+            None => read.await?,
+        };
+        Ok::<_, VtopError>(Ok(result))
     })
     .await;
     match completed {
-        Ok(Ok(result)) => Ok(result),
+        Ok(Ok(Ok(result))) => Ok(result),
+        Ok(Ok(Err(status))) => Err(evidence
+            .classify(
+                format!("{backend} verification command exited with {status}"),
+                deadline,
+            )
+            .await),
         Ok(Err(error)) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -302,31 +324,47 @@ pub(crate) async fn read_command_bounded(
     backend: &str,
     timeout: Duration,
 ) -> Result<Vec<u8>, VtopError> {
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| VtopError::Upload(format!("spawning {backend} download: {e}")))?;
+    let deadline = command_deadline(timeout);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = spawn_retrying_text_busy(cmd, backend, "download").await?;
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| VtopError::Upload(format!("{backend} download stdout unavailable")))?;
-    let completed = tokio::time::timeout(timeout, async {
-        let bytes = read_bounded(stdout, max_bytes, object_uri).await?;
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| VtopError::Upload(format!("waiting for {backend} download: {e}")))?;
+    let evidence = ReadBackEvidence::collect(&mut child, backend, "download")?;
+    let completed = tokio::time::timeout_at(deadline, async {
+        // Exit watched while stdout drains, as in `verify_command_content`
+        // (review of #530): a failed tool is classified on its own exit, not
+        // after a descendant holding stdout lets go.
+        let read = read_bounded(stdout, max_bytes, object_uri);
+        tokio::pin!(read);
+        let mut bytes = None;
+        let status = loop {
+            tokio::select! {
+                outcome = &mut read, if bytes.is_none() => bytes = Some(outcome?),
+                status = child.wait() => break status.map_err(|e| {
+                    VtopError::Upload(format!("waiting for {backend} download: {e}"))
+                })?,
+            }
+        };
         if !status.success() {
-            return Err(VtopError::Upload(format!(
-                "{backend} download command exited with {status}"
-            )));
+            return Ok(Err(status));
         }
-        Ok::<_, VtopError>(bytes)
+        let bytes = match bytes {
+            Some(bytes) => bytes,
+            None => read.await?,
+        };
+        Ok::<_, VtopError>(Ok(bytes))
     })
     .await;
     match completed {
-        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Ok(Ok(bytes))) => Ok(bytes),
+        Ok(Ok(Err(status))) => Err(evidence
+            .classify(
+                format!("{backend} download command exited with {status}"),
+                deadline,
+            )
+            .await),
         Ok(Err(error)) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -340,6 +378,193 @@ pub(crate) async fn read_command_bounded(
                 timeout.as_secs()
             )))
         }
+    }
+}
+
+/// A read-back tool's stderr, kept as evidence of WHY it failed (#481).
+///
+/// REGRESSION: both read-back helpers used to send the tool's stderr to
+/// `/dev/null` and report only the exit status, as a generic `Upload`. So an
+/// `aws s3 cp … -`, `s3cmd get … -` or `mc cat` that the store THROTTLED
+/// during verification or a manifest read-back reached the engine as an
+/// ordinary failure, and `note_store_request` told the width controller the
+/// store was fine while it was asking for less. The write path (`command.rs`)
+/// already classified its evidence; the read path now does the same, on the
+/// same last line, through the same `upload_failure`.
+///
+/// Drained on its own task from the moment the child starts, so a tool that
+/// fills stderr can never stall the stdout read. Dropping it aborts the drain.
+///
+/// The kept tail lives OUTSIDE the task, shared with it, so that a wait for
+/// the drain which runs out of time can still read what was captured. The
+/// case that matters: the tool printed `SlowDown` and exited, but a
+/// grandchild it left behind inherited stderr and holds the pipe open. The
+/// drain never reaches EOF, yet the line the classifier needs is already in
+/// the buffer; waiting on a `JoinHandle<String>` alone would throw it away
+/// with the timeout and report the throttle as an ordinary failure.
+struct ReadBackEvidence {
+    drain: tokio::task::JoinHandle<()>,
+    kept: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Drop for ReadBackEvidence {
+    fn drop(&mut self) {
+        self.drain.abort();
+    }
+}
+
+/// Spawn a command backend's tool, retrying a briefly busy executable.
+///
+/// ETXTBSY (`Text file busy`, os error 26) means the executable is still
+/// open for writing somewhere — an installer replacing it in place, or a
+/// sibling `fork` that inherited the write descriptor before `exec`. It
+/// clears on its own, so the spawn is retried a bounded number of times with
+/// a short backoff before it is reported. Every command spawn goes through
+/// here (the write path's `CommandPolicy::capture`, the read-back and the
+/// verify), so they cannot drift apart again: the read-back and verify used
+/// to spawn once and fail outright, which this PR's concurrent test fixtures
+/// exposed as an intermittent `Text file busy`.
+pub(crate) async fn spawn_retrying_text_busy(
+    command: &mut Command,
+    backend: &str,
+    operation: &str,
+) -> Result<tokio::process::Child, VtopError> {
+    retry_text_busy(|| command.spawn(), backend, operation).await
+}
+
+/// How many times a spawn that hit ETXTBSY is retried, `10 ms × n` apart.
+const TEXT_BUSY_RETRIES: u32 = 4;
+/// `ETXTBSY` on Linux and the BSDs, macOS included.
+const TEXT_BUSY: i32 = 26;
+
+/// `spawn_retrying_text_busy` over any spawn, so the retry policy and its
+/// error messages can be tested without racing a real busy executable.
+async fn retry_text_busy<T>(
+    mut spawn: impl FnMut() -> std::io::Result<T>,
+    backend: &str,
+    operation: &str,
+) -> Result<T, VtopError> {
+    let mut busy_retries = 0_u32;
+    loop {
+        match spawn() {
+            Ok(spawned) => return Ok(spawned),
+            Err(error)
+                if error.raw_os_error() == Some(TEXT_BUSY) && busy_retries < TEXT_BUSY_RETRIES =>
+            {
+                busy_retries += 1;
+                tokio::time::sleep(Duration::from_millis(10 * u64::from(busy_retries))).await;
+            }
+            Err(error) => {
+                let hint = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    "; verify that the command is executable and its filesystem is not mounted noexec"
+                } else if error.raw_os_error() == Some(TEXT_BUSY) {
+                    "; the executable remained busy after bounded retries; install/replace it atomically and retry"
+                } else {
+                    ""
+                };
+                return Err(VtopError::Upload(format!(
+                    "spawning {backend} {operation}: {error}{hint}"
+                )));
+            }
+        }
+    }
+}
+
+/// The instant a command invocation must be finished by, fixed BEFORE the
+/// tool is spawned. `upload.command_timeout_seconds` bounds the whole call:
+/// running the tool and then collecting its stderr evidence both spend from
+/// this one deadline, so neither can restart the clock (#529 review). The
+/// setting is an unbounded `u64`, so an absurd value saturates to a
+/// practically-never deadline instead of panicking on `Instant` overflow.
+fn command_deadline(timeout: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(30 * 365 * 24 * 60 * 60))
+}
+
+impl ReadBackEvidence {
+    /// The most stderr kept. Enough for any CLI's last error line; the rest
+    /// is drained, not stored, so a chatty tool can neither block on a full
+    /// pipe nor grow this process. The TAIL is what is kept: the classifier
+    /// reads the last line, and a tool that prints progress before failing
+    /// would otherwise have its error discarded as the part past the cap.
+    const MAX_BYTES: usize = 64 * 1024;
+    /// How much of the last line the error message repeats.
+    const MAX_SHOWN_CHARS: usize = 240;
+    /// How long the drain may run on after the tool has EXITED. Everything
+    /// the tool wrote is already in the pipe by then (at most one pipe
+    /// buffer, read in microseconds), so this only has to cover scheduling
+    /// the drain task; past it, a descendant is what holds the pipe open.
+    const EXITED_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+    fn collect(
+        child: &mut tokio::process::Child,
+        backend: &str,
+        operation: &str,
+    ) -> Result<Self, VtopError> {
+        let mut stderr = child.stderr.take().ok_or_else(|| {
+            VtopError::Upload(format!("{backend} {operation} stderr unavailable"))
+        })?;
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::clone(&kept);
+        let drain = tokio::spawn(async move {
+            let mut chunk = [0_u8; 4096];
+            while let Ok(read) = stderr.read(&mut chunk).await {
+                if read == 0 {
+                    break;
+                }
+                // Held only for the copy, never across the next read.
+                let mut kept = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+                kept.extend_from_slice(&chunk[..read]);
+                if kept.len() > Self::MAX_BYTES {
+                    let excess = kept.len() - Self::MAX_BYTES;
+                    kept.drain(..excess);
+                }
+            }
+        });
+        Ok(Self { drain, kept })
+    }
+
+    /// The error for a tool that EXITED non-zero: its last stderr line, and
+    /// the throttle classification that line supports. Called once the child
+    /// has exited, so the pipe is normally at EOF and the drain finishes at
+    /// once. A grandchild the tool left behind can hold the pipe open, so the
+    /// wait is bounded twice: by `EXITED_DRAIN_GRACE` from now, and by what is
+    /// left of the command's own `deadline` — evidence is worth waiting for,
+    /// not worth hanging on, and never worth stretching the invocation past
+    /// `upload.command_timeout_seconds`. The grace is what keeps a tool that
+    /// failed AT ONCE from waiting out the whole deadline (review of #530:
+    /// with the 300 s default, an immediately-failed read-back took about
+    /// five minutes). When the wait ends early, the tail captured so far is
+    /// classified: the tool's error line was written before it exited, so it
+    /// is already kept.
+    async fn classify(mut self, detail: String, deadline: tokio::time::Instant) -> VtopError {
+        let until = tokio::time::Instant::now()
+            .checked_add(Self::EXITED_DRAIN_GRACE)
+            .map_or(deadline, |grace| grace.min(deadline));
+        let _ = tokio::time::timeout_at(until, &mut self.drain).await;
+        let evidence = {
+            let kept = self
+                .kept
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            String::from_utf8_lossy(&kept).into_owned()
+        };
+        let shown: String = evidence
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
+            .chars()
+            .take(Self::MAX_SHOWN_CHARS)
+            .collect();
+        let detail = if shown.is_empty() {
+            detail
+        } else {
+            format!("{detail}: {shown}")
+        };
+        upload_failure(detail, &evidence)
     }
 }
 
@@ -770,5 +995,82 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("timeout"));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// The one spawn policy every command backend call shares: a busy
+    /// executable (ETXTBSY) is retried at most `TEXT_BUSY_RETRIES` times and
+    /// then reported with the install-atomically hint; any other error is
+    /// reported at once. Driven by a scripted spawn, not by racing a real
+    /// busy file. Before this, the read-back and verify spawned once, so the
+    /// "busy then free" case below failed them outright.
+    #[tokio::test]
+    async fn a_busy_executable_is_retried_a_bounded_number_of_times_on_every_spawn() {
+        use std::io::{Error, ErrorKind};
+        let scripted = |failures: Vec<Error>| {
+            let mut failures = failures.into_iter();
+            let mut attempts = 0_u32;
+            move || {
+                attempts += 1;
+                match failures.next() {
+                    Some(error) => Err(error),
+                    None => Ok(attempts),
+                }
+            }
+        };
+        let busy = || Error::from_raw_os_error(TEXT_BUSY);
+
+        // Busy for every retry the policy allows, then free: spawned.
+        let failures = (0..TEXT_BUSY_RETRIES).map(|_| busy()).collect();
+        let attempts = retry_text_busy(scripted(failures), "aws cli", "download")
+            .await
+            .expect("a spawn that frees up within the retries must succeed");
+        assert_eq!(attempts, TEXT_BUSY_RETRIES + 1);
+
+        // Busy one time more than that: reported, with the hint, after
+        // exactly 1 + TEXT_BUSY_RETRIES attempts.
+        let mut calls = 0_u32;
+        let mut spawn = scripted((0..=TEXT_BUSY_RETRIES).map(|_| busy()).collect());
+        let error = retry_text_busy(
+            || {
+                calls += 1;
+                spawn()
+            },
+            "aws cli",
+            "verification",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(calls, TEXT_BUSY_RETRIES + 1, "retries must be bounded");
+        let message = error.to_string();
+        assert!(
+            message.contains("spawning aws cli verification:")
+                && message.contains("install/replace it atomically"),
+            "unexpected error: {message}"
+        );
+
+        // Not busy: no retry, reported at once (with the noexec hint for a
+        // permission error).
+        for (error, hint) in [
+            (Error::from(ErrorKind::PermissionDenied), Some("noexec")),
+            (Error::from(ErrorKind::NotFound), None),
+        ] {
+            let mut calls = 0_u32;
+            let mut spawn = scripted(vec![error]);
+            let error = retry_text_busy(
+                || {
+                    calls += 1;
+                    spawn()
+                },
+                "s3cmd",
+                "upload",
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(calls, 1, "only a busy executable is retried: {error}");
+            let message = error.to_string();
+            assert!(message.contains("spawning s3cmd upload:"), "{message}");
+            assert_eq!(hint.is_some_and(|h| message.contains(h)), hint.is_some());
+            assert!(!message.contains("atomically"), "{message}");
+        }
     }
 }
