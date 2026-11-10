@@ -95,7 +95,9 @@ def _write_text_file(path: str, target_bytes: int, fmt: str) -> int:
     else:
         gens = [LINE_GENERATORS.get(fmt, line_txt)]
     written = 0
-    with open(path, "w", encoding="utf-8") as fh:
+    # "x", never "w" (#481, review): an existing path is refused, not
+    # truncated. See generate_dataset.
+    with open(path, "x", encoding="utf-8") as fh:
         while written < target_bytes:
             line = random.choice(gens)() + "\n"
             fh.write(line)
@@ -110,7 +112,7 @@ def _write_binary_file(path: str, target_bytes: int) -> int:
     # whole payload in memory at once.
     chunk = 8 * 1024 * 1024
     remaining = target_bytes
-    with open(path, "wb") as fh:
+    with open(path, "xb") as fh:
         while remaining > 0:
             n = min(chunk, remaining)
             fh.write(os.urandom(n))
@@ -142,6 +144,15 @@ def generate_dataset(out_dir: str, fmt: str, volume: int, size_class: str,
     The engine keeps that path's committed byte offset, so the shorter
     replacement is skipped and its records never arrive: silent loss inside the
     very measurement meant to observe a backlog (review).
+
+    A file is NEVER overwritten: it is created exclusively, and an existing
+    path raises FileExistsError (#481, review). With a pinned `seed`, names
+    repeat exactly from run to run, so a rerun into a caller-supplied
+    --seed-dir would otherwise rewrite the previous run's files - or a
+    caller's own data that happens to share a name - in a directory the
+    runner promises to leave intact. The runner gives every run its own
+    prefix, so a refusal here means two generations in one run asked for the
+    same namespace, which is a bug to surface rather than paper over.
     """
     random.seed(seed if seed else None)
     os.makedirs(out_dir, exist_ok=True)

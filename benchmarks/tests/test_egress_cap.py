@@ -489,3 +489,40 @@ def test_every_committed_rate_record_rejudges_to_its_committed_verdict(tmp_path)
         with open(os.path.join(run, "egress_verdict.json"), encoding="utf-8") as fh:
             committed = json.load(fh)
         assert json.loads((out / "egress_verdict.json").read_text()) == committed, run
+
+
+def test_a_pinned_dataset_never_overwrites_a_file_already_in_the_seed_dir(tmp_path):
+    # With initial_seed the names repeat exactly, so a rerun into the same
+    # --seed-dir used to reopen the previous run's paths with "w" (review).
+    from lib import seed as seed_lib
+
+    seed_dir = tmp_path / "seed"
+    seed_lib.generate_dataset(str(seed_dir), "jsonl", 2, "small", seed=481, prefix="aaaaaa-evt")
+    before = {p.name: p.read_bytes() for p in seed_dir.iterdir()}
+    with pytest.raises(FileExistsError):
+        seed_lib.generate_dataset(str(seed_dir), "jsonl", 2, "small", seed=481,
+                                  prefix="aaaaaa-evt")
+    after = {p.name: p.read_bytes() for p in seed_dir.iterdir()}
+    assert after == before, "a refused generation must leave the existing files untouched"
+
+    # A second run gets its own namespace: same bytes, new names, nothing lost.
+    seed_lib.generate_dataset(str(seed_dir), "jsonl", 2, "small", seed=481, prefix="bbbbbb-evt")
+    files = sorted(seed_dir.iterdir())
+    assert len(files) == 4
+    first = sorted(p.read_bytes() for p in files if p.name.startswith("aaaaaa"))
+    second = sorted(p.read_bytes() for p in files if p.name.startswith("bbbbbb"))
+    assert first == second, "the pinned seed must still reproduce the same bytes"
+
+
+def test_every_seeding_call_in_the_runner_is_namespaced_by_the_run():
+    # The runner's three generations (up front, concurrent rounds, per-cycle
+    # reseeds) must each carry the run's tag, or a rerun into the same
+    # --seed-dir collides on the deterministic names.
+    import re
+
+    with open(os.path.join(HERE, "run_benchmark.py"), encoding="utf-8") as fh:
+        source = fh.read()
+    calls = re.findall(r"seed\.generate_dataset\((.*?)\)\n", source, flags=re.S)
+    assert len(calls) == 3, calls
+    for call in calls:
+        assert 'prefix=f"{run_tag}-' in call, call

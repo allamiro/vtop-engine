@@ -403,8 +403,15 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
         if files_seen:
             print(f"[bench] seed dir already held {files_seen} file(s); counted "
                   "into the seeded baseline")
+        # EVERY GENERATION GETS A NAMESPACE OF THIS RUN'S OWN (#481, review).
+        # With a pinned initial_seed (and the concurrent rounds' fixed seeds)
+        # file names repeat exactly between runs, so a rerun into the same
+        # --seed-dir would reuse the previous run's paths. The run id's random
+        # tail keeps the bytes reproducible and the names distinct; the
+        # generator refuses, rather than truncates, any path that still exists.
+        run_tag = run_id.rsplit("-", 1)[-1]
         totals = seed.generate_dataset(seed_dir, sc.format, int(sc.volume), sc.file_size,
-                                       seed=initial_seed(sc))
+                                       seed=initial_seed(sc), prefix=f"{run_tag}-evt")
         files_seen += totals["files"]
         seeded_bytes += totals["bytes"]
         print(f"[bench] seeded {totals['files']} files ({totals['bytes']} bytes) "
@@ -466,7 +473,7 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
                         # cursor for — silent loss inside the measurement.
                         more = seed.generate_dataset(seed_dir, sc.format, per_round,
                                                      sc.file_size, seed=10_000 + round_no,
-                                                     prefix=f"evt{round_no}")
+                                                     prefix=f"{run_tag}-evt{round_no}")
                         with seed_lock:
                             files_seen += more["files"]
                             seeded_bytes += more["bytes"]
@@ -693,7 +700,8 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
                                          float(sc.get("backlog_multiplier", 0.25)))
                 more = seed.generate_dataset(seed_dir, sc.format,
                                              per_cycle, sc.file_size,
-                                             seed=cycle + 1)
+                                             seed=cycle + 1,
+                                             prefix=f"{run_tag}-cycle{cycle + 1}")
                 files_seen += more["files"]
                 seeded_bytes += more["bytes"]
             else:
