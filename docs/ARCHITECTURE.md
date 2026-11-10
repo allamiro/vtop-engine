@@ -345,8 +345,44 @@ What follows from that, in the engine:
   new file, and does not delete it. Before, a same-length replacement at the
   same inode satisfied every test of `delete_after_commit`
   (`end_byte >= size`) and was deleted unread.
+- **`delete_after_commit` deletes only a file that has stopped being
+  written** (#619). A commit that covers a file to its end no longer deletes
+  it. It records what the file looked like (inode, first page, length,
+  mtime), and the file is deleted only once it has stayed exactly like that
+  for `delete_quiet_seconds` (default 3600), timed on the engine's
+  monotonic clock from that commit. The check runs again at the next commit
+  or read pass. Until then the file is kept and read as usual. Before, the
+  engine deleted the path the moment it caught up. Most appenders hold their
+  log open with `O_APPEND`, so every later line went into the unlinked inode,
+  which no path names, and was lost. That happened every time the engine
+  caught up on a live file. The delete itself renames the file to a hidden
+  name beside it (`.<name>.<nanos>.vtop-delete`), checks the renamed file
+  again, and unlinks it only if it is still unchanged. A line appended
+  between the decision and the rename is caught there, and the file is
+  hard-linked back under its name and kept. Before, a check-then-unlink lost
+  that line. A writer that opens the path for each write creates a new file
+  once the rename has happened, and that file is read as a new source. A
+  restart re-arms the wait from the seed, but only from a row that names the
+  inode and the first page.
 
 Limits, stated plainly:
+
+- **No portable check proves that no process holds a file open**, so
+  `delete_after_commit` cannot prove it either. A writer that keeps the file
+  open, is silent for longer than `delete_quiet_seconds`, and then writes
+  again writes into a deleted file, and those lines are lost. The same holds
+  for a write through a held descriptor in the moment between the second
+  check and the unlink. Scanning `/proc/*/fd` was considered and rejected:
+  it is Linux-only, it needs privileges to see other users' descriptors, and
+  it cannot see writers in other containers' PID namespaces, which is exactly
+  where a sidecar deployment puts them. The option is meant for files that
+  are finished: whole-file drops, and rotated logs after the writer has
+  reopened. A crash between the rename and the unlink leaves the fully
+  archived file under its hidden name. If a configured pattern matches that
+  name, the file is archived again (a duplicate). If not, it stays until it
+  is removed by hand. If the hard link back fails (a new file already has
+  the name, or the filesystem has no hard links), the file is left under the
+  hidden name and an error names both paths.
 
 - The **unread tail of a rotated-away file** is not read through the old path.
   If the rotated name (`app.log.1`) also matches a configured pattern it is

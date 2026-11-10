@@ -1492,12 +1492,15 @@ impl Engine {
                 let fmt = default_format_for(&streams, SourceType::File);
                 adapters.insert(
                     SourceType::File,
-                    Box::new(FileSource::with_mode(
-                        f.paths.clone(),
-                        fmt,
-                        f.delete_after_commit,
-                        f.whole_file,
-                    )),
+                    Box::new(
+                        FileSource::with_mode(
+                            f.paths.clone(),
+                            fmt,
+                            f.delete_after_commit,
+                            f.whole_file,
+                        )
+                        .with_delete_quiet_period(Duration::from_secs(f.delete_quiet_seconds)),
+                    ),
                 );
             }
         }
