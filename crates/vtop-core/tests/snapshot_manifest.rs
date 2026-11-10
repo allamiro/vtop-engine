@@ -64,6 +64,7 @@ fn file_builder() -> ManifestBuilder {
             end_byte: 2048,
             file_size: 2048,
             mtime: "2026-01-01T00:00:30Z".into(),
+            content_fingerprint: None,
         },
         object_uri: "s3://telemetry-jsonl/tenant=default/source=_data_input_app.log/format=jsonl/year=2026/month=01/day=01/hour=00/obj.jsonl.gz".into(),
         manifest_uri: "s3://telemetry-jsonl/tenant=default/source=_data_input_app.log/format=jsonl/year=2026/month=01/day=01/hour=00/obj.manifest.json".into(),

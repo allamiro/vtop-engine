@@ -77,6 +77,11 @@ docker compose -f benchmarks/docker-compose.benchmark.yml --profile containerize
 python3 benchmarks/run_benchmark.py my-containerized-scenario.yaml   # runner_mode: container
 ```
 
+The service publishes the long-lived engine's metrics port (#510) on
+`127.0.0.1:9464` whatever mode a scenario runs, so `up` fails if something on
+the host already holds that port. Set `VTOP_BENCH_METRICS_PORT` (in the shell
+or `benchmarks/.env`) to a free one; the runner reads the same variable.
+
 Build the binary **before** `compose up`: the `vtop-engine` service
 bind-mounts `target/release/vtopctl` read-only, and the mount is declared
 with `create_host_path: false` so Compose refuses to start (rather than
@@ -145,6 +150,180 @@ themselves short. A longer-duration soak amortizes it; so would a
 resident in-container cycle runner, which is #477-adjacent work. Compare
 container runs to container runs until then.
 
+### Which engine runs the window: `engine_mode` (#510)
+
+Every scenario runs the engine one of two ways:
+
+| `engine_mode` | what runs | what it can see |
+|---|---|---|
+| `process-once` (the default) | a fresh `vtopctl --json process-once` per cycle, today's behaviour | per-batch outcomes: stage timings, latency percentiles, per-object upload rows |
+| `run` | ONE `vtopctl run` for `duration_seconds`, started with `VTOP_METRICS_ADDR`, its `/metrics` scraped every `engine_scrape_interval_seconds` (default 1, at most 1) | anything that lives in the engine process: a rate cap's token bucket, the width controller, the engine's own process-lifetime counters |
+
+`process-once` stays the default for the reason `host` and `toxiproxy` do:
+every recorded scenario keeps the engine it was measured on, or its historical
+numbers stop being comparable to its future ones. A scenario that names no
+mode writes the files it always has, with byte-identical CSV headers and no
+`engine_*` summary key. The one difference is the echoed scenario: like every
+other scenario key, `engine_mode` and `engine_scrape_interval_seconds` are in
+the loader's defaults, so `summary.json`'s `scenario` block now lists them at
+`process-once` and `1.0`.
+
+**When to prefer `run`.** Whenever the question is about state that a fresh
+process resets: a rate cap (#481, which is verified against the engine's own
+egress counter, never against host-wide `psutil` bytes), the adaptive width
+controller backing off (#102), throttles, or a steady-state engine rather
+than a cold start per cycle. Stay on `process-once` for comparisons with
+recorded numbers and for per-batch latency percentiles.
+
+**What it costs, and what it gives up.**
+
+- A scrape per interval over loopback, and about **200 CSV rows per
+  sample** — every series the engine exposes, histogram buckets included:
+  about 40–50 KB of `engine_metrics.csv` per second (measured, mock backend,
+  10 s windows: 402–516 KB), so an hour-long soak writes a file in the
+  hundreds of megabytes.
+- **No per-batch outcomes.** `vtopctl run` prints none, so
+  `batch_metrics.csv`, `upload_metrics.csv`, `state_transition_metrics.csv`
+  and `backlog_metrics.csv` carry headers only, and the columns only outcomes
+  can fill (`avg_latency_ms`, `p50/p95/p99_latency_ms`, `upload_p50_ms`,
+  `upload_p95_ms`, `compression_ratio_avg`, `avg_batch_duration_ms`) are
+  **blank** — unknown, not the 0.0 an empty list would produce. The stage
+  histograms are in the series instead.
+- **Batches seal on thresholds, not at the end of a cycle.** A long-lived
+  engine accumulates across cycles and seals on `batch_max_records`,
+  `batch_max_bytes` or `batch_max_age_seconds`, so a small input under the
+  default 60 s age can commit nothing inside a short window — and a run that
+  committed nothing is refused like any other run that measured nothing.
+  Set the thresholds for the window you give it.
+- **No per-cycle re-seeding.** There are no cycles: the input is seeded once,
+  plus the concurrent seeder if `seed_concurrently: true` — which stops when
+  the window closes, before the engine's stop begins, so nothing it writes
+  during the stop grace is counted as seeded while none of the engine's
+  commits then count as archived.
+- **`duration_seconds` in the summary is still the run's wall clock**
+  (seeding, the window, the stop and the recovery pass), exactly as in the
+  per-cycle mode; the window itself is `engine_window_seconds`. The
+  `throughput_*` columns divide by the **window**, because their counts are
+  the counters' increase inside it — over the wall clock, a 10 s stop grace
+  alone would cut a one-minute window's rate by a seventh. (The per-cycle
+  mode keeps dividing by its wall clock; a matrix never mixes the two.)
+- **The window runs from the engine's launch.** The input is seeded before
+  launch, and a small run can commit all of it before the endpoint first
+  answers, so the counters are read against zero at launch — true of the fresh
+  process the runner starts — not against the first answer.
+  `engine_window_seconds` covers the same span: the start, then the configured
+  duration rounded up to whole intervals from the first answer.
+
+**What it writes.** `engine_metrics.csv`, one row per series per sample:
+`timestamp` (the sample's, ISO 8601 UTC), `elapsed_seconds` since launch,
+`interval_seconds` since the previous sample, `scrape_latency_seconds` (how
+long that sample's scrape took), `metric`, `labels`,
+`type`, `value`, and for counters the interval's `delta` and
+`delta_per_second` — so "was the rate ever exceeded in any one second" is
+answered from the artifact, not from an average.
+
+A sample is stamped when its scrape's answer **arrives**: the engine renders
+its counters as the last step before it writes the response, and what load
+delays is the handler getting to run at all. Stamped at the request's start,
+one answer delayed 0.08 s in 0.1 s buckets turned a steady 100 commits/s into
+180/s then 20/s. Where in the request the counters were read cannot be
+observed, though, so each bucket edge is uncertain by up to its scrape's
+latency — which is why it is on every row, and why a scrape slower than a
+tenth of the interval refuses the window (below): within that bound a
+one-interval bucket's rate is within about −9 %/+11 % of the true one, and the
+two latencies on its rows bound it exactly. The opening row's interval is
+the launch-to-first-answer span and its delta the increase since launch; that
+span is not a scheduled bucket, so it has no `delta_per_second` and does not
+enter `engine_<name>_max_per_second`. A counter series that first
+appears mid-window counts from zero in the interval it appeared, because the
+engine creates its labelled counters on their first increment. The engine's
+own output goes to `engine-run.log`.
+
+The engine's series, by kind (`vtop_core::telemetry`):
+
+| kind | series | read as |
+|---|---|---|
+| counter | `vtop_batches_total`, `vtop_verified_total`, `vtop_commits_total`, `vtop_verification_failures_total`, `vtop_verification_backend_limited_total`, `vtop_replay_required_total`, `vtop_failed_total`, `vtop_records_total`, `vtop_bytes_in_total`, `vtop_bytes_out_total`, `vtop_source_read_errors_total`, `vtop_retention_lost_records_total`, `vtop_upload_throttled_total` | only ever increase within one process: `delta` / `delta_per_second` per interval |
+| histogram | `vtop_stage_duration_seconds`, `vtop_batch_duration_seconds`, `vtop_compression_ratio` | their `_bucket`, `_sum` and `_count` are monotonic, so they carry deltas like counters |
+| gauge | `vtop_inflight_batches`, `vtop_upload_width` | instantaneous: `value` only, no delta |
+
+The flat columns appended to `metrics.csv` and `summary.json` on a `run`
+scenario only: `engine_mode`, `engine_metrics_address`,
+`engine_window_seconds`, `engine_scrape_interval_seconds`,
+`engine_scrape_latency_max_seconds` (the slowest scrape), `engine_samples`,
+`engine_stopped_by`, and per surfaced series — summed across label sets —
+`engine_<name>_window` and `engine_<name>_max_per_second` for a counter,
+`engine_<name>_min` and `engine_<name>_max` for a gauge. Surfaced today:
+`commits_total`, `failed_total`, `records_total`, `bytes_in_total`,
+`bytes_out_total`, `upload_throttled_total` (counters) and
+`inflight_batches`, `upload_width` (gauges). A counter column the endpoint
+never exposed is **blank**: "never incremented" and "this binary does not
+have the series" cannot be told apart from the endpoint. The run-level
+`successful_batches`, `failed_batches`, `total_input_bytes` and
+`total_output_bytes` come from the same counters' increase inside the window.
+
+**Adding a column for a new series is one line**: an entry in
+`SUMMARY_SERIES` in `lib/engine_run.py`, e.g.
+`("vtop_upload_egress_bytes_total", "counter")` when #481 adds it. The
+declared kind is checked against the endpoint's `# TYPE` line, and a mismatch
+refuses the run.
+
+**Refused, never reported partially** (exit 5, the reason on stderr; the
+samples taken so far stay in `engine_metrics.partial.csv` for diagnosis and
+no `summary.json` is written):
+
+- the endpoint never answers within 30 s of launch — the message names the
+  address it tried;
+- another long-lived run on this host holds the address — containerized runs
+  all share one published port, and two overlapping windows would both scrape
+  whichever engine bound it (the claim is an `flock` on
+  `vtop-bench-metrics-<host>-<port>.lock` in the temp directory, held from
+  before the check below until the engine is stopped, and released by the
+  kernel if the runner dies);
+- something already answers at that address before the engine starts — a
+  leaked engine from an earlier run would otherwise be scraped in this one's
+  place;
+- a scrape fails inside the window, or two samples land more than two
+  intervals apart;
+- a scrape inside the window takes longer than a tenth of the interval
+  (`MAX_SCRAPE_LATENCY_FRACTION`: 100 ms at the default 1 s), or every answer
+  before the window opens does. A slow first answer alone does not refuse —
+  it is not used, and the first answer within the bound opens the window with nothing lost,
+  since the counters are read against zero at launch;
+- a counter goes backwards or a series disappears (a different process is
+  answering, or the engine restarted);
+- the engine exits before the window closes.
+
+**Stopping the engine, on every way out** — a closed window, any refusal
+above, any failure in between, Ctrl-C, and a SIGTERM or SIGHUP to the runner.
+SIGINT (the engine's graceful stop, which flushes its buffers) is re-sent for
+up to 10 s, then SIGKILL, and `engine_stopped_by` records which one it took.
+Which to expect depends on the binary. Since #532 (#526) `vtopctl run` keeps
+a stop signal that arrives mid-cycle and honours it between cycles, so a
+build of main stops on `sigint`. The v0.6.0 release binary did not: it only
+noticed a ctrl-c that arrived while its loop was idle in `select!`, and under
+a concurrent seeder three of three trials had not exited 15 s after one
+SIGINT, nor after 75 SIGINTs 0.2 s apart — expect `sigkill` there under
+sustained load, which is why SIGINT is re-sent through the grace. A SIGKILLed
+engine can leave batches mid-pipeline in the ledger for the recovery pass
+afterwards to recover, so read `recovery_ms` beside `engine_stopped_by`.
+
+**Per runner mode:**
+
+- `host` — the engine is a host process in its own session, listening on a
+  fresh loopback port per run (`engine_metrics_address` records which).
+- `container` — the engine is exec'd in `vtop-engine` listening on
+  `0.0.0.0:9464`, which the compose file publishes on the host's loopback
+  (`VTOP_BENCH_METRICS_PORT` picks the host port, `VTOP_BIND_ADDR` the
+  address, as for every other port there). A `vtop-engine` container created
+  before that port existed does not have it; recreate the `containerized`
+  profile, or the run is refused as never answering. The scrape does not
+  cross the netem middlebox, which shapes the engine-to-store path. Teardown
+  happens **inside** the container: killing a `docker exec` client does not
+  stop the process it started (verified against the lab's hardened image
+  with both SIGTERM and SIGKILL), so the runner finds the `vtopctl` whose
+  argv names this run's config and signals it there.
+
 ## 4. Run the full matrix
 
 ```bash
@@ -170,6 +349,8 @@ Each `results/<run_id>/` contains:
 | `replay_metrics.csv` | one row per replay | failed state, replay duration, success |
 | `backlog_metrics.csv` | one row per sustained-load cycle | bytes seeded vs archived, and the deficit between them |
 | `system_metrics.csv` | one row per sample | cpu%, memory, disk, network |
+| `engine_metrics.csv` | one row per engine series per scrape — `engine_mode: run` only (§3) | timestamp, metric, labels, type, value, per-interval delta and per-second rate for counters |
+| `engine-run.log` | the long-lived engine's own output — `engine_mode: run` only | |
 | `summary.json` / `summary.md` | run rollup | everything above, aggregated + bottleneck notes |
 
 All timestamps are ISO 8601 (UTC).
@@ -251,9 +432,9 @@ What the run answers, and where to read it:
 
 | question | reads on |
 |----------|----------|
-| does a thin pipe grow the **deficit** rather than the process? | `backlog_metrics.csv` should climb while `memory_max_mb` in `metrics.csv` stays bounded — the #98 hypothesis-1 shape, now reachable on purpose. (The engine's own queue gauges, `inflight_batches` and `upload_throttled_total`, are not scraped by this harness; read them off the engine's `/metrics` if you run it with `VTOP_METRICS_ADDR`.) |
+| does a thin pipe grow the **deficit** rather than the process? | `backlog_metrics.csv` should climb while `memory_max_mb` in `metrics.csv` stays bounded — the #98 hypothesis-1 shape, now reachable on purpose. (The engine's own `vtop_inflight_batches` gauge and `vtop_upload_throttled_total` counter are scraped only by an `engine_mode: run` scenario (§3), which has no per-cycle `backlog_metrics.csv` rows.) |
 | is the wait attributed honestly? | `upload_p95_ms` in `summary.json` / `metrics.csv` — the p95 of the per-batch `object_upload_ms`, which `upload_metrics.csv` carries per object as `upload_duration_ms` — grows by the pipe; `p95_latency_ms` (the whole batch) grows by the same, not more |
-| what does the controller see? | the raw signal #102's width controller consumes — the per-batch `object_upload_ms`, summarized as `upload_p50_ms` / `upload_p95_ms`, against the pipe. The controller itself lives in the engine process, and this harness runs one `process-once` per cycle, so its width resets every cycle: observing the back-off (and the throttle counter it reacts to) needs a long-lived `vtopctl run` against the same shaped stack with its `/metrics` scraped, which is where the #102 measurement belongs |
+| what does the controller see? | per cycle, the raw signal #102's width controller consumes — the per-batch `object_upload_ms`, summarized as `upload_p50_ms` / `upload_p95_ms`, against the pipe. The controller itself lives in the engine process and resets with every `process-once`, so the back-off is observed with `engine_mode: run` (§3): one long-lived `vtopctl run` against the same shaped stack, whose `engine_metrics.csv` carries `vtop_upload_width` per second beside the `vtop_upload_throttled_total` it reacts to, summarized as `engine_upload_width_min` / `_max` and `engine_upload_throttled_total_window` / `_max_per_second`. That is where the #102 measurement belongs |
 | what is the control? | the runner unshapes the pipe on every way out, so a following unshaped run of scenario 12 is the comparison — same seeder, same store, no pipe |
 
 ### The netem middlebox: loss, policing and a real queue (#477)
@@ -374,6 +555,7 @@ profile chain does not.
 | `shaping_bottleneck_kbps` | **kilobits/s** | the `tbf` rate; requires a `shaping_buffer_bdp`, because tbf's queue *is* the bottleneck buffer and nobody should inherit a default one |
 | `shaping_buffer_bdp` | multiples of the BDP | bottleneck queue depth; requires both a rate and a latency, since the bandwidth-delay product is their product |
 | `shaping_policer_kbps` | **kilobits/s** | token-bucket policer on the ingress hook: drops above its rate, queues nothing |
+| `shaping_competitor` | `<mode>:<seconds>` | a plain-TCP bulk flow in the same bottleneck queue, measured alone / with VTOP / alone again — see below. Absent means no competitor, and the competitor columns are written blank; needs `shaping_driver: netem` **and** a `shaping_bottleneck_kbps` |
 
 `shaping_buffer_bdp` is the **congestion** queue, and only that — enforced as
 `tbf`'s own byte `limit`, on a queue nothing else shares. The upload's `netem`
@@ -399,17 +581,19 @@ reordering are the same in both layouts.
 > unit travels with the number; a reader comparing the raw columns has to
 > convert deliberately.
 
-The three bundled netem scenarios all shape the same 10 Mbit/s, 100 ms link,
-so that they differ in what the middlebox does with a burst and in nothing
-else. Their workload is scenario 13's (400 small JSONL files, 50-record
+The bundled netem scenarios all shape the same 10 Mbit/s, 100 ms link.
+Scenarios 14-16 differ in what the middlebox does with a burst and in nothing
+else; their workload is scenario 13's (400 small JSONL files, 50-record
 batches, a 1.5x concurrent seeder, 300 s), so the numbers can be read beside
-it — the toxiproxy row's caveats included:
+it — the toxiproxy row's caveats included. Scenario 18 has a workload of its
+own (see its row and [The flow beside the upload](#the-flow-beside-the-upload-478)):
 
 | scenario | the link | what it measures |
 |---|---|---|
 | `14-lossy-wan` | 0.5% bursty (`gemodel`) loss, one BDP of buffer | non-congestive loss, where a loss-based control law settles near the inverse square root of the loss rate. Acceptance criterion: `object_upload` p95 at least **3x** the same file at zero loss — and the zero-loss control is that file with `shaping_loss_pct: 0` **and the `shaping_loss_model` line removed**, which the driver requires |
 | `15-policed-uplink` | a 10 Mbit/s policer, no queue at all | the edge-uplink case with **no queueing-delay signal**: the round trip stays flat while the link shreds bursts, so a delay-based control law degrades silently. The drops are the policer's, so the loss columns read 0 |
-| `16-contended-bottleneck` | four BDP of buffer, no loss | queue depth: what a batch waits behind when the buffer is deep (4 BDP = 400 ms of standing queue at this rate). **Not** fairness or contention — nothing here starts a second flow; that half is #478 |
+| `16-contended-bottleneck` | four BDP of buffer, no loss | queue depth: what a batch waits behind when the buffer is deep (4 BDP = 400 ms of standing queue at this rate). **Not** fairness or contention — nothing here starts a second flow; `18-competing-flow` is that half |
+| `18-competing-flow` | one BDP of buffer, no loss, **a second flow** | what the upload costs its neighbour (#478): the engine runs at the shipped default of eight concurrent batches while a plain-TCP bulk flow shares the queue. One BDP and no loss, the link of `14-lossy-wan`'s zero-loss control — but **not** its workload: 150 small JSONL files in batches of up to 5000 records, no concurrent seeder, 150 s, because with a sustained backlog and small batches the engine's cycles ran too long for one to fit wholly inside the 60 s window, and a window with no whole cycle is refused. Read it against its own solo windows, not against scenarios 13-16 |
 
 #### The calibration gate
 
@@ -430,6 +614,204 @@ link whose bucket was delivering its rate. A scenario with no bottleneck — the
 policer in scenario 15 — still records the probe but is not gated on it, since
 a TCP flow through a policer lands well below the token rate by design and a
 band around that rate would refuse every policed run.
+
+#### The flow beside the upload (#478)
+
+Raising upload concurrency wins throughput on a long link for a mechanical
+reason: loss-based TCP's share is **per connection**, so N connections take
+roughly N times a single flow's share of a shared bottleneck. VTOP already
+makes that decision — `batching.max_concurrent_batches` defaults to 8, and its
+AIMD width controller grows the width back on every cycle the store did not
+refuse. A shaped WAN link never refuses: a thin pipe is a *rate*, not a 429, so
+under exactly the conditions this lab measures the controller sees nothing to
+back off from.
+
+> **The number that authorises a concurrency or rate knob is the COMPETITOR's
+> goodput, not VTOP's.** VTOP's own throughput going up is what a wider egress
+> is *for*; it says nothing about whether the width is safe to ship. What
+> decides that is what the flow beside it was left with. A scenario that adds
+> `shaping_competitor` records that number, and it is the one to read.
+
+`shaping_competitor: bulk:60` runs a plain-TCP bulk flow (`iperf3`, from the
+calibration probe's container to the iperf3 server the middlebox already runs)
+across the same ingress hook and the same `tbf` queue as the upload. No
+policer: a competitor beside one is refused, because the policer drops ahead
+of the shared queue. Three windows, in this order and inside **one**
+installation of the shape:
+
+1. **competitor alone**, before the engine's clock starts;
+2. **competitor with VTOP**, opened once the seed exists so the window covers
+   the engine at work;
+3. **competitor alone again**, as the run's shaped block closes.
+
+The bracket is the point: a single solo measurement cannot tell a bottleneck
+that drifted mid-run from an engine that took bandwidth, so the drift would be
+absorbed into the fairness claim and reported as VTOP's doing. **If the two
+solo windows disagree by more than 10% the run is refused, naming both
+numbers** — an unstable bottleneck cannot support a fairness claim.
+
+The run's resource columns cover the engine's window only, with the disk
+counters read at its two boundaries. `network_tx_mb` and `network_rx_mb` are
+**left empty** on a contended run, with the reason in
+`network_counters_withheld`: psutil's counters are host-wide, and the engine's
+window contains the competing flow by design, so no boundary can separate the
+engine's bytes from the neighbour's.
+
+Five flat columns reach `metrics.csv`, `matrix.csv`, `summary.json` and the
+`Competing flow` row of `summary.md` (blank for every run that started no
+competitor):
+
+| column | what it is |
+|---|---|
+| `competitor_goodput_mbps_with` | the competing flow's received rate over its **whole** window while VTOP was uploading — the answer to "what did the neighbour get" |
+| `competitor_goodput_mbps_without` | the mean of the two solo windows — the same flow on the same link with VTOP idle |
+| `competitor_goodput_mbps_over_vtop_window` | the same flow over the **span the index is taken on** (`vtop_window_seconds`), derived from the report's own per-second interval stream. One of the index's two inputs |
+| `vtop_goodput_mbps_with` | VTOP's own share beside that flow: the bytes committed by the engine cycles the window **wholly contained**, over the span those cycles cover (see the refusal below). Committed object bytes, so framing, manifests and retries are **excluded** and the engine is understated. The index's other input |
+| `competitor_jain_index` | Jain's fairness index over those two flows: 1.0 for an even split, 0.5 when one flow takes everything |
+
+**Both of the index's rates cover one span, and it is not the competitor's
+window.** VTOP's share can only be charged whole engine cycles, so it is a rate
+over the cycles the window contained — nested inside the window. Pairing that
+with the competitor's whole-window average would compare a slice against an
+average, and a flow whose rate moves during the minute (a queue that fills, a
+retransmission burst, the engine's own concurrency ramping) would then be
+misreported by whatever the two spans differ by. So the competitor is
+re-measured over that same span from its own `intervals` stream, and
+`summary.json` states which span it was: `jain_span_seconds`,
+`competitor_bytes_over_vtop_window` and `competitor_intervals_over_vtop_window`
+beside `vtop_window_seconds`. iperf3's interval entries are the **sender's**,
+so they supply only the shape — how the flow's bytes were spread across the
+window — while the receiver's total supplies the magnitude, for the same reason
+`sum_sent` is refused everywhere else here.
+
+**The index never appears without the per-flow numbers beside it,** and a test
+asserts that over the headers themselves. An index is symmetric: 0.61 is
+equally true of an engine that starved its neighbour and a neighbour that
+starved the engine, so it cannot say which flow won and must never be quoted
+alone. Note also that `vtop_goodput_mbps_with` understates VTOP — it counts committed
+object bytes, not wire bytes — and that this does NOT bias the index in one
+direction. Jain's index peaks at equality, so understating the engine moves the
+number **towards** equality when the engine's true share is the larger, and
+**away** from it when the competitor's is: the error flatters the engine in
+exactly the case worth catching, and penalises it in the harmless one. Read a
+marginal index as a reason to look at the two per-flow numbers, which is why
+they are never allowed to appear without it.
+
+Every other way this measurement can go wrong is a refusal rather than a
+number, because each of them produces a plausible result:
+
+- `shaping_competitor` with `shaping_driver: toxiproxy` (or on an unshaped
+  run) is **refused by name**: a per-connection bandwidth toxic meters each
+  connection inside the proxy, so the two flows never queue behind one another
+  and the index would come out near 1.0 on a link where VTOP could be taking
+  everything. A second refusal, with the same reasoning, covers a netem shape
+  that sets no `shaping_bottleneck_kbps`: no `tbf`, no shared queue. A policer
+  does not qualify either — it drops above its rate and holds nothing.
+- `shaping_competitor` with `engine_mode: run` (#510) is **refused** (exit 2,
+  before anything is seeded): VTOP's share is a rate over the engine cycles
+  the contended window wholly contains, noted as each `process-once`
+  returns, and a long-lived engine has no cycles to note. Contended runs use
+  the per-cycle engine.
+- A competitor that cannot be started fails the run, carrying iperf3's own
+  words.
+- A window that outlives the engine's loop fails the run: the tail of it would
+  be a solo measurement under a contended name. The arithmetic is checked
+  against `duration_seconds` before a seed byte is written, and against what
+  actually happened when the block closes.
+- The **received** rate is recorded, never the sent one, and the sender's view
+  is not used as a fallback. At the far end of a token bucket `sum_sent`
+  counts bytes still sitting in the queue, so a competitor read that way looks
+  less harmed than it was.
+- A contended window that contained no **whole** engine cycle is refused
+  rather than recorded. The engine's committed-byte total moves in one step
+  when a `process_once` returns, so a cycle that began before the window
+  opened, or returned after it closed, carries bytes from outside the window
+  that cannot be separated from the bytes inside — it is charged to neither
+  side, because splitting it would mean inventing the moment each byte left.
+  If every cycle straddled an edge, VTOP's share is **unknown, not zero**, and
+  a recorded zero would credit the competitor with a fair-share result it
+  never had to fight for. Lengthen the window so it spans at least one whole
+  cycle, or shorten the cycle. `summary.json` records what was attributed:
+  `vtop_attributed_cycles`, `vtop_window_seconds` (the span those cycles
+  cover, nested inside the competitor's window rather than equal to it) and
+  `vtop_bytes_across_competitor_window` — the engine's total movement between
+  the window's two edges, which is never divided by anything and whose gap
+  from the attributed bytes is how much of it could not be placed.
+- A contended window whose attributed cycles contain an **uncommitted batch or
+  a failed engine call** is refused. The engine reports a size only for a
+  batch that reached VERIFIED, so a batch that uploaded its object and then
+  failed verification, or a `process_once` that errored mid-cycle, put bytes in
+  the shared queue that never reach VTOP's committed total — VTOP's share is
+  unknown, and the partial count of the batches that did commit would
+  understate it by exactly the traffic the competitor was contending with. A
+  failure in a cycle that straddled an edge does not refuse the run: that
+  cycle is outside the span both rates are taken over. The wire is not counted
+  instead because none of the lab's counters is VTOP's goodput either: the
+  middlebox's ingress counts bytes before the queue (the `sum_sent` error
+  again), and any count at the store side includes retransmissions and
+  framing. Cycle ends are stamped the instant `process_once` returns, not
+  after the runner's own outcome parsing and CSV writes, so harness
+  bookkeeping never stretches a cycle across an edge.
+- **Where the competitor's window sat on the run's clock is read from its own
+  stream, not from a timer and not from the command's two ends.** The
+  competitor runs with `iperf3 --json-stream` (iperf 3.17 or later; the lab's
+  `nicolaka/netshoot:v0.16` is 3.21), which writes each interval's line as that
+  interval ends. A small stamper runs **beside iperf3 inside the probe
+  container** and prefixes every line with `time.monotonic()` as it is
+  written; Docker gives a container no clock of its own, so that is the run's
+  own clock. Each interval's writing, less where it ends on the window's own
+  clock, is an estimate of when the window opened that can only be late (by
+  iperf3's own write), so the earliest estimate places the window. Stamped at
+  the source rather than on arrival, because a delay in the `docker exec`
+  relay common to every line would shift every arrival equally, where no
+  comparison between lines can see it; the host's arrival stamps now only
+  prove the clock is shared, and a line "written" after it was read (a
+  VM-backed Docker, another kernel's clock) is refused. An earlier round only **bounded** it — a
+  window of the report's length somewhere between the command's launch plus the
+  ramp and the moment its report came back — and laid the interval stream down
+  from the latest such opening, which silently assumed every second of
+  `docker exec` overhead fell before measuring began; overhead that fell after
+  it shifted the stream, and the engine's span was read against the wrong
+  seconds of the flow. Those two ends are kept as a consistency check: stamps
+  that place the window outside them are refused, and so is a stream whose
+  per-line estimates disagree by more than 0.25 s — lines stamped in a burst
+  were buffered before the stamper and date nothing. A competitor whose iperf3
+  lacks `--json-stream` is refused by name, and a whole-document `-J` report
+  is refused rather than read without a placement. Cycles are then attributed
+  to the placed window: one that ran while `docker exec` was still starting or
+  connecting is charged to neither side, and so is one that returned after
+  the stream's last measured second. `summary.json` records
+  `competitor_window_unaccounted_seconds` (the plumbing's overhead around the
+  window), `competitor_window_setup_seconds` (how much of it fell before
+  measuring began) and `competitor_window_sync_spread_seconds` (how far the
+  per-line estimates disagreed).
+- An iperf3 report with **no `intervals` stream** is refused, at the first solo
+  window rather than after all three have run. Without it the competing flow
+  has only a whole-window average, and the index would be back to comparing
+  rates over two different spans. So is a report whose stream is entirely the
+  omitted ramp, one with an entry this module cannot read (refused rather than
+  skipped, because a skipped entry leaves a hole and the receiver's bytes would
+  then be spread across a window the stream no longer describes), and one whose
+  stream leaves the engine's own span uncovered — the competitor's rate over
+  that span would have to be invented. **Uncovered, not untouched:** a stream
+  with a hole under the span still overlaps it at both ends, and accepting that
+  would treat the missing seconds as seconds in which the competitor received
+  nothing while the rate's denominator still covered them — an understated
+  flow, and an index that flatters VTOP by exactly the missing stretch. Two
+  intervals that meet at a boundary are contiguous, to within the rounding
+  iperf3 prints its interval bounds at.
+
+A contended run adds roughly `2 x (window + 3 s)` of wall clock beyond the
+engine's `duration_seconds` — the two solo windows, each with its omitted
+ramp; the contended window runs inside the engine's duration. Those solo
+seconds are the harness's rather than the engine's — VTOP is deliberately
+idle for both of them — so `duration_seconds` excludes them and the engine's
+throughput columns stay comparable with an uncontended run's. Each phase's own
+window is recorded in `summary.json` under `competitor`.
+
+This issue builds the instrument and sets **no fairness target**. What VTOP may
+do to a neighbour becomes a shipping gate in the egress-ceiling work, where a
+knob is actually added.
 
 #### What netem itself cannot tell you
 
@@ -614,7 +996,8 @@ Copy any file in `scenarios/`, change the knobs, drop it in `scenarios/`.
 Every parameter is configurable (see `lib/scenario.py` `DEFAULTS`):
 volume, file_size, format, batch_max_records/bytes/age, compression(+level),
 checksum, backend, duration_seconds, fault, sys_sample_interval, bucket,
-endpoint_url, and the `shaping_*` keys (§7). `run_matrix.py --all`
+endpoint_url, `runner_mode` and `engine_mode` / `engine_scrape_interval_seconds`
+(§3), and the `shaping_*` keys (§7). `run_matrix.py --all`
 automatically picks it up.
 
 ## Benchmark matrix coverage
@@ -632,7 +1015,10 @@ automatically picks it up.
 | Runtime duration | ✅ any (`duration_seconds`) | 5 min / 30 min / 1 h presets easy to add |
 | Sustained backpressure | ✅ `seed_concurrently` + `backlog_multiplier` | a real deficit, not just sustained load — scenario `11-backpressure-soak` (#98) |
 | Bandwidth-shaped upload | ✅ toxiproxy on the `shaped` profile, `shaping_*` keys | the upload link as the bottleneck — scenario `13-backpressure-soak-shaped` (#403) |
+| Engine's own metrics | ⚠️ `engine_mode: run` (implemented; no bundled scenario yet) | one long-lived `vtopctl run` per window, `/metrics` scraped per second into `engine_metrics.csv` (#510). Not bundled on purpose: `run_matrix.py --all` refuses a matrix that mixes engine modes, so one run-mode file among the per-cycle ones would stop `--all`; #481 adds the first |
 | Proxy hop in front of the store | ✅ nginx on the `h3` profile, `h3_proxy: true` | the topology control a transport comparison needs, and the lab's only HTTP/3 counterparty — scenario `17-proxy-hop-tcp-baseline` (#484) |
+| Lossy / policed / queued link | ✅ the netem middlebox on the `netem` profile | loss, a policer and a real bottleneck queue, which a TCP-terminating proxy cannot produce — scenarios `14-lossy-wan`, `15-policed-uplink`, `16-contended-bottleneck` (#477) |
+| What the upload costs a neighbour | ✅ `shaping_competitor`, netem only | one plain-TCP bulk flow in the same queue, measured alone / with VTOP / alone again — scenario `18-competing-flow` (#478). The competitor's goodput, not VTOP's, is what authorises a concurrency or rate knob |
 
 ## Native segment write amp / proof overhead (#189)
 

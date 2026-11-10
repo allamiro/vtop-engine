@@ -500,15 +500,25 @@ and where its reading of the new one began, are not recorded, so the old
 file's tail from the window's start and the new file's start below its last
 read are reported as unproven - a window that read them looks the same as a
 release before #564 that skipped them - and are not counted as lost. A file
-whose content restarted at the same path and inode (a copytruncate, or a
-reused inode) is told apart by the file size each read observed: a read that
-saw the file smaller than what was already read there starts a new
-generation, judged on its own, with its start below its first read unproven.
-Spool markers record no size, so spool files are judged per inode only. And a
-replacement that reuses the inode and was already as large as the old read
-position when first read cannot be told apart at all - path, inode and size
-agree - so the old file's commits can cover its unread start; closing that
-needs a content fingerprint in the markers (#578).
+or spool whose content restarted at the same path and inode (a copytruncate,
+or a reused inode) is told apart by what each read observed: a read that saw
+the file smaller than what was already read there, or whose fingerprint of
+the file's first bytes differs from one an earlier read took over the same
+length (#578), starts a new generation, judged on its own, with its start
+below its first read unproven. The fingerprint is what catches a replacement
+that reuses the inode and was already as large as the old read position when
+first read - path, inode and size agree - so the old file's commits no longer
+cover its unread start. Two limits remain: the fingerprint covers the first
+4 KiB only, so a replacement whose first 4 KiB are byte for byte the old
+file's still looks like the same file; and fingerprints of different lengths
+(a file under 4 KiB fingerprints all of itself, so the length grows with it)
+cannot be compared, so a replacement of a small file is caught here only
+where two reads covered the same length (the adapter, which has the bytes,
+checks the shorter one at read time). Rows written before #578 carry no fingerprint (and,
+for spools, no size): they are judged as before - files by size, spools per
+inode only - and a fingerprint is compared only with one of the same length,
+so they never split a unit. See the ledger format note in
+[`ARCHITECTURE.md`](ARCHITECTURE.md) §7.2.
 
 ---
 
@@ -920,6 +930,27 @@ Short procedures now; expand into a full ops runbook before go-live.
   remains is the one way to stall the tier - that voter cannot decode the
   raise itself. A node that refuses to start with "written by a newer
   release" is an old binary on a newer log: upgrade it.
+- **Lineage verdicts on promotion records (#577), feature level 6:** a
+  promotion counts a fenced replica's answer only when the candidate could
+  prove the replica's epoch history agrees with its own (or the replica
+  reconciled to it); an answer whose lineage is unknown is recorded and not
+  counted, whatever its offset. An Unknown replica does not by itself block
+  promotion: the candidate still promotes when a majority of the replica
+  set answers with a proven lineage (the candidate plus one Agreed follower
+  of three, say). It refuses with "too few replicas answered with a lineage
+  this candidate could prove" only when the proven answers fall short of
+  that majority - for example when the reachable replicas include ones with
+  records but no epoch history (a log that predates its journal, a journal
+  restarted empty). Repair those replicas (`vtopctl node repair` installs the source's
+  history) rather than lowering anything. Recording the verdicts needs
+  `vtopctl meta enable-features --level 6` once every metadata voter runs
+  this release; until then promotions are recorded without them (and
+  without the uncounted answers). Upgrade every data node and the `vtopctl`
+  you audit with BEFORE raising the level: an older one cannot decode a
+  verdict-carrying transition record, so its published-floor read fails
+  closed (the node will not promote) and its `meta transitions` errors.
+  Records written before the raise carry no verdicts and are judged as they
+  always were.
 - **Change a range's replica set (#553):** a range's quorum is counted over
   the set metadata records for it (`vtopctl meta replica-set --config
   meta-admin.yaml --topic-uuid T --range-uuid R`; every `vtopctl meta`

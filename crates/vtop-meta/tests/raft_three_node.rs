@@ -1361,3 +1361,122 @@ async fn a_command_newer_than_the_clusters_feature_level_never_reaches_the_log()
         judged.response
     );
 }
+
+/// #577: a promotion report that carries a lineage verdict on each quorum
+/// answer is the SAME command kind as v0.5.0's report with a payload v0.6.0
+/// cannot decode (a new outcome tag). A cluster below the verdicts' level
+/// must not get it into its log, while the verdict-less report the data node
+/// falls back to keeps working - promotion must not stall on an old tier.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_lineage_carrying_report_never_reaches_an_old_level_log() {
+    use vtop_meta::{
+        AnswerLineage, Consensus, ConsensusError, OpenraftConsensus, PromotionOutcome,
+        QuorumAnswer, LINEAGE_VERDICTS_FEATURE_LEVEL,
+    };
+
+    let seed = SEED ^ 0x577;
+    let mut cluster = Cluster::boot(seed).await;
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone());
+    let report =
+        |env: CommandEnvelope, outcome: PromotionOutcome| MetadataCommand::ReportPromotionOutcome {
+            env,
+            topic_uuid: Uuid::from_u128(0x20),
+            range_uuid: Uuid::from_u128(0x21),
+            holder_node_uuid: Uuid::from_u128(0x10),
+            fencing_epoch: 1,
+            outcome,
+        };
+    let with_verdicts = PromotionOutcome::Established {
+        boundary_offset: Some(5),
+        sealed_prefix_end: None,
+        quorum: vec![
+            QuorumAnswer {
+                node_uuid: Uuid::from_u128(0x10),
+                offset: 5,
+                lineage: Some(AnswerLineage::Agreed),
+            },
+            QuorumAnswer {
+                node_uuid: Uuid::from_u128(0x11),
+                offset: 5,
+                lineage: Some(AnswerLineage::Unknown),
+            },
+        ],
+        votes: 1,
+        required: 2,
+    };
+    let last_log = |cluster: &Cluster| {
+        cluster
+            .leader()
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0)
+    };
+
+    // The level just below the verdicts': everything else this release adds
+    // is enabled, so the refusal is about the payload and nothing else.
+    let below = LINEAGE_VERDICTS_FEATURE_LEVEL - 1;
+    let env = cluster.envelope();
+    let raised = consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: below,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        raised.response,
+        MetadataResponse::Ack {
+            generation: u64::from(below)
+        }
+    );
+
+    let before = last_log(&cluster);
+    let env = cluster.envelope();
+    match consensus.propose(report(env, with_verdicts.clone())).await {
+        Err(ConsensusError::FeatureNotEnabled { needed, enabled }) => {
+            assert_eq!((needed, enabled), (LINEAGE_VERDICTS_FEATURE_LEVEL, below));
+        }
+        other => panic!(
+            "a lineage-carrying report was not refused at level {below} (seed={seed:#x}): \
+             {other:?}"
+        ),
+    }
+    assert_eq!(
+        last_log(&cluster),
+        before,
+        "the refused lineage-carrying report reached the log"
+    );
+
+    // The legacy form passes the gate (the state machine then judges it: no
+    // such range here).
+    let env = cluster.envelope();
+    let legacy = consensus
+        .propose(report(env, with_verdicts.without_lineage()))
+        .await
+        .unwrap();
+    assert!(
+        matches!(legacy.response, MetadataResponse::Rejected(_)),
+        "{:?}",
+        legacy.response
+    );
+
+    // Raised, the verdicts pass the gate too.
+    let env = cluster.envelope();
+    consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: LINEAGE_VERDICTS_FEATURE_LEVEL,
+        })
+        .await
+        .unwrap();
+    let env = cluster.envelope();
+    let judged = consensus.propose(report(env, with_verdicts)).await.unwrap();
+    assert!(
+        matches!(judged.response, MetadataResponse::Rejected(_)),
+        "{:?}",
+        judged.response
+    );
+}

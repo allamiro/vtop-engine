@@ -611,3 +611,47 @@ def test_every_bundled_scenario_still_loads_under_both_driver_guards():
         f"the sweep exercised {sorted(drivers)}: both guards are only proven harmless once a "
         "real scenario of each driver has been through them, and the netem scenarios (14-16) "
         "are the ones the new refusal could break")
+
+
+# A malformed shaping key is a scenario typo, and the harness refuses it the way
+# it refuses a typo'd runner_mode or competitor key: one `[bench]` line naming
+# the key, exit 2, before anything is seeded (#601). It used to raise a plain
+# ValueError out of `shape_from_scenario`, which `__main__` does not catch (it
+# turns only ShapingError into a refusal), so the run ended in a traceback.
+# Driven through the real script in a subprocess: the bug lived in what
+# `__main__` lets escape, which an in-process call to main() cannot see.
+API = "shaping_api_url: http://127.0.0.1:8474"
+
+
+@pytest.mark.parametrize("lines, named", [
+    # toxiproxy reads its keys only once shaping_api_url switches it on, as
+    # every shaped toxiproxy scenario in scenarios/ does.
+    (f"{API}\nshaping_bandwidth_kbps: fast", "shaping_bandwidth_kbps"),
+    (f"{API}\nshaping_bandwidth_kbps: -5", "shaping_bandwidth_kbps"),
+    (f"{API}\nshaping_latency_ms: 1.5", "shaping_latency_ms"),
+    ("shaping_driver: netemm", "shaping_driver"),
+    ("shaping_driver: netem\nshaping_bottleneck_kbps: fast", "shaping_bottleneck_kbps"),
+])
+def test_a_malformed_shaping_key_is_refused_in_one_line_not_a_traceback(
+        tmp_path, lines, named):
+    import subprocess
+    import sys
+
+    sc = tmp_path / "typo.yaml"
+    sc.write_text(f"name: typo\n{lines}\n", encoding="utf-8")
+    bench = os.path.join(os.path.dirname(__file__), "..")
+    proc = subprocess.run(
+        [sys.executable, "run_benchmark.py", str(sc),
+         "--results-dir", str(tmp_path / "results"),
+         "--seed-dir", str(tmp_path / "seed")],
+        cwd=bench, capture_output=True, text=True, timeout=60)
+    assert "Traceback" not in proc.stderr, (
+        f"{lines!r} escaped as a traceback instead of a refusal:\n{proc.stderr}")
+    assert proc.returncode == 2, (
+        f"{lines!r} exited {proc.returncode}, expected 2 (a pre-run refusal); "
+        f"stderr: {proc.stderr.strip()}")
+    refusal = [ln for ln in proc.stderr.splitlines() if ln.startswith("[bench] ")]
+    assert len(refusal) == 1 and named in refusal[0], (
+        f"expected one [bench] line naming {named}, got stderr: {proc.stderr.strip()}")
+    assert not os.path.exists(tmp_path / "seed") or not os.listdir(tmp_path / "seed"), (
+        "a refused scenario seeded data before it was refused")
