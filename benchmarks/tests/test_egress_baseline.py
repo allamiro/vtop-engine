@@ -202,8 +202,10 @@ def test_bottleneck_names_follow_the_fixed_rule():
     assert eb.name_bottleneck("wan100", 0.95, 0.5, 0.1, 0.1) == "link (rate)"
     assert eb.name_bottleneck("wan100", 0.60, 0.30, 0.1, 0.1) == "verification"
     assert eb.name_bottleneck("wan100-loss1", 0.40, 0.05, 0.1, 0.1) == "link (per-flow window)"
-    assert eb.name_bottleneck("lan", 0.0, 0.1, 1.2, 0.8) == "CPU (engine)"
-    assert eb.name_bottleneck("lan", 0.0, 0.1, 0.8, 1.2) == "store"
+    assert eb.name_bottleneck("lan", 0.0, 0.1, 5.0, 0.8) == "CPU (engine)"
+    assert eb.name_bottleneck("lan", 0.0, 0.1, 0.8, 5.0) == "CPU (store)"
+    assert eb.name_bottleneck("lan", 0.0, 0.1, 1.2, 0.9) == "store I/O (no CPU saturated)", (
+        "a busier engine is not a CPU bottleneck while five of six cores idle")
 
 
 # ---------------------------------------------------------------- charts

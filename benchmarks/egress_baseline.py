@@ -537,6 +537,9 @@ def evaluate_gate(runs: list[dict], objects: list[dict]) -> dict:
 
 
 LINK_LIMITED_FRACTION = 0.90
+# The lab VM the sweep ran in (Lima, vz): six vCPUs for the engine, the store
+# and the middlebox together.
+LAB_VCPUS = 6
 
 
 def name_bottleneck(profile: str, fraction: float, verify_share: float,
@@ -548,11 +551,17 @@ def name_bottleneck(profile: str, fraction: float, verify_share: float,
       of a batch's time (a wire change cannot shrink it);
     - otherwise the link's per-flow window: too few TCP flows for the round
       trip and the loss to fill the rate;
-    - the unshaped LAN: whichever side burned more CPU per second of the
-      drain, the engine or the store.
+    - the unshaped LAN: CPU when the engine or the store kept 80% of the lab
+      VM's cores busy over the drain; otherwise the store's I/O path (its
+      write and read-back through the middlebox's forwarding), which this
+      sweep does not separate further.
     """
     if profile == "lan":
-        return "CPU (engine)" if engine_cores >= store_cores else "store"
+        if engine_cores >= 0.8 * LAB_VCPUS:
+            return "CPU (engine)"
+        if store_cores >= 0.8 * LAB_VCPUS:
+            return "CPU (store)"
+        return "store I/O (no CPU saturated)"
     if fraction >= LINK_LIMITED_FRACTION:
         return "link (rate)"
     if verify_share >= 0.25:
