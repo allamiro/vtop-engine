@@ -2387,7 +2387,7 @@ impl Engine {
             let _ = adapter.replay_from_markers(markers).await;
             for marker in markers {
                 if let Some(position) = adapter.read_position(marker) {
-                    landed.insert(unit_key(marker), position);
+                    landed.insert(rewind_key(marker), position);
                 }
             }
         }
@@ -2940,20 +2940,60 @@ impl ShutdownRequests for OsShutdownSignals {
 ///
 /// The inode is part of the unit: a path that was rotated has incomplete
 /// ranges for the old file and for the current one, and a lower offset in the
-/// old file must not hide the current file's range from the plan.
+/// old file must not hide the current file's range from the plan. So, within
+/// an inode, is content PROVEN to be another file's (#578): a replacement at
+/// the same inode. Each such generation keeps its own lowest start, so the
+/// replacement's rewind is attempted (and lands) even though the old
+/// content's, lower, is refused; content that cannot be told apart stays one
+/// generation, so one file is never rewound twice.
 #[derive(Default)]
 struct RewindPlan {
-    lowest: HashMap<String, ProgressMarker>,
+    /// Per unit, one rewind per proven content generation.
+    lowest: HashMap<String, Vec<Rewind>>,
     /// The lowest pending start per source (a path or a topic-partition), per
     /// inode and content fingerprint, for [`RewindPlan::holds_back`].
     by_source: HashMap<String, Vec<PendingGroup>>,
-    /// When each unit was last added. Recovery visits incomplete rows oldest
-    /// first, so a higher number is a more recent file; the adapters keep one
-    /// cursor per path, so the unit applied LAST at a path decides where it
+    added: u64,
+}
+
+/// The lowest start of one content generation of a unit.
+struct Rewind {
+    marker: ProgressMarker,
+    /// Every fingerprint its ranges carried: what a later range is compared
+    /// with to tell whether it is this content or another.
+    contents: Vec<ContentFingerprint>,
+    /// When it was last added. Recovery visits incomplete rows oldest first,
+    /// so a higher number is a more recent file; the adapters keep one cursor
+    /// per path, so the rewind applied LAST at a path decides where it
     /// resumes, and that must be the most recent file, not whichever inode
     /// sorts last as text (review of #563).
-    recency: HashMap<String, u64>,
-    added: u64,
+    recency: u64,
+}
+
+impl Rewind {
+    fn proven_other(&self, content: Option<&ContentFingerprint>) -> bool {
+        self.contents
+            .iter()
+            .any(|mine| proven_other(Some(mine), content))
+    }
+}
+
+/// Whether two contents are proven different: fingerprints of the same
+/// length with other bytes. Content that cannot be compared (different
+/// lengths, or none) is not.
+fn proven_other(a: Option<&ContentFingerprint>, b: Option<&ContentFingerprint>) -> bool {
+    a.zip(b)
+        .is_some_and(|(a, b)| a.same_content(b) == Some(false))
+}
+
+/// Which rewind a landing belongs to: the unit, and the content its marker
+/// carries when it carries one - distinct per generation of a unit (see
+/// [`RewindPlan`]).
+fn rewind_key(marker: &ProgressMarker) -> String {
+    match marker.content_fingerprint() {
+        Some(content) => format!("{}#{}:{}", unit_key(marker), content.len, content.sha256),
+        None => unit_key(marker),
+    }
 }
 
 /// Pending ranges of one source read from one file: one inode, one content
@@ -2973,10 +3013,7 @@ impl PendingGroup {
     /// fingerprints of the same length with other bytes. Content that cannot
     /// be compared (different lengths, or none) is not proven other.
     fn proven_other(&self, content: Option<&ContentFingerprint>) -> bool {
-        self.content
-            .as_ref()
-            .zip(content)
-            .is_some_and(|(mine, theirs)| mine.same_content(theirs) == Some(false))
+        proven_other(self.content.as_ref(), content)
     }
 }
 
@@ -2994,27 +3031,43 @@ impl RewindPlan {
                 lowest: position,
             }),
         }
-        let unit = unit_key(start);
         self.added += 1;
-        self.recency.insert(unit.clone(), self.added);
-        match self.lowest.get(&unit) {
-            Some(held) if start_position(held) <= position => {}
-            _ => {
-                self.lowest.insert(unit, start.clone());
+        let content = start.content_fingerprint();
+        let generations = self.lowest.entry(unit_key(start)).or_default();
+        match generations
+            .iter_mut()
+            .find(|generation| !generation.proven_other(content))
+        {
+            Some(generation) => {
+                generation.recency = self.added;
+                if let Some(content) = content {
+                    if !generation.contents.contains(content) {
+                        generation.contents.push(content.clone());
+                    }
+                }
+                if position < start_position(&generation.marker) {
+                    generation.marker = start.clone();
+                }
             }
+            None => generations.push(Rewind {
+                marker: start.clone(),
+                contents: content.into_iter().cloned().collect(),
+                recency: self.added,
+            }),
         }
     }
 
     /// Replace each unit's raw start with the position its rewind actually
-    /// landed on (`effective`, by unit key). A rewind never goes below what the
+    /// landed on (`effective`, by [`rewind_key`] of the rewind's marker). A rewind never goes below what the
     /// source has already committed, so a stale ledger row whose range a later
     /// batch re-archived lands AT the committed point, not at its own start:
     /// nothing is about to be re-read for it, and it must not hold back a
     /// VERIFIED range above it (review of #563). A unit with no entry keeps its
     /// raw start, which is the conservative answer.
     fn rebase(&mut self, effective: &HashMap<String, i128>) {
-        for (unit, marker) in &self.lowest {
-            let Some(&landed) = effective.get(unit) else {
+        for rewind in self.lowest.values().flatten() {
+            let marker = &rewind.marker;
+            let Some(&landed) = effective.get(&rewind_key(marker)) else {
                 continue;
             };
             // Every group of THAT file moves (review of #578): a file under
@@ -3024,13 +3077,14 @@ impl RewindPlan {
             // a replacement at the same inode - does not: the landing says
             // nothing about it.
             let inode = marker_inode(marker);
-            let content = marker.content_fingerprint();
             for group in self
                 .by_source
                 .get_mut(&source_key(marker))
                 .into_iter()
                 .flatten()
-                .filter(|group| group.inode == inode && !group.proven_other(content))
+                .filter(|group| {
+                    group.inode == inode && !rewind.proven_other(group.content.as_ref())
+                })
             {
                 group.lowest = group.lowest.max(landed);
             }
@@ -3084,22 +3138,21 @@ impl RewindPlan {
     }
 
     fn markers(&self) -> Vec<ProgressMarker> {
-        let mut markers: Vec<_> = self
-            .lowest
-            .iter()
-            .map(|(k, m)| (k.clone(), m.clone()))
-            .collect();
+        let mut rewinds: Vec<&Rewind> = self.lowest.values().flatten().collect();
         // Grouped by source, and within a source oldest file first so the most
-        // recent file's rewind is applied last. The unit key breaks ties, so
+        // recent file's rewind is applied last. The rewind key breaks ties, so
         // the log and the tests do not depend on hash order.
-        markers.sort_by_cached_key(|(unit, marker)| {
+        rewinds.sort_by_cached_key(|rewind| {
             (
-                source_key(marker),
-                self.recency.get(unit).copied().unwrap_or(0),
-                unit.clone(),
+                source_key(&rewind.marker),
+                rewind.recency,
+                rewind_key(&rewind.marker),
             )
         });
-        markers.into_iter().map(|(_, m)| m).collect()
+        rewinds
+            .into_iter()
+            .map(|rewind| rewind.marker.clone())
+            .collect()
     }
 }
 
@@ -4431,7 +4484,10 @@ mod tests {
         let mut plan = RewindPlan::default();
         plan.add(&file(0, ContentFingerprint::of(&text[..100])));
         plan.add(&file(100, ContentFingerprint::of(&text[..200])));
-        plan.rebase(&HashMap::from([(unit_key(&file(0, None)), 200)]));
+        plan.rebase(&HashMap::from([(
+            rewind_key(&file(0, ContentFingerprint::of(&text[..100]))),
+            200,
+        )]));
         assert!(
             !plan.holds_back(&file(200, ContentFingerprint::of(&text[..300]))),
             "both pending ranges were re-archived through 200; the [100,200) group must \
@@ -4442,10 +4498,63 @@ mod tests {
         let mut plan = RewindPlan::default();
         plan.add(&file(0, page(b'A')));
         plan.add(&file(50, page(b'B')));
-        plan.rebase(&HashMap::from([(unit_key(&file(0, None)), 300)]));
+        plan.rebase(&HashMap::from([(rewind_key(&file(0, page(b'A'))), 300)]));
         assert!(
             plan.holds_back(&file(100, page(b'B'))),
             "a landing in A's content says nothing about B's pending range"
+        );
+    }
+
+    /// Review of #578 (Codex): pending ranges of old content A (from 0) and of
+    /// its same-inode replacement B (from 100). One rewind per inode went to
+    /// A's start, which the adapter refuses, so B never landed and its stale
+    /// start held back B's VERIFIED range on every restart. Each proven
+    /// content generation now gets its own rewind, the newest applied last;
+    /// content that cannot be told apart stays one rewind, so a growing
+    /// small file is never rewound twice.
+    #[test]
+    fn each_proven_content_generation_gets_its_own_rewind() {
+        let page = |tag: u8| ContentFingerprint::of(&[tag; 5_000]);
+        let file = |start: u64, content: Option<ContentFingerprint>| ProgressMarker::File {
+            path: "/a".into(),
+            inode: Some(1),
+            start_byte: start,
+            end_byte: start + 100,
+            file_size: 8_192,
+            mtime: String::new(),
+            content_fingerprint: content,
+        };
+        let mut plan = RewindPlan::default();
+        plan.add(&file(0, page(b'A')));
+        plan.add(&file(100, page(b'B')));
+        let markers = plan.markers();
+        assert_eq!(
+            markers.iter().map(start_position).collect::<Vec<_>>(),
+            [0, 100],
+            "A's rewind, then B's - the most recent content applied last"
+        );
+        // A's rewind is refused (no landing); B's lands at 300, where a later
+        // batch has already committed B through.
+        plan.rebase(&HashMap::from([(rewind_key(&markers[1]), 300)]));
+        assert!(
+            !plan.holds_back(&file(300, page(b'B'))),
+            "B's re-archived pending range must not hold back B's VERIFIED [300,400)"
+        );
+
+        let text: Vec<u8> = (0..40)
+            .flat_map(|i| format!("line {i:03}\n").into_bytes())
+            .collect();
+        let mut plan = RewindPlan::default();
+        plan.add(&file(0, ContentFingerprint::of(&text[..100])));
+        plan.add(&file(100, ContentFingerprint::of(&text[..200])));
+        plan.add(&file(150, None));
+        assert_eq!(
+            plan.markers()
+                .iter()
+                .map(start_position)
+                .collect::<Vec<_>>(),
+            [0],
+            "one file whose fingerprints cannot be compared is one rewind, to its lowest start"
         );
     }
 
