@@ -947,8 +947,9 @@ Short procedures now; expand into a full ops runbook before go-live.
   - **A range that holds records but where no replica has epoch history
     cannot promote, and repair cannot fix it.** That means logs whose
     records predate their epoch journal on every replica, or journals lost
-    on every replica. A repair whose source has no history installs none
-    and warns. Every candidate holding records is Unknown to itself and
+    on every replica. A repair whose source has no history installs none,
+    and warns when it transferred records (a repair that moved none leaves
+    a replica that disputes nothing). Every candidate holding records is Unknown to itself and
     stands aside, and a candidate holding none stands aside for them, so
     the range goes unled. (A fresh, empty range is not affected: a
     candidate at 0 disputes nothing and promotes.) The transition record shows
