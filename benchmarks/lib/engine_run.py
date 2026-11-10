@@ -96,6 +96,13 @@ READY_TIMEOUT_SECONDS = 30.0
 # costs microseconds.
 READY_POLL_SECONDS = 0.02
 
+# After a scrape fails mid-window, how long the engine gets to show it EXITED
+# before the failure is filed as the endpoint's (#594). An exit closes the
+# socket before the process can be reaped, and a `docker exec` client outlives
+# the container process it ran by a little, so one exit_code() read right
+# after the failure can still say "running". Only the refusal path waits.
+ENGINE_EXIT_GRACE_SECONDS = 1.0
+
 # How long the graceful stop gets before SIGKILL. `vtopctl run` treats ctrl-c
 # as a graceful stop — it force-flushes its buffered batches and exits. Since
 # #532 (#526) it keeps a SIGINT that arrives mid-cycle and honours it between
@@ -1001,6 +1008,22 @@ def _observe(proc, endpoint: MetricsEndpoint, recorder: SeriesRecorder, duration
             f"the engine exited with status {rc} {when}; a window it did not live through "
             f"measured nothing. Its output ({log_path}):\n{tail or '(empty)'}")
 
+    def exit_after_failed_scrape() -> int | None:
+        # A process whose exit closed the socket is not always reapable yet
+        # (and a `docker exec` client outlives its container process by a
+        # little), so the exit is waited for briefly rather than read once. An
+        # engine still running after the grace is alive and its endpoint is
+        # what stopped.
+        # The last sleep is clamped to what remains, so the wait never runs
+        # past the grace and still ends on a read at its deadline (review).
+        give_up = clock() + ENGINE_EXIT_GRACE_SECONDS
+        while True:
+            rc = proc.exit_code()
+            remaining = give_up - clock()
+            if rc is not None or remaining <= 0:
+                return rc
+            sleep(min(READY_POLL_SECONDS, remaining))
+
     # A reading is stamped when its answer ARRIVES, and its scrape's latency
     # is bounded — see MAX_SCRAPE_LATENCY_FRACTION. Stamped at the request's
     # start instead, a handler delayed by load read counters later than their
@@ -1081,6 +1104,14 @@ def _observe(proc, endpoint: MetricsEndpoint, recorder: SeriesRecorder, duration
         try:
             expo = scrape(endpoint, timeout=interval)
         except ScrapeFailed as err:
+            # The engine may have exited WHILE this scrape was in flight: the
+            # check above saw it running, its exit closed the socket, and the
+            # scrape failed first (#594, about 1 run in 80). That failure is a
+            # symptom; the cause is the exit, so it is named as one.
+            rc = exit_after_failed_scrape()
+            if rc is not None:
+                raise exited(rc, f"{clock() - opened:.1f}s into a {duration:g}s window, while "
+                             f"a scrape was in flight ({err})") from err
             raise ScrapeStopped(
                 f"scraping {endpoint.url} stopped {started - opened:.1f}s into a {duration:g}s window "
                 f"after {recorder.samples} sample(s): {err}. A partial series is not a "
