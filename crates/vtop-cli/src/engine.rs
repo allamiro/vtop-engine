@@ -2968,6 +2968,16 @@ impl PendingGroup {
     fn is(&self, marker: &ProgressMarker) -> bool {
         self.inode == marker_inode(marker) && self.content.as_ref() == marker.content_fingerprint()
     }
+
+    /// Whether this group's content is proven to differ from `content`:
+    /// fingerprints of the same length with other bytes. Content that cannot
+    /// be compared (different lengths, or none) is not proven other.
+    fn proven_other(&self, content: Option<&ContentFingerprint>) -> bool {
+        self.content
+            .as_ref()
+            .zip(content)
+            .is_some_and(|(mine, theirs)| mine.same_content(theirs) == Some(false))
+    }
 }
 
 impl RewindPlan {
@@ -3007,10 +3017,20 @@ impl RewindPlan {
             let Some(&landed) = effective.get(unit) else {
                 continue;
             };
-            if let Some(group) = self
+            // Every group of THAT file moves (review of #578): a file under
+            // one page fingerprints a different length at each read, so one
+            // file's ranges can sit in several groups, which were one before
+            // groups carried content. A group proven to be other content -
+            // a replacement at the same inode - does not: the landing says
+            // nothing about it.
+            let inode = marker_inode(marker);
+            let content = marker.content_fingerprint();
+            for group in self
                 .by_source
                 .get_mut(&source_key(marker))
-                .and_then(|groups| groups.iter_mut().find(|group| group.is(marker)))
+                .into_iter()
+                .flatten()
+                .filter(|group| group.inode == inode && !group.proven_other(content))
             {
                 group.lowest = group.lowest.max(landed);
             }
@@ -3058,15 +3078,7 @@ impl RewindPlan {
                     .filter(|group| {
                         inode.is_none() || group.inode.is_none() || group.inode == inode
                     })
-                    .filter(|group| {
-                        group
-                            .content
-                            .as_ref()
-                            .zip(content)
-                            .is_none_or(|(pending, verified)| {
-                                pending.same_content(verified) != Some(false)
-                            })
-                    })
+                    .filter(|group| !group.proven_other(content))
                     .any(|group| group.lowest < from)
             })
     }
@@ -4393,6 +4405,48 @@ mod tests {
                 "B's own pending [50,150) is below B's VERIFIED range"
             );
         }
+    }
+
+    /// Review of #578 (Codex): a file under one page fingerprints a different
+    /// length at each read, so its pending ranges fall into several groups.
+    /// When the unit's rewind lands above all of them (a later batch already
+    /// re-archived them), every group of that file must move with it - before
+    /// the groups were split they were one, and a group left at its raw start
+    /// held back the VERIFIED range above it on every restart. A group of
+    /// content proven to be another file's does not move.
+    #[test]
+    fn a_landed_rewind_rebases_every_group_of_the_same_file() {
+        let text: Vec<u8> = (0..40)
+            .flat_map(|i| format!("line {i:03}\n").into_bytes())
+            .collect();
+        let file = |start: u64, content: Option<ContentFingerprint>| ProgressMarker::File {
+            path: "/a".into(),
+            inode: Some(1),
+            start_byte: start,
+            end_byte: start + 100,
+            file_size: 300,
+            mtime: String::new(),
+            content_fingerprint: content,
+        };
+        let mut plan = RewindPlan::default();
+        plan.add(&file(0, ContentFingerprint::of(&text[..100])));
+        plan.add(&file(100, ContentFingerprint::of(&text[..200])));
+        plan.rebase(&HashMap::from([(unit_key(&file(0, None)), 200)]));
+        assert!(
+            !plan.holds_back(&file(200, ContentFingerprint::of(&text[..300]))),
+            "both pending ranges were re-archived through 200; the [100,200) group must \
+             not stay at its raw start"
+        );
+
+        let page = |tag: u8| ContentFingerprint::of(&[tag; 5_000]);
+        let mut plan = RewindPlan::default();
+        plan.add(&file(0, page(b'A')));
+        plan.add(&file(50, page(b'B')));
+        plan.rebase(&HashMap::from([(unit_key(&file(0, None)), 300)]));
+        assert!(
+            plan.holds_back(&file(100, page(b'B'))),
+            "a landing in A's content says nothing about B's pending range"
+        );
     }
 
     #[test]
