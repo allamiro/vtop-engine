@@ -24,6 +24,84 @@ A number without its conditions is not a measurement, it is a rumor.
 | Hardware | RTT | Loss rate | Loss model | Bottleneck rate | Buffer depth | Competitor state | Transport | Bottleneck | Date |
 |----------|-----|-----------|------------|-----------------|--------------|------------------|-----------|------------|------|
 
+## The tuned-TCP baseline, and the gate (#483)
+
+### The gate, fixed before the sweep was read
+
+This subsection was committed before any sweep run was read, and the results
+below are judged against it unchanged. The commit that introduced it is the
+evidence of the order.
+
+**Definitions.**
+
+- **VTOP goodput `G`** (Mbit/s): the committed object bytes of a run × 8,
+  divided by the wall time of the engine cycles that committed them
+  (`cycle_metrics.csv`, one row per `process-once`). Object bytes only:
+  manifests, HTTP framing and retransmissions are excluded, so `G` understates
+  the wire.
+- **Link goodput `C`** (Mbit/s): the same run's `emulator_validation_mbps` —
+  one iperf3 TCP flow through the shape's impairment-free twin (same rate,
+  buffer and mean delay; no loss), measured by the harness immediately before
+  that run. On the lossy profile `C` is therefore the link's goodput without
+  the loss, which is the ceiling a loss-tolerant transport is being asked to
+  approach.
+- **Unused fraction `U`** = 1 − `G`/`C`.
+- **Best-tuned configuration, per profile**: the grid point (below) with the
+  highest median `G`/`C` across its repetitions on that profile. Ties within
+  two percentage points go to the configuration with fewer connections
+  (`max_concurrency` × `parts_in_flight`), because it costs a neighbour less.
+- **Confirmation runs.** The best-tuned point is selected on the grid's
+  repetitions and then re-measured; the gate is evaluated on the confirmation
+  runs alone, so the configuration that won by noise is not also the one
+  whose noise is reported.
+
+**The thresholds.** Two single numbers. The datagram issues (#485, #486
+and #488) open if **either** is crossed; if neither is, they do not open, and
+that is recorded here as the outcome.
+
+1. **Goodput: `U` > 0.20** — the best-tuned TCP configuration leaves more than
+   20% of the link's goodput unused, by the median of its confirmation runs, on
+   **either** 100 ms profile (10 Mbit/s with 0% loss, or 10 Mbit/s with 1%
+   `gemodel` loss).
+2. **Tail: `R` > 2.0** — where `R` is `object_upload` p95 on the 1% `gemodel`
+   profile divided by `object_upload` p95 on the 0% profile, both at the
+   configuration that is best-tuned on the 1% profile, each p95 taken over
+   every object of that profile's confirmation runs pooled.
+
+**Noise rule, also fixed now.** A verdict is stated on the medians. If a
+threshold lies inside the range (minimum to maximum) of the repetitions that
+decide it, the verdict is reported as within noise, and the document says the
+gate should be re-measured before #485 is scheduled either way.
+
+**Not part of the gate.** The clean-LAN profile (no RTT to speak of) and the
+policed-uplink row. The policed row has no calibrated `C` — a policer has no
+queue for a single flow to fill, and the harness's probe deliberately runs on
+the twin without it — so it is reported against the policer's configured
+token rate and read as a finding, not as a threshold.
+
+### The sweep
+
+- **Grid.** `upload.transports.tcp_tls.max_concurrency` ∈ {1, 2, 4, 8, 16}
+  (with `batching.max_concurrent_batches` set to the same value, since the
+  engine takes the minimum of the two) × `parts_in_flight` ∈ {1, 2, 4}, with
+  `part_size_bytes` 5 MiB — the smallest part S3 and MinIO accept, so that a
+  20 MiB object is four parts and every `parts_in_flight` value is
+  distinguishable.
+- **Untuned default**, for comparison and never as the baseline: no tuning
+  block, so the shipped values — eight concurrent batches, 8 MiB parts, four
+  parts in flight.
+- **Profiles.** Clean LAN (the middlebox in the path, no qdisc); 100 ms RTT at
+  10 Mbit/s, one BDP of buffer, 0% loss; the same with 1% `gemodel` loss
+  (bursty, mean burst two packets) on the upload direction; and a policed
+  uplink — a 10 Mbit/s policer and no queue, at 100 ms.
+- **Workload.** Per run, a fixed backlog of `max(4, 2 × max_concurrency)`
+  objects of 20 MiB each (JSONL, `compression: none`, so wire payload equals
+  object size; SHA-256 checksums; `s3_native` to the lab MinIO), drained by
+  `process-once`.
+- **Repetitions.** At least two per grid point; the default and the
+  best-tuned configuration re-measured to at least five on each 100 ms
+  profile.
+
 ## Counterparty survey: which S3-compatible endpoints serve HTTP/3 (#484)
 
 A transport needs something on the other end. The datagram path this
