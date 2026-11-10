@@ -481,8 +481,10 @@ in a state replay can explain.
   `SplitRange` on the metadata plane, fenced like a sealed-segment
   registration, into children the formats already expected. One broker
   serving several Kafka partitions is not in this tag.
-- **Every call that leaves the process has a deadline (#556)**, including
-  the upload body, so a stalled endpoint cannot hold a batch forever.
+- **The archive engine's object-store and state-store calls have deadlines
+  (#556)**, including the upload body, so a stalled endpoint cannot hold a
+  batch forever. `vtopctl migrate` is not covered: its Postgres connection
+  and schema statements are still unbounded.
 - **A stop signal that arrives mid-cycle is honoured (#526)**, and SIGTERM
   flushes like Ctrl-C.
 - **A failed batch hands its range back to the source (#552)**; recovery
@@ -492,8 +494,10 @@ in a state replay can explain.
 - **A claim generation fences an engine that lost its claim (#557).**
 - **The time partition is the seal time, or event time on request (#559).**
 - **An archive coverage audit, and a prune that keeps its anchor (#560).**
-- **Large objects upload as resumable multipart (#482)**, and the
-  verification gap that path walked into is closed.
+- **On the native S3 backend, a large object uploads as resumable
+  multipart (#482)**, and the verification gap that path walked into is
+  closed. The command backends (AWS CLI, s3cmd, `mc`) and LocalFS still
+  hand the object over in one call, with no resume.
 - **A store throttle during a command backend's read-back or verify is a
   throttle (#529)**, not a failure, on every backend.
 - **Upload transports are a trait and a registry (#479, #480)**, one tuning
