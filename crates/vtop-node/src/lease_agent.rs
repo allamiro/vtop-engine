@@ -348,13 +348,15 @@ impl ReplicaPlaneProbe {
         // against.
         let candidate_lineage = self.view.epoch_starts();
         // The candidate's own answer is its own history by definition - when
-        // it HAS one. A candidate that cannot vouch for its lineage cannot
-        // prove anyone else's either (#577), itself included: every answer,
-        // its own among them, is Unknown and none of them counts.
+        // it HAS one. A candidate holding records it cannot vouch for cannot
+        // prove anyone else's lineage either (#577), itself included: its
+        // answer is Unknown like theirs. One holding NO records has nothing
+        // to vouch for: a lease-led broker on a fresh range has adopted no
+        // epoch yet, so its vector is empty, and its 0 disputes nothing.
         let mut probes = vec![crate::promotion::ReplicaProbe {
             node_id: self.node_uuid,
             local_committed_offset,
-            lineage: if candidate_lineage.is_empty() {
+            lineage: if candidate_lineage.is_empty() && local_committed_offset != Some(0) {
                 vtop_meta::AnswerLineage::Unknown
             } else {
                 vtop_meta::AnswerLineage::Agreed
@@ -5583,7 +5585,7 @@ mod tests {
     /// served replica 2, and an unreachable replica 3: a 3-replica range in
     /// which replica 2's answer decides whether a majority answered.
     async fn probe_with_one_reachable_follower(
-        candidate: Arc<vtop_broker::replication::InProcessFollower>,
+        candidate: Arc<dyn CandidateLocalView>,
         follower: Arc<vtop_broker::replication::InProcessFollower>,
     ) -> (
         Vec<crate::promotion::ReplicaProbe>,
@@ -5597,7 +5599,7 @@ mod tests {
             .unwrap()
             .with_timeout(Duration::from_secs(5));
         let probe = ReplicaPlaneProbe::new(
-            candidate as Arc<dyn CandidateLocalView>,
+            candidate,
             Uuid::from_u128(1),
             client,
             vec![
@@ -5648,7 +5650,9 @@ mod tests {
         assert!(follower.epoch_starts().is_empty(), "precondition");
         meta.set(LINEAGE_NEW_EPOCH);
 
-        let (probes, _stop) = probe_with_one_reachable_follower(candidate, follower).await;
+        let (probes, _stop) =
+            probe_with_one_reachable_follower(candidate as Arc<dyn CandidateLocalView>, follower)
+                .await;
         let answer = probes
             .iter()
             .find(|probe| probe.node_id == Uuid::from_u128(2))
@@ -5690,7 +5694,9 @@ mod tests {
         );
         meta.set(LINEAGE_NEW_EPOCH);
 
-        let (probes, _stop) = probe_with_one_reachable_follower(candidate, follower).await;
+        let (probes, _stop) =
+            probe_with_one_reachable_follower(candidate as Arc<dyn CandidateLocalView>, follower)
+                .await;
         let answer = probes
             .iter()
             .find(|probe| probe.node_id == Uuid::from_u128(2))
@@ -5708,6 +5714,47 @@ mod tests {
                 promotion,
                 crate::promotion::Promotion::Established {
                     committed_offset: 5,
+                    ..
+                }
+            ),
+            "{promotion:?}"
+        );
+    }
+
+    /// #577, and what live-chaos scenarios 09 and 11-13 caught in a first
+    /// draft: a FRESH range's first promotion. The lease-led leader's broker
+    /// sits at epoch 0 with an empty log and no epoch adopted yet, so the
+    /// history it sends is empty - and the replica it fences holds nothing
+    /// either. Nothing is disputed, so both answers count and the range
+    /// promotes at 0, as it always did.
+    #[tokio::test]
+    async fn a_fresh_ranges_first_promotion_is_not_refused_for_lineage() {
+        let candidate_dir = tempfile::tempdir().unwrap();
+        let candidate = Arc::new(test_broker(candidate_dir.path(), 0));
+        assert!(
+            candidate.epoch_starts().is_empty(),
+            "precondition: a lease-led broker before its first adoption"
+        );
+        let follower_dir = tempfile::tempdir().unwrap();
+        let (follower, meta) = lineage_replica(follower_dir.path(), Uuid::from_u128(2), 0);
+        meta.set(LINEAGE_NEW_EPOCH);
+
+        let (probes, _stop) =
+            probe_with_one_reachable_follower(candidate as Arc<dyn CandidateLocalView>, follower)
+                .await;
+        assert!(
+            probes
+                .iter()
+                .filter(|probe| probe.local_committed_offset.is_some())
+                .all(|probe| probe.lineage == vtop_meta::AnswerLineage::Agreed),
+            "{probes:?}"
+        );
+        let promotion = crate::promotion::establish(&probes, 3, Uuid::from_u128(1), None);
+        assert!(
+            matches!(
+                promotion,
+                crate::promotion::Promotion::Established {
+                    committed_offset: 0,
                     ..
                 }
             ),

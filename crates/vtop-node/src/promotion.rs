@@ -155,12 +155,25 @@ pub struct ReplicaProbe {
 /// confined to records retention reclaimed, #290/#408): its offset is not
 /// proven to describe the candidate's history, so the verdict is Unknown,
 /// as it is when either side has no history to compare.
+///
+/// A replica that holds NO records (`answered_tail` 0) disputes nothing: its
+/// offset of 0 is a prefix of every history, so it is Agreed whatever either
+/// vector says. That is the normal shape of a fresh range, where a lease-led
+/// broker has adopted no epoch yet and so sends an empty vector (live-chaos
+/// scenarios 09 and 11-13 caught a first draft that refused it).
 pub fn fenced_lineage(
     candidate: &[EpochStart],
     answered: &[EpochStart],
     answered_tail: u64,
     truncated_records: u64,
 ) -> AnswerLineage {
+    if answered_tail == 0 {
+        return if truncated_records > 0 {
+            AnswerLineage::Reconciled { truncated_records }
+        } else {
+            AnswerLineage::Agreed
+        };
+    }
     match compare_lineages(candidate, answered) {
         Lineage::Unknown => AnswerLineage::Unknown,
         Lineage::DivergesAt(offset) if offset < answered_tail => AnswerLineage::Unknown,
@@ -918,6 +931,13 @@ mod tests {
         assert_eq!(
             fenced_lineage(&[], &starts(&[(1, 0), (3, 90)]), 90, 0),
             AnswerLineage::Unknown
+        );
+        // A replica holding nothing disputes nothing, even against a
+        // candidate with no history (a fresh range's first promotion).
+        assert_eq!(fenced_lineage(&[], &[], 0, 0), AnswerLineage::Agreed);
+        assert_eq!(
+            fenced_lineage(&[], &starts(&[(3, 0)]), 0, 0),
+            AnswerLineage::Agreed
         );
         // A divergence below the replica's tail that it did not act on (the
         // retention-confined dispute): its offset is not proven.
