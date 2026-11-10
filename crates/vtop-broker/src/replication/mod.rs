@@ -216,6 +216,9 @@ pub struct InProcessFollower {
 /// duplicate (#261), so the suffix has to go first. The first append under
 /// `epoch` that reaches `from` is the evidence: only an established leader
 /// appends under its epoch. It discards the suffix before it is applied.
+/// While it is kept, the replica's reconnect status reports its log as
+/// ending at `from` (see [`InProcessFollower::replication_status`]), so the
+/// leader keeps the records it must send there.
 ///
 /// In memory only. A replica restarted with a kept suffix is in the same
 /// position as one that was absent from the fence: nothing reconciled it,
@@ -719,6 +722,40 @@ impl InProcessFollower {
                 ),
             )),
             Err(problem) => Err((ErrorCode::Storage, problem.to_string())),
+        }
+    }
+
+    /// `(local_committed_offset, next_offset)` as the leader's reconnect
+    /// status probe should see them: never past the start of a suffix a
+    /// fence kept in dispute (#611, #616 review).
+    ///
+    /// The leader prunes its retransmission buffer by this answer BEFORE the
+    /// replica sees the new leader's high-water mark. Counted as held, the
+    /// kept records made the new leader's own records at those offsets look
+    /// already delivered, so they were dropped. The mark then discarded the
+    /// suffix, nothing re-sent the dropped records, and every later append
+    /// failed its base-offset check. Reported at the dispute's start, the
+    /// buffer keeps them, and the first one to arrive settles the dispute
+    /// and lands. Under-reporting is safe: a batch the replica already holds
+    /// in agreement is acked as a duplicate.
+    pub fn replication_status(&self) -> (u64, u64) {
+        let (committed, next) = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                state.segment.committed_offset(),
+                state.segment.next_offset(),
+            )
+        };
+        let kept = *self
+            .kept_dispute
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match kept {
+            Some(dispute) => (committed.min(dispute.from), next.min(dispute.from)),
+            None => (committed, next),
         }
     }
 
