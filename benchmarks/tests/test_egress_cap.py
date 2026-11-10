@@ -514,6 +514,48 @@ def test_a_pinned_dataset_never_overwrites_a_file_already_in_the_seed_dir(tmp_pa
     assert first == second, "the pinned seed must still reproduce the same bytes"
 
 
+def test_a_generation_that_collides_part_way_leaves_nothing_behind(tmp_path):
+    # A collision on a LATER file used to leave the earlier files of the same
+    # call in the seed dir, where the next run counted them as input (review).
+    from lib import seed as seed_lib
+
+    scout = tmp_path / "scout"
+    seed_lib.generate_dataset(str(scout), "jsonl", 3, "small", seed=481, prefix="t-evt")
+    names = sorted(p.name for p in scout.iterdir())
+    assert len(names) == 3
+
+    seed_dir = tmp_path / "seed"
+    seed_dir.mkdir()
+    (seed_dir / names[2]).write_text("the caller's own file\n")
+    with pytest.raises(FileExistsError):
+        seed_lib.generate_dataset(str(seed_dir), "jsonl", 3, "small", seed=481, prefix="t-evt")
+    assert sorted(p.name for p in seed_dir.iterdir()) == [names[2]], (
+        "the two files the failed call created before the collision must be removed")
+    assert (seed_dir / names[2]).read_text() == "the caller's own file\n", (
+        "the file that was already there is not this call's and must be untouched")
+
+
+def test_a_generation_that_fails_mid_file_removes_its_partial_file_too(tmp_path, monkeypatch):
+    from lib import seed as seed_lib
+
+    real = seed_lib._write_text_file
+    calls = []
+
+    def failing_on_the_second(path, target, fmt):
+        calls.append(path)
+        if len(calls) == 2:
+            with open(path, "x", encoding="utf-8") as fh:
+                fh.write("half a fi")
+            raise OSError(28, "No space left on device")
+        return real(path, target, fmt)
+
+    monkeypatch.setattr(seed_lib, "_write_text_file", failing_on_the_second)
+    seed_dir = tmp_path / "seed"
+    with pytest.raises(OSError, match="No space left"):
+        seed_lib.generate_dataset(str(seed_dir), "jsonl", 3, "small", seed=481, prefix="t-evt")
+    assert list(seed_dir.iterdir()) == [], "the complete file and the partial one are both gone"
+
+
 def test_every_seeding_call_in_the_runner_is_namespaced_by_the_run():
     # The runner's three generations (up front, concurrent rounds, per-cycle
     # reseeds) must each carry the run's tag, or a rerun into the same

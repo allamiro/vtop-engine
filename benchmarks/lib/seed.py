@@ -153,18 +153,44 @@ def generate_dataset(out_dir: str, fmt: str, volume: int, size_class: str,
     runner promises to leave intact. The runner gives every run its own
     prefix, so a refusal here means two generations in one run asked for the
     same namespace, which is a bug to surface rather than paper over.
+
+    ALL OR NOTHING (#481, review): if any file of the call fails - a name
+    collision, a full disk, an interrupt - every file THIS call created is
+    removed before the error propagates, so an aborted generation leaves no
+    orphans for the next run to count as pre-existing input. Only this call's
+    files are ever removed: each is created exclusively, so a path that
+    existed beforehand fails at open and is never on the list. (Under
+    concurrent seeding the engine may already have read an earlier file of
+    the failed call; the runner treats a seeder failure as a failed run.)
     """
     random.seed(seed if seed else None)
     os.makedirs(out_dir, exist_ok=True)
     ext = _ext(fmt)
     total_bytes = 0
     pad = len(str(volume))
-    for i in range(volume):
-        name = f"{prefix}-{str(i).zfill(pad)}-{''.join(random.choices(string.ascii_lowercase, k=4))}.{ext}"
-        path = os.path.join(out_dir, name)
-        target = _pick_size(size_class)
-        if fmt == "binary":
-            total_bytes += _write_binary_file(path, target)
-        else:
-            total_bytes += _write_text_file(path, target, fmt)
+    created: list[str] = []
+    try:
+        for i in range(volume):
+            name = f"{prefix}-{str(i).zfill(pad)}-{''.join(random.choices(string.ascii_lowercase, k=4))}.{ext}"
+            path = os.path.join(out_dir, name)
+            target = _pick_size(size_class)
+            try:
+                if fmt == "binary":
+                    written = _write_binary_file(path, target)
+                else:
+                    written = _write_text_file(path, target, fmt)
+            except FileExistsError:
+                raise  # not ours: the exclusive open refused it
+            except BaseException:
+                created.append(path)  # ours if it exists: opened exclusively
+                raise
+            created.append(path)
+            total_bytes += written
+    except BaseException:
+        for path in created:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        raise
     return {"files": volume, "bytes": total_bytes}
