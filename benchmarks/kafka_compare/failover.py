@@ -343,8 +343,12 @@ def save_node_logs(system: str, logs: str, full: bool) -> None:
         done = sh(["docker", "logs", "-t", container(system, n)], check=False)
         text = (done.stdout + done.stderr).splitlines()
         if not full:
-            picked = [line for line in text if any(word in line for word in keep)]
-            text = picked[-400:] + ["--- tail ---"] + text[-60:]
+            # Raft's per-heartbeat replication errors to a dead peer (two a
+            # second, each several lines) would push the promotion lines out
+            # of any window; they say nothing the role lines do not.
+            picked = [line for line in text if any(word in line for word in keep)
+                      and "openraft::replication" not in line and "replication_handler" not in line]
+            text = picked[-600:] + ["--- tail ---"] + text[-40:]
         with open(os.path.join(logs, f"node-{n}.log"), "w") as handle:
             handle.write("\n".join(text) + "\n")
 
