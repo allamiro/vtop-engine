@@ -11,7 +11,8 @@
 //! The audit reads the ledger (and, for rows pruned since, the digests the
 //! prune wrote before deleting them), groups committed ranges by SOURCE UNIT
 //! (one Kafka topic-partition under one consumer group, one file or spool
-//! file at one inode) and reports per unit:
+//! file at one inode - and, within that, one content generation) and
+//! reports per unit:
 //!
 //! - **holes**: stretches between the first and last committed byte/offset
 //!   that no committed range covers. A hole a FAILED or REPLAY_REQUIRED row
@@ -37,7 +38,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use vtop_core::errors::VtopError;
 use vtop_core::state_machine::BatchState;
-use vtop_core::types::{ProgressMarker, SourceType};
+use vtop_core::types::{ContentFingerprint, ProgressMarker, SourceType};
 use vtop_state::{BatchRecord, StateStore};
 
 /// One source unit: the scope within which committed ranges must tile.
@@ -58,15 +59,21 @@ pub enum Unit {
         /// would merge an old file's ranges with a new one's - and the old
         /// file's commits would cover the new file's lost bytes. A row whose
         /// read saw the file SMALLER than an earlier row of the same path
-        /// and inode had already read starts a new generation. Spool markers
-        /// record no size, so spool units are not split this way; and a
-        /// replacement already as large as the old read position when first
-        /// read looks like the same file (#578).
+        /// and inode had already read starts a new generation; so does one
+        /// whose fingerprint of the file's first bytes differs from one an
+        /// earlier row took over the same length (#578), which catches a
+        /// replacement already as large as the old read position. Rows
+        /// without a fingerprint (written before #578) are split by size
+        /// alone, as they always were.
         generation: u32,
     },
     SyslogSpool {
         path: String,
         inode: Option<u64>,
+        /// As for [`Unit::File`]. Spool markers record a size and a
+        /// fingerprint only since #578; older spool rows are judged per
+        /// inode, as before.
+        generation: u32,
     },
 }
 
@@ -83,6 +90,30 @@ impl Unit {
     /// markers), so a gap nothing explains is lost data only for the former.
     fn contiguous(&self) -> bool {
         !matches!(self, Unit::Kafka { .. })
+    }
+
+    /// The same file or spool at another content generation; Kafka as is.
+    fn at_generation(self, generation: u32) -> Unit {
+        match self {
+            Unit::File { path, inode, .. } => Unit::File {
+                path,
+                inode,
+                generation,
+            },
+            Unit::SyslogSpool { path, inode, .. } => Unit::SyslogSpool {
+                path,
+                inode,
+                generation,
+            },
+            kafka @ Unit::Kafka { .. } => kafka,
+        }
+    }
+
+    fn generation(&self) -> u32 {
+        match self {
+            Unit::File { generation, .. } | Unit::SyslogSpool { generation, .. } => *generation,
+            Unit::Kafka { .. } => 0,
+        }
     }
 
     /// A file or spool row without an inode (a legacy marker, or a platform
@@ -110,15 +141,22 @@ impl std::fmt::Display for Unit {
                 path,
                 inode: i,
                 generation,
+            }
+            | Unit::SyslogSpool {
+                path,
+                inode: i,
+                generation,
             } => {
-                write!(f, "file {path} (inode {}", inode(i))?;
+                let kind = if matches!(self, Unit::File { .. }) {
+                    "file"
+                } else {
+                    "spool"
+                };
+                write!(f, "{kind} {path} (inode {}", inode(i))?;
                 if *generation > 0 {
                     write!(f, ", generation {generation}")?;
                 }
                 write!(f, ")")
-            }
-            Unit::SyslogSpool { path, inode: i } => {
-                write!(f, "spool {path} (inode {})", inode(i))
             }
         }
     }
@@ -251,7 +289,11 @@ pub fn unit_ranges(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
             inode,
             *last_read_start,
             *end_byte,
-            &|path, inode| Unit::SyslogSpool { path, inode },
+            &|path, inode| Unit::SyslogSpool {
+                path,
+                inode,
+                generation: 0,
+            },
         ),
         _ => Vec::new(),
     }
@@ -319,7 +361,11 @@ pub fn rotation_unproven(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
             path,
             inode,
             *start_byte,
-            |path, inode| Unit::SyslogSpool { path, inode },
+            |path, inode| Unit::SyslogSpool {
+                path,
+                inode,
+                generation: 0,
+            },
         ),
         _ => return Vec::new(),
     };
@@ -337,10 +383,15 @@ pub fn rotation_unproven(record: &BatchRecord) -> Vec<(Unit, u64, u64)> {
     stretches
 }
 
-/// The size a row's read saw the file at, for the file `unit` names.
-fn observed_size(record: &BatchRecord, unit: &Unit) -> Option<u64> {
-    let Unit::File { path, inode, .. } = unit else {
-        return None;
+/// The size a row's read saw the file at, and the fingerprint it took of
+/// the file's first bytes, for the file or spool `unit` names: from the
+/// window's last read when that read was of this file, else its first.
+fn observed<'r>(
+    record: &'r BatchRecord,
+    unit: &Unit,
+) -> (Option<u64>, Option<&'r ContentFingerprint>) {
+    let (Unit::File { path, inode, .. } | Unit::SyslogSpool { path, inode, .. }) = unit else {
+        return (None, None);
     };
     [&record.progress_end, &record.progress_start]
         .into_iter()
@@ -349,55 +400,95 @@ fn observed_size(record: &BatchRecord, unit: &Unit) -> Option<u64> {
                 path: read_path,
                 inode: read_inode,
                 file_size,
+                content_fingerprint,
                 ..
-            } if read_path == path && read_inode == inode => Some(*file_size),
+            } if matches!(unit, Unit::File { .. }) && read_path == path && read_inode == inode => {
+                Some((Some(*file_size), content_fingerprint.as_ref()))
+            }
+            ProgressMarker::SyslogSpool {
+                path: read_path,
+                inode: read_inode,
+                file_size,
+                content_fingerprint,
+                ..
+            } if matches!(unit, Unit::SyslogSpool { .. })
+                && read_path == path
+                && read_inode == inode =>
+            {
+                Some((*file_size, content_fingerprint.as_ref()))
+            }
             _ => None,
         })
+        .unwrap_or((None, None))
 }
 
-/// The content generation of each file (see [`Unit::File`]), assigned
-/// walking rows in creation order.
+/// What is known of one content generation of a file or spool.
+#[derive(Default)]
+struct Generation {
+    number: u32,
+    /// The highest end read in it.
+    read_to: u64,
+    /// Every fingerprint its rows took, by the length it covers (#578). A
+    /// file under one page fingerprints all of itself, so one file shows
+    /// several lengths as it grows; only fingerprints of the SAME length can
+    /// be compared, so each length is kept. At most one per length up to
+    /// `ContentFingerprint::MAX_LEN`, whatever the number of rows.
+    content: BTreeMap<u64, String>,
+}
+
+/// The content generation of each file and spool (see [`Unit::File`]),
+/// assigned walking rows in creation order.
 #[derive(Default)]
 struct Generations {
-    /// (path, inode) -> (generation, highest end read in it).
-    files: HashMap<(String, Option<u64>), (u32, u64)>,
+    /// The unit at generation 0 -> its current generation.
+    files: HashMap<Unit, Generation>,
 }
 
 impl Generations {
     /// `unit` with its generation, for a read ending at `end` that saw the
-    /// file at `observed` bytes: a file seen smaller than this generation
-    /// has already been read is new content.
-    fn place(&mut self, unit: Unit, observed: Option<u64>, end: u64) -> Unit {
-        let Unit::File { path, inode, .. } = unit else {
+    /// file at `observed` bytes with `content` at its start: a file seen
+    /// smaller than this generation has already been read, or starting with
+    /// other bytes than an earlier read of the same length saw, is new
+    /// content. A row without a fingerprint (written before #578) cannot
+    /// show the second, nor a spool row of then the first: it stays in the
+    /// generation it is in.
+    fn place(
+        &mut self,
+        unit: Unit,
+        observed: Option<u64>,
+        content: Option<&ContentFingerprint>,
+        end: u64,
+    ) -> Unit {
+        if matches!(unit, Unit::Kafka { .. }) {
             return unit;
-        };
-        let (generation, read_to) = self.files.entry((path.clone(), inode)).or_insert((0, 0));
-        if observed.is_some_and(|size| size > 0 && size < *read_to) {
-            *generation += 1;
-            *read_to = 0;
         }
-        *read_to = (*read_to).max(end);
-        Unit::File {
-            path,
-            inode,
-            generation: *generation,
+        let known = self.files.entry(unit.clone().at_generation(0)).or_default();
+        let shrank = observed.is_some_and(|size| size > 0 && size < known.read_to);
+        let replaced = content.is_some_and(|content| {
+            known
+                .content
+                .get(&content.len)
+                .is_some_and(|sha256| *sha256 != content.sha256)
+        });
+        if shrank || replaced {
+            known.number += 1;
+            known.read_to = 0;
+            known.content.clear();
         }
+        known.read_to = known.read_to.max(end);
+        if let Some(content) = content {
+            known.content.insert(content.len, content.sha256.clone());
+        }
+        unit.at_generation(known.number)
     }
 
     /// `unit` in the generation its file is in now.
     fn current(&self, unit: Unit) -> Unit {
-        let Unit::File { path, inode, .. } = unit else {
-            return unit;
-        };
         let generation = self
             .files
-            .get(&(path.clone(), inode))
-            .map_or(0, |(generation, _)| *generation);
-        Unit::File {
-            path,
-            inode,
-            generation,
-        }
+            .get(&unit.clone().at_generation(0))
+            .map_or(0, |known| known.number);
+        unit.at_generation(generation)
     }
 }
 
@@ -488,16 +579,15 @@ pub fn audit(records: impl IntoIterator<Item = BatchRecord>) -> Vec<UnitReport> 
             if end <= start {
                 continue; // an empty read covers nothing
             }
-            let observed = observed_size(record, &unit);
-            let unit = generations.place(unit, observed, end);
+            let (size, content) = observed(record, &unit);
+            let unit = generations.place(unit, size, content, end);
             // A later generation is new content from byte 0, so its start
             // below its first read is not old history: unproven, as at a
             // rotation (a copytruncated file resumed at the old offset by a
-            // release before #564 looks like this).
-            if let Unit::File { generation, .. } = &unit {
-                if *generation > 0 && start > 0 && !units.contains_key(&unit) {
-                    unproven.entry(unit.clone()).or_default().push((0, start));
-                }
+            // release before #564, or a same-inode replacement resumed there
+            // by one before #578, looks like this).
+            if unit.generation() > 0 && start > 0 && !units.contains_key(&unit) {
+                unproven.entry(unit.clone()).or_default().push((0, start));
             }
             units.entry(unit).or_default().push(Row {
                 batch_id: record.batch_id.clone(),
@@ -1317,6 +1407,7 @@ mod tests {
             // unless a test says otherwise (see `sized`).
             file_size: 1 << 40,
             mtime: String::new(),
+            content_fingerprint: None,
         }
     }
 
@@ -1337,6 +1428,7 @@ mod tests {
             end_byte,
             file_size: size,
             mtime: String::new(),
+            content_fingerprint: None,
         };
         row(id, state, marker(start), marker(end))
     }
@@ -1446,6 +1538,7 @@ mod tests {
                 end_byte: end,
                 file_size: end,
                 mtime: String::new(),
+                content_fingerprint: None,
             };
             row(id, Committed, marker(start), marker(start))
         };
@@ -2111,5 +2204,223 @@ mod tests {
         }
         assert!(!text.contains("/a.log"), "a path became a label: {text}");
         assert!(report.lines().last().unwrap().contains("FAILED"));
+    }
+
+    // ---- content identity (#578) --------------------------------------------
+
+    /// A one-read window over `[start, end)` of `/c.log` (a file) or
+    /// `/c.spool` (a spool) at inode 7, that saw the file at `size` bytes
+    /// starting with `head` - `None` for a marker from before #578.
+    #[allow(clippy::too_many_arguments)]
+    fn content_read(
+        id: &str,
+        state: BatchState,
+        spool: bool,
+        start: u64,
+        end: u64,
+        size: Option<u64>,
+        head: Option<&[u8]>,
+    ) -> BatchRecord {
+        let content = head.and_then(vtop_core::types::ContentFingerprint::of);
+        let marker = |end_byte: u64| {
+            if spool {
+                ProgressMarker::SyslogSpool {
+                    spool_id: "c.spool".into(),
+                    path: "/c.spool".into(),
+                    inode: Some(7),
+                    start_byte: start,
+                    end_byte,
+                    received_time_start: None,
+                    received_time_end: None,
+                    file_size: size,
+                    content_fingerprint: content.clone(),
+                }
+            } else {
+                ProgressMarker::File {
+                    path: "/c.log".into(),
+                    inode: Some(7),
+                    start_byte: start,
+                    end_byte,
+                    file_size: size.unwrap_or(0),
+                    mtime: String::new(),
+                    content_fingerprint: content.clone(),
+                }
+            }
+        };
+        row(id, state, marker(start), marker(end))
+    }
+
+    /// Two files' worth of first bytes, each over a page, so their
+    /// fingerprints cover the same length and compare.
+    fn page(tag: u8) -> Vec<u8> {
+        vec![tag; 5_000]
+    }
+
+    /// #578, the issue's example: the old file's `[0,100)` committed, then a
+    /// replacement at the SAME inode, already larger than 100 bytes when
+    /// first read, read from 50 (as a release before #578 resumed it).
+    /// Path, inode and size all agree, so the old commit covered the
+    /// replacement's `[0,50)`. Its first bytes differ: a new generation,
+    /// whose unread start is unproven rather than covered.
+    #[test]
+    fn a_same_inode_replacement_that_is_never_smaller_is_a_new_generation() {
+        for spool in [false, true] {
+            let units = audit([
+                content_read(
+                    "old",
+                    Committed,
+                    spool,
+                    0,
+                    100,
+                    Some(8_192),
+                    Some(&page(b'o')),
+                ),
+                content_read(
+                    "new",
+                    Committed,
+                    spool,
+                    50,
+                    150,
+                    Some(8_192),
+                    Some(&page(b'n')),
+                ),
+            ]);
+            assert_eq!(
+                units.len(),
+                2,
+                "spool={spool}: the replacement must be its own unit, not merged with \
+                 the file it replaced: {units:#?}"
+            );
+            let new = units
+                .iter()
+                .find(|u| u.unit.generation() == 1)
+                .expect("the replacement is generation 1");
+            assert_eq!((new.audited_from, new.committed_through), (50, 150));
+            assert_eq!(
+                new.unproven
+                    .iter()
+                    .map(|h| (h.start, h.end))
+                    .collect::<Vec<_>>(),
+                [(0, 50)],
+                "spool={spool}: the replacement's [0,50) was never read and must not \
+                 look covered by the old file's [0,100)"
+            );
+            let old = units.iter().find(|u| u.unit.generation() == 0).unwrap();
+            assert_eq!((old.audited_from, old.committed_through), (0, 100));
+        }
+    }
+
+    /// #578: a spool marker now records its size, so a spool truncated and
+    /// read again from a lower position splits exactly as a file does (spool
+    /// rows were judged per inode only before).
+    #[test]
+    fn a_spool_seen_smaller_starts_a_new_generation() {
+        let units = audit([
+            content_read("old", Committed, true, 0, 100, Some(100), None),
+            content_read("new", Committed, true, 50, 80, Some(80), None),
+        ]);
+        assert_eq!(units.len(), 2, "{units:#?}");
+        let new = units.iter().find(|u| u.unit.generation() == 1).unwrap();
+        assert_eq!((new.unproven[0].start, new.unproven[0].end), (0, 50));
+        assert!(new
+            .unit
+            .to_string()
+            .contains("spool /c.spool (inode 7, generation 1)"));
+    }
+
+    /// A file under one page fingerprints all of itself, so each read of a
+    /// growing small file takes a different, longer fingerprint. Those cannot
+    /// be compared with each other and must not split the file; one that
+    /// repeats an earlier length with other bytes still does.
+    #[test]
+    fn a_small_file_that_grows_stays_one_generation() {
+        let text: Vec<u8> = (0..400)
+            .flat_map(|i| format!("line {i:05}\n").into_bytes())
+            .collect();
+        let grown = audit([
+            content_read("a", Committed, false, 0, 11, Some(11), Some(&text[..11])),
+            content_read("b", Committed, false, 11, 33, Some(33), Some(&text[..33])),
+            content_read(
+                "c",
+                Committed,
+                false,
+                33,
+                4_400,
+                Some(4_400),
+                Some(&text[..4_400]),
+            ),
+        ]);
+        assert_eq!(grown.len(), 1, "{grown:#?}");
+        assert!(grown[0].unproven.is_empty() && grown[0].unexplained_holes.is_empty());
+
+        let replaced = audit([
+            content_read("a", Committed, false, 0, 11, Some(11), Some(&text[..11])),
+            content_read("b", Committed, false, 11, 33, Some(33), Some(&text[..33])),
+            // 33 bytes again, other bytes: not the file that was read.
+            content_read("c", Committed, false, 20, 40, Some(40), Some(&[b'z'; 33])),
+        ]);
+        assert_eq!(replaced.len(), 2, "{replaced:#?}");
+    }
+
+    /// Rows from before #578 carry no fingerprint and are judged exactly as
+    /// they were: a legacy row and a fingerprinted one cannot be compared, so
+    /// the pair below stays one unit (the size test has nothing to say
+    /// either). Fingerprinted rows after it are still compared with each
+    /// other. An empty file at a read took no fingerprint and proves nothing.
+    #[test]
+    fn rows_without_a_fingerprint_are_judged_as_before() {
+        let mixed = audit([
+            content_read("legacy", Committed, false, 0, 100, Some(8_192), None),
+            content_read(
+                "new",
+                Committed,
+                false,
+                50,
+                150,
+                Some(8_192),
+                Some(&page(b'n')),
+            ),
+        ]);
+        assert_eq!(mixed.len(), 1, "{mixed:#?}");
+        assert!(mixed[0].unproven.is_empty());
+
+        let later = audit([
+            content_read("legacy", Committed, false, 0, 100, Some(8_192), None),
+            content_read(
+                "a",
+                Committed,
+                false,
+                100,
+                200,
+                Some(8_192),
+                Some(&page(b'a')),
+            ),
+            content_read(
+                "b",
+                Committed,
+                false,
+                150,
+                300,
+                Some(8_192),
+                Some(&page(b'b')),
+            ),
+        ]);
+        assert_eq!(later.len(), 2, "{later:#?}");
+
+        // Empty when the read opened it (no fingerprint), written to while
+        // it read: the next read's fingerprint has nothing to differ from.
+        let empty = audit([
+            content_read("empty", Committed, false, 0, 10, Some(10), Some(b"")),
+            content_read(
+                "a",
+                Committed,
+                false,
+                10,
+                20,
+                Some(20),
+                Some(b"0123456789abcdefghij"),
+            ),
+        ]);
+        assert_eq!(empty.len(), 1, "{empty:#?}");
     }
 }

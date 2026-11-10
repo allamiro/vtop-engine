@@ -154,6 +154,7 @@ mod tests {
             end_byte: 10,
             file_size: 10,
             mtime: "now".into(),
+            content_fingerprint: None,
         };
         TelemetryBatch {
             batch_id: "vtop-test".into(),

@@ -816,6 +816,104 @@ def test_an_engine_that_exits_before_the_window_closes_refuses_the_run(
     assert not os.path.exists(tmp_path / engine_run.ENGINE_METRICS_CSV)
 
 
+class EngineExitingMidScrape:
+    """The engine exits WHILE scrape number `exits_during` is in flight (#594).
+
+    Deterministic, on a fake clock: the window's exit check before that scrape
+    sees a running engine, the exit closes the socket so the scrape fails, and
+    the process is reapable only after `reap_lag` further exit_code() reads (a
+    real exit closes the socket before waitpid can see it). `exits_during=None`
+    is the control: the endpoint stops answering and the engine lives on."""
+
+    def __init__(self, exits_during, reap_lag: int = 0, rc: int = 3) -> None:
+        self.now = 1000.0
+        self.exits_during = exits_during
+        self.reap_lag = reap_lag
+        self.rc = rc
+        self.scrapes = 0
+        self.started = False
+        self.exited = False
+        self.stopped = False
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+    # the engine-process double
+    def start(self, log) -> None:
+        self.started = True
+
+    def exit_code(self):
+        if not self.exited:
+            return None
+        if self.reap_lag > 0:
+            self.reap_lag -= 1
+            return None
+        return self.rc
+
+    def stop(self, grace: float) -> str:
+        self.stopped = True
+        return "exited" if self.exited else "sigint"
+
+    def scrape(self, endpoint, timeout):
+        if not self.started:
+            raise engine_run.ScrapeFailed("nothing answers before launch")
+        self.scrapes += 1
+        if self.exits_during is None and self.scrapes > 3:
+            self.failed_at = self.now
+            raise engine_run.ScrapeFailed("connection refused")
+        if self.scrapes == self.exits_during:
+            self.exited = True
+            raise engine_run.ScrapeFailed("connection reset by peer")
+        return prom_text.parse(_body(commits=self.scrapes, bytes_out=self.scrapes))
+
+    def run(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(engine_run, "scrape", self.scrape)
+        return engine_run.measure_window(
+            "vtopctl", "/c.yaml", _scenario(engine_mode="run"), str(tmp_path),
+            duration=3.0, interval=0.1, ready_timeout=1.0,
+            endpoint=engine_run.MetricsEndpoint("127.0.0.1:1", "127.0.0.1", 1),
+            engine_process=self, sleep=self.sleep, clock=self.clock)
+
+
+@pytest.mark.parametrize("reap_lag", [0, 5])
+def test_an_engine_that_exits_during_a_scrape_is_refused_for_its_exit_not_the_scrape(
+        tmp_path, monkeypatch, reap_lag):
+    # The race behind the flaky stand-in test (#594): the exit check passes,
+    # the engine exits mid-scrape, and the failed scrape used to be filed as
+    # ScrapeStopped, naming the symptom instead of the cause. With reap_lag the
+    # first exit_code() read after the failure still says "running", which is
+    # what a real process looks like between closing its socket and being
+    # reaped; a single re-read would still misfile it.
+    engine = EngineExitingMidScrape(exits_during=5, reap_lag=reap_lag)
+    with pytest.raises(engine_run.EngineExitedEarly, match="status 3") as err:
+        engine.run(tmp_path, monkeypatch)
+    assert "while a scrape was in flight" in str(err.value)
+    assert not os.path.exists(tmp_path / engine_run.ENGINE_METRICS_CSV)
+    assert engine.stopped
+
+
+def test_a_scrape_that_fails_while_the_engine_runs_is_still_a_stopped_scrape(
+        tmp_path, monkeypatch):
+    # The control: the endpoint stops answering and the engine never exits.
+    # The wait for an exit ends AT the grace, not a poll past it (review): a
+    # 0.05 s grace is not a whole number of 0.02 s polls, so a loop that
+    # always sleeps a full poll would wait 0.06 s here.
+    monkeypatch.setattr(engine_run, "ENGINE_EXIT_GRACE_SECONDS", 0.05)
+    engine = EngineExitingMidScrape(exits_during=None)
+    with pytest.raises(engine_run.ScrapeStopped, match="connection refused"):
+        engine.run(tmp_path, monkeypatch)
+    # Pinned from both sides (review): past the grace, the refusal is late;
+    # short of it (no wait, or one that stops a poll early), an engine that
+    # is still being reaped is misfiled as a stopped scrape again.
+    waited = engine.now - engine.failed_at
+    assert abs(waited - 0.05) <= 1e-9, (
+        f"waited {waited:.3f}s of fake time for an exit after the failed scrape against a "
+        "0.05s grace: the wait must run to ENGINE_EXIT_GRACE_SECONDS and end there")
+
+
 def test_a_long_lived_run_with_a_competitor_is_refused_before_it_costs_anything(
         tmp_path, monkeypatch, capsys):
     # The competitor (#478) charges VTOP's share of its contended window from

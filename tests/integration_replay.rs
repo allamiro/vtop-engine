@@ -164,6 +164,7 @@ async fn verification_failure_never_commits() {
             end_byte: 0,
             file_size: 0,
             mtime: String::new(),
+            content_fingerprint: None,
         })
         .await
         .unwrap();
