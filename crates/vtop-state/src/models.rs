@@ -83,6 +83,13 @@ pub struct CommittedCursor {
     /// alone. `None` for a row that predates the field, or a file that was
     /// empty when read.
     pub content_fingerprint: Option<ContentFingerprint>,
+    /// The fingerprint of the bytes ending at `end_byte` that the same row's
+    /// marker took (#620): a file rewritten at the same inode while the
+    /// engine was down, with the same first page, is caught by it. `None`
+    /// for a row that predates the field (judged as before), a marker at
+    /// byte 0, and every spool row. Read out of the stored JSON - the
+    /// column already holds it, so no migration.
+    pub tail_fingerprint: Option<ContentFingerprint>,
 }
 
 /// A `content_fingerprint` read out of a stored marker as JSON text. Anything

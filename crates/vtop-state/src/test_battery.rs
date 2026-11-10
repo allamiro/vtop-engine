@@ -363,6 +363,7 @@ async fn max_committed_end_bytes_aggregates_in_store(store: &dyn StateStore) {
         file_size: end,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     let mk = |id: &str, path: &str, end: u64| {
         let mut r = sample_record(id);
@@ -416,11 +417,13 @@ async fn max_committed_end_bytes_aggregates_in_store(store: &dyn StateStore) {
 /// #578: the restart cursor carries the content fingerprint (and, for a
 /// spool, the length) the NEWEST committed row recorded - read out of the
 /// stored JSON by both backends - and a newest row from before the field
-/// answers "unknown", never an older row's fingerprint.
+/// answers "unknown", never an older row's fingerprint. #620: the same for
+/// the fingerprint of the bytes below the end.
 async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn StateStore) {
     use vtop_core::types::ContentFingerprint;
     let old = ContentFingerprint::of(b"old first line\n");
     let new = ContentFingerprint::of(&[b'x'; 5000]);
+    let tail = |end: u64| ContentFingerprint::of_tail(format!("bytes below {end}\n").as_bytes());
     let file = |end: u64, content: Option<ContentFingerprint>| ProgressMarker::File {
         path: "/fp.log".into(),
         inode: Some(9),
@@ -428,6 +431,9 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
         end_byte: end,
         file_size: end,
         mtime: String::new(),
+        // A row that records a first page records the bytes below its end
+        // too, as the adapter writes them.
+        tail_fingerprint: content.as_ref().and(tail(end)),
         content_fingerprint: content,
     };
     let spool = |end: u64, content: Option<ContentFingerprint>| ProgressMarker::SyslogSpool {
@@ -477,6 +483,7 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
             end_byte: 5000,
             observed_size: Some(5000),
             content_fingerprint: new.clone(),
+            tail_fingerprint: tail(5000),
         })
     );
     let spools = store
@@ -491,6 +498,7 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
             end_byte: 40,
             observed_size: None,
             content_fingerprint: None,
+            tail_fingerprint: None,
         }),
         "the newest row predates the fields: unknown, not an older row's values"
     );
@@ -513,6 +521,36 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
         (got.observed_size, got.content_fingerprint.clone()),
         (Some(51), old)
     );
+
+    // #620: a newest file row from before the tail field answers "unknown"
+    // for it, never the older row's tail.
+    let mut r = sample_record("fp-4");
+    r.source_type = SourceType::File;
+    r.progress_start = file(6000, new.clone());
+    r.progress_end = {
+        let mut legacy = file(6000, new.clone());
+        if let ProgressMarker::File {
+            tail_fingerprint, ..
+        } = &mut legacy
+        {
+            *tail_fingerprint = None;
+        }
+        legacy
+    };
+    store.save_batch_state(&r).await.unwrap();
+    for st in LEGAL_WALK {
+        store.update_batch_state("fp-4", st, &p).await.unwrap();
+    }
+    let files = store.committed_cursors(SourceType::File).await.unwrap();
+    let got = files.iter().find(|c| c.path == "/fp.log").unwrap();
+    assert_eq!(
+        (
+            got.end_byte,
+            got.content_fingerprint.clone(),
+            got.tail_fingerprint.clone()
+        ),
+        (6000, new, None)
+    );
 }
 
 /// #558: a restart seeds each file's cursor from the ledger. The ledger's
@@ -532,6 +570,7 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
         file_size: end * 10,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     let mk = |id: &str, path: &str, inode: Option<u64>, end: u64| {
         let mut r = sample_record(id);
@@ -635,6 +674,7 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
         // 70, and /rot.log's old inode (9000) must not leak into the new one.
         observed_size: Some(end_byte * 10),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     assert_eq!(
         got,
@@ -694,6 +734,7 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
             // These spool markers record no file length (as before #578).
             observed_size: None,
             content_fingerprint: None,
+            tail_fingerprint: None,
         }],
         "the spool answers with the newest inode and that inode's maximum"
     );
@@ -813,6 +854,7 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
         file_size: end,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     let record = |id: &str, source_type: SourceType, name: &str, marker: ProgressMarker| {
         let mut r = sample_record(id);
@@ -979,6 +1021,7 @@ async fn listed_prune_deletes_only_what_was_listed(store: &dyn StateStore) {
         file_size: end,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     for (id, end) in [("lp-10", 10), ("lp-20", 20), ("lp-30", 30), ("lp-40", 40)] {
         let mut rec = sample_record(id);

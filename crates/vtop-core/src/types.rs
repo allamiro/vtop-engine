@@ -217,6 +217,18 @@ pub enum ProgressMarker {
         /// marker serializes byte for byte as it did before.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content_fingerprint: Option<ContentFingerprint>,
+        /// What the bytes just below `end_byte` were when this read ended
+        /// (#620): the SHA-256 of the `len` bytes that END at `end_byte`
+        /// (`len` is `end_byte` capped at [`ContentFingerprint::MAX_LEN`]).
+        /// A file rewritten in place with the same first page, or a reused
+        /// inode whose first page is the old file's, agrees with
+        /// `content_fingerprint`; the bytes under the read position do not.
+        /// `None` on a row written before the field existed (judged by
+        /// inode, length and first page, exactly as before) and for a marker
+        /// at byte 0. Omitted when `None`, so such a marker serializes byte
+        /// for byte as it did before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tail_fingerprint: Option<ContentFingerprint>,
     },
     SyslogSpool {
         spool_id: String,
@@ -287,6 +299,21 @@ impl ContentFingerprint {
             .is_some_and(|prefix| crate::checksum::sha256_bytes(prefix) == self.sha256)
     }
 
+    /// The fingerprint of the last [`Self::MAX_LEN`] (at most) of `bytes`:
+    /// what a marker records of the bytes that end at its `end_byte` (#620).
+    /// `None` for no bytes, as for [`Self::of`].
+    pub fn of_tail(bytes: &[u8]) -> Option<Self> {
+        Self::of(&bytes[bytes.len().saturating_sub(Self::MAX_LEN)..])
+    }
+
+    /// Whether `bytes` are exactly the bytes this fingerprint was taken of:
+    /// the same length and the same digest. For a tail fingerprint, the
+    /// caller reads the `len` bytes that end at the marker's `end_byte`; a
+    /// file too short to hold them yields fewer, which never matches.
+    pub fn matches_bytes(&self, bytes: &[u8]) -> bool {
+        bytes.len() as u64 == self.len && crate::checksum::sha256_bytes(bytes) == self.sha256
+    }
+
     /// Whether two fingerprints show the same content: `Some` when they
     /// cover the same number of bytes, `None` when they do not and so cannot
     /// be compared.
@@ -328,7 +355,8 @@ impl ProgressMarker {
         }
     }
 
-    /// This marker as a manifest carries it: without the fields #578 added.
+    /// This marker as a manifest carries it: without the fields #578 and
+    /// #620 added.
     ///
     /// A manifest is verified by decoding it and hashing the re-encoded
     /// struct, and serde drops fields a reader does not know. An older
@@ -342,8 +370,12 @@ impl ProgressMarker {
             ProgressMarker::Kafka { .. } => {}
             ProgressMarker::File {
                 content_fingerprint,
+                tail_fingerprint,
                 ..
-            } => *content_fingerprint = None,
+            } => {
+                *content_fingerprint = None;
+                *tail_fingerprint = None;
+            }
             ProgressMarker::SyslogSpool {
                 file_size,
                 content_fingerprint,
@@ -368,6 +400,17 @@ impl ProgressMarker {
                 content_fingerprint,
                 ..
             } => content_fingerprint.as_ref(),
+        }
+    }
+
+    /// The fingerprint of the bytes ending at `end_byte` a file marker
+    /// carries, if any (#620).
+    pub fn tail_fingerprint(&self) -> Option<&ContentFingerprint> {
+        match self {
+            ProgressMarker::File {
+                tail_fingerprint, ..
+            } => tail_fingerprint.as_ref(),
+            ProgressMarker::Kafka { .. } | ProgressMarker::SyslogSpool { .. } => None,
         }
     }
 }
@@ -396,6 +439,7 @@ mod tests {
                 file_size: 8192,
                 mtime: "2026-01-01T00:00:30Z".into(),
                 content_fingerprint: None,
+                tail_fingerprint: None,
             }
         );
         let spool: ProgressMarker = serde_json::from_str(OLD_SPOOL_ROW).unwrap();
@@ -445,6 +489,66 @@ mod tests {
             "an older verify-manifest drops what it does not know and would fail the \
              self-hash: {manifest}"
         );
+    }
+
+    /// A file marker in the shape the code before #620 writes it: #578's
+    /// first-page fingerprint and no tail. Captured from origin/main at
+    /// 3564edc (`serde_json::to_string` of this marker there).
+    const PRE_TAIL_FILE_ROW: &str = r#"{"source_type":"file","path":"/var/log/app.log","inode":877,"start_byte":0,"end_byte":100,"file_size":8192,"mtime":"2026-01-01T00:00:30Z","content_fingerprint":{"len":4,"sha256":"edeaaff3f1774ad2888673770c6d64097e391bc362d7d6fb34982ddf0efd18cb"}}"#;
+
+    /// #620: a row from before the tail fingerprint decodes with none - which
+    /// every reader judges as before - and re-encodes byte for byte; a marker
+    /// with one round-trips, and a manifest never carries it.
+    #[test]
+    fn markers_written_before_the_tail_fingerprint_still_decode_as_unknown() {
+        let old: ProgressMarker = serde_json::from_str(PRE_TAIL_FILE_ROW).unwrap();
+        assert_eq!(old.tail_fingerprint(), None);
+        assert_eq!(
+            old.content_fingerprint(),
+            ContentFingerprint::of(b"abc\n").as_ref()
+        );
+        assert_eq!(serde_json::to_string(&old).unwrap(), PRE_TAIL_FILE_ROW);
+
+        let mut marker = old.clone();
+        if let ProgressMarker::File {
+            tail_fingerprint, ..
+        } = &mut marker
+        {
+            *tail_fingerprint = ContentFingerprint::of_tail(b"the bytes before end_byte\n");
+        }
+        let json = serde_json::to_string(&marker).unwrap();
+        assert!(json.contains("tail_fingerprint"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ProgressMarker>(&json).unwrap(),
+            marker
+        );
+        let manifest = serde_json::to_string(&marker.for_manifest()).unwrap();
+        assert!(
+            !manifest.contains("tail_fingerprint") && !manifest.contains("content_fingerprint"),
+            "an older verify-manifest drops what it does not know and would fail the \
+             self-hash: {manifest}"
+        );
+    }
+
+    /// A tail fingerprint covers the LAST page of what it is given, and
+    /// matches only those exact bytes: a shorter or a longer read does not.
+    #[test]
+    fn a_tail_fingerprint_covers_the_last_page_and_matches_only_those_bytes() {
+        assert_eq!(ContentFingerprint::of_tail(b""), None);
+        let mut bytes = vec![b'a'; 3000];
+        bytes.extend(vec![b'b'; 3000]);
+        let tail = ContentFingerprint::of_tail(&bytes).unwrap();
+        let last_page = &bytes[bytes.len() - ContentFingerprint::MAX_LEN..];
+        assert_eq!(Some(&tail), ContentFingerprint::of(last_page).as_ref());
+        assert!(tail.matches_bytes(last_page));
+        assert!(!tail.matches_bytes(&last_page[1..]), "one byte short");
+        assert!(!tail.matches_bytes(&bytes), "more than it covers");
+        let mut rewritten = last_page.to_vec();
+        rewritten[0] = b'X';
+        assert!(!tail.matches_bytes(&rewritten), "same length, other bytes");
+        let small = ContentFingerprint::of_tail(b"one line\n").unwrap();
+        assert_eq!(small.len, 9);
+        assert!(small.matches_bytes(b"one line\n"));
     }
 
     #[test]

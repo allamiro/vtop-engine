@@ -338,11 +338,25 @@ What follows from that, in the engine:
   still longer than the committed offset, and the content fingerprint, so a
   replacement at the same inode is caught too. Syslog-spool markers record
   their length and fingerprint since #578; a spool seeded from an older row
-  has the inode and the offset only.
+  has the inode and the offset only. File markers also record, since #620,
+  the fingerprint of the page that ends at their `end_byte`, so the seed
+  catches a rewrite that kept the first page as well (below).
+- **The bytes below the read position are evidence too** (#620). Every file
+  read fingerprints the page (at most 4 KiB) that ends where it stopped,
+  from the bytes it consumed, and the next read - and a seed after a
+  restart - checks that the file still holds those bytes there, through the
+  descriptor it reads from (one extra read of at most a page; two after a
+  rewind moved the position off the page's end). A file
+  rewritten in place with the same first page, or a reused inode whose new
+  file starts like the old one, fails it and is read from byte 0. A late or
+  recovered commit is judged the same way against its range's end, so one
+  whose generation record was evicted (more than 256 ranges issued since)
+  or lost to a restart cannot carry the cursor into the rewritten content.
 - **Late commits, rewinds and `delete_after_commit` judge content too**
-  (#578): a range whose marker fingerprinted other first bytes than the file
-  at the path now holds does not move the cursor, is not replayed into the
-  new file, and does not delete it. Before, a same-length replacement at the
+  (#578, #620): a range whose marker fingerprinted other first bytes - or
+  other bytes below its end - than the file at the path now holds does not
+  move the cursor, is not replayed into the new file, and does not delete
+  it. Before, a same-length replacement at the
   same inode satisfied every test of `delete_after_commit`
   (`end_byte >= size`) and was deleted unread.
 
@@ -357,25 +371,32 @@ Limits, stated plainly:
   truncate are lost by the rotation tool before the engine can see them. If the
   file also regrows beyond the old read position before the next read, the
   truncation is invisible to the adapter.
-- A file is identified by its **inode number and its first page**. An inode
-  number can be reused: on a *different* filesystem by a replacement that
-  happens to carry it (markers do not record the device), and on the *same*
-  filesystem by the next file created after one is **unlinked**. Since #578
-  such a file is caught by its first bytes, whatever its length. What is
-  still not caught is a replacement whose first page is byte for byte the
-  old file's - a fixed header longer than 4 KiB, or a file restored from a
-  copy - and, for a file under one page, one whose first bytes repeat all of
-  the old, shorter file. Those look like a continuation, as every
-  replacement at a reused inode did before.
+- A file is identified by its **inode number, its first page, and the page
+  below the read position**. An inode number can be reused: on a
+  *different* filesystem by a replacement that happens to carry it (markers
+  do not record the device), and on the *same* filesystem by the next file
+  created after one is **unlinked**. Since #578 such a file is caught by its
+  first bytes, and since #620 by the bytes below the read position, whatever
+  its length. What is still not caught is a replacement that matches BOTH
+  pages byte for byte - the same first 4 KiB and the same 4 KiB below the
+  old position, such as a file restored from a copy of the old one, or a
+  file under one page whose new content repeats all of the old - and a
+  change confined to the bytes BETWEEN the two pages, which only a full
+  re-hash of everything below the position would see. Those look like a
+  continuation.
 - Late commits are judged against the file as it is NOW (another inode, an
-  end beyond its length, or other first bytes than the batch read). A
-  `copytruncate` whose new content starts with the same first page as the
-  old (see above) and regrows past the old end before the late commit lands
-  cannot be told from the original.
+  end beyond its length, other first bytes, or other bytes below the range's
+  end than the batch read). The in-process generation record still orders
+  the discontinuities one process saw; a commit it has no record of (evicted,
+  or after a restart) falls back to these tests, and passes only for content
+  that matches both pages - the case above.
 - **Rows written before #578 carry no fingerprint**, and a cursor seeded from
   one, or a range recovered from one, is judged by inode and length alone,
   exactly as before. The first read after an upgrade that finds the file
-  non-empty takes a fingerprint, and from there the check applies.
+  non-empty takes a fingerprint, and from there the check applies. Rows
+  written before #620 carry no tail fingerprint and are judged by inode,
+  length and first page, exactly as before; the first read after the
+  upgrade takes one.
 - History pruning keeps one row per path, so a file untouched for longer than
   the retention window can lose the rows that name its inode. The restart then
   reads it from byte 0 again: duplicates, bounded by the file.
@@ -413,6 +434,24 @@ needs nothing either.
 - An older binary reading a newer ledger ignores the fields (serde skips
   unknown keys) and judges as it always did. Downgrade is still not
   supported (see the roadmap's versioning note); this is what it would do.
+
+#### Ledger format note: tail fingerprints (#620)
+
+The same kind of change, to file markers only, and again no DDL on either
+backend: the restart seed reads the new field out of the stored
+`progress_end_json` as it reads `content_fingerprint`.
+
+- New, optional and omitted when unknown: `tail_fingerprint` on file markers,
+  the same `{"len", "sha256"}` shape, covering the `len` bytes that END at the
+  marker's `end_byte`. Absent for a marker at byte 0 and for a read the stat
+  proved unchanged (it does not open the file).
+- Rows written before it decode with the field absent and are judged exactly
+  as before (inode, length, first page); a marker without it serializes byte
+  for byte as before. A stored value no writer could produce (a zero length,
+  a digest that is not 64 lowercase hex digits) reads as absent.
+- The manifest's `source_progress` never carries it, for the reason above.
+  The coverage audit does not use it.
+- An older binary ignores it, as above.
 
 ---
 

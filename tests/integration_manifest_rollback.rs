@@ -88,6 +88,7 @@ async fn seed(
         file_size: 7,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     let object_bytes = b"archived-bytes";
     let object_digest = vtop_core::checksum::sha256_bytes(object_bytes);
@@ -215,6 +216,7 @@ async fn overwrite_current_manifest(sc: &Scenario, dir: &Path, replayed_count: u
         file_size: 1,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     let (replayed, replayed_path) = build_manifest(
         &attack_work,
