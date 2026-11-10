@@ -230,3 +230,17 @@ def test_the_charts_are_a_pure_function_of_the_points():
     first = render()
     assert first == render()
     assert first.count("<circle") >= 2 and "stroke-dasharray" in first
+
+
+def test_a_contended_row_is_scenario_18_with_only_the_width_replaced(tmp_path):
+    with open(eb.CONTENDED_BASE, encoding="utf-8") as fh:
+        base = fh.read()
+    sc = _load(tmp_path, eb.contended_yaml(base, 4, 2, "contended"))
+    original = _load(tmp_path, base)
+    assert sc.get("max_concurrent_batches") == 4
+    assert sc.get("transports")["tcp_tls"]["max_concurrency"] == 4
+    for key in ("shaping_competitor", "shaping_bottleneck_kbps", "shaping_buffer_bdp",
+                "shaping_latency_ms", "batch_max_records", "duration_seconds", "volume"):
+        assert sc.get(key) == original.get(key), key
+    default = _load(tmp_path, eb.contended_yaml(base, None, None, "contended"))
+    assert default.get("max_concurrent_batches") == 8 and not default.get("transports")

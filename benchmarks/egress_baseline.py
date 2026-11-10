@@ -215,21 +215,57 @@ def _vm_loadavg() -> str:
         return ""
 
 
+CONTENDED_BASE = os.path.join(HERE, "scenarios", "18-competing-flow.yaml")
+
+
+def contended_yaml(base_text: str, c: int | None, pif: int | None, name: str) -> str:
+    """Scenario 18 with only its name and its width replaced.
+
+    A contended row cannot use the sweep's drain: the competitor's share of the
+    engine is charged only to cycles its window WHOLLY contains, and one
+    drain of 20 MiB objects is one cycle longer than any window. Scenario 18's
+    workload exists for exactly that constraint — short per-cycle drains of
+    small batches — so the contended rows run it unchanged apart from the
+    configuration being compared.
+    """
+    keep = [line for line in base_text.splitlines()
+            if not line.startswith(("name:", "max_concurrent_batches:"))]
+    lines = [f"name: {name}"] + keep
+    if c is None:
+        lines.append("max_concurrent_batches: 8")
+    else:
+        lines += [f"max_concurrent_batches: {c}", "transports:", "  tcp_tls:",
+                  f"    max_concurrency: {c}", f"    parts_in_flight: {pif}",
+                  f"    part_size_bytes: {PART_BYTES}"]
+    return "\n".join(lines) + "\n"
+
+
 def cmd_run(args) -> int:
     c = None if args.config == "default" else args.c
     pif = None if args.config == "default" else args.pif
     label = config_label(c, pif)
     name = f"tcpb-{args.profile}-{label}-r{args.rep}"
-    n = args.objects or objects_for(c, args.profile)
-    pool = ensure_pool(args.pool, n)
-    work = os.path.join(args.run_root, f"seed-{name}-{os.getpid()}")
-    os.makedirs(work)
-    for path in pool[:n]:
-        os.link(path, os.path.join(work, os.path.basename(path)))
     scen = os.path.join(args.run_root, f"{name}-{os.getpid()}.yaml")
+    seed_args: list[str] = []
+    work = ""
+    if args.phase == "contended":
+        if args.profile != "wan100":
+            raise SystemExit("contended rows run on scenario 18's link, the wan100 profile")
+        n = 0
+        with open(CONTENDED_BASE, encoding="utf-8") as fh:
+            body = contended_yaml(fh.read(), c, pif, name)
+    else:
+        n = args.objects or objects_for(c, args.profile)
+        pool = ensure_pool(args.pool, n)
+        work = os.path.join(args.run_root, f"seed-{name}-{os.getpid()}")
+        os.makedirs(work)
+        for path in pool[:n]:
+            os.link(path, os.path.join(work, os.path.basename(path)))
+        seed_args = ["--seed-dir", work]
+        body = scenario_yaml(args.profile, c, pif, name, competitor=args.competitor,
+                             duration=args.duration)
     with open(scen, "w", encoding="utf-8") as fh:
-        fh.write(scenario_yaml(args.profile, c, pif, name, competitor=args.competitor,
-                               duration=args.duration))
+        fh.write(body)
     os.makedirs(args.results, exist_ok=True)
     before = set(os.listdir(args.results))
     started = datetime.now(timezone.utc).isoformat()
@@ -237,7 +273,7 @@ def cmd_run(args) -> int:
     cpu_before = {k: cgroup_cpu_seconds(v) for k, v in CPU_CONTAINERS.items()}
     t0 = time.monotonic()
     proc = subprocess.run([sys.executable, os.path.join(HERE, "run_benchmark.py"), scen,
-                           "--results-dir", args.results, "--seed-dir", work],
+                           "--results-dir", args.results, *seed_args],
                           check=False)
     wall = time.monotonic() - t0
     cpu_after = {k: cgroup_cpu_seconds(v) for k, v in CPU_CONTAINERS.items()}
@@ -247,7 +283,8 @@ def cmd_run(args) -> int:
     run_id = new[0] if len(new) == 1 else ""
     if run_id:
         _minio_rm_prefix(run_id)
-    shutil.rmtree(work, ignore_errors=True)
+    if work:
+        shutil.rmtree(work, ignore_errors=True)
     os.remove(scen)
     index = os.path.join(args.results, "sweep_index.csv")
     fresh = not os.path.exists(index)
@@ -259,7 +296,8 @@ def cmd_run(args) -> int:
                         "vm_loadavg_before", "vm_loadavg_after", "vm",
                         "engine_cpu_seconds", "store_cpu_seconds"])
         w.writerow([run_id, args.phase, args.profile, label, "" if c is None else c,
-                    "" if pif is None else pif, args.rep, n, args.competitor,
+                    "" if pif is None else pif, args.rep, n,
+                    "bulk:60 (scenario 18)" if args.phase == "contended" else args.competitor,
                     proc.returncode, started, round(wall, 1), load_before, _vm_loadavg(),
                     args.vm, cpu_used["engine"], cpu_used["store"]])
     return proc.returncode
