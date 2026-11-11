@@ -949,7 +949,9 @@ Short procedures now; expand into a full ops runbook before go-live.
   3. Resume producers once the new leader is serving.
 - **Rolling a data node back past #635:** a replica holding a suffix a fence
   kept in dispute marks its fencing-epoch journal version 2 until the new
-  leader settles it, usually within one append. A release before #635 refuses
+  leader settles it, usually within one append. A crash between clearing the
+  dispute and lowering the header can leave it at 2 until this release next
+  opens the directory, which lowers it. A release before #635 refuses
   to start on it with `fencing-epoch journal: unsupported version 2`. That is
   deliberate: the older release would ack the new leader's records over the
   disputed ones. Start the newer release again and let the range's leader

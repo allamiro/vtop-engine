@@ -418,3 +418,70 @@ fn a_torn_write_anywhere_in_the_fence_or_settlement_never_acks_over_an_announced
     }
     assert!(runs > 0, "the workload made no writes to tear");
 }
+
+/// #643 review (cubic P1). A stale record found at open whose clear FAILS is
+/// still on disk, and the process must not serve past it as if it were gone.
+/// Here the record (kept from 5) starts below the mark the replica later
+/// learned (7), so it is stale; its clear is failed once. The replica must
+/// keep something held that stops it acking past its current tail until a
+/// retry clears the record. Dropping it from memory let the next append be
+/// acked through 11 while the record sat on disk.
+#[test]
+fn a_stale_record_whose_clear_fails_at_open_keeps_the_replica_from_acking_past_it() {
+    let fixture = fixture();
+    let base = {
+        let sim = SimStorage::new();
+        sim.restore(&fixture);
+        let env = sim.env(SEED);
+        let meta = MetaFencingEpoch::new(NEW_EPOCH);
+        let node = open_replica(&env, &meta).expect("open the fixture");
+        let outcome = node
+            .fence(NEW_EPOCH, &candidate_history())
+            .expect("the fence keeps 5..10");
+        assert_eq!((outcome.truncated_records, outcome.next_offset), (0, HELD));
+        drop(node);
+        CommittedFloorFile::open_in(&env, path("committed-floor"))
+            .save(7)
+            .expect("the mark moves past the record's start");
+        sim.snapshot()
+    };
+
+    // Find the open's first write to the record: the stale clear.
+    let clear_op = {
+        let sim = SimStorage::new();
+        sim.restore(&base);
+        let meta = MetaFencingEpoch::new(NEW_EPOCH);
+        drop(open_replica(&sim.env(SEED), &meta).expect("reopen"));
+        sim.trace()
+            .into_iter()
+            .find(|entry| {
+                entry.path.to_string_lossy().ends_with("kept-dispute")
+                    && matches!(entry.kind, TraceKind::HandleWrite | TraceKind::HandleSetLen)
+            })
+            .expect("the open clears the stale record")
+            .index
+    };
+
+    let sim = SimStorage::new();
+    sim.restore(&base);
+    let env = sim.env(SEED);
+    sim.set_fault(FaultPlan::FailOp {
+        op: clear_op,
+        kind: std::io::ErrorKind::Other,
+    });
+    let meta = MetaFencingEpoch::new(NEW_EPOCH);
+    let node = open_replica(&env, &meta).expect("the open survives a failed clear");
+    assert_eq!(node.cluster_committed().get(), 7, "precondition: the mark");
+
+    // A newer epoch's leader appends past the tail. Nothing settles under
+    // it, so only what the open held decides how far this replica acks.
+    meta.set(NEW_EPOCH + 1);
+    node.adopt_fencing_epoch(NEW_EPOCH + 1);
+    let ack = node
+        .apply_append(&append_request(NEW_EPOCH + 1, NEW_LEADER, HELD))
+        .expect("the append itself lands");
+    assert_eq!(
+        ack.local_committed_offset, HELD,
+        "the replica acked past a stale record it could not clear, which is still on disk"
+    );
+}

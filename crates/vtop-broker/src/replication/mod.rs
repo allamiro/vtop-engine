@@ -511,18 +511,28 @@ impl InProcessFollower {
     /// * `from` is below this replica's committed mark. A dispute always
     ///   starts at or above the mark (#616): below it everything is
     ///   committed, and the truncation guard would refuse the settlement;
-    /// * a newer epoch was adopted since the fence that kept it. Only an
-    ///   append or mark under that fence's epoch settles a dispute, and this
-    ///   replica refuses that epoch from now on. A newer fence retires it
-    ///   anyway (#616 review); this covers a retirement whose clear did not
-    ///   reach the disk;
     /// * the epoch owning `from` is no longer the one that owned it then: the
     ///   suffix was replaced, for instance by a binary that never knew the
     ///   record.
     ///
+    /// A newer epoch in the journal is deliberately NOT one of them (#643
+    /// review). Lease adoption records an epoch without judging this
+    /// replica, and in memory a dispute survives adoption and keeps capping
+    /// acks until a newer FENCE retires it, which clears the record. A
+    /// restart must not do what adoption does not.
+    ///
     /// With no usable history (broken, or no journal entries to judge by)
     /// only the first two tests apply, and the record is kept: forgetting a
     /// live dispute reopens #261, keeping one is at worst a capped status.
+    ///
+    /// A stale record whose clear FAILS stays held (#643 review): it is still
+    /// on disk, so the process must not serve past it as if it were gone.
+    /// It is held from `max(from, tail)`, never below the tail. That caps
+    /// acks at the current tail and never discards a record: settling it
+    /// truncates to the tail (nothing) and retries the clear, and a newer
+    /// fence's retirement retries it too. Held from its own `from` instead,
+    /// a record stale because its start was replaced or is below the mark
+    /// would settle over the leader's records or against the guard.
     fn reload_kept_dispute(
         &self,
         journal: &mut crate::fencing_epochs::FencingEpochJournal,
@@ -550,17 +560,16 @@ impl InProcessFollower {
             // would refuse to settle it, wedging every later append.
             Some("it starts below this replica's committed mark")
         } else if history_known
-            && journal
-                .latest()
-                .is_some_and(|latest| latest.epoch > record.fence_epoch)
-        {
-            Some("a newer epoch was adopted after the fence that kept it")
-        } else if history_known
             && journal.epoch_owning(record.from).unwrap_or(0) != record.suffix_epoch
         {
             Some("the records from its start were written under another epoch since")
         } else {
             None
+        };
+        let held = KeptDispute {
+            epoch: record.fence_epoch,
+            from: record.from,
+            suffix_epoch: record.suffix_epoch,
         };
         if let Some(reason) = stale {
             eprintln!(
@@ -569,11 +578,14 @@ impl InProcessFollower {
                 self.node_id, record.fence_epoch, record.from
             );
             if let Err(problem) = journal.clear_kept_dispute() {
+                let from = record.from.max(next_offset);
                 eprintln!(
-                    "replica {}: could not clear the stale dispute record; the next open \
-                     judges it again (#635): {problem}",
+                    "replica {}: could not clear the stale dispute record, so it stays held from \
+                     offset {from}: no ack passes it until a settlement or a newer fence clears \
+                     it (#635): {problem}",
                     self.node_id
                 );
+                return Some(KeptDispute { from, ..held });
             }
             return None;
         }
@@ -592,11 +604,7 @@ impl InProcessFollower {
              this replica's acks and status there until that epoch's leader settles it (#635)",
             self.node_id, record.fence_epoch, record.from
         );
-        Some(KeptDispute {
-            epoch: record.fence_epoch,
-            from: record.from,
-            suffix_epoch: record.suffix_epoch,
-        })
+        Some(held)
     }
 
     /// Install `dispute`, durably (#635), recording which epoch owns its

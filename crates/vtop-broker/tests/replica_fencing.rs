@@ -608,6 +608,14 @@ fn restart_under_the_new_epoch(dir: &TempDir, range: &RangeIdentity) -> Arc<InPr
     node
 }
 
+/// The kept dispute recorded on disk beside the fencing-epoch journal
+/// (#635), as the next open would read it.
+fn recorded_dispute(dir: &TempDir) -> Option<vtop_broker::kept_dispute::KeptDisputeRecord> {
+    FencingEpochJournal::open(dir.path().join("fencing-epochs"))
+        .unwrap()
+        .kept_dispute()
+}
+
 /// The fencing-epoch journal's header version (#635): 2 while a kept
 /// dispute is recorded beside it, which every older release refuses.
 fn epoch_journal_version(dir: &TempDir) -> u16 {
@@ -815,13 +823,7 @@ fn a_dispute_a_nodes_own_newer_fence_retired_is_not_restored_by_a_restart() {
         1,
         "the retirement must reach the disk, gate included"
     );
-    assert_eq!(
-        std::fs::read(dir.path().join("fencing-epochs.kept-dispute"))
-            .unwrap()
-            .len(),
-        0,
-        "the record must be cleared"
-    );
+    assert_eq!(recorded_dispute(&dir), None, "the record must be cleared");
 
     let meta = MetaFencingEpoch::new(NEWER_EPOCH);
     let node = follower_via_the_real_open_path(
@@ -835,6 +837,54 @@ fn a_dispute_a_nodes_own_newer_fence_retired_is_not_restored_by_a_restart() {
         node.replication_status(),
         (10, 10),
         "a restart restored a dispute the node's own newer fence had retired"
+    );
+}
+
+/// #643 review (cubic P1). Lease adoption of a newer epoch records that
+/// epoch in the journal without judging this replica, and in memory a
+/// dispute survives it, capping acks until a newer FENCE retires it. A
+/// restart must not do more than adoption: a newer epoch in the journal is
+/// not evidence the dispute was retired, and dropping it at open let the
+/// replica ack past the old suffix.
+#[test]
+fn a_dispute_survives_lease_adoption_of_a_newer_epoch_and_a_restart() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    keep_a_dispute_then_die(&dir, &range);
+    {
+        let node = restart_under_the_new_epoch(&dir, &range);
+        node.meta_fencing_epoch().set(NEWER_EPOCH);
+        assert!(node.adopt_fencing_epoch(NEWER_EPOCH), "the lease watcher");
+        assert_eq!(
+            node.replication_status(),
+            (5, 5),
+            "precondition: adoption alone does not retire it"
+        );
+    }
+    let meta = MetaFencingEpoch::new(NEWER_EPOCH);
+    let node = follower_via_the_real_open_path(
+        &dir,
+        &range,
+        &meta,
+        ActiveSegment::recover(dir.path().join("range.active")).unwrap(),
+    );
+    node.adopt_fencing_epoch(NEWER_EPOCH);
+    assert_eq!(
+        node.replication_status(),
+        (5, 5),
+        "a restart after lease adoption dropped a dispute no fence retired"
+    );
+    let ack = node
+        .apply_append(&append_request(
+            &range,
+            NEWER_EPOCH,
+            Uuid::from_u128(0xA7),
+            10,
+        ))
+        .expect("the append itself lands");
+    assert_eq!(
+        ack.local_committed_offset, 5,
+        "the ack passed a dispute that is still held"
     );
 }
 
@@ -862,10 +912,8 @@ fn a_dispute_record_below_the_committed_mark_is_discarded_at_open() {
         "a record below the committed mark was restored"
     );
     assert_eq!(
-        std::fs::read(dir.path().join("fencing-epochs.kept-dispute"))
-            .unwrap()
-            .len(),
-        0,
+        recorded_dispute(&dir),
+        None,
         "the record must be cleared, not left for the next open"
     );
     assert_eq!(epoch_journal_version(&dir), 1, "and the gate lowered");
@@ -914,8 +962,8 @@ fn a_dispute_record_the_log_has_moved_past_is_discarded_at_open() {
         "a stale dispute record discarded the established leader's records"
     );
     assert_eq!(
-        std::fs::read(&sidecar).unwrap().len(),
-        0,
+        recorded_dispute(&dir),
+        None,
         "the stale record is cleared, not left for the next open"
     );
 }

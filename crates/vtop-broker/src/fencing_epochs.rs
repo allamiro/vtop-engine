@@ -46,8 +46,10 @@ const VERSION: u16 = 1;
 /// The same layout as [`VERSION`], with a kept dispute recorded beside the
 /// journal (#635, [`crate::kept_dispute`]). Raised while one is pending,
 /// lowered once it is cleared. Every release before #635 refuses any version
-/// but 1, so an older binary refuses this directory for exactly as long as it
-/// would otherwise serve the disputed suffix with no record of the dispute.
+/// but 1, so an older binary refuses this directory whenever it could
+/// otherwise serve the disputed suffix with no record of the dispute. A crash
+/// between clearing the record and lowering the gate can leave the gate up
+/// with no record; this release lowers it at its next open.
 /// The two versions differ only in their low byte, so raising and lowering
 /// the gate is a one-byte write, which a crash cannot tear.
 const VERSION_DISPUTE_PENDING: u16 = 2;
@@ -166,10 +168,15 @@ impl FencingEpochJournal {
             return Err(Self::corrupt("bad magic".to_owned()));
         }
         let version = u16::from_be_bytes([bytes[8], bytes[9]]);
+        if version > VERSION_DISPUTE_PENDING {
+            return Err(Self::corrupt(format!(
+                "unsupported version {version}, written by a newer release; this release \
+                 reads versions {VERSION} and {VERSION_DISPUTE_PENDING}"
+            )));
+        }
         if version != VERSION && version != VERSION_DISPUTE_PENDING {
             return Err(Self::corrupt(format!(
-                "unsupported version {version}; this release reads versions {VERSION} and \
-                 {VERSION_DISPUTE_PENDING}, so a higher one was written by a newer release"
+                "invalid version {version}; no release writes it"
             )));
         }
         let dispute_gate = version == VERSION_DISPUTE_PENDING;
@@ -222,14 +229,30 @@ impl FencingEpochJournal {
             env,
             crate::kept_dispute::sidecar_path(&path),
         )?;
-        Ok(Self {
+        let mut journal = Self {
             path,
             file,
             entries,
             poisoned: false,
             dispute_gate,
             kept_dispute,
-        })
+        };
+        // A raised gate with no record is a crash between clearing the record
+        // and lowering the gate (#643 review). Lowered here, by every open,
+        // so older binaries are kept out only while a record may be pending.
+        // A failure is reported, not fatal: a gate left up only keeps older
+        // binaries out a little longer, and the next open retries.
+        if journal.dispute_gate && journal.kept_dispute.current().is_none() {
+            if let Err(problem) = journal.clear_kept_dispute() {
+                eprintln!(
+                    "fencing-epoch journal {}: could not lower the dispute gate left up with no \
+                     dispute recorded; older binaries stay refused until an open lowers it \
+                     (#635): {problem}",
+                    journal.path.display()
+                );
+            }
+        }
+        Ok(journal)
     }
 
     /// Record an epoch adoption, honoring what the journal already knows.
@@ -898,6 +921,40 @@ mod tests {
             .err()
             .expect("version 3 is unknown here");
         assert!(refused.to_string().contains("newer release"), "{refused}");
+
+        // #643 review (cubic P3): a version no release writes is invalid,
+        // not newer; upgrading would not help.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[8..10].copy_from_slice(&0_u16.to_be_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let refused = FencingEpochJournal::open(&path)
+            .err()
+            .expect("version 0 is invalid");
+        assert!(
+            !refused.to_string().contains("newer release")
+                && refused.to_string().contains("invalid version 0"),
+            "{refused}"
+        );
+    }
+
+    /// #643 review (cubic P2). Clearing the record and lowering the gate
+    /// are two durable steps; a crash between them leaves the gate up with
+    /// no record. Any open of the journal lowers it, so older binaries are
+    /// kept out only while a record may actually be pending.
+    #[test]
+    fn a_raised_gate_with_no_record_is_lowered_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(journal(&dir));
+        let path = dir.path().join("fencing-epochs");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[8..10].copy_from_slice(&VERSION_DISPUTE_PENDING.to_be_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let reopened = journal(&dir);
+        assert!(!reopened.dispute_gate());
+        assert_eq!(reopened.kept_dispute(), None);
+        drop(reopened);
+        assert_eq!(header_version(&dir), VERSION);
     }
 
     /// #611, case by case. The replica holds epoch-18 records to 10 and
