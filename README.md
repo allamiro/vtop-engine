@@ -63,10 +63,24 @@ For every batch, VTOP:
 
 ---
 
+## Measured against Apache Kafka
+
+[![Produce throughput at saturation, VTOP's Kafka gateway vs Apache Kafka, same JVM client, profile defaults, single host](docs/benchmarks/img/kafka-compare-produce-throughput.png)](docs/benchmarks/kafka-comparison.md)
+
+On one host (an Apple M5 Max laptop; each three-node cluster in turn in the same Docker Desktop VM, 2 CPUs
+and `2g` of memory per node; profile `defaults`), the same JVM producer reached a higher saturation throughput against
+Apache Kafka than against VTOP's Kafka gateway at both record sizes measured, where under `defaults` a Kafka
+`acks=all` acknowledgement does not wait for an fsync and a VTOP quorum acknowledgement does. Indicative, not
+a production benchmark: the method, the latency and consume results, the raw CSV and every condition are in
+[docs/benchmarks/kafka-comparison.md](docs/benchmarks/kafka-comparison.md).
+
+---
+
 ## Table of contents
 
 - [Overview](#overview)
 - [Status](#status)
+- [Measured against Apache Kafka](#measured-against-apache-kafka)
 - [Why VTOP exists](#why-vtop-exists)
 - [Core rule](#core-rule)
 - [How it works](#how-it-works)
