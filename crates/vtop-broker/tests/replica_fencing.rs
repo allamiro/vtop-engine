@@ -642,6 +642,148 @@ fn a_newer_fence_that_agrees_with_the_kept_records_retires_the_old_dispute() {
     );
 }
 
+/// The #640 shape on one replica: epoch-18 records to 5, then the epoch-19
+/// leader's catch-up 5..11 (epoch-18 records and its own marker), which this
+/// replica adopted 19 at offset 5 for and so files under 19. Its high-water
+/// mark is `mark`. The caller fencing at 20 files 5..10 under 18, so the two
+/// histories disagree from 5.
+fn caught_up_under_its_own_epoch(mark: u64) -> Harness {
+    let h = follower();
+    for offset in 0..5 {
+        append_at(&h, OLD_EPOCH, OLD_LEADER, offset).unwrap();
+    }
+    h.meta.set(NEW_EPOCH);
+    h.node.adopt_fencing_epoch(NEW_EPOCH);
+    for offset in 5..11 {
+        append_at(&h, NEW_EPOCH, Uuid::from_u128(0xA9), offset).unwrap();
+    }
+    h.node.cluster_committed().advance_to(mark);
+    h.meta.set(NEWER_EPOCH);
+    h
+}
+
+fn fence_from_the_epoch_19_leader(h: &Harness) -> Result<u64, (ErrorCode, String)> {
+    h.node
+        .fence(
+            NEWER_EPOCH,
+            &[
+                EpochStart {
+                    epoch: OLD_EPOCH,
+                    start_offset: 0,
+                },
+                EpochStart {
+                    epoch: NEW_EPOCH,
+                    start_offset: 10,
+                },
+                EpochStart {
+                    epoch: NEWER_EPOCH,
+                    start_offset: 11,
+                },
+            ],
+        )
+        .map(|fenced| fenced.truncated_records)
+}
+
+/// #616 regression, found by the promotion crash sweep (#640 shape). The
+/// histories disagree from 5, below this replica's own high-water mark of
+/// 11. Everything below the mark is committed, and a committed record is
+/// never in dispute. #616 kept a dispute from 5 anyway. Every later append
+/// tried to settle it, the truncation guard refused, and the replica refused
+/// every append for good. Now nothing at or below the mark is kept, and
+/// here the mark is the tail, so nothing is kept at all. The replica takes
+/// the next leader's appends.
+#[test]
+fn a_fence_never_keeps_a_dispute_below_the_replicas_high_water_mark() {
+    let h = caught_up_under_its_own_epoch(11);
+    assert_eq!(
+        fence_from_the_epoch_19_leader(&h),
+        Ok(0),
+        "nothing is discarded"
+    );
+    assert_eq!(h.node.next_offset(), 11);
+    assert_eq!(
+        h.node.replication_status(),
+        (11, 11),
+        "a dispute was kept at or below the high-water mark"
+    );
+    let ack = h
+        .node
+        .apply_append(&append_request(
+            &h.range,
+            NEWER_EPOCH,
+            Uuid::from_u128(0xAA),
+            11,
+        ))
+        .expect("the replica refused the next leader's append");
+    assert_eq!(ack.local_committed_offset, 12);
+}
+
+/// The same shape with the mark at 9, so 9..11 are not known committed.
+/// Only that stretch is kept in dispute, not the committed 5..9. It is the
+/// stretch the crash sweep caught being acked over when the fence refused
+/// instead (a refused fence still adopts the epoch and leaves the replica
+/// unreconciled). The next leader's first append over it discards it,
+/// which the guard can always do, because it starts at the mark.
+#[test]
+fn a_dispute_below_the_mark_is_kept_only_from_the_mark() {
+    let h = caught_up_under_its_own_epoch(9);
+    assert_eq!(fence_from_the_epoch_19_leader(&h), Ok(0));
+    assert_eq!(
+        h.node.replication_status(),
+        (9, 9),
+        "kept from the mark, not from 5"
+    );
+    let ack = h
+        .node
+        .apply_append(&append_request(
+            &h.range,
+            NEWER_EPOCH,
+            Uuid::from_u128(0xAA),
+            9,
+        ))
+        .expect("the next leader's append over the kept stretch lands");
+    assert_eq!(ack.local_committed_offset, 10);
+    assert_eq!(h.node.next_offset(), 10);
+}
+
+/// #616 regression, also found by the promotion crash sweep (its no-fault
+/// run). R kept 5..10 in dispute against the epoch-19 candidate, which was
+/// refused, and R then won epoch 20 itself. A candidate fencing ITSELF at a
+/// newer epoch makes its own log the reference, so a dispute kept for an
+/// older epoch is retired there exactly as a newer peer fence retires it.
+/// Left in place, the dispute capped R's acknowledgement of its own appends
+/// at 5, and the new leader's marker never committed.
+#[test]
+fn a_candidate_fencing_itself_at_a_newer_epoch_retires_its_old_dispute() {
+    let h = kept_extension();
+    h.meta.set(NEWER_EPOCH);
+    assert_eq!(
+        h.node
+            .fence_locally(NEWER_EPOCH)
+            .expect("R fences itself at 20"),
+        10
+    );
+    assert_eq!(
+        h.node.replication_status(),
+        (10, 10),
+        "an epoch-19 dispute outlived R's own fence at 20"
+    );
+    let ack = h
+        .node
+        .apply_append(&append_request(
+            &h.range,
+            NEWER_EPOCH,
+            Uuid::from_u128(0xA2),
+            10,
+        ))
+        .expect("the new leader's own marker lands");
+    assert_eq!(
+        ack.local_committed_offset, 11,
+        "the new leader's own append was acked only through {}",
+        ack.local_committed_offset
+    );
+}
+
 /// #611, the other way a fence can be told to discard records that may be
 /// acknowledged: the replica's disputed records come from a leadership NEWER
 /// than the caller's at the divergence point. Here the caller holds epoch-19
