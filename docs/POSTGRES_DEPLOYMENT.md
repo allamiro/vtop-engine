@@ -81,8 +81,9 @@ reference keeps credentials out of config serialization and command arguments.
 
 ## Failure behavior
 
-If the table, required columns, or invariant trigger are absent, engine startup
-fails with instructions to run `vtopctl migrate`. It does not try to repair the
+If the table, required columns, or invariant trigger are absent, or the
+trigger is disabled or runs an older function body, engine startup fails with
+instructions to run `vtopctl migrate`. It does not try to repair the
 schema. If the runtime role lacks `USAGE` or `SELECT`, startup reports the
 missing runtime access. Migration failures remain fatal to the deployment step.
 
@@ -106,10 +107,18 @@ migration job per database; engine replicas should start only after it succeeds.
 - The invariant trigger also refuses an `INSERT` in any state but `batching`
   (#625). Re-running `vtopctl migrate` replaces the trigger function in
   place. Every release inserts only `batching`, so an older engine on the
-  upgraded schema is unaffected. A data-only restore into a migrated schema
-  (`pg_restore --data-only`) is refused by this trigger, as it already was
-  for `source_committed` rows. Stop every engine first, and restore in one
-  of two ways:
+  upgraded schema is unaffected. Engine startup now requires the trigger to
+  be enabled and to run the #625 function body, not just to exist by name:
+  an engine from this release refuses to start, with instructions to run
+  `vtopctl migrate`, until the migration has run. Run it before rolling out
+  the engines, as above.
+- Restoring the ledger from a backup. Stop every engine first, and **always
+  finish with `vtopctl migrate`**. A schema restored from an older archive
+  (`pg_restore`, or `--schema-only`) carries that release's trigger
+  function, and the migration's `CREATE OR REPLACE` installs the current one
+  and re-creates the trigger enabled. A data-only restore into a migrated
+  schema (`pg_restore --data-only`) is refused by the trigger, as it already
+  was for `source_committed` rows. Restore the data in one of two ways:
   - `pg_restore --data-only --disable-triggers`. This issues
     `ALTER TABLE batches DISABLE TRIGGER ALL`, which only the table's owner
     (the migration identity) or a superuser may run; the runtime role is
@@ -117,10 +126,11 @@ migration job per database; engine replicas should start only after it succeeds.
     documentation says to run it as a superuser, and a superuser is required
     once the table has foreign-key triggers, which `batches` does not.
   - Without superuser: once the schema exists (`vtopctl migrate`, or
-    `pg_restore --schema-only`), have the owner run
-    `ALTER TABLE batches DISABLE TRIGGER trg_commit_after_verify`, restore
-    with `--data-only`, then `ALTER TABLE batches ENABLE TRIGGER
-    trg_commit_after_verify` before any engine starts. Engine startup checks
-    that the trigger exists, not that it is enabled.
+    `pg_restore --schema-only` followed by `vtopctl migrate`), have the
+    owner run `ALTER TABLE batches DISABLE TRIGGER trg_commit_after_verify`,
+    then restore with `--data-only`.
+
+  Then run `vtopctl migrate` before any engine starts. Startup refuses a
+  disabled trigger or an older function body.
 - Test grants after role changes: runtime must be able to read/write ledger
   rows but must fail `CREATE TABLE`, `ALTER TABLE`, `DELETE`, and `TRUNCATE`.

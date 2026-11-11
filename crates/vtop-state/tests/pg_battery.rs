@@ -62,6 +62,45 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         "missing trigger must give migration guidance: {err}"
     );
 
+    // Nor is a trigger that exists by name but runs the body from before #625
+    // (a schema restored from an older archive, or never re-migrated), or one
+    // a restore left disabled.
+    for (setup, what) in [
+        (
+            "CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$ \
+             BEGIN \
+                 IF NEW.state = 'source_committed' THEN \
+                     IF TG_OP = 'INSERT' THEN \
+                         RAISE EXCEPTION 'commit before verified: batch % inserted directly as source_committed', NEW.batch_id \
+                             USING ERRCODE = 'check_violation'; \
+                     ELSIF OLD.state <> 'verified' THEN \
+                         RAISE EXCEPTION 'commit before verified: batch % is %', OLD.batch_id, OLD.state \
+                             USING ERRCODE = 'check_violation'; \
+                     END IF; \
+                 END IF; \
+                 RETURN NEW; \
+             END; \
+             $fn$ LANGUAGE plpgsql;",
+            "a trigger function from before #625",
+        ),
+        (
+            "ALTER TABLE batches DISABLE TRIGGER trg_commit_after_verify",
+            "a disabled trigger",
+        ),
+    ] {
+        PgStateStore::migrate(&migrator_conn).await.unwrap();
+        let admin = PgStateStore::connect(&migrator_conn).await.unwrap();
+        admin.execute_raw(setup).await.unwrap();
+        let err = match PgStateStore::connect(&migrator_conn).await {
+            Ok(_) => panic!("runtime connect must reject {what}"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("vtopctl migrate"),
+            "{what} must give migration guidance: {err}"
+        );
+    }
+
     // The deployment identity applies DDL once, then creates a deliberately
     // narrow role. PostgreSQL's default PUBLIC schema privileges are revoked so
     // the test does not accidentally pass through an implicit grant.

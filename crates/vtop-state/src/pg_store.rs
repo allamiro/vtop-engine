@@ -250,13 +250,21 @@ impl PgStateStore {
         .await
         .map_err(map_schema_check)?;
 
+        // The trigger must be enabled and call the CURRENT function body, not
+        // merely exist by name: a schema restored from an older archive, or
+        // never re-migrated, keeps the name with the body from before #625,
+        // and a restore that disabled it may never have enabled it again. The
+        // body is matched by the message the #625 check raises.
         let trigger_present: bool = sqlx::query_scalar(
             "SELECT EXISTS ( \
                 SELECT 1 FROM pg_catalog.pg_trigger t \
                 JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
+                JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid \
                 WHERE c.oid = 'batches'::regclass \
                   AND t.tgname = 'trg_commit_after_verify' \
                   AND NOT t.tgisinternal \
+                  AND t.tgenabled IN ('O', 'A') \
+                  AND p.prosrc LIKE '%must be inserted as batching%' \
              )",
         )
         .fetch_one(&self.pool)

@@ -75,6 +75,8 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
 -- committed without ever having been verified. Every engine release inserts
 -- only batching, so an older binary on an upgraded database is unaffected.
 -- CREATE OR REPLACE means re-running `vtopctl migrate` installs the new body.
+-- Engine startup (PgStateStore::check_schema) refuses a function whose body
+-- lacks the text 'must be inserted as batching': keep that message.
 CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$
 BEGIN
     IF NEW.state = 'source_committed' THEN
