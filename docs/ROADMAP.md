@@ -234,8 +234,26 @@ reopen quietly.
   that kept such a suffix and was outvoted discards it on the established
   leader's first append or committed high-water mark past its start,
   instead of acking a record it does not hold (#261) or exposing the kept
-  records as committed. That memory does not survive a restart, which leaves
-  it in the same position as a replica that was absent from the fence.
+  records as committed. Until it is settled, that dispute caps the replica's
+  acks and reconnect status at its start.
+- **#635** - the #611 dispute lived in memory only. A replica restarted
+  between the fence reply that kept the suffix and its settlement came back
+  holding the old records with nothing marking them, reported its full log,
+  and acked the new leader's record at the disputed offset as a duplicate of
+  a different one (#261). The dispute (fence epoch, first disputed offset,
+  and the epoch that owned that offset) is now written beside the
+  fencing-epoch journal, as `fencing-epochs.kept-dispute`, and fsynced before
+  the fence replies; every retirement, whether by settlement, truncation or
+  a newer fence, clears it durably before anything is acked past it. A
+  restart restores it, so it caps acks and status and is settled exactly as
+  before. A record the log has provably moved past is discarded at open,
+  never settled over the new leader's records. **Older releases refuse the
+  directory while a dispute is pending:** the journal's header is version 2
+  for exactly that long, and every earlier release opens only version 1, so
+  a downgrade cannot silently serve the suffix. Once settled the header is
+  back at 1. A crash sweep (`kept_dispute_crash_sweep.rs`) cuts the fence
+  and the settlement at every storage operation and every byte of every
+  write.
   **The protection is the fenced replica's, so it holds only on upgraded
   replicas.** There is no wire or feature-level change and the fence frames
   are identical, so nothing tells a candidate which replicas run this
