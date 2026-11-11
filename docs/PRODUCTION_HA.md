@@ -268,11 +268,14 @@ line, so it is no more frequent than the batch log itself.
 **Per-stream checksum selection (#669).** An entry in `streams.yaml` may set
 `checksum: { algorithm: sha256 }`, `blake3`, or `none`. An omitted checksum
 inherits `config.yaml`'s algorithm. The global
-`upload.require_strong_verification` floor applies to every stream: `none`
-is rejected at config load when the floor is on, and warns by stream name
-when it is off. The runtime floor still refuses any size-only backend result.
-`validate --print-effective` shows the resolved algorithm and its origin;
-startup logs each stream's algorithm and derived method.
+`upload.require_strong_verification` floor applies to every stream: a stream
+that sets `none` is rejected at config load when the floor is on, and warns by
+stream name when it is off. The runtime floor still refuses any size-only
+backend result. `validate --print-effective` shows each stream's resolved
+`checksum.algorithm` and `verification_method`, with origin `stream` when the
+entry sets its own; at startup the engine logs one INFO
+`stream verification settings` line per stream with its algorithm, origin and
+method.
 
 On native S3, SHA-256 uses a service-computed checksum from HEAD, falling
 back to read-back if no usable whole-object checksum is supplied; BLAKE3

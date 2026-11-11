@@ -8,9 +8,10 @@
 //! when recovery's storage re-check accepted such a result. These helpers live
 //! outside `engine.rs` to keep the engine's own diff to its call sites.
 
-use vtop_core::config::{StreamsConfig, VtopConfig};
+use vtop_core::config::{effective_algorithm, StreamsConfig, VtopConfig};
 use vtop_core::telemetry;
 use vtop_state::BatchRecord;
+use vtop_upload::verification_method;
 
 /// Called once when an engine starts for mutating work (`run`,
 /// `process-once`, `replay`). Logs each [`VtopConfig::warnings`] entry as one
@@ -23,6 +24,27 @@ use vtop_state::BatchRecord;
 pub(crate) fn announce(config: &VtopConfig, streams: &StreamsConfig) {
     for warning in streams.warnings(config) {
         tracing::warn!("{warning}");
+    }
+    // One line per stream with the algorithm its new batches use and the
+    // method the backend verifies it by (#669), through the same resolver
+    // and mapping `validate --print-effective` prints (#670), so the choice
+    // is visible without running `validate`.
+    let backend = config.upload.backend.as_str();
+    let algorithm = effective_algorithm(config, None);
+    tracing::info!(
+        algorithm = %algorithm,
+        method = verification_method(backend, algorithm).as_str(),
+        "default verification settings (sources no stream matches)"
+    );
+    for stream in &streams.streams {
+        let algorithm = effective_algorithm(config, Some(stream));
+        tracing::info!(
+            stream = %stream.source_name,
+            algorithm = %algorithm,
+            origin = if stream.checksum.is_some() { "stream" } else { "global" },
+            method = verification_method(backend, algorithm).as_str(),
+            "stream verification settings"
+        );
     }
     if let Some(mx) = telemetry::metrics() {
         let size_only = !config.upload.require_strong_verification;

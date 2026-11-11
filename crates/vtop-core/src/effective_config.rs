@@ -253,7 +253,14 @@ pub fn effective_streams(config: &VtopConfig, streams: Option<&StreamsConfig>) -
             },
         };
         let backend_origin = global("upload.backend");
-        let algorithm_origin = global("checksum.algorithm");
+        // The same resolution the pipeline runs (#669): a stream's own
+        // `checksum` wins, else the global algorithm.
+        let algorithm = crate::config::effective_algorithm(config, stream);
+        let algorithm_origin = if stream.is_some_and(|s| s.checksum.is_some()) {
+            Stream
+        } else {
+            global("checksum.algorithm")
+        };
         // The width is `max_concurrent_batches` unless an active transport
         // tuning narrows it (s3_native only); `max_concurrency_ceiling` is a
         // refusal bound and never sets it.
@@ -317,12 +324,14 @@ pub fn effective_streams(config: &VtopConfig, streams: Option<&StreamsConfig>) -
                 },
             },
             checksum_algorithm: EffectiveSetting {
-                value: config.checksum.algorithm,
+                value: algorithm,
                 origin: algorithm_origin,
             },
             verification_method: EffectiveSetting {
-                value: verification_method(&config.upload.backend, config.checksum.algorithm),
-                origin: if algorithm_origin == Global || backend_origin == Global {
+                value: verification_method(&config.upload.backend, algorithm),
+                origin: if algorithm_origin == Stream {
+                    Stream
+                } else if algorithm_origin == Global || backend_origin == Global {
                     Global
                 } else {
                     BuiltInDefault
