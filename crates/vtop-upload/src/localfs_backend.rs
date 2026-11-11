@@ -20,6 +20,18 @@ pub struct LocalFsBackend {
     root: PathBuf,
 }
 
+/// A read that failed: [`VtopError::NotFound`] only when the file is absent.
+/// Every error used to read as NotFound, so an object that exists but cannot
+/// be read (a permission error, an I/O failure) was reported as gone by
+/// anything telling the two apart, `vtopctl scrub` among them (#628).
+fn read_error(object_uri: &str, error: std::io::Error) -> VtopError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        VtopError::NotFound(object_uri.to_string())
+    } else {
+        VtopError::Upload(format!("localfs read {object_uri}: {error}"))
+    }
+}
+
 impl LocalFsBackend {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -103,7 +115,7 @@ impl UploadBackend for LocalFsBackend {
         let path = self.object_path(object_uri)?;
         tokio::fs::read(&path)
             .await
-            .map_err(|_| VtopError::NotFound(object_uri.to_string()))
+            .map_err(|e| read_error(object_uri, e))
     }
 
     async fn get_object_bounded(
@@ -114,7 +126,7 @@ impl UploadBackend for LocalFsBackend {
         let path = self.object_path(object_uri)?;
         let file = tokio::fs::File::open(&path)
             .await
-            .map_err(|_| VtopError::NotFound(object_uri.to_string()))?;
+            .map_err(|e| read_error(object_uri, e))?;
         read_bounded(file, max_bytes, object_uri).await
     }
 
@@ -122,7 +134,7 @@ impl UploadBackend for LocalFsBackend {
         let path = self.object_path(object_uri)?;
         let meta = tokio::fs::metadata(&path)
             .await
-            .map_err(|_| VtopError::NotFound(object_uri.to_string()))?;
+            .map_err(|e| read_error(object_uri, e))?;
         Ok(ObjectHead {
             uri: object_uri.to_string(),
             size_bytes: Some(meta.len()),
@@ -176,6 +188,33 @@ mod tests {
         f.write_all(data).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    /// Only an absent file is NotFound. Something at the path that cannot be
+    /// read (here a directory, which a test running as root cannot get from a
+    /// permission bit) is an error of its own, so a scrub reports it as
+    /// unreadable rather than missing (#628).
+    #[tokio::test]
+    async fn only_an_absent_file_reads_as_not_found() {
+        let root = tempfile::tempdir().unwrap();
+        let b = LocalFsBackend::new(root.path());
+        let absent = "s3://bucket/a/absent.gz";
+        assert!(matches!(
+            b.get_object(absent).await,
+            Err(VtopError::NotFound(_))
+        ));
+        let unreadable = "s3://bucket/a/dir.gz";
+        std::fs::create_dir_all(b.object_path(unreadable).unwrap()).unwrap();
+        for result in [
+            b.get_object(unreadable).await,
+            b.get_object_bounded(unreadable, 1024).await,
+        ] {
+            match result {
+                Err(VtopError::NotFound(_)) => panic!("an unreadable path is not an absent one"),
+                Err(_) => {}
+                Ok(bytes) => panic!("read {} bytes from a directory", bytes.len()),
+            }
+        }
     }
 
     #[tokio::test]
