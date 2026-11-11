@@ -113,6 +113,14 @@ impl Replica {
     /// A process death and restart: nothing in memory survives, and the
     /// lease watcher adopts metadata's current grant.
     fn restart(self, granted: u64) -> Self {
+        let replica = self.reopen();
+        replica.grant(granted);
+        replica
+    }
+
+    /// Reopen from disk with nothing adopted yet: what the replica answers
+    /// before its lease watcher has run.
+    fn reopen(self) -> Self {
         let Replica {
             dir,
             id,
@@ -123,14 +131,12 @@ impl Replica {
         drop(node);
         drop(meta);
         let (meta, node) = Self::open(dir.path(), id);
-        let replica = Replica {
+        Replica {
             dir,
             id,
             meta,
             node,
-        };
-        replica.grant(granted);
-        replica
+        }
     }
 
     /// Metadata grants `epoch` and this replica's lease watcher adopts it.
@@ -324,4 +330,57 @@ fn an_in_sync_follower_records_the_epoch_at_its_tail_as_before() {
     r.append(R_EPOCH, SHARED);
     c.append(R_EPOCH, SHARED);
     assert_eq!(c.node.epoch_starts(), r.node.epoch_starts());
+}
+
+/// A crash after an append is durable but before the journal is re-derived
+/// from the lineage (#648 review). C holds R's first epoch-20 record at 10,
+/// but its journal still ends with epoch 18: the follow that records 19 and
+/// 20 at 10 never ran. Metadata moves on to 21 while C is down, so neither
+/// its restart's adoption nor any append is under 20, the lineage's epoch.
+/// The open must replay the lineage before the replica answers anything, or
+/// C reports the record at 10 as written by 18, and keeps that.
+#[test]
+fn the_open_replays_the_lineage_over_records_a_crash_left_unfiled() {
+    let (r, c) = up_to_the_fence_at_20();
+    catch_up_and_write(&r, &c);
+    let journal_path = c.dir.path().join("fencing-epochs");
+    let Replica {
+        dir,
+        id,
+        meta,
+        node,
+    } = c;
+    drop(node);
+    drop(meta);
+    // The crash window on disk: the record at 10 is durable, the journal is
+    // as the fence left it, and the sidecar still names the lineage.
+    let mut journal = FencingEpochJournal::open(&journal_path).unwrap();
+    journal.truncate_to(1).unwrap();
+    assert_eq!(journal.entries(), starts(&[(OLD_EPOCH, 0)]).as_slice());
+    assert_eq!(journal.leader_lineage_epoch(), Some(R_EPOCH));
+    drop(journal);
+    let (meta, node) = Replica::open(dir.path(), id);
+    let c = Replica {
+        dir,
+        id,
+        meta,
+        node,
+    };
+
+    assert_eq!(
+        c.node.epoch_starts(),
+        r.node.epoch_starts(),
+        "reopened, C must answer with the leader's history for the records it holds, before \
+         anything is adopted or appended"
+    );
+    // Metadata moved on while C was down.
+    c.grant(R_EPOCH + 1);
+    let mut expected = r.node.epoch_starts();
+    expected.push(EpochStart {
+        epoch: R_EPOCH + 1,
+        start_offset: R_TAIL + 1,
+    });
+    assert_eq!(c.node.epoch_starts(), expected);
+    let c = c.reopen();
+    assert_eq!(c.node.epoch_starts(), expected, "and it is durable");
 }

@@ -588,11 +588,16 @@ impl InProcessFollower {
             self.fencing_epoch_history_broken
                 .store(true, Ordering::SeqCst);
         }
-        // A lineage reloaded from its sidecar (#640) resumes where the log
-        // opened: records a crash lost are re-sent by the same leader.
-        journal.settle_leader_lineage_at_open(next_offset);
-        self.lineage_following
-            .store(journal.leader_lineage_epoch().is_some(), Ordering::SeqCst);
+        // A lineage reloaded from its sidecar (#640) is replayed over the log
+        // as it opened, before anything reads this history (#648 review): a
+        // crash between an append's fsync and the journal's re-derivation
+        // left those records filed under the old entries.
+        match journal.replay_leader_lineage_at_open(next_offset) {
+            Ok(following) => self.lineage_following.store(following, Ordering::SeqCst),
+            Err(_) => self
+                .fencing_epoch_history_broken
+                .store(true, Ordering::SeqCst),
+        }
         *self
             .fencing_epoch_journal
             .lock()

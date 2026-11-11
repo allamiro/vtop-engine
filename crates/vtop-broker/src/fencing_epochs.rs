@@ -585,16 +585,33 @@ impl FencingEpochJournal {
         self.lineage.as_ref().map(|lineage| lineage.epoch)
     }
 
-    /// Lower the lineage's anchor to the log's tail as the log opened (#640).
+    /// Replay a persisted lineage over the log as it opened (#640, #648
+    /// review), before the journal is answered from or written to. Returns
+    /// whether the lineage still has entries the log has not reached.
     ///
-    /// A crash can lose records the replica held when it took the lineage.
-    /// The records it takes from the new tail on still come from the same
-    /// leader, and below it the histories still agree, so the anchor moves
-    /// down with the tail. In memory only: every open recomputes it.
-    pub fn settle_leader_lineage_at_open(&mut self, tail: u64) {
-        if let Some(lineage) = self.lineage.as_mut() {
-            lineage.anchor = lineage.anchor.min(tail);
-        }
+    /// The journal and the log are made durable separately: an append is
+    /// fsynced, then the journal is re-derived from the lineage. A crash
+    /// between the two leaves records filed under whatever the journal said
+    /// before, and nothing later is sure to repair it. The restart's adoption
+    /// and the next append re-derive only under the lineage's own epoch, and
+    /// metadata may have moved past it while the replica was down. So the
+    /// open replays the lineage itself, up to the tail and never past an
+    /// entry of a later epoch (see [`Self::follow_leader_lineage`]).
+    ///
+    /// The anchor first comes down to the tail: a crash can lose records the
+    /// replica held when it took the lineage, and the records it takes from
+    /// the new tail on still come from the same leader. That is in memory
+    /// only; every open recomputes it.
+    pub fn replay_leader_lineage_at_open(&mut self, tail: u64) -> BrokerResult<bool> {
+        let Some(lineage) = self.lineage.as_mut() else {
+            return Ok(false);
+        };
+        lineage.anchor = lineage.anchor.min(tail);
+        let epoch = lineage.epoch;
+        Ok(matches!(
+            self.follow_leader_lineage(epoch, tail)?,
+            LineageFollow::Following { complete: false }
+        ))
     }
 
     /// File this replica's records from the lineage's anchor through `tail`
@@ -660,12 +677,32 @@ impl FencingEpochJournal {
                 }),
             }
         }
+        // The lineage governs records only until this replica moved on to a
+        // later epoch: an entry of a newer epoch at or above the anchor (an
+        // adoption, or a truncation's re-anchoring) begins records that came
+        // from some other leader. They and everything after them are kept as
+        // they are, and the leader's entries are applied only below them.
+        // While the replica follows `epoch` there is no such entry; it
+        // matters to the replay at open, when the replica may have moved on
+        // before a crash.
+        let later = self
+            .entries
+            .iter()
+            .position(|entry| entry.start_offset >= anchor && entry.epoch > epoch);
+        let window_end = later.map_or(tail, |index| tail.min(self.entries[index].start_offset));
         for entry in leader
             .iter()
-            .filter(|entry| entry.start_offset >= anchor && entry.start_offset <= tail)
+            .filter(|entry| entry.start_offset >= anchor && entry.start_offset <= window_end)
         {
             if target.last().is_none_or(|last| entry.epoch > last.epoch) {
                 target.push(*entry);
+            }
+        }
+        if let Some(index) = later {
+            for entry in &self.entries[index..] {
+                if target.last().is_none_or(|last| entry.epoch > last.epoch) {
+                    target.push(*entry);
+                }
             }
         }
         if target != self.entries {
@@ -1999,5 +2036,44 @@ mod tests {
         j.truncate_to(4).unwrap();
         j.follow_leader_lineage(20, 9).unwrap();
         assert_eq!(j.entries(), starts(&[(18, 0), (20, 8)]).as_slice());
+    }
+
+    /// The replay at open (#648 review) files the records a crash left
+    /// unfiled, and stops at an entry of a later epoch: records from there
+    /// on came from another leader, which the lineage says nothing about.
+    #[test]
+    fn the_replay_at_open_stops_at_a_later_epoch() {
+        let leader = starts(&[(18, 0), (19, 10), (20, 10)]);
+        // Caught up to 12 under 20, the follow lost to a crash, then 21
+        // adopted at 12: the leader's entries at 10 belong below it.
+        let dir = TempDir::new().unwrap();
+        {
+            let mut j = journal(&dir);
+            j.record(18, 0).unwrap();
+            assert!(j.take_leader_lineage(20, &leader, 5, 0).unwrap());
+            j.record_adoption(21, 12).unwrap();
+        }
+        let mut j = journal(&dir);
+        assert!(!j.replay_leader_lineage_at_open(12).unwrap());
+        assert_eq!(
+            j.entries(),
+            starts(&[(18, 0), (19, 10), (20, 10), (21, 12)]).as_slice()
+        );
+        drop(j);
+        assert_eq!(
+            journal(&dir).entries(),
+            starts(&[(18, 0), (19, 10), (20, 10), (21, 12)]).as_slice(),
+            "durable"
+        );
+
+        // Moved on to 21 at 8, before the leader of 20 reached its own
+        // entries: everything from 8 is 21's, and stays so.
+        let dir = TempDir::new().unwrap();
+        let mut j = journal(&dir);
+        j.record(18, 0).unwrap();
+        assert!(j.take_leader_lineage(20, &leader, 5, 0).unwrap());
+        j.record_adoption(21, 8).unwrap();
+        j.replay_leader_lineage_at_open(12).unwrap();
+        assert_eq!(j.entries(), starts(&[(18, 0), (21, 8)]).as_slice());
     }
 }
