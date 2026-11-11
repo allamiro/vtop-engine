@@ -305,38 +305,72 @@ digest, and picks the hash scheme from the version:
 |---|---|
 | `0.1`, `0.2`, `0.3` | Legacy: the manifest decoded into the fields that release knows, both embedded values blanked, re-serialized as compact JSON in struct order. Unchanged, so every archived manifest verifies as before. A field that release does not know is dropped before hashing. |
 | `0.4` | Canonical: the **stored** document, with `manifest.sha256` set to `""` and `manifest.mac` set to `""` where that key is present (an absent MAC stays absent), object keys sorted at every depth, serialized as compact JSON. Fields the reader does not know stay in, so they are authenticated too. |
-| anything newer | Refused as **newer than this build supports**, never as corrupt or tampered. |
+| anything newer | Reported as a manifest that **claims a version this build cannot authenticate**, never as corrupt or tampered, and acted on only when its bytes are proven to be the writer's (below). |
 
 The `0.4` canonical form is sorted-key compact JSON as `serde_json` writes it:
 array order and every value are significant, strings are re-escaped minimally,
-and an integer is written in decimal. It is not full RFC 8785 (JCS). Two
+and an integer is written in decimal. It is not full RFC 8785 (JCS). Some
 inputs are refused as malformed, because their canonical bytes would not pin
-down what the document says: a **duplicate key** in any object (parsers
-disagree on which one wins), and a **number that is not an integer** in the
-signed or unsigned 64-bit range (it would be re-encoded as a float, so
-different stored numbers could share one hash). A `0.4` writer stays within
-both rules. The reader release writes no `0.4` manifest; it only reads them.
+down what the document says:
 
-"Newer" means a `MAJOR.MINOR` of digits above `0.4`. Any other `protocol` or
-`version` (missing, not a string, `0.0`, `0.4.1`, ...) is a malformed document,
-and the error type carries the difference. The readers:
+- a **duplicate key** in any object, since parsers disagree on which one wins;
+- a **number that is not an integer** in the signed or unsigned 64-bit range:
+  a fraction, an exponent, or an integer beyond that range. It would be
+  re-encoded as a float, so different stored numbers could share one hash;
+- **`-0`**. It is not the integer `0`, and two stored forms would share one
+  canonical form.
 
-- **Recovery's re-check of a VERIFIED row** (`storage_still_verified`): a
-  newer manifest leaves the row VERIFIED, neither committed nor marked for
-  replay, with an error log; an upgraded engine commits it later. Like any
-  uncommitted range it holds back a VERIFIED range of the same source unit
-  above it, unless the unit has already committed past it. Only VERIFIED rows
-  are re-checked: a row that never reached VERIFIED is re-read whatever its
-  manifest says, as before. The engine's next read of that source still
-  starts at the committed point, below the newer range, so its bytes are
-  archived again (a duplicate, never a gap), as for any range recovery
-  leaves uncommitted.
+A `0.4` writer stays within these rules. The reader release writes no `0.4`
+manifest; it only reads them. In every version, a second `protocol` or
+`version` key at the top level is malformed.
+
+**Version grammar.** A version is dotted digits, `MAJOR.MINOR` or
+`MAJOR.MINOR.PATCH`, each part with no leading zero (`0` itself is fine). A
+missing PATCH compares as `0`. Versions above the newest the reader knows
+(`0.4` here), such as `0.5`, `0.4.1` or `1.0.0`, are **newer**. Anything else
+is a **malformed** document: a missing `protocol` or `version`, a version that
+is not a string, `00.5`, `0.4a`, an empty string, or a well-formed version
+that is not newer and not one this reader knows (`0.0`, `0.4.0`, `0.3.1`).
+The error type carries the difference.
+
+**A newer version is a claim, not a fact.** The version is read before
+anything is authenticated, so a storage tamperer can write `"version": "0.9"`
+over a manifest. A reader acts on the claim only when the bytes are proven to
+be what the batch's writer stored. Both of these must hold:
+
+- they are the row's **pinned** immutable manifest version, which an
+  overwrite of the key cannot change;
+- they carry the batch id and the self-hash the ledger recorded.
+
+Otherwise the manifest is unauthenticated, exactly as before (see
+SECURITY_MODEL.md §8.2). The readers:
+
+- **Recovery's re-check of a VERIFIED row** (`storage_still_verified`):
+  - **A proven newer manifest** leaves the row VERIFIED, neither committed nor
+    marked for replay. It is logged as an error and counted in
+    `vtop_recovery_unsupported_manifest_total`, and an upgraded engine
+    commits it later.
+  - **Holding back:** like any uncommitted range, it holds back a VERIFIED
+    range of the same source unit above it.
+  - **Retiring:** once the unit has committed past it (proven as for any
+    range retired under #567), it is retired as SUPERSEDED. That makes no
+    source commit, and stops the row being claimed and downloaded at every
+    restart.
+  - **An unproven newer manifest** is unauthenticated: FAILED, then
+    REPLAY_REQUIRED.
+  - **Rows that never reached VERIFIED** are not re-checked. Such a row is
+    re-read whatever its manifest says, as before.
+  - **Duplicates:** the engine's next read of that source still starts at the
+    committed point, below a held newer range, so its bytes are archived again
+    (a duplicate, never a gap), as for any range recovery leaves uncommitted.
 - **The in-run keyed read-back** of the manifest this engine just stored
   verifies it from the stored bytes by the same rules.
-- **`vtopctl scrub`** reports the batch as `unsupported_version`, not
-  `unauthenticated` or `mismatched`. It is still a finding: nothing was
-  checked. Upgrade the scrub's binary and run it again.
-- **`vtopctl verify-manifest`** fails with the newer-version error.
+- **`vtopctl scrub`** reports a proven newer manifest as `unsupported_version`,
+  and an unproven one as `unauthenticated`. Both are findings, because neither
+  was checked. For `unsupported_version`, upgrade the scrub's binary and run
+  it again.
+- **`vtopctl verify-manifest`** has no ledger to bind the bytes to. It fails
+  with "manifest URI claims version X, which this build cannot authenticate".
 
 **Upgrade order.** The reader release (release A in #671) reads `0.1`-`0.4`
 and **still writes `0.3`**, so engines before and after it can share a ledger

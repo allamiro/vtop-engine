@@ -1126,24 +1126,99 @@ delegate_backend!(
 );
 
 /// A manifest from a newer release (#671) is its own finding, not
-/// `unauthenticated`: before, a scrub binary older than the archive's writer
-/// reported every such batch as a failed self-hash.
+/// `unauthenticated` - when its bytes are proven to be what this fleet wrote:
+/// the row's pinned, immutable version, carrying the self-hash the ledger
+/// recorded.
 #[tokio::test]
-async fn a_newer_manifest_is_unsupported_not_unauthenticated() {
+async fn a_pinned_newer_manifest_is_unsupported_not_unauthenticated() {
     let a = archive(1).await;
     let mut rows = a.rows().await;
     let uri = rows[0].record.manifest_uri.clone().unwrap();
-    a.overwrite(
-        &uri,
-        br#"{"protocol":"VTOP","version":"0.9","future_enum":"unrecognized"}"#,
-        true,
-    )
-    .await;
-    rows[0].record.manifest_version_id = None;
+    let recorded = rows[0].record.manifest_sha256.clone().unwrap();
+    let doc = serde_json::json!({
+        "protocol": "VTOP",
+        "version": "0.9",
+        "batch_id": rows[0].record.batch_id,
+        "manifest": {"uri": uri, "sha256": recorded},
+        "future_enum": "unrecognized",
+    });
+    let staged = a.dir.path().join("newer-671.json");
+    std::fs::write(&staged, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let stored = a.mock.put_manifest(&staged, &uri, None).await.unwrap();
+    rows[0].record.manifest_version_id = stored.version_id;
     let report = a.scrub_rows(rows, &opts()).await;
     assert_eq!(report.findings.len(), 1);
     assert_eq!(report.findings[0].result.as_str(), "unsupported_version");
-    assert!(report.findings[0]
-        .detail
-        .contains("newer than this build supports"));
+    assert!(
+        report.findings[0].detail.contains("claims version 0.9"),
+        "{}",
+        report.findings[0].detail
+    );
+}
+
+/// Review of #674: `version` is read before anything is authenticated, so a
+/// tamperer who overwrites a manifest with `{"version": "0.9"}` must not turn
+/// an integrity finding into "upgrade the scrub". At a key no version pins,
+/// the bytes are not proven to be this fleet's: unauthenticated, even when
+/// the forgery copies the self-hash the ledger recorded.
+#[tokio::test]
+async fn an_unpinned_newer_manifest_is_unauthenticated() {
+    let a = archive(1).await;
+    let mut rows = a.rows().await;
+    let uri = rows[0].record.manifest_uri.clone().unwrap();
+    let recorded = rows[0].record.manifest_sha256.clone().unwrap();
+    for forged in [
+        serde_json::json!({"protocol": "VTOP", "version": "0.9"}),
+        serde_json::json!({
+            "protocol": "VTOP",
+            "version": "0.9",
+            "batch_id": rows[0].record.batch_id,
+            "manifest": {"uri": uri, "sha256": recorded},
+        }),
+    ] {
+        a.overwrite(&uri, &serde_json::to_vec(&forged).unwrap(), true)
+            .await;
+        rows[0].record.manifest_version_id = None;
+        let report = a.scrub_rows(rows.clone(), &opts()).await;
+        assert_eq!(report.findings.len(), 1, "{forged}");
+        assert_eq!(
+            report.findings[0].result.as_str(),
+            "unauthenticated",
+            "{forged}: {}",
+            report.findings[0].detail
+        );
+    }
+}
+
+/// A pin alone is not the proof: the pinned version must also carry the
+/// batch id and the self-hash the ledger recorded, or it is not this batch's.
+#[tokio::test]
+async fn a_pinned_newer_manifest_not_bound_to_the_ledger_is_unauthenticated() {
+    let a = archive(1).await;
+    let mut rows = a.rows().await;
+    let uri = rows[0].record.manifest_uri.clone().unwrap();
+    let recorded = rows[0].record.manifest_sha256.clone().unwrap();
+    for (batch_id, sha256) in [
+        (rows[0].record.batch_id.clone(), "cd".repeat(32)),
+        ("another-batch".to_string(), recorded.clone()),
+    ] {
+        let doc = serde_json::json!({
+            "protocol": "VTOP",
+            "version": "0.9",
+            "batch_id": batch_id,
+            "manifest": {"uri": uri, "sha256": sha256},
+        });
+        let staged = a.dir.path().join("unbound-671.json");
+        std::fs::write(&staged, serde_json::to_vec(&doc).unwrap()).unwrap();
+        let stored = a.mock.put_manifest(&staged, &uri, None).await.unwrap();
+        rows[0].record.manifest_version_id = stored.version_id;
+        let report = a.scrub_rows(rows.clone(), &opts()).await;
+        assert_eq!(report.findings.len(), 1, "{doc}");
+        assert_eq!(
+            report.findings[0].result.as_str(),
+            "unauthenticated",
+            "{doc}: {}",
+            report.findings[0].detail
+        );
+    }
 }

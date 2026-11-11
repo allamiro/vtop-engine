@@ -74,9 +74,11 @@ pub enum ScrubResult {
     /// timeout, a throttle, a permission error). Nothing was proven either
     /// way, so it is a finding: a scrub that could not look did not pass.
     Unreadable,
-    /// The manifest is from a newer release than this build reads (#671):
-    /// not damaged, but not checked either, so it is a finding. Upgrade the
-    /// scrub's binary and run it again.
+    /// The manifest is from a newer release than this build reads (#671),
+    /// proven to be the writer's: the row's pinned version, carrying the
+    /// batch id and self-hash the ledger recorded. Not checked, so it is a
+    /// finding: upgrade the scrub's binary and run it again. The same claim
+    /// without that proof is [`ScrubResult::Unauthenticated`].
     UnsupportedVersion,
 }
 
@@ -188,6 +190,41 @@ pub async fn check_stored_batch(
     check_with_manifest(backend, mac_key, rec).await.0
 }
 
+/// Whether a manifest claiming a version this build cannot authenticate is
+/// proven to be the one the batch's writer stored, so the claim may be acted
+/// on (#671, review of #674). Two things together:
+///
+/// - the bytes are the row's PINNED version (#135): an immutable version the
+///   writer recorded at upload, which an overwrite of the key cannot change.
+///   The ledger's `manifest_sha256` is the writer's self-hash, computed by a
+///   scheme this build cannot reproduce, so it alone binds nothing: a
+///   tamperer can copy it into a forgery at the current key;
+/// - and the document carries the batch id and the self-hash the ledger
+///   recorded, so the pinned version is this batch's.
+///
+/// Without a pin there is no such proof, and the manifest is treated as
+/// unauthenticated, as every release before #671 treated it.
+fn newer_manifest_is_the_fleets(rec: &BatchRecord, bytes: &[u8]) -> Result<(), String> {
+    let Some(version) = rec.manifest_version_id.as_deref() else {
+        return Err("the row pins no manifest version, so these bytes are not proven to be what its writer stored".into());
+    };
+    let claimed = vtop_core::manifest::claimed_binding(bytes);
+    let bound = claimed.as_ref().is_some_and(|(batch_id, sha256)| {
+        batch_id == &rec.batch_id
+            && rec
+                .manifest_sha256
+                .as_deref()
+                .is_some_and(|want| !want.is_empty() && want.eq_ignore_ascii_case(sha256))
+    });
+    if bound {
+        Ok(())
+    } else {
+        Err(format!(
+            "its pinned version {version} does not carry the batch id and self-hash the ledger recorded"
+        ))
+    }
+}
+
 /// [`check_stored_batch`], also returning the pinned manifest's bytes when
 /// they were read, so the scrub can compare the current key against them.
 async fn check_with_manifest(
@@ -245,10 +282,16 @@ async fn check_manifest_and_object(
     let manifest = match ParsedManifest::from_slice(bytes) {
         Ok(manifest) => manifest,
         Err(e @ VtopError::UnsupportedManifestVersion { .. }) => {
-            return BatchCheck::new(
-                ScrubResult::UnsupportedVersion,
-                format!("manifest {muri}: {e}"),
-            );
+            // The version is read before anything is authenticated, so a
+            // tamperer could write `"version": "0.9"` to turn an integrity
+            // finding into "upgrade the binary" - and recovery would hold the
+            // row VERIFIED for good (review of #674). The claim counts only
+            // for bytes proven to be what this fleet wrote.
+            let e = e.at_manifest_uri(muri);
+            return match newer_manifest_is_the_fleets(rec, bytes) {
+                Ok(()) => BatchCheck::new(ScrubResult::UnsupportedVersion, e.to_string()),
+                Err(why) => unauthenticated(format!("{e}, and {why}")),
+            };
         }
         Err(e) => return unauthenticated(format!("manifest {muri} does not parse: {e}")),
     };
@@ -258,25 +301,27 @@ async fn check_manifest_and_object(
     // Bind the manifest to the durable ledger before trusting it: a validly
     // authenticated manifest of ANOTHER batch, or one whose digest is not the
     // one the ledger recorded, is not this batch's manifest.
-    if manifest.batch_id != rec.batch_id {
+    if manifest.fields().batch_id != rec.batch_id {
         return unauthenticated(format!(
             "manifest {muri} is batch {}'s, not {}",
-            manifest.batch_id, rec.batch_id
+            manifest.fields().batch_id,
+            rec.batch_id
         ));
     }
-    if manifest.manifest.uri != muri || manifest.object.uri != uri {
+    if manifest.fields().manifest.uri != muri || manifest.fields().object.uri != uri {
         return unauthenticated(format!(
             "manifest {muri} names manifest {} and object {}, the ledger {muri} and {uri}",
-            manifest.manifest.uri, manifest.object.uri
+            manifest.fields().manifest.uri,
+            manifest.fields().object.uri
         ));
     }
     let ledger_manifest_hash_matches = rec.manifest_sha256.as_deref().is_some_and(|want| {
-        !want.is_empty() && want.eq_ignore_ascii_case(&manifest.manifest.sha256)
+        !want.is_empty() && want.eq_ignore_ascii_case(&manifest.fields().manifest.sha256)
     });
     if !ledger_manifest_hash_matches {
         return unauthenticated(format!(
             "manifest {muri} hashes to {}, the ledger recorded {}",
-            manifest.manifest.sha256,
+            manifest.fields().manifest.sha256,
             rec.manifest_sha256.as_deref().unwrap_or("nothing")
         ));
     }
@@ -284,9 +329,9 @@ async fn check_manifest_and_object(
     // BLAKE3 digest: it is the configured algorithm's.
     if rec
         .object_size_bytes
-        .is_some_and(|want| want < 0 || want as u64 != manifest.object.size_bytes)
+        .is_some_and(|want| want < 0 || want as u64 != manifest.fields().object.size_bytes)
         || rec.object_sha256.as_deref().is_some_and(|want| {
-            !want.is_empty() && !want.eq_ignore_ascii_case(&manifest.object.checksum)
+            !want.is_empty() && !want.eq_ignore_ascii_case(&manifest.fields().object.checksum)
         })
     {
         return BatchCheck::new(
@@ -296,6 +341,7 @@ async fn check_manifest_and_object(
     }
 
     let algo = match manifest
+        .fields()
         .object
         .checksum_algorithm
         .parse::<ChecksumAlgorithm>()
@@ -309,7 +355,7 @@ async fn check_manifest_and_object(
         }
     };
     let expected = if algo.is_enabled() {
-        if manifest.object.checksum.is_empty() {
+        if manifest.fields().object.checksum.is_empty() {
             return BatchCheck::new(
                 ScrubResult::Mismatched,
                 format!("manifest {muri} declares {algo:?} but records no digest"),
@@ -317,13 +363,13 @@ async fn check_manifest_and_object(
         }
         Some(ObjectChecksum::new(
             algo.as_str(),
-            &manifest.object.checksum,
+            &manifest.fields().object.checksum,
         ))
     } else {
         None
     };
     match backend
-        .verify_object(uri, manifest.object.size_bytes, expected)
+        .verify_object(uri, manifest.fields().object.size_bytes, expected)
         .await
     {
         Err(e) => read_failure("object", uri, &e),

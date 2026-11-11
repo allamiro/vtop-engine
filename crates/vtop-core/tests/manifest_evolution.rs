@@ -122,7 +122,7 @@ fn newer_version_is_distinct_before_decoding_or_authentication() {
         let bytes = serde_json::to_vec(&json!({"protocol":"VTOP", "version":version})).unwrap();
         let err = ParsedManifest::from_slice(&bytes).unwrap_err();
         assert!(matches!(err, VtopError::UnsupportedManifestVersion { .. }));
-        assert!(err.to_string().contains("newer than this build supports"));
+        assert!(err.to_string().contains("cannot authenticate"));
     }
     for header in [
         json!({"protocol":"other", "version":"0.4"}),
@@ -160,7 +160,7 @@ fn released_070_manifests_verify_without_reencoding_the_fixture() {
         ),
     ] {
         let parsed = ParsedManifest::from_slice(bytes).unwrap();
-        assert_eq!(parsed.version, "0.2");
+        assert_eq!(parsed.fields().version, "0.2");
         parsed
             .verify_authentication(signed.then_some(&key))
             .unwrap();
@@ -242,7 +242,7 @@ fn a_malformed_envelope_is_not_reported_as_newer() {
         json!({"version": "0.4"}),
         json!({"protocol": "VTOP"}),
         json!({"protocol": "VTOP", "version": 4}),
-        json!({"protocol": "VTOP", "version": "0.4.1"}),
+        json!({"protocol": "VTOP", "version": "0.4.1.0"}),
         json!({"protocol": "VTOP", "version": "-1.0"}),
         json!({"protocol": "VTOP", "version": ""}),
         json!(["VTOP", "0.9"]),
@@ -263,4 +263,99 @@ fn a_huge_newer_version_is_reported_bounded() {
     let err = ParsedManifest::from_slice(&bytes).unwrap_err();
     assert!(matches!(err, VtopError::UnsupportedManifestVersion { .. }));
     assert!(err.to_string().len() < 200, "{err}");
+}
+
+/// Review of #674: the header was read into a last-wins map, so a document
+/// carrying `version` twice could be reported as newer. A duplicate envelope
+/// key is malformed, whatever the version.
+#[test]
+fn a_duplicate_envelope_key_is_malformed_not_newer() {
+    for text in [
+        r#"{"protocol":"VTOP","version":"0.4","version":"0.9"}"#,
+        r#"{"protocol":"VTOP","version":"0.3","version":"0.9"}"#,
+        r#"{"protocol":"other","protocol":"VTOP","version":"0.9"}"#,
+        r#"{"protocol":"VTOP","version":"0.9","version":"0.9"}"#,
+    ] {
+        let err = ParsedManifest::from_slice(text.as_bytes()).unwrap_err();
+        assert!(
+            !matches!(err, VtopError::UnsupportedManifestVersion { .. }),
+            "{text}: {err}"
+        );
+        assert!(err.to_string().contains("duplicate"), "{text}: {err}");
+    }
+    // A legacy manifest with a duplicate envelope key is refused too.
+    let mut doc = legacy();
+    doc["tenant"] = json!("default");
+    let text = String::from_utf8(serde_json::to_vec(&doc).unwrap()).unwrap();
+    let doubled = text.replacen(
+        r#""version":"0.3""#,
+        r#""version":"0.3","version":"0.3""#,
+        1,
+    );
+    assert_ne!(doubled, text);
+    assert!(ParsedManifest::from_slice(doubled.as_bytes()).is_err());
+}
+
+/// The version grammar is fixed now, so later writers are not tied to two
+/// parts: dotted digits, two or three parts, no leading zeros. Above the
+/// newest readable version is newer; anything else is malformed.
+#[test]
+fn a_three_part_version_above_the_maximum_is_newer_and_bad_grammar_is_malformed() {
+    let classify = |version: &str| {
+        let bytes = serde_json::to_vec(&json!({"protocol": "VTOP", "version": version})).unwrap();
+        ParsedManifest::from_slice(&bytes).unwrap_err()
+    };
+    for version in ["1.0.0", "0.5.1", "0.4.1", "0.5", "10.0"] {
+        let err = classify(version);
+        assert!(
+            matches!(&err, VtopError::UnsupportedManifestVersion { supported, .. }
+                if *supported == vtop_core::manifest::MAX_READABLE_VERSION),
+            "{version}: {err}"
+        );
+    }
+    for version in [
+        "00.5", "0.05", "0.4a", "", "0.4.0.1", "1.", ".5", "0.4.0", "0.3.9", "+1.0", " 1.0",
+    ] {
+        let err = classify(version);
+        assert!(
+            !matches!(err, VtopError::UnsupportedManifestVersion { .. }),
+            "{version}: {err}"
+        );
+    }
+}
+
+/// `-0` re-encodes as `0` (or `-0.0`): two stored forms, one canonical form.
+#[test]
+fn negative_zero_in_an_04_manifest_is_malformed() {
+    let mut doc = future(false);
+    doc["extension"]["zero"] = json!(0);
+    let sealed = String::from_utf8(serde_json::to_vec(&seal(doc)).unwrap()).unwrap();
+    let edited = sealed.replacen(r#""zero":0"#, r#""zero":-0"#, 1);
+    assert_ne!(edited, sealed);
+    assert!(ParsedManifest::from_slice(edited.as_bytes()).is_err());
+}
+
+/// Review of #674: a 0.4 manifest must not hand out the legacy re-encoded
+/// hash or bytes - they drop its unknown fields, the way back to "newer
+/// looks tampered".
+#[test]
+fn a_parsed_04_manifest_gives_no_legacy_hash_or_reencoding() {
+    let parsed = ParsedManifest::from_slice(&serde_json::to_vec(&future(false)).unwrap()).unwrap();
+    assert!(parsed.fields().self_hash().is_err());
+    assert!(parsed.fields().to_json_bytes().is_err());
+    assert!(parsed.fields().verify_self_hash().is_err());
+    // A legacy one still does.
+    let parsed = ParsedManifest::from_slice(&serde_json::to_vec(&legacy()).unwrap()).unwrap();
+    parsed.fields().self_hash().unwrap();
+    parsed.fields().to_json_bytes().unwrap();
+}
+
+/// The error says what is known: the document CLAIMS a newer version, which
+/// this build cannot authenticate.
+#[test]
+fn the_newer_version_error_says_the_version_is_claimed() {
+    let bytes = serde_json::to_vec(&json!({"protocol": "VTOP", "version": "0.9"})).unwrap();
+    let err = ParsedManifest::from_slice(&bytes).unwrap_err();
+    assert!(err.to_string().contains("claims version 0.9"), "{err}");
+    assert!(err.to_string().contains("cannot authenticate"), "{err}");
 }

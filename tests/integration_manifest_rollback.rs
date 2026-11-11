@@ -373,29 +373,22 @@ async fn legacy_row_without_version_rejects_replayed_manifest() {
 /// A VERIFIED batch whose manifest is from a newer release (#671) is neither
 /// committed nor marked for replay: before, it failed the re-check as
 /// tampered and was marked FAILED and REPLAY_REQUIRED, so an upgraded engine
-/// could no longer commit it. The ledger row is left exactly as it was.
+/// could no longer commit it. The ledger row is left exactly as it was. Its
+/// bytes are the row's pinned, immutable version, carrying the self-hash the
+/// ledger recorded: proven to be what the fleet wrote.
 #[tokio::test]
 async fn a_newer_manifest_stays_pending_without_replay_or_commit() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut sc, _) = seed(
+    let (mut sc, _) = seed_version(
         dir.path(),
         "future-version",
         "s3://telemetry-data/future.raw",
         "s3://telemetry-data/future.manifest.json",
-        false,
+        true,
+        "0.9",
+        true,
     )
     .await;
-    let staged = dir.path().join("future.json");
-    std::fs::write(
-        &staged,
-        br#"{"protocol":"VTOP","version":"0.9","future":"unknown"}"#,
-    )
-    .unwrap();
-    sc.engine
-        .backend
-        .put_manifest(&staged, sc.manifest_uri, None)
-        .await
-        .unwrap();
     let summary = sc.engine.recover().await.unwrap();
     assert_eq!(
         summary.still_pending, 1,
@@ -420,7 +413,11 @@ async fn a_newer_manifest_stays_pending_without_replay_or_commit() {
         ),
         "{err}"
     );
-    assert!(err.to_string().contains("newer than this build supports"));
+    // Standalone, with no ledger to bind it, the claim is all there is.
+    let text = err.to_string();
+    assert!(text.contains(sc.manifest_uri), "{text}");
+    assert!(text.contains("claims version 0.9"), "{text}");
+    assert!(text.contains("cannot authenticate"), "{text}");
     assert_eq!(
         sc.engine
             .store
@@ -430,6 +427,50 @@ async fn a_newer_manifest_stays_pending_without_replay_or_commit() {
             .unwrap()
             .state,
         BatchState::Verified
+    );
+}
+
+/// Review of #674: `version` is read before anything is authenticated. A
+/// tamperer who overwrites an unpinned manifest with a "newer" document -
+/// even one copying the self-hash the ledger recorded - must not get the
+/// batch held VERIFIED for good: its bytes are not proven to be the fleet's,
+/// so recovery replays it, as before #671.
+#[tokio::test]
+async fn a_forged_newer_manifest_at_an_unpinned_key_is_replayed_not_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut sc, trusted) = seed(
+        dir.path(),
+        "forged-future",
+        "s3://telemetry-data/forged.raw",
+        "s3://telemetry-data/forged.manifest.json",
+        false,
+    )
+    .await;
+    let forged = serde_json::json!({
+        "protocol": "VTOP",
+        "version": "0.9",
+        "batch_id": sc.batch_id,
+        "manifest": {"uri": sc.manifest_uri, "sha256": trusted.manifest.sha256},
+    });
+    let staged = dir.path().join("forged-671.json");
+    std::fs::write(&staged, serde_json::to_vec(&forged).unwrap()).unwrap();
+    sc.engine
+        .backend
+        .put_manifest(&staged, sc.manifest_uri, None)
+        .await
+        .unwrap();
+    let summary = sc.engine.recover().await.unwrap();
+    assert_eq!(summary.replay_required, 1, "{summary:?}");
+    assert_eq!(summary.committed, 0, "{summary:?}");
+    assert_eq!(
+        sc.engine
+            .store
+            .get_batch(sc.batch_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        BatchState::ReplayRequired
     );
 }
 

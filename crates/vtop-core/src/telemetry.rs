@@ -82,6 +82,13 @@ pub struct Metrics {
     pub replay_required_total: IntCounterVec,
     pub failed_total: IntCounterVec,
 
+    /// VERIFIED batches whose stored manifest recovery found to be from a
+    /// newer release than this engine reads (#671): left VERIFIED for an
+    /// upgraded engine, or retired once their source has committed past them.
+    /// Non-zero means an engine is older than a writer sharing its ledger,
+    /// which the upgrade order rules out: upgrade this engine.
+    pub recovery_unsupported_manifest_total: IntCounterVec,
+
     /// Volume. Rates are derived from these in PromQL, never exported directly.
     pub records_total: IntCounterVec,
     pub bytes_in_total: IntCounterVec,
@@ -218,6 +225,11 @@ impl Metrics {
             "Batches marked REPLAY_REQUIRED and re-read from source",
             labels3(),
         )?;
+        let recovery_unsupported_manifest_total = cv(
+            "recovery_unsupported_manifest_total",
+            "VERIFIED batches whose manifest recovery found to be from a newer release than this engine reads (#671); upgrade the engine",
+            labels3(),
+        )?;
         let failed_total = cv(
             "failed_total",
             "Batches that reached the FAILED state",
@@ -329,6 +341,7 @@ impl Metrics {
             verification_mode,
             replay_required_total,
             failed_total,
+            recovery_unsupported_manifest_total,
             records_total,
             bytes_in_total,
             bytes_out_total,

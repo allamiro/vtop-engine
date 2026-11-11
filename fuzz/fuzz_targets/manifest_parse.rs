@@ -13,6 +13,8 @@ use libfuzzer_sys::fuzz_target;
 use vtop_core::manifest::{ParsedManifest, VtopManifest};
 
 fuzz_target!(|data: &[u8]| {
+    // Read on a newer-version claim, before anything is authenticated.
+    let _ = vtop_core::manifest::claimed_binding(data);
     if let Ok(stored) = ParsedManifest::from_slice(data) {
         let _ = stored.verify_self_hash();
         let _ = stored.verify_authentication(None);

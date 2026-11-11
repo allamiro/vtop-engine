@@ -653,7 +653,7 @@ one result:
 | `mismatched` | something is stored, and it is not what was committed (object content or size, the manifest's current key, the ledger's record of the object) | yes |
 | `unauthenticated` | the manifest does not parse, fails its self-hash or MAC, or does not bind to the ledger row | yes |
 | `unreadable` | the store answered with an error other than absence (timeout, throttle, permission); nothing was proven | yes |
-| `unsupported_version` | the manifest is from a newer release than this binary reads (#671): not damaged, but not checked either; upgrade the scrub's binary and run it again | yes |
+| `unsupported_version` | the row's pinned manifest version, carrying the self-hash the ledger recorded, is from a newer release than this binary reads (#671): not checked, so a finding; upgrade the scrub's binary and run it again. The same claim at a key no version pins is `unauthenticated`: a tamperer can write any version | yes |
 
 It exits non-zero on any finding; `--json` prints the report (each finding with
 its batch id, URIs, version and whether its row came from the ledger or a
