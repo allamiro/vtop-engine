@@ -53,6 +53,9 @@ impl SpoolSeen {
             inode: self.inode,
             size: self.file_size,
             content: self.content.clone(),
+            // The spool records no tail fingerprint (#620 covers the file
+            // source); its cursor is judged by inode, length and first page.
+            tail: None,
         }
     }
 }
