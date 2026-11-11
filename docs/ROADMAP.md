@@ -266,7 +266,10 @@ reopen quietly.
   record that leader sends under the leader's entries. After a catch-up its
   vector equals the leader's for the caught-up range (after a partial
   catch-up, only that far). A crash between an append and that filing is
-  repaired when the replica next opens, before it answers anything. A
+  repaired when the replica next opens, before it answers anything, provided
+  the `fencing-epochs.leader` sidecar survived intact; a missing or torn
+  sidecar reads as "no lineage" and repairs nothing, leaving those records
+  filed as before #640 (an Unknown answer later, never a counted one). A
   follower the fence did not reach, or one that
   kept a dispute that has not settled, adopts at its tail as before.
   **Compatibility:** the journal format is unchanged, so an older binary
