@@ -1302,6 +1302,12 @@ pub struct Engine {
     /// Last committed-history prune attempt (#128); pruning is idle-cycle
     /// only and rate-limited, so a busy pipeline never pays for it.
     last_ledger_prune: Option<std::time::Instant>,
+    /// VERIFIED rows this process holds and has not committed (#624): held
+    /// back by recovery above a range of the same unit that is being read
+    /// again, or whose source commit failed. Each is re-checked after every
+    /// later pass of its source type ([`Engine::settle_verified`]). Before,
+    /// only the next restart looked at them again.
+    unsettled: Vec<Unsettled>,
     /// Exclusive work-dir lock held for the engine's lifetime (#66).
     /// Held only by [`Engine::new_exclusive`] instances; empty for read-only
     /// construction (#66).
@@ -1579,6 +1585,7 @@ impl Engine {
             cycle_had_failure: false,
             failure_streak: 0,
             last_ledger_prune: None,
+            unsettled: Vec::new(),
             _instance_locks: Vec::new(),
         })
     }
@@ -1664,11 +1671,151 @@ impl Engine {
                 "no enabled adapter for source type {source_type}"
             )));
         };
+        // Rows left uncommitted by EARLIER passes are re-checked after this
+        // one (#624): after, so a held-back range is settled by the pass whose
+        // re-read committed past it; only earlier ones, so a commit that has
+        // just failed is not retried at once against a source that just
+        // refused it.
+        let earlier = self
+            .unsettled
+            .iter()
+            .filter(|row| row.source_type == source_type)
+            .count();
         let result = self
             .run_cycle(adapter.as_mut(), &source_type, force_flush)
             .await;
+        if earlier > 0 {
+            self.settle_verified(adapter.as_mut(), &source_type, earlier)
+                .await;
+        }
         self.adapters.insert(source_type, adapter);
         result
+    }
+
+    /// Re-check the VERIFIED rows of `source_type` this process left
+    /// uncommitted - the first `count` of them, the ones recorded before the
+    /// pass that just ran - and commit those that may commit now (#624).
+    ///
+    /// Recovery ran only at startup, so a VERIFIED row it held back, or one
+    /// whose source commit failed, stayed VERIFIED until the next restart.
+    /// That restart then committed it after newer ranges had committed past
+    /// it: the Kafka group offset went backwards (#614, #617), and the file
+    /// adapter's cursor - its read head too, for a range read before the
+    /// restart - went back to the stale end and read everything since again.
+    ///
+    /// Nothing is claimed. Every row here is this process's own: created by
+    /// its pipeline, or claimed by its recovery, and in both cases it still
+    /// holds the fence token (VERIFIED releases none) and has finished with
+    /// it - the pass that produced it committed or gave up on it before
+    /// returning. So no in-flight batch, of this engine or another, is ever
+    /// touched: `claim_incomplete_batches` would claim this engine's own
+    /// in-flight rows. A row that another engine has claimed since (its lease
+    /// ran out) refuses the ledger write and is dropped here; that engine's
+    /// recovery commits it.
+    ///
+    /// - A row recovery held back waits until its source has committed past
+    ///   its END - by then the re-read below it has archived and committed its
+    ///   bytes again, and committing it moves no source: the Kafka adapter
+    ///   skips a commit at or below its frontier (#617), the file and spool
+    ///   adapters one at or below a committed point they confirmed. Committing
+    ///   it any earlier could move the committed point past bytes still being
+    ///   re-read, which is what the hold-back is for.
+    /// - A row whose commit failed is retried as the pipeline left it: the
+    ///   pipeline had already decided it may commit. A newer range committed
+    ///   since makes the retry the same superseded no-op.
+    async fn settle_verified(
+        &mut self,
+        adapter: &mut dyn SourceAdapter,
+        source_type: &SourceType,
+        count: usize,
+    ) {
+        let mut earlier = Vec::new();
+        let mut kept = Vec::new();
+        for row in std::mem::take(&mut self.unsettled) {
+            if &row.source_type == source_type && earlier.len() < count {
+                earlier.push(row);
+            } else {
+                kept.push(row);
+            }
+        }
+        for row in earlier {
+            if !self.settle_one(adapter, &row).await {
+                kept.push(row);
+            }
+        }
+        self.unsettled = kept;
+    }
+
+    /// Settle one row; `true` when it needs no more attention (committed, or
+    /// no longer this process's to commit).
+    async fn settle_one(&self, adapter: &mut dyn SourceAdapter, row: &Unsettled) -> bool {
+        let rec = match self.store.get_batch(&row.batch_id).await {
+            Ok(Some(rec)) if rec.state == BatchState::Verified => rec,
+            // Gone, or moved on: nothing left for this process to commit.
+            Ok(_) => return true,
+            Err(e) => {
+                tracing::warn!(batch_id = %row.batch_id, error = %e, "could not re-read an uncommitted VERIFIED row; retried after the next pass");
+                return false;
+            }
+        };
+        if row.held_back
+            && !adapter
+                .committed_through(&rec.progress_end)
+                .is_some_and(|committed| committed >= end_position(&rec.progress_end))
+        {
+            return false;
+        }
+        if let Err(e) = adapter.commit_progress(&rec.progress_end).await {
+            tracing::warn!(batch_id = %rec.batch_id, error = %e, "source commit still failing; retried after the next pass");
+            return false;
+        }
+        match self.store.mark_source_committed(&rec.batch_id).await {
+            Ok(()) => {
+                if let Some(mx) = telemetry::metrics() {
+                    let l = [
+                        rec.tenant.as_str(),
+                        rec.source_type.as_str(),
+                        rec.format.extension(),
+                    ];
+                    // A row recovery held back was verified by the process
+                    // that crashed; count it here, as `commit_recovered` does,
+                    // so commits_total never exceeds verified_total. A failed
+                    // commit's verification was counted by the pipeline.
+                    if row.held_back {
+                        mx.verified_total.with_label_values(&l).inc();
+                        mx.batches_total
+                            .with_label_values(&[l[0], l[1], l[2], BatchState::Verified.as_str()])
+                            .inc();
+                    }
+                    mx.commits_total.with_label_values(&l).inc();
+                    mx.batches_total
+                        .with_label_values(&[
+                            l[0],
+                            l[1],
+                            l[2],
+                            BatchState::SourceCommitted.as_str(),
+                        ])
+                        .inc();
+                }
+                tracing::info!(
+                    batch_id = %rec.batch_id,
+                    held_back = row.held_back,
+                    "source_committed (an earlier pass left it VERIFIED)"
+                );
+                true
+            }
+            Err(e) => {
+                let lost = e.to_string().contains("claimed by another engine")
+                    || e.to_string().contains("not claimed by this engine");
+                tracing::warn!(
+                    batch_id = %rec.batch_id,
+                    error = %e,
+                    lost,
+                    "could not record the commit of an earlier VERIFIED row"
+                );
+                lost
+            }
+        }
     }
 
     async fn run_cycle(
@@ -2052,11 +2199,24 @@ impl Engine {
                 Ok(VerifyStep::Verified(v)) => {
                     let batch_id = v.batch_id.clone();
                     match self.pipeline().commit_verified(adapter, v).await {
-                        Ok(outcome) => outcomes.push(outcome),
+                        Ok(outcome) => {
+                            // The source commit failed: the row stays VERIFIED,
+                            // and a later pass retries it (#624).
+                            if !outcome.committed {
+                                self.unsettled
+                                    .push(Unsettled::commit_failed(&batch_id, source_type));
+                            }
+                            outcomes.push(outcome)
+                        }
                         Err(e) => {
-                            // Already VERIFIED and durable; recovery retries the
-                            // commit. Keep going so siblings still commit.
+                            // Already VERIFIED and durable (the source may
+                            // have committed, the ledger write did not); a
+                            // later pass retries it (#624), and recovery
+                            // after a restart. Keep going so siblings still
+                            // commit.
                             tracing::error!(batch_id, error = %e, "commit failed after verify");
+                            self.unsettled
+                                .push(Unsettled::commit_failed(&batch_id, source_type));
                             first_err.get_or_insert(e);
                         }
                     }
@@ -2496,6 +2656,7 @@ impl Engine {
                      it stays VERIFIED until the lower range has been re-read"
                 );
                 summary.still_pending += 1;
+                self.unsettled.push(Unsettled::held_back(&rec));
                 continue;
             }
             self.commit_recovered(&rec, &mut summary).await?;
@@ -2635,6 +2796,8 @@ impl Engine {
                 Err(e) => {
                     tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery commit failed");
                     summary.still_pending += 1;
+                    self.unsettled
+                        .push(Unsettled::commit_failed(&rec.batch_id, &rec.source_type));
                 }
             }
         } else {
@@ -3344,6 +3507,35 @@ fn unit_key(marker: &ProgressMarker) -> String {
     match marker_inode(marker) {
         Some(inode) => format!("{}|{inode}", source_key(marker)),
         None => format!("{}|?", source_key(marker)),
+    }
+}
+
+/// A VERIFIED row this process left uncommitted (#624); see
+/// [`Engine::settle_verified`].
+#[derive(Debug, Clone)]
+struct Unsettled {
+    batch_id: String,
+    source_type: SourceType,
+    /// Held back by recovery above a range being read again, rather than
+    /// left by a source commit that failed.
+    held_back: bool,
+}
+
+impl Unsettled {
+    fn held_back(rec: &BatchRecord) -> Self {
+        Self {
+            batch_id: rec.batch_id.clone(),
+            source_type: rec.source_type.clone(),
+            held_back: true,
+        }
+    }
+
+    fn commit_failed(batch_id: &str, source_type: &SourceType) -> Self {
+        Self {
+            batch_id: batch_id.to_owned(),
+            source_type: source_type.clone(),
+            held_back: false,
+        }
     }
 }
 
@@ -4629,13 +4821,14 @@ mod tests {
                 Some(Failed),
             ),
             // After VERIFIED nothing is handed back: the range is archived,
-            // the row stays VERIFIED, and recovery retries the commit.
+            // the row stays VERIFIED, and the next pass retries the commit
+            // (#624) - superseded by then, so the source does not move back.
             (
                 "SOURCE_COMMITTED",
                 &[To(SourceCommitted)],
                 false,
                 true,
-                Some(Verified),
+                Some(SourceCommitted),
             ),
         ];
         for &(case, refused, throttled, first_errs, first_row) in cases {
@@ -4793,6 +4986,113 @@ mod tests {
         fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
             self.0.as_any_mut()
         }
+    }
+
+    /// Delegates to the real adapter, but its next `failures` source commits
+    /// fail (a Kafka coordinator that is unavailable, say).
+    struct FailingCommits {
+        inner: Box<dyn SourceAdapter>,
+        failures: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl SourceAdapter for FailingCommits {
+        async fn discover_sources(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
+            self.inner.discover_sources().await
+        }
+        async fn read_batch_candidates(
+            &mut self,
+            source: &DiscoveredSource,
+            max_records: usize,
+            max_bytes: usize,
+            max_wait: Duration,
+        ) -> Result<Vec<ReadResult>, VtopError> {
+            self.inner
+                .read_batch_candidates(source, max_records, max_bytes, max_wait)
+                .await
+        }
+        async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            if self.failures > 0 {
+                self.failures -= 1;
+                return Err(VtopError::Source("source commit refused".into()));
+            }
+            self.inner.commit_progress(marker).await
+        }
+        async fn replay_from_marker(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            self.inner.replay_from_marker(marker).await
+        }
+        fn read_position(&self, marker: &ProgressMarker) -> Option<i128> {
+            self.inner.read_position(marker)
+        }
+        fn committed_through(&self, marker: &ProgressMarker) -> Option<i128> {
+            self.inner.committed_through(marker)
+        }
+        fn source_type(&self) -> SourceType {
+            self.inner.source_type()
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self.inner.as_any_mut()
+        }
+    }
+
+    /// #624: a batch whose source commit failed after VERIFIED stayed
+    /// VERIFIED until the next restart: nothing in the running loop looked
+    /// at it again. It is retried after a later pass of its source - and,
+    /// because a newer range has committed past it by then, retried without
+    /// moving the committed point back.
+    #[tokio::test]
+    async fn a_verified_batch_whose_commit_failed_is_committed_on_a_later_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\n").unwrap();
+        let store = format!("sqlite://{}", dir.path().join("state.db").display());
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            &store,
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 3_600;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let inner = engine.adapters.remove(&SourceType::File).unwrap();
+        engine.adapters.insert(
+            SourceType::File,
+            Box::new(FailingCommits { inner, failures: 1 }),
+        );
+
+        let first = engine.run_source(SourceType::File, true).await.unwrap();
+        assert!(!first[0].committed, "{first:?}");
+        let stuck = first[0].batch_id.clone();
+        assert_eq!(
+            engine.store.get_batch(&stuck).await.unwrap().unwrap().state,
+            BatchState::Verified
+        );
+
+        append_line(&input, "line 2");
+        let second = engine.run_source(SourceType::File, true).await.unwrap();
+        assert!(second.iter().all(|o| o.committed), "{second:?}");
+        let newer = engine
+            .store
+            .get_batch(&second[0].batch_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            engine.store.get_batch(&stuck).await.unwrap().unwrap().state,
+            BatchState::SourceCommitted,
+            "the batch whose commit failed is committed by a later pass, without a restart"
+        );
+        let len = std::fs::metadata(&input).unwrap().len();
+        assert_eq!(
+            engine.adapters[&SourceType::File].committed_through(&newer.progress_end),
+            Some(i128::from(len)),
+            "committing the older range moved the committed point back"
+        );
+        assert_gap_free("commit retried", &archived_ranges(&engine).await, len);
+        let after = engine.run_source(SourceType::File, true).await.unwrap();
+        assert!(after.is_empty(), "nothing is read again: {after:?}");
     }
 
     /// #627, the other direction, and why it is not taken: had the running

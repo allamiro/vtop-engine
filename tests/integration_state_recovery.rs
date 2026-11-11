@@ -1163,7 +1163,7 @@ async fn recovery_does_not_commit_a_verified_range_above_a_failed_one() {
         .await
         .unwrap()
         .into_iter()
-        .filter(|b| b.state == BatchState::SourceCommitted)
+        .filter(|b| b.state == BatchState::SourceCommitted && b.batch_id != "b-above")
         .collect();
     assert_eq!(reread.len(), 1, "{reread:?}");
     let ProgressMarker::File { start_byte, .. } = &reread[0].progress_start else {
@@ -1175,6 +1175,18 @@ async fn recovery_does_not_commit_a_verified_range_above_a_failed_one() {
          would have clamped the rewind to byte 28 and skipped it"
     );
     assert_eq!(reread[0].record_count, Some(4));
+    // #624: and the held-back row is settled in the same pass, without a
+    // restart - the re-read committed past it.
+    assert_eq!(
+        engine
+            .store
+            .get_batch("b-above")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        BatchState::SourceCommitted
+    );
 }
 
 /// #563 (review): a FAILED row whose bytes a later retry already archived and
@@ -1651,4 +1663,136 @@ async fn a_replay_row_above_the_committed_point_is_still_rewound_and_retired_onc
     );
     let outcomes = engine.process_once(SourceType::File).await.unwrap();
     assert!(outcomes.is_empty(), "{outcomes:?}");
+}
+
+// ---- #624: a held-back VERIFIED range is settled while the engine runs -------
+
+/// #624: recovery holds a VERIFIED range back while a lower range of its file
+/// is re-read, and nothing in the running loop looked at it again: it stayed
+/// VERIFIED until the next restart, which then committed it - moving the
+/// committed point, and with it the read head, back below everything the
+/// re-read had archived since.
+///
+/// Now the pass whose re-read commits past it settles it: SOURCE_COMMITTED,
+/// without a restart, and without moving the source back - the next pass
+/// reads nothing again.
+#[tokio::test]
+async fn a_held_back_verified_range_is_settled_without_a_restart_and_without_moving_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    // Six 7-byte lines: the failed range is [0,14), the held-back VERIFIED one
+    // [14,28), and [28,42) has not been read yet.
+    std::fs::write(&input, "line-0\nline-1\nline-2\nline-3\nline-4\nline-5\n").unwrap();
+    let inode = inode_of(&input);
+    let db = dir.path().join("state.db");
+    let url = format!("sqlite://{}", db.display());
+    let path = input.to_string_lossy().into_owned();
+
+    let above = file_row("b-above", &path, inode, (14, 28), "2026-01-01T00:00:01Z");
+    let object_uri = "s3://telemetry-data/x/b-above.raw.gz";
+    let manifest_uri = "s3://telemetry-data/x/b-above.manifest.json";
+    let object_bytes = b"archived-bytes";
+    let object_digest = vtop_core::checksum::sha256_bytes(object_bytes);
+    let (manifest, manifest_path) = write_recovery_manifest_with_records(
+        &work,
+        "b-above",
+        &path,
+        above.progress_end.clone(),
+        object_uri,
+        manifest_uri,
+        object_bytes.len() as u64,
+        "sha256",
+        &object_digest,
+        2,
+    );
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        hand_back_row(
+            &store,
+            &file_row("b-failed", &path, inode, (0, 14), "2026-01-01T00:00:00Z"),
+        )
+        .await;
+        let mut above = above.clone();
+        above.object_uri = Some(object_uri.into());
+        above.manifest_uri = Some(manifest_uri.into());
+        above.object_sha256 = Some(object_digest.clone());
+        above.manifest_sha256 = Some(manifest.manifest.sha256.clone());
+        above.object_size_bytes = Some(object_bytes.len() as i64);
+        store.save_batch_state(&above).await.unwrap();
+        for st in [
+            BatchState::Sealed,
+            BatchState::Compressed,
+            BatchState::Checksummed,
+            BatchState::ObjectUploaded,
+            BatchState::ManifestUploaded,
+            BatchState::Verified,
+        ] {
+            store
+                .update_batch_state("b-above", st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    let cfg = file_config(work.to_str().unwrap(), &url, vec![path.clone()], "mock");
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let staged = dir.path().join("staged-object");
+    std::fs::write(&staged, object_bytes).unwrap();
+    engine
+        .backend
+        .put_object(
+            &staged,
+            object_uri,
+            Some(vtop_upload::ObjectChecksum::new("sha256", &object_digest)),
+        )
+        .await
+        .unwrap();
+    engine
+        .backend
+        .put_manifest(
+            &manifest_path,
+            manifest_uri,
+            Some(vtop_upload::ObjectChecksum::new(
+                "sha256",
+                &manifest.manifest.sha256,
+            )),
+        )
+        .await
+        .unwrap();
+
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(
+        (
+            summary.committed,
+            summary.still_pending,
+            summary.replay_required
+        ),
+        (0, 1, 1),
+        "the VERIFIED range is held back above the failed one ({summary:?})"
+    );
+
+    // The re-read from byte 0 archives the whole file and commits it; the
+    // held-back range is settled in the same pass.
+    let outcomes = engine.process_once(SourceType::File).await.unwrap();
+    assert!(outcomes.iter().all(|o| o.committed), "{outcomes:?}");
+    let held = engine.store.get_batch("b-above").await.unwrap().unwrap();
+    assert_eq!(
+        held.state,
+        BatchState::SourceCommitted,
+        "settled without a restart"
+    );
+    let file = &engine.adapters[&SourceType::File];
+    assert_eq!(
+        file.committed_through(&held.progress_end),
+        Some(42),
+        "settling the older range moved the committed point back"
+    );
+    let again = engine.process_once(SourceType::File).await.unwrap();
+    assert!(
+        again.is_empty(),
+        "settling the older range moved the read head back: {again:?}"
+    );
 }
