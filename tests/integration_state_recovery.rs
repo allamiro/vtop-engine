@@ -2092,3 +2092,157 @@ async fn a_held_back_verified_range_is_settled_without_a_restart_and_without_mov
         "settling the older range moved the read head back: {again:?}"
     );
 }
+
+/// #624 with #651: the settle pass is a commit path for a row recovery left,
+/// so a size-only acceptance at recovery's re-check is counted when the row
+/// settles - once - and never at the hold, as `commit_recovered` counts it.
+///
+/// A FAILED `[0,7)` holds back a VERIFIED `[7,14)` whose re-check can confirm
+/// only size (`MockBackend::limited`). Both rows carry the inode and content
+/// fingerprint the file adapter records, so #567's identity rule lets the
+/// held row settle once the re-read has committed past it. The held row's
+/// tenant is its own: the re-read's pipeline batch is counted under the
+/// engine's tenant, so the counter below moves for the settle alone.
+#[tokio::test]
+async fn a_held_back_size_only_row_counts_its_size_only_acceptance_when_it_settles() {
+    let row_tenant = "tenant-624-settled-size-only";
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    std::fs::write(&input, "line-0\nline-1\n").unwrap();
+    let inode = inode_of(&input);
+    let head = std::fs::read(&input).unwrap();
+    let url = format!("sqlite://{}", dir.path().join("state.db").display());
+    let path = input.to_string_lossy().into_owned();
+    let range = |start: u64, end: u64| ProgressMarker::File {
+        path: path.clone(),
+        inode,
+        start_byte: start,
+        end_byte: end,
+        file_size: 14,
+        mtime: String::new(),
+        content_fingerprint: vtop_core::types::ContentFingerprint::of(&head),
+        tail_fingerprint: None,
+    };
+    let object_uri = "s3://telemetry-data/x/b-held.raw.gz";
+    let manifest_uri = "s3://telemetry-data/x/b-held.manifest.json";
+    // Checksums disabled, and a backend that can only confirm size.
+    let (manifest, manifest_path) = write_recovery_manifest(
+        &work,
+        "b-held",
+        &path,
+        range(7, 14),
+        object_uri,
+        manifest_uri,
+        14,
+        "none",
+        "",
+    );
+    let row = |id: &str, start: u64, end: u64, at: &str| BatchRecord {
+        batch_id: id.into(),
+        tenant: row_tenant.into(),
+        source_type: SourceType::File,
+        source_name: path.clone(),
+        format: TelemetryFormat::Raw,
+        state: BatchState::Batching,
+        progress_start: range(start, end),
+        progress_end: range(start, end),
+        object_uri: None,
+        manifest_uri: None,
+        object_sha256: None,
+        manifest_sha256: None,
+        manifest_version_id: None,
+        object_size_bytes: None,
+        record_count: Some(1),
+        error_message: None,
+        owner: None,
+        lease_expires_at: None,
+        created_at: at.into(),
+        updated_at: at.into(),
+    };
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        hand_back_row(&store, &row("b-below", 0, 7, "2026-01-01T00:00:00Z")).await;
+        let mut held = row("b-held", 7, 14, "2026-01-01T00:00:01Z");
+        held.object_uri = Some(object_uri.into());
+        held.manifest_uri = Some(manifest_uri.into());
+        held.object_sha256 = Some(String::new());
+        held.manifest_sha256 = Some(manifest.manifest.sha256.clone());
+        held.object_size_bytes = Some(14);
+        store.save_batch_state(&held).await.unwrap();
+        for st in [
+            BatchState::Sealed,
+            BatchState::Compressed,
+            BatchState::Checksummed,
+            BatchState::ObjectUploaded,
+            BatchState::ManifestUploaded,
+            BatchState::Verified,
+        ] {
+            store
+                .update_batch_state("b-held", st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    // testkit's config has require_strong_verification: false.
+    let mut cfg = file_config(work.to_str().unwrap(), &url, vec![path.clone()], "mock");
+    cfg.engine.tenant = "tenant-624-settle-engine".into();
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    engine.backend = std::sync::Arc::new(vtop_upload::MockBackend::limited());
+    let staged = dir.path().join("staged");
+    std::fs::write(&staged, b"fourteen-bytes").unwrap();
+    engine
+        .backend
+        .put_object(&staged, object_uri, None)
+        .await
+        .unwrap();
+    engine
+        .backend
+        .put_manifest(&manifest_path, manifest_uri, None)
+        .await
+        .unwrap();
+
+    let before = size_only_count(row_tenant);
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(
+        (
+            summary.committed,
+            summary.still_pending,
+            summary.replay_required
+        ),
+        (0, 1, 1),
+        "b-held passes its size-only re-check and is held back: {summary:?}"
+    );
+    assert_eq!(
+        size_only_count(row_tenant) - before,
+        0,
+        "nothing is counted at the hold"
+    );
+
+    // The re-read from byte 0 commits past b-held, and the settle pass
+    // commits it in the same pass.
+    let outcomes = engine.process_once(SourceType::File).await.unwrap();
+    assert!(outcomes.iter().all(|o| o.committed), "{outcomes:?}");
+    assert_eq!(
+        engine
+            .store
+            .get_batch("b-held")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        BatchState::SourceCommitted,
+        "the held-back row settled without a restart"
+    );
+    assert_eq!(
+        size_only_count(row_tenant) - before,
+        1,
+        "the settled row's size-only acceptance is counted once, at its commit"
+    );
+    // And not again.
+    engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(size_only_count(row_tenant) - before, 1);
+}
