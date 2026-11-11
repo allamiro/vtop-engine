@@ -11,7 +11,7 @@
 //! engine holds a `Box<dyn StateStore>`. Postgres arrives in Phase 3 behind a
 //! Cargo feature and implements the exact same trait.
 
-use crate::models::{BatchPatch, BatchRecord, CommittedCursor};
+use crate::models::{BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset};
 use crate::sqlite_store::SqliteStateStore;
 use async_trait::async_trait;
 use vtop_core::errors::VtopError;
@@ -203,6 +203,17 @@ pub trait StateStore: Send + Sync {
         source_type: SourceType,
     ) -> Result<Vec<CommittedCursor>, VtopError>;
 
+    /// Where each Kafka (topic, partition, consumer group) resumes according
+    /// to the ledger: the end offset of its NEWEST committed batch, by
+    /// `(created_at, batch_id)`, computed IN THE STORE (#77, #614).
+    ///
+    /// The Kafka adapter resumes from this rather than from the group's
+    /// committed offset on the broker, which any engine can move, fenced or
+    /// not. History pruning keeps exactly this row for every (topic,
+    /// partition, consumer group), so the answer is the same before and after
+    /// any prune.
+    async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError>;
+
     /// All batches, newest first.
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError>;
 
@@ -229,9 +240,11 @@ pub trait StateStore: Send + Sync {
     /// returns the number deleted. Three protections are non-negotiable:
     /// rows in any other state are never touched; rows at or after the
     /// cutoff are never touched; and for every source path (falling back to
-    /// `source_name` when the progress marker carries no path) the NEWEST
+    /// `source_name` when the progress marker carries no path), and for a
+    /// Kafka row every (topic, partition, consumer group), the NEWEST
     /// committed row - by `created_at`, then `batch_id` - is always retained,
-    /// so [`StateStore::committed_cursors`] returns identical cursor seeds
+    /// so [`StateStore::committed_cursors`] and
+    /// [`StateStore::committed_kafka_offsets`] return identical answers
     /// before and after any prune. [`StateStore::max_committed_end_bytes`]
     /// is not prune-invariant: the highest end byte can belong to an older
     /// generation of the file, which is exactly the row a restart must not

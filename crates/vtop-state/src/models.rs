@@ -92,6 +92,26 @@ pub struct CommittedCursor {
     pub tail_fingerprint: Option<ContentFingerprint>,
 }
 
+/// Where the ledger says a Kafka partition resumes, for one consumer group
+/// (#614): the end offset of the NEWEST committed batch read from it.
+///
+/// The group's committed offset on the broker cannot answer this. The adapter
+/// reads with `assign()`, so its commits carry no group generation, and Kafka
+/// accepts one from an engine whose claim has already moved on - backwards or
+/// forwards. The ledger's commit is fenced (#557); this is what it recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedKafkaOffset {
+    pub topic: String,
+    pub partition: i32,
+    pub consumer_group: String,
+    /// The newest committed batch's last offset; the partition resumes at the
+    /// one after it. Newest by `(created_at, batch_id)` - the order the windows
+    /// were read, and the row pruning keeps - not the highest: a topic that
+    /// was deleted and recreated starts its offsets again, and the old topic's
+    /// highest offset would skip the new one's first records.
+    pub end_offset: i64,
+}
+
 /// A `content_fingerprint` read out of a stored marker as JSON text. Anything
 /// that does not parse reads as "unknown", never as some other fingerprint:
 /// an unknown fingerprint only forgoes a check, a wrong one would invent a

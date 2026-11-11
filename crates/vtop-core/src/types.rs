@@ -405,6 +405,100 @@ impl ProgressMarker {
         }
     }
 
+    /// The range a batch built from several reads holds (#622): the last
+    /// read's marker `last` with the first read's start (`first`).
+    ///
+    /// The engine buffers reads of one unit into one window, and each read's
+    /// end marker carries THAT read's start. A manifest or batch id built
+    /// from the last read's end marker alone named only its range and hid the
+    /// window's earlier bytes or offsets. This is for naming and describing
+    /// the batch only: the commit marker stays `last`, because the file
+    /// adapter settles a commit by the exact range of the read it issued.
+    ///
+    /// `last` is returned unchanged when `first` does not name the same unit
+    /// (another variant, topic, partition, group, path, spool, or a known
+    /// different inode) or starts above it: a window never spans either, and
+    /// a range the markers do not prove must not be claimed.
+    pub fn spanning(first: &Self, last: &Self) -> Self {
+        // An unknown inode on either side proves no change of file, as in
+        // the engine's window continuity check.
+        let same_inode = |a: &Option<u64>, b: &Option<u64>| match (a, b) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+        let mut span = last.clone();
+        match (first, &mut span) {
+            (
+                ProgressMarker::Kafka {
+                    topic: first_topic,
+                    partition: first_partition,
+                    consumer_group: first_group,
+                    start_offset: first_start,
+                    ..
+                },
+                ProgressMarker::Kafka {
+                    topic,
+                    partition,
+                    consumer_group,
+                    start_offset,
+                    ..
+                },
+            ) if first_topic == topic
+                && first_partition == partition
+                && first_group == consumer_group
+                && first_start <= start_offset =>
+            {
+                *start_offset = *first_start;
+            }
+            (
+                ProgressMarker::File {
+                    path: first_path,
+                    inode: first_inode,
+                    start_byte: first_start,
+                    ..
+                },
+                ProgressMarker::File {
+                    path,
+                    inode,
+                    start_byte,
+                    ..
+                },
+            ) if first_path == path
+                && same_inode(first_inode, inode)
+                && first_start <= start_byte =>
+            {
+                *start_byte = *first_start;
+            }
+            (
+                ProgressMarker::SyslogSpool {
+                    spool_id: first_spool,
+                    path: first_path,
+                    inode: first_inode,
+                    start_byte: first_start,
+                    received_time_start: first_received,
+                    ..
+                },
+                ProgressMarker::SyslogSpool {
+                    spool_id,
+                    path,
+                    inode,
+                    start_byte,
+                    received_time_start,
+                    ..
+                },
+            ) if first_spool == spool_id
+                && first_path == path
+                && same_inode(first_inode, inode)
+                && first_start <= start_byte =>
+            {
+                *start_byte = *first_start;
+                *received_time_start = first_received.clone();
+            }
+            _ => {}
+        }
+        span
+    }
+
     /// This marker as a manifest carries it: without the fields #578 and
     /// #620 added.
     ///
@@ -647,6 +741,142 @@ mod tests {
         let small = ContentFingerprint::of_tail(b"one line\n").unwrap();
         assert_eq!(small.len, 9);
         assert!(small.matches_bytes(b"one line\n"));
+    }
+
+    fn file(path: &str, inode: Option<u64>, start: u64, end: u64) -> ProgressMarker {
+        ProgressMarker::File {
+            path: path.into(),
+            inode,
+            start_byte: start,
+            end_byte: end,
+            file_size: end,
+            mtime: "m".into(),
+            content_fingerprint: ContentFingerprint::of(b"head"),
+            // The page below `end` (#620), distinct per end, so a span that
+            // kept any read's tail but the last one's would not compare equal.
+            tail_fingerprint: (end > 0)
+                .then(|| ContentFingerprint::of_tail(format!("below {end}").as_bytes()))
+                .flatten(),
+        }
+    }
+
+    fn kafka(topic: &str, partition: i32, start: i64, end: i64) -> ProgressMarker {
+        ProgressMarker::Kafka {
+            topic: topic.into(),
+            partition,
+            start_offset: start,
+            end_offset: end,
+            consumer_group: "g".into(),
+        }
+    }
+
+    fn spool(inode: Option<u64>, start: u64, end: u64, received: Option<&str>) -> ProgressMarker {
+        ProgressMarker::SyslogSpool {
+            spool_id: "s".into(),
+            path: "/s".into(),
+            inode,
+            start_byte: start,
+            end_byte: end,
+            received_time_start: received.map(str::to_owned),
+            received_time_end: Some("end".into()),
+            file_size: Some(end),
+            content_fingerprint: None,
+        }
+    }
+
+    /// #622: a window's range is its first read's start to its last read's
+    /// end, everything else (identity, size, end) taken from the last read.
+    #[test]
+    fn a_span_takes_the_first_reads_start_and_the_last_reads_everything_else() {
+        let span =
+            ProgressMarker::spanning(&file("/a", Some(7), 0, 0), &file("/a", Some(7), 12, 30));
+        assert_eq!(span, file("/a", Some(7), 0, 30));
+        assert_eq!(span.range_token(), "b0-30");
+
+        let span = ProgressMarker::spanning(&kafka("t", 2, 100, 100), &kafka("t", 2, 200, 249));
+        assert_eq!(span, kafka("t", 2, 100, 249));
+        assert_eq!(span.range_token(), "p2-100-249");
+
+        let span = ProgressMarker::spanning(
+            &spool(Some(4), 10, 10, Some("first")),
+            &spool(Some(4), 40, 90, Some("last")),
+        );
+        assert_eq!(span, spool(Some(4), 10, 90, Some("first")));
+
+        // An unknown inode on one side proves no change of file.
+        let span = ProgressMarker::spanning(&file("/a", None, 0, 0), &file("/a", Some(7), 12, 30));
+        assert_eq!(span, file("/a", Some(7), 0, 30));
+
+        // A single read: the span is the read itself.
+        let one = file("/a", Some(7), 12, 30);
+        assert_eq!(
+            ProgressMarker::spanning(&file("/a", Some(7), 12, 12), &one),
+            one
+        );
+    }
+
+    /// #620 with #622: a span ends where the LAST read ended, so its tail
+    /// fingerprint - the page below `end_byte` - must be the last read's, never
+    /// the first's (that would name bytes below the first read's end, at the
+    /// span's end). A last read with no tail gives a span with none. And the
+    /// manifest's copy of a span carries no tail, as for any marker.
+    #[test]
+    fn a_span_carries_the_last_reads_tail_and_a_manifest_carries_none() {
+        let first = file("/a", Some(7), 0, 12);
+        let last = file("/a", Some(7), 12, 30);
+        let span = ProgressMarker::spanning(&first, &last);
+        assert_eq!(span.range_token(), "b0-30");
+        assert_eq!(span.tail_fingerprint(), last.tail_fingerprint());
+        assert_ne!(span.tail_fingerprint(), first.tail_fingerprint());
+        assert!(span.tail_fingerprint().is_some());
+
+        let mut untailed = last.clone();
+        if let ProgressMarker::File {
+            tail_fingerprint, ..
+        } = &mut untailed
+        {
+            *tail_fingerprint = None;
+        }
+        assert_eq!(
+            ProgressMarker::spanning(&first, &untailed).tail_fingerprint(),
+            None,
+            "the first read's tail must not stand in for a last read that has none"
+        );
+
+        let manifest = span.for_manifest();
+        assert_eq!(manifest.tail_fingerprint(), None);
+        assert_eq!(manifest.content_fingerprint(), None);
+        assert_eq!(manifest.range_token(), "b0-30");
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(!json.contains("tail_fingerprint"), "{json}");
+    }
+
+    /// A span is never claimed across two units, or backwards: the last
+    /// read's own range is all the markers prove.
+    #[test]
+    fn a_span_across_units_or_backwards_is_only_the_last_read() {
+        let last = file("/a", Some(7), 12, 30);
+        for first in [
+            file("/b", Some(7), 0, 0),
+            file("/a", Some(8), 0, 0),
+            file("/a", Some(7), 20, 20),
+            kafka("t", 0, 0, 0),
+        ] {
+            assert_eq!(ProgressMarker::spanning(&first, &last), last, "{first:?}");
+        }
+        let last = kafka("t", 2, 200, 249);
+        for first in [
+            kafka("u", 2, 0, 0),
+            kafka("t", 3, 0, 0),
+            kafka("t", 2, 201, 201),
+        ] {
+            assert_eq!(ProgressMarker::spanning(&first, &last), last, "{first:?}");
+        }
+        let last = spool(Some(4), 40, 90, Some("last"));
+        assert_eq!(
+            ProgressMarker::spanning(&spool(Some(5), 0, 0, None), &last),
+            last
+        );
     }
 
     #[test]

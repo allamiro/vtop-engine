@@ -25,7 +25,7 @@
 //!
 //! Compiled only with `--features postgres`.
 
-use crate::models::{BatchPatch, BatchRecord, CommittedCursor};
+use crate::models::{BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset};
 use crate::store::StateStore;
 use async_trait::async_trait;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
@@ -56,7 +56,9 @@ const MAX_CONFLICT_RETRIES: u32 = 5;
 /// candidate listing and the listed delete (#560) so the three cannot drift.
 /// A row is deletable only when a newer committed row - ordered by
 /// (created_at, batch_id), the order committed_cursors reads - exists for
-/// its source path, so the restart cursor's row always survives (#564). The
+/// its source path, so the restart cursor's row always survives (#564) - and,
+/// for a Kafka row, of its partition and consumer group, where that
+/// partition resumes (#614; see the SQLite predicate). The
 /// successor probe's expressions must stay identical to
 /// idx_batches_commit_newest in migrations/postgres/0001_state_store.sql.
 macro_rules! pg_prune_predicate_sql {
@@ -68,6 +70,10 @@ macro_rules! pg_prune_predicate_sql {
               AND n.source_type = b.source_type \
               AND COALESCE(n.progress_end_json::jsonb ->> 'path', n.source_name) \
                   = COALESCE(b.progress_end_json::jsonb ->> 'path', b.source_name) \
+              AND (n.progress_end_json::jsonb ->> 'partition') \
+                  IS NOT DISTINCT FROM (b.progress_end_json::jsonb ->> 'partition') \
+              AND (n.progress_end_json::jsonb ->> 'consumer_group') \
+                  IS NOT DISTINCT FROM (b.progress_end_json::jsonb ->> 'consumer_group') \
               AND (n.created_at > b.created_at \
                    OR (n.created_at = b.created_at AND n.batch_id > b.batch_id)) \
           )"
@@ -564,6 +570,47 @@ impl StateStore for PgStateStore {
                     tail_fingerprint: tail
                         .as_deref()
                         .and_then(crate::models::parse_content_fingerprint),
+                })
+            })
+            .collect())
+    }
+
+    async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
+        // See the SQLite implementation: the newest committed row per (topic,
+        // partition, consumer group), in the order pruning keeps.
+        let rows = sqlx::query(
+            "WITH committed AS ( \
+                 SELECT progress_end_json::jsonb ->> 'topic' AS topic, \
+                        (progress_end_json::jsonb ->> 'partition')::bigint AS part, \
+                        progress_end_json::jsonb ->> 'consumer_group' AS grp, \
+                        (progress_end_json::jsonb ->> 'end_offset')::bigint AS end_offset, \
+                        created_at, batch_id \
+                 FROM batches WHERE state = $1 AND source_type = $2 \
+             ), latest AS ( \
+                 SELECT topic, part, grp, end_offset, ROW_NUMBER() OVER ( \
+                            PARTITION BY topic, part, grp \
+                            ORDER BY created_at DESC, batch_id DESC) AS rn \
+                 FROM committed \
+             ) \
+             SELECT topic, part, grp, end_offset FROM latest WHERE rn = 1",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(SourceType::Kafka.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let topic: Option<String> = r.get("topic");
+                let partition: Option<i64> = r.get("part");
+                let group: Option<String> = r.get("grp");
+                let end: Option<i64> = r.get("end_offset");
+                Some(CommittedKafkaOffset {
+                    topic: topic?,
+                    partition: i32::try_from(partition?).ok()?,
+                    consumer_group: group?,
+                    end_offset: end?,
                 })
             })
             .collect())
