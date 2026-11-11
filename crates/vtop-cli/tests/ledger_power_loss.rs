@@ -178,6 +178,12 @@ impl StateStore for Recorder {
     ) -> Result<Vec<CommittedCursor>, VtopError> {
         self.inner.committed_cursors(source_type).await
     }
+    async fn committed_cursors_by_file(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<CommittedCursor>, VtopError> {
+        self.inner.committed_cursors_by_file(source_type).await
+    }
     async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
         self.inner.committed_kafka_offsets().await
     }
