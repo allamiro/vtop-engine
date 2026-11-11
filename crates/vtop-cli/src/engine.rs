@@ -1549,12 +1549,15 @@ impl Engine {
                 let fmt = default_format_for(&streams, SourceType::File);
                 adapters.insert(
                     SourceType::File,
-                    Box::new(FileSource::with_mode(
-                        f.paths.clone(),
-                        fmt,
-                        f.delete_after_commit,
-                        f.whole_file,
-                    )),
+                    Box::new(
+                        FileSource::with_mode(
+                            f.paths.clone(),
+                            fmt,
+                            f.delete_after_commit,
+                            f.whole_file,
+                        )
+                        .with_delete_quiet_period(Duration::from_secs(f.delete_quiet_seconds)),
+                    ),
                 );
             }
         }
@@ -2552,6 +2555,10 @@ impl Engine {
                         c.content_fingerprint,
                         c.tail_fingerprint,
                     );
+                    // A file archived but not yet deleted before the restart
+                    // (#619): re-armed only if it still has the mtime the
+                    // committed batch saw.
+                    fs.arm_delete_from_seed(&c.path, c.observed_mtime.as_deref());
                 }
             }
         }
