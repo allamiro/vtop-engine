@@ -79,8 +79,10 @@ emit_lease_yaml() {
 }
 eval "lib_$(declare -f lease_field)"
 lease_field() { # <meta-id> <python expression over `d`>
-  local id="$1" expr="$2" m
+  local id="$1" expr="$2" m tried=" "
   for m in "$id" 1 2 3; do
+    [[ "$tried" == *" $m "* ]] && continue
+    tried+="$m "
     lib_lease_field "$m" "$expr" && return 0
   done
   return 1
@@ -149,12 +151,28 @@ echo "$PRODUCER" >> "$WORKDIR/pids"
 await_acked_floor "$ACKED_FILE" "$SHARED"
 # An acknowledgement proves only that SOME majority holds the prefix (#646
 # review). Both followers must hold it before C dies, so that what C lacks is
-# exactly the suffix acknowledged after. The committed offset counts the
-# epoch's boundary marker too, hence the epoch on top of the record count.
+# exactly the suffix acknowledged after. The target is the leader's own
+# committed offset, read once the prefix is acknowledged: it covers the
+# prefix and counts exactly the entries the log holds, boundary markers
+# included, where an epoch number would count lease grants (a refused grant
+# mints an epoch and appends nothing).
 PREFIX="$(cat "$ACKED_FILE")"
+L_COMMITTED="$(sample_metric "$(data_metrics_addr $((L + 10)))" \
+  vtop_broker_local_committed_offset)" \
+  || fail "the leader's committed offset could not be read after the $PREFIX-record prefix"
+# The leader commits locally before a quorum acknowledges, so this is never
+# below the acknowledged prefix.
+[[ "$L_COMMITTED" -ge "$PREFIX" ]] \
+  || fail "the leader reports $L_COMMITTED committed entries under $PREFIX acknowledged records"
 for n in "$C" "$R"; do
-  await_metric_at_least "$(data_metrics_addr $((n + 10)))"     vtop_broker_local_committed_offset $((PREFIX + EPOCH))     "follower $n must hold the $PREFIX-record shared prefix before C is killed"
+  await_metric_at_least "$(data_metrics_addr $((n + 10)))" \
+    vtop_broker_local_committed_offset "$L_COMMITTED" \
+    "follower $n must hold the leader's first $L_COMMITTED entries (the $PREFIX-record \
+shared prefix) before C is killed"
 done
+# Boundary markers in the log so far, for turning C's entry count into a
+# record count below: one per marker the leader published.
+MARKERS="$(grep -c "boundary_marker_published" "$WORKDIR/logs/data-candidate-$L.log" || true)"
 kill9_pid "${PIDS[$C]}"
 FROZEN_AT="$(cat "$ACKED_FILE")"
 log "C=$C SIGKILLed with the acknowledged floor at $FROZEN_AT"
@@ -175,14 +193,16 @@ them by L and R alone; R=$R frozen"
 PIDS[C]=$(start_candidate "$C" "$LEADER_ID")
 C_NEXT="$(sed -n 's/.*segment_recovered report=.*next_offset: \([0-9]*\).*/\1/p' \
   "$WORKDIR/logs/data-candidate-$C.log" | tail -1)"
-log "C=$C restarted from its own directory holding ${C_NEXT:-?} records"
+C_RECORDS=""
+[[ -n "$C_NEXT" ]] && C_RECORDS=$((C_NEXT - MARKERS))
+log "C=$C restarted from its own directory holding ${C_NEXT:-?} log entries \
+(${C_RECORDS:-?} records and $MARKERS boundary marker(s))"
 # The acknowledged floor the producer writes trails what the leader has
 # already sent, so C can die holding records acknowledged after it (seed 701
 # did: C came back with all 300). Then C lacks nothing, may legitimately
-# lead, and the #611 shape was not reached: reported, never a PASS. One
-# boundary marker per promoted epoch sits in the log beside the records.
-if [[ -n "$C_NEXT" && "$C_NEXT" -ge $((ACKED + EPOCH)) ]]; then
-  log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_next=$C_NEXT \
+# lead, and the #611 shape was not reached: reported, never a PASS.
+if [[ -n "$C_RECORDS" && "$C_RECORDS" -ge "$ACKED" ]]; then
+  log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_records=$C_RECORDS \
 serving=none (shape not reached)"
   log "SKIP: C came back holding every one of the $ACKED acknowledged records; the #611 \
 shape (C lacking acknowledged records) was not reached"
@@ -236,7 +256,7 @@ if [[ -n "$L_NEXT" && -n "$R_NEXT" && "$L_NEXT" -gt "$R_NEXT" ]]; then
   # them, so R cannot reach a quorum with L, and C is behind (#341). The
   # #611 claim above has been checked; the read-back cannot run without a
   # published mark. Exit 77 is reported as SKIP by run-all.sh, never PASS.
-  log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_next=${C_NEXT:-?} c_epoch=$C_EPOCH \
+  log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_records=${C_RECORDS:-?} c_epoch=$C_EPOCH \
 c_refused_by_r=$REFUSED r_epoch=$R_EPOCH r_next=$R_NEXT l_next=$L_NEXT serving=none (#641)"
   log "SKIP: L returned holding $((L_NEXT - R_NEXT)) unacknowledged record(s) past R's tail \
 and is never fenced (#641); no quorum can form until it is"
@@ -274,6 +294,6 @@ CHAOS_MAX_OFFSET_GAPS="$SERVING_EPOCH" \
   "$(candidate_native_addr "$SERVING")" "$ACKED" "$ACKED"
 log "all $ACKED acknowledged records read back byte-exact from candidate $SERVING"
 
-log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_next=${C_NEXT:-?} c_epoch=$C_EPOCH \
+log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_records=${C_RECORDS:-?} c_epoch=$C_EPOCH \
 c_refused_by_r=$REFUSED r_epoch=$R_EPOCH r_next=${R_NEXT:-?} l_next=${L_NEXT:-?} \
 serving=$SERVING serving_epoch=$SERVING_EPOCH"

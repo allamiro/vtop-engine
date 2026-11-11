@@ -203,11 +203,6 @@ pub struct InProcessFollower {
     /// Records a fence disputed but KEPT (#611): the epoch of that fence and
     /// the first offset in dispute. See [`KeptDispute`].
     kept_dispute: Mutex<Option<KeptDispute>>,
-    /// The fencing caller's history from a fence that KEPT a dispute (#640):
-    /// the epoch and the vector. Taken as the leader lineage once the
-    /// dispute settles under that epoch, when every record from its start
-    /// on comes from that epoch's leader. In memory, like the dispute.
-    pending_lineage: Mutex<Option<(u64, Vec<crate::fencing_epochs::EpochStart>)>>,
     /// Whether the journal holds a leader lineage the appends have not yet
     /// caught up with (#640): the fast path that keeps a follower in steady
     /// state from taking the journal lock on every append.
@@ -229,13 +224,38 @@ pub struct InProcessFollower {
 /// ending at `from` (see [`InProcessFollower::replication_status`]), so the
 /// leader keeps the records it must send there.
 ///
-/// In memory only. A replica restarted with a kept suffix is in the same
-/// position as one that was absent from the fence: nothing reconciled it,
-/// and the catch-up path's #261 gap applies to it until the next fence.
+/// Durable (#635). Every install and retirement is written to the record
+/// beside the fencing-epoch journal ([`crate::kept_dispute`]) inside the
+/// same critical section that changes it here, and an install is durable
+/// before the fence reply that announces it. A restarted replica reloads
+/// it in [`InProcessFollower::set_fencing_epoch_journal`]. In memory only,
+/// a restart between the reply and the settlement left the replica holding
+/// the old suffix with nothing marking it, in the position of a replica
+/// absent from the fence, and the catch-up path acked the new leader's
+/// record over a different one (#261).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct KeptDispute {
     epoch: u64,
     from: u64,
+    /// The epoch that owned the record at `from` when the fence kept it
+    /// (0 when this replica's history could not say). Persisted so a reload
+    /// can tell a record the log has since moved past (#635).
+    suffix_epoch: u64,
+    /// The caller's tail the fence bounded this dispute by, or 0 when it
+    /// did not (#616 review). Persisted so a reload can refuse a record
+    /// that starts below it (#635).
+    caller_tail: u64,
+}
+
+impl KeptDispute {
+    fn record(self) -> crate::kept_dispute::KeptDisputeRecord {
+        crate::kept_dispute::KeptDisputeRecord {
+            fence_epoch: self.epoch,
+            from: self.from,
+            suffix_epoch: self.suffix_epoch,
+            caller_tail: self.caller_tail,
+        }
+    }
 }
 
 impl InProcessFollower {
@@ -310,7 +330,6 @@ impl InProcessFollower {
             online: AtomicBool::new(true),
             hold_fsync: AtomicBool::new(false),
             kept_dispute: Mutex::new(None),
-            pending_lineage: Mutex::new(None),
             lineage_following: AtomicBool::new(false),
         })
     }
@@ -424,16 +443,17 @@ impl InProcessFollower {
     }
 
     /// Take the fencing caller's history as the lineage of `epoch`'s leader
-    /// (#640), or set it aside while a dispute is kept for `epoch`. Called
-    /// with the meta lock held, which every append holds too, so the tail
-    /// read here is the one the lineage is anchored at.
+    /// (#640), or hold it while a dispute is kept for `epoch`. Called with
+    /// the meta lock held, which every append holds too, so the tail read
+    /// here is the one the lineage is anchored at.
     ///
     /// A kept dispute means this replica holds records the caller does not
     /// share. The lineage says who wrote the records the leader sends, not
     /// those, so it waits for the dispute to settle (see
-    /// [`Self::settle_kept_dispute`]), and any lineage held for `epoch` is
-    /// dropped durably meanwhile: a restart forgets the dispute (#635), and
-    /// must not then file the kept records under the leader's entries.
+    /// [`Self::settle_kept_dispute`]). It waits on disk, as the dispute does
+    /// since #635, so a restart between the fence and the settlement changes
+    /// nothing; and it is never followed while it waits, so the kept records
+    /// are never filed under the leader's entries.
     fn take_leader_lineage_locked(&self, epoch: u64, leader: &[crate::fencing_epochs::EpochStart]) {
         if self.held_fencing_epoch() != epoch {
             // A newer grant overtook the fence; its own fence brings its own
@@ -456,11 +476,6 @@ impl InProcessFollower {
                 disputed,
             )
         };
-        *self
-            .pending_lineage
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            disputed.then(|| (epoch, leader.to_vec()));
         let mut guard = self
             .fencing_epoch_journal
             .lock()
@@ -472,7 +487,9 @@ impl InProcessFollower {
             return;
         }
         let outcome = if disputed {
-            journal.drop_leader_lineage(epoch).map(|()| None)
+            journal
+                .hold_leader_lineage_until_settled(epoch, leader)
+                .map(|_| None)
         } else {
             journal
                 .take_leader_lineage(epoch, leader, tail, base)
@@ -492,6 +509,46 @@ impl InProcessFollower {
             Err(_) => {
                 self.fencing_epoch_history_broken
                     .store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Take the history held for `epoch` while its fence's dispute was
+    /// pending, now that the dispute is settled (#640). Called with the meta
+    /// lock held, after the settlement's truncation retired the dispute, so
+    /// the tail it reads is the dispute's start and every record from there
+    /// on comes from `epoch`'s leader. A no-op when none is held.
+    fn take_waiting_leader_lineage_locked(&self, epoch: u64) {
+        let leader = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|journal| journal.waiting_leader_lineage(epoch));
+        if let Some(leader) = leader {
+            self.take_leader_lineage_locked(epoch, &leader);
+        }
+    }
+
+    /// Drop a history held for an older epoch's dispute, retired by a newer
+    /// fence or this node's own candidate fence rather than settled (#640,
+    /// the retirement rules of #635). Lock order: state, dispute, journal.
+    ///
+    /// A failed write is not fatal: a history left waiting for an older
+    /// epoch is never followed (appends under that epoch can no longer
+    /// arrive), and the open takes it only through the agreement check every
+    /// lineage passes. A torn sidecar reads as none.
+    fn drop_waiting_leader_lineage_before(&self, epoch: u64) {
+        let mut guard = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(journal) = guard.as_mut() {
+            if let Some(waiting) = journal
+                .waiting_leader_lineage_epoch()
+                .filter(|waiting| *waiting < epoch)
+            {
+                let _ = journal.drop_leader_lineage(waiting);
             }
         }
     }
@@ -588,6 +645,7 @@ impl InProcessFollower {
             self.fencing_epoch_history_broken
                 .store(true, Ordering::SeqCst);
         }
+        let reloaded = self.reload_kept_dispute(&mut journal, next_offset);
         // A lineage reloaded from its sidecar (#640) is replayed over the log
         // as it opened, before anything reads this history (#648 review): a
         // crash between an append's fsync and the journal's re-derivation
@@ -598,10 +656,223 @@ impl InProcessFollower {
                 .fencing_epoch_history_broken
                 .store(true, Ordering::SeqCst),
         }
+        // A history held while its fence's dispute was pending, whose dispute
+        // is no longer held (#640, with #635): a settlement a crash cut short
+        // before it took the lineage, or a record the reload judged stale.
+        // Taken afresh at the tail the log opened with, exactly as the
+        // settlement would have: the agreement check below the tail refuses
+        // it while any record this replica holds is still its own.
+        if let Some(epoch) = journal.waiting_leader_lineage_epoch() {
+            let still_disputed = reloaded.is_some_and(|dispute| dispute.epoch == epoch);
+            if !still_disputed {
+                let leader = journal.waiting_leader_lineage(epoch).unwrap_or_default();
+                let base = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .segment
+                    .base_offset();
+                let taken = journal
+                    .take_leader_lineage(epoch, &leader, next_offset, base)
+                    .and_then(|taken| {
+                        if taken {
+                            journal.follow_leader_lineage(epoch, next_offset).map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    });
+                match taken {
+                    Ok(Some(crate::fencing_epochs::LineageFollow::Following { complete })) => {
+                        self.lineage_following.store(!complete, Ordering::SeqCst);
+                    }
+                    Ok(_) => {}
+                    Err(_) => self
+                        .fencing_epoch_history_broken
+                        .store(true, Ordering::SeqCst),
+                }
+            }
+        }
+        {
+            // Installed under the state lock, like every change to the
+            // dispute (#616 review), and before the journal is visible, so
+            // nothing judges this replica in between.
+            let _state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *self
+                .kept_dispute
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = reloaded;
+        }
         *self
             .fencing_epoch_journal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(journal);
+    }
+
+    /// The kept dispute recorded beside `journal`, if it still describes
+    /// this log (#635). Restored, it caps status and acks at its start and
+    /// is settled exactly as before the restart.
+    ///
+    /// A record is discarded, durably, when the log has provably moved past
+    /// it, since settling it would then truncate records an established
+    /// leader sent:
+    /// * the log no longer reaches past `from` (a settlement truncated it and
+    ///   died before clearing the record);
+    /// * `from` is below this replica's committed mark. A dispute always
+    ///   starts at or above the mark (#616): below it everything is
+    ///   committed, and the truncation guard would refuse the settlement;
+    /// * `from` is below the caller's tail the fence bounded it by. A
+    ///   divergence below the mark keeps only what lies past the caller's
+    ///   tail (#616 review), and settling below it would discard records the
+    ///   new leader holds and cannot re-send. (A divergence at or above the
+    ///   mark is not bounded by the caller's tail, and records 0 there: a
+    ///   replica holding a newer leadership's records keeps them from the
+    ///   divergence, which can be below the caller's tail.)
+    /// * the epoch owning `from` is no longer the one that owned it then: the
+    ///   suffix was replaced, for instance by a binary that never knew the
+    ///   record.
+    ///
+    /// A newer epoch in the journal is deliberately NOT one of them (#643
+    /// review). Lease adoption records an epoch without judging this
+    /// replica, and in memory a dispute survives adoption and keeps capping
+    /// acks until a newer FENCE retires it, which clears the record. A
+    /// restart must not do what adoption does not.
+    ///
+    /// With no usable history (broken, or no journal entries to judge by)
+    /// only the first two tests apply, and the record is kept: forgetting a
+    /// live dispute reopens #261, keeping one is at worst a capped status.
+    ///
+    /// A stale record whose clear FAILS stays held (#643 review): it is still
+    /// on disk, so the process must not serve past it as if it were gone.
+    /// It is held from `max(from, tail)`, never below the tail. That caps
+    /// acks at the current tail and never discards a record: settling it
+    /// truncates to the tail (nothing) and retries the clear, and a newer
+    /// fence's retirement retries it too. Held from its own `from` instead,
+    /// a record stale because its start was replaced or is below the mark
+    /// would settle over the leader's records or against the guard.
+    fn reload_kept_dispute(
+        &self,
+        journal: &mut crate::fencing_epochs::FencingEpochJournal,
+        next_offset: u64,
+    ) -> Option<KeptDispute> {
+        let Some(record) = journal.kept_dispute() else {
+            // Lowers a gate a crash left raised between clearing the record
+            // and lowering it; a no-op otherwise.
+            if let Err(problem) = journal.clear_kept_dispute() {
+                eprintln!(
+                    "replica {}: could not lower the fencing-epoch journal's dispute gate; \
+                     older binaries stay refused until it is (#635): {problem}",
+                    self.node_id
+                );
+            }
+            return None;
+        };
+        let history_known = !self.fencing_epoch_history_broken.load(Ordering::SeqCst)
+            && !journal.entries().is_empty();
+        let stale = if next_offset <= record.from {
+            Some("the log no longer reaches past its start")
+        } else if record.from < self.cluster_committed.get() {
+            // A dispute starts at or above the mark (#616): what lies below
+            // it is committed, never in dispute, and the truncation guard
+            // would refuse to settle it, wedging every later append.
+            Some("it starts below this replica's committed mark")
+        } else if record.from < record.caller_tail {
+            // Bounded by the caller's tail (#616 review), a dispute starts
+            // at or past it: below it are records the caller holds and its
+            // first append, at that tail, cannot re-send.
+            Some("it starts below the caller's tail its fence bounded it by")
+        } else if history_known
+            && journal.epoch_owning(record.from).unwrap_or(0) != record.suffix_epoch
+        {
+            Some("the records from its start were written under another epoch since")
+        } else {
+            None
+        };
+        let held = KeptDispute {
+            epoch: record.fence_epoch,
+            from: record.from,
+            suffix_epoch: record.suffix_epoch,
+            caller_tail: record.caller_tail,
+        };
+        if let Some(reason) = stale {
+            eprintln!(
+                "replica {}: discarding the recorded epoch-{} dispute from offset {}: {reason} \
+                 (#635)",
+                self.node_id, record.fence_epoch, record.from
+            );
+            if let Err(problem) = journal.clear_kept_dispute() {
+                let from = record.from.max(next_offset);
+                eprintln!(
+                    "replica {}: could not clear the stale dispute record, so it stays held from \
+                     offset {from}: no ack passes it until a settlement or a newer fence clears \
+                     it (#635): {problem}",
+                    self.node_id
+                );
+                return Some(KeptDispute { from, ..held });
+            }
+            return None;
+        }
+        // Re-recording raises a gate an older layout left down; a no-op
+        // otherwise. A failure leaves the record on disk, which is what
+        // matters for the next open.
+        if let Err(problem) = journal.record_kept_dispute(record) {
+            eprintln!(
+                "replica {}: could not raise the fencing-epoch journal's dispute gate (#635): \
+                 {problem}",
+                self.node_id
+            );
+        }
+        eprintln!(
+            "replica {}: restored the epoch-{} fence's dispute over offsets from {}; it caps \
+             this replica's acks and status there until that epoch's leader settles it (#635)",
+            self.node_id, record.fence_epoch, record.from
+        );
+        Some(held)
+    }
+
+    /// Install `dispute`, durably (#635), recording which epoch owns its
+    /// start now. The caller holds the state lock and passes the dispute's
+    /// guard: lock order is state, dispute, then the journal. Held in memory
+    /// even when the write fails, since it protects this process either way;
+    /// the error fails the fence, so no reply announces a dispute a restart
+    /// would forget.
+    fn install_kept_dispute_locked(
+        &self,
+        kept: &mut Option<KeptDispute>,
+        mut dispute: KeptDispute,
+    ) -> BrokerResult<()> {
+        let mut journal = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        dispute.suffix_epoch = journal
+            .as_ref()
+            .and_then(|journal| journal.epoch_owning(dispute.from))
+            .unwrap_or(0);
+        *kept = Some(dispute);
+        match journal.as_mut() {
+            Some(journal) => journal.record_kept_dispute(dispute.record()),
+            None => Ok(()),
+        }
+    }
+
+    /// Retire the kept dispute, durably first (#635). Same locking as
+    /// [`Self::install_kept_dispute_locked`]. When the write fails the
+    /// dispute stays held: what is on disk still says it, and the in-memory
+    /// state must not promise less than a restart would restore. The next
+    /// settlement retries the retirement before anything is acked past it.
+    fn retire_kept_dispute_locked(&self, kept: &mut Option<KeptDispute>) -> BrokerResult<()> {
+        let mut journal = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(journal) = journal.as_mut() {
+            journal.clear_kept_dispute()?;
+        }
+        *kept = None;
+        Ok(())
     }
 
     /// Attach the durable floor beneath `cluster_committed` (#240).
@@ -781,7 +1052,15 @@ impl InProcessFollower {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if kept.is_some_and(|dispute| dispute.from >= offset) {
-                *kept = None;
+                if let Err(problem) = self.retire_kept_dispute_locked(&mut kept) {
+                    // Still held: the settlement that called this, or the
+                    // next one, retries before anything is acked past it.
+                    eprintln!(
+                        "replica {}: truncated to {offset} but could not clear the recorded \
+                         dispute (#635): {problem}",
+                        self.node_id
+                    );
+                }
             }
             outcome
         };
@@ -852,10 +1131,17 @@ impl InProcessFollower {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if state.segment.next_offset() <= dispute.from {
-                *self
+                let mut kept = self
                     .kept_dispute
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.retire_kept_dispute_locked(&mut kept)
+                    .map_err(|problem| Self::unretired(dispute, &problem))?;
+                drop(kept);
+                drop(state);
+                // Nothing to discard, and the records from here on are this
+                // epoch's leader's all the same (#640).
+                self.take_waiting_leader_lineage_locked(epoch);
                 return Ok(());
             }
         }
@@ -868,17 +1154,30 @@ impl InProcessFollower {
                      never acknowledged (#611)",
                     self.node_id, outcome.records_removed, dispute.from
                 );
+                // `truncate_to` retires it; a dispute still held here is one
+                // whose durable clear failed. Acking over it now would leave
+                // a record a restart restores over the leader's own records.
+                let still_held = {
+                    let _state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *self
+                        .kept_dispute
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        == Some(dispute)
+                };
+                if still_held {
+                    return Err(Self::unretired(
+                        dispute,
+                        &BrokerError::KeptDispute("the durable clear failed".to_owned()),
+                    ));
+                }
                 // Every record from the dispute's start on now comes from
                 // this epoch's leader, so the history its fence carried is
                 // the lineage to file them by (#640).
-                let pending = self
-                    .pending_lineage
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take();
-                if let Some((_, leader)) = pending.filter(|(held, _)| *held == epoch) {
-                    self.take_leader_lineage_locked(epoch, &leader);
-                }
+                self.take_waiting_leader_lineage_locked(epoch);
                 Ok(())
             }
             Err(BrokerError::TruncationBelowAcknowledged {
@@ -894,6 +1193,20 @@ impl InProcessFollower {
             )),
             Err(problem) => Err((ErrorCode::Storage, problem.to_string())),
         }
+    }
+
+    /// The refusal for an append or mark that would settle `dispute` while
+    /// its durable record could not be cleared (#635).
+    fn unretired(dispute: KeptDispute, problem: &BrokerError) -> (ErrorCode, String) {
+        (
+            ErrorCode::Storage,
+            format!(
+                "the dispute the epoch-{} fence kept from offset {} is settled but its record \
+                 could not be cleared; refusing to ack past it until it is, since a restart \
+                 would restore it over this leader's records: {problem}",
+                dispute.epoch, dispute.from
+            ),
+        )
     }
 
     /// `(local_committed_offset, next_offset)` as the leader's reconnect
@@ -1055,7 +1368,19 @@ impl InProcessFollower {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if kept.is_some_and(|dispute| dispute.epoch < epoch) {
-            *kept = None;
+            // Durably too (#635): a restart must not restore it. A failed
+            // clear keeps it, so memory and disk agree, and refuses the vote.
+            self.retire_kept_dispute_locked(&mut kept)
+                .map_err(|problem| {
+                    (
+                        ErrorCode::Storage,
+                        format!(
+                            "could not retire the dispute this node kept for an older epoch, \
+                         which a restart would otherwise restore (#635): {problem}"
+                        ),
+                    )
+                })?;
+            self.drop_waiting_leader_lineage_before(epoch);
         }
         drop(kept);
         Ok(state.segment.committed_offset())
@@ -1189,7 +1514,20 @@ impl InProcessFollower {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if kept.is_some_and(|dispute| dispute.epoch < fencing_epoch) {
-                *kept = None;
+                // Durably too (#635): a restart must not restore a dispute a
+                // newer fence retired. A failed clear fails the fence and
+                // keeps the dispute, so memory and disk still agree.
+                self.retire_kept_dispute_locked(&mut kept)
+                    .map_err(|problem| {
+                        (
+                            ErrorCode::Storage,
+                            format!(
+                                "could not retire the dispute an older fence kept, which a \
+                                 restart would otherwise restore (#635): {problem}"
+                            ),
+                        )
+                    })?;
+                self.drop_waiting_leader_lineage_before(fencing_epoch);
             }
         }
         if leader_epoch_starts.is_empty() {
@@ -1343,7 +1681,9 @@ impl InProcessFollower {
         // Unknown and never counted.
         if !supersedes {
             // Installed under the state lock (#616 review): a status snapshot
-            // sees the log and the dispute together.
+            // sees the log and the dispute together. Durable before this
+            // fence returns (#635): the reply announces the kept suffix, and
+            // a restart must not forget what it announced.
             let state = self
                 .state
                 .lock()
@@ -1358,20 +1698,36 @@ impl InProcessFollower {
             // gap no leader fills. Without a tail in the caller's history,
             // nothing is kept, which is the answer before #616.
             let mark = self.cluster_committed.get();
-            let from = if divergence >= mark {
-                divergence
+            let (from, bounded_by) = if divergence >= mark {
+                (divergence, 0)
             } else {
                 caller_tail(leader_epoch_starts, fencing_epoch)
-                    .map_or(u64::MAX, |tail| tail.max(mark))
+                    .map_or((u64::MAX, 0), |tail| (tail.max(mark), tail))
             };
             if from < state.segment.next_offset() {
-                *self
+                let mut kept = self
                     .kept_dispute
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(KeptDispute {
-                    epoch: fencing_epoch,
-                    from,
-                });
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.install_kept_dispute_locked(
+                    &mut kept,
+                    KeptDispute {
+                        epoch: fencing_epoch,
+                        from,
+                        suffix_epoch: 0,
+                        caller_tail: bounded_by,
+                    },
+                )
+                .map_err(|problem| {
+                    (
+                        ErrorCode::Storage,
+                        format!(
+                            "could not record the suffix this fence keeps in dispute from \
+                             {from}; a reply announcing it would not survive a restart \
+                             (#635): {problem}"
+                        ),
+                    )
+                })?;
             }
             return Ok(0);
         }

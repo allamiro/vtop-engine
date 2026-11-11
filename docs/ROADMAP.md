@@ -241,8 +241,8 @@ reopen quietly.
   that kept such a suffix and was outvoted discards it on the established
   leader's first append or committed high-water mark past its start,
   instead of acking a record it does not hold (#261) or exposing the kept
-  records as committed. That memory does not survive a restart, which leaves
-  it in the same position as a replica that was absent from the fence.
+  records as committed. Until it is settled, that dispute caps the replica's
+  acks and reconnect status at its start.
   **The protection is the fenced replica's, so it holds only on upgraded
   replicas.** There is no wire or feature-level change and the fence frames
   are identical, so nothing tells a candidate which replicas run this
@@ -253,6 +253,34 @@ reopen quietly.
   keep the rolling upgrade itself from triggering it. An older candidate
   facing an upgraded replica judges the kept answer refused (its offset is
   higher) or Unknown, never a grant.
+- **#635** - the #611 dispute lived in memory only. A replica restarted
+  between the fence reply that kept the suffix and its settlement came back
+  holding the old records with nothing marking them, reported its full log,
+  and acked the new leader's record at the disputed offset as a duplicate of
+  a different one (#261). The dispute (fence epoch, first disputed offset,
+  and, when this replica's history can say, the epoch that owned that
+  offset) is now written beside the fencing-epoch journal, as
+  `fencing-epochs.kept-dispute`, and fsynced before the fence replies. Every
+  retirement, whether by settlement, truncation, a newer fence or the node's
+  own fence as a candidate, clears it durably before anything is acked past
+  it. A restart restores it, so it caps acks and status and is settled
+  exactly as before. A record the log has provably moved past, or one that
+  starts below the replica's committed mark or below the caller's tail its
+  fence bounded it by, is discarded at open, never settled over the new
+  leader's records. A lease adoption of a newer epoch is not such evidence:
+  adoption alone retires nothing. A dispute is retired only by its
+  settlement, a truncation past its start, a newer fence, or the node's own
+  fence as a candidate, and each of these clears the record.
+  The record holds two checksummed frames, so a crash while it changes
+  reads back the old state or the new one, never neither. **Older releases refuse the
+  directory while a dispute may be pending:** the journal's header is
+  version 2 from before the record is written until after it is cleared,
+  and every earlier release opens only version 1, so a downgrade cannot
+  silently serve the suffix. A crash between clearing the record and
+  lowering the header leaves the header at 2 until this release next opens
+  the directory, which lowers it. A crash sweep
+  (`kept_dispute_crash_sweep.rs`) cuts the fence and the settlement at every
+  storage operation and every byte of every write.
 - **#640** - a follower filed the records a new leader caught it up on under
   the wrong epoch. It recorded an epoch it adopted at its own tail, so when
   it was behind, the records the new leader then sent it were filed under the
@@ -270,10 +298,14 @@ reopen quietly.
   the `fencing-epochs.leader` sidecar survived intact; a missing or torn
   sidecar reads as "no lineage" and repairs nothing, leaving those records
   filed as before #640 (an Unknown answer later, never a counted one). A
-  follower the fence did not reach, or one that
-  kept a dispute that has not settled, adopts at its tail as before.
-  **Compatibility:** the journal format is unchanged, so an older binary
-  reads it as its own and simply resumes adopting at its tail. The sidecar is
+  follower that kept a dispute (#611) holds the fence's history in the same
+  sidecar, as #635 holds the dispute, and takes it only once the dispute
+  settles, at the tail the settlement leaves; a newer fence or the node's
+  own candidate fence drops it, as they retire the dispute. A follower the
+  fence did not reach adopts at its tail as before.
+  **Compatibility:** the lineage changes nothing in the journal's own format
+  (its header gate is #635's), so an older binary that may open it reads it
+  as its own and simply resumes adopting at its tail. The sidecar is
   a name older binaries never open, and this release reads a missing, torn or
   newer-version sidecar as "no lineage", the old behaviour. **Journals
   mislabelled by an earlier release are not rewritten**: nothing on a replica
