@@ -38,7 +38,20 @@ pub const DEDUP_CAPACITY: usize = 65_536;
 const SNAPSHOT_PAYLOAD_VERSION: u16 = 1;
 
 const MAX_SNAPSHOT_KEY_BYTES: usize = 256;
-const MAX_SNAPSHOT_VALUE_BYTES: usize = 1024;
+/// The largest record value a snapshot carries, enforced on write and on
+/// read alike (#657).
+///
+/// Releases through v0.7.0 enforce 1024 on read, and every record they can
+/// decode still fits that (the largest is a tier copy, 972 bytes). The one
+/// record over it is a transition whose promotion report carries a
+/// reconciled lineage verdict on each of [`MAX_TRANSITION_QUORUM`] answers
+/// (1169 bytes): a payload recorded only at
+/// [`crate::command::LINEAGE_VERDICTS_FEATURE_LEVEL`], whose outcome tag no
+/// reader older than that level can decode at any length. So raising the
+/// bound reaches only records older readers already cannot read, and needs no
+/// level of its own. `the_largest_record_of_every_kind_fits_the_snapshot_
+/// value_bound` pins both halves of that argument.
+const MAX_SNAPSHOT_VALUE_BYTES: usize = 2048;
 const MAX_SNAPSHOT_RESPONSE_BYTES: usize = 1024;
 const MAX_SNAPSHOT_RECORDS: u32 = 1 << 24;
 
@@ -864,6 +877,17 @@ impl MetaValue {
                 put_u32(&mut out, config.feature_level);
             }
             MetaValue::RangeReplicaSet(set) => {
+                // The decoder's bound, not the transient one a placement may
+                // hold during a rebalance (#657): a recorded set is never
+                // above MAX_REPLICAS, and one written above it would be a
+                // snapshot no voter could restore.
+                if set.members.len() > MAX_REPLICAS {
+                    return Err(CodecError::BoundExceeded {
+                        what: "replica set members",
+                        actual: set.members.len(),
+                        maximum: MAX_REPLICAS,
+                    });
+                }
                 put_u8(&mut out, VALUE_TAG_RANGE_REPLICA_SET);
                 put_u64(&mut out, set.generation);
                 put_u64(&mut out, set.recorded_at_epoch);
@@ -1426,6 +1450,15 @@ impl MetaStateMachine {
             return reject(MetadataError::invalid_transition(
                 "a replica set names one or more distinct nodes",
             ));
+        }
+        // The command codec already refuses more, so through the log this
+        // never fires; a command that never crossed the codec would
+        // otherwise leave a record the snapshot reader refuses (#657).
+        if sorted.len() > MAX_REPLICAS {
+            return reject(MetadataError::limit(format!(
+                "a replica set names at most {MAX_REPLICAS} nodes, not {}",
+                sorted.len()
+            )));
         }
         if let Some(missing) = sorted
             .iter()
@@ -2872,21 +2905,31 @@ impl MetaStateMachine {
             reported_at_ms: now_ms,
             reported_apply_index: apply_index,
         };
-        // An attested record must stay inside the snapshot's value bound;
-        // checked for the attested form only, which every voter at its
-        // feature level judges alike.
-        if outcome.attestation().is_some() {
-            let candidate = RangeTransitionRecord {
-                outcome: reported.clone(),
-                ..transition.clone()
-            };
-            let fits = MetaValue::RangeTransition(candidate)
-                .encode()
-                .is_ok_and(|bytes| bytes.len() <= MAX_SNAPSHOT_VALUE_BYTES);
-            if !fits {
-                return reject(MetadataError::limit(
-                    "an attested promotion report must fit the snapshot value bound",
-                ));
+        // The only record whose size the reporter chooses (#657), so the one
+        // checked here: the state never holds a record a snapshot cannot
+        // carry. Encoding is a pure function of the record, so every voter
+        // reaches the same verdict. Through the log this never refuses - the
+        // command codec bounds the answers and the largest record fits - but
+        // a command that never crossed the codec could carry a record that
+        // cannot be encoded at all, and accepting it would fail every
+        // snapshot after it.
+        let candidate = MetaValue::RangeTransition(RangeTransitionRecord {
+            outcome: reported.clone(),
+            ..transition.clone()
+        });
+        match candidate.encode() {
+            Ok(bytes) if bytes.len() <= MAX_SNAPSHOT_VALUE_BYTES => {}
+            Ok(bytes) => {
+                return reject(MetadataError::limit(format!(
+                    "the report would make epoch {fencing_epoch}'s transition record {} bytes, \
+                     above the {MAX_SNAPSHOT_VALUE_BYTES}-byte snapshot value bound",
+                    bytes.len()
+                )))
+            }
+            Err(error) => {
+                return reject(MetadataError::invalid_transition(format!(
+                    "the report would make a transition record a snapshot cannot carry: {error}"
+                )))
             }
         }
         transition.outcome = reported;
@@ -5742,6 +5785,11 @@ impl MetaStateMachine {
             put_u16(&mut out, key.len() as u16);
             out.extend_from_slice(key);
             let encoded = value.encode()?;
+            // Read back exactly as `decode_snapshot` will (#657). A record
+            // the reader refuses fails HERE, where it was written, and not
+            // on the restart of a voter or the catch-up of a follower that
+            // is sent it - each of which costs the metadata tier a member.
+            read_snapshot_record(&MetaKey::decode(key)?, &encoded)?;
             put_u32(&mut out, encoded.len() as u32);
             out.extend_from_slice(&encoded);
         }
@@ -5753,6 +5801,7 @@ impl MetaStateMachine {
                 .expect("dedup order and dedup responses always agree");
             put_uuid(&mut out, *request_id);
             let encoded = response.encode()?;
+            read_snapshot_response(&encoded)?;
             put_u32(&mut out, encoded.len() as u32);
             out.extend_from_slice(&encoded);
         }
@@ -5799,38 +5848,9 @@ impl MetaStateMachine {
             }
             let typed_key = MetaKey::decode(&key)?;
             let value_len = reader.u32("snapshot value length")? as usize;
-            if value_len > MAX_SNAPSHOT_VALUE_BYTES {
-                return Err(CodecError::BoundExceeded {
-                    what: "snapshot value",
-                    actual: value_len,
-                    maximum: MAX_SNAPSHOT_VALUE_BYTES,
-                });
-            }
-            let value = MetaValue::decode(reader.take(value_len, "snapshot value")?)?;
-            if !key_matches_value(&typed_key, &value) {
-                return Err(CodecError::InvalidValue {
-                    what: "snapshot record",
-                    reason: "value type does not match its key category",
-                });
-            }
-            // A transition's invariants are part of its canonical form
-            // (review): the key names the epoch it minted, and a mint only
-            // ever moves the epoch forward. A snapshot that disagrees with
-            // either was not written by this state machine.
-            if let (
-                MetaKey::RangeTransition { fencing_epoch, .. },
-                MetaValue::RangeTransition(transition),
-            ) = (&typed_key, &value)
-            {
-                if transition.epoch_to != *fencing_epoch
-                    || transition.epoch_to <= transition.epoch_from
-                {
-                    return Err(CodecError::InvalidValue {
-                        what: "snapshot record",
-                        reason: "transition epochs disagree with the key or do not advance",
-                    });
-                }
-            }
+            check_snapshot_value_len(value_len)?;
+            let value =
+                read_snapshot_record(&typed_key, reader.take(value_len, "snapshot value")?)?;
             previous_key = Some(key.clone());
             records.insert(key, value);
         }
@@ -5847,14 +5867,8 @@ impl MetaStateMachine {
         for _ in 0..dedup_count {
             let request_id = reader.uuid("dedup request id")?;
             let response_len = reader.u32("dedup response length")? as usize;
-            if response_len > MAX_SNAPSHOT_RESPONSE_BYTES {
-                return Err(CodecError::BoundExceeded {
-                    what: "dedup response",
-                    actual: response_len,
-                    maximum: MAX_SNAPSHOT_RESPONSE_BYTES,
-                });
-            }
-            let response = MetadataResponse::decode(reader.take(response_len, "dedup response")?)?;
+            check_snapshot_response_len(response_len)?;
+            let response = read_snapshot_response(reader.take(response_len, "dedup response")?)?;
             if dedup_responses.insert(request_id, response).is_some() {
                 return Err(CodecError::InvalidValue {
                     what: "dedup entry",
@@ -5870,6 +5884,66 @@ impl MetaStateMachine {
             dedup_responses,
         })
     }
+}
+
+fn check_snapshot_value_len(len: usize) -> Result<(), CodecError> {
+    if len > MAX_SNAPSHOT_VALUE_BYTES {
+        return Err(CodecError::BoundExceeded {
+            what: "snapshot value",
+            actual: len,
+            maximum: MAX_SNAPSHOT_VALUE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn check_snapshot_response_len(len: usize) -> Result<(), CodecError> {
+    if len > MAX_SNAPSHOT_RESPONSE_BYTES {
+        return Err(CodecError::BoundExceeded {
+            what: "dedup response",
+            actual: len,
+            maximum: MAX_SNAPSHOT_RESPONSE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Everything `decode_snapshot` demands of one record, in one place so the
+/// writer can demand it too (#657): a writer that checked less than the
+/// reader once produced snapshots no voter could restore.
+fn read_snapshot_record(typed_key: &MetaKey, bytes: &[u8]) -> Result<MetaValue, CodecError> {
+    check_snapshot_value_len(bytes.len())?;
+    let value = MetaValue::decode(bytes)?;
+    if !key_matches_value(typed_key, &value) {
+        return Err(CodecError::InvalidValue {
+            what: "snapshot record",
+            reason: "value type does not match its key category",
+        });
+    }
+    // A transition's invariants are part of its canonical form (review):
+    // the key names the epoch it minted, and a mint only ever moves the
+    // epoch forward. A snapshot that disagrees with either was not written
+    // by this state machine.
+    if let (
+        MetaKey::RangeTransition { fencing_epoch, .. },
+        MetaValue::RangeTransition(transition),
+    ) = (typed_key, &value)
+    {
+        if transition.epoch_to != *fencing_epoch || transition.epoch_to <= transition.epoch_from {
+            return Err(CodecError::InvalidValue {
+                what: "snapshot record",
+                reason: "transition epochs disagree with the key or do not advance",
+            });
+        }
+    }
+    Ok(value)
+}
+
+/// What `decode_snapshot` demands of one dedup response, shared with the
+/// writer for the same reason as [`read_snapshot_record`].
+fn read_snapshot_response(bytes: &[u8]) -> Result<MetadataResponse, CodecError> {
+    check_snapshot_response_len(bytes.len())?;
+    MetadataResponse::decode(bytes)
 }
 
 fn key_matches_value(key: &MetaKey, value: &MetaValue) -> bool {
@@ -7174,6 +7248,56 @@ mod tests {
             later,
             unproven_established(500, &quorum, Some(fresh))
         )));
+    }
+
+    /// #657 / #636: the largest report an attested promotion can make - every
+    /// quorum answer with the largest verdict, and the attestation with the
+    /// operator name at its bound - passes the apply-time size refusal, is
+    /// recorded, uses the attestation up, and survives a snapshot.
+    #[test]
+    fn the_largest_attested_report_is_recorded_and_survives_a_snapshot() {
+        let (mut machine, first, topic, range, mut next) = attestable_range();
+        let epoch = range_of(&machine, topic, range).fencing_epoch;
+        assert!(!is_rejected(&attest(
+            &mut machine,
+            next(),
+            500,
+            topic,
+            range,
+            first,
+            &"o".repeat(MAX_ATTESTATION_OPERATOR_BYTES)
+        )));
+        let live = machine
+            .promotion_attestation(topic, range)
+            .cloned()
+            .unwrap();
+        let mut outcome = largest_outcome(true);
+        if let PromotionOutcome::Established { attestation, .. } = &mut outcome {
+            *attestation = Some(live);
+        }
+        assert_eq!(
+            report(
+                &mut machine,
+                next(),
+                501,
+                2_000,
+                first,
+                topic,
+                range,
+                epoch,
+                outcome
+            ),
+            MetadataResponse::TransitionRecorded {
+                fencing_epoch: epoch
+            }
+        );
+        assert!(machine.promotion_attestation(topic, range).is_none());
+        let restored =
+            MetaStateMachine::decode_snapshot(&machine.encode_snapshot().unwrap()).unwrap();
+        assert_eq!(
+            transitions_of(&restored, topic, range),
+            transitions_of(&machine, topic, range)
+        );
     }
 
     /// #656 review: a report for an epoch the range has moved past is
@@ -10421,11 +10545,702 @@ mod tests {
             .encode()
             .unwrap();
         assert_eq!(encoded.len(), 972);
-        assert!(encoded.len() < MAX_SNAPSHOT_VALUE_BYTES);
+        // A tier copy is a record every released binary reads, so it must
+        // fit the bound THEY enforce, not only this build's (#657).
+        assert!(encoded.len() <= LEGACY_SNAPSHOT_VALUE_BYTES);
+        assert!(encoded.len() <= MAX_SNAPSHOT_VALUE_BYTES);
         assert_eq!(
             MetaValue::decode(&encoded).unwrap(),
             MetaValue::TierCopy(max_tier_copy_record())
         );
+    }
+
+    /// The snapshot value bound every release through v0.7.0 enforces on
+    /// read (#657). A record any of them can decode must fit it, or a
+    /// snapshot this build writes would stop one of them restoring.
+    const LEGACY_SNAPSHOT_VALUE_BYTES: usize = 1024;
+
+    /// The largest quorum answer the codec carries: a reconciled verdict,
+    /// with its truncation count, on a node id and offset (#577).
+    fn largest_answer(node: u128) -> crate::command::QuorumAnswer {
+        crate::command::QuorumAnswer {
+            node_uuid: Uuid::from_u128(node),
+            offset: u64::MAX,
+            lineage: Some(crate::command::AnswerLineage::Reconciled {
+                truncated_records: u64::MAX,
+            }),
+        }
+    }
+
+    /// The largest outcome a promotion report may carry: every optional
+    /// field present and [`MAX_TRANSITION_QUORUM`] answers - the bound both
+    /// the command codec and `report_promotion_outcome` enforce - each with
+    /// the largest verdict, or with none (`with_lineage: false`, the form
+    /// every release since v0.5.0 records).
+    fn largest_outcome(with_lineage: bool) -> PromotionOutcome {
+        PromotionOutcome::Established {
+            boundary_offset: Some(u64::MAX),
+            sealed_prefix_end: Some(u64::MAX),
+            quorum: (0..MAX_TRANSITION_QUORUM as u128)
+                .map(|node| crate::command::QuorumAnswer {
+                    lineage: largest_answer(0).lineage.filter(|_| with_lineage),
+                    ..largest_answer(1_000 + node)
+                })
+                .collect(),
+            votes: u32::MAX,
+            required: u32::MAX,
+            attestation: None,
+        }
+    }
+
+    /// The largest attestation (#636): the operator name at its bound.
+    fn largest_attestation() -> PromotionAttestation {
+        PromotionAttestation {
+            attestation_id: Uuid::from_u128(u128::MAX),
+            replica_node_uuid: Uuid::from_u128(u128::MAX - 1),
+            operator: "o".repeat(MAX_ATTESTATION_OPERATOR_BYTES),
+            attested_at_ms: i64::MAX,
+        }
+    }
+
+    /// The largest transition an attested promotion records (#636): the
+    /// largest verdict-carrying outcome plus the attestation it used.
+    fn largest_attested_transition() -> RangeTransitionRecord {
+        let mut record = largest_transition(true);
+        if let TransitionOutcome::Reported {
+            outcome: PromotionOutcome::Established { attestation, .. },
+            ..
+        } = &mut record.outcome
+        {
+            *attestation = Some(largest_attestation());
+        }
+        record
+    }
+
+    fn largest_transition(with_lineage: bool) -> RangeTransitionRecord {
+        RangeTransitionRecord {
+            epoch_from: u64::MAX - 1,
+            epoch_to: u64::MAX,
+            holder_from: Some(Uuid::from_u128(u128::MAX)),
+            holder_to: Uuid::from_u128(u128::MAX - 1),
+            grant: GrantKind::Election,
+            granted_at_ms: i64::MAX,
+            granted_apply_index: u64::MAX,
+            outcome: TransitionOutcome::Reported {
+                outcome: largest_outcome(with_lineage),
+                reported_at_ms: i64::MAX,
+                reported_apply_index: u64::MAX,
+            },
+        }
+    }
+
+    /// Every [`MetaValue`] kind, numbered by an exhaustive match: a new
+    /// kind does not compile until it is numbered here, and is then missing
+    /// from the largest-record test below until a record is added for it.
+    const META_VALUE_KINDS: usize = 21;
+    fn meta_value_kind(value: &MetaValue) -> usize {
+        match value {
+            MetaValue::Node(_) => 0,
+            MetaValue::Topic(_) => 1,
+            MetaValue::TopicName(_) => 2,
+            MetaValue::Range(_) => 3,
+            MetaValue::Segment(_) => 4,
+            MetaValue::Key(_) => 5,
+            MetaValue::Group(_) => 6,
+            MetaValue::GroupName(_) => 7,
+            MetaValue::GroupMember(_) => 8,
+            MetaValue::GroupCursor(_) => 9,
+            MetaValue::SegmentPlacement(_) => 10,
+            MetaValue::ReplacementProof(_) => 11,
+            MetaValue::RebalanceIntent(_) => 12,
+            MetaValue::TierCopy(_) => 13,
+            MetaValue::TopicRetentionPolicy(_) => 14,
+            MetaValue::RangeTransition(_) => 15,
+            MetaValue::LineageTransition(_) => 16,
+            MetaValue::ClusterConfig(_) => 17,
+            MetaValue::RangeReplicaSet(_) => 18,
+            MetaValue::NodeVersion(_) => 19,
+            MetaValue::PromotionAttestation(_) => 20,
+        }
+    }
+
+    /// The largest record of every kind, each with its pinned encoded
+    /// length and whether a release before feature level 6 can decode it.
+    /// Every variable-length field is at its codec bound and every optional
+    /// field is present.
+    fn largest_records() -> Vec<(MetaValue, usize, bool)> {
+        let uuid = Uuid::from_u128(u128::MAX);
+        vec![
+            // tag 1 + addr (2 + 256) + state 1 + generation 8 + domain
+            // (2 + 64) + weight 4.
+            (
+                MetaValue::Node(NodeRecord {
+                    addr: "a".repeat(MAX_NODE_ADDR_BYTES),
+                    state: NodeState::Draining,
+                    generation: u64::MAX,
+                    failure_domain: "d".repeat(MAX_FAILURE_DOMAIN_BYTES),
+                    placement_weight: u32::MAX,
+                }),
+                338,
+                true,
+            ),
+            // tag 1 + name (2 + 249) + epoch 8 + generation 8.
+            (
+                MetaValue::Topic(TopicRecord {
+                    name: "t".repeat(crate::keys::MAX_TOPIC_NAME_BYTES),
+                    topic_epoch: u64::MAX,
+                    generation: u64::MAX,
+                }),
+                268,
+                true,
+            ),
+            (
+                MetaValue::TopicName(TopicNameRecord {
+                    topic_uuid: uuid,
+                    latest_epoch: u64::MAX,
+                }),
+                25,
+                true,
+            ),
+            // v3: tag 1 + generation 8 + prefix 8 + bits 1 + epoch 8 +
+            // lineage 8 + parents (1 + 2 * 16) + seal (1 + 8 + 16) + lease
+            // with a deadline (1 + 16 + 8 + 8 + 8).
+            (
+                MetaValue::Range(RangeRecord {
+                    generation: u64::MAX,
+                    key_prefix: u64::MAX,
+                    key_prefix_bits: u8::MAX,
+                    fencing_epoch: u64::MAX,
+                    lineage_generation: u64::MAX,
+                    parents: vec![uuid, Uuid::from_u128(1)],
+                    sealed_at: Some(SealedParent {
+                        barrier_offset: u64::MAX,
+                        transition_id: uuid,
+                    }),
+                    lease: Some(LeaseRecord {
+                        holder_node_uuid: uuid,
+                        fencing_epoch: u64::MAX,
+                        granted_apply_index: u64::MAX,
+                        expires_at_ms: Some(i64::MAX),
+                    }),
+                }),
+                133,
+                true,
+            ),
+            (
+                MetaValue::Segment(SegmentRecord {
+                    segment_generation: u64::MAX,
+                    base_offset: u64::MAX,
+                    next_offset: u64::MAX,
+                    content_root: [0xff; 32],
+                    state: SegmentState::RetentionExpired,
+                    sealed_by_epoch: u64::MAX,
+                }),
+                66,
+                true,
+            ),
+            (
+                MetaValue::Key(KeyRecord {
+                    scheme: u16::MAX,
+                    public_material_digest: [0xff; 32],
+                    state: KeyState::Active,
+                }),
+                36,
+                true,
+            ),
+            // tag 1 + name (2 + 249) + generation 8.
+            (
+                MetaValue::Group(ConsumerGroupRecord {
+                    name: "g".repeat(crate::keys::MAX_GROUP_NAME_BYTES),
+                    generation: u64::MAX,
+                }),
+                260,
+                true,
+            ),
+            (
+                MetaValue::GroupName(GroupNameRecord { group_uuid: uuid }),
+                17,
+                true,
+            ),
+            // tag 1 + generation 8 + heartbeat 8 + ranges (2 + 16 * 32).
+            (
+                MetaValue::GroupMember(GroupMemberRecord {
+                    generation: u64::MAX,
+                    last_heartbeat_apply_index: u64::MAX,
+                    assigned: (0..MAX_ASSIGNED_RANGES as u128)
+                        .map(|range| RangeAssignment {
+                            topic_uuid: uuid,
+                            range_uuid: Uuid::from_u128(range),
+                        })
+                        .collect(),
+                }),
+                531,
+                true,
+            ),
+            (
+                MetaValue::GroupCursor(CursorCheckpointRecord {
+                    topic_epoch: u64::MAX,
+                    range_generation: u64::MAX,
+                    segment_uuid: uuid,
+                    segment_generation: u64::MAX,
+                    segment_root: [0xff; 32],
+                    record_offset: u64::MAX,
+                    record_index: u64::MAX,
+                    lineage_transition_id: Some(uuid),
+                    checkpoint_generation: u64::MAX,
+                    committed_by_member: uuid,
+                }),
+                130,
+                true,
+            ),
+            // tag 1 + generation 8 + rf 1 + apply index 8 + nodes (2 + 9 *
+            // 16): the transient RF + 1 set a rebalance holds.
+            (
+                MetaValue::SegmentPlacement(SegmentPlacementRecord {
+                    generation: u64::MAX,
+                    declared_replication_factor: MAX_REPLICAS as u8,
+                    replica_nodes: (0..MAX_TRANSIENT_REPLICAS as u128)
+                        .map(Uuid::from_u128)
+                        .collect(),
+                    committed_apply_index: u64::MAX,
+                }),
+                164,
+                true,
+            ),
+            (
+                MetaValue::ReplacementProof(ReplacementProofRecord {
+                    generation: u64::MAX,
+                    segment_generation: u64::MAX,
+                    content_root: [0xff; 32],
+                    expected_length_bytes: u64::MAX,
+                    source_node_uuid: uuid,
+                    destination_node_uuid: uuid,
+                    fencing_epoch: u64::MAX,
+                    verification_method: VerificationMethod::AuthenticatedContentRoot,
+                    verifier_node_uuid: uuid,
+                    verified_at_apply_index: u64::MAX,
+                    verified_term: u64::MAX,
+                }),
+                130,
+                true,
+            ),
+            (
+                MetaValue::RebalanceIntent(RebalanceIntentRecord {
+                    from_node_uuid: uuid,
+                    to_node_uuid: uuid,
+                    proposed_at_apply_index: u64::MAX,
+                    placement_generation_at_proposal: u64::MAX,
+                }),
+                49,
+                true,
+            ),
+            (MetaValue::TierCopy(max_tier_copy_record()), 972, true),
+            (
+                MetaValue::TopicRetentionPolicy(TopicRetentionPolicyRecord {
+                    generation: u64::MAX,
+                    unarchived_deletion_allowed: true,
+                }),
+                10,
+                true,
+            ),
+            // Without verdicts, the form every release since v0.5.0
+            // records: header (tag 1 + epochs 16 + holder_from 17 +
+            // holder_to 16 + grant 1 + granted 16) 67 + reported 1 +
+            // outcome (tag 1 + boundary 9 + sealed prefix 9 + count 2 + 32 *
+            // 24 + votes 8) 797 + reported at/index 16.
+            (
+                MetaValue::RangeTransition(largest_transition(false)),
+                881,
+                true,
+            ),
+            // With a reconciled verdict on each answer (#577, feature level
+            // 6): 32 * 33 instead of 32 * 24. Over the released bound, which
+            // is why the bound was raised; no release before level 6 decodes
+            // this outcome tag at any length.
+            (
+                MetaValue::RangeTransition(largest_transition(true)),
+                1169,
+                false,
+            ),
+            (
+                MetaValue::LineageTransition(LineageTransitionRecord {
+                    parent_range_uuid: uuid,
+                    barrier_offset: u64::MAX,
+                    left_range_uuid: uuid,
+                    right_range_uuid: uuid,
+                    sealed_by_epoch: u64::MAX,
+                    issued_at_ms: i64::MAX,
+                }),
+                73,
+                true,
+            ),
+            (
+                MetaValue::ClusterConfig(ClusterConfigRecord {
+                    feature_level: u32::MAX,
+                }),
+                5,
+                true,
+            ),
+            // tag 1 + generation 8 + epoch 8 + members (2 + 8 * 16): a
+            // recorded set is at most MAX_REPLICAS; the transient extra
+            // member is a placement's alone.
+            (
+                MetaValue::RangeReplicaSet(RangeReplicaSetRecord {
+                    generation: u64::MAX,
+                    members: (0..MAX_REPLICAS as u128).map(Uuid::from_u128).collect(),
+                    recorded_at_epoch: u64::MAX,
+                }),
+                147,
+                true,
+            ),
+            // The attested form (#636, feature level 8): the verdict-carrying
+            // record above with outcome tag 4 instead of 3, plus the
+            // attestation - id 16 + replica 16 + operator (2 + 128) + at 8.
+            (
+                MetaValue::RangeTransition(largest_attested_transition()),
+                1339,
+                false,
+            ),
+            // tag 1 + the attestation 170 (#636, feature level 8).
+            (
+                MetaValue::PromotionAttestation(largest_attestation()),
+                171,
+                false,
+            ),
+            // tag 1 + release (2 + 64) + protocol 2 + level 4 (#634, feature
+            // level 7).
+            (
+                MetaValue::NodeVersion(crate::versions::NodeVersionRecord {
+                    release: "r".repeat(crate::command::MAX_RELEASE_BYTES),
+                    max_replica_protocol: u16::MAX,
+                    supported_feature_level: u32::MAX,
+                }),
+                73,
+                false,
+            ),
+        ]
+    }
+
+    /// #657: no record any command can produce is too large for a snapshot
+    /// to carry. The largest record of every kind encodes within the bound
+    /// `decode_snapshot` enforces, and decodes back to itself; a record a
+    /// release before feature level 6 can read also fits the 1024 bytes
+    /// that release enforces, so raising the bound changed nothing an older
+    /// reader can meet.
+    #[test]
+    fn the_largest_record_of_every_kind_fits_the_snapshot_value_bound() {
+        let mut covered = std::collections::BTreeSet::new();
+        for (value, pinned, readable_before_level_6) in largest_records() {
+            covered.insert(meta_value_kind(&value));
+            let encoded = value.encode().unwrap();
+            assert_eq!(
+                encoded.len(),
+                pinned,
+                "largest {value:?} encodes to {} bytes, pinned at {pinned}",
+                encoded.len()
+            );
+            assert!(
+                encoded.len() <= MAX_SNAPSHOT_VALUE_BYTES,
+                "largest record of kind {} is {} bytes, above the {MAX_SNAPSHOT_VALUE_BYTES}-byte \
+                 snapshot value bound",
+                meta_value_kind(&value),
+                encoded.len()
+            );
+            if readable_before_level_6 {
+                assert!(
+                    encoded.len() <= LEGACY_SNAPSHOT_VALUE_BYTES,
+                    "largest record of kind {} is {} bytes: a release that enforces \
+                     {LEGACY_SNAPSHOT_VALUE_BYTES} could decode it but not restore it",
+                    meta_value_kind(&value),
+                    encoded.len()
+                );
+            }
+            assert_eq!(MetaValue::decode(&encoded).unwrap(), value);
+        }
+        assert_eq!(
+            covered,
+            (0..META_VALUE_KINDS).collect(),
+            "every MetaValue kind needs its largest record in largest_records()"
+        );
+    }
+
+    /// #657: the largest transition record a promotion report can produce -
+    /// [`MAX_TRANSITION_QUORUM`] answers, each with a reconciled verdict -
+    /// is accepted when applied, and the snapshot holding it restores. It
+    /// used to encode without complaint and then be refused on restore, so
+    /// a voter restarting from it, or a follower sent it, could not start.
+    #[test]
+    fn the_largest_transition_record_the_code_allows_survives_a_snapshot() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        acquire(
+            &mut machine,
+            3,
+            3,
+            1_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        );
+        let outcome = largest_outcome(true);
+        assert_eq!(
+            report(
+                &mut machine,
+                4,
+                4,
+                2_000,
+                holder,
+                topic_uuid,
+                range_uuid,
+                1,
+                outcome.clone()
+            ),
+            MetadataResponse::TransitionRecorded { fencing_epoch: 1 }
+        );
+        let recorded = transitions_of(&machine, topic_uuid, range_uuid);
+        assert!(matches!(
+            &recorded[..],
+            [RangeTransitionRecord {
+                outcome: TransitionOutcome::Reported { outcome: kept, .. },
+                ..
+            }] if *kept == outcome
+        ));
+        let value_len = recorded[0].canonical_bytes().unwrap().len();
+        assert!(
+            value_len > LEGACY_SNAPSHOT_VALUE_BYTES,
+            "the record is {value_len} bytes; this test needs one above the old bound"
+        );
+
+        let snapshot = machine.encode_snapshot().unwrap();
+        let restored = MetaStateMachine::decode_snapshot(&snapshot).unwrap_or_else(|error| {
+            panic!(
+                "a snapshot with a {value_len}-byte transition record was written \
+                 but cannot be restored: {error}"
+            )
+        });
+        assert_eq!(restored, machine);
+    }
+
+    /// #657: `encode_snapshot` refuses a record `decode_snapshot` would
+    /// refuse, so the failure surfaces where the record is written - not on
+    /// a voter's restart, where it costs the metadata tier a member. A
+    /// record over the value bound is one; a record the value decoder
+    /// rejects (here a range with three parents, where a range has at most
+    /// two) is the other, and neither may be written.
+    #[test]
+    fn encode_snapshot_refuses_a_record_its_reader_would_refuse() {
+        let topic_uuid = Uuid::from_u128(20);
+        let range_with_parents = |count: u128| {
+            let mut machine = MetaStateMachine::new();
+            machine.records.insert(
+                MetaKey::Range {
+                    topic_uuid,
+                    range_uuid: Uuid::from_u128(21),
+                }
+                .encode(),
+                MetaValue::Range(RangeRecord {
+                    generation: 1,
+                    key_prefix: 0,
+                    key_prefix_bits: 0,
+                    fencing_epoch: 0,
+                    lineage_generation: 0,
+                    parents: (0..count)
+                        .map(|parent| Uuid::from_u128(100 + parent))
+                        .collect(),
+                    sealed_at: None,
+                    lease: None,
+                }),
+            );
+            machine
+        };
+
+        // Over the bound: 200 parents is a 3.2 KB value.
+        let oversized = range_with_parents(200);
+        let error = match oversized.encode_snapshot() {
+            Ok(written) => panic!(
+                "a {}-byte snapshot holding a 3.2 KB value was written; decode_snapshot \
+                 refuses it",
+                written.len()
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                CodecError::BoundExceeded {
+                    what: "snapshot value",
+                    maximum: MAX_SNAPSHOT_VALUE_BYTES,
+                    ..
+                }
+            ),
+            "refused for the wrong reason: {error:?}"
+        );
+
+        // Inside the bound, but a value the decoder refuses.
+        let three_parents = range_with_parents(3);
+        let error = match three_parents.encode_snapshot() {
+            Ok(written) => panic!(
+                "a {}-byte snapshot holding a three-parent range was written; \
+                 decode_snapshot refuses it",
+                written.len()
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                CodecError::InvalidValue {
+                    what: "range parents",
+                    ..
+                }
+            ),
+            "refused for the wrong reason: {error:?}"
+        );
+
+        // And the legal shape still writes and restores.
+        let two_parents = range_with_parents(2);
+        let snapshot = two_parents.encode_snapshot().unwrap();
+        assert_eq!(
+            MetaStateMachine::decode_snapshot(&snapshot).unwrap(),
+            two_parents
+        );
+    }
+
+    /// #657: a report whose transition record could not be written into a
+    /// snapshot is refused when applied, so the state never holds it. The
+    /// refusal depends only on the command and the record, so every voter
+    /// refuses it alike. A record that cannot be encoded at all is the case
+    /// reachable today: an in-process command (one that never crossed the
+    /// codec) with a verdict on some answers and not others. Accepted, it
+    /// made every later snapshot fail to encode.
+    #[test]
+    fn a_report_whose_record_could_not_be_snapshotted_is_refused_when_applied() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        acquire(
+            &mut machine,
+            3,
+            3,
+            1_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        );
+        let PromotionOutcome::Established {
+            boundary_offset,
+            sealed_prefix_end,
+            mut quorum,
+            votes,
+            required,
+            attestation,
+        } = largest_outcome(true)
+        else {
+            unreachable!()
+        };
+        quorum[0].lineage = None;
+        let half_verdicts = PromotionOutcome::Established {
+            boundary_offset,
+            sealed_prefix_end,
+            quorum,
+            votes,
+            required,
+            attestation,
+        };
+        let response = report(
+            &mut machine,
+            4,
+            4,
+            2_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            1,
+            half_verdicts,
+        );
+        assert!(
+            matches!(
+                &response,
+                MetadataResponse::Rejected(MetadataError::InvalidTransition(detail))
+                    if detail.contains("snapshot")
+            ),
+            "expected a refusal naming the snapshot, got {response:?}"
+        );
+        assert!(matches!(
+            &transitions_of(&machine, topic_uuid, range_uuid)[..],
+            [RangeTransitionRecord {
+                outcome: TransitionOutcome::Pending,
+                ..
+            }]
+        ));
+        let restored =
+            MetaStateMachine::decode_snapshot(&machine.encode_snapshot().unwrap()).unwrap();
+        assert_eq!(restored, machine);
+    }
+
+    /// #657: a recorded replica set is at most [`MAX_REPLICAS`] - the bound
+    /// the snapshot reader holds it to - so the state machine refuses a
+    /// larger one when applied, and the value codec refuses to write one,
+    /// rather than a snapshot carrying a record no voter can restore. The
+    /// transient extra member belongs to a placement during a rebalance,
+    /// never to a recorded set.
+    #[test]
+    fn a_replica_set_above_max_replicas_is_refused_when_applied_and_written() {
+        let (mut machine, _holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let members: Vec<Uuid> = (0..=MAX_REPLICAS as u128)
+            .map(|node| Uuid::from_u128(500 + node))
+            .collect();
+        // Registered, so the size is the only thing wrong with the set.
+        for (index, node_uuid) in (100..).zip(&members) {
+            assert!(matches!(
+                machine.apply(
+                    index,
+                    &MetadataCommand::RegisterNode {
+                        env: envelope(u128::from(index)),
+                        node_uuid: *node_uuid,
+                        addr: format!("n{index}:9200"),
+                        expected_generation: None,
+                    },
+                ),
+                MetadataResponse::Ack { .. }
+            ));
+        }
+        let response = machine.apply(
+            3,
+            &MetadataCommand::SetRangeReplicaSet {
+                env: envelope(3),
+                topic_uuid,
+                range_uuid,
+                members: members.clone(),
+                expected_generation: 0,
+            },
+        );
+        assert!(
+            matches!(
+                response,
+                MetadataResponse::Rejected(MetadataError::Limit(_))
+            ),
+            "a {}-member replica set was not refused: {response:?}",
+            members.len()
+        );
+        assert!(machine.range_replica_set(topic_uuid, range_uuid).is_none());
+
+        let oversized = MetaValue::RangeReplicaSet(RangeReplicaSetRecord {
+            generation: 1,
+            members,
+            recorded_at_epoch: 0,
+        });
+        assert!(matches!(
+            oversized.encode(),
+            Err(CodecError::BoundExceeded {
+                what: "replica set members",
+                maximum: MAX_REPLICAS,
+                ..
+            })
+        ));
     }
 
     #[test]

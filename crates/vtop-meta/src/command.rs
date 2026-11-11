@@ -390,6 +390,12 @@ pub fn derived_group_uuid(cluster_id: Uuid, name: &str) -> Uuid {
 
 /// Bound on the fenced-quorum answers a promotion report may carry: the
 /// replica set plus the transient extra a rebalance holds, with room.
+///
+/// It also sizes the largest transition record, which a snapshot must carry
+/// (#657): 881 bytes without verdicts, 1169 with a reconciled verdict on
+/// every answer. Raising it, or adding to what an answer carries, has to keep
+/// `the_largest_record_of_every_kind_fits_the_snapshot_value_bound` in
+/// `state.rs` passing.
 pub const MAX_TRANSITION_QUORUM: usize = 32;
 
 /// One fenced replica's answer at promotion, as the transition record keeps
