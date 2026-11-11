@@ -433,37 +433,7 @@ impl FencingEpochJournal {
     /// a divergence point and discarded a log the two replicas entirely agreed
     /// on. A verdict makes that mistake impossible to make quietly.
     pub fn compare_lineage(&self, other: &[EpochStart]) -> Lineage {
-        // CANONICALIZED before comparing (#408 review): an epoch adopted
-        // while idle writes nothing, and its successor starting at the same
-        // offset is the epoch that actually governs records from there. One
-        // replica recording the idle adoption and another not still
-        // attribute every record identically — comparing the raw vectors
-        // would call that divergence and mandate truncating records both
-        // sides agree on.
-        let mine_canonical = canonicalize_lineage(&self.entries);
-        let theirs_canonical = canonicalize_lineage(other);
-        let mut compared = 0_usize;
-        for (mine, theirs) in mine_canonical.iter().zip(theirs_canonical.iter()) {
-            if mine.epoch != theirs.epoch || mine.start_offset != theirs.start_offset {
-                // Either different leadership at the same position in history,
-                // or the same epoch beginning in two different places — which
-                // is a disagreement about what came before it.
-                return Lineage::DivergesAt(mine.start_offset.min(theirs.start_offset));
-            }
-            compared += 1;
-        }
-        // Neither vector contradicted the other. Note this covers the case
-        // where one is a PREFIX of the other, which is not divergence: the
-        // shorter replica has simply recorded less, and nothing here proves
-        // anything about the records beyond its last entry.
-        if compared == 0 {
-            // Nothing was actually compared, so nothing is proven. Two replicas
-            // that cannot vouch for their own history are not in agreement —
-            // they are mutually ignorant, and reconciling on that basis is the
-            // opposite of what an empty vector means everywhere else here.
-            return Lineage::Unknown;
-        }
-        Lineage::Agreed
+        compare_lineages(&self.entries, other)
     }
 
     fn sync_parent(env: &Env, path: &Path) -> BrokerResult<()> {
@@ -491,6 +461,46 @@ impl FencingEpochJournal {
     fn corrupt(message: String) -> BrokerError {
         BrokerError::EpochJournalCorrupt(format!("fencing-epoch journal: {message}"))
     }
+}
+
+/// [`FencingEpochJournal::compare_lineage`] over two vectors neither of which
+/// is this process's journal (#577): a promotion candidate judges each fenced
+/// replica's answer by comparing the history it sent with the history the
+/// replica returned, and holds no journal for the replica side. One function,
+/// so the candidate's verdict and the replica's reconciliation cannot drift
+/// apart on what "agreed" means.
+pub fn compare_lineages(mine: &[EpochStart], theirs: &[EpochStart]) -> Lineage {
+    // CANONICALIZED before comparing (#408 review): an epoch adopted
+    // while idle writes nothing, and its successor starting at the same
+    // offset is the epoch that actually governs records from there. One
+    // replica recording the idle adoption and another not still
+    // attribute every record identically — comparing the raw vectors
+    // would call that divergence and mandate truncating records both
+    // sides agree on.
+    let mine_canonical = canonicalize_lineage(mine);
+    let theirs_canonical = canonicalize_lineage(theirs);
+    let mut compared = 0_usize;
+    for (mine, theirs) in mine_canonical.iter().zip(theirs_canonical.iter()) {
+        if mine.epoch != theirs.epoch || mine.start_offset != theirs.start_offset {
+            // Either different leadership at the same position in history,
+            // or the same epoch beginning in two different places — which
+            // is a disagreement about what came before it.
+            return Lineage::DivergesAt(mine.start_offset.min(theirs.start_offset));
+        }
+        compared += 1;
+    }
+    // Neither vector contradicted the other. Note this covers the case
+    // where one is a PREFIX of the other, which is not divergence: the
+    // shorter replica has simply recorded less, and nothing here proves
+    // anything about the records beyond its last entry.
+    if compared == 0 {
+        // Nothing was actually compared, so nothing is proven. Two replicas
+        // that cannot vouch for their own history are not in agreement —
+        // they are mutually ignorant, and reconciling on that basis is the
+        // opposite of what an empty vector means everywhere else here.
+        return Lineage::Unknown;
+    }
+    Lineage::Agreed
 }
 
 /// Collapse every same-offset run to its last entry (#408): an epoch

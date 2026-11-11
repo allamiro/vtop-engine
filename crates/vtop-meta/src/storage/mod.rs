@@ -98,7 +98,12 @@ pub(crate) fn is_newer_format(error: &CodecError) -> bool {
                 | "log entry kind"
                 | "record value tag"
                 | "meta key category"
-                | "snapshot payload version",
+                | "snapshot payload version"
+                // Inside a known kind (#577): a promotion outcome or answer
+                // verdict this build does not know was written by a newer
+                // one, exactly as an unknown kind is.
+                | "promotion outcome"
+                | "quorum answer lineage",
             ..
         }
     )

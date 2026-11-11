@@ -199,6 +199,33 @@ reopen quietly.
   is the leader (an older leader cannot hold a set), and otherwise asks the
   leader it names - so data nodes may be upgraded ahead of the metadata
   tier without one stale endpoint switching the check off.
+- **#577** - a promotion's quorum answers were bare offsets. The fence
+  reconciles each replica against the candidate's epoch vector before it
+  answers, but where lineage cannot be proven (a replica with records and no
+  epoch history, a broken journal, a candidate with no history of its own)
+  it reconciles nothing, and that replica's offset was still counted - toward
+  the majority, the boundary, the §5.4.1 vote and the replica-set gate -
+  whatever leadership wrote its records. The candidate now judges each
+  answer from the history the fence returned: Agreed, Reconciled (it
+  discarded n records first) or Unknown, and only the first two count,
+  even when nothing else is available - falling back to offsets then would
+  be a fence that fails open exactly when needed. A replica that cannot
+  prove lineage is repaired from one that can (`vtopctl node repair`, #315),
+  not promoted on a guess. A candidate with no history stands aside for a
+  replica that has records: a candidate holding records it cannot vouch
+  for always did, and one holding none now does too (#612). The costs
+  (#612): a range that holds records but where NO replica has epoch
+  history (records that predate the journal on every replica, or journals
+  lost on every replica) cannot promote, and repair cannot fix it, since a
+  history-less source has nothing to install; and a
+  replica whose only dispute is below its retained base (#408) is not
+  counted. The verdicts are recorded with the quorum and the replica-set gate
+  and `vtopctl meta transitions` count only the proven answers. Recording
+  them is a new outcome tag inside the promotion report, so it is gated at
+  feature level 6: below it (or against a metadata tier that predates
+  levels) a data node records the report without verdicts AND without the
+  Unknown answers, which that form's readers would count by offset. Records
+  written before verdicts carry none and are judged exactly as before.
 
 One observation rode along without becoming a fix: scenario 09 once left a
 promotion unacquired within its deadline (#318). The flake has not recurred —

@@ -14,7 +14,14 @@ use std::path::{Path, PathBuf};
 /// Protocol identifier embedded in every manifest.
 pub const VTOP_PROTOCOL: &str = "VTOP";
 /// Manifest schema version.
-pub const VTOP_VERSION: &str = "0.2";
+///
+/// `0.3` (#622): `source_progress` runs from the batch's first read's start to
+/// its last read's end. Up to `0.2` it carried the last read's start, so a
+/// batch built from several reads claimed less than its object held; the
+/// ledger's `progress_start` is the authority for those. The shape is
+/// unchanged, so every released verifier reads both: the bump tells a reader
+/// which meaning a manifest's start has.
+pub const VTOP_VERSION: &str = "0.3";
 /// Maximum serialized manifest size accepted from storage.
 ///
 /// Manifests contain metadata only and are normally a few KiB. A hard 1 MiB

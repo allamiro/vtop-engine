@@ -2307,6 +2307,7 @@ mod tests {
                     quorum: vec![crate::command::QuorumAnswer {
                         node_uuid: Uuid::from_u128(11),
                         offset: 401,
+                        lineage: None,
                     }],
                     votes: 1,
                     required: 1,

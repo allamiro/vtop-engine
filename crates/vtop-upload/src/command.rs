@@ -149,14 +149,39 @@ impl CommandPolicy {
         Ok(String::from_utf8_lossy(&combined).into_owned())
     }
 
+    /// Run the tool and keep what it wrote.
+    ///
+    /// The call is over when the TOOL exits, not when every copy of its
+    /// pipes closes (#593). This used to join the exit with both drains, so
+    /// a descendant that inherited stdout or stderr — a backgrounded helper,
+    /// a credential process — kept a tool that had already exited "running"
+    /// until `upload.command_timeout_seconds` (300 s by default) ran out,
+    /// and the timeout then threw away everything captured, a `SlowDown`
+    /// included. Now the exit is watched while the pipes drain; once it is
+    /// in, the drains get `EXITED_DRAIN_GRACE` (never past the deadline) to
+    /// collect what the tool wrote before exiting, and what they hold then
+    /// is the output. A timeout reports that output too.
+    ///
+    /// The tool runs in its own process group, which is killed on a timeout,
+    /// when the call is dropped mid-run, and when something is still holding
+    /// the pipes after the tool exited; `kill_on_drop` alone ends only the
+    /// tool and left the holder running.
     async fn capture(
         &self,
         command: &mut Command,
         operation: &str,
     ) -> Result<CapturedOutput, VtopError> {
+        // Fixed before the spawn: running the tool and draining what it
+        // wrote spend from this one deadline (#529 review).
+        let deadline = crate::base::command_deadline(self.timeout);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.process_group(0);
         let mut child =
             crate::base::spawn_retrying_text_busy(command, self.backend, operation).await?;
+        // Declared after `child`, so on a cancelled call it is dropped first
+        // and kills the group while the tool is still unreaped.
+        let mut group = ToolGroup::of(&child);
         let stdout = child.stdout.take().ok_or_else(|| {
             VtopError::Upload(format!("{} {operation} stdout unavailable", self.backend))
         })?;
@@ -164,34 +189,87 @@ impl CommandPolicy {
             VtopError::Upload(format!("{} {operation} stderr unavailable", self.backend))
         })?;
         let max = self.max_output_bytes;
-        let completed = tokio::time::timeout(self.timeout, async {
-            let (status, stdout, stderr) = tokio::join!(
-                child.wait(),
-                capture_bounded(stdout, max),
-                capture_bounded(stderr, max)
-            );
-            (status, stdout, stderr)
-        })
-        .await;
+        let mut kept_stdout = KeptOutput::default();
+        let mut kept_stderr = KeptOutput::default();
+        let (exit, stdout_end, stderr_end) = {
+            let stdout_drain = drain_bounded(stdout, max, &mut kept_stdout);
+            let stderr_drain = drain_bounded(stderr, max, &mut kept_stderr);
+            tokio::pin!(stdout_drain, stderr_drain);
+            let mut stdout_end = None;
+            let mut stderr_end = None;
+            let exit = tokio::time::timeout_at(deadline, async {
+                loop {
+                    tokio::select! {
+                        end = &mut stdout_drain, if stdout_end.is_none() => stdout_end = Some(end),
+                        end = &mut stderr_drain, if stderr_end.is_none() => stderr_end = Some(end),
+                        status = child.wait() => break status,
+                    }
+                }
+            })
+            .await;
+            if exit.is_ok() {
+                let until = tokio::time::Instant::now()
+                    .checked_add(crate::base::EXITED_DRAIN_GRACE)
+                    .map_or(deadline, |grace| grace.min(deadline));
+                // Both unfinished drains are polled TOGETHER (review of
+                // #615): awaiting one and then the other let a descendant
+                // holding stdout spend the whole grace while the tool's last
+                // stderr line sat unread in the pipe.
+                let _ = tokio::time::timeout_at(until, async {
+                    while stdout_end.is_none() || stderr_end.is_none() {
+                        tokio::select! {
+                            end = &mut stdout_drain, if stdout_end.is_none() => stdout_end = Some(end),
+                            end = &mut stderr_drain, if stderr_end.is_none() => stderr_end = Some(end),
+                        }
+                    }
+                })
+                .await;
+            }
+            (exit, stdout_end, stderr_end)
+        };
 
-        let (status, stdout, stderr) = match completed {
-            Ok(result) => result,
+        let status = match exit {
+            Ok(status) => {
+                // A failed wait proves nothing about the tool, so the group
+                // stays armed for the drop below.
+                if status.is_ok() {
+                    group.reaped();
+                }
+                status
+            }
             Err(_) => {
+                // The tool is still running, so its group is certainly the
+                // one it was started in: end the tool and everything it
+                // started, then report what they had written.
+                group.kill();
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                return Err(VtopError::Upload(format!(
+                group.reaped();
+                let detail = format!(
                     "{} {operation} exceeded the {}s timeout",
                     self.backend,
                     self.timeout.as_secs()
-                )));
+                );
+                return Err(failure_with_evidence(
+                    detail,
+                    &kept_stdout.bytes,
+                    &kept_stderr.bytes,
+                ));
             }
         };
+        if !reached_eof(&stdout_end) || !reached_eof(&stderr_end) {
+            // The tool has exited, yet a pipe was not read to its end: a
+            // descendant may still hold it. End the group rather than leave
+            // it running with nobody reading its output.
+            group.kill();
+        }
         let status = status.map_err(|error| {
             VtopError::Upload(format!("waiting for {} {operation}: {error}", self.backend))
         })?;
-        let (stdout, stdout_oversized) = stdout?;
-        let (stderr, stderr_oversized) = stderr?;
-        if stdout_oversized || stderr_oversized {
+        for end in [stdout_end, stderr_end].into_iter().flatten() {
+            end?;
+        }
+        if kept_stdout.oversized || kept_stderr.oversized {
             return Err(VtopError::Upload(format!(
                 "{} {operation} exceeded the {}-byte output limit",
                 self.backend, self.max_output_bytes
@@ -199,8 +277,8 @@ impl CommandPolicy {
         }
         Ok(CapturedOutput {
             status,
-            stdout,
-            stderr,
+            stdout: kept_stdout.bytes,
+            stderr: kept_stderr.bytes,
         })
     }
 }
@@ -211,15 +289,91 @@ struct CapturedOutput {
     stderr: Vec<u8>,
 }
 
+/// The process group a tool runs in, made by `process_group(0)` so its id is
+/// the tool's pid (#593). A tool's descendants inherit it unless they leave
+/// on purpose, so killing the group ends what the tool started, including
+/// whatever is still holding its stdout or stderr.
+///
+/// While the tool is unreaped its pid, and so the group id, cannot be
+/// reused. After it is reaped the group is killed only when a pipe was not
+/// read to EOF — normally because a descendant still holds it, almost always
+/// from inside that group, which then still exists and still pins the id.
+///
+/// Unix only: elsewhere there is no group, and only the tool is killed.
+struct ToolGroup {
+    #[cfg(unix)]
+    leader: Option<rustix::process::Pid>,
+    unreaped: bool,
+}
+
+impl ToolGroup {
+    fn of(child: &tokio::process::Child) -> Self {
+        #[cfg(unix)]
+        {
+            // Never 1: `kill(-1, ..)` signals every process this one may
+            // signal. A spawned child's pid never is 1, but the guard is free.
+            let leader = child
+                .id()
+                .and_then(|id| i32::try_from(id).ok())
+                .filter(|id| *id > 1)
+                .and_then(rustix::process::Pid::from_raw);
+            Self {
+                leader,
+                unreaped: true,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child;
+            Self { unreaped: true }
+        }
+    }
+
+    fn kill(&self) {
+        #[cfg(unix)]
+        if let Some(leader) = self.leader {
+            // ESRCH (the group is already gone) is the expected outcome
+            // when nothing was left behind.
+            let _ = rustix::process::kill_process_group(leader, rustix::process::Signal::KILL);
+        }
+    }
+
+    fn reaped(&mut self) {
+        self.unreaped = false;
+    }
+}
+
+impl Drop for ToolGroup {
+    fn drop(&mut self) {
+        // A call dropped mid-run (shutdown, a caller's own timeout) never
+        // reaches the explicit kills; `kill_on_drop` then ends only the tool.
+        if self.unreaped {
+            self.kill();
+        }
+    }
+}
+
 /// The error for a tool that exited non-zero: its exit status, the last
 /// line it wrote (stderr first, stdout if stderr was silent — bounded, since
 /// a tool can print a whole listing on failure), and the classification the
 /// evidence supports (#102). Before this the message carried only the
 /// status, so a `SlowDown` and a `NoSuchBucket` read identically.
 fn exit_failure(backend: &str, operation: &str, output: &CapturedOutput) -> VtopError {
+    failure_with_evidence(
+        format!("{backend} {operation} exited with {}", output.status),
+        &output.stdout,
+        &output.stderr,
+    )
+}
+
+/// `detail`, followed by the last line the tool wrote, classified by that
+/// evidence. Shared by a non-zero exit and a timeout (#593): a tool that hung
+/// after printing a `SlowDown` was reported as a bare timeout, which the
+/// width controller read as an ordinary failure.
+fn failure_with_evidence(detail: String, stdout: &[u8], stderr: &[u8]) -> VtopError {
     const MAX_EVIDENCE_CHARS: usize = 240;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    let stdout = String::from_utf8_lossy(stdout);
     let evidence = if stderr.trim().is_empty() {
         stdout
     } else {
@@ -233,37 +387,53 @@ fn exit_failure(backend: &str, operation: &str, output: &CapturedOutput) -> Vtop
         .unwrap_or_default();
     let shown: String = last_line.chars().take(MAX_EVIDENCE_CHARS).collect();
     let detail = if shown.is_empty() {
-        format!("{backend} {operation} exited with {}", output.status)
+        detail
     } else {
-        format!(
-            "{backend} {operation} exited with {}: {shown}",
-            output.status
-        )
+        format!("{detail}: {shown}")
     };
     crate::base::upload_failure(detail, &evidence)
+}
+
+/// Whether a drain read its pipe to EOF, which proves nothing else holds it.
+/// A drain cut off by the grace (`None`) proves nothing, and neither does one
+/// that FAILED (review of #615): it stopped reading with the pipe possibly
+/// still held, and treating it as finished skipped the group kill.
+fn reached_eof(end: &Option<std::io::Result<()>>) -> bool {
+    matches!(end, Some(Ok(())))
+}
+
+/// One pipe's output as far as it has been read: the first `max_bytes`, and
+/// whether more arrived. It lives outside the drain so that a drain cut off
+/// by the deadline or the post-exit grace still leaves what it read (#593).
+#[derive(Default)]
+struct KeptOutput {
+    bytes: Vec<u8>,
+    oversized: bool,
 }
 
 /// Continue draining after the storage cap is reached so a finite child does
 /// not deadlock on a full pipe. Memory remains bounded; an infinite producer
 /// is terminated by the policy timeout.
-async fn capture_bounded<R>(mut reader: R, max_bytes: usize) -> Result<(Vec<u8>, bool), VtopError>
+async fn drain_bounded<R>(
+    mut reader: R,
+    max_bytes: usize,
+    kept: &mut KeptOutput,
+) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
 {
-    let mut captured = Vec::with_capacity(max_bytes.min(64 * 1024));
-    let mut oversized = false;
+    kept.bytes.reserve(max_bytes.min(64 * 1024));
     let mut chunk = [0_u8; 8192];
     loop {
         let read = reader.read(&mut chunk).await?;
         if read == 0 {
-            break;
+            return Ok(());
         }
-        let remaining = max_bytes.saturating_sub(captured.len());
+        let remaining = max_bytes.saturating_sub(kept.bytes.len());
         let keep = remaining.min(read);
-        captured.extend_from_slice(&chunk[..keep]);
-        oversized |= keep < read;
+        kept.bytes.extend_from_slice(&chunk[..keep]);
+        kept.oversized |= keep < read;
     }
-    Ok((captured, oversized))
 }
 
 #[cfg(all(test, unix))]
@@ -803,6 +973,257 @@ mod tests {
         assert_eq!(
             descendants, 2,
             "each call's tool must have left its descendant"
+        );
+    }
+
+    /// A descendant for `script_with_descendant` that holds the tool's stdout
+    /// AND stderr (it redirects neither) and, once the test creates `go` in
+    /// the fixture directory, writes `survived` there. Gating on a file the
+    /// test controls, rather than on a sleep, keeps the check off the clock:
+    /// a descendant still alive when the call has returned leaves `survived`
+    /// within one poll of `go`, and one the call killed never does.
+    const SURVIVOR: &str = "( while [ ! -e \"${0%/*}/go\" ]; do sleep 0.05; done; \
+                            echo survived > \"${0%/*}/survived\" )";
+
+    /// Whether a `SURVIVOR` descendant outlived the call: release it, then
+    /// give it far longer than its 50 ms poll to answer. Under a loaded CI
+    /// box a slow survivor can only make this read `false` (a missed
+    /// detection), never a spurious `true`.
+    async fn survivor_outlived_the_call(dir: &tempfile::TempDir) -> bool {
+        std::fs::write(dir.path().join("go"), b"").unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        dir.path().join("survived").exists()
+    }
+
+    /// #593: the WRITE path (`capture`, behind every upload, manifest write,
+    /// delete and `--version` probe) joined the tool's exit with BOTH pipe
+    /// drains, so a descendant that inherited stdout/stderr kept the call
+    /// open until `upload.command_timeout_seconds` (300 s by default) ran
+    /// out, and then reported a successful tool as a timeout. The command
+    /// timeout here is 20 s, so returning on the tool's exit plus the short
+    /// drain grace and waiting out the deadline differ by an order of
+    /// magnitude, not by CI jitter.
+    #[tokio::test]
+    async fn a_successful_write_returns_on_the_tools_exit_while_a_descendant_holds_its_output() {
+        let (dir, path) = script_with_descendant(
+            "printf 'upload: ./object to s3://bucket/key\\n'\n{bg}\nexit 0",
+            SURVIVOR,
+        );
+        let mut cfg = config(&path);
+        cfg.command_timeout_seconds = 20;
+        let policy = CommandPolicy::from_config(&cfg, "test").unwrap();
+        let bound = policy.timeout();
+        let mut command = policy.command();
+        let started = std::time::Instant::now();
+        let outcome = policy.output(&mut command, "object upload").await;
+        let elapsed = started.elapsed();
+        let survived = survivor_outlived_the_call(&dir).await;
+        let descendants = kill_descendants(&dir);
+        assert_eq!(descendants, 1, "the tool must have left its descendant");
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "took {elapsed:?} (command timeout {bound:?}): the tool had already exited 0, yet \
+             the call waited for a descendant to close the pipes it inherited"
+        );
+        let output = outcome.unwrap_or_else(|error| {
+            panic!("the tool exited 0, yet the write was reported as failed: {error}")
+        });
+        assert!(
+            output.contains("upload: ./object to s3://bucket/key"),
+            "the tool's own stdout was lost: {output:?}"
+        );
+        assert!(
+            !survived,
+            "the descendant still holding the tool's pipes outlived the call: it was not in a \
+             process group the call ended"
+        );
+    }
+
+    /// #593, the evidence half: a write the store THROTTLED, whose tool
+    /// exited at once but left a descendant holding stderr, used to come back
+    /// after the whole deadline as a bare `exceeded the 20s timeout` - a
+    /// plain failure, telling the width controller the store was fine while
+    /// it was asking for less (the misclassification #529 fixed for the read
+    /// path). The same shape as #530's read-back test, driving an upload.
+    #[tokio::test]
+    async fn a_throttled_write_is_classified_promptly_while_a_descendant_holds_stderr() {
+        use crate::base::UploadBackend;
+        let (dir, path) = script_with_descendant(
+            "printf '%s\\n' 'An error occurred (SlowDown) when calling the PutObject operation' >&2\n\
+             {bg}\n\
+             exit 1",
+            "sleep 30 >/dev/null",
+        );
+        let mut cfg = config(&path);
+        cfg.command_timeout_seconds = 20;
+        let policy = CommandPolicy::from_config(&cfg, "test").unwrap();
+        let bound = policy.timeout();
+        let backend = crate::awscli_backend::AwsCliBackend::new(policy, None, None);
+        let object = tempfile::NamedTempFile::new().unwrap();
+        let started = std::time::Instant::now();
+        let outcome = backend
+            .put_object(object.path(), "s3://bucket/key", None)
+            .await;
+        let elapsed = started.elapsed();
+        let descendants = kill_descendants(&dir);
+        assert_eq!(descendants, 1, "the tool must have left its descendant");
+        let error = outcome.expect_err("a tool that exited 1 must fail the upload");
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "took {elapsed:?} (command timeout {bound:?}): the tool had already exited, yet the \
+             stderr drain ran on toward the command deadline"
+        );
+        assert!(
+            error.is_upload_throttle(),
+            "the tool exited with a SlowDown on stderr, yet the upload reported: {error}"
+        );
+        assert!(
+            error.to_string().contains("SlowDown"),
+            "the throttle line is the evidence and must be in the message: {error}"
+        );
+    }
+
+    /// Review of #615: the post-exit grace awaited the stdout drain and THEN
+    /// the stderr drain. When the tool's exit won the race against the read
+    /// of its last stderr bytes, and a descendant held stdout, the stdout
+    /// wait spent the whole grace, stderr was never polled again, and the
+    /// throttle line sitting in the pipe was dropped. Whether the exit wins
+    /// is a coin flip per call (`select!` picks among ready branches at
+    /// random), so one call proves little; many concurrent calls make the
+    /// old order fail essentially every run, while each call still costs only
+    /// the one shared 1 s grace.
+    #[tokio::test]
+    async fn a_descendant_holding_stdout_cannot_cost_a_write_its_final_stderr_line() {
+        use crate::base::UploadBackend;
+        const CALLS: usize = 24;
+        let (dir, path) = script_with_descendant(
+            "{bg}\n\
+             printf '%s\\n' 'An error occurred (SlowDown) when calling the PutObject operation' >&2\n\
+             exit 1",
+            "sleep 30 2>/dev/null",
+        );
+        let mut cfg = config(&path);
+        cfg.command_timeout_seconds = 20;
+        let backend = crate::awscli_backend::AwsCliBackend::new(
+            CommandPolicy::from_config(&cfg, "test").unwrap(),
+            None,
+            None,
+        );
+        let object = tempfile::NamedTempFile::new().unwrap();
+        let started = std::time::Instant::now();
+        let outcomes = futures::future::join_all(
+            (0..CALLS).map(|_| backend.put_object(object.path(), "s3://bucket/key", None)),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let descendants = kill_descendants(&dir);
+        assert_eq!(
+            descendants, CALLS,
+            "each call's tool must have left its descendant"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "{CALLS} concurrent calls took {elapsed:?} against a 20 s command timeout"
+        );
+        let lost: Vec<String> = outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect_err("a tool that exited 1 must fail the upload"))
+            .filter(|error| !error.is_upload_throttle() || !error.to_string().contains("SlowDown"))
+            .map(|error| error.to_string())
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "{} of {CALLS} calls lost the tool's final stderr line while a descendant held \
+             stdout through the grace; first: {:?}",
+            lost.len(),
+            lost.first()
+        );
+    }
+
+    /// Review of #615: only a drain that read its pipe to EOF lets the
+    /// tool's group live. A failed read used to count as finished, so the
+    /// group kill was skipped with the pipe's holder possibly alive. A pipe
+    /// read error cannot be provoked from a shell fixture, so the rule is
+    /// pinned here, on the predicate `capture` uses.
+    #[test]
+    fn only_a_drain_that_reached_eof_spares_the_tools_group() {
+        assert!(reached_eof(&Some(Ok(()))));
+        assert!(
+            !reached_eof(&None),
+            "a drain cut off by the grace left the pipe held"
+        );
+        assert!(
+            !reached_eof(&Some(Err(std::io::Error::other("read failed")))),
+            "a failed drain stopped reading with the pipe possibly still held"
+        );
+    }
+
+    /// #593: a write that really does time out reported only `exceeded the
+    /// Ns timeout`, discarding everything the tool had printed, and killed
+    /// only the tool - a descendant it started kept running. Both what each
+    /// pipe carried and the descendant's end are checked here.
+    #[tokio::test]
+    async fn a_timed_out_write_reports_what_it_captured_and_ends_the_tools_descendants() {
+        let throttled = script_with_descendant(
+            "printf 'upload: 12%% done\\n'\n\
+             printf '%s\\n' 'An error occurred (SlowDown) when calling the PutObject operation' >&2\n\
+             {bg}\n\
+             exec /bin/sleep 30",
+            SURVIVOR,
+        );
+        let quiet_stderr = executable_script("printf 'upload: 47%% done\\n'\nexec /bin/sleep 30");
+        let policy_for = |path: &std::path::Path| {
+            let mut policy = CommandPolicy::from_config(&config(path), "test").unwrap();
+            policy.timeout = Duration::from_secs(1);
+            policy
+        };
+        let throttled_policy = policy_for(&throttled.1);
+        let quiet_policy = policy_for(&quiet_stderr.1);
+        let mut throttled_command = throttled_policy.command();
+        let mut quiet_command = quiet_policy.command();
+        let started = std::time::Instant::now();
+        let (throttled_outcome, quiet_outcome) = tokio::join!(
+            throttled_policy.run(&mut throttled_command, "object upload"),
+            quiet_policy.run(&mut quiet_command, "object upload"),
+        );
+        let elapsed = started.elapsed();
+        let survived = survivor_outlived_the_call(&throttled.0).await;
+        let descendants = kill_descendants(&throttled.0);
+        assert_eq!(descendants, 1, "the tool must have left its descendant");
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "a 1 s command timeout took {elapsed:?} to fire"
+        );
+
+        let error = throttled_outcome.expect_err("a hung tool must fail the upload");
+        let message = error.to_string();
+        assert!(message.contains("timeout"), "not a timeout: {message}");
+        assert!(
+            message.contains("SlowDown"),
+            "the stderr captured before the timeout was discarded: {message}"
+        );
+        assert!(
+            error.is_upload_throttle(),
+            "the tool's last word before it hung was a SlowDown, yet the timeout reported: \
+             {error}"
+        );
+
+        let error = quiet_outcome.expect_err("a hung tool must fail the upload");
+        let message = error.to_string();
+        assert!(message.contains("timeout"), "not a timeout: {message}");
+        assert!(
+            message.contains("upload: 47% done"),
+            "with stderr silent, the stdout captured before the timeout is the evidence, and \
+             it was discarded: {message}"
+        );
+        assert!(
+            !error.is_upload_throttle(),
+            "progress output is not a throttle: {error}"
+        );
+
+        assert!(
+            !survived,
+            "the timed-out tool's descendant outlived the call: the timeout killed only the tool"
         );
     }
 

@@ -35,9 +35,34 @@
 //! **Closed: replicas can say which epoch wrote which stretch of their log.**
 //! The KIP-101 vector is durable per replica and travels on the fence reply.
 //!
-//! **Open: promotion does not yet USE that vector.** A [`ReplicaProbe`] still
-//! carries a bare offset, so two replicas reporting 90 are still compared as
-//! numbers here even though each can now prove whose writes put it there.
+//! **Closed (#577): promotion USES that vector.** Every [`ReplicaProbe`]
+//! carries a lineage verdict beside its offset ([`fenced_lineage`]): the
+//! candidate compares the history it sent with the one the fenced replica
+//! returned, and an answer is `Agreed`, `Reconciled` (the replica discarded a
+//! diverged suffix first) or `Unknown` (no history to compare on one side: a
+//! replica with records but no journal, a broken journal, a candidate that
+//! cannot vouch for its own). [`establish`] counts only the first two. An
+//! Unknown answer's offset is a count of records whatever wrote them, and
+//! counting it is the one way left for a replica holding another leadership's
+//! log to complete a majority, vote for a candidate missing acknowledged
+//! records, or later ack a marker over records it never held - reconciliation
+//! touched nothing on it, so the ack-on-divergence hole (#261) is open there.
+//! The verdicts are recorded with the quorum (feature level 6), so the
+//! replica-set gate and chain audits count the same answers this did.
+//!
+//! The rule is strict on purpose: Unknown answers never count, not even when
+//! no provable answer exists. Falling back to offsets "when nothing better is
+//! available" is a fence that fails open exactly when it is needed. A replica
+//! that cannot prove lineage is repaired from one that can (`vtopctl node
+//! repair` installs the source's history, #315), not promoted on a guess.
+//! That costs liveness, and the costs are stated rather than hidden (#612):
+//! a range that holds records but where NO replica has epoch history
+//! (records that predate the journal everywhere, journals lost everywhere)
+//! cannot promote at all, and repair
+//! cannot fix it, because a history-less source has none to install. A
+//! dispute confined to records retention reclaimed (#290/#408) also leaves
+//! the replica's answer Unknown, because the candidate cannot see the
+//! replica's retained base.
 //!
 //! **Open: followers are never truncated by an election.** A replica holding
 //! uncommitted records above the established boundary keeps them. This code
@@ -106,6 +131,8 @@
 
 use std::collections::BTreeMap;
 use uuid::Uuid;
+use vtop_broker::fencing_epochs::{compare_lineages, EpochStart, Lineage};
+use vtop_meta::AnswerLineage;
 
 /// What one replica reported, or that it did not answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +140,56 @@ pub struct ReplicaProbe {
     pub node_id: Uuid,
     /// `None` when the replica could not be reached or refused.
     pub local_committed_offset: Option<u64>,
+    /// Whether the offset describes the candidate's history (#577). Only an
+    /// answer whose lineage was proven counts toward the quorum. Meaningless
+    /// for an absent replica, which counts for nothing anyway.
+    pub lineage: AnswerLineage,
+}
+
+/// The lineage verdict on one fenced replica's answer (#577), judged by the
+/// candidate from what it sent and what came back.
+///
+/// `candidate` is the epoch history the candidate sent with the fence;
+/// `answered` is the history the replica returned AFTER reconciling against
+/// it, `answered_tail` the replica's next offset, and `truncated_records`
+/// what reconciliation discarded.
+///
+/// Judged by the same comparison the replica's own reconciliation uses
+/// ([`compare_lineages`]), and by the same rule for what counts as disputed:
+/// a divergence at or above the replica's tail concerns records it does not
+/// hold - typically just each side's adoption of the new epoch at its own
+/// tail - so every record it holds agrees. A divergence BELOW its tail that
+/// survived reconciliation is one the replica declined to act on (a dispute
+/// confined to records retention reclaimed, #290/#408): its offset is not
+/// proven to describe the candidate's history, so the verdict is Unknown,
+/// as it is when either side has no history to compare.
+///
+/// A replica that holds NO records (`answered_tail` 0) disputes nothing: its
+/// offset of 0 is a prefix of every history, so it is Agreed whatever either
+/// vector says. That is the normal shape of a fresh range, where a lease-led
+/// broker has adopted no epoch yet and so sends an empty vector (live-chaos
+/// scenarios 09 and 11-13 caught a first draft that refused it).
+pub fn fenced_lineage(
+    candidate: &[EpochStart],
+    answered: &[EpochStart],
+    answered_tail: u64,
+    truncated_records: u64,
+) -> AnswerLineage {
+    if answered_tail == 0 {
+        return if truncated_records > 0 {
+            AnswerLineage::Reconciled { truncated_records }
+        } else {
+            AnswerLineage::Agreed
+        };
+    }
+    match compare_lineages(candidate, answered) {
+        Lineage::Unknown => AnswerLineage::Unknown,
+        Lineage::DivergesAt(offset) if offset < answered_tail => AnswerLineage::Unknown,
+        Lineage::Agreed | Lineage::DivergesAt(_) if truncated_records > 0 => {
+            AnswerLineage::Reconciled { truncated_records }
+        }
+        Lineage::Agreed | Lineage::DivergesAt(_) => AnswerLineage::Agreed,
+    }
 }
 
 /// The outcome of asking a replica set where it stands.
@@ -121,15 +198,26 @@ pub enum Promotion {
     /// A quorum answered; this is the boundary they can prove.
     Established {
         committed_offset: u64,
-        /// Replicas that answered, for the operator record.
+        /// Replicas that answered with a proven lineage - the ones counted -
+        /// for the operator record.
         answered: BTreeMap<Uuid, u64>,
+        /// Replicas that answered but whose lineage could not be proven
+        /// (#577): recorded, never counted.
+        unproven: BTreeMap<Uuid, u64>,
     },
-    /// Too few replicas answered to establish anything.
+    /// Too few replicas answered with a proven lineage to establish anything.
     ///
     /// Refusing to serve is the only safe response. A leader that promoted
     /// anyway would be publishing a high-water mark no quorum had confirmed,
     /// which is precisely the guess this exists to prevent.
-    QuorumUnavailable { answered: usize, required: usize },
+    QuorumUnavailable {
+        /// Answers that count: fenced, with a proven lineage.
+        answered: usize,
+        required: usize,
+        /// Answers that were fenced but whose lineage was Unknown (#577) -
+        /// the ones that would have completed the quorum by offset alone.
+        unproven: usize,
+    },
     /// A quorum proved a boundary this leader's own disk does not reach.
     ///
     /// Serving here would be worse than a guess. Publishing the quorum's
@@ -241,20 +329,31 @@ pub fn establish(
         probes.len()
     );
     let required = majority(replication_factor);
+    // ONLY A PROVEN LINEAGE COUNTS (#577). An Unknown answer is fenced and
+    // stopped like any other, but nothing reconciled it against the
+    // candidate, so its offset counts records whatever leadership wrote
+    // them - see the module docs for what counting it would let through.
+    // It is kept aside for the operator record and nothing else.
     let mut answered = BTreeMap::new();
+    let mut unproven = BTreeMap::new();
     for probe in probes {
         if let Some(offset) = probe.local_committed_offset {
-            answered.insert(probe.node_id, offset);
+            if probe.lineage.is_provable() {
+                answered.insert(probe.node_id, offset);
+            } else {
+                unproven.insert(probe.node_id, offset);
+            }
         }
     }
     if answered.len() < required {
         return Promotion::QuorumUnavailable {
             answered: answered.len(),
             required,
+            unproven: unproven.len(),
         };
     }
     debug_assert_eq!(
-        answered.len(),
+        answered.len() + unproven.len(),
         probes
             .iter()
             .filter(|p| p.local_committed_offset.is_some())
@@ -361,6 +460,7 @@ pub fn establish(
     Promotion::Established {
         committed_offset,
         answered,
+        unproven,
     }
 }
 
@@ -372,6 +472,15 @@ mod tests {
         ReplicaProbe {
             node_id: Uuid::from_u128(node),
             local_committed_offset: offset,
+            lineage: AnswerLineage::Agreed,
+        }
+    }
+
+    fn probe_with(node: u128, offset: u64, lineage: AnswerLineage) -> ReplicaProbe {
+        ReplicaProbe {
+            node_id: Uuid::from_u128(node),
+            local_committed_offset: Some(offset),
+            lineage,
         }
     }
 
@@ -587,7 +696,8 @@ mod tests {
             promotion,
             Promotion::QuorumUnavailable {
                 answered: 1,
-                required: 2
+                required: 2,
+                unproven: 0,
             }
         );
     }
@@ -686,6 +796,163 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// #577, the issue's own shape: the candidate and one replica answer,
+    /// the third is unreachable. The replica answered with the candidate's
+    /// offset, but its lineage could not be compared (no epoch history), so
+    /// that offset is a count of records whatever wrote them. By offset it
+    /// completed the majority and promotion established; it must not.
+    #[test]
+    fn an_unknown_lineage_replica_does_not_complete_a_majority() {
+        let promotion = establish(
+            &[
+                probe(1, Some(100)),
+                probe_with(2, 100, AnswerLineage::Unknown),
+                probe(3, None),
+            ],
+            3,
+            Uuid::from_u128(1),
+            None,
+        );
+        assert_eq!(
+            promotion,
+            Promotion::QuorumUnavailable {
+                answered: 1,
+                required: 2,
+                unproven: 1,
+            },
+            "an answer whose lineage was not proven was counted toward the quorum"
+        );
+    }
+
+    /// #577: nor does an Unknown answer move the boundary. By offset, the
+    /// k-th highest of {500, 100, 90} is 100; replica 3's 500 is records
+    /// nobody proved are the candidate's, so the boundary is what the two
+    /// proven answers hold, and it is set aside in the record.
+    #[test]
+    fn an_unknown_lineage_replica_does_not_set_the_boundary() {
+        let promotion = establish(
+            &[
+                probe(1, Some(100)),
+                probe(2, Some(90)),
+                probe_with(3, 500, AnswerLineage::Unknown),
+            ],
+            3,
+            Uuid::from_u128(1),
+            None,
+        );
+        let Promotion::Established {
+            committed_offset,
+            answered,
+            unproven,
+        } = promotion
+        else {
+            panic!("two proven answers are a majority of three: {promotion:?}")
+        };
+        assert_eq!(committed_offset, 90, "the unknown 500 lifted the boundary");
+        assert_eq!(answered.len(), 2);
+        assert_eq!(
+            unproven.into_iter().collect::<Vec<_>>(),
+            vec![(Uuid::from_u128(3), 500)]
+        );
+    }
+
+    /// #577: a replica that discarded a diverged suffix and THEN answered
+    /// holds the candidate's history up to its offset, as surely as one that
+    /// never diverged. It counts.
+    #[test]
+    fn a_reconciled_replica_counts() {
+        let promotion = establish(
+            &[
+                probe(1, Some(100)),
+                probe_with(
+                    2,
+                    100,
+                    AnswerLineage::Reconciled {
+                        truncated_records: 3,
+                    },
+                ),
+                probe(3, None),
+            ],
+            3,
+            Uuid::from_u128(1),
+            None,
+        );
+        assert!(
+            matches!(
+                promotion,
+                Promotion::Established {
+                    committed_offset: 100,
+                    ..
+                }
+            ),
+            "{promotion:?}"
+        );
+    }
+
+    fn starts(entries: &[(u64, u64)]) -> Vec<EpochStart> {
+        entries
+            .iter()
+            .map(|(epoch, start_offset)| EpochStart {
+                epoch: *epoch,
+                start_offset: *start_offset,
+            })
+            .collect()
+    }
+
+    /// #577: the verdict the candidate draws from what it sent and what the
+    /// fenced replica returned, case by case - each the way a real fence
+    /// leaves the two vectors (both sides adopt the new epoch at their OWN
+    /// tail, which is bookkeeping, not dispute).
+    #[test]
+    fn the_verdict_on_a_fenced_answer() {
+        // Candidate at 100 under epochs 1 and 2, fenced at 3.
+        let candidate = starts(&[(1, 0), (2, 50), (3, 100)]);
+
+        // Lagging but agreeing: the replica's only difference is where it
+        // adopted 3, at its own tail.
+        assert_eq!(
+            fenced_lineage(&candidate, &starts(&[(1, 0), (2, 50), (3, 90)]), 90, 0),
+            AnswerLineage::Agreed
+        );
+        // Lagging so far it never saw epoch 2: every record it holds is
+        // epoch 1's, as on the candidate.
+        assert_eq!(
+            fenced_lineage(&candidate, &starts(&[(1, 0), (3, 40)]), 40, 0),
+            AnswerLineage::Agreed
+        );
+        // Diverged and reconciled: it discarded what a rival epoch wrote and
+        // re-anchored 3 where the candidate has it.
+        assert_eq!(
+            fenced_lineage(&candidate, &starts(&[(1, 0), (2, 50), (3, 100)]), 100, 4),
+            AnswerLineage::Reconciled {
+                truncated_records: 4
+            }
+        );
+        // No history on the replica (records, no journal): Unknown.
+        assert_eq!(
+            fenced_lineage(&candidate, &[], 100, 0),
+            AnswerLineage::Unknown
+        );
+        // No history on the CANDIDATE: nothing is provable about anyone.
+        assert_eq!(
+            fenced_lineage(&[], &starts(&[(1, 0), (3, 90)]), 90, 0),
+            AnswerLineage::Unknown
+        );
+        // A replica holding nothing disputes nothing, even against a
+        // candidate with no history (a fresh range's first promotion).
+        assert_eq!(fenced_lineage(&[], &[], 0, 0), AnswerLineage::Agreed);
+        assert_eq!(
+            fenced_lineage(&[], &starts(&[(3, 0)]), 0, 0),
+            AnswerLineage::Agreed
+        );
+        // A divergence below the replica's tail that it did not act on (the
+        // retention-confined dispute): its offset is not proven.
+        assert_eq!(
+            fenced_lineage(&candidate, &starts(&[(1, 0), (7, 50), (3, 90)]), 90, 0),
+            AnswerLineage::Unknown
+        );
     }
 
     #[test]
