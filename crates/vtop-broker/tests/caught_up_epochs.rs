@@ -315,6 +315,36 @@ fn a_replica_that_keeps_a_dispute_files_nothing_by_the_callers_history() {
     );
 }
 
+/// A caller whose history does not name the epoch it fences at (#648
+/// review: a lease-driven broker adopts its grant only after the probe)
+/// says where every epoch up to its own began, but not where its new one
+/// begins. Taken as the lineage, it would drop the follower's adoption of
+/// that epoch and replace it with nothing, filing the new leader's records
+/// under the old epoch. It is not taken: the follower keeps the adoption at
+/// its tail, as before #640.
+#[test]
+fn a_fence_whose_history_lacks_its_own_epoch_is_not_taken_as_the_lineage() {
+    let r = Replica::new(0xB1);
+    let c = Replica::new(0xB2);
+    for offset in 0..SHARED {
+        r.append(OLD_EPOCH, offset);
+        c.append(OLD_EPOCH, offset);
+    }
+    for offset in SHARED..R_TAIL {
+        r.append(OLD_EPOCH, offset);
+    }
+    c.grant(R_EPOCH);
+    let without_its_epoch = r.node.epoch_starts();
+    assert_eq!(without_its_epoch, starts(&[(OLD_EPOCH, 0)]));
+    c.node.fence(R_EPOCH, &without_its_epoch).unwrap();
+    assert_eq!(
+        c.node.epoch_starts(),
+        starts(&[(OLD_EPOCH, 0), (R_EPOCH, SHARED)]),
+        "the adoption at the tail stays: the caller's history says nothing about where \
+         its epoch begins"
+    );
+}
+
 /// A follower already at the leader's tail is unchanged: the leader's epoch
 /// begins exactly at its tail, which is what adoption recorded before #640.
 #[test]

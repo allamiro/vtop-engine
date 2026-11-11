@@ -47,8 +47,12 @@
 //! So an entry AT a follower's tail is provisional. It owns no record, and
 //! the fence that installs a leader also hands the follower that leader's
 //! history: the candidate's vector, which IS the leader's, since a leader
-//! writes under its epoch only from the tail it sent. When the follower's own
-//! history agrees with it below the follower's tail, the follower keeps it as
+//! writes under its epoch only from the tail it sent. That holds only when
+//! the vector ends with the new epoch at the candidate's tail, so a vector
+//! that does not name it is not taken; the lease agent's probe adds the
+//! entry for a candidate that adopts its grant only after the probe. When
+//! the follower's own history agrees with it below the follower's tail, the
+//! follower keeps it as
 //! its LEADER LINEAGE ([`FencingEpochJournal::take_leader_lineage`]) and
 //! files every record that leader sends it under the leader's own entries
 //! ([`FencingEpochJournal::follow_leader_lineage`]), dropping its provisional
@@ -543,13 +547,24 @@ impl FencingEpochJournal {
             && leader.windows(2).all(|pair| {
                 pair[1].epoch > pair[0].epoch && pair[1].start_offset >= pair[0].start_offset
             });
+        // The vector must name `epoch` itself, as its last epoch: the entry
+        // the caller recorded at its own tail, where its records under
+        // `epoch` will begin (#648 review). Without it the history says where
+        // every older epoch began and nothing about the new one, and taking
+        // it would drop this replica's adoption of `epoch` and put nothing in
+        // its place, filing the new leader's records under an older epoch. A
+        // caller that fences before adopting (a lease-driven broker adopts
+        // its grant after the probe) sends exactly that.
+        let names_the_epoch = canonicalize_lineage(leader)
+            .last()
+            .is_some_and(|last| last.epoch == epoch);
         let vouches_for_anchor = leader.iter().any(|entry| entry.start_offset <= anchor);
         let agrees_below = anchor <= base || {
             let mine = clamp_lineage(&self.entries, base, anchor);
             let theirs = clamp_lineage(leader, base, anchor);
             !mine.is_empty() && mine == theirs
         };
-        if !(well_formed && vouches_for_anchor && agrees_below) {
+        if !(well_formed && names_the_epoch && vouches_for_anchor && agrees_below) {
             self.drop_leader_lineage(epoch)?;
             return Ok(false);
         }
