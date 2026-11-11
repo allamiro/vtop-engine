@@ -1045,6 +1045,20 @@ impl InProcessFollower {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A candidate fencing ITSELF at a newer epoch makes its own log the
+        // reference (#616 regression, found by the promotion crash sweep): a
+        // dispute it kept against an older epoch's candidate is retired, as a
+        // newer peer fence retires one. Left in place, the dispute capped the
+        // acks of this node's own appends once it led, and its marker never
+        // committed. Under the state lock, like every change to it.
+        let mut kept = self
+            .kept_dispute
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if kept.is_some_and(|dispute| dispute.epoch < epoch) {
+            *kept = None;
+        }
+        drop(kept);
         Ok(state.segment.committed_offset())
     }
 
@@ -1309,20 +1323,41 @@ impl InProcessFollower {
                 )
             })
         };
+        // NEVER a dispute below this replica's own high-water mark (#616
+        // regression, found by the promotion crash sweep in the #640 shape).
+        // Everything below the mark is committed, and a committed record is
+        // never in dispute. A dispute kept from below the mark could never be
+        // settled, because the truncation guard refuses it, so the replica
+        // refused every append from then on. A divergence below the mark (a
+        // caught-up stretch filed under a different epoch, #640) says nothing
+        // about the committed records. Only the stretch above the mark is
+        // kept in dispute, and if the mark reaches the tail, nothing is.
+        //
+        // Not a refusal, as before #616: a refused fence still adopts the
+        // epoch and leaves the suffix above the mark unreconciled. The sweep
+        // showed that replica then acking the new leader's record over an
+        // unacknowledged one it held (#261). Kept, the suffix is discarded by
+        // the new leader's first append or mark over it, which the guard can
+        // always do, because it starts at or above the mark. The candidate
+        // still judges this answer itself: a divergence below both tails is
+        // Unknown and never counted.
         if !supersedes {
             // Installed under the state lock (#616 review): a status snapshot
             // sees the log and the dispute together.
-            let _state = self
+            let state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *self
-                .kept_dispute
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(KeptDispute {
-                epoch: fencing_epoch,
-                from: divergence,
-            });
+            let from = divergence.max(self.cluster_committed.get());
+            if from < state.segment.next_offset() {
+                *self
+                    .kept_dispute
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(KeptDispute {
+                    epoch: fencing_epoch,
+                    from,
+                });
+            }
             return Ok(0);
         }
         match self.truncate_to(divergence) {
