@@ -581,10 +581,15 @@ impl FileSource {
                 // path may be handed the freed inode number, and an inode
                 // check cannot tell it from the one it replaced, so the cursor
                 // must not outlive it (#558). Nor may a descriptor kept to
-                // re-read its ranges (#621): every one of them is archived, and
-                // held open it would keep the deleted file's space allocated.
-                // A rotated file being re-read under this path is a different
-                // file and stays.
+                // re-read its ranges (#621). The commit that recorded this
+                // delete usually released it, but not when a later window had
+                // been read and the file was then cut back to this commit's
+                // end: the later range is still outstanding. With the file and
+                // its cursor gone, nothing would read this path again, so
+                // nothing else would close it, and it would pin the deleted
+                // file's space (a_delete_closes_a_descriptor_the_adapter_still_
+                // held_for_that_path). A rotated file being re-read under
+                // this path is a different file and stays.
                 self.cursors.remove(path);
                 self.held.remove(path);
                 tracing::info!(
@@ -4998,6 +5003,56 @@ mod tests {
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
         let err = fs.replay_from_marker(&start).await.unwrap_err().to_string();
         assert!(err.contains("identity changed"), "{err}");
+    }
+
+    /// #621 with `delete_after_commit` (#619): a delete can find the path's
+    /// descriptor still held. A later window was read, then the file was cut
+    /// back to the end of an earlier one before that window committed. The
+    /// earlier window's commit is current and covers the whole (shortened)
+    /// file, so it records the delete. It does not release the descriptor,
+    /// whose later range is still outstanding. Once the file is deleted and its
+    /// cursor dropped, nothing reads that path again, so nothing else would
+    /// ever close the descriptor: it pinned the deleted file's space, and a
+    /// slot of the limit, for the life of the process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_delete_closes_a_descriptor_the_adapter_still_held_for_that_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "a 1\n").unwrap(); // 4 bytes
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let first = read_all_one(&mut fs, &path).await;
+        assert_eq!(lines(&first), ["a 1"]);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"b 2\n")
+            .unwrap();
+        let second = read_all_one(&mut fs, &path).await;
+        assert_eq!(
+            lines(&second),
+            ["b 2"],
+            "a later window, [4, 8), outstanding"
+        );
+        // Cut back to the first window's end before the second commits.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(4)
+            .unwrap();
+
+        fs.commit_progress(&first[0].progress_end).await.unwrap();
+        assert!(
+            !Path::new(&path).exists(),
+            "the first window covers the whole file now, so it is deleted"
+        );
+        assert!(
+            fs.held.is_empty(),
+            "and the descriptor held for its outstanding range is closed with it"
+        );
     }
 
     /// #621 with `delete_after_commit` (#619): the re-read of a rotated range
