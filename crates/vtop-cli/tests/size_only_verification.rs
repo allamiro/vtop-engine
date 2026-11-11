@@ -62,8 +62,11 @@ fn vtopctl(args: &[&str], config: &Path) -> Output {
         .args(args)
         .arg("--config")
         .arg(config)
-        // The assertions read the plain-text log format.
+        // The assertions read the plain-text log format, at the level the
+        // test passes: RUST_LOG overrides --log-level (vtop_observe::logging),
+        // so an inherited RUST_LOG=error would hide the WARN under test.
         .env_remove("VTOP_LOG_FORMAT")
+        .env_remove("RUST_LOG")
         .stdin(Stdio::null())
         .output()
         .expect("spawn vtopctl")
@@ -185,6 +188,12 @@ fn mode_gauge(scrape: &str, tenant: &str, mode: &str) -> Option<i64> {
 
 /// Startup also sets a gauge, so the mode can be alerted on before (or
 /// without) any traffic: the per-batch counter only moves when a batch does.
+///
+/// The gauge is set wherever a metrics registry exists. Only `vtopctl run`
+/// builds one, and only when `VTOP_METRICS_ADDR` is set (`metrics_server`):
+/// the one-shot `process-once` and `replay` serve no endpoint, so they log
+/// the startup WARN and export nothing. This pins the library half;
+/// `run_serves_the_verification_mode_gauge` pins what `run` exposes.
 #[tokio::test]
 async fn startup_sets_the_verification_mode_gauge() {
     let m = vtop_core::telemetry::init().expect("metrics registry");
@@ -229,4 +238,96 @@ async fn startup_sets_the_verification_mode_gauge() {
                 .join("\n")
         );
     }
+}
+
+/// Kills `vtopctl run` if an assertion unwinds past it.
+struct Running(std::process::Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A loopback port nothing is listening on right now, avoiding the ports
+/// the compose lab publishes.
+fn free_port() -> u16 {
+    loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if ![8083, 9000, 9092, 9100].contains(&port) {
+            return port;
+        }
+    }
+}
+
+/// One plain-HTTP GET of `/metrics`; `None` while nothing answers yet.
+fn scrape(port: u16) -> Option<String> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok()?;
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .ok()?;
+    let mut body = String::new();
+    stream.read_to_string(&mut body).ok()?;
+    Some(body)
+}
+
+/// The one command that serves metrics exposes the gauge from startup, on
+/// an idle engine: no batch has to move for the alert to fire.
+#[test]
+fn run_serves_the_verification_mode_gauge() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path(), Some(false));
+    let port = free_port();
+    let log = dir.path().join("engine.log");
+    let log_file = std::fs::File::create(&log).unwrap();
+    let _engine = Running(
+        Command::new(env!("CARGO_BIN_EXE_vtopctl"))
+            .args(["--log-level", "warn", "run", "--config"])
+            .arg(&config)
+            .env("VTOP_METRICS_ADDR", format!("127.0.0.1:{port}"))
+            .env_remove("VTOP_METRICS_TLS_CERT")
+            .env_remove("VTOP_METRICS_TLS_KEY")
+            .env_remove("VTOP_METRICS_TLS_CLIENT_CA")
+            .env_remove("VTOP_LOG_FORMAT")
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::null())
+            .stdout(log_file.try_clone().unwrap())
+            .stderr(log_file)
+            .spawn()
+            .expect("spawn vtopctl run"),
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let body = loop {
+        if let Some(body) = scrape(port).filter(|b| b.contains("vtop_verification_mode{")) {
+            break body;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "vtopctl run never served vtop_verification_mode on 127.0.0.1:{port}; log:\n{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    assert_eq!(
+        (
+            mode_gauge(&body, "default", "size_only"),
+            mode_gauge(&body, "default", "strong")
+        ),
+        (Some(1), Some(0)),
+        "require_strong_verification=false must read size_only=1, strong=0; scrape:\n{}",
+        body.lines()
+            .filter(|l| l.contains("verification_mode"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }

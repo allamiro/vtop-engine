@@ -6,7 +6,7 @@
 //! is explicit and documented, but its only signal used to be a WARN per
 //! batch: nothing at startup, nothing from a config check, and nothing at all
 //! when recovery's storage re-check accepted such a result. These helpers live
-//! outside `engine.rs` so the engine's own diff stays two call sites.
+//! outside `engine.rs` to keep the engine's own diff to its call sites.
 
 use vtop_core::config::VtopConfig;
 use vtop_core::telemetry;
@@ -14,8 +14,12 @@ use vtop_state::BatchRecord;
 
 /// Called once when an engine starts for mutating work (`run`,
 /// `process-once`, `replay`). Logs each [`VtopConfig::warnings`] entry as one
-/// WARN and sets `vtop_verification_mode{tenant,mode}`, so the mode can be
-/// alerted on before any batch moves.
+/// WARN and sets `vtop_verification_mode{tenant,mode}`.
+///
+/// The gauge is set only where a metrics registry exists, which is `run`
+/// with `VTOP_METRICS_ADDR` set (`metrics_server::maybe_start`). The one-shot
+/// commands serve no endpoint and deliberately build no registry, so for
+/// them the WARN is the whole signal.
 pub(crate) fn announce(config: &VtopConfig) {
     for warning in config.warnings() {
         tracing::warn!("{warning}");
@@ -32,13 +36,24 @@ pub(crate) fn announce(config: &VtopConfig) {
     }
 }
 
+/// What recovery's storage re-check of a VERIFIED row concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recheck {
+    /// The row must not commit; it is replayed instead.
+    Failed,
+    /// Stored content matched a digest.
+    Strong,
+    /// Only size and existence were confirmed, and the opt-out allows it.
+    SizeOnly,
+}
+
 /// Recovery's storage re-check got a size-only result for a VERIFIED row.
-/// Returns whether the row may still commit: only under the explicit opt-out.
-/// Either way the decision is logged with the batch id; an acceptance is
-/// counted in `vtop_verification_backend_limited_total` with the labels the
-/// running engine uses, because it is the same weak commit the counter exists
-/// for, made by a different path.
-pub(crate) fn recheck_accepts_size_only(config: &VtopConfig, rec: &BatchRecord, why: &str) -> bool {
+/// Under the strong default the row fails the re-check; under the opt-out it
+/// passes as [`Recheck::SizeOnly`]. Either way the decision is logged with
+/// the batch id. The COUNT waits for the commit (see [`count_size_only_commit`]):
+/// a row that passes here can still be held back under a lower incomplete
+/// range, stay VERIFIED, and be re-checked by every later recovery.
+pub(crate) fn recheck_size_only(config: &VtopConfig, rec: &BatchRecord, why: &str) -> Recheck {
     if config.upload.require_strong_verification {
         tracing::warn!(
             batch_id = %rec.batch_id,
@@ -46,13 +61,27 @@ pub(crate) fn recheck_accepts_size_only(config: &VtopConfig, rec: &BatchRecord, 
             "recovery re-check: storage confirmed size only and strong verification \
              is required; not committing"
         );
-        return false;
+        return Recheck::Failed;
     }
     tracing::warn!(
         batch_id = %rec.batch_id,
         reason = %why,
-        "recovery re-check passed (backend_limited: size-only); committing under \
+        "recovery re-check passed on size alone (backend_limited) under \
          upload.require_strong_verification: false"
+    );
+    Recheck::SizeOnly
+}
+
+/// Recovery committed a row whose re-check was size-only: count it in
+/// `vtop_verification_backend_limited_total` with the running engine's labels,
+/// beside the `verified_total` recovery counts for the same commit.
+pub(crate) fn count_size_only_commit(recheck: Recheck, rec: &BatchRecord) {
+    if recheck != Recheck::SizeOnly {
+        return;
+    }
+    tracing::warn!(
+        batch_id = %rec.batch_id,
+        "recovered: source_committed on a size-only verification"
     );
     if let Some(mx) = telemetry::metrics() {
         mx.verification_backend_limited_total
@@ -63,5 +92,4 @@ pub(crate) fn recheck_accepts_size_only(config: &VtopConfig, rec: &BatchRecord, 
             ])
             .inc();
     }
-    true
 }
