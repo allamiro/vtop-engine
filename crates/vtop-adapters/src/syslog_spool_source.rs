@@ -625,10 +625,19 @@ impl SourceAdapter for SyslogSpoolSource {
             let c = self.cursors.entry(path.clone()).or_default();
             // Superseded by a commit this process confirmed (#624; see
             // `FileSource::commit_progress`).
+            // Proven, not merely not disproven (review of #659); a spool
+            // marker records no tail.
             if c.committed_byte >= *end_byte
-                && c.confirmed_for
-                    .as_ref()
-                    .is_some_and(|file| file.is(*marker_inode, marker_content.as_ref()))
+                && c.confirmed_for.as_ref().is_some_and(|file| {
+                    file.proves(
+                        Path::new(path),
+                        c.committed_byte,
+                        *marker_inode,
+                        marker_content.as_ref(),
+                        None,
+                        marker_file_size.unwrap_or(0).max(*end_byte),
+                    )
+                })
             {
                 tracing::info!(
                     path,
@@ -640,7 +649,8 @@ impl SourceAdapter for SyslogSpoolSource {
                 return Ok(());
             }
             c.committed_byte = *end_byte;
-            c.confirmed_for = continuity::ConfirmedFile::of(*marker_inode, marker_content.as_ref());
+            c.confirmed_for =
+                continuity::ConfirmedFile::of(*marker_inode, marker_content.as_ref(), None);
             // See `FileSource::commit_progress`: a recovered commit below the
             // seeded head restarts the head there; and, whatever its end, the
             // cursor adopts the identity the batch saw - the seed may be of

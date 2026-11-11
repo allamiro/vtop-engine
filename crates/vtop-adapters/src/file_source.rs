@@ -2654,10 +2654,20 @@ impl SourceAdapter for FileSource {
             // generation's, and a point confirmed for another file says
             // nothing about this range (see `confirmed_for`). Nothing is
             // deleted for it either; the newer commit already decided that.
+            // Proven, not merely not disproven (review of #659): see
+            // `ConfirmedFile::proves`.
+            let marker_tail_at = continuity::Tail::at(*end_byte, marker_tail.clone());
             if c.committed_byte >= *end_byte
-                && c.confirmed_for
-                    .as_ref()
-                    .is_some_and(|file| file.is(*marker_inode, marker_content.as_ref()))
+                && c.confirmed_for.as_ref().is_some_and(|file| {
+                    file.proves(
+                        Path::new(path),
+                        c.committed_byte,
+                        *marker_inode,
+                        marker_content.as_ref(),
+                        marker_tail_at.as_ref(),
+                        (*marker_file_size).max(*end_byte),
+                    )
+                })
             {
                 tracing::info!(
                     path,
@@ -2669,8 +2679,11 @@ impl SourceAdapter for FileSource {
                 return Ok(());
             }
             c.committed_byte = *end_byte;
-            c.confirmed_for =
-                crate::continuity::ConfirmedFile::of(*marker_inode, marker_content.as_ref());
+            c.confirmed_for = crate::continuity::ConfirmedFile::of(
+                *marker_inode,
+                marker_content.as_ref(),
+                marker_tail_at,
+            );
             // A commit with no in-process record is recovery after a restart.
             let recovered = generation == continuity::Settled::Unknown;
             if c.read_byte < *end_byte {

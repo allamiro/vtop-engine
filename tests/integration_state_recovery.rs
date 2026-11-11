@@ -2321,3 +2321,162 @@ async fn a_held_back_size_only_row_counts_its_size_only_acceptance_when_it_settl
     engine.process_once(SourceType::File).await.unwrap();
     assert_eq!(size_only_count(row_tenant) - before, 1);
 }
+
+/// #659 review (Codex P1): a skipped commit must have content evidence.
+///
+/// Two VERIFIED rows of one inode from two generations: an older one through
+/// byte 60 recorded with no fingerprints (a legacy marker), and one read after
+/// a copytruncate, through byte 21. The file then regrows to 84 bytes before
+/// recovery. Recovery commits the older row first: that sets the committed
+/// point to 60 for this inode, with no content on record. The newer row's
+/// commit was then skipped as "superseded" - `None` content cannot be shown
+/// to differ - and the read head stayed at 60, so bytes 21..60 of the new
+/// generation were never archived. Unknown content must never suppress a
+/// commit: the newer row's commit moves the cursor back to 21, as before
+/// #624, and the next pass reads 21..84.
+#[tokio::test]
+async fn an_unfingerprinted_older_commit_never_suppresses_a_newer_generations() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    // The new generation, regrown to 84 bytes: twelve 7-byte lines.
+    let content: String = (0..12).map(|i| format!("new-{i:02}\n")).collect();
+    assert_eq!(content.len(), 84);
+    std::fs::write(&input, &content).unwrap();
+    let inode = inode_of(&input);
+    let url = format!("sqlite://{}", dir.path().join("state.db").display());
+    let path = input.to_string_lossy().into_owned();
+    // The old generation's row: [0,60), read when the file was 60 bytes, by
+    // a build that recorded no fingerprints.
+    let old = ProgressMarker::File {
+        path: path.clone(),
+        inode,
+        start_byte: 0,
+        end_byte: 60,
+        file_size: 60,
+        mtime: String::new(),
+        content_fingerprint: None,
+        tail_fingerprint: None,
+    };
+    // The new generation's row: [0,21), read when the file was 21 bytes.
+    let new = ProgressMarker::File {
+        path: path.clone(),
+        inode,
+        start_byte: 0,
+        end_byte: 21,
+        file_size: 21,
+        mtime: String::new(),
+        content_fingerprint: vtop_core::types::ContentFingerprint::of(&content.as_bytes()[..21]),
+        tail_fingerprint: vtop_core::types::ContentFingerprint::of(&content.as_bytes()[..21]),
+    };
+    let staged = dir.path().join("staged");
+    std::fs::write(&staged, b"archived-bytes").unwrap();
+    let digest = vtop_core::checksum::sha256_bytes(b"archived-bytes");
+    let mut cfg = file_config(work.to_str().unwrap(), &url, vec![path.clone()], "mock");
+    cfg.batching.max_batch_age_seconds = 3_600;
+    let mut verified_rows = Vec::new();
+    for (id, marker, at) in [
+        ("b-old-gen", old, "2026-01-01T00:00:00Z"),
+        ("b-new-gen", new, "2026-01-01T00:00:01Z"),
+    ] {
+        let object_uri = format!("s3://telemetry-data/x/{id}.raw.gz");
+        let manifest_uri = format!("s3://telemetry-data/x/{id}.manifest.json");
+        let (manifest, manifest_path) = write_recovery_manifest(
+            &work,
+            id,
+            &path,
+            marker.clone(),
+            &object_uri,
+            &manifest_uri,
+            14,
+            "sha256",
+            &digest,
+        );
+        let mut rec = file_row(id, &path, inode, (0, 0), at);
+        rec.progress_start = marker.clone();
+        rec.progress_end = marker;
+        rec.object_uri = Some(object_uri.clone());
+        rec.manifest_uri = Some(manifest_uri.clone());
+        rec.object_sha256 = Some(digest.clone());
+        rec.manifest_sha256 = Some(manifest.manifest.sha256.clone());
+        rec.object_size_bytes = Some(14);
+        verified_rows.push((rec, object_uri, manifest_uri, manifest, manifest_path));
+    }
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        for (rec, ..) in &verified_rows {
+            store.save_batch_state(rec).await.unwrap();
+            for st in [
+                BatchState::Sealed,
+                BatchState::Compressed,
+                BatchState::Checksummed,
+                BatchState::ObjectUploaded,
+                BatchState::ManifestUploaded,
+                BatchState::Verified,
+            ] {
+                store
+                    .update_batch_state(&rec.batch_id, st, &BatchPatch::default())
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    for (_, object_uri, manifest_uri, manifest, manifest_path) in &verified_rows {
+        engine
+            .backend
+            .put_object(
+                &staged,
+                object_uri,
+                Some(vtop_upload::ObjectChecksum::new("sha256", &digest)),
+            )
+            .await
+            .unwrap();
+        engine
+            .backend
+            .put_manifest(
+                manifest_path,
+                manifest_uri,
+                Some(vtop_upload::ObjectChecksum::new(
+                    "sha256",
+                    &manifest.manifest.sha256,
+                )),
+            )
+            .await
+            .unwrap();
+    }
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(summary.committed, 2, "both rows commit: {summary:?}");
+
+    // The next pass must read the new generation on from byte 21.
+    engine.process_once(SourceType::File).await.unwrap();
+    let mut covered: Vec<(u64, u64)> = engine
+        .store
+        .list_batches()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|b| b.state == BatchState::SourceCommitted && b.batch_id != "b-old-gen")
+        .map(|b| match (&b.progress_start, &b.progress_end) {
+            (ProgressMarker::File { start_byte, .. }, ProgressMarker::File { end_byte, .. }) => {
+                (*start_byte, *end_byte)
+            }
+            other => panic!("a file batch carries file markers: {other:?}"),
+        })
+        .collect();
+    covered.sort_unstable();
+    let mut through = 0;
+    for &(start, end) in &covered {
+        assert!(
+            start <= through,
+            "bytes {through}..{start} of the new generation were never archived: {covered:?}"
+        );
+        through = through.max(end);
+    }
+    assert_eq!(
+        through, 84,
+        "the new generation is archived only through {through}: {covered:?}"
+    );
+}
