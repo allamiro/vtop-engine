@@ -230,6 +230,14 @@ impl fmt::Display for Fault {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Violation {
+    /// A leader acknowledged or published different bytes at an offset that
+    /// already holds an acknowledged record: the earlier one was lost, at
+    /// the moment the later one replaced it.
+    AcknowledgedRecordReplaced {
+        offset: u64,
+        acknowledged: String,
+        replaced_by: String,
+    },
     /// A record a leader acknowledged or published is not on the final
     /// leader at its offset.
     AckedRecordLost {
@@ -286,8 +294,8 @@ impl Outcome {
     ///
     /// * #635: an ack or disagreement on a node that was restarted while it
     ///   held a kept dispute its fence reply had announced, at or above the
-    ///   dispute's start. A lost
-    ///   acknowledged record counts only as a consequence of such an ack.
+    ///   dispute's start. A lost acknowledged record counts only inside the
+    ///   range of such a dispute, on a node that acked falsely there.
     /// * #640: no leader finished, and the last election failed for want of
     ///   a provable quorum: answers came back but were judged Unknown. Every
     ///   acknowledged record must still be durable on a majority, or the run
@@ -301,13 +309,29 @@ impl Outcome {
                 .iter()
                 .any(|(forgot, from)| *forgot == node && offset >= *from)
         };
-        let any_635_ack = self.violations.iter().any(|violation| {
-            matches!(
-                violation,
-                Violation::AckWithoutTheRecord { node, offset, .. }
-                    if after_a_forgotten_dispute(*node, *offset)
-            )
-        });
+        // A lost record is #635's only inside the range a forgotten dispute
+        // covered, on a node that then acked a record it did not hold there
+        // (#646 review): the false ack is how #635 loses a record. A loss
+        // anywhere else is independent of it and stays a new failure.
+        let disputes_that_acked_falsely: Vec<(usize, u64)> = self
+            .forgotten_disputes
+            .iter()
+            .copied()
+            .filter(|(node, from)| {
+                self.violations.iter().any(|violation| {
+                    matches!(
+                        violation,
+                        Violation::AckWithoutTheRecord { node: acked, offset, .. }
+                            if acked == node && offset >= from
+                    )
+                })
+            })
+            .collect();
+        let lost_to_635 = |offset: u64| {
+            disputes_that_acked_falsely
+                .iter()
+                .any(|(_, from)| offset >= *from)
+        };
         let mut issues = BTreeSet::new();
         for violation in &self.violations {
             let issue = match violation {
@@ -319,8 +343,14 @@ impl Outcome {
                         return None;
                     }
                 }
-                Violation::AckedRecordLost { .. } if any_635_ack => 635,
-                Violation::AckedRecordLost { .. } => return None,
+                Violation::AckedRecordLost { offset, .. }
+                | Violation::AcknowledgedRecordReplaced { offset, .. }
+                    if lost_to_635(*offset) =>
+                {
+                    635
+                }
+                Violation::AckedRecordLost { .. }
+                | Violation::AcknowledgedRecordReplaced { .. } => return None,
                 Violation::Liveness(_)
                     if self.final_leader.is_none()
                         && matches!(
@@ -826,12 +856,47 @@ impl Cluster {
             .is_some_and(|current| Arc::ptr_eq(current, replica))
     }
 
+    /// Record that `value` at `offset` was acknowledged or published. The
+    /// first acknowledgement of an offset is the oracle and is never
+    /// replaced (#646 review): different bytes acknowledged there later mean
+    /// the first record was lost, and comparing the final leader against
+    /// the replacement would hide exactly that.
+    fn acknowledge(&mut self, offset: u64, value: String) {
+        match self.acknowledged.get(&offset) {
+            None => {
+                self.acknowledged.insert(offset, value);
+            }
+            Some(first) if *first == value => {}
+            Some(first) => {
+                let first = first.clone();
+                let already = self.violations.iter().any(|violation| {
+                    matches!(
+                        violation,
+                        Violation::AcknowledgedRecordReplaced { offset: at, replaced_by, .. }
+                            if *at == offset && *replaced_by == value
+                    )
+                });
+                if already {
+                    return;
+                }
+                self.note(format!(
+                    "LOSS: {value} acknowledged at {offset}, where {first} was acknowledged"
+                ));
+                self.violations.push(Violation::AcknowledgedRecordReplaced {
+                    offset,
+                    acknowledged: first,
+                    replaced_by: value,
+                });
+            }
+        }
+    }
+
     /// Publish `mark` to `to` (the leader included) at `epoch`.
     fn publish_mark(&mut self, leader: usize, epoch: u64, mark: u64, to: &[usize]) {
         let leader_log = durable_records(&self.nodes[leader].disk);
         for offset in 0..mark {
             if let Some(value) = leader_log.get(&offset) {
-                self.acknowledged.insert(offset, value.clone());
+                self.acknowledge(offset, value.clone());
             }
         }
         for node in to {
@@ -880,7 +945,7 @@ impl Cluster {
             let request = self.new_record(format!("e{OLD_EPOCH}-o{offset}"), OLD_EPOCH, L, offset);
             if self.replicate(L, &request, &[R]) {
                 self.note(format!("acknowledged {} at {offset}", value_of(&request)));
-                self.acknowledged.insert(offset, value_of(&request));
+                self.acknowledge(offset, value_of(&request));
             }
         }
     }
@@ -1069,7 +1134,7 @@ impl Cluster {
             return false;
         }
         self.note(format!("acknowledged {} at {offset}", value_of(&request)));
-        self.acknowledged.insert(offset, value_of(&request));
+        self.acknowledge(offset, value_of(&request));
         self.publish_mark(leader, epoch, offset + 1, &[0, 1, 2]);
         self.still_the_same(leader, &own)
     }
@@ -1095,9 +1160,13 @@ impl Cluster {
     }
 
     /// An orderly reopen of `node`'s directory: commit, drop, open.
-    fn role_flip(&mut self, node: usize) {
-        let Some(replica) = self.nodes[node].replica.take() else {
-            return;
+    /// True when the node came out of the flip still holding the role: the
+    /// same process reopened its directory. A death or crash during the flip
+    /// restarts it as a follower, and leadership then needs a new election
+    /// (#646 review).
+    fn role_flip(&mut self, node: usize) -> bool {
+        let Some(replica) = self.up(node) else {
+            return false;
         };
         self.note(format!(
             "{} reopens its directory for the role flip",
@@ -1106,14 +1175,23 @@ impl Cluster {
         if let Err(error) = replica.quiesce() {
             self.note(format!("{} pre-flip commit failed: {error}", NAMES[node]));
         }
-        drop(replica);
+        // The step is counted while the process still holds its replica, so
+        // a death scheduled here fires (#646 review: taken first, the
+        // replica was already gone and the kill was skipped). A death or a
+        // crash restarts the node from its directory as a follower: the
+        // process that won the election is gone, and with it the role.
         self.after_step(node);
-        if self.nodes[node].replica.is_none() {
-            if self.nodes[node].disk.has_crashed() {
-                self.nodes[node].disk.reboot();
-            }
-            self.restart(node);
+        if !self.still_the_same(node, &replica) {
+            self.note(format!(
+                "{} died during the role flip; its leadership died with it",
+                NAMES[node]
+            ));
+            return false;
         }
+        self.nodes[node].replica = None;
+        drop(replica);
+        self.restart(node);
+        self.nodes[node].replica.is_some()
     }
 
     /// Restart the nodes the scenario held down. True if there were any.
@@ -1184,7 +1262,9 @@ impl Cluster {
                     self.role_flip(deposed);
                 }
             }
-            self.role_flip(candidate);
+            if !self.role_flip(candidate) {
+                continue;
+            }
             let Some(leading) = self.up(candidate) else {
                 continue;
             };
@@ -1446,6 +1526,11 @@ fn summary(outcome: &Outcome) -> String {
                 expected,
                 found,
             } => format!("acked {expected} at {offset} lost (final leader holds {found:?})"),
+            Violation::AcknowledgedRecordReplaced {
+                offset,
+                acknowledged,
+                replaced_by,
+            } => format!("acked {acknowledged} at {offset} replaced by {replaced_by}"),
             Violation::AckWithoutTheRecord {
                 node,
                 offset,
@@ -1679,33 +1764,6 @@ fn a_second_failover_after_a_catch_up_still_finishes_with_two_agreeing_replicas(
     );
 }
 
-/// #640. R leads at 20 after catching C up on 5..10, and L, back before the
-/// election, has caught up too. R's producer-epoch journal entry is torn
-/// as it takes its marker, so R refuses to reopen and stays out (that
-/// journal's designed answer to a torn entry). L and C hold identical
-/// bytes, but each filed the records it caught up on under the epoch it
-/// adopted at its own tail, so each judges the other's answer Unknown and
-/// neither is ever established. The range is unavailable with two healthy
-/// replicas.
-#[test]
-#[ignore = "#640: caught-up records are filed under the adopted epoch, so two healthy replicas cannot prove a quorum"]
-fn reproduction_two_caught_up_replicas_cannot_prove_a_quorum_after_the_leader_is_lost() {
-    let setup = setup_disks();
-    let fault = Fault::Storage {
-        node: R,
-        plan: FaultPlan::CrashDuringWrite {
-            op: 225,
-            byte_cut: 28,
-        },
-    };
-    let outcome = run(Shape::AckedLeaderReturns, fault, &setup);
-    assert!(
-        outcome.violations.is_empty(),
-        "{}",
-        outcome.report(Shape::AckedLeaderReturns, &fault)
-    );
-}
-
 /// The index of `node`'s `ordinal`-th (from 1) `kind` operation on `file`
 /// in the clean run of `shape`. Reproductions name a crash point this way,
 /// not by bare index, so a change that adds a storage operation elsewhere
@@ -1731,6 +1789,38 @@ fn nth_op(
             )
         })
         .index
+}
+
+/// #640. R leads at 20 after catching C up on 5..10, and L, back before the
+/// election, has caught up too. R's producer-epoch journal entry is torn
+/// as it takes its marker, so R refuses to reopen and stays out (that
+/// journal's designed answer to a torn entry). L and C hold identical
+/// bytes, but each filed the records it caught up on under the epoch it
+/// adopted at its own tail, so each judges the other's answer Unknown and
+/// neither is ever established. The range is unavailable with two healthy
+/// replicas.
+#[test]
+#[ignore = "#640: caught-up records are filed under the adopted epoch, so two healthy replicas cannot prove a quorum"]
+fn reproduction_two_caught_up_replicas_cannot_prove_a_quorum_after_the_leader_is_lost() {
+    let setup = setup_disks();
+    let op = nth_op(
+        Shape::AckedLeaderReturns,
+        &setup,
+        R,
+        TraceKind::HandleWrite,
+        PRODUCER_EPOCHS,
+        6,
+    );
+    let fault = Fault::Storage {
+        node: R,
+        plan: FaultPlan::CrashDuringWrite { op, byte_cut: 28 },
+    };
+    let outcome = run(Shape::AckedLeaderReturns, fault, &setup);
+    assert!(
+        outcome.violations.is_empty(),
+        "{}",
+        outcome.report(Shape::AckedLeaderReturns, &fault)
+    );
 }
 
 /// #641, found by the sweep: the "absent replica" gap `promotion.rs` listed.
