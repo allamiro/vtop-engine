@@ -1961,6 +1961,81 @@ async fn a_retired_range_counts_no_verification_and_no_commit() {
     );
 }
 
+/// #567 (review, Codex): a file rewritten in place, keeping its inode and its
+/// first page but SHORTER, is a new generation, and the newest committed row -
+/// the old content's, committed through byte 10000 - says nothing about it.
+/// A handed-back range of the new content below that offset must keep the
+/// replay path: retired as SUPERSEDED, it would be terminal with no commit
+/// covering its bytes.
+#[tokio::test]
+async fn a_range_of_a_truncated_rewrite_is_not_retired_against_the_old_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    // The new content: the old first page, then a shorter rest, 5000 bytes
+    // of 10-byte lines.
+    let line = |i: usize| format!("line-{:04}\n", i % 10_000);
+    let content: String = (0..500).map(line).collect();
+    assert_eq!(content.len(), 5_000);
+    std::fs::write(&input, &content).unwrap();
+    let inode = inode_of(&input);
+    let first_page = vtop_core::types::ContentFingerprint::of(&content.as_bytes()[..4096]);
+    let url = format!("sqlite://{}", dir.path().join("state.db").display());
+    let path = input.to_string_lossy().into_owned();
+    let marker = |start: u64, end: u64, size: u64| ProgressMarker::File {
+        path: path.clone(),
+        inode,
+        start_byte: start,
+        end_byte: end,
+        file_size: size,
+        mtime: String::new(),
+        content_fingerprint: first_page.clone(),
+        tail_fingerprint: None,
+    };
+    let row = |id: &str, m: ProgressMarker, at: &str| {
+        let mut rec = file_row(id, &path, inode, (0, 0), at);
+        rec.progress_start = m.clone();
+        rec.progress_end = m;
+        rec
+    };
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        // The old content, 10000 bytes, committed through its end...
+        commit_row(
+            &store,
+            &row("b-old", marker(0, 10_000, 10_000), "2026-01-01T00:00:00Z"),
+        )
+        .await;
+        // ...and a range of the new content, read after the rewrite, that
+        // failed: [4000, 5000) of a 5000-byte file.
+        hand_back_row(
+            &store,
+            &row("b-new", marker(4_000, 5_000, 5_000), "2026-01-01T00:00:01Z"),
+        )
+        .await;
+    }
+    let cfg = file_config(work.to_str().unwrap(), &url, vec![path.clone()], "mock");
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(
+        (summary.superseded, summary.replay_required),
+        (0, 1),
+        "the truncated rewrite's range was retired against the old content's offset: {summary:?}"
+    );
+    assert_eq!(
+        engine
+            .store
+            .get_batch("b-new")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        BatchState::ReplayRequired
+    );
+}
+
 // ---- #624: a held-back VERIFIED range is settled while the engine runs -------
 
 /// #624: recovery holds a VERIFIED range back while a lower range of its file
