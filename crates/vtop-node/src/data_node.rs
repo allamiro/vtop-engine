@@ -888,14 +888,22 @@ pub async fn serve(
     let _version_task = match config.lease.as_ref() {
         Some(lease) => {
             let interval = Duration::from_millis(lease.renew_interval_ms.max(100));
+            // A round's RPC budget is the lease duration, as the lease
+            // watcher's reads have, not the cadence (review): a cadence
+            // under the admin client's per-candidate allowance would cancel
+            // every round before it could pass a stalled endpoint.
+            let budget = Duration::from_millis(lease.lease_duration_ms).max(interval);
             let level = crate::version_report::cluster_level_for(config.node_uuid);
             let admin = lease_admin_client(lease)?;
+            // The startup read stays within one interval: it is best effort,
+            // and the loop's first round has the full budget.
             crate::version_report::read_level(&admin, &level, interval).await;
             Some(Aborting(tokio::spawn(crate::version_report::run(
                 admin,
                 config.node_uuid,
                 level,
                 interval,
+                budget,
                 shutdown.clone(),
             ))))
         }

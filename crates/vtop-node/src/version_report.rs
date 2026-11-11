@@ -99,19 +99,44 @@ const MAX_BACKOFF_ROUNDS: u32 = 32;
 /// Read the finalized level once, within `budget`, into `level`. A read the
 /// tier cannot serve leaves the level as it was: levels only rise, so the
 /// last one read is a lower bound.
-pub async fn read_level(admin: &AdminClient, level: &ClusterFeatureLevel, budget: Duration) {
-    if let Ok(Ok(read)) = tokio::time::timeout(budget, admin.read_cluster_versions(false)).await {
-        level.observe(read.versions.feature_level);
+///
+/// Returns `false` when the budget ran out. The client is then pointed at
+/// its next candidate (#634 review): it moves its preference only on an
+/// answer, so an endpoint that accepts and never answers would otherwise be
+/// asked first by every later request.
+pub async fn read_level(
+    admin: &AdminClient,
+    level: &ClusterFeatureLevel,
+    budget: Duration,
+) -> bool {
+    match tokio::time::timeout(budget, admin.read_cluster_versions(false)).await {
+        Ok(Ok(read)) => {
+            level.observe(read.versions.feature_level);
+            true
+        }
+        Ok(Err(_)) => true,
+        Err(_) => {
+            admin.prefer_next_candidate();
+            false
+        }
     }
 }
 
 /// Report until accepted, and keep `level` current, every `interval` until
 /// `shutdown` fires.
+///
+/// `budget` bounds one round's RPCs, the read and the report together, and
+/// is NOT the polling cadence (#634 review): a cadence shorter than the
+/// admin client's per-candidate allowance would cancel every round before
+/// it could fail over past a stalled metadata endpoint. The data node gives
+/// it the lease duration, the budget its lease watcher gives its reads.
+/// Rounds never overlap: the next starts `interval` after this one ends.
 pub async fn run(
     admin: AdminClient,
     node_uuid: Uuid,
     level: ClusterFeatureLevel,
     interval: Duration,
+    budget: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut reported = false;
@@ -137,11 +162,12 @@ pub async fn run(
         }
         // The level FIRST (review): the replica plane judges peers against
         // it, and a report that hangs must not leave it unread for a round.
-        read_level(&admin, &level, interval).await;
+        let round = tokio::time::Instant::now() + budget;
+        let read_in_time = read_level(&admin, &level, budget).await;
         if !reported && skip_rounds > 0 {
             skip_rounds -= 1;
-        } else if !reported {
-            match tokio::time::timeout(interval, report_once(&admin, node_uuid)).await {
+        } else if !reported && read_in_time {
+            match tokio::time::timeout_at(round, report_once(&admin, node_uuid)).await {
                 Ok(Reported::Accepted { feature_level }) => {
                     reported = true;
                     level.observe(feature_level);
@@ -180,7 +206,8 @@ pub async fn run(
                     skip_rounds = backoff;
                     backoff = (backoff * 2).min(MAX_BACKOFF_ROUNDS);
                 }
-                Err(_) => {}
+                // Out of time: start the next round at the next candidate.
+                Err(_) => admin.prefer_next_candidate(),
             }
         }
         tokio::select! {
@@ -344,6 +371,7 @@ mod tests {
             node,
             level.clone(),
             Duration::from_millis(20),
+            Duration::from_secs(5),
             shutdown,
         ));
 
@@ -443,6 +471,7 @@ mod tests {
             Uuid::from_u128(0x634),
             level.clone(),
             Duration::from_secs(5),
+            Duration::from_secs(5),
             shutdown,
         ));
         assert!(
@@ -473,6 +502,7 @@ mod tests {
             Uuid::from_u128(0x634),
             ClusterFeatureLevel::unknown(),
             Duration::from_millis(20),
+            Duration::from_secs(5),
             shutdown,
         ));
         tokio::time::sleep(Duration::from_millis(600)).await;
@@ -495,5 +525,85 @@ mod tests {
         );
         reporter.abort();
         serving.abort();
+    }
+
+    /// #634 review (Codex): a metadata endpoint that accepts and then never
+    /// answers must not hold the reporter forever. A round that runs out of
+    /// time used to leave the client preferring the same endpoint - it moves
+    /// only on an answer - so every round asked it again, the report never
+    /// landed, and the level stayed unread. The healthy second endpoint must
+    /// get the report within a few rounds.
+    #[tokio::test]
+    async fn a_stalled_first_endpoint_does_not_keep_the_report_from_the_next() {
+        let hung = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hung_endpoint = hung.local_addr().unwrap();
+        // Accepts, holds the connection, never reads or answers.
+        let holding = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = hung.accept().await {
+                held.push(stream);
+            }
+        });
+        let tier = Arc::new(Tier {
+            level: AtomicU32::new(vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL),
+            registered: true.into(),
+            propose_delay: Duration::ZERO,
+            reports: Default::default(),
+        });
+        let (single, serving) = serve(Arc::clone(&tier)).await;
+        drop(single);
+        let healthy_endpoint = {
+            // `serve` bound its own listener; reach it through a fresh one.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = listener.local_addr().unwrap();
+            let server = vtop_meta::AdminServer::plaintext(
+                Arc::clone(&tier) as Arc<dyn vtop_meta::AdminHandler>,
+                vtop_meta::transport::AdminAuthorizer::permissive(),
+            )
+            .unwrap();
+            tokio::spawn(async move {
+                let _ = server.serve(listener).await;
+            });
+            endpoint
+        };
+        let candidate = |id: u64, endpoint| vtop_meta::AdminCandidate {
+            node_id: Some(vtop_meta::MetaNodeId(id)),
+            endpoint,
+            host: None,
+            server_name: String::new(),
+            plaintext: true,
+        };
+        let client = AdminClient::plaintext(vec![
+            candidate(1, hung_endpoint),
+            candidate(2, healthy_endpoint),
+        ])
+        .unwrap();
+        let level = ClusterFeatureLevel::unknown();
+        let (_stop, shutdown) = tokio::sync::watch::channel(false);
+        let reporter = tokio::spawn(run(
+            client,
+            Uuid::from_u128(0x634),
+            level.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            shutdown,
+        ));
+        assert!(
+            until(Duration::from_secs(8), || !tier
+                .reports
+                .lock()
+                .unwrap()
+                .is_empty())
+            .await,
+            "the healthy endpoint never received the report: every round asked the stalled one"
+        );
+        assert!(
+            until(Duration::from_secs(4), || level.get()
+                == vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL)
+            .await
+        );
+        reporter.abort();
+        serving.abort();
+        holding.abort();
     }
 }
