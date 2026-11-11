@@ -1269,6 +1269,13 @@ impl Cluster {
                 continue;
             };
             self.published = self.published.max(committed_offset);
+            // The process that won. `elect` checked it was still running
+            // when `establish` answered; leadership is this process's, not
+            // the node's (#646 review): a candidate that dies during the
+            // deposed leader's flip and restarts is a follower.
+            let Some(winner) = self.up(candidate) else {
+                continue;
+            };
             // The role flip `data_node` performs: the deposed leader and the
             // new one each reopen their directory, so nothing held in memory
             // (a kept dispute included) crosses the flip.
@@ -1276,6 +1283,13 @@ impl Cluster {
                 if deposed != candidate {
                     self.role_flip(deposed);
                 }
+            }
+            if !self.still_the_same(candidate, &winner) {
+                self.note(format!(
+                    "{} died during the deposed leader's role flip; its leadership died with it",
+                    NAMES[candidate]
+                ));
+                continue;
             }
             if !self.role_flip(candidate) {
                 continue;

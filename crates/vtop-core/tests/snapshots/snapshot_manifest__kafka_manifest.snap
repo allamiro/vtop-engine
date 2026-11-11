@@ -4,7 +4,7 @@ expression: json
 ---
 {
   "protocol": "VTOP",
-  "version": "0.2",
+  "version": "0.3",
   "batch_id": "vtop-20260101T000000Z-app_events-p0-0-99-deadbeef",
   "tenant": "default",
   "source_type": "kafka",
@@ -30,7 +30,7 @@ expression: json
   },
   "manifest": {
     "uri": "s3://telemetry-cef/tenant=default/source=app_events/format=cef/year=2026/month=01/day=01/hour=00/vtop-20260101T000000Z-app_events-p0-0-99-deadbeef.manifest.json",
-    "sha256": "9cd45db4359fd86c26e274c376f2509fe20991a955a03b8112ccee01cd9a41ec"
+    "sha256": "ab7a5bb0f3bffa362abb4552bbafb3c2af345c6c2db9ab417ad6946c1dab0376"
   },
   "partitioning": {
     "path_template": "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/",

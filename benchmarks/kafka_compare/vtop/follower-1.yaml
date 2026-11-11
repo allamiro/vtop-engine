@@ -1,0 +1,13 @@
+# VTOP node 2: a follower of the range led by vtop-1 (see leader.yaml).
+# Followers serve no Kafka gateway: the node refuses `kafka` on any role but
+# leader or standalone, because the gateway serves the range this node leads.
+role: follower
+node_uuid: aaaaaaaa-0000-0000-0000-0000000000a2
+cluster_id: 11111111-2222-3333-4444-555555555555
+data_dir: /home/vtop/data
+fencing_epoch: 18
+range: { topic: "bench", topic_epoch: 1, range_id: aaaaaaaa-0000-0000-0000-0000000000c1, range_generation: 0 }
+segment_id: aaaaaaaa-0000-0000-0000-0000000000d1
+replica_listen: "0.0.0.0:9300"
+replica_transport: plaintext-on-any-interface
+observability: { listen: "0.0.0.0:9600" }
