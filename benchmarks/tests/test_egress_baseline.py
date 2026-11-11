@@ -5,6 +5,7 @@ arithmetic that produces it is pinned here: the goodput a run is credited
 with, the best-tuned selection and its tie rule, the two thresholds, the noise
 rule, and the charts being a pure function of the data.
 """
+import json
 import os
 import subprocess
 import sys
@@ -319,3 +320,44 @@ def test_a_value_above_the_chart_scale_is_marked_off_scale_not_drawn_at_the_top(
     assert "(off scale)" in outside and "(off scale)" not in inside
     # The legend draws circles too; the off-scale point must not add one.
     assert outside.count("<circle") == inside.count("<circle") - 1
+
+
+# ------------------------------------------- the committed dataset, as a gate
+
+DATA = os.path.join(eb.HERE, "measurements", "483-tcp-baseline")
+
+
+def _committed_dataset():
+    return (eb._read_csv(os.path.join(DATA, "runs.csv")),
+            eb._read_csv(os.path.join(DATA, "objects.csv")))
+
+
+@pytest.mark.parametrize("missing", ["wan100", "wan100-loss1"])
+def test_a_gated_profile_with_no_grid_runs_leaves_the_gate_undecided_never_closed(missing):
+    # The datagram issues close on this verdict, so a dataset that cannot
+    # select a best-tuned point on one required profile must not report the
+    # gate closed: that criterion is undecided, and so is the gate.
+    runs, objects = _committed_dataset()
+    runs = [r for r in runs if not (r["profile"] == missing and r["phase"] == "grid")]
+    gate = eb.evaluate_gate(runs, objects)
+    assert gate["datagram_issues_open"] is None, gate
+    assert gate["profiles"][missing]["opens"] is None, gate["profiles"]
+
+
+def test_the_committed_verdict_is_closed_and_matches_gate_json():
+    runs, objects = _committed_dataset()
+    gate = eb.evaluate_gate(runs, objects)
+    with open(os.path.join(DATA, "gate.json"), encoding="utf-8") as fh:
+        assert json.load(fh) == json.loads(json.dumps(gate, sort_keys=True))
+    assert gate["datagram_issues_open"] is False
+
+
+def test_one_criterion_crossed_opens_the_gate_even_if_another_is_undecided():
+    runs = _gate_runs([0.93, 0.94, 0.95], [0.70, 0.72, 0.75])
+    runs = [r for r in runs if not (r["profile"] == "wan100" and r["phase"] == "grid")]
+    gate = eb.evaluate_gate(runs, _objects(runs, {"wan100": 60000, "wan100-loss1": 66000}))
+    assert gate["profiles"]["wan100"]["opens"] is None
+    assert gate["profiles"]["wan100-loss1"]["opens"] is True
+    assert gate["datagram_issues_open"] is True, (
+        "the gate opens if EITHER threshold is crossed; an undecided criterion beside a "
+        "crossed one cannot close it")

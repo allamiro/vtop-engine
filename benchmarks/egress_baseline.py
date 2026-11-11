@@ -547,6 +547,16 @@ def evaluate_gate(runs: list[dict], objects: list[dict]) -> dict:
             points.setdefault(r["config"], []).append(_fraction(r))
             conns[r["config"]] = int(_f(r["c"])) * int(_f(r["pif"]))
         if not points:
+            # No grid, no best-tuned point, so this criterion is UNDECIDED —
+            # recorded as such, never dropped. Dropped, the verdict below was
+            # taken over the criteria that remained and could read closed on
+            # a dataset that never measured this profile (review, #661).
+            out["profiles"][profile] = {
+                "best_config": None, "selection_median_fraction": None,
+                "confirmation_runs": 0, "unused_median": None, "unused_min": None,
+                "unused_max": None, "opens": None, "within_noise": False,
+                "undecided_because": "no grid runs on this profile",
+            }
             continue
         best[profile] = best_config(points, conns)
         conf = [_fraction(r) for r in runs if r["profile"] == profile
@@ -593,10 +603,19 @@ def evaluate_gate(runs: list[dict], objects: list[dict]) -> dict:
             "opens": (ratio > GATE_P95_RATIO) if ratio is not None else None,
             "within_noise": within_noise(GATE_P95_RATIO, rep_ratios),
         }
-    decided = [p["opens"] for p in out["profiles"].values()] + [
+    # Every criterion the doc fixes is listed by name, so one that could not be
+    # evaluated is None here rather than absent. The gate opens if EITHER
+    # threshold is crossed, so one crossed criterion opens it; it is closed
+    # only when every criterion was evaluated and none crossed; anything else
+    # is undecided (None), never closed.
+    decided = [out["profiles"][p]["opens"] for p in GATED_PROFILES] + [
         out.get("p95_ratio", {}).get("opens")]
-    out["datagram_issues_open"] = (any(bool(d) for d in decided)
-                                   if all(d is not None for d in decided) else None)
+    if any(d is True for d in decided):
+        out["datagram_issues_open"] = True
+    elif all(d is False for d in decided):
+        out["datagram_issues_open"] = False
+    else:
+        out["datagram_issues_open"] = None
     return out
 
 
