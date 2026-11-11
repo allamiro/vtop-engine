@@ -358,18 +358,24 @@ What follows from that, in the engine:
   log open with `O_APPEND`, so every later line went into the unlinked
   inode, which no path names, and was lost. That happened every time the
   engine caught up on a live file. The delete itself renames the file to a
-  hidden name beside it (`.<name>.<nanos>.vtop-delete`), checks the renamed
-  file again, and unlinks it only if it is still unchanged. A line appended
-  between the decision and the rename is caught there, and the file is
-  hard-linked back under its name and kept. Before, a check-then-unlink lost
-  that line. A writer that opens the path for each write creates a new file
-  once the rename has happened, and that file is read as a new source. A
-  delete that fails (the open, the rename or the unlink) keeps the wait's
-  result and is retried on the next pass. A file whose mtime alone moved
-  (same inode, first page and length, as when a producer stamps a finished
-  drop) starts the wait again. A file that is gone, or that changed in any
-  other way, is no longer a candidate until a new commit covers it. The
-  deletes run on the blocking pool, as many at once as the reads.
+  hidden name in the same directory (`.vtop-delete.<nanos>.<n>`, bounded
+  and independent of the file's own name, so a name near the 255-byte limit
+  still fits), checks the renamed file again, and unlinks it only if it is
+  still unchanged. A line appended between the decision and the rename is
+  caught there, and the file is hard-linked back under its name and kept.
+  Before, a check-then-unlink lost that line. A writer that opens the path
+  for each write creates a new file once the rename has happened, and that
+  file is read as a new source. A delete that fails (the open, the rename or
+  the unlink) keeps the wait's result and is retried on the next pass. A
+  file that is gone, or that changed in any way - its mtime included - is no
+  longer a candidate, and is kept until a new commit covers it. **That
+  includes a file whose mtime alone moved** (same inode, first page and
+  length): it may be a producer stamping a finished drop, but it may as well
+  be a same-length rewrite past the first page, and nothing checked today
+  can tell the two apart. Never deleting changed data was chosen over always
+  deleting touched files; once a fingerprint of the rest of the file exists
+  (#620), a touch can restart the wait instead. The deletes run on the
+  blocking pool, as many at once as the reads.
 - **The wait is in memory, so a restart starts it again.** The seed re-arms
   it with a fresh clock, but only from a row that names the inode and the
   first page, and whose batch saw the file end at the committed offset. A
