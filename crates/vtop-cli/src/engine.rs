@@ -2565,7 +2565,8 @@ impl Engine {
         // that was rotated while the engine was down is started at byte 0
         // instead of at the old file's high-water mark (#558) - and the
         // fingerprint of its first bytes, for a replacement that kept the
-        // inode (#578).
+        // inode (#578), and of the bytes below the offset, for one that also
+        // kept the first page (#620).
         let file_cursors = self.store.committed_cursors(SourceType::File).await?;
         let spool_cursors = self
             .store
@@ -2580,6 +2581,7 @@ impl Engine {
                         c.inode,
                         c.observed_size,
                         c.content_fingerprint,
+                        c.tail_fingerprint,
                     );
                 }
             }
@@ -3579,6 +3581,7 @@ mod tests {
             file_size: 0,
             mtime: String::new(),
             content_fingerprint: None,
+            tail_fingerprint: None,
         };
         assert_eq!(buffer_key(&file, &fm).1, "/a.log");
     }
@@ -3800,6 +3803,7 @@ mod tests {
             file_size: 4,
             mtime: String::new(),
             content_fingerprint: None,
+            tail_fingerprint: None,
         };
         let read = ReadResult {
             records: vec![b"one".to_vec()],
@@ -4758,6 +4762,7 @@ mod tests {
             file_size: 0,
             mtime: String::new(),
             content_fingerprint: None,
+            tail_fingerprint: None,
         };
         let inodes = |plan: &RewindPlan| -> Vec<Option<u64>> {
             plan.markers().iter().map(marker_inode).collect()
@@ -4791,6 +4796,7 @@ mod tests {
             file_size: 0,
             mtime: String::new(),
             content_fingerprint: None,
+            tail_fingerprint: None,
         };
         let kafka = |partition: i32, start: i64| ProgressMarker::Kafka {
             topic: "t".into(),
@@ -4850,6 +4856,7 @@ mod tests {
             file_size: 0,
             mtime: String::new(),
             content_fingerprint: None,
+            tail_fingerprint: None,
         };
         let mut plan = RewindPlan::default();
         plan.add(&file(0, 100));
@@ -4884,6 +4891,7 @@ mod tests {
             file_size: 0,
             mtime: String::new(),
             content_fingerprint: None,
+            tail_fingerprint: None,
         };
         let mut plan = RewindPlan::default();
         plan.add(&file("/a", 1, 100, 150));
@@ -4979,6 +4987,7 @@ mod tests {
             file_size: 8_192,
             mtime: String::new(),
             content_fingerprint: content,
+            tail_fingerprint: None,
         };
         let spool = |start: u64, content: Option<ContentFingerprint>| ProgressMarker::SyslogSpool {
             spool_id: "s".into(),
@@ -5031,6 +5040,7 @@ mod tests {
             file_size: 300,
             mtime: String::new(),
             content_fingerprint: content,
+            tail_fingerprint: None,
         };
         let mut plan = RewindPlan::default();
         plan.add(&file(0, ContentFingerprint::of(&text[..100])));
@@ -5074,6 +5084,7 @@ mod tests {
             file_size: 8_192,
             mtime: String::new(),
             content_fingerprint: content,
+            tail_fingerprint: None,
         };
         let mut plan = RewindPlan::default();
         plan.add(&file(0, page(b'A')));
@@ -5704,6 +5715,7 @@ mod tests {
             file_size: 0,
             mtime: String::new(),
             content_fingerprint: None,
+            tail_fingerprint: None,
         };
         let limits = BatchLimits::default();
         let src = DiscoveredSource {
