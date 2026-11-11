@@ -84,6 +84,14 @@ pub struct CommittedCursor {
     /// alone. `None` for a row that predates the field, or a file that was
     /// empty when read.
     pub content_fingerprint: Option<ContentFingerprint>,
+    /// The file's mtime as the MOST RECENT committed batch observed it (the
+    /// marker's `mtime`, RFC 3339 as the file adapter writes it). The file
+    /// source re-arms a deferred `delete_after_commit` after a restart only
+    /// while the file still has this mtime (#619, review of #631): a
+    /// same-inode, same-length rewrite while the engine was down agrees with
+    /// every other field here. `None` where the marker records none or an
+    /// empty one (a filesystem without mtimes, a syslog spool marker).
+    pub observed_mtime: Option<String>,
     /// The fingerprint of the bytes ending at `end_byte` that the same row's
     /// marker took (#620): a file rewritten at the same inode while the
     /// engine was down, with the same first page, is caught by it. `None`

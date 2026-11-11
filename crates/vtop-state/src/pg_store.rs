@@ -623,14 +623,15 @@ impl StateStore for PgStateStore {
                         (progress_end_json::jsonb ->> 'file_size')::bigint AS file_size, \
                         progress_end_json::jsonb ->> 'content_fingerprint' AS content, \
                         progress_end_json::jsonb ->> 'tail_fingerprint' AS tail, \
+                        progress_end_json::jsonb ->> 'mtime' AS mtime, \
                         created_at, batch_id \
                  FROM batches WHERE state = $1 AND source_type = $2 \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, tail, ROW_NUMBER() OVER ( \
+                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ROW_NUMBER() OVER ( \
                             PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size, content, tail FROM latest WHERE rn = 1",
+             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest WHERE rn = 1",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(source_type.as_str())
@@ -645,6 +646,7 @@ impl StateStore for PgStateStore {
                 let end: Option<i64> = r.get("end_byte");
                 let size: Option<i64> = r.get("file_size");
                 let content: Option<String> = r.get("content");
+                let mtime: Option<String> = r.get("mtime");
                 let tail: Option<String> = r.get("tail");
                 Some(CommittedCursor {
                     path: path?,
@@ -654,6 +656,7 @@ impl StateStore for PgStateStore {
                     content_fingerprint: content
                         .as_deref()
                         .and_then(crate::models::parse_content_fingerprint),
+                    observed_mtime: mtime.filter(|m| !m.is_empty()),
                     tail_fingerprint: tail
                         .as_deref()
                         .and_then(crate::models::parse_content_fingerprint),

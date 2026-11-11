@@ -1355,6 +1355,183 @@ async fn recovery_commits_a_verified_range_above_a_failed_row_that_a_retry_alrea
     );
 }
 
+/// A ledger whose only VERIFIED row, `b-629` over `[7,14)`, can be re-checked
+/// by size alone (checksums disabled, testkit's `require_strong_verification:
+/// false`), with its object and manifest staged in the engine's backend. With
+/// `failed_below`, a FAILED row over `[0,7)` of the same file sits under it,
+/// so recovery must hold `b-629` back (#552).
+async fn size_only_verified_ledger(dir: &Path, tenant: &str, failed_below: bool) -> Engine {
+    let work = dir.join("work");
+    let input = dir.join("in.log");
+    std::fs::write(&input, "line-0\nline-1\n").unwrap();
+    let url = format!("sqlite://{}", dir.join("state.db").display());
+    let path = input.to_string_lossy().into_owned();
+    let range = |start: u64, end: u64| ProgressMarker::File {
+        path: path.clone(),
+        inode: None,
+        start_byte: start,
+        end_byte: end,
+        file_size: 14,
+        mtime: String::new(),
+        content_fingerprint: None,
+        tail_fingerprint: None,
+    };
+    let object_uri = "s3://telemetry-data/x/b-629.raw.gz";
+    let manifest_uri = "s3://telemetry-data/x/b-629.manifest.json";
+    // Checksums disabled: the only thing the re-check can confirm is size.
+    let (manifest, manifest_path) = write_recovery_manifest(
+        &work,
+        "b-629",
+        &path,
+        range(7, 14),
+        object_uri,
+        manifest_uri,
+        14,
+        "none",
+        "",
+    );
+    let row = |id: &str, start: u64, end: u64, at: &str| BatchRecord {
+        batch_id: id.into(),
+        tenant: tenant.into(),
+        source_type: SourceType::File,
+        source_name: path.clone(),
+        format: TelemetryFormat::Raw,
+        state: BatchState::Batching,
+        progress_start: range(start, end),
+        progress_end: range(start, end),
+        object_uri: None,
+        manifest_uri: None,
+        object_sha256: None,
+        manifest_sha256: None,
+        manifest_version_id: None,
+        object_size_bytes: None,
+        record_count: Some(1),
+        error_message: None,
+        owner: None,
+        lease_expires_at: None,
+        created_at: at.into(),
+        updated_at: at.into(),
+    };
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        if failed_below {
+            store
+                .save_batch_state(&row("b-629-failed", 0, 7, "2026-01-01T00:00:00+00:00"))
+                .await
+                .unwrap();
+            store
+                .mark_failed("b-629-failed", "upload failed")
+                .await
+                .unwrap();
+        }
+        let mut verified = row("b-629", 7, 14, "2026-01-01T00:00:01+00:00");
+        verified.object_uri = Some(object_uri.into());
+        verified.manifest_uri = Some(manifest_uri.into());
+        verified.object_sha256 = Some(String::new());
+        verified.manifest_sha256 = Some(manifest.manifest.sha256.clone());
+        verified.object_size_bytes = Some(14);
+        store.save_batch_state(&verified).await.unwrap();
+        for st in [
+            BatchState::Sealed,
+            BatchState::Compressed,
+            BatchState::Checksummed,
+            BatchState::ObjectUploaded,
+            BatchState::ManifestUploaded,
+            BatchState::Verified,
+        ] {
+            store
+                .update_batch_state("b-629", st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    let mut cfg = file_config(
+        work.to_str().unwrap(),
+        &url,
+        vec![path.clone()],
+        "mock", // testkit config has require_strong_verification: false
+    );
+    cfg.engine.tenant = tenant.into();
+    let engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let staged = dir.join("staged");
+    std::fs::write(&staged, b"fourteen-bytes").unwrap();
+    engine
+        .backend
+        .put_object(&staged, object_uri, None)
+        .await
+        .unwrap();
+    engine
+        .backend
+        .put_manifest(&manifest_path, manifest_uri, None)
+        .await
+        .unwrap();
+    engine
+}
+
+/// `vtop_verification_backend_limited_total` for one tenant's raw file batches.
+fn size_only_count(tenant: &str) -> u64 {
+    vtop_core::telemetry::init()
+        .expect("metrics registry")
+        .verification_backend_limited_total
+        .with_label_values(&[tenant, "file", TelemetryFormat::Raw.extension()])
+        .get()
+}
+
+/// #629: recovery's storage re-check accepted a size-only (backend-limited)
+/// result for a VERIFIED row without a word, so a commit made on size alone
+/// left no trace in the counter the running engine uses for exactly that. It
+/// must count it under the same labels (tenant, source type, format).
+#[tokio::test]
+async fn recovery_counts_a_size_only_acceptance_like_the_running_engine() {
+    // A tenant no other test uses: the registry is process-wide.
+    let tenant = "tenant-629-recovery";
+    let before = size_only_count(tenant);
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = size_only_verified_ledger(dir.path(), tenant, false).await;
+
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(summary.committed, 1, "the size-only re-check commits");
+    let after = size_only_count(tenant);
+    assert_eq!(
+        after - before,
+        1,
+        "recovery committed b-629 on size alone and must count it in \
+         vtop_verification_backend_limited_total{{tenant={tenant:?}}}: \
+         before {before}, after {after}"
+    );
+}
+
+/// #629 (review): the count is of size-only COMMITS, as in the running
+/// engine, where it moves with `verified_total`. A VERIFIED row that passes
+/// the re-check but is held back under a failed lower range is not committed,
+/// and stays VERIFIED to be re-checked by every later recovery; counting it
+/// at the re-check counted a commit that never happened, once per restart.
+#[tokio::test]
+async fn recovery_does_not_count_a_size_only_row_it_holds_back() {
+    let tenant = "tenant-629-held-back";
+    let before = size_only_count(tenant);
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = size_only_verified_ledger(dir.path(), tenant, true).await;
+
+    for pass in 1..=2 {
+        let summary = engine.recover().await.unwrap();
+        assert_eq!(summary.committed, 0, "pass {pass}: b-629 is held back");
+        let row = engine.store.get_batch("b-629").await.unwrap().unwrap();
+        assert_eq!(row.state, BatchState::Verified, "pass {pass}");
+        let after = size_only_count(tenant);
+        assert_eq!(
+            after - before,
+            0,
+            "pass {pass}: b-629 was re-checked by size but not committed, so \
+             vtop_verification_backend_limited_total{{tenant={tenant:?}}} must not \
+             move: before {before}, after {after}"
+        );
+    }
+}
+
 // ---- #567: a handed-back range its source has since committed past ----------
 
 /// The inode the file adapter records for `path`, so the ledger rows below
@@ -1718,6 +1895,69 @@ async fn a_legacy_marker_without_an_inode_is_never_retired() {
             .unwrap()
             .state,
         BatchState::ReplayRequired
+    );
+}
+
+/// #567 with #651: retiring a range as SUPERSEDED verifies nothing and
+/// commits nothing, so it counts neither - not `verified_total`, not
+/// `commits_total`, and not the size-only acceptance counter. Only the
+/// retirement itself is counted, under `batches_total{state="superseded"}`.
+#[tokio::test]
+async fn a_retired_range_counts_no_verification_and_no_commit() {
+    // A tenant no other test uses: the registry is process-wide.
+    let tenant = "tenant-567-retired";
+    let count = |family: &str| -> u64 {
+        let mx = vtop_core::telemetry::init().expect("metrics registry");
+        let l = [tenant, "file", TelemetryFormat::Raw.extension()];
+        match family {
+            "verified" => mx.verified_total.with_label_values(&l).get(),
+            "commits" => mx.commits_total.with_label_values(&l).get(),
+            "size_only" => mx
+                .verification_backend_limited_total
+                .with_label_values(&l)
+                .get(),
+            _ => mx
+                .batches_total
+                .with_label_values(&[l[0], l[1], l[2], "superseded"])
+                .get(),
+        }
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    std::fs::write(&input, "line-0\nline-1\nline-2\nline-3\n").unwrap();
+    let inode = inode_of(&input);
+    let db = dir.path().join("state.db");
+    let url = format!("sqlite://{}", db.display());
+    let path = input.to_string_lossy().into_owned();
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        let mut stale = file_row("b-stale", &path, inode, (0, 14), "2026-01-01T00:00:00Z");
+        stale.tenant = tenant.into();
+        hand_back_row(&store, &stale).await;
+        let mut retry = file_row("b-retry", &path, inode, (0, 28), "2026-01-01T00:00:02Z");
+        retry.tenant = tenant.into();
+        commit_row(&store, &retry).await;
+    }
+    let families = ["verified", "commits", "size_only", "superseded"];
+    let before = families.map(count);
+    let mut cfg = file_config(work.to_str().unwrap(), &url, vec![path.clone()], "mock");
+    cfg.engine.tenant = tenant.into();
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(summary.superseded, 1, "{summary:?}");
+    let after = families.map(count);
+    let delta: Vec<u64> = after
+        .iter()
+        .zip(before.iter())
+        .map(|(a, b)| a - b)
+        .collect();
+    assert_eq!(
+        delta,
+        [0, 0, 0, 1],
+        "(verified, commits, size-only, superseded) counted for a retirement"
     );
 }
 

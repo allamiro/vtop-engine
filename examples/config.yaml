@@ -216,7 +216,8 @@ upload:
   create_bucket: true           # auto-create per-format buckets on first use
   # Default true: VERIFIED requires a digest derived from stored content (or a
   # storage-service-computed digest). Set false only for explicit size-only
-  # compatibility/lab operation.
+  # compatibility/lab operation: it accepts same-size corruption, and the
+  # engine says so at startup and in `vtopctl validate`.
   require_strong_verification: true
 
 partitioning:
