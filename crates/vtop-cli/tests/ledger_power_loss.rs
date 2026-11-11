@@ -45,7 +45,7 @@ use vtop_core::config::StreamsConfig;
 use vtop_core::errors::VtopError;
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::{ProgressMarker, SourceType};
-use vtop_state::{BatchPatch, BatchRecord, CommittedCursor, StateStore};
+use vtop_state::{BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset, StateStore};
 use vtop_upload::{MockBackend, UploadBackend};
 
 const FILES: usize = 3;
@@ -177,6 +177,9 @@ impl StateStore for Recorder {
         source_type: SourceType,
     ) -> Result<Vec<CommittedCursor>, VtopError> {
         self.inner.committed_cursors(source_type).await
+    }
+    async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
+        self.inner.committed_kafka_offsets().await
     }
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
         self.inner.list_batches().await
