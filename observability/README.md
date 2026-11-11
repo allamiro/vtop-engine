@@ -201,7 +201,7 @@ lab has no textfile collector, so nothing here charts or alerts on them.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `vtop_scrub_objects_total{result}` | counter | Committed batches checked, by `result`: `ok`; `limited` (present at its size, archived with checksums disabled: counted, not a finding); `missing`, `mismatched`, `unauthenticated`, `unreadable` (findings). Every result is written, at zero when nothing had it. Carried forward from the file each run replaces, so it counts across runs. |
+| `vtop_scrub_objects_total{result}` | counter | Committed batches checked, by `result`: `ok`; `limited` (size-only: present at its size, no digest compared, the same result recovery counts in `vtop_verification_backend_limited_total`; counted, not a finding); `missing`, `mismatched`, `unauthenticated`, `unreadable` (findings). Every result is written, at zero when nothing had it. Carried forward from the file each run replaces, so it counts across runs. |
 | `vtop_scrub_last_run_findings` | gauge | Findings in the latest run. With a rotating cursor this is one slice's: the next slice can read 0 while damage found earlier in the pass is still there, so alert on the timestamp below. |
 | `vtop_scrub_last_run_timestamp_seconds` | gauge | When the latest run finished. |
 | `vtop_scrub_last_success_timestamp_seconds` | gauge | When a run last finished with no findings; 0 if none has. A run with findings leaves it where it was. |

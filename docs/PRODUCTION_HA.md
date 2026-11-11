@@ -643,7 +643,7 @@ one result:
 | Result | Meaning | Finding |
 |---|---|---|
 | `ok` | content matches the authenticated manifest, which matches the ledger | no |
-| `limited` | present at its size; archived with checksums disabled, so content cannot be compared | no |
+| `limited` | size-only: present at its size, but no digest compared (`checksum.algorithm: none`, or a backend that cannot hash); the same result recovery's re-check calls size-only and counts in `vtop_verification_backend_limited_total` (#629) | no |
 | `missing` | the object, the pinned manifest version or the manifest's current key is gone | yes |
 | `mismatched` | something is stored, and it is not what was committed (object content or size, the manifest's current key, the ledger's record of the object) | yes |
 | `unauthenticated` | the manifest does not parse, fails its self-hash or MAC, or does not bind to the ledger row | yes |

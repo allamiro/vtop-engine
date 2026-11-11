@@ -49,9 +49,15 @@ pub enum ScrubResult {
     /// The stored object's content matches the authenticated manifest, and
     /// the manifest matches the ledger.
     Ok,
-    /// The object is present at the recorded size, but the batch was archived
-    /// with checksums disabled, so its content cannot be compared. Counted,
-    /// not a finding: that is the deployment's choice, not damage.
+    /// Size-only: the backend passed the object on size and existence but
+    /// compared no digest (`backend_limited`). That happens when the batch
+    /// was archived with `checksum.algorithm: none`, or on a backend that
+    /// cannot hash. It is the same result recovery's re-check calls
+    /// size-only, decides under `upload.require_strong_verification` and
+    /// counts in `vtop_verification_backend_limited_total` (#629, #651).
+    /// Counted here, not a finding: the archive was committed that way by
+    /// configuration. A same-size replacement cannot be told apart from it,
+    /// which is the risk that opt-out accepts.
     Limited,
     /// The object or the manifest (its pinned version, or its current key) is
     /// gone.
@@ -1033,8 +1039,8 @@ impl ScrubReport {
         let mut out = String::new();
         out.push_str(
             "# HELP vtop_scrub_objects_total Committed batches the archive scrub checked, by \
-             result (ok; limited: present at its size, archived with checksums disabled; any \
-             other result is a finding)\n# TYPE vtop_scrub_objects_total counter\n",
+             result (ok; limited: size-only, size and existence confirmed but no digest \
+             compared; any other result is a finding)\n# TYPE vtop_scrub_objects_total counter\n",
         );
         for (result, n) in &self.results {
             let total = carried.counts.get(*result).copied().unwrap_or(0) + n;

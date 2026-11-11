@@ -160,6 +160,29 @@ async fn an_intact_archive_scrubs_clean() {
     }
 }
 
+/// The scrub's `limited` is recovery's size-only (#629, #651): the backend
+/// passed the object with `backend_limited`. Batches committed that way under
+/// the `require_strong_verification: false` opt-out (as the testkit config
+/// sets it) are counted as `limited` and are not findings.
+#[tokio::test]
+async fn a_size_only_pass_is_limited_and_not_a_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    let inputs = vec![write_input(dir.path(), "a.log", 3)];
+    let cfg = config(dir.path(), &inputs, "mock");
+    assert!(!cfg.upload.require_strong_verification);
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    engine.backend = Arc::new(MockBackend::limited());
+    assert!(engine.process_once(SourceType::File).await.unwrap()[0].committed);
+
+    let rows = scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
+    let report = engine.scrub(rows, &opts()).await.unwrap();
+    assert!(report.passed, "{report:#?}");
+    assert_eq!(count(&report, ScrubResult::Limited), 1, "{report:#?}");
+    assert_eq!(count(&report, ScrubResult::Ok), 0);
+}
+
 /// One flipped byte, size unchanged: the shape a HEAD cannot see.
 #[tokio::test]
 async fn a_corrupted_object_byte_is_reported_as_mismatched() {
