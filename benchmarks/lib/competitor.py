@@ -1038,6 +1038,18 @@ def measure(spec: CompetitorSpec, run: Runner, phase: str) -> CompetitorSample:
     of its refusals preventing.
     """
     code, out, arrivals = run(spec.argv())
+    try:
+        return _judge_the_flow(spec, phase, code, out, arrivals)
+    except ShapingError as refused:
+        # A report that never became a sample — refused by the parser, or by a
+        # nonzero exit after the flow had already written part of its stream —
+        # rides on the refusal, for `Contention.keep_raw_reports` (#610).
+        refused.competitor_report = (phase, out, arrivals)
+        raise
+
+
+def _judge_the_flow(spec: CompetitorSpec, phase: str, code: int, out: str,
+                    arrivals: tuple[float, ...] | None) -> CompetitorSample:
     if code != 0 and "unrecognized option" in out and JSON_STREAM_FLAG.lstrip("-") in out:
         # Its own sentence rather than the generic one below: "start the netem
         # stack" is the wrong advice for a stack that is up and running an
@@ -1057,13 +1069,7 @@ def measure(spec: CompetitorSpec, run: Runner, phase: str) -> CompetitorSample:
             f"(`{shlex.join(spec.argv())}` exited {code}): {out[:400]}. Start the netem "
             "stack — docker compose -f benchmarks/docker-compose.benchmark.yml "
             "--profile netem up -d — and check the middlebox's iperf3 server is up")
-    try:
-        return parse_report(out, spec, phase, arrivals)
-    except ShapingError as refused:
-        # A report the parser refused never becomes a sample, so the refusal
-        # itself carries it, for `Contention.keep_raw_reports` (#610).
-        refused.competitor_report = (phase, out, arrivals)
-        raise
+    return parse_report(out, spec, phase, arrivals)
 
 
 def _phase_slug(phase: str) -> str:
@@ -1075,29 +1081,34 @@ def write_raw_report(directory: str, phase: str, out: str,
     """Leave one phase's raw iperf3 reports in `directory` (#610).
 
     The sender's file is the client's --json-stream exactly as the parser saw
-    it. The receiver's is the server's own report, which `--get-server-output`
-    puts in the stream's `end` event as `server_output_json`; when it is not
-    there, the file says so rather than being left out, so a missing receiver
-    view is a recorded fact and not an absent file. Returns the paths written.
+    it (on a nonzero exit, the output with stderr joined). The receiver's is the
+    server's own report, which `--get-server-output` makes the stream carry as a
+    `server_output_json` event of its own; when there is none, the file says so
+    rather than being left out, so a missing receiver view is a recorded fact
+    and not an absent file. Returns the paths written.
     """
     slug = _phase_slug(phase)
     paths = {kind: os.path.join(directory, name.format(phase=slug))
              for kind, name in RAW_REPORT_FILES.items()}
-    receiver: Any = {"absent": "the client's end event carried no server_output_json "
-                               "or server_output_text"}
+    receiver: Any = {"absent": "the stream carried no server_output_json or "
+                               "server_output_text event"}
     for line in out.splitlines():
         try:
             event = json.loads(line)
         except ValueError:
             continue
-        if isinstance(event, dict) and event.get("event") == "end":
-            data = event.get("data")
-            if isinstance(data, dict) and "server_output_json" in data:
-                receiver = data["server_output_json"]
-            elif isinstance(data, dict) and "server_output_text" in data:
-                # A server that answered in text rather than JSON: kept as it
-                # came, because it is still the receiver's own interval lines.
-                receiver = {"server_output_text": data["server_output_text"]}
+        if not isinstance(event, dict):
+            continue
+        # Under --json-stream, iperf 3.21 writes the server's report as an event
+        # of its OWN, just before `end` (iperf_json_finish: JSONStream_Output(test,
+        # "server_output_json", ...)), not as a field inside `end`. A server that
+        # answered in text arrives as `server_output_text` and is kept as it came,
+        # because it is still the receiver's own interval lines.
+        kind, data = event.get("event"), event.get("data")
+        if kind == "server_output_json":
+            receiver = data
+        elif kind == "server_output_text":
+            receiver = {"server_output_text": data}
     os.makedirs(directory, exist_ok=True)
     with open(paths["sender"], "w") as f:
         f.write(out + ("\n" if out and not out.endswith("\n") else ""))

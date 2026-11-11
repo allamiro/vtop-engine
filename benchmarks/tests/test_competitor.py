@@ -2396,22 +2396,27 @@ def _report_whose_receiver_outlasts_its_stream(extra_seconds):
     """The shape every contended window took on the hosted runner (#610): the
     stream covers the window it was asked for, and the receiver's summary says it
     measured `extra_seconds` more, so the stream is laid down `extra_seconds`
-    late and the window's opening is a hole. It carries a server report, as
-    `--get-server-output` puts one in the end event."""
+    late and the window's opening is a hole.
+
+    It carries the server's report the way iperf 3.21 streams one under
+    `--get-server-output`: as a `server_output_json` event of its OWN, written
+    just before `end` (iperf_json_finish), not as a field inside `end` (review)."""
     steps = int(round(SCRIPTED_WINDOW_SECONDS / SCRIPTED_STEP_SECONDS))
     sent, received = 9.0, 8.0
     stream_seconds = steps * SCRIPTED_STEP_SECONDS
     receiver_seconds = stream_seconds + extra_seconds
-    return iperf_stream(
+    lines = iperf_stream(
         iperf_intervals([sent] * steps, step=SCRIPTED_STEP_SECONDS),
         end={"sum_sent": {"bits_per_second": sent * 1e6, "seconds": stream_seconds,
                           "bytes": int(sent * 1e6 * stream_seconds / 8), "retransmits": 0},
              "sum_received": {"bits_per_second": received * 1e6, "seconds": receiver_seconds,
                               "bytes": int(received * 1e6 * receiver_seconds / 8)},
-             "sender_tcp_congestion": "cubic",
-             "server_output_json": {"intervals": [{"sum": {"start": 0.0, "end": receiver_seconds,
-                                                           "seconds": receiver_seconds}}],
-                                    "end": {"sum_received": {"seconds": receiver_seconds}}}})
+             "sender_tcp_congestion": "cubic"}).splitlines()
+    server = {"event": "server_output_json", "data": {
+        "intervals": [{"sum": {"start": 0.0, "end": receiver_seconds,
+                               "seconds": receiver_seconds}}],
+        "end": {"sum_received": {"seconds": receiver_seconds}}}}
+    return "\n".join(lines[:-1] + [json.dumps(server), lines[-1]])
 
 
 def test_a_refused_contended_window_leaves_both_sides_raw_reports_and_is_refused_unchanged(
@@ -2483,3 +2488,17 @@ def test_the_command_asks_for_the_receivers_own_report():
     assert competitor.SERVER_OUTPUT_FLAG in argv, (
         "without --get-server-output a refused window keeps only the sender's side, and "
         "the receiver's is one summary figure (#610)")
+
+
+def test_a_flow_that_exits_nonzero_still_leaves_what_it_wrote(tmp_path):
+    # A flow that wrote part of its stream and then exited nonzero is refused
+    # before the parser ever sees it (review): its output rides on the refusal
+    # all the same, so the evidence of how far it got is kept.
+    partial = '{"event": "start", "data": {}}\niperf3: error - control socket has closed'
+    box = ScriptedCompetitor([9.0], refuse=(1, partial))
+    with pytest.raises(ShapingError, match="could not be started"):
+        with contended(spec(30), vtop_bytes=lambda: 0, run=box, log=lambda _m: None,
+                       diagnostics_dir=str(tmp_path)):
+            pass
+    assert (tmp_path / "competitor-iperf3-alone-before-sender.jsonl").read_text().rstrip(
+        "\n") == partial
