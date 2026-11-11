@@ -12,6 +12,8 @@ records) is a table at the top of the report, never only a chart.
 """
 from __future__ import annotations
 
+import csv
+import json
 import os
 from typing import Any
 
@@ -461,6 +463,10 @@ def write_markdown(run: fschema.FailoverRun, images: dict[str, str], csv_rel: di
     if contention:
         add(contention)
         add("")
+    ab = steady_ab_note(run.run_dir)
+    if ab:
+        add(ab)
+        add("")
     batch_note = vtop_batch_pacing_note(env, rows)
     if batch_note:
         add(batch_note)
@@ -599,6 +605,46 @@ def host_noise_paragraph(env: dict[str, Any]) -> str:
             + ". Each repetition's own summary is in `environment.json` (`host_noise.per_repetition`)"
             + ("; the highest load maxima were in " + ", ".join(f"{tag} ({load})" for load, tag in busiest)
                if busiest else "") + ".")
+
+
+def steady_ab_note(run_dir: str) -> str:
+    """The steady-state A/B committed beside the run (`steady-ab/`, made by steady_ab.py), if any:
+    each node image's longest gap, schedule p99 and round-trip p99, and whether each image's worst
+    gap came in its own busiest round. Numbers only; the reader draws the comparison."""
+    path = os.path.join(run_dir, "steady-ab", "ab.csv")
+    if not os.path.isfile(path):
+        return ""
+    with open(path, newline="") as handle:
+        runs = [r for r in csv.DictReader(handle) if r["max_gap_ms"]]
+    with open(os.path.join(run_dir, "steady-ab", "environment.json")) as handle:
+        ab_env = json.load(handle)
+    if not runs:
+        return ""
+
+    def spread(engine, column):
+        values = [float(r[column]) for r in runs if r["engine"] == engine]
+        return f"{fmt_ms(stats.median(values))} ({fmt_ms(min(values))} - {fmt_ms(max(values))})"
+
+    engines = sorted({r["engine"] for r in runs})
+    worst = []
+    for engine in engines:
+        mine = [r for r in runs if r["engine"] == engine]
+        by_gap = max(mine, key=lambda r: float(r["max_gap_ms"]))
+        by_load = max(mine, key=lambda r: float(r["load1_max"] or 0))
+        if by_gap is by_load:
+            worst.append(f"{engine} {fmt_ms(float(by_gap['max_gap_ms']))} at load {by_gap['load1_max']}")
+    images = "; ".join(f"{e} = `{ab_env['engines'][e]['image']}`" for e in engines)
+    rounds = max(int(r["round"]) for r in runs)
+    text = (f"**Steady-state A/B, no faults** (`steady-ab/`, made by `steady_ab.py`: {images}; interleaved over "
+            f"{rounds} rounds, one client image `{ab_env['client_image']}`, {ab_env['rate']:,} records/s, "
+            f"{ab_env['seconds']} s per run). Median (min - max) per image: longest ack gap "
+            + ", ".join(f"{e} {spread(e, 'max_gap_ms')}" for e in engines)
+            + "; schedule p99 " + ", ".join(f"{e} {spread(e, 'lat_p99_ms')}" for e in engines)
+            + "; batch round-trip p99 " + ", ".join(f"{e} {spread(e, 'rtt_p99_ms')}" for e in engines) + ".")
+    if len(worst) == len(engines):
+        text += (" Each image's longest gap came in its own busiest round (" + "; ".join(worst)
+                 + "); per-run host noise is in `steady-ab/ab.csv`.")
+    return text
 
 
 def _sentence(text: str) -> str:
