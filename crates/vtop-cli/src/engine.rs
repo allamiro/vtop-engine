@@ -1683,6 +1683,25 @@ impl Engine {
         .await
     }
 
+    /// [`Engine::scrub`] under locks the caller holds until it has published
+    /// (`vtopctl scrub`, review of #652); the cursor's final position past a
+    /// finding comes back pending, for the caller to commit after publishing.
+    pub(crate) async fn scrub_held(
+        &self,
+        rows: Vec<crate::scrub::ScrubRow>,
+        opts: &crate::scrub::ScrubOptions,
+        held: &crate::scrub::RunLock,
+    ) -> Result<crate::scrub::ScrubReport, VtopError> {
+        crate::scrub::scrub_held(
+            self.backend.as_ref(),
+            self.manifest_mac_key.as_ref(),
+            rows,
+            opts,
+            held,
+        )
+        .await
+    }
+
     /// Enumerate all sources across all enabled adapters.
     pub async fn discover(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
         let mut all = Vec::new();

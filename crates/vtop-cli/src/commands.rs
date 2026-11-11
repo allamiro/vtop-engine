@@ -665,6 +665,12 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 sample: sample.map(to_usize),
                 seed: *seed,
             };
+            // The run's locks, from before anything it will replace is read
+            // until it has published or rolled back (review of #652): an
+            // overlapping run that published in between would otherwise be
+            // overwritten from this run's older snapshot. Held to the end of
+            // this arm.
+            let lock = crate::scrub::lock_run(cursor_file.as_deref(), metrics_file.as_deref())?;
             // Read BEFORE the scrub, and only an absent file is a first run:
             // the totals and last-success time carry forward from it, so a
             // file that exists and cannot be read would otherwise be replaced
@@ -690,7 +696,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 _ => None,
             };
             let mut report = engine
-                .scrub(crate::scrub::committed_rows(ledger, digested), &opts)
+                .scrub_held(crate::scrub::committed_rows(ledger, digested), &opts, &lock)
                 .await?;
             report.sources = sources;
             report.warnings.extend(digest_warning);
@@ -713,7 +719,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                     // alerts read. Put the cursor back, so the next run checks
                     // this slice again and publishes what it finds.
                     let undone = match &snapshot {
-                        Some(snapshot) => match snapshot.restore() {
+                        Some(snapshot) => match snapshot.restore(&lock) {
                             Ok(()) => "; the cursor was put back, so the next run checks \
                                        this slice again"
                                 .to_string(),
@@ -727,6 +733,12 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                     )));
                 }
             }
+            // Published (the report, and the metrics file when asked for):
+            // only now may the cursor pass this run's findings.
+            if let Some(pending) = report.pending_cursor.take() {
+                pending.commit(&lock)?;
+            }
+            drop(lock);
             if report.passed {
                 Ok(())
             } else {

@@ -656,12 +656,25 @@ saturating the store:
   recorded only once the earlier one is, so a run killed part-way never skips a
   batch but may check again up to concurrency - 1 batches it had already
   finished. The run that reaches the end completes the pass; the next run
-  starts again from the first batch. A finding does not hold the cursor: the
-  run that found it reports it, and the next pass checks it again. That is
-  why the example alert reads `vtop_scrub_last_finding_timestamp_seconds` and
-  fires for a pass window after it, rather than reading the latest run alone.
-  A lock beside the file refuses a second scrub on the
-  same cursor (a cron run overlapping the previous one);
+  starts again from the first batch.
+
+  A finding holds the saved cursor until it is published. Saving stops
+  before the first finding, and the run's final position is saved only
+  after the report is printed and, with `--metrics-file`, the metrics file
+  is written. A run killed in between, or one whose metrics file cannot be
+  written (that run is undone to where it started), leaves the cursor
+  before the damage, so the next run finds it again rather than resuming
+  past damage nobody was told about. Once published, the cursor moves on;
+  the next pass checks the batch again. That is why the example alert reads
+  `vtop_scrub_last_finding_timestamp_seconds` and fires for a pass window
+  after it, rather than reading the latest run alone.
+
+  A run holds locks beside the cursor and the metrics file
+  (`<path>.lock`) from before it reads either until it has published, so an
+  overlapping run (a cron run that outlasts its hour) is refused, not
+  interleaved: two runs sharing a metrics file, cursor or not, would each
+  replace it from what they read before the other wrote. A missing metrics
+  directory is refused at that lock, before any reads;
 - or `--sample N [--seed S]`: N batches chosen at random; the seed is printed,
   and the same seed picks the same batches.
 

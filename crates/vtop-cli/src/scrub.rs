@@ -546,30 +546,74 @@ impl Cursor {
     }
 }
 
-/// Held for the run: two scrubs sharing a cursor (a cron run that overlaps
-/// the previous one) would each advance it past rows the other has not
-/// finished.
-struct CursorLock {
-    _file: std::fs::File,
+/// The locks a run holds from before it reads anything it will replace until
+/// it has published (review of #652): the cursor's and the metrics file's,
+/// each a `<path>.lock` beside it. Two scrubs sharing a cursor (a cron run
+/// that overlaps the previous one) would each advance it past rows the other
+/// has not finished. Two sharing a metrics file, cursor or not, would each
+/// replace the file from the snapshot they read before the other published,
+/// losing its counts and its finding time.
+pub struct RunLock {
+    _held: Vec<std::fs::File>,
 }
 
-fn lock_cursor(path: &Path) -> Result<CursorLock, VtopError> {
+/// Take the run's locks: the cursor's first, then the metrics file's, so two
+/// runs never hold one each and wait on the other.
+pub fn lock_run(cursor: Option<&Path>, metrics: Option<&Path>) -> Result<RunLock, VtopError> {
+    let mut held = Vec::new();
+    // The cursor's directory is created, as the cursor file itself always
+    // has been. The metrics file's is not: it is the textfile collector's,
+    // and a run that cannot publish into it should fail here, before any
+    // reads, not after a slice of them.
+    for (path, what, create_dir) in [(cursor, "cursor", true), (metrics, "metrics file", false)] {
+        if let Some(path) = path {
+            held.push(lock_file(path, what, create_dir)?);
+        }
+    }
+    Ok(RunLock { _held: held })
+}
+
+fn lock_file(path: &Path, what: &str, create_dir: bool) -> Result<std::fs::File, VtopError> {
     let lock = PathBuf::from(format!("{}.lock", path.display()));
-    if let Some(parent) = lock.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)?;
+    if create_dir {
+        if let Some(parent) = lock.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
     }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&lock)?;
+        .open(&lock)
+        .map_err(|e| {
+            VtopError::Other(format!("cannot lock the {what} at {}: {e}", lock.display()))
+        })?;
     match file.try_lock() {
-        Ok(()) => Ok(CursorLock { _file: file }),
+        Ok(()) => Ok(file),
         Err(std::fs::TryLockError::WouldBlock) => Err(VtopError::Other(format!(
-            "another scrub holds {}; it is still running against this cursor",
+            "another scrub holds {}; it is still running against this {what}",
             lock.display()
         ))),
         Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// Where a run with findings leaves the cursor once its results are
+/// published. Until then the saved cursor stays before its first finding, so
+/// a run killed in between resumes at the damage and finds it again (review
+/// of #652). [`scrub`] commits it at once (it publishes nothing). The
+/// command commits it after the report and the metrics file are out.
+#[derive(Debug, Clone)]
+pub struct PendingCursor {
+    path: PathBuf,
+    cursor: Cursor,
+}
+
+impl PendingCursor {
+    /// Save the run's final position. Takes the run's lock as proof it is
+    /// still held.
+    pub fn commit(mut self, _held: &RunLock) -> Result<(), VtopError> {
+        self.cursor.store(&self.path)
     }
 }
 
@@ -600,10 +644,9 @@ impl CursorSnapshot {
         })
     }
 
-    /// Put the cursor back, under the cursor lock: a scrub that has started
-    /// since holds it, and is not undone.
-    pub fn restore(&self) -> Result<(), VtopError> {
-        let _lock = lock_cursor(&self.path)?;
+    /// Put the cursor back. It takes the run's lock, held since before the
+    /// snapshot, so no other scrub can have moved the cursor in between.
+    pub fn restore(&self, _held: &RunLock) -> Result<(), VtopError> {
         match &self.bytes {
             Some(bytes) => {
                 let dir = self
@@ -690,6 +733,10 @@ pub struct ScrubReport {
     /// archive would print every id it read.
     #[serde(skip)]
     pub checked_ids: Vec<String>,
+    /// The cursor's final position, not yet saved because the run found
+    /// something: committed once the findings are published.
+    #[serde(skip)]
+    pub pending_cursor: Option<PendingCursor>,
 }
 
 /// Pick `n` rows at random: the `n` whose keyed hash of the batch id is
@@ -719,17 +766,37 @@ fn sample_rows(rows: Vec<ScrubRow>, n: usize, seed: u64) -> Vec<ScrubRow> {
 /// `limit` batches in order, and records each one as it completes, in order,
 /// so a run killed part-way resumes after the last batch it finished. The run
 /// that reaches the end completes the pass: the cursor resets and the next run
-/// starts again from the first batch. A finding does not hold the cursor
-/// back: it is reported by the run that found it, and checked again next pass.
+/// starts again from the first batch. The saved cursor stops at the first
+/// finding, so a run killed before it publishes resumes at the damage. This
+/// entry point publishes nothing, so it saves the final position before it
+/// returns. The `vtopctl scrub` command, which publishes, saves it only once
+/// the report and metrics are out ([`PendingCursor`]).
 pub async fn scrub(
     backend: &dyn UploadBackend,
     mac_key: Option<&ManifestMacKey>,
     rows: Vec<ScrubRow>,
     opts: &ScrubOptions,
 ) -> Result<ScrubReport, VtopError> {
+    let lock = lock_run(opts.cursor_file.as_deref(), None)?;
+    let mut report = scrub_held(backend, mac_key, rows, opts, &lock).await?;
+    if let Some(pending) = report.pending_cursor.take() {
+        pending.commit(&lock)?;
+    }
+    Ok(report)
+}
+
+/// [`scrub`] under locks the caller took ([`lock_run`]) and holds until it has
+/// published. A final cursor position past a finding is returned in
+/// `pending_cursor`, for the caller to commit after publishing.
+pub async fn scrub_held(
+    backend: &dyn UploadBackend,
+    mac_key: Option<&ManifestMacKey>,
+    rows: Vec<ScrubRow>,
+    opts: &ScrubOptions,
+    _held: &RunLock,
+) -> Result<ScrubReport, VtopError> {
     let committed = rows.len();
     let concurrency = opts.concurrency.max(1);
-    let _lock = opts.cursor_file.as_deref().map(lock_cursor).transpose()?;
 
     let mut cursor = match &opts.cursor_file {
         Some(path) => Some(Cursor::load(path)?),
@@ -808,11 +875,18 @@ pub async fn scrub(
             }
             if let (Some(c), Some(path)) = (cursor.as_mut(), opts.cursor_file.as_deref()) {
                 c.after = Some(row.record.batch_id.clone());
-                c.store(path)?;
+                // Saved only up to the first finding (review of #652): past
+                // it, a run killed before publishing would resume after
+                // damage nobody was told about. The position is still
+                // tracked; it is saved once the findings are published.
+                if findings.is_empty() {
+                    c.store(path)?;
+                }
             }
         }
     }
 
+    let mut pending_cursor = None;
     let progress = match (cursor.as_mut(), opts.cursor_file.as_deref()) {
         (Some(c), Some(path)) => {
             if reaches_end {
@@ -820,7 +894,14 @@ pub async fn scrub(
                 c.pass_started_at = None;
                 c.passes_completed += 1;
             }
-            c.store(path)?;
+            if findings.is_empty() {
+                c.store(path)?;
+            } else {
+                pending_cursor = Some(PendingCursor {
+                    path: path.to_path_buf(),
+                    cursor: c.clone(),
+                });
+            }
             Some(CursorProgress {
                 file: path.to_path_buf(),
                 resumed_after,
@@ -851,6 +932,7 @@ pub async fn scrub(
         warnings: Vec::new(),
         passed,
         checked_ids,
+        pending_cursor,
     })
 }
 
@@ -1161,6 +1243,7 @@ mod tests {
             warnings: Vec::new(),
             passed: findings == 0,
             checked_ids: Vec::new(),
+            pending_cursor: None,
         }
     }
 
@@ -1281,25 +1364,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("scrub.cursor");
         std::fs::write(&path, b"{\"before\":1}").unwrap();
+        // The run's lock is taken before the snapshot and held through the
+        // restore, so nothing else moves the cursor in between.
+        let held = lock_run(Some(&path), None).unwrap();
         let snapshot = CursorSnapshot::take(&path).unwrap();
         std::fs::write(&path, b"{\"after\":2}").unwrap();
-        snapshot.restore().unwrap();
+        snapshot.restore(&held).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"{\"before\":1}");
-
-        // A scrub holding the cursor is not undone under it.
-        let held = lock_cursor(&path).unwrap();
-        assert!(snapshot.restore().is_err());
-        drop(held);
     }
 
     #[test]
-    fn two_scrubs_cannot_share_a_cursor() {
+    fn two_scrubs_cannot_share_a_cursor_or_a_metrics_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("scrub.cursor");
-        let held = lock_cursor(&path).unwrap();
-        let error = lock_cursor(&path).err().expect("the second is refused");
-        assert!(error.to_string().contains("another scrub"), "{error}");
+        let cursor = dir.path().join("scrub.cursor");
+        let metrics = dir.path().join("scrub.prom");
+        let held = lock_run(Some(&cursor), Some(&metrics)).unwrap();
+        for (c, m) in [
+            (Some(cursor.as_path()), None),
+            (None, Some(metrics.as_path())),
+        ] {
+            let error = lock_run(c, m).err().expect("the second is refused");
+            assert!(error.to_string().contains("another scrub"), "{error}");
+        }
         drop(held);
-        lock_cursor(&path).expect("free again once the first run ends");
+        lock_run(Some(&cursor), Some(&metrics)).expect("free again once the first run ends");
     }
 }

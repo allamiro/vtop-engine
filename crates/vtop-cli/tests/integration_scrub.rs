@@ -525,6 +525,98 @@ async fn an_interrupted_run_resumes_after_the_last_object_it_finished() {
     );
 }
 
+/// A run killed after it found damage, before its results were published,
+/// resumes AT the damage (review of #652). The cursor used to be saved past
+/// every finished batch, findings included, so the resumed run started after
+/// the damaged batch. The finding reached no report and no metric, and the
+/// findings alert stayed silent until the next pass. The cursor now stops
+/// advancing at the first finding.
+#[tokio::test]
+async fn a_run_killed_after_a_finding_resumes_at_the_finding() {
+    let a = archive(4).await;
+    let ids: Vec<String> = a.ledger().await.into_iter().map(|r| r.batch_id).collect();
+    let ledger = a.ledger().await;
+    a.mock.corrupt(ledger[1].object_uri.as_deref().unwrap());
+    let cursor = a.dir.path().join("scrub.cursor");
+    // ids[0] passes, ids[1] is the finding, ids[2] never returns: killed there.
+    let gate = Arc::new(Gate::new(a.mock.clone(), 2));
+    let opts = ScrubOptions {
+        concurrency: 1,
+        cursor_file: Some(cursor.clone()),
+        ..ScrubOptions::default()
+    };
+    let run = scrub::scrub(gate.as_ref(), None, a.rows().await, &opts);
+    assert!(tokio::time::timeout(Duration::from_millis(500), run)
+        .await
+        .is_err());
+
+    let resumed = a
+        .scrub(&ScrubOptions {
+            cursor_file: Some(cursor),
+            ..ScrubOptions::default()
+        })
+        .await;
+    assert_eq!(
+        resumed.cursor.as_ref().unwrap().resumed_after.as_deref(),
+        Some(ids[0].as_str()),
+        "the cursor stopped before the finding: {resumed:#?}"
+    );
+    assert_eq!(
+        findings(&resumed),
+        vec![(ids[1].clone(), ScrubResult::Mismatched)],
+        "the resumed run finds the damage again"
+    );
+}
+
+/// A run holds its locks from before it reads the previous metrics until it
+/// has published (review of #652). Otherwise an overlapping run could publish
+/// in between, and the first would overwrite it from its older snapshot,
+/// losing counts and the second's finding time. The metrics file is locked
+/// too, so overlapping runs without a cursor are covered. A run that finds
+/// the lock held is refused and leaves the file alone.
+#[tokio::test]
+async fn a_run_is_refused_while_another_holds_its_metrics_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let inputs = vec![write_input(dir.path(), "a.log", 3)];
+    let mut cfg = config(dir.path(), &inputs, "localfs");
+    cfg.upload.local_path = Some(dir.path().join("store").to_string_lossy().into_owned());
+    let config_path = dir.path().join("config.yaml");
+    std::fs::write(&config_path, serde_yaml::to_string(&cfg).unwrap()).unwrap();
+    {
+        let mut engine = Engine::new(cfg.clone(), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        assert!(engine.process_once(SourceType::File).await.unwrap()[0].committed);
+    }
+    let metrics = dir.path().join("scrub.prom");
+    std::fs::write(&metrics, "vtop_scrub_objects_total{result=\"ok\"} 41\n").unwrap();
+    // Another run, mid-publication, holds the metrics file's lock.
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(format!("{}.lock", metrics.display()))
+        .unwrap();
+    held.try_lock().unwrap();
+
+    let cli = vtop_cli::commands::Cli::try_parse_from([
+        "vtopctl",
+        "scrub",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--metrics-file",
+        metrics.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(vtop_cli::commands::dispatch(cli).await, 1, "refused");
+    assert_eq!(
+        std::fs::read_to_string(&metrics).unwrap(),
+        "vtop_scrub_objects_total{result=\"ok\"} 41\n",
+        "the other run's file is not overwritten"
+    );
+    drop(held);
+}
+
 #[tokio::test]
 async fn a_sample_checks_that_many_rows_and_the_same_seed_picks_the_same_rows() {
     let a = archive(6).await;
@@ -773,8 +865,13 @@ async fn a_finding_whose_metrics_could_not_be_published_is_found_again() {
         vtop_cli::commands::dispatch(cli)
     };
 
-    // The metrics directory does not exist: the run finds the damage and
-    // cannot publish it.
+    // The write fails AFTER the scrub: a directory where the metrics file's
+    // temporary file goes. (A missing metrics directory is refused before
+    // any reads, at the lock.) The run finds the damage and cannot publish
+    // it.
+    std::fs::create_dir_all(&metrics_dir).unwrap();
+    let blocker = metrics_dir.join(".scrub.prom.tmp");
+    std::fs::create_dir(&blocker).unwrap();
     assert_eq!(run().await, 1);
     assert!(!metrics.exists());
     assert!(
@@ -784,7 +881,7 @@ async fn a_finding_whose_metrics_could_not_be_published_is_found_again() {
 
     // Publication repaired: the next slice is the same one, so the finding
     // is published.
-    std::fs::create_dir_all(&metrics_dir).unwrap();
+    std::fs::remove_dir(&blocker).unwrap();
     assert_eq!(run().await, 1, "the damaged batch is checked again");
     let text = std::fs::read_to_string(&metrics).unwrap();
     assert!(
@@ -794,6 +891,46 @@ async fn a_finding_whose_metrics_could_not_be_published_is_found_again() {
     assert!(
         metric_value(&text, "vtop_scrub_last_finding_timestamp_seconds") > 0.0,
         "the findings alert can see it: {text}"
+    );
+}
+
+/// The scrub reads the archive, never the sources, and arms no
+/// `delete_after_commit` (#631). A source file is deleted only from the file
+/// source's read and commit paths, and a deferred delete is re-armed only by
+/// recovery's seeding. The scrub's read-only engine runs none of them, even
+/// under a config that deletes committed files at once.
+#[tokio::test]
+async fn a_scrub_never_deletes_or_rearms_a_committed_source_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_input(dir.path(), "a.log", 3);
+    let original = std::fs::read(&input).unwrap();
+    let mut cfg = config(dir.path(), std::slice::from_ref(&input), "localfs");
+    cfg.upload.local_path = Some(dir.path().join("store").to_string_lossy().into_owned());
+    {
+        let mut engine = Engine::new(cfg.clone(), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        assert!(engine.process_once(SourceType::File).await.unwrap()[0].committed);
+    }
+    // Now a config under which the engine WOULD delete it, at once.
+    let file = cfg.sources.file.as_mut().unwrap();
+    file.delete_after_commit = true;
+    file.delete_quiet_seconds = 0;
+    let config_path = dir.path().join("config.yaml");
+    std::fs::write(&config_path, serde_yaml::to_string(&cfg).unwrap()).unwrap();
+
+    let cli = vtop_cli::commands::Cli::try_parse_from([
+        "vtopctl",
+        "scrub",
+        "--config",
+        config_path.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(vtop_cli::commands::dispatch(cli).await, 0);
+    assert_eq!(
+        std::fs::read(&input).unwrap(),
+        original,
+        "the committed source is where it was, unchanged"
     );
 }
 
