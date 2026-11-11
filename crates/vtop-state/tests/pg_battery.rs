@@ -62,6 +62,77 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         "missing trigger must give migration guidance: {err}"
     );
 
+    // #567: a state CHECK without SUPERSEDED is not runtime-ready either, even
+    // under the current schema marker: the first retirement would fail
+    // at runtime. `vtopctl migrate` widens the CHECK in place, keeping the
+    // rows, and a second run leaves the constraint alone.
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    let admin = PgStateStore::connect(&migrator_conn).await.unwrap();
+    admin
+        .execute_raw(
+            "TRUNCATE batches; \
+             INSERT INTO batches \
+             (batch_id, tenant, source_type, source_name, format, state, \
+              progress_start_json, progress_end_json, created_at, updated_at) \
+             VALUES ('pre-567','default','kafka','app','cef','batching','{}','{}','t','t'); \
+             ALTER TABLE batches DROP CONSTRAINT state_enum; \
+             ALTER TABLE batches ADD CONSTRAINT state_enum CHECK (state IN ( \
+                 'discovered','batching','sealed','compressed','checksummed', \
+                 'object_uploaded','manifest_uploaded','verified','source_committed', \
+                 'failed','replay_required'));",
+        )
+        .await
+        .unwrap();
+    let err = match PgStateStore::connect(&migrator_conn).await {
+        Ok(_) => panic!("runtime connect must reject a state CHECK without 'superseded'"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("vtopctl migrate"),
+        "a pre-#567 state CHECK must give migration guidance: {err}"
+    );
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    let admin = PgStateStore::connect(&migrator_conn)
+        .await
+        .expect("migrate widens the state CHECK");
+    admin
+        .execute_raw(
+            "DROP TABLE IF EXISTS vtop_test_state_enum; \
+             CREATE TABLE vtop_test_state_enum AS \
+               SELECT oid FROM pg_catalog.pg_constraint \
+               WHERE conrelid = 'batches'::regclass AND conname = 'state_enum'; \
+             UPDATE batches SET state = 'superseded' WHERE batch_id = 'pre-567'; \
+             DO $chk$ BEGIN \
+               IF (SELECT state FROM batches WHERE batch_id = 'pre-567') IS DISTINCT FROM 'superseded' THEN \
+                 RAISE EXCEPTION 'the migration lost the row, or the CHECK refused superseded'; \
+               END IF; \
+             END $chk$;",
+        )
+        .await
+        .unwrap();
+    let err = admin
+        .execute_raw("UPDATE batches SET state = 'not-a-state' WHERE batch_id = 'pre-567'")
+        .await
+        .expect_err("the widened CHECK still refuses an unknown state");
+    assert!(
+        err.to_string().contains("state_enum"),
+        "expected the state CHECK to refuse it, got: {err}"
+    );
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    admin
+        .execute_raw(
+            "DO $chk$ BEGIN \
+               IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c \
+                              JOIN vtop_test_state_enum t ON t.oid = c.oid \
+                              WHERE c.conname = 'state_enum') THEN \
+                 RAISE EXCEPTION 'a second migrate replaced a CHECK that already admits superseded'; \
+               END IF; \
+             END $chk$; \
+             DROP TABLE vtop_test_state_enum;",
+        )
+        .await
+        .unwrap();
+
     // Nor is a trigger that exists by name but whose function body has no
     // current schema marker, or one a restore left disabled. The old body is
     // the trigger function as released before #625 (no marker):
@@ -124,6 +195,50 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
     PgStateStore::connect(&migrator_conn)
         .await
         .expect("the current schema must pass startup");
+
+    // #567: the other half of the marker/CHECK pair. The release between #625
+    // and #567 installs its marker-2 body with CREATE OR REPLACE and leaves
+    // the state CHECK alone, so a re-run of ITS migrate leaves the widened
+    // CHECK under an older marker. Refused all the same (the reverse, a
+    // current marker over an old CHECK, is refused above).
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    let admin = PgStateStore::connect(&migrator_conn).await.unwrap();
+    admin
+        .execute_raw(
+            "CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$
+-- vtop-state-schema 2
+BEGIN
+    IF NEW.state = 'source_committed' THEN
+        IF TG_OP = 'INSERT' THEN
+            RAISE EXCEPTION 'commit before verified: batch % inserted directly as source_committed', NEW.batch_id
+                USING ERRCODE = 'check_violation';
+        ELSIF OLD.state <> 'verified' THEN
+            RAISE EXCEPTION 'commit before verified: batch % is %', OLD.batch_id, OLD.state
+                USING ERRCODE = 'check_violation';
+        END IF;
+    END IF;
+    IF TG_OP = 'INSERT' AND NEW.state <> 'batching' THEN
+        RAISE EXCEPTION 'batch % must be inserted as batching, not %', NEW.batch_id, NEW.state
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;",
+        )
+        .await
+        .unwrap();
+    let err = match PgStateStore::connect(&migrator_conn).await {
+        Ok(_) => panic!("runtime connect must reject a marker-2 body over the widened CHECK"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("vtopctl migrate"),
+        "a marker-2 body must give migration guidance: {err}"
+    );
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    PgStateStore::connect(&migrator_conn)
+        .await
+        .expect("migrate restores the marker-3 body");
 
     // The deployment identity applies DDL once, then creates a deliberately
     // narrow role. PostgreSQL's default PUBLIC schema privileges are revoked so

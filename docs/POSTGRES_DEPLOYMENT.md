@@ -81,9 +81,11 @@ reference keeps credentials out of config serialization and command arguments.
 
 ## Failure behavior
 
-If the table, required columns, or invariant trigger are absent, or the
+If the table, required columns, or invariant trigger are absent, the
 trigger is disabled or its function lacks a current schema version marker,
-engine startup fails with instructions to run `vtopctl migrate`. It does not try to repair the
+or the `state_enum` CHECK does not admit every state the engine writes
+(`superseded` since #567), engine startup fails with instructions to run
+`vtopctl migrate`. It does not try to repair the
 schema. If the runtime role lacks `USAGE` or `SELECT`, startup reports the
 missing runtime access. Migration failures remain fatal to the deployment step.
 
@@ -100,6 +102,21 @@ migration job per database; engine replicas should start only after it succeeds.
 - A runtime rollback may use the upgraded backward-compatible schema. Do not
   drop columns or the invariant trigger while any VTOP process can access the
   database.
+- **`superseded` (#567) needs the migration.** The release that adds the
+  terminal `SUPERSEDED` state widens the `state_enum` CHECK. `vtopctl
+  migrate` replaces the constraint in place, only if it lacks the state. The
+  replacement validates every row while it holds the table's lock, and a
+  later re-run does nothing. Engines of that release refuse to start on a
+  schema without it.
+  Older engines keep running on the widened schema; they never write the
+  state. An older engine that READS a superseded row fails closed: its startup
+  recovery claim, and `vtopctl status`, stop with `unknown batch state:
+  superseded` rather than misreading it. So once an upgraded engine has
+  written a superseded row - which its recovery does to the first stale
+  handed-back row it finds - an older engine sharing the ledger cannot
+  restart. Upgrade every
+  engine on a ledger together, or drain the older ones first. Rolling back
+  past this release means restoring a ledger backup taken before the upgrade.
 - Changes to the JSON inside ledger rows need no migration step. The content
   fingerprint added to file and spool markers (#578) is such a change: no
   DDL, older rows keep being read and judged as before. See the ledger format
@@ -109,11 +126,13 @@ migration job per database; engine replicas should start only after it succeeds.
   place. Every release inserts only `batching`, so an older engine on the
   upgraded schema is unaffected.
 - Schema version marker. The first non-empty line of the trigger function's
-  body (`prosrc`) is the SQL comment `-- vtop-state-schema 2`, written on the
+  body (`prosrc`) is the SQL comment `-- vtop-state-schema 3`, written on the
   line right after `$fn$`. Engine startup reads only that line: it requires
   the trigger to be enabled and its function body to open with a marker of
-  at least the version the engine was built for (2 since #625), not just a
-  trigger with that name. A missing or unparseable marker, or one on any
+  at least the version the engine was built for (2 since #625, 3 since #567,
+  whose migration also widens the state CHECK), not just a trigger with that
+  name. Startup also checks the `state_enum` CHECK itself, so a current
+  marker over an old CHECK is refused as well. A missing or unparseable marker, or one on any
   later line, counts as an old schema.
   An engine from this release therefore refuses to start, with instructions
   to run `vtopctl migrate`, until the migration has run, so run it before
@@ -122,9 +141,9 @@ migration job per database; engine replicas should start only after it succeeds.
   `vtopctl migrate` is run against an upgraded database, its
   `CREATE OR REPLACE` installs the older, unmarked body, and this release's
   engines refuse to start until this release's migration runs again.
-  **Any future change to the trigger or its function must bump this
-  marker** in the migration together with `MIN_SCHEMA_VERSION` in
-  `pg_store.rs`.
+  **Any future change to the trigger, its function, or the schema the
+  migration leaves must bump this marker** in the migration together with
+  `MIN_SCHEMA_VERSION` in `pg_store.rs`.
 - Restoring the ledger from a backup. Stop every engine first, and **always
   finish with `vtopctl migrate`**. A schema restored from an older archive
   (`pg_restore`, or `--schema-only`) carries that release's trigger
