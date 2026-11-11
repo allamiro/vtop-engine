@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use futures::StreamExt;
 use vtop_adapters::base::{DiscoveredSource, ReadResult, SourceAdapter};
+use vtop_adapters::file_source::ArchivedEnd;
 #[cfg(feature = "kafka")]
 use vtop_adapters::KafkaSource;
 use vtop_adapters::{FileSource, SyslogSpoolSource};
@@ -1951,6 +1952,16 @@ impl Engine {
                 }
             }
         }
+        // A range handed back to a file rotated away that its re-read then had
+        // to refuse (the rotated file was truncated, or no longer starts with
+        // the bytes it was held for) is missing from the archive just as a
+        // refused rewind is, and is counted the same way (review of #621). The
+        // read error above only says a read failed.
+        if let Some(files) = adapter.as_any_mut().downcast_mut::<FileSource>() {
+            for path in files.take_refused_rereads() {
+                self.count_refused_replay_of(source_type, &path);
+            }
+        }
 
         let read_phase_ms = cycle_started.elapsed().as_millis() as u64;
         // Logged once per cycle per source type. The ratio that matters is
@@ -2178,7 +2189,9 @@ impl Engine {
                     // The adapter could not rewind (a spool file that was
                     // rotated away, say). The range is NOT being re-read, so
                     // this must be loud: it is the one outcome that leaves the
-                    // archive short of the source.
+                    // archive short of the source - and counted, so it can be
+                    // alerted on rather than grepped for (#621).
+                    self.count_refused_replay(source_type, marker);
                     tracing::error!(
                         source_type = %source_type,
                         start = ?marker,
@@ -2469,10 +2482,19 @@ impl Engine {
         // are reported by the second pass.
         let mut landed: HashMap<String, i128> = HashMap::new();
         for (source_type, markers) in &by_source {
-            let Some(adapter) = self.adapters.get_mut(source_type) else {
+            if let Some(adapter) = self.adapters.get_mut(source_type) {
+                let _ = adapter.replay_from_markers(markers).await;
+            }
+        }
+        // A range handed back to a file that was rotated away is re-read from
+        // where it was rotated to (#621) - and its FAILED row is rewound again
+        // at every restart, so the re-read must start above what a later
+        // batch already archived of that file.
+        self.floor_rotated_replays().await;
+        for (source_type, markers) in &by_source {
+            let Some(adapter) = self.adapters.get(source_type) else {
                 continue;
             };
-            let _ = adapter.replay_from_markers(markers).await;
             for marker in markers {
                 if let Some(position) = adapter.read_position(marker) {
                     landed.insert(rewind_key(marker), position);
@@ -2524,6 +2546,7 @@ impl Engine {
                     // The decision to replay is already durable; what failed is
                     // the rewind itself. Swallowing this made recovery report
                     // success for a range that was never going to be re-read.
+                    self.count_refused_replay(&source_type, marker);
                     tracing::error!(
                         start = ?marker,
                         error = %e,
@@ -2534,6 +2557,66 @@ impl Engine {
             }
         }
         Ok(summary)
+    }
+
+    /// Start each re-read of a rotated file (#621) above what the ledger says
+    /// is already archived of that file. Failing to ask costs a duplicate of
+    /// what was archived, never a skip, so it is a warning, not an error.
+    async fn floor_rotated_replays(&mut self) {
+        let Some(files) = self
+            .adapters
+            .get_mut(&SourceType::File)
+            .and_then(|adapter| adapter.as_any_mut().downcast_mut::<FileSource>())
+        else {
+            return;
+        };
+        let paths = files.rotated_replay_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let rows = match self.store.committed_cursors_by_file(SourceType::File).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    paths = ?paths,
+                    error = %e,
+                    "recovery could not read what is already archived of rotated files; their \
+                     failed ranges are re-read from their start, which may archive part of them \
+                     again"
+                );
+                return;
+            }
+        };
+        for path in paths {
+            let archived: Vec<ArchivedEnd> = rows
+                .iter()
+                .filter(|row| row.path == path)
+                .map(archived_end)
+                .collect();
+            files.raise_rotated_replay_floor(&path, &archived);
+        }
+    }
+
+    /// A source refused to hand a failed range back (#621): counted under the
+    /// tenant the range's source is charged to, like a read error.
+    fn count_refused_replay(&self, source_type: &SourceType, marker: &ProgressMarker) {
+        let source_name = match marker {
+            ProgressMarker::Kafka { topic, .. } => topic.as_str(),
+            ProgressMarker::File { path, .. } | ProgressMarker::SyslogSpool { path, .. } => {
+                path.as_str()
+            }
+        };
+        self.count_refused_replay_of(source_type, source_name);
+    }
+
+    fn count_refused_replay_of(&self, source_type: &SourceType, source_name: &str) {
+        let Some(mx) = telemetry::metrics() else {
+            return;
+        };
+        let tenant = tenant_for_source(&self.streams, &self.config.engine.tenant, source_name);
+        mx.source_replay_refused_total
+            .with_label_values(&[tenant.as_str(), source_type.as_str()])
+            .inc();
     }
 
     /// Whether `rec`'s source has committed past the end of its range, in the
@@ -2660,21 +2743,34 @@ impl Engine {
         // fingerprint of its first bytes, for a replacement that kept the
         // inode (#578), and of the bytes below the offset, for one that also
         // kept the first page (#620).
-        let file_cursors = self.store.committed_cursors(SourceType::File).await?;
+        //
+        // Per FILE, not per path, for file sources (review of #621): a range
+        // re-read from a rotated file commits under the path after the batches
+        // of the file now there, so the path's newest row can name the rotated
+        // file. The seed is then the row of the file at the path, when that
+        // file is positively identified (`FileSource::seed_choice`); otherwise
+        // the newest row, as before.
+        let file_rows = self
+            .store
+            .committed_cursors_by_file(SourceType::File)
+            .await?;
         let spool_cursors = self
             .store
             .committed_cursors(SourceType::SyslogSpool)
             .await?;
         if let Some(a) = self.adapters.get_mut(&SourceType::File) {
             if let Some(fs) = a.as_any_mut().downcast_mut::<FileSource>() {
-                for c in file_cursors {
+                // The store answers each path's files together, newest first.
+                for files in file_rows.chunk_by(|a, b| a.path == b.path) {
+                    let archived: Vec<ArchivedEnd> = files.iter().map(archived_end).collect();
+                    let c = &files[FileSource::seed_choice(&files[0].path, &archived)];
                     fs.seed_committed_from(
                         &c.path,
                         c.end_byte,
                         c.inode,
                         c.observed_size,
-                        c.content_fingerprint,
-                        c.tail_fingerprint,
+                        c.content_fingerprint.clone(),
+                        c.tail_fingerprint.clone(),
                     );
                     // A file archived but not yet deleted before the restart
                     // (#619): re-armed only if it still has the mtime the
@@ -3484,6 +3580,17 @@ fn source_for_marker(requested: &DiscoveredSource, marker: &ProgressMarker) -> D
     }
 }
 
+/// What the file adapter needs of a committed row to judge which file it was
+/// read from (#621): its inode, end, first page and the page below its end.
+fn archived_end(row: &vtop_state::CommittedCursor) -> ArchivedEnd {
+    ArchivedEnd {
+        inode: row.inode,
+        end_byte: row.end_byte,
+        content: row.content_fingerprint.clone(),
+        tail: row.tail_fingerprint.clone(),
+    }
+}
+
 /// The tenant a source's per-source metrics are charged to: the stream
 /// override when the source name matches a configured stream, the engine
 /// default otherwise — the same resolution the pipeline applies to batches.
@@ -3528,6 +3635,7 @@ fn prime_source_counters<'a>(
             let labels = [tenant, source_type.as_str()];
             let _ = mx.source_read_errors_total.with_label_values(&labels);
             let _ = mx.retention_lost_records_total.with_label_values(&labels);
+            let _ = mx.source_replay_refused_total.with_label_values(&labels);
         }
     }
 }
@@ -4491,6 +4599,407 @@ mod tests {
         );
     }
 
+    /// Every committed file batch as (inode, start byte, end byte, records).
+    async fn committed_file_ranges(engine: &Engine) -> Vec<(Option<u64>, u64, u64, Option<i64>)> {
+        let mut got: Vec<_> = engine
+            .store
+            .list_batches()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.state == BatchState::SourceCommitted)
+            .map(|b| {
+                let (
+                    ProgressMarker::File {
+                        inode, start_byte, ..
+                    },
+                    ProgressMarker::File { end_byte, .. },
+                ) = (&b.progress_start, &b.progress_end)
+                else {
+                    panic!("a file batch carries file markers");
+                };
+                (*inode, *start_byte, *end_byte, b.record_count)
+            })
+            .collect();
+        got.sort();
+        got
+    }
+
+    /// #621: a batch fails and its range is handed back while the file is
+    /// still at its path - then logrotate renames it, compresses it and
+    /// removes the original before the re-read. The next read found another
+    /// inode at the path and restarted on the new file; the failed range was
+    /// never archived and nothing said so. It is now re-read through the
+    /// descriptor the adapter kept on the old file, under the old inode, and
+    /// the new file is archived from its first byte.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_range_whose_file_is_rotated_before_the_re_read_is_archived_from_the_old_file()
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        std::fs::write(&input, "old 1\nold 2\n").unwrap(); // 12 bytes
+        let old_inode = std::fs::metadata(&input).unwrap().ino();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 3_600;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        engine.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(1));
+        let first = engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(first[0].final_state, BatchState::Failed);
+
+        let rotated = dir.path().join("app.log.1");
+        std::fs::rename(&input, &rotated).unwrap();
+        std::fs::write(&input, "new 1\n").unwrap(); // 6 bytes
+        std::fs::remove_file(&rotated).unwrap();
+        let new_inode = std::fs::metadata(&input).unwrap().ino();
+
+        for _ in 0..3 {
+            engine.run_source(SourceType::File, true).await.unwrap();
+        }
+        assert_eq!(
+            committed_file_ranges(&engine).await,
+            {
+                let mut want = vec![
+                    (Some(old_inode), 0, 12, Some(2)),
+                    (Some(new_inode), 0, 6, Some(1)),
+                ];
+                want.sort();
+                want
+            },
+            "the failed range once, from the old file, and the new file whole"
+        );
+    }
+
+    /// #621 across a restart: the batch failed, the engine stopped before the
+    /// re-read, and the file was rotated by rename while it was down. Recovery
+    /// refused the rewind at every start and the range was never archived. It
+    /// now finds the rotated file beside the path (same inode, same first
+    /// bytes) and re-reads the range from it - once: a later restart, which
+    /// still sees the old FAILED row, finds the range archived and does not
+    /// archive it again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_range_rotated_away_while_the_engine_was_down_is_archived_once_by_recovery() {
+        use std::os::unix::fs::MetadataExt;
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        std::fs::write(&input, "old 1\nold 2\n").unwrap(); // 12 bytes
+        let old_inode = std::fs::metadata(&input).unwrap().ino();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let config = |work: &str| {
+            let mut cfg = file_config(
+                dir.path().join(work).to_str().unwrap(),
+                &url,
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            cfg.batching.max_batch_age_seconds = 3_600;
+            cfg
+        };
+
+        {
+            let mut first = Engine::new(config("work-1"), StreamsConfig { streams: vec![] })
+                .await
+                .unwrap();
+            first.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(1));
+            let done = first.run_source(SourceType::File, true).await.unwrap();
+            assert_eq!(done[0].final_state, BatchState::Failed);
+        } // the engine stops before the re-read
+
+        std::fs::rename(&input, dir.path().join("app.log.1")).unwrap();
+        std::fs::write(&input, "new 1\n").unwrap(); // 6 bytes
+        let new_inode = std::fs::metadata(&input).unwrap().ino();
+
+        let want = {
+            let mut want = vec![
+                (Some(old_inode), 0, 12, Some(2)),
+                (Some(new_inode), 0, 6, Some(1)),
+            ];
+            want.sort();
+            want
+        };
+        {
+            let mut second = Engine::new(config("work-2"), StreamsConfig { streams: vec![] })
+                .await
+                .unwrap();
+            let summary = second.recover().await.unwrap();
+            assert_eq!(summary.still_pending, 0, "{summary:?}");
+            for _ in 0..3 {
+                second.run_source(SourceType::File, true).await.unwrap();
+            }
+            assert_eq!(
+                committed_file_ranges(&second).await,
+                want,
+                "the failed range from the rotated file, and the new file whole"
+            );
+        }
+        let mut third = Engine::new(config("work-3"), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        third.recover().await.unwrap();
+        for _ in 0..3 {
+            third.run_source(SourceType::File, true).await.unwrap();
+        }
+        assert_eq!(
+            committed_file_ranges(&third).await,
+            want,
+            "a later restart finds the range archived and archives nothing again"
+        );
+    }
+
+    /// Review of #621 (Codex): a re-read of a rotated file must not become the
+    /// path's restart position. One cycle sees the rotation: the old file's
+    /// buffered window is sealed and fails, and the new file's window commits.
+    /// The old range is then re-read from the rotated file and commits, after
+    /// the new file's batch. The restart seed was the newest committed row of
+    /// the path, by creation, so it named the rotated file. The restart then
+    /// took the new file for a rotation and archived it again from byte 0.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_re_read_of_a_rotated_file_does_not_take_over_the_paths_restart_position() {
+        use std::os::unix::fs::MetadataExt;
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        std::fs::write(&input, "old 1\nold 2\n").unwrap(); // 12 bytes
+        let old_inode = std::fs::metadata(&input).unwrap().ino();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let config = |work: &str| {
+            let mut cfg = file_config(
+                dir.path().join(work).to_str().unwrap(),
+                &url,
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            cfg.batching.max_records = 10_000;
+            cfg.batching.max_bytes = 104_857_600;
+            cfg.batching.max_batch_age_seconds = 3_600;
+            // One upload at a time, in the order the windows were sealed: the
+            // old file's window goes first, so the one throttled put below is
+            // its upload, whatever the pipeline does between puts.
+            cfg.batching.max_concurrent_batches = 1;
+            cfg
+        };
+        let new_inode;
+        {
+            let mut first = Engine::new(config("work-1"), StreamsConfig { streams: vec![] })
+                .await
+                .unwrap();
+            let held = first.run_source(SourceType::File, false).await.unwrap();
+            assert!(
+                held.is_empty(),
+                "the old file's window is buffered, not flushed"
+            );
+
+            std::fs::rename(&input, dir.path().join("app.log.1")).unwrap();
+            std::fs::write(&input, "new 1\nnew 2\nnew 3\n").unwrap(); // 18 bytes
+            new_inode = std::fs::metadata(&input).unwrap().ino();
+
+            // One cycle: the rotation seals the old window, the new file is
+            // read and flushed. The old window's upload is throttled; the new
+            // one's goes through.
+            first.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(1));
+            let rotated = first.run_source(SourceType::File, true).await.unwrap();
+            let failed: Vec<_> = rotated
+                .iter()
+                .filter(|o| o.final_state == BatchState::Failed)
+                .collect();
+            assert_eq!(failed.len(), 1, "the old window fails: {rotated:?}");
+            assert_eq!(
+                committed_file_ranges(&first).await,
+                vec![(Some(new_inode), 0, 18, Some(3))],
+                "and the new file's window commits in the same cycle"
+            );
+            // The old range is re-read from the rotated file and commits
+            // later, under the same path.
+            for _ in 0..3 {
+                first.run_source(SourceType::File, true).await.unwrap();
+            }
+            let mut want = vec![
+                (Some(old_inode), 0, 12, Some(2)),
+                (Some(new_inode), 0, 18, Some(3)),
+            ];
+            want.sort();
+            assert_eq!(committed_file_ranges(&first).await, want);
+        } // the engine stops
+
+        let mut second = Engine::new(config("work-2"), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        second.recover().await.unwrap();
+        for _ in 0..3 {
+            second.run_source(SourceType::File, true).await.unwrap();
+        }
+        let new_batches: Vec<_> = committed_file_ranges(&second)
+            .await
+            .into_iter()
+            .filter(|(inode, ..)| *inode == Some(new_inode))
+            .collect();
+        assert_eq!(
+            new_batches,
+            vec![(Some(new_inode), 0, 18, Some(3))],
+            "the new file resumes at its committed 18 after the restart; it is not \
+             archived again from byte 0"
+        );
+
+        // And it resumes there: a line appended now is archived on its own.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&input)
+            .unwrap()
+            .write_all(b"new 4\n")
+            .unwrap();
+        second.run_source(SourceType::File, true).await.unwrap();
+        assert!(
+            committed_file_ranges(&second)
+                .await
+                .contains(&(Some(new_inode), 18, 24, Some(1))),
+            "the restart position kept: {:?}",
+            committed_file_ranges(&second).await
+        );
+    }
+
+    /// `vtop_source_replay_refused_total` for one tenant's file sources, read
+    /// back through the registry as a scrape would.
+    fn refused_so_far(tenant: &str) -> u64 {
+        let mx = telemetry::init().unwrap();
+        mx.registry
+            .gather()
+            .iter()
+            .filter(|f| f.name().ends_with("source_replay_refused_total"))
+            .flat_map(|f| f.get_metric().iter())
+            .find(|m| {
+                let labels = m.get_label();
+                labels
+                    .iter()
+                    .any(|l| l.name() == "tenant" && l.value() == tenant)
+                    && labels
+                        .iter()
+                        .any(|l| l.name() == "source_type" && l.value() == "file")
+            })
+            .map_or(0, |m| m.get_counter().get_value() as u64)
+    }
+
+    /// #621 (review): the batch fails, its range is handed back, the file is
+    /// rotated away - and the rotated file is then truncated above its first
+    /// page, so its fingerprint still matches. The re-read through the held
+    /// descriptor archived the shortened prefix as though it were the range.
+    /// It is refused instead, and counted like any refused rewind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotated_file_truncated_before_its_re_read_is_refused_and_counted() {
+        use std::os::unix::fs::MetadataExt;
+        let _serial = THROTTLE_TESTS.lock().await;
+        let tenant = "truncated-621";
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        let old: String = (0..200)
+            .map(|i| format!("line {i:04} of the old file\n"))
+            .collect();
+        std::fs::write(&input, &old).unwrap();
+        let old_inode = std::fs::metadata(&input).unwrap().ino();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 3_600;
+        cfg.engine.tenant = tenant.into();
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        engine.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(1));
+        let first = engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(first[0].final_state, BatchState::Failed);
+
+        let rotated = dir.path().join("app.log.1");
+        std::fs::rename(&input, &rotated).unwrap();
+        std::fs::write(&input, "new 1\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&rotated)
+            .unwrap()
+            .set_len(4_500)
+            .unwrap();
+
+        let before = refused_so_far(tenant);
+        for _ in 0..3 {
+            engine.run_source(SourceType::File, true).await.unwrap();
+        }
+        assert_eq!(
+            refused_so_far(tenant) - before,
+            1,
+            "the refused re-read is counted under the engine's tenant"
+        );
+        let committed = committed_file_ranges(&engine).await;
+        assert!(
+            committed
+                .iter()
+                .all(|(inode, ..)| *inode != Some(old_inode)),
+            "nothing of the shortened file is archived as the range: {committed:?}"
+        );
+        assert_eq!(committed.len(), 1, "the new file is: {committed:?}");
+    }
+
+    /// #621: when the rotated file is gone (compressed and removed while the
+    /// engine was down), the range cannot be re-read. That stays loud - and is
+    /// counted, not only logged, so it can be alerted on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_range_whose_file_is_gone_is_refused_and_counted() {
+        let _serial = THROTTLE_TESTS.lock().await;
+        let tenant = "refused-621";
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        std::fs::write(&input, "old 1\nold 2\n").unwrap();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let config = |work: &str| {
+            let mut cfg = file_config(
+                dir.path().join(work).to_str().unwrap(),
+                &url,
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            cfg.batching.max_batch_age_seconds = 3_600;
+            cfg.engine.tenant = tenant.into();
+            cfg
+        };
+        {
+            let mut first = Engine::new(config("work-1"), StreamsConfig { streams: vec![] })
+                .await
+                .unwrap();
+            first.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(1));
+            let done = first.run_source(SourceType::File, true).await.unwrap();
+            assert_eq!(done[0].final_state, BatchState::Failed);
+        }
+        std::fs::rename(&input, dir.path().join("app.log.1")).unwrap();
+        std::fs::write(&input, "new 1\n").unwrap();
+        std::fs::remove_file(dir.path().join("app.log.1")).unwrap();
+
+        let before = refused_so_far(tenant);
+        let mut second = Engine::new(config("work-2"), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let summary = second.recover().await.unwrap();
+        assert_eq!(summary.still_pending, 1, "{summary:?}");
+        assert_eq!(
+            refused_so_far(tenant) - before,
+            1,
+            "the refused rewind is counted under the engine's tenant"
+        );
+    }
+
     /// A ledger write [`FaultyLedger`] can refuse: a row's insert, or a
     /// transition to the named state. `mark_failed`, `mark_verified` and
     /// `mark_source_committed` count as transitions to theirs.
@@ -4574,6 +5083,12 @@ mod tests {
             source_type: SourceType,
         ) -> Result<Vec<vtop_state::CommittedCursor>, VtopError> {
             self.inner.committed_cursors(source_type).await
+        }
+        async fn committed_cursors_by_file(
+            &self,
+            source_type: SourceType,
+        ) -> Result<Vec<vtop_state::CommittedCursor>, VtopError> {
+            self.inner.committed_cursors_by_file(source_type).await
         }
         async fn committed_kafka_offsets(
             &self,

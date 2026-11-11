@@ -10,6 +10,7 @@ use crate::base::{
     AdapterReadReport, DiscoveredSource, ReadResult, SourceAdapter, SourceReadOutcome,
 };
 use crate::continuity::{self, Discontinuity, Observed};
+use crate::rotated::{self, HeldFile, Replay, RotatedFile};
 use async_trait::async_trait;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -345,6 +346,34 @@ pub struct FileSource {
     /// is already taken.
     #[cfg(test)]
     first_aside: Option<PathBuf>,
+    /// Per path, a descriptor on the file its cursor reads, kept while a
+    /// range read from it is not committed (#621): when the file is rotated
+    /// away, it is the way back to those ranges if one fails.
+    held: HashMap<String, HeldFile>,
+    /// Files that have left the path their ranges were read under, kept to
+    /// re-read a failed range from (#621). See [`crate::rotated`].
+    rotated: Vec<RotatedFile>,
+    /// How many descriptors `held` and `rotated` keep open in all.
+    max_held: usize,
+    /// How long a descriptor in `rotated` is kept, unused and with no re-read
+    /// in progress.
+    hold_for: Duration,
+    /// Paths whose handed-back range a re-read through a rotated file's
+    /// descriptor had to refuse, for the engine to count
+    /// ([`Self::take_refused_rereads`]).
+    refused_rereads: Vec<String>,
+}
+
+/// What recovery knows is already archived of one file at a path (#621): the
+/// end of its newest committed range, and which file that was - its inode,
+/// its first page, and the page ending at `end_byte` (#620). A rotated file's
+/// re-read never starts below the end of a range committed from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivedEnd {
+    pub inode: Option<u64>,
+    pub end_byte: u64,
+    pub content: Option<ContentFingerprint>,
+    pub tail: Option<ContentFingerprint>,
 }
 
 #[cfg(test)]
@@ -369,6 +398,11 @@ impl FileSource {
             whole_file,
             cursors: HashMap::new(),
             warned_aliases: std::sync::Mutex::new(HashMap::new()),
+            held: HashMap::new(),
+            rotated: Vec::new(),
+            max_held: rotated::MAX_HELD_FILES,
+            hold_for: rotated::HOLD_FOR,
+            refused_rereads: Vec::new(),
             delete_quiet: DEFAULT_DELETE_QUIET,
             #[cfg(test)]
             before_delete: None,
@@ -443,6 +477,60 @@ impl FileSource {
                 tail: continuity::Tail::at(committed_byte, tail),
             });
         }
+    }
+
+    /// Which of `path`'s committed files - the newest committed range of each
+    /// file that has lived there, newest first - the restart seed is taken
+    /// from (review of #621). An index into `newest_first`.
+    ///
+    /// Normally the newest, as it always was: the window read last. But a
+    /// range re-read from a file rotated away from the path commits under the
+    /// path AFTER the batches of the file now there, so the newest row can
+    /// name the rotated file. Seeded from it, the restart took the current
+    /// file for a rotation and archived it again from byte 0. So when the
+    /// newest row's file is not the one at the path, the seed is the row of the
+    /// file that is - but only on POSITIVE identity ([`continuity::proves`],
+    /// the same test #567's `committed_through` makes): the same inode, the
+    /// first page its marker fingerprinted, the page ending at its end (#620),
+    /// and at least that long. Overriding the newest row also needs the row
+    /// to CARRY the page below its end: a legacy row with a first page alone
+    /// is not evidence enough to depart from the default. Without that, or
+    /// without a match, the newest row stands: that costs a re-read of the
+    /// current file, never a skip.
+    pub fn seed_choice(path: &str, newest_first: &[ArchivedEnd]) -> usize {
+        let Some(newest) = newest_first.first() else {
+            return 0;
+        };
+        let Some(current_inode) = std::fs::metadata(path).ok().and_then(|md| inode_of(&md)) else {
+            return 0;
+        };
+        if newest.inode.is_none() || newest.inode == Some(current_inode) {
+            return 0;
+        }
+        newest_first
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, row)| {
+                let (Some(inode), Some(content), Some(tail)) = (row.inode, &row.content, &row.tail)
+                else {
+                    return false;
+                };
+                let tail = continuity::Tail {
+                    end: row.end_byte,
+                    fingerprint: tail.clone(),
+                };
+                continuity::proves_at_path(
+                    Path::new(path),
+                    &continuity::Identity {
+                        inode,
+                        contents: &[content],
+                        tails: &[&tail],
+                        min_len: row.end_byte,
+                    },
+                )
+            })
+            .map_or(0, |(i, _)| i)
     }
 
     /// Re-arm the deferred delete of a file the engine had fully archived but
@@ -546,8 +634,18 @@ impl FileSource {
                 // The file this cursor described is gone. A new file at the
                 // path may be handed the freed inode number, and an inode
                 // check cannot tell it from the one it replaced, so the cursor
-                // must not outlive it (#558).
+                // must not outlive it (#558). Nor may a descriptor kept to
+                // re-read its ranges (#621). The commit that recorded this
+                // delete usually released it, but not when a later window had
+                // been read and the file was then cut back to this commit's
+                // end: the later range is still outstanding. With the file and
+                // its cursor gone, nothing would read this path again, so
+                // nothing else would close it, and it would pin the deleted
+                // file's space (a_delete_closes_a_descriptor_the_adapter_still_
+                // held_for_that_path). A rotated file being re-read under
+                // this path is a different file and stays.
                 self.cursors.remove(path);
+                self.held.remove(path);
                 tracing::info!(
                     path,
                     "deleted after commit: fully archived and unwritten for the quiet period"
@@ -664,10 +762,9 @@ impl FileSource {
             && cursor.read_byte == current.file_size
     }
 
-    /// Stat a path without opening it, for the skip decision. A path that
-    /// cannot be stat'd is NOT skipped: it is handed to the read, which
-    /// reports the error properly instead of having it swallowed here as a
-    /// silent skip.
+    /// Stat a path without opening it, as the skip decision does (inside each
+    /// read's job, through `tokio::fs`, since both read paths share `run_job`).
+    #[cfg(test)]
     fn stat_identity(path: &str) -> Option<FileIdentity> {
         std::fs::metadata(path)
             .ok()
@@ -758,9 +855,11 @@ impl FileSource {
             verbatim,
             identity,
             discontinuity,
+            descriptor,
             start_tail,
         } = slice;
         let cursor = self.cursors.entry(path.to_string()).or_default();
+        let read_byte_before = cursor.read_byte;
         if let Some(why) = discontinuity {
             tracing::warn!(path, previous_read_byte = cursor.read_byte, "{why}");
             cursor.committed_byte = 0;
@@ -773,6 +872,10 @@ impl FileSource {
         // file can grow between the two, and recording the earlier identity
         // would let the next cycle skip bytes this one never read.
         cursor.seen = Some(identity.clone());
+        if let Some(why) = discontinuity {
+            self.retire_held(path, read_byte_before, why);
+        }
+        self.hold(path, descriptor, &identity, start, end);
         ReadResult {
             progress_start: Self::marker_from(path, &identity, start, start, start_tail.as_ref()),
             progress_end: Self::marker_from(path, &identity, start, end, identity.tail.as_ref()),
@@ -791,6 +894,7 @@ impl FileSource {
         if let Some(restart) = failed.restart {
             let (why, opened) = *restart;
             let cursor = self.cursors.entry(path.to_string()).or_default();
+            let read_byte_before = cursor.read_byte;
             tracing::warn!(
                 path,
                 previous_read_byte = cursor.read_byte,
@@ -801,8 +905,705 @@ impl FileSource {
             cursor.generations.discontinuity();
             cursor.delete_candidate = None;
             cursor.seen = Some(opened);
+            self.retire_held(path, read_byte_before, why);
         }
         failed.error
+    }
+
+    // ---- re-reading a range from a file rotated away (#621) ---------------
+    //
+    // See `crate::rotated` for the why. The cursor's file is held while a
+    // range read from it is outstanding; a rotation retires the descriptor to
+    // `rotated` instead of closing it; a rewind refused for the file at the
+    // path re-reads the range from a rotated file proven to be the one read.
+
+    /// A read restarted the cursor on new content. A descriptor held on the
+    /// file that was RENAMED away still reaches its bytes, and is kept while a
+    /// range read from it is outstanding - with the re-read already started
+    /// when the cursor had been rewound into it, since that rewind was
+    /// accepted on the promise that the range would be read again. After a
+    /// truncation or a replacement at the same inode the descriptor reaches
+    /// the new content, not the old, and is closed.
+    fn retire_held(&mut self, path: &str, read_byte_before: u64, why: Discontinuity) {
+        let Some(held) = self.held.remove(path) else {
+            return;
+        };
+        if !matches!(why, Discontinuity::Rotated { .. }) {
+            return;
+        }
+        let rewound = read_byte_before < held.read_end;
+        if !held.outstanding() && !rewound {
+            return;
+        }
+        let replay = rewound.then(|| Replay {
+            read_byte: read_byte_before.max(held.committed),
+            drained: false,
+        });
+        tracing::info!(
+            path,
+            inode = held.inode,
+            read_end = held.read_end,
+            committed = held.committed,
+            rewound,
+            "file rotated away with ranges not yet archived; its descriptor is kept to re-read them"
+        );
+        // Moving a descriptor from `held` to `rotated` does not change the
+        // count, so there is always room.
+        self.rotated.push(RotatedFile {
+            path: path.to_string(),
+            held,
+            replay,
+        });
+    }
+
+    /// Keep (or refresh) the descriptor on the file a read just handed a
+    /// range out of. `descriptor` is a duplicate of the read's, taken only
+    /// when the read opened another file than the one held.
+    fn hold(
+        &mut self,
+        path: &str,
+        descriptor: Option<std::fs::File>,
+        identity: &FileIdentity,
+        start: u64,
+        end: u64,
+    ) {
+        let (Some(inode), Some(content)) = (identity.inode, identity.content.clone()) else {
+            return;
+        };
+        if end <= start {
+            if self
+                .held
+                .get(path)
+                .is_some_and(|held| held.inode == inode && !held.outstanding())
+            {
+                self.held.remove(path);
+            }
+            return;
+        }
+        if let Some(held) = self.held.get_mut(path) {
+            if held.inode == inode && descriptor.is_none() {
+                held.read_end = held.read_end.max(end);
+                held.seen_len(identity.file_size);
+                if identity.tail.is_some() {
+                    held.tail = identity.tail.clone();
+                }
+                held.content = content;
+                held.touched = std::time::Instant::now();
+                return;
+            }
+        }
+        let Some(file) = descriptor else {
+            return;
+        };
+        if !self.held.contains_key(path) && !self.make_room() {
+            tracing::debug!(
+                path,
+                max = self.max_held,
+                "not holding a descriptor: the limit is reached; a failed range of this file \
+                 can still be found by its inode if the file is rotated"
+            );
+            return;
+        }
+        let committed = self.cursors.get(path).map_or(0, |c| c.committed_byte);
+        let mut held = HeldFile::new(file, inode, content, end, committed, identity.file_size);
+        held.tail = identity.tail.clone();
+        self.held.insert(path.to_string(), held);
+    }
+
+    /// Whether one more descriptor may be kept. At the limit, the rotated file
+    /// unused for longest with no re-read in progress is closed to make room.
+    fn make_room(&mut self) -> bool {
+        if self.held.len() + self.rotated.len() < self.max_held {
+            return true;
+        }
+        let Some(oldest) = self
+            .rotated
+            .iter()
+            .enumerate()
+            .filter(|(_, rotated)| !rotated.replaying())
+            .min_by_key(|(_, rotated)| rotated.held.touched)
+            .map(|(i, _)| i)
+        else {
+            return false;
+        };
+        let closed = self.rotated.remove(oldest);
+        tracing::warn!(
+            path = closed.path,
+            inode = closed.held.inode,
+            max = self.max_held,
+            "closed the descriptor on a rotated file to stay within the limit; a range read \
+             from it that fails is looked for by its inode instead"
+        );
+        true
+    }
+
+    /// Close the descriptors on rotated files unused for longer than
+    /// `hold_for` with no re-read in progress.
+    fn expire_rotated(&mut self) {
+        let hold_for = self.hold_for;
+        self.rotated.retain(|rotated| {
+            let keep = rotated.replaying() || rotated.held.touched.elapsed() < hold_for;
+            if !keep {
+                tracing::info!(
+                    path = rotated.path,
+                    inode = rotated.held.inode,
+                    resolved = rotated.resolved(),
+                    "closed the descriptor on a rotated file after {hold_for:?} unused"
+                );
+            }
+            keep
+        });
+    }
+
+    /// Note a commit for the file it was read from, wherever it is held, and
+    /// close a descriptor nothing read from it waits on any more.
+    ///
+    /// A descriptor counts the commit only if the marker's content - its first
+    /// page, and the page ending at its end (#620) - is what the descriptor
+    /// reaches now (review of #621). The inode alone is not enough: a window
+    /// of a file's old content can commit after the file was rewritten in
+    /// place, and raising the new content's floor with it made a later
+    /// re-read skip the new content's first bytes. A commit that does not
+    /// count costs a re-read at most.
+    fn note_committed(
+        &mut self,
+        path: &str,
+        inode: Option<u64>,
+        end: u64,
+        content: Option<&ContentFingerprint>,
+        tail: Option<&ContentFingerprint>,
+    ) {
+        let Some(inode) = inode else {
+            return;
+        };
+        let tail = continuity::Tail::at(end, tail.cloned());
+        if let Some(held) = self.held.get_mut(path) {
+            if held.inode == inode && held.holds(content, tail.as_ref()) {
+                held.committed_to(end);
+                if !held.outstanding() {
+                    self.held.remove(path);
+                }
+            }
+        }
+        for rotated in self.rotated.iter_mut().filter(|rotated| {
+            rotated.path == path
+                && rotated.held.inode == inode
+                && rotated.held.holds(content, tail.as_ref())
+        }) {
+            rotated.raise_floor(end);
+        }
+        self.rotated.retain(|rotated| {
+            let done = rotated.path == path && rotated.held.inode == inode && rotated.resolved();
+            if done {
+                tracing::info!(
+                    path,
+                    inode,
+                    "every range read from a rotated file is archived"
+                );
+            }
+            !done
+        });
+    }
+
+    /// The rotated file whose range is being re-read under `path`, if any.
+    fn replaying(&self, path: &str) -> Option<usize> {
+        self.rotated
+            .iter()
+            .position(|rotated| rotated.path == path && rotated.replaying())
+    }
+
+    /// A read of a rotated file found nothing more to re-read.
+    fn rotated_drained(&mut self, path: &str) {
+        let Some(i) = self.replaying(path) else {
+            return;
+        };
+        if let Some(replay) = self.rotated[i].replay.as_mut() {
+            replay.drained = true;
+        }
+        if self.rotated[i].resolved() {
+            let done = self.rotated.remove(i);
+            tracing::info!(
+                path,
+                inode = done.held.inode,
+                "every range read from a rotated file is archived"
+            );
+        }
+    }
+
+    /// Fold a re-read of a rotated file into its record and build its result.
+    /// The markers name the source path, as the range's first read did, and
+    /// the inode the bytes are actually in.
+    fn apply_rotated(&mut self, path: &str, slice: SliceRead) -> ReadResult {
+        if let Some(rotated) = self.rotated.iter_mut().find(|rotated| {
+            rotated.path == path
+                && rotated.replaying()
+                && Some(rotated.held.inode) == slice.identity.inode
+        }) {
+            rotated.replay = Some(Replay {
+                read_byte: slice.end,
+                drained: slice.records.is_empty(),
+            });
+            rotated.held.read_end = rotated.held.read_end.max(slice.end);
+            rotated.held.seen_len(slice.identity.file_size);
+            if slice.identity.tail.is_some() {
+                rotated.held.tail = slice.identity.tail.clone();
+            }
+            rotated.held.touched = std::time::Instant::now();
+        }
+        ReadResult {
+            progress_start: Self::marker_from(
+                path,
+                &slice.identity,
+                slice.start,
+                slice.start,
+                slice.start_tail.as_ref(),
+            ),
+            progress_end: Self::marker_from(
+                path,
+                &slice.identity,
+                slice.start,
+                slice.end,
+                slice.identity.tail.as_ref(),
+            ),
+            records: slice.records,
+            first_timestamp: None,
+            last_timestamp: None,
+            verbatim: slice.verbatim,
+        }
+    }
+
+    /// A re-read of a rotated file failed: the descriptor no longer proves the
+    /// file, or the read itself failed. The range will not be re-read in this
+    /// process, so this is loud - and handed to the engine to count, as a
+    /// refused rewind is ([`Self::take_refused_rereads`]); a restart looks for
+    /// the file again.
+    fn rotated_read_failed(&mut self, path: &str, error: VtopError) -> VtopError {
+        self.refused_rereads.push(path.to_string());
+        if let Some(i) = self.replaying(path) {
+            let failed = self.rotated.remove(i);
+            tracing::error!(
+                path,
+                inode = failed.held.inode,
+                error = %error,
+                "could not re-read a failed range from the file it was rotated to; it will not \
+                 be re-read until a restart finds that file again"
+            );
+        }
+        error
+    }
+
+    /// The cursor was rewound into the file it holds, and that file has left
+    /// the path: its rewound range is re-read from the descriptor, before the
+    /// new file at the path is read (whose markers would otherwise be newer).
+    fn promote_rewound(&mut self, path: &str) {
+        let Some(held) = self.held.remove(path) else {
+            return;
+        };
+        let read_byte = self
+            .cursors
+            .get(path)
+            .map_or(0, |c| c.read_byte)
+            .max(held.committed);
+        self.rotated.push(RotatedFile {
+            path: path.to_string(),
+            held,
+            replay: Some(Replay {
+                read_byte,
+                drained: false,
+            }),
+        });
+    }
+
+    /// Re-read a range through a descriptor on a rotated file. The descriptor
+    /// is proven again first, as [`rotated::proves`] proves a file: its first
+    /// bytes must still be the ones it was held for, and it must be no
+    /// shorter than it was seen to be. A truncation above the first page
+    /// keeps the fingerprint, and reading on would archive a shortened prefix
+    /// as the range - or nothing at all, and call the re-read done (review of
+    /// #621). Nor may the page below where it was last read have changed
+    /// (#620): a rewrite that kept the first page is not the file.
+    async fn read_rotated(
+        read: RotatedRead,
+        path: &str,
+        max_records: usize,
+        max_bytes: usize,
+        whole_file: bool,
+    ) -> Result<SliceRead, VtopError> {
+        let mut file = tokio::fs::File::from_std(read.file);
+        let mut identity = Self::identity_of(&file.metadata().await?);
+        if identity.file_size < read.min_len || read.start > identity.file_size {
+            return Err(VtopError::Source(format!(
+                "cannot re-read {path} from the file it was rotated to: that file is now {} \
+                 bytes, shorter than the {} it was when its ranges were read (truncated since)",
+                identity.file_size,
+                read.min_len.max(read.start)
+            )));
+        }
+        let head = continuity::read_head(&mut file).await?;
+        if identity.inode != Some(read.inode) || !read.content.matches_head(&head) {
+            return Err(VtopError::Source(format!(
+                "cannot re-read {path} from the file it was rotated to: that file's first bytes \
+                 are no longer the ones the range was read after"
+            )));
+        }
+        if let Some(tail) = read.tail.as_ref() {
+            let at_tail =
+                continuity::read_ending_at(&mut file, tail.end, tail.fingerprint.len).await?;
+            if !tail.fingerprint.matches_bytes(&at_tail) {
+                return Err(VtopError::Source(format!(
+                    "cannot re-read {path} from the file it was rotated to: the bytes before \
+                     byte {} are no longer the ones it was read with (rewritten in place)",
+                    tail.end
+                )));
+            }
+        }
+        identity.content = ContentFingerprint::of(&head);
+        let content = identity.content.clone();
+        // The page below the re-read's start, for its markers' tails (#620),
+        // exactly as a read of the path takes it.
+        let below_len = read.start.min(ContentFingerprint::MAX_LEN as u64);
+        let below = continuity::read_ending_at(&mut file, read.start, below_len).await?;
+        let mut slice = Self::read_opened(
+            file,
+            path,
+            read.start,
+            max_records,
+            max_bytes,
+            whole_file,
+            identity.file_size,
+            None,
+        )
+        .await?;
+        slice.identity.content = content;
+        slice.start_tail = continuity::Tail::at(read.start, ContentFingerprint::of_tail(&below));
+        slice.identity.tail = continuity::Tail::at(
+            slice.end,
+            tail_of_read(&below, &slice.records, !slice.verbatim),
+        );
+        Ok(slice)
+    }
+
+    /// Hand a range back through a rotated file (#621), when the file at the
+    /// path refused it. `true` when the range will be re-read: from a rotated
+    /// file already kept, from the descriptor the cursor still holds, or from
+    /// a file found where rotation left it - each PROVEN to be the file the
+    /// range was read from, by its first page and, when the marker recorded
+    /// one, the page ending where the range ends (#620). A marker without an
+    /// inode or a first-page fingerprint proves nothing, and is refused as
+    /// before.
+    fn replay_rotated(&mut self, marker: &ProgressMarker) -> bool {
+        let ProgressMarker::File {
+            path,
+            inode: Some(inode),
+            start_byte,
+            end_byte,
+            file_size: size_when_read,
+            content_fingerprint: Some(content),
+            tail_fingerprint,
+            ..
+        } = marker
+        else {
+            return false;
+        };
+        let (path, inode, start) = (path.as_str(), *inode, *start_byte);
+        let tail = continuity::Tail::at(*end_byte, tail_fingerprint.clone());
+        if let Some(i) = self
+            .rotated
+            .iter()
+            .position(|rotated| rotated.path == path && rotated.held.inode == inode)
+        {
+            let held = &mut self.rotated[i].held;
+            let min_len = (*size_when_read).max(held.min_len);
+            if held.proves(content, min_len, start, tail.as_ref()) {
+                held.seen_len(*size_when_read);
+                self.rotated[i].rewind(start);
+                return true;
+            }
+            self.rotated.remove(i);
+        }
+        if self.held.get(path).is_some_and(|held| held.inode == inode) {
+            let mut held = self.held.remove(path).expect("checked above");
+            let min_len = (*size_when_read).max(held.min_len);
+            if held.proves(content, min_len, start, tail.as_ref()) {
+                held.seen_len(*size_when_read);
+                let mut rotated = RotatedFile {
+                    path: path.to_string(),
+                    held,
+                    replay: None,
+                };
+                rotated.rewind(start);
+                self.rotated.push(rotated);
+                return true;
+            }
+        }
+        let Some((found, file)) = rotated::find(
+            path,
+            &self.paths,
+            inode,
+            content,
+            *size_when_read,
+            start,
+            tail.as_ref(),
+        ) else {
+            return false;
+        };
+        if !self.make_room() {
+            tracing::error!(
+                path,
+                found = %found.display(),
+                max = self.max_held,
+                "found the file a failed range was rotated to, but every descriptor the adapter \
+                 may keep is re-reading another"
+            );
+            return false;
+        }
+        tracing::warn!(
+            path,
+            found = %found.display(),
+            inode,
+            start,
+            "the file a failed range was read from has left its path; re-reading the range from \
+             where it was rotated to"
+        );
+        let mut held = HeldFile::new(file, inode, content.clone(), 0, 0, *size_when_read);
+        held.tail = tail;
+        let mut rotated = RotatedFile {
+            path: path.to_string(),
+            held,
+            replay: None,
+        };
+        rotated.rewind(start);
+        self.rotated.push(rotated);
+        true
+    }
+
+    /// The source paths with a rotated file's range being re-read (#621), for
+    /// recovery to look up what of those files is already archived.
+    pub fn rotated_replay_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .rotated
+            .iter()
+            .filter(|rotated| rotated.replaying())
+            .map(|rotated| rotated.path.clone())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// What the ledger says is archived of the files that have lived at
+    /// `path` (#621): a rotated file's re-read starts above the newest range
+    /// committed from it. Recovery rewinds every FAILED row again at each
+    /// start - they stay in the ledger - so without this a range re-read from
+    /// a rotated file was archived again at every restart while that file
+    /// existed. Only a row naming the file's inode whose fingerprint its first
+    /// bytes match counts; anything else costs a re-read, never a skip.
+    pub fn raise_rotated_replay_floor(&mut self, path: &str, archived: &[ArchivedEnd]) {
+        for rotated in self
+            .rotated
+            .iter_mut()
+            .filter(|rotated| rotated.path == path && rotated.replaying())
+        {
+            let len = rotated.held.file.metadata().map_or(0, |md| md.len());
+            // A row without a fingerprint (written before #578) is not used.
+            // It cannot be what a re-read wrote - every re-read row carries a
+            // fingerprint, and only a fingerprinted marker is re-read from a
+            // rotated file at all - so it predates the failed range and ends
+            // at or below its start, where it raises nothing. Trusting inode
+            // and length alone would let a file that reused the inode raise
+            // the floor and skip bytes; ignoring it costs a re-read at most.
+            // A row whose page below its end (#620) is no longer in the file
+            // was read from other content at that inode, and does not count.
+            let floor = archived
+                .iter()
+                .filter(|row| row.inode == Some(rotated.held.inode) && row.end_byte <= len)
+                .filter(|row| {
+                    let tail = continuity::Tail::at(row.end_byte, row.tail.clone());
+                    rotated.held.holds(row.content.as_ref(), tail.as_ref())
+                })
+                .map(|row| row.end_byte)
+                .max();
+            if let Some(floor) = floor {
+                rotated.raise_floor(floor);
+                tracing::info!(
+                    path,
+                    inode = rotated.held.inode,
+                    floor,
+                    "a rotated file's re-read starts above what is already archived of it"
+                );
+            }
+        }
+    }
+
+    /// The source paths whose handed-back range could not be re-read from the
+    /// file it was rotated to since the last call (#621): the file was
+    /// truncated, or no longer starts with the bytes it was held for. The
+    /// engine counts each as a refused rewind; the error alone reached only
+    /// the read-error counter, which does not say a range is missing.
+    pub fn take_refused_rereads(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.refused_rereads)
+    }
+
+    #[cfg(test)]
+    fn with_hold_limits(mut self, max_held: usize, hold_for: Duration) -> Self {
+        self.max_held = max_held;
+        self.hold_for = hold_for;
+        self
+    }
+
+    /// The descriptor held on the file `path`'s cursor was rewound into: a
+    /// range of it was handed back and has not been read again yet.
+    fn rewound_held(&self, path: &str) -> Option<&HeldFile> {
+        let cursor = self.cursors.get(path)?;
+        let seen_inode = cursor.seen.as_ref().and_then(|seen| seen.inode);
+        self.held
+            .get(path)
+            .filter(|held| cursor.read_byte < held.read_end && seen_inode == Some(held.inode))
+    }
+
+    /// Snapshot what one file's read needs, so the reads of a pass can run
+    /// concurrently and be applied afterwards.
+    fn read_job(&mut self, path: &str) -> ReadJob {
+        let cursor = self.cursors.entry(path.to_string()).or_default();
+        let (start, seen) = (cursor.read_byte, cursor.seen.clone());
+        let rotated = self.replaying(path).and_then(|i| {
+            let rotated = &self.rotated[i];
+            Some(RotatedRead {
+                file: rotated.held.file.try_clone().ok()?,
+                inode: rotated.held.inode,
+                content: rotated.held.content.clone(),
+                min_len: rotated.held.min_len,
+                tail: rotated.held.tail.clone(),
+                start: rotated.replay?.read_byte,
+            })
+        });
+        let rewound = self.rewound_held(path).and_then(|held| {
+            Some(RotatedRead {
+                file: held.file.try_clone().ok()?,
+                inode: held.inode,
+                content: held.content.clone(),
+                min_len: held.min_len,
+                tail: held.tail.clone(),
+                start: start.max(held.committed),
+            })
+        });
+        let held = self.held.get(path);
+        ReadJob {
+            path: path.to_string(),
+            start,
+            seen,
+            held_inode: held.map(|held| held.inode),
+            rotated,
+            rewound,
+        }
+    }
+
+    /// One file's read. A rotated file's range being re-read comes first;
+    /// only when it has nothing more is the path read. `true` alongside means
+    /// that re-read reached its end in this pass.
+    async fn run_job(
+        job: ReadJob,
+        max_records: usize,
+        max_bytes: usize,
+        whole_file: bool,
+    ) -> (PassOutcome, bool) {
+        let mut drained = false;
+        if let Some(rotated) = job.rotated {
+            match Self::read_rotated(rotated, &job.path, max_records, max_bytes, whole_file).await {
+                Ok(slice) if slice.records.is_empty() => drained = true,
+                other => return (PassOutcome::Rotated(other), false),
+            }
+        }
+        // A path that cannot be stat'd is NOT skipped: it goes to the read,
+        // which reports the error properly instead of having it swallowed
+        // here as a silent skip.
+        let current = tokio::fs::metadata(&job.path)
+            .await
+            .ok()
+            .map(|md| Self::identity_of(&md));
+        if let Some(rewound) = job.rewound {
+            if current.as_ref().and_then(|current| current.inode) != Some(rewound.inode) {
+                let read =
+                    Self::read_rotated(rewound, &job.path, max_records, max_bytes, whole_file)
+                        .await;
+                return (PassOutcome::Rewound(read), drained);
+            }
+        }
+        if drained && current.is_none() {
+            return (PassOutcome::Nothing, drained);
+        }
+        let snapshot = FileCursor {
+            read_byte: job.start,
+            seen: job.seen,
+            ..FileCursor::default()
+        };
+        let outcome = match current {
+            Some(current) if Self::can_skip(&snapshot, &current) => {
+                PassOutcome::SkippedUnchanged(current)
+            }
+            _ => {
+                let last_seen = snapshot.seen.as_ref().map(FileIdentity::observed);
+                PassOutcome::Read(
+                    Self::read_slice(
+                        job.path.clone(),
+                        job.start,
+                        max_records,
+                        max_bytes,
+                        whole_file,
+                        last_seen,
+                        job.held_inode,
+                    )
+                    .await,
+                )
+            }
+        };
+        (outcome, drained)
+    }
+
+    /// Fold one file's read into the adapter and build what the engine sees.
+    fn apply_outcome(
+        &mut self,
+        path: &str,
+        start: u64,
+        outcome: PassOutcome,
+        drained: bool,
+    ) -> Result<Vec<ReadResult>, VtopError> {
+        if drained {
+            self.rotated_drained(path);
+        }
+        match outcome {
+            // A skipped file reports an empty read at the cursor it already
+            // holds: indistinguishable from one that was read and had nothing
+            // to give, which is what it is.
+            PassOutcome::SkippedUnchanged(id) => Ok(vec![ReadResult {
+                progress_start: Self::marker_from(path, &id, start, start, None),
+                progress_end: Self::marker_from(path, &id, start, start, None),
+                records: Vec::new(),
+                first_timestamp: None,
+                last_timestamp: None,
+                verbatim: false,
+            }]),
+            PassOutcome::Read(Ok(slice)) => Ok(vec![self.apply_slice(path, slice)]),
+            PassOutcome::Read(Err(failed)) => Err(self.apply_failed_read(path, failed)),
+            PassOutcome::Rotated(Ok(slice)) => Ok(vec![self.apply_rotated(path, slice)]),
+            PassOutcome::Rotated(Err(error)) => Err(self.rotated_read_failed(path, error)),
+            PassOutcome::Rewound(Ok(slice)) => {
+                self.promote_rewound(path);
+                Ok(vec![self.apply_rotated(path, slice)])
+            }
+            PassOutcome::Rewound(Err(error)) => {
+                self.held.remove(path);
+                self.refused_rereads.push(path.to_string());
+                tracing::error!(
+                    path,
+                    error = %error,
+                    "a range handed back for re-reading cannot be read from its file, which has \
+                     left the path since; it will not be re-read until a restart finds that file"
+                );
+                Err(error)
+            }
+            PassOutcome::Nothing | PassOutcome::Deleted => Ok(Vec::new()),
+        }
     }
 
     /// Read one file from `start`, honouring the budgets. Pure with respect to
@@ -815,6 +1616,10 @@ impl FileSource {
     /// descriptor is checked against it (and against `start`) before any byte
     /// is read: a different inode, or a file shorter than `start`, means the
     /// position no longer applies and the read restarts at byte 0 (#558).
+    ///
+    /// `held_inode` is the file the adapter already holds a descriptor on for
+    /// this path (#621); a read of any other file hands back a duplicate of
+    /// its own descriptor for the adapter to keep.
     async fn read_slice(
         path: String,
         start: u64,
@@ -822,6 +1627,7 @@ impl FileSource {
         max_bytes: usize,
         whole_file: bool,
         last_seen: Option<Observed>,
+        held_inode: Option<u64>,
     ) -> Result<SliceRead, SliceError> {
         // Read AND fingerprint through one open descriptor: a rotation between
         // "read the bytes" and "stat the path" would otherwise mix the old
@@ -866,6 +1672,19 @@ impl FileSource {
         // can regrow past its old length before the next read and the
         // truncation is never seen (review of #564).
         let restart = discontinuity.map(|why| Box::new((why, opened.clone())));
+        // A descriptor to keep on this file while its ranges are outstanding
+        // (#621), duplicated only when the one held is on another file (or
+        // on content this read just found replaced). Failing to duplicate is
+        // not a failed read: the file is simply not held.
+        let descriptor =
+            if opened.inode.is_some() && (opened.inode != held_inode || discontinuity.is_some()) {
+                match file.try_clone().await {
+                    Ok(dup) => Some(dup.into_std().await),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
         // The page below `start`, which this read's markers fingerprint with
         // the bytes it reads (#620). Usually the very bytes just checked.
         let below_len = start.min(ContentFingerprint::MAX_LEN as u64);
@@ -902,6 +1721,7 @@ impl FileSource {
             // The size and mtime are the descriptor's after the read; the
             // content is what it held at open, which an append cannot change.
             slice.identity.content = opened.content;
+            slice.descriptor = descriptor;
             // The tails are of the bytes this read consumed, not a second
             // read of the file after it: one rewritten in between must not
             // be fingerprinted as what was archived (#620).
@@ -963,6 +1783,7 @@ impl FileSource {
                 verbatim: true,
                 identity,
                 discontinuity,
+                descriptor: None,
                 start_tail: None,
             });
         }
@@ -1032,6 +1853,7 @@ impl FileSource {
             verbatim: false,
             identity,
             discontinuity,
+            descriptor: None,
             start_tail: None,
         })
     }
@@ -1415,11 +2237,48 @@ struct SliceRead {
     /// What the read saw below `start` (#620), for its start marker; the
     /// tail below `end` is the identity's.
     start_tail: Option<continuity::Tail>,
+    /// A duplicate of the read's descriptor, for the adapter to keep while
+    /// the ranges read through it are outstanding (#621).
+    descriptor: Option<std::fs::File>,
+}
+
+/// A descriptor on a rotated file, and where to re-read it from (#621).
+struct RotatedRead {
+    file: std::fs::File,
+    inode: u64,
+    /// The first bytes the file must still start with.
+    content: ContentFingerprint,
+    /// How long it must still be: it was seen this long (review of #621).
+    min_len: u64,
+    /// The page it must still hold where it was last read up to (#620).
+    tail: Option<continuity::Tail>,
+    start: u64,
+}
+
+/// One file's share of a read pass, snapshotted from the adapter so many
+/// files can be read concurrently (#96 B2).
+struct ReadJob {
+    path: String,
+    start: u64,
+    seen: Option<FileIdentity>,
+    held_inode: Option<u64>,
+    /// A rotated file's range being re-read: read before the path (#621).
+    rotated: Option<RotatedRead>,
+    /// The descriptor held on the file the cursor was rewound into: if that
+    /// file has left the path, the rewound range is read from it (#621).
+    rewound: Option<RotatedRead>,
 }
 
 enum PassOutcome {
     SkippedUnchanged(FileIdentity),
     Read(Result<SliceRead, SliceError>),
+    /// A range re-read from a rotated file (#621).
+    Rotated(Result<SliceRead, VtopError>),
+    /// A rewound range re-read from the file that has left the path since.
+    Rewound(Result<SliceRead, VtopError>),
+    /// Nothing to read: the path is gone, and a rotated file's re-read has
+    /// reached its end.
+    Nothing,
     /// Deleted by `delete_after_commit` before the pass (#619): fully
     /// archived, so there was nothing left to read.
     Deleted,
@@ -1518,6 +2377,34 @@ impl SourceAdapter for FileSource {
                  source is meant"
             );
         }
+        // A range being re-read from a rotated file is read under its source
+        // path (#621), and a path with nothing at it right now - rotated away
+        // with no new file created yet - matches no pattern. It stays a source
+        // until its re-read has reached the end of the rotated file. So does a
+        // path whose cursor was rewound into the file it holds a descriptor
+        // on (review of #621): if that file was renamed away with nothing
+        // created in its place, only a read of the path moves the rewound
+        // range onto the rotated list, and no read happens for a path that is
+        // not a source.
+        let replaying = self
+            .rotated
+            .iter()
+            .filter(|rotated| rotated.replaying())
+            .map(|rotated| rotated.path.as_str());
+        let rewound = self
+            .held
+            .keys()
+            .map(String::as_str)
+            .filter(|path| self.rewound_held(path).is_some());
+        for path in replaying.chain(rewound) {
+            if seen.insert(without_dot_components(Path::new(path))) {
+                out.push(DiscoveredSource {
+                    source_type: SourceType::File,
+                    source_name: path.to_string(),
+                    format: self.format.clone(),
+                });
+            }
+        }
         Ok(out)
     }
 
@@ -1534,42 +2421,15 @@ impl SourceAdapter for FileSource {
         if self.delete_if_quiet(&path).await {
             return Ok(Vec::new());
         }
-        let cursor = self.cursors.entry(path.clone()).or_default();
-        let start = cursor.read_byte;
         // Cheapest signal first (#100): an unchanged, fully-read file is
-        // skipped without an open. The marker still reports the cursor where
-        // it stands, so a skipped file is indistinguishable from one that was
-        // read and had nothing to give — which is what it is.
-        if let Some(current) = Self::stat_identity(&path) {
-            if Self::can_skip(cursor, &current) {
-                return Ok(vec![ReadResult {
-                    progress_start: Self::marker_from(&path, &current, start, start, None),
-                    progress_end: Self::marker_from(&path, &current, start, start, None),
-                    records: Vec::new(),
-                    first_timestamp: None,
-                    last_timestamp: None,
-                    verbatim: false,
-                }]);
-            }
-        }
-        let last_seen = self
-            .cursors
-            .get(&path)
-            .and_then(|c| c.seen.as_ref())
-            .map(FileIdentity::observed);
-        match Self::read_slice(
-            path.clone(),
-            start,
-            max_records,
-            max_bytes,
-            self.whole_file,
-            last_seen,
-        )
-        .await
-        {
-            Ok(slice) => Ok(vec![self.apply_slice(&path, slice)]),
-            Err(failed) => Err(self.apply_failed_read(&path, failed)),
-        }
+        // skipped without an open (see `run_job`). The marker still reports
+        // the cursor where it stands, so a skipped file is indistinguishable
+        // from one that was read and had nothing to give — which is what it is.
+        self.expire_rotated();
+        let job = self.read_job(&path);
+        let start = job.start;
+        let (outcome, drained) = Self::run_job(job, max_records, max_bytes, self.whole_file).await;
+        self.apply_outcome(&path, start, outcome, drained)
     }
 
     /// Read every file CONCURRENTLY (#96 B2). Each file's read is independent
@@ -1629,60 +2489,33 @@ impl SourceAdapter for FileSource {
                 deleted.insert(i);
             }
         }
-        let jobs: Vec<(usize, String, u64, Option<FileIdentity>)> = sources
+        self.expire_rotated();
+        let jobs: Vec<(usize, ReadJob)> = sources
             .iter()
             .enumerate()
             .filter(|(i, _)| !deleted.contains(i))
-            .map(|(i, s)| {
-                let path = s.source_name.clone();
-                let cursor = self.cursors.entry(path.clone()).or_default();
-                (i, path, cursor.read_byte, cursor.seen.clone())
-            })
+            .map(|(i, s)| (i, self.read_job(&s.source_name)))
             .collect();
 
-        let mut results: Vec<(usize, String, u64, PassOutcome)> =
-            futures::stream::iter(jobs.into_iter().map(|(i, path, start, seen)| async move {
-                // A path that cannot be stat'd is NOT skipped: it goes to
-                // the read, which reports the error properly instead of
-                // having it swallowed here as a silent skip.
-                let current = tokio::fs::metadata(&path)
-                    .await
-                    .ok()
-                    .map(|md| Self::identity_of(&md));
-                let snapshot = FileCursor {
-                    read_byte: start,
-                    seen,
-                    ..FileCursor::default()
-                };
-                let outcome = match current {
-                    Some(current) if Self::can_skip(&snapshot, &current) => {
-                        PassOutcome::SkippedUnchanged(current)
-                    }
-                    _ => {
-                        let last_seen = snapshot.seen.as_ref().map(FileIdentity::observed);
-                        PassOutcome::Read(
-                            Self::read_slice(
-                                path.clone(),
-                                start,
-                                max_records,
-                                max_bytes,
-                                whole_file,
-                                last_seen,
-                            )
-                            .await,
-                        )
-                    }
-                };
-                (i, path, start, outcome)
+        let mut results: Vec<(usize, String, u64, PassOutcome, bool)> =
+            futures::stream::iter(jobs.into_iter().map(|(i, job)| async move {
+                let (path, start) = (job.path.clone(), job.start);
+                let (outcome, drained) =
+                    Self::run_job(job, max_records, max_bytes, whole_file).await;
+                (i, path, start, outcome, drained)
             }))
             .buffer_unordered(FILE_READ_CONCURRENCY)
             .collect()
             .await;
-        results.extend(
-            deleted
-                .into_iter()
-                .map(|i| (i, sources[i].source_name.clone(), 0, PassOutcome::Deleted)),
-        );
+        results.extend(deleted.into_iter().map(|i| {
+            (
+                i,
+                sources[i].source_name.clone(),
+                0,
+                PassOutcome::Deleted,
+                false,
+            )
+        }));
         // buffer_unordered completes in I/O order; report in source order.
         results.sort_by_key(|(i, ..)| *i);
         // COUNTED, not silent. The issue asks for deferred work to be visible,
@@ -1691,7 +2524,7 @@ impl SourceAdapter for FileSource {
         // identical in every other metric.
         let skipped_count = results
             .iter()
-            .filter(|(_, _, _, outcome)| matches!(outcome, PassOutcome::SkippedUnchanged(_)))
+            .filter(|(_, _, _, outcome, _)| matches!(outcome, PassOutcome::SkippedUnchanged(_)))
             .count();
         if skipped_count > 0 {
             tracing::debug!(
@@ -1714,26 +2547,12 @@ impl SourceAdapter for FileSource {
         // a skipped file reports an empty read at the cursor it already
         // holds, so the caller sees one outcome per source however the cycle
         // got there.
-        for (source_index, path, start, outcome) in results {
-            let result = match outcome {
-                PassOutcome::SkippedUnchanged(id) => Ok(vec![ReadResult {
-                    progress_start: Self::marker_from(&path, &id, start, start, None),
-                    progress_end: Self::marker_from(&path, &id, start, start, None),
-                    records: Vec::new(),
-                    first_timestamp: None,
-                    last_timestamp: None,
-                    verbatim: false,
-                }]),
-                PassOutcome::Read(Ok(slice)) => {
-                    any_records |= !slice.records.is_empty();
-                    Ok(vec![self.apply_slice(&path, slice)])
-                }
-                PassOutcome::Read(Err(failed)) => {
-                    any_failed = true;
-                    Err(self.apply_failed_read(&path, failed))
-                }
-                PassOutcome::Deleted => Ok(Vec::new()),
-            };
+        for (source_index, path, start, outcome, drained) in results {
+            let result = self.apply_outcome(&path, start, outcome, drained);
+            match &result {
+                Ok(reads) => any_records |= reads.iter().any(|read| !read.is_empty()),
+                Err(_) => any_failed = true,
+            }
             report.outcomes.push(SourceReadOutcome {
                 source_index,
                 result,
@@ -1770,6 +2589,16 @@ impl SourceAdapter for FileSource {
                 "file adapter given non-file marker".into(),
             ));
         };
+        // Whatever the cursor makes of it below, these bytes of that file are
+        // archived: a descriptor kept to re-read them can be let go (#621) -
+        // if it still reaches the content they were read from.
+        self.note_committed(
+            path,
+            *marker_inode,
+            *end_byte,
+            marker_content.as_ref(),
+            marker_tail.as_ref(),
+        );
         // A batch read BEFORE a rotation or truncation commits after the
         // cursor has already restarted on the new content. Moving the cursor
         // to its offset would carry it past bytes of a file that were never
@@ -1962,46 +2791,69 @@ impl SourceAdapter for FileSource {
         // rotation or truncation has replaced it since, there is nothing at
         // those offsets to re-read, and rewinding the NEW file there would
         // archive its middle as though it were the lost range. Refuse, so the
-        // engine reports that the range will not be re-read (#558).
+        // engine reports that the range will not be re-read (#558) - unless
+        // the file it WAS read from can still be reached (#621, below).
+        self.expire_rotated();
         let (current_inode, current_size, current_head, current_tail) =
             Self::probe_with_tail(Path::new(path), *end_byte, marker_tail.as_ref());
-        if let Some(marker) = marker_inode {
-            if current_inode.is_some() && current_inode != Some(*marker) {
-                return Err(VtopError::Source(format!(
+        let refusal = 'refusal: {
+            if marker_inode
+                .is_some_and(|marker| current_inode.is_some() && current_inode != Some(marker))
+            {
+                break 'refusal Some(VtopError::Source(format!(
                     "cannot replay file {path}: file identity changed (rotation/replacement)"
                 )));
             }
-        }
-        // The marker records how long the file was when the range was read,
-        // and an append-only file only grows. A file now SHORTER than that has
-        // been truncated, even when the range starts early enough to fit in
-        // what is left: replaying from byte 0 would archive replacement bytes
-        // as though they were the range that was lost.
-        if *start_byte > current_size || current_size < *size_when_read {
-            return Err(VtopError::Source(format!(
-                "cannot replay file {path} at byte {start_byte}: file length is {current_size} \
-                 (truncated; it was {size_when_read} when this range was read)"
-            )));
-        }
-        // The same inode and no shorter, but other first bytes: a
-        // replacement that reused the inode (#578). Its offsets are not the
-        // range's either.
-        if let Some(content) = marker_content {
-            if !content.matches_head(&current_head) {
-                return Err(VtopError::Source(format!(
+            // The marker records how long the file was when the range was
+            // read, and an append-only file only grows. A file now SHORTER
+            // than that has been truncated, even when the range starts early
+            // enough to fit in what is left: replaying from byte 0 would
+            // archive replacement bytes as though they were the range that
+            // was lost.
+            if *start_byte > current_size || current_size < *size_when_read {
+                break 'refusal Some(VtopError::Source(format!(
+                    "cannot replay file {path} at byte {start_byte}: file length is \
+                     {current_size} (truncated; it was {size_when_read} when this range was \
+                     read)"
+                )));
+            }
+            // The same inode and no shorter, but other first bytes: a
+            // replacement that reused the inode (#578). Its offsets are not
+            // the range's either.
+            if let Some(content) = marker_content
+                .as_ref()
+                .filter(|content| !content.matches_head(&current_head))
+            {
+                break 'refusal Some(VtopError::Source(format!(
                     "cannot replay file {path}: its first {} bytes are not the ones this \
                      range was read after (replaced at the same inode)",
                     content.len
                 )));
             }
-        }
-        // The same first bytes, but other bytes below where the range ends:
-        // rewritten in place, keeping the first page (#620).
-        if !continuity::tail_is_current(marker_tail.as_ref(), &current_tail) {
-            return Err(VtopError::Source(format!(
-                "cannot replay file {path}: the bytes before byte {end_byte} are not the ones \
-                 this range was read with (rewritten at the same inode)"
-            )));
+            // The same first bytes, but other bytes below where the range
+            // ends: rewritten in place, keeping the first page (#620).
+            (!continuity::tail_is_current(marker_tail.as_ref(), &current_tail)).then(|| {
+                VtopError::Source(format!(
+                    "cannot replay file {path}: the bytes before byte {end_byte} are not the \
+                     ones this range was read with (rewritten at the same inode)"
+                ))
+            })
+        };
+        if let Some(refusal) = refusal {
+            // The file at the path is not the range's, but the range's file
+            // may still be reachable - through a descriptor kept on it, or
+            // under the name it was rotated to - and PROVEN to be the one the
+            // range was read from (#621). Otherwise the refusal stands.
+            if self.replay_rotated(marker) {
+                tracing::warn!(
+                    path,
+                    start_byte,
+                    "file rotated away since the range was read; the range is re-read from the \
+                     file it was read from"
+                );
+                return Ok(());
+            }
+            return Err(refusal);
         }
         let c = self.cursors.entry(path.clone()).or_default();
         c.read_byte = (*start_byte).max(c.committed_byte);
@@ -2035,6 +2887,21 @@ impl SourceAdapter for FileSource {
         else {
             return None;
         };
+        // A range being re-read from a rotated file (#621) lands where that
+        // re-read stands - for a marker of that file's content.
+        if let Some(replay) = self
+            .rotated
+            .iter()
+            .filter(|rotated| rotated.path == *path && Some(rotated.held.inode) == *marker_inode)
+            .filter(|rotated| {
+                marker_content
+                    .as_ref()
+                    .is_none_or(|marker| rotated.held.content.same_content(marker) != Some(false))
+            })
+            .find_map(|rotated| rotated.replay)
+        {
+            return Some(i128::from(replay.read_byte));
+        }
         let c = self.cursors.get(path)?;
         let (identity, content) = match c.rewound_for {
             // A rewind checked the marker against the file it rewound.
@@ -2113,47 +2980,37 @@ impl SourceAdapter for FileSource {
             return None;
         }
         let seen_content = seen.content.as_ref()?;
-        let same = seen_content.same_content(marker_content);
-        if same == Some(false) {
+        if seen_content.same_content(marker_content) == Some(false) {
             return None;
         }
-        let (current_inode, current_size, head, below) =
-            Self::probe_with_tail(Path::new(path), *end_byte, marker_tail.as_ref());
-        if current_inode != Some(*marker_inode) {
-            return None;
-        }
-        // An append-only file never gets shorter. One now shorter than the
-        // cursor's position, than the length the cursor saw, or than the
-        // length the marker's read saw has been truncated since - a rewrite
-        // in place that can keep the inode and the first page, so the checks
-        // above cannot see it - and the cursor's committed byte belongs to the
-        // content before it (review of #567, Codex).
-        if current_size < c.committed_byte
-            || current_size < seen.file_size
-            || current_size < *marker_size
-            || current_size < *end_byte
-        {
-            return None;
-        }
-        if same.is_none()
-            && !(seen_content.matches_head(&head) && marker_content.matches_head(&head))
-        {
-            return None;
-        }
-        if marker_tail
-            .as_ref()
-            .is_some_and(|tail| !tail.matches_bytes(&below))
-        {
-            return None;
-        }
-        if let Some(tail) = seen.tail.as_ref() {
-            let (current_inode, _, _, below) =
-                Self::probe_with_tail(Path::new(path), tail.end, Some(&tail.fingerprint));
-            if current_inode != Some(*marker_inode) || !tail.fingerprint.matches_bytes(&below) {
-                return None;
-            }
-        }
-        Some(i128::from(c.committed_byte))
+        // The one positive-identity test (`continuity::proves`), shared with
+        // the restart seed's choice and the rotated-file re-read (#621):
+        // - both first pages must match the file now at the path - equal
+        //   fingerprints too, which say nothing about what the file holds NOW;
+        // - an append-only file never gets shorter: one now shorter than the
+        //   cursor's position, the length the cursor saw, the length the
+        //   marker's read saw, or the range's end has been truncated since -
+        //   a rewrite in place that can keep the inode and the first page -
+        //   and the cursor's committed byte belongs to the content before it
+        //   (review of #567, Codex);
+        // - the marker's tail, and the cursor's own, must still be where they
+        //   were taken.
+        let marker_tail = continuity::Tail::at(*end_byte, marker_tail.clone());
+        let tails: Vec<&continuity::Tail> = marker_tail.iter().chain(seen.tail.as_ref()).collect();
+        let proven = continuity::proves_at_path(
+            Path::new(path),
+            &continuity::Identity {
+                inode: *marker_inode,
+                contents: &[seen_content, marker_content],
+                tails: &tails,
+                min_len: c
+                    .committed_byte
+                    .max(seen.file_size)
+                    .max(*marker_size)
+                    .max(*end_byte),
+            },
+        );
+        proven.then(|| i128::from(c.committed_byte))
     }
 
     fn source_type(&self) -> SourceType {
@@ -3005,6 +3862,52 @@ mod tests {
         assert_eq!(
             fs.committed_through(&marker(Some(inode), whole, None)),
             None
+        );
+    }
+
+    /// The committed point and the restart seed's choice (#621) share one
+    /// positive-identity test, which keeps the stricter rule of each: equal
+    /// first-page fingerprints in the marker and the cursor say they read the
+    /// same content, not that the file at the path STILL holds it. A file
+    /// rewritten in place - the same inode, longer, other first bytes - with
+    /// no tails recorded passed every other check and lent the old content's
+    /// committed byte to a range of it, retiring that range for good.
+    #[cfg(unix)]
+    #[test]
+    fn equal_fingerprints_still_have_to_match_the_file_now_at_the_path() {
+        use std::os::unix::fs::MetadataExt;
+        let old: Vec<u8> = (0..100u8).map(|i| b'a' + i % 26).collect();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&old).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let content = ContentFingerprint::of(&old);
+        let marker = ProgressMarker::File {
+            path: path.clone(),
+            inode: Some(inode),
+            start_byte: 0,
+            end_byte: 30,
+            file_size: 100,
+            mtime: String::new(),
+            content_fingerprint: content.clone(),
+            tail_fingerprint: None,
+        };
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        fs.seed_committed_from(&path, 40, Some(inode), Some(100), content, None);
+        assert_eq!(fs.committed_through(&marker), Some(40), "the file read");
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[b'Z'; 120])
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(
+            fs.committed_through(&marker),
+            None,
+            "the file at the path no longer starts with what both recorded"
         );
     }
 
@@ -4217,6 +5120,780 @@ mod tests {
         }
     }
 
+    // ---- a failed range from a file rotated away since it was read (#621) ---
+
+    /// One read pass over one path, through the per-source read.
+    async fn read_one(fs: &mut FileSource, path: &str) -> Vec<ReadResult> {
+        fs.read_batch_candidates(&src(path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap()
+    }
+
+    /// One read pass over one path, through the whole-adapter read the engine
+    /// uses.
+    async fn read_all_one(fs: &mut FileSource, path: &str) -> Vec<ReadResult> {
+        let report = fs
+            .read_all_batch_candidates(&[src(path)], 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        report
+            .outcomes
+            .into_iter()
+            .flat_map(|outcome| outcome.result.unwrap())
+            .collect()
+    }
+
+    fn file_marker(marker: &ProgressMarker) -> (Option<u64>, u64, u64) {
+        let ProgressMarker::File {
+            inode,
+            start_byte,
+            end_byte,
+            ..
+        } = marker
+        else {
+            panic!("a file marker");
+        };
+        (*inode, *start_byte, *end_byte)
+    }
+
+    /// #621: the batch fails after its file has been rotated away - renamed,
+    /// then compressed and removed, as logrotate does with `compress` and no
+    /// `delaycompress` - and a new file has taken the path. The rewind used to
+    /// be refused and the range was never archived. The adapter still holds a
+    /// descriptor on the file it read, and re-reads the range through it: the
+    /// original bytes, under the original inode, then the new file from byte 0.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_range_is_re_read_through_the_held_descriptor_after_its_file_is_rotated_away()
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "old 1\nold 2\nold 3\n").unwrap(); // 18 bytes
+        let old_inode = std::fs::metadata(&path).unwrap().ino();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = read_one(&mut fs, &path).await;
+        assert_eq!(lines(&first), ["old 1", "old 2", "old 3"]);
+
+        // The new file is created before the old one is removed, as logrotate
+        // does: a filesystem may hand a freed inode to the next file created.
+        let rotated = format!("{path}.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::write(&path, "new 1\n").unwrap();
+        std::fs::remove_file(&rotated).unwrap();
+        let new_inode = std::fs::metadata(&path).unwrap().ino();
+        assert_ne!(old_inode, new_inode, "the test needs a real rotation");
+
+        fs.replay_from_marker(&first[0].progress_start)
+            .await
+            .expect("the range is re-read through the descriptor still open on the old file");
+        let again = read_one(&mut fs, &path).await;
+        assert_eq!(
+            lines(&again),
+            ["old 1", "old 2", "old 3"],
+            "the failed range, from the file it was read from"
+        );
+        assert_eq!(
+            file_marker(&again[0].progress_end),
+            (Some(old_inode), 0, 18)
+        );
+        fs.commit_progress(&again[0].progress_end).await.unwrap();
+
+        let next = read_one(&mut fs, &path).await;
+        assert_eq!(lines(&next), ["new 1"], "then the new file, from byte 0");
+        assert_eq!(file_marker(&next[0].progress_end), (Some(new_inode), 0, 6));
+        fs.commit_progress(&next[0].progress_end).await.unwrap();
+        assert!(
+            lines(&read_one(&mut fs, &path).await).is_empty(),
+            "and nothing twice"
+        );
+    }
+
+    /// #621: the batch failed while its file was still at the path, so the
+    /// rewind was accepted - and the file was rotated before the re-read. The
+    /// next read found another inode and restarted on the new file, and the
+    /// range the engine had been told would be re-read never was, without an
+    /// error. The rewound range is now re-read from the old file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rewind_accepted_before_a_rotation_is_still_re_read_from_the_old_file() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "old 1\nold 2\n").unwrap(); // 12 bytes
+        let old_inode = std::fs::metadata(&path).unwrap().ino();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = read_all_one(&mut fs, &path).await;
+        assert_eq!(lines(&first), ["old 1", "old 2"]);
+        fs.replay_from_marker(&first[0].progress_start)
+            .await
+            .expect("the file is still at its path: an ordinary rewind");
+
+        let rotated = format!("{path}.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::write(&path, "new 1\n").unwrap();
+        std::fs::remove_file(&rotated).unwrap();
+
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for _ in 0..4 {
+            for read in read_all_one(&mut fs, &path).await {
+                if read.is_empty() {
+                    continue;
+                }
+                let (inode, start, end) = file_marker(&read.progress_end);
+                let got = lines(std::slice::from_ref(&read));
+                if inode == Some(old_inode) {
+                    old.push((start, end, got));
+                } else {
+                    new.push((start, end, got));
+                }
+                fs.commit_progress(&read.progress_end).await.unwrap();
+            }
+        }
+        assert_eq!(
+            old,
+            vec![(0, 12, vec!["old 1".to_string(), "old 2".to_string()])],
+            "the rewound range is re-read from the old file, once"
+        );
+        assert_eq!(new, vec![(0, 6, vec!["new 1".to_string()])]);
+    }
+
+    /// #621, across a restart: a fresh adapter holds no descriptor, so it
+    /// looks for the file the range was read from beside its path - the same
+    /// inode with the same first bytes, no shorter than when the range was
+    /// read - and re-reads the range from there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restarted_adapter_finds_a_failed_range_in_the_file_it_was_rotated_to() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "old 1\nold 2\n").unwrap(); // 12 bytes
+        let old_inode = std::fs::metadata(&path).unwrap().ino();
+        let start = {
+            let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+            read_one(&mut fs, &path).await[0].progress_start.clone()
+        }; // the engine stops
+
+        std::fs::rename(&path, format!("{path}.1")).unwrap();
+        std::fs::write(&path, "new 1\nnew 2\nnew 3\n").unwrap();
+
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        fs.replay_from_marker(&start)
+            .await
+            .expect("the rotated file is found beside the path and proven to be the one read");
+        let again = read_all_one(&mut fs, &path).await;
+        assert_eq!(lines(&again), ["old 1", "old 2"]);
+        assert_eq!(
+            file_marker(&again[0].progress_end),
+            (Some(old_inode), 0, 12)
+        );
+        fs.commit_progress(&again[0].progress_end).await.unwrap();
+        let next = read_all_one(&mut fs, &path).await;
+        assert_eq!(lines(&next), ["new 1", "new 2", "new 3"]);
+    }
+
+    /// #620 in the rotated-file proof: after a restart the search finds the
+    /// rotated file by inode, and its first page and length agree with the
+    /// marker - but it was rewritten in place below that page, so the page
+    /// ending where the failed range starts (what its start marker
+    /// fingerprints) is not the one it was read after. It is not the range's
+    /// file, and the rewind stays refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotated_file_rewritten_below_its_first_page_is_not_re_read_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let header = "#".repeat(ContentFingerprint::MAX_LEN + 100) + "\n";
+        std::fs::write(&path, format!("{header}old 1\n")).unwrap();
+        let start = {
+            let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+            let first = read_one(&mut fs, &path).await;
+            fs.commit_progress(&first[0].progress_end).await.unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"old 2\n")
+                .unwrap();
+            // The window that fails starts above byte 0.
+            let second = read_one(&mut fs, &path).await;
+            assert_eq!(lines(&second), ["old 2"]);
+            second[0].progress_start.clone()
+        }; // the engine stops
+        let ProgressMarker::File {
+            tail_fingerprint, ..
+        } = &start
+        else {
+            panic!("a file marker");
+        };
+        assert!(
+            tail_fingerprint.is_some(),
+            "its start marker fingerprints the page below it"
+        );
+
+        let rotated = format!("{path}.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::write(&path, "new 1\n").unwrap();
+        // Same inode, same first page, same length - other bytes below the
+        // range's start.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&rotated)
+            .unwrap();
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(header.len() as u64)).unwrap();
+        file.write_all(b"OLD 1\n").unwrap();
+        drop(file);
+
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let err = fs.replay_from_marker(&start).await.unwrap_err().to_string();
+        assert!(err.contains("identity changed"), "{err}");
+    }
+
+    /// Review of #621: the restart seed is the newest committed row of the
+    /// path, unless that row names a file no longer at the path (a re-read of
+    /// a rotated file commits after the current file's batches). Then it is
+    /// the current file's row - only on positive identity: the same inode,
+    /// the first page and the page below its end. Anything less keeps the
+    /// newest row, which costs a re-read of the current file, never a skip.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_restart_seed_is_the_file_at_the_path_only_when_it_is_proven() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "new 1\nnew 2\n").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let read = read_one(&mut fs, &path).await;
+        let ProgressMarker::File {
+            content_fingerprint,
+            tail_fingerprint,
+            ..
+        } = &read[0].progress_end
+        else {
+            panic!("a file marker");
+        };
+        let current = ArchivedEnd {
+            inode: Some(inode),
+            end_byte: 12,
+            content: content_fingerprint.clone(),
+            tail: tail_fingerprint.clone(),
+        };
+        assert!(current.content.is_some() && current.tail.is_some());
+        let rotated = ArchivedEnd {
+            inode: Some(inode + 1_000_000),
+            end_byte: 30,
+            content: ContentFingerprint::of(b"old"),
+            tail: ContentFingerprint::of_tail(b"old"),
+        };
+
+        assert_eq!(
+            FileSource::seed_choice(&path, &[current.clone(), rotated.clone()]),
+            0,
+            "the newest row is the file at the path: as before"
+        );
+        assert_eq!(
+            FileSource::seed_choice(&path, &[rotated.clone(), current.clone()]),
+            1,
+            "the newest row is a rotated file's re-read: the file at the path is proven"
+        );
+        let legacy = ArchivedEnd {
+            tail: None,
+            ..current.clone()
+        };
+        assert_eq!(
+            FileSource::seed_choice(&path, &[rotated.clone(), legacy]),
+            0,
+            "a row without the page below its end proves nothing"
+        );
+        // Rewritten in place below the first page: the same inode and first
+        // bytes, other bytes below the end.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"new 1\nNEW 2\n")
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        let short_head = ArchivedEnd {
+            content: ContentFingerprint::of(b"new 1\n"),
+            ..current.clone()
+        };
+        assert_eq!(
+            FileSource::seed_choice(&path, &[rotated, short_head]),
+            0,
+            "a file whose bytes below the end changed is not the row's file"
+        );
+    }
+
+    /// #621 with `delete_after_commit` (#619): a delete can find the path's
+    /// descriptor still held. A later window was read, then the file was cut
+    /// back to the end of an earlier one before that window committed. The
+    /// earlier window's commit is current and covers the whole (shortened)
+    /// file, so it records the delete. It does not release the descriptor,
+    /// whose later range is still outstanding. Once the file is deleted and its
+    /// cursor dropped, nothing reads that path again, so nothing else would
+    /// ever close the descriptor: it pinned the deleted file's space, and a
+    /// slot of the limit, for the life of the process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_delete_closes_a_descriptor_the_adapter_still_held_for_that_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "a 1\n").unwrap(); // 4 bytes
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let first = read_all_one(&mut fs, &path).await;
+        assert_eq!(lines(&first), ["a 1"]);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"b 2\n")
+            .unwrap();
+        let second = read_all_one(&mut fs, &path).await;
+        assert_eq!(
+            lines(&second),
+            ["b 2"],
+            "a later window, [4, 8), outstanding"
+        );
+        // Cut back to the first window's end before the second commits.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(4)
+            .unwrap();
+
+        fs.commit_progress(&first[0].progress_end).await.unwrap();
+        assert!(
+            !Path::new(&path).exists(),
+            "the first window covers the whole file now, so it is deleted"
+        );
+        assert!(
+            fs.held.is_empty(),
+            "and the descriptor held for its outstanding range is closed with it"
+        );
+    }
+
+    /// #621 with `delete_after_commit` (#619): the re-read of a rotated range
+    /// and the deferred delete work on the same path without stepping on each
+    /// other. The re-read's commit names the rotated file's inode, which is
+    /// not the file at the path, so it records no delete candidate: neither
+    /// the rotated file nor the new one is deleted for it. The new file, once
+    /// fully archived and unwritten for the quiet period, is deleted as usual,
+    /// and nothing the adapter held for that path outlives it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotated_re_read_and_delete_after_commit_share_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let rotated = format!("{path}.1");
+        std::fs::write(&path, "old 1\nold 2\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let first = read_all_one(&mut fs, &path).await;
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::write(&path, "new 1\n").unwrap();
+        fs.replay_from_marker(&first[0].progress_start)
+            .await
+            .expect("re-read through the held descriptor");
+
+        let again = read_all_one(&mut fs, &path).await;
+        assert_eq!(lines(&again), ["old 1", "old 2"]);
+        fs.commit_progress(&again[0].progress_end).await.unwrap();
+        assert!(
+            Path::new(&rotated).exists() && Path::new(&path).exists(),
+            "the re-read's commit deletes neither the rotated file nor the new one"
+        );
+
+        let next = read_all_one(&mut fs, &path).await;
+        assert_eq!(lines(&next), ["new 1"]);
+        fs.commit_progress(&next[0].progress_end).await.unwrap();
+        assert!(
+            !Path::new(&path).exists(),
+            "the new file, fully archived and quiet, is deleted as before"
+        );
+        assert!(
+            Path::new(&rotated).exists(),
+            "the rotated file is not this adapter's to delete"
+        );
+        assert!(
+            fs.held.is_empty() && fs.rotated.is_empty(),
+            "no descriptor outlives what it was kept for"
+        );
+    }
+
+    /// Review of #621: a commit raises a held file's commit floor only if it
+    /// was read from the content that file holds NOW, not merely from its
+    /// inode. A window of the old content, committed late after the file was
+    /// rewritten in place, raised the floor of the new content's descriptor.
+    /// When the new content's range then failed and the file was renamed away
+    /// before the re-read, the re-read started at the old window's end and
+    /// skipped the new content's first bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_late_commit_of_replaced_content_does_not_raise_the_held_files_floor() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "old 1\n").unwrap(); // 6 bytes
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let old = read_all_one(&mut fs, &path).await;
+        assert_eq!(lines(&old), ["old 1"]);
+
+        // Rewritten in place, same inode, longer, other first bytes.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"NEW 1\nNEW 2\n")
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        let new = read_all_one(&mut fs, &path).await;
+        assert_eq!(
+            lines(&new),
+            ["NEW 1", "NEW 2"],
+            "the replacement, from byte 0"
+        );
+
+        // The old window commits late; the new one fails and is handed back.
+        fs.commit_progress(&old[0].progress_end).await.unwrap();
+        fs.replay_from_marker(&new[0].progress_start)
+            .await
+            .expect("the new content is still at its path");
+        // Renamed away before the re-read, nothing in its place.
+        std::fs::rename(&path, format!("{path}.1")).unwrap();
+
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let sources = fs.discover_sources().await.unwrap();
+            let report = fs
+                .read_all_batch_candidates(&sources, 100, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            for outcome in report.outcomes {
+                for read in outcome.result.unwrap() {
+                    if read.is_empty() {
+                        continue;
+                    }
+                    got.push((
+                        file_marker(&read.progress_end),
+                        lines(std::slice::from_ref(&read)),
+                    ));
+                    fs.commit_progress(&read.progress_end).await.unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            got,
+            vec![(
+                (Some(inode), 0, 12),
+                vec!["NEW 1".to_string(), "NEW 2".to_string()]
+            )],
+            "the new content's range from its first byte, not from the old window's end"
+        );
+    }
+
+    /// Review of #621: a rewind of a rotated file's re-read never goes below
+    /// what is committed from that file, as a rewind of a file at its path
+    /// never goes below its committed point. Recovery rewinds, then commits a
+    /// VERIFIED row of the same file that starts where the pending range does
+    /// (the object that replaced a stale row for the same bytes), then rewinds
+    /// again. Kept at the first rewind's position, the second re-read the
+    /// bytes that commit had just archived.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotated_re_read_is_never_rewound_below_what_is_committed_of_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "old 1\nold 2\n").unwrap(); // 12 bytes
+        let (start, end) = {
+            let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+            let read = read_one(&mut fs, &path).await;
+            (read[0].progress_start.clone(), read[0].progress_end.clone())
+        };
+        std::fs::rename(&path, format!("{path}.1")).unwrap();
+        std::fs::write(&path, "new 1\n").unwrap();
+
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        fs.replay_from_marker(&start).await.unwrap();
+        // The VERIFIED row for the same bytes commits during recovery.
+        fs.commit_progress(&end).await.unwrap();
+        fs.replay_from_marker(&start).await.unwrap();
+        assert_eq!(fs.read_position(&start), Some(12), "landed at the commit");
+
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            for read in read_all_one(&mut fs, &path).await {
+                got.extend(lines(std::slice::from_ref(&read)));
+                fs.commit_progress(&read.progress_end).await.unwrap();
+            }
+        }
+        assert_eq!(got, ["new 1"], "the committed bytes are not archived again");
+    }
+
+    /// Recovery rewinds every range twice (once to learn where it lands, once
+    /// after the commits). A rotated file's range is re-read once, not twice.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotated_range_rewound_twice_is_re_read_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "old 1\nold 2\n").unwrap();
+        let start = {
+            let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+            read_one(&mut fs, &path).await[0].progress_start.clone()
+        };
+        std::fs::rename(&path, format!("{path}.1")).unwrap();
+        std::fs::write(&path, "new 1\n").unwrap();
+
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        for result in fs
+            .replay_from_markers(&[start.clone(), start.clone()])
+            .await
+        {
+            result.unwrap();
+        }
+        fs.replay_from_marker(&start).await.unwrap();
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            for read in read_all_one(&mut fs, &path).await {
+                got.extend(lines(std::slice::from_ref(&read)));
+                fs.commit_progress(&read.progress_end).await.unwrap();
+            }
+        }
+        assert_eq!(got, ["old 1", "old 2", "new 1"]);
+    }
+
+    /// #621 (review): a rewind accepted while the file was at its path, then
+    /// the file renamed away with NOTHING created at the path. No pattern
+    /// matches the path any more, so discovery dropped it, no read ran, and
+    /// the rewound range sat behind a held descriptor that was never read.
+    /// The path stays a source until the rewound range is re-read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rewound_file_renamed_away_with_nothing_at_its_path_is_still_re_read() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "old 1\nold 2\n").unwrap(); // 12 bytes
+        let old_inode = std::fs::metadata(&path).unwrap().ino();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = read_all_one(&mut fs, &path).await;
+        fs.replay_from_marker(&first[0].progress_start)
+            .await
+            .expect("the file is still at its path: an ordinary rewind");
+        std::fs::rename(&path, format!("{path}.1")).unwrap();
+
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let sources = fs.discover_sources().await.unwrap();
+            let report = fs
+                .read_all_batch_candidates(&sources, 100, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            for outcome in report.outcomes {
+                for read in outcome.result.unwrap() {
+                    if read.is_empty() {
+                        continue;
+                    }
+                    got.push((
+                        file_marker(&read.progress_end),
+                        lines(std::slice::from_ref(&read)),
+                    ));
+                    fs.commit_progress(&read.progress_end).await.unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            got,
+            vec![(
+                (Some(old_inode), 0, 12),
+                vec!["old 1".to_string(), "old 2".to_string()]
+            )],
+            "the rewound range, once, from the file renamed away"
+        );
+        assert!(
+            fs.discover_sources().await.unwrap().is_empty(),
+            "and the path is no longer a source once it is archived"
+        );
+    }
+
+    /// #621 (review): a rotated file truncated after its rewind was accepted
+    /// keeps its first page when the cut is above it, so the fingerprint still
+    /// matches. The re-read then archived a shortened prefix of the range and
+    /// called it done. The descriptor must still be as long as the file was
+    /// when its ranges were read; a shorter one is refused, loudly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotated_file_truncated_after_its_rewind_is_refused_not_read_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let old: String = (0..200)
+            .map(|i| format!("line {i:04} of the old file\n"))
+            .collect();
+        assert!(old.len() > 4096 + 500, "longer than the fingerprinted page");
+        std::fs::write(&path, &old).unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = fs
+            .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(first[0].records.len(), 200);
+
+        let rotated = format!("{path}.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::write(&path, "new 1\n").unwrap();
+        fs.replay_from_marker(&first[0].progress_start)
+            .await
+            .expect("the held descriptor proves the file");
+        // Cut above the first page: the fingerprint still matches.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&rotated)
+            .unwrap()
+            .set_len(4_500)
+            .unwrap();
+
+        let err = fs
+            .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+            .await
+            .expect_err("a shortened rotated file must not be re-read as if it were the range")
+            .to_string();
+        assert!(err.contains("shorter"), "{err}");
+        assert_eq!(
+            fs.take_refused_rereads(),
+            vec![path.clone()],
+            "the refusal is handed to the engine to count"
+        );
+        let next = fs
+            .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(lines(&next), ["new 1"], "the new file is read as before");
+    }
+
+    /// #621: the descriptors are bounded. Past the limit a file is not held,
+    /// and a rotated file's descriptor with no re-read in progress is closed
+    /// once unused for the hold time - after which a range of a rotated file
+    /// that is gone cannot be re-read, and is refused as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn held_descriptors_are_bounded_in_number_and_in_time() {
+        fn rotate_away(path: &str) {
+            std::fs::rename(path, format!("{path}.1")).unwrap();
+            std::fs::write(path, "new 1\n").unwrap();
+            std::fs::remove_file(format!("{path}.1")).unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.log").to_string_lossy().into_owned();
+        let b = dir.path().join("b.log").to_string_lossy().into_owned();
+        std::fs::write(&a, "a 1\n").unwrap();
+        std::fs::write(&b, "b 1\n").unwrap();
+
+        // One descriptor at most: the first file read is held, the second not.
+        let mut fs = FileSource::new(vec![a.clone(), b.clone()], TelemetryFormat::Raw, false)
+            .with_hold_limits(1, Duration::from_secs(3600));
+        let start_a = read_one(&mut fs, &a).await[0].progress_start.clone();
+        let start_b = read_one(&mut fs, &b).await[0].progress_start.clone();
+        rotate_away(&a);
+        rotate_away(&b);
+        fs.replay_from_marker(&start_a)
+            .await
+            .expect("held within the limit");
+        let err = fs
+            .replay_from_marker(&start_b)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("identity changed"), "{err}");
+
+        // No hold time: the rotated file's descriptor is closed at the next
+        // pass, before its range fails.
+        std::fs::write(&a, "a 2\n").unwrap();
+        let mut fs = FileSource::new(vec![a.clone()], TelemetryFormat::Raw, false)
+            .with_hold_limits(8, Duration::ZERO);
+        let start = read_one(&mut fs, &a).await[0].progress_start.clone();
+        rotate_away(&a);
+        assert_eq!(lines(&read_one(&mut fs, &a).await), ["new 1"]);
+        assert_eq!(fs.rotated.len(), 1, "kept: its range is not committed");
+        let err = fs.replay_from_marker(&start).await.unwrap_err().to_string();
+        assert!(err.contains("identity changed"), "{err}");
+        assert!(fs.rotated.is_empty() && fs.held.len() <= 1);
+    }
+
+    /// #621: a range is re-read from another file only when that file is
+    /// PROVEN to be the one it was read from. Anything else keeps the loud
+    /// refusal: a `copytruncate` copy (a new inode holding the same bytes), a
+    /// rotated file rewritten in place, a rotated file that is gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_range_is_re_read_from_a_rotated_file_only_when_its_identity_is_proven() {
+        let old = "old 1\nold 2\n";
+        let setup = || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("app.log").to_string_lossy().into_owned();
+            std::fs::write(&path, old).unwrap();
+            (dir, path)
+        };
+        async fn first_start(path: &str) -> ProgressMarker {
+            let mut fs = FileSource::new(vec![path.to_string()], TelemetryFormat::Raw, false);
+            read_one(&mut fs, path).await[0].progress_start.clone()
+        }
+
+        // copytruncate, in the same process: the copy has a new inode, and the
+        // descriptor on the original now reads the truncated content.
+        let (_dir, path) = setup();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let start = read_one(&mut fs, &path).await[0].progress_start.clone();
+        std::fs::copy(&path, format!("{path}.1")).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"n\n")
+            .unwrap();
+        let err = fs.replay_from_marker(&start).await.unwrap_err().to_string();
+        assert!(err.contains("truncated"), "{err}");
+        assert_eq!(lines(&read_one(&mut fs, &path).await), ["n"]);
+
+        // Rotated, then rewritten in place: the same inode, other first bytes.
+        let (_dir, path) = setup();
+        let start = first_start(&path).await;
+        let rotated = format!("{path}.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&rotated)
+            .unwrap()
+            .write_all(b"OLD 1\n")
+            .unwrap();
+        std::fs::write(&path, "new 1\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let err = fs.replay_from_marker(&start).await.unwrap_err().to_string();
+        assert!(err.contains("identity changed"), "{err}");
+
+        // Rotated, and gone before a restart: nothing holds it any more.
+        let (_dir, path) = setup();
+        let start = first_start(&path).await;
+        std::fs::rename(&path, format!("{path}.1")).unwrap();
+        std::fs::write(&path, "new 1\n").unwrap();
+        std::fs::remove_file(format!("{path}.1")).unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let err = fs.replay_from_marker(&start).await.unwrap_err().to_string();
+        assert!(err.contains("identity changed"), "{err}");
+        assert_eq!(
+            lines(&read_one(&mut fs, &path).await),
+            ["new 1"],
+            "a refused range leaves the new file's read alone"
+        );
+    }
     // ---- delete_after_commit on a file still being written (#619) -----------
 
     /// #619 (A): the delete decision is a check and the unlink an act, with
