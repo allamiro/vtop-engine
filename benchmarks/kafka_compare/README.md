@@ -185,6 +185,14 @@ default) and the VTOP side by its native client (`vtop-node produce` via
   consumer process: ... TimeoutException`: that is how `kafka-console-consumer.sh` ends a read with
   `--timeout-ms` once no record arrives for 20 s, not a failed read-back. The next line,
   `Processed a total of N messages`, is the read; the verdict is the `verify` column.
+- **Host contention.** The host is shared and not quieted. `host_noise.csv` samples it every 30 s (load
+  average, CPU idle, Docker containers including `rust:` builds, Lima VMs running), and `environment.json`
+  `host_noise` summarises it for the run and per repetition. The report names the repetitions it affected.
+- **Committed run, and the one it superseded.** `results/failover-20261111T032549Z` is the committed run.
+  It replaced `results/failover-20261110T185855Z`, whose VTOP producer sent a batch when its first record
+  was due and stamped acknowledgements after fsyncing its floor file, so its VTOP 30 s-before p99 was not
+  comparable with Kafka's (#613 review). That run was added in e0c3d35 and is last present, unchanged, in
+  190037b on the #613 branch (`git show 190037b:benchmarks/kafka_compare/results/failover-20261110T185855Z/failover.csv`).
 
 ## Known gaps
 

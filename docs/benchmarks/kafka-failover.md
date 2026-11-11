@@ -4,7 +4,7 @@
 
 > **Single host, Apple M5 Max (Mac17,6), Docker Desktop 4.99.0 (245822); indicative, not a production benchmark.** Both clusters ran as Linux containers in the same Docker Desktop VM, one at a time, with identical per-node limits.
 
-[#597](https://github.com/allamiro/vtop-engine/issues/597), part of [#595](https://github.com/allamiro/vtop-engine/issues/595); charts per [#600](https://github.com/allamiro/vtop-engine/issues/600). Raw data: [`failover.csv`](../../benchmarks/kafka_compare/results/failover-20261110T185855Z/failover.csv), [`timeline.csv`](../../benchmarks/kafka_compare/results/failover-20261110T185855Z/timeline.csv) and [`environment.json`](../../benchmarks/kafka_compare/results/failover-20261110T185855Z/environment.json), run `failover-20261110T185855Z`. Every number below is generated from those files by `benchmarks/kafka_compare/report.py`.
+[#597](https://github.com/allamiro/vtop-engine/issues/597), part of [#595](https://github.com/allamiro/vtop-engine/issues/595); charts per [#600](https://github.com/allamiro/vtop-engine/issues/600). Raw data: [`failover.csv`](../../benchmarks/kafka_compare/results/failover-20261111T032549Z/failover.csv), [`timeline.csv`](../../benchmarks/kafka_compare/results/failover-20261111T032549Z/timeline.csv) and [`environment.json`](../../benchmarks/kafka_compare/results/failover-20261111T032549Z/environment.json), run `failover-20261111T032549Z`. Every number below is generated from those files by `benchmarks/kafka_compare/report.py`.
 
 ## First finding: a Kafka client cannot follow a VTOP failover
 
@@ -39,16 +39,16 @@ Median (min - max) over the repetitions that ran, each system at its shipped tim
 
 | fault | system | unavailability window (longest ack gap after the fault) | time to new leader | p99 latency, 30 s after | p99 latency, 30 s before | client retries (each client's own count, not comparable) | acked lost | duplicates |
 |---|---|---|---|---|---|---|---|---|
-| kill -9 of the leader | Kafka | 9.18 s (8.91 s - 13.5 s) | 8.45 s (7.89 s - 12.5 s) | 8.88 s (8.61 s - 13.2 s) | 8 ms (6 ms - 8 ms) | 4 (2 - 4) | 0 (0 - 0) | 0 (0 - 0) |
-| kill -9 of the leader | VTOP | 28.9 s (28.6 s - 29.0 s) | 13.4 s (13.2 s - 13.6 s) | 28.7 s (28.3 s - 28.8 s) | 8 ms (8 ms - 9 ms) | 256 (231 - 258) | 0 (0 - 0) | 0 (0 - 0) |
-| orderly stop of the leader | Kafka | 1.03 s (35 ms - 2.06 s) | 50 ms (47 ms - 66 ms) | 750 ms (7 ms - 1.78 s) | 7 ms (7 ms - 9 ms) | 2 (2 - 2) | 0 (0 - 0) | 0 (0 - 0) |
-| orderly stop of the leader | VTOP | 15.5 s (13.3 s - 16.9 s) | 1.51 s (937 ms - 3.13 s) | 15.3 s (13.0 s - 16.7 s) | 8 ms (8 ms - 8 ms) | 111 (108 - 145) | 0 (0 - 0) | 0 (0 - 0) |
-| network partition of the leader | Kafka | 30.0 s (30.0 s - 30.0 s) | 11.7 s (8.84 s - 12.8 s) | 29.7 s (29.7 s - 29.8 s) | 8 ms (7 ms - 9 ms) | 5 (5 - 5) | 0 (0 - 0) | 0 (0 - 0) |
-| network partition of the leader | VTOP | 30.1 s (30.1 s - 30.1 s) | 13.5 s (12.9 s - 13.6 s) | 29.9 s (29.9 s - 29.9 s) | 8 ms (8 ms - 9 ms) | 13 (7 - 29) | 0 (0 - 0) | 0 (0 - 0) |
+| kill -9 of the leader | Kafka | 10.2 s (8.64 s - 17.8 s) | 9.27 s (7.68 s - 12.3 s) | 9.96 s (8.37 s - 17.5 s) | 28 ms (8 ms - 247 ms) | 6 (4 - 10) | 0 (0 - 0) | 0 (0 - 0) |
+| kill -9 of the leader | VTOP | 25.7 s (24.9 s - 28.9 s) | 12.8 s (12.0 s - 13.4 s) | 25.6 s (25.0 s - 28.8 s) | 1.05 s (30 ms - 28.2 s) | 193 (144 - 226) | 0 (0 - 0) | 0 (0 - 0) |
+| orderly stop of the leader | Kafka | 67 ms (41 ms - 1.08 s) | 101 ms (88 ms - 152 ms) | 7 ms (6 ms - 902 ms) | 7 ms (7 ms - 10 ms) | 2 (2 - 10) | 0 (0 - 0) | 0 (0 - 0) |
+| orderly stop of the leader | VTOP | 16.7 s (13.6 s - 19.3 s) | 2.20 s (2.16 s - 3.02 s) | 16.4 s (13.3 s - 22.3 s) | 106 ms (30 ms - 531 ms) | 112 (104 - 135) | 0 (0 - 0) | 0 (0 - 0) |
+| network partition of the leader | Kafka | 30.0 s (30.0 s - 30.0 s) | 8.74 s (7.89 s - 12.2 s) | 29.7 s (29.7 s - 29.8 s) | 7 ms (6 ms - 8 ms) | 5 (5 - 5) | 0 (0 - 0) | 0 (0 - 0) |
+| network partition of the leader | VTOP | 30.1 s (30.1 s - 30.2 s) | 12.9 s (12.8 s - 13.3 s) | 29.9 s (29.9 s - 29.9 s) | 27 ms (26 ms - 312 ms) | 7 (7 - 21) | 0 (0 - 0) | 0 (0 - 0) |
 
-The unavailability window is the longest gap between acknowledgements after the fault, so a repetition with no outage still reports one: its longest ordinary gap. In Kafka stop_leader repetition 2 (35 ms, starting 615 ms after the fault, against a 30 ms steady-state longest gap) the gap is within twice the steady-state one: the producer saw no outage, and that value is jitter, not a failover time. It is still counted in the median and range above.
+The unavailability window is the longest gap between acknowledgements after the fault, so a repetition with no outage still reports one: its longest ordinary gap. In Kafka stop_leader repetition 1 (41 ms, starting 34.3 s after the fault, against a 36 ms steady-state longest gap), Kafka stop_leader repetition 2 (61 ms, starting 48.4 s after the fault, against a 28 ms steady-state longest gap), Kafka stop_leader repetition 4 (67 ms, starting 50.3 s after the fault, against a 25 ms steady-state longest gap) the gap is within twice the steady-state one or began after a new leader had been named: the producer saw no outage from the fault, and that value is not a failover time. It is still counted in the median and range above.
 
-**VTOP's latency in this run is off in a way the run cannot correct.** Its producer (`vtop-node produce --rate`, batches of 100) sent each batch when the batch's FIRST record was due, so the other records left up to 19.8 ms before their scheduled send time, which makes a latency measured from the schedule short by up to that much; and it stamped each acknowledgement only after fsyncing its acked-floor file to the bind-mounted output directory, which makes every latency long by that fsync, a time this run did not record. The early send alone (up to 19.8 ms) is not small against VTOP's 30 s-before p99 (at most 9 ms here), and the fsync's effect cannot be quantified, so that column is not comparable with Kafka's. Against its 30 s-after p99 (at least 13.0 s here) the early send is small. The unavailability window and the time to new leader do not use the schedule (the window's ends can each move by one fsync). The producer has been fixed; a VTOP p99 before that is comparable needs a re-run.
+**Pre-fault windows that were not a quiet steady state.** Kept in every table above, and named here. In VTOP kill9_leader repetition 2 (30 s-before p99 26.3 s, steady-state longest gap 609 ms; host load up to 19.66, CPU idle down to 22.11%, up to 5 `rust:` build containers); VTOP kill9_leader repetition 3 (30 s-before p99 28.2 s, steady-state longest gap 824 ms; host load up to 18.44, CPU idle down to 22.59%, up to 6 `rust:` build containers); VTOP kill9_leader repetition 4 (30 s-before p99 1.05 s, steady-state longest gap 251 ms; host load up to 10.89, CPU idle down to 52.58%, up to 3 `rust:` build containers) the producer was more than a second behind its schedule before any fault, so the offered rate was not sustained there and that p99 is queueing, not service latency. The host was oversubscribed (one-minute load above its 18 logical CPUs) during Kafka kill9_leader repetition 1, VTOP kill9_leader repetition 1, Kafka kill9_leader repetition 2, VTOP kill9_leader repetition 2, Kafka kill9_leader repetition 3, VTOP kill9_leader repetition 3: every number from those repetitions carries that contention.
 
 ![Unavailability and time to leader](img/kafka-failover-unavailability.png)
 
@@ -58,36 +58,36 @@ The unavailability window is the longest gap between acknowledgements after the 
 
 | system | fault | rep | status | leader | leader was metadata leader | unavailable | gap starts | steady max gap | to new leader | new leader | p99 after | sent errors | retries | re-routes | error classes | verify |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Kafka | kill9_leader | 1 | ok | 2 | false | 8.95 s | 4 ms | 27 ms | 8.98 s | 3 | 8.66 s | 0 | 4 | - | code:NETWORK_EXCEPTION 2; connect_failures 13; retries 4 | passed |
-| Kafka | kill9_leader | 2 | ok | 1 | false | 9.18 s | 11 ms | 29 ms | 8.19 s | 2 | 8.88 s | 0 | 4 | - | code:NETWORK_EXCEPTION 2; connect_failures 13; retries 4 | passed |
-| Kafka | kill9_leader | 3 | ok | 2 | true | 13.5 s | 10 ms | 30 ms | 12.5 s | 3 | 13.2 s | 0 | 4 | - | code:NETWORK_EXCEPTION 2; connect_failures 16; retries 4 | passed |
-| Kafka | kill9_leader | 4 | ok | 2 | false | 9.44 s | 4 ms | 46 ms | 8.45 s | 3 | 9.14 s | 0 | 4 | - | code:NETWORK_EXCEPTION 2; connect_failures 13; retries 4 | passed |
-| Kafka | kill9_leader | 5 | ok | 2 | false | 8.91 s | 13 ms | 37 ms | 7.89 s | 3 | 8.61 s | 0 | 2 | - | code:NETWORK_EXCEPTION 1; connect_failures 12; retries 2 | passed |
-| Kafka | stop_leader | 1 | ok | 1 | false | 1.03 s | 44 ms | 25 ms | 56 ms | 2 | 764 ms | 0 | 2 | - | code:NOT_LEADER_OR_FOLLOWER 1; retries 2 | passed |
-| Kafka | stop_leader | 2 | ok | 2 | false | 35 ms | 615 ms | 30 ms | 47 ms | 3 | 7 ms | 0 | 2 | - | code:NOT_LEADER_OR_FOLLOWER 1; retries 2 | passed |
-| Kafka | stop_leader | 3 | ok | 3 | true | 1.03 s | 46 ms | 28 ms | 66 ms | 1 | 739 ms | 0 | 2 | - | code:NOT_LEADER_OR_FOLLOWER 1; retries 2 | passed |
-| Kafka | stop_leader | 4 | ok | 3 | false | 1.03 s | 42 ms | 26 ms | 50 ms | 1 | 750 ms | 0 | 2 | - | code:NOT_LEADER_OR_FOLLOWER 1; retries 2 | passed |
-| Kafka | stop_leader | 5 | ok | 2 | false | 2.06 s | 36 ms | 31 ms | 50 ms | 3 | 1.78 s | 0 | 2 | - | code:NOT_LEADER_OR_FOLLOWER 1; retries 2 | passed |
-| Kafka | partition_leader | 1 | ok | 1 | false | 30.0 s | 8 ms | 32 ms | 8.84 s | 2 | 29.7 s | 0 | 5 | - | code:REQUEST_TIMED_OUT 5; retries 5 | passed |
-| Kafka | partition_leader | 2 | ok | 2 | true | 30.0 s | 10 ms | 35 ms | 11.7 s | 3 | 29.8 s | 0 | 5 | - | code:REQUEST_TIMED_OUT 5; retries 5 | passed |
-| Kafka | partition_leader | 3 | ok | 1 | true | 30.0 s | 9 ms | 36 ms | 12.8 s | 2 | 29.7 s | 0 | 5 | - | code:REQUEST_TIMED_OUT 5; retries 5 | passed |
-| Kafka | partition_leader | 4 | ok | 3 | true | 30.0 s | 9 ms | 25 ms | 12.8 s | 1 | 29.7 s | 0 | 5 | - | code:REQUEST_TIMED_OUT 5; retries 5 | passed |
-| Kafka | partition_leader | 5 | ok | 3 | false | 30.0 s | 10 ms | 37 ms | 8.87 s | 1 | 29.7 s | 0 | 5 | - | code:REQUEST_TIMED_OUT 5; retries 5 | passed |
-| VTOP | kill9_leader | 1 | ok | 1 | true | 28.6 s | 12 ms | 43 ms | 13.2 s | 3 | 28.3 s | 231 | 231 | 1 | connection lost 1; name not resolvable 98; node not serving (handshake closed) 132 | passed |
-| VTOP | kill9_leader | 2 | ok | 3 | false | 28.8 s | 9 ms | 36 ms | 13.4 s | 1 | 28.5 s | 254 | 254 | 1 | connection lost 1; name not resolvable 113; node not serving (handshake closed) 140 | passed |
-| VTOP | kill9_leader | 3 | ok | 3 | false | 28.9 s | -2 ms | 33 ms | 13.4 s | 1 | 28.7 s | 256 | 256 | 1 | connection lost 1; name not resolvable 112; node not serving (handshake closed) 143 | passed |
-| VTOP | kill9_leader | 4 | ok | 3 | false | 29.0 s | 12 ms | 35 ms | 13.6 s | 1 | 28.8 s | 258 | 258 | 1 | connection lost 1; name not resolvable 113; node not serving (handshake closed) 144 | passed |
-| VTOP | kill9_leader | 5 | ok | 3 | false | 29.0 s | -0 ms | 39 ms | 13.5 s | 1 | 28.7 s | 258 | 258 | 1 | connection lost 1; name not resolvable 114; node not serving (handshake closed) 143 | passed |
-| VTOP | stop_leader | 1 | ok | 1 | true | 15.5 s | 12 ms | 35 ms | 3.08 s | 3 | 15.3 s | 110 | 110 | 1 | connection lost 1; node not serving (handshake closed) 109 | passed |
-| VTOP | stop_leader | 2 | ok | 3 | false | 16.9 s | 14 ms | 45 ms | 1.51 s | 2 | 16.7 s | 143 | 143 | 1 | connection lost 1; node not serving (handshake closed) 142 | passed |
-| VTOP | stop_leader | 3 | ok | 3 | false | 16.9 s | -1 ms | 36 ms | 1.50 s | 1 | 16.7 s | 145 | 145 | 1 | connection lost 1; node not serving (handshake closed) 144 | passed |
-| VTOP | stop_leader | 4 | ok | 2 | false | 13.3 s | -6 ms | 42 ms | 937 ms | 1 | 13.0 s | 111 | 111 | 1 | connection lost 1; node not serving (handshake closed) 110 | passed |
-| VTOP | stop_leader | 5 | ok | 1 | true | 15.5 s | 11 ms | 32 ms | 3.13 s | 3 | 15.3 s | 108 | 108 | 1 | connection lost 1; node not serving (handshake closed) 107 | passed |
-| VTOP | partition_leader | 1 | ok | 3 | false | 30.1 s | 11 ms | 35 ms | 13.5 s | 2 | 29.9 s | 13 | 13 | 1 | node not serving (handshake closed) 12; request timeout 1 | passed |
-| VTOP | partition_leader | 2 | ok | 3 | false | 30.1 s | 6 ms | 32 ms | 13.6 s | 1 | 29.9 s | 29 | 29 | 1 | node not serving (handshake closed) 12; produce rejected 16; request timeout 1 | passed |
-| VTOP | partition_leader | 3 | ok | 3 | false | 30.1 s | 19 ms | 46 ms | 13.5 s | 1 | 29.9 s | 13 | 13 | 1 | node not serving (handshake closed) 12; request timeout 1 | passed |
-| VTOP | partition_leader | 4 | ok | 1 | true | 30.1 s | 13 ms | 41 ms | 12.9 s | 3 | 29.9 s | 7 | 7 | 1 | node not serving (handshake closed) 6; request timeout 1 | passed |
-| VTOP | partition_leader | 5 | ok | 3 | false | 30.1 s | 14 ms | 34 ms | 13.4 s | 1 | 29.9 s | 11 | 11 | 1 | node not serving (handshake closed) 10; request timeout 1 | passed |
+| Kafka | kill9_leader | 1 | ok | 1 | false | 10.2 s | 8 ms | 98 ms | 9.27 s | 2 | 9.96 s | 0 | 6 | - | code:NETWORK_EXCEPTION 3; connect_failures 14; retries 6 | passed |
+| Kafka | kill9_leader | 2 | ok | 3 | false | 17.8 s | 47 ms | 254 ms | 11.0 s | 1 | 17.5 s | 0 | 10 | - | code:NETWORK_EXCEPTION 5; connect_failures 1; retries 10 | passed |
+| Kafka | kill9_leader | 3 | ok | 2 | false | 10.0 s | 8 ms | 75 ms | 9.04 s | 3 | 9.75 s | 0 | 8 | - | code:NETWORK_EXCEPTION 4; connect_failures 13; retries 8 | passed |
+| Kafka | kill9_leader | 4 | ok | 3 | false | 8.64 s | 6 ms | 348 ms | 7.68 s | 1 | 8.37 s | 0 | 4 | - | code:NETWORK_EXCEPTION 2; connect_failures 12; retries 4 | passed |
+| Kafka | kill9_leader | 5 | ok | 3 | true | 13.3 s | 13 ms | 45 ms | 12.3 s | 1 | 13.0 s | 0 | 4 | - | code:NETWORK_EXCEPTION 2; connect_failures 16; retries 4 | passed |
+| Kafka | stop_leader | 1 | ok | 1 | false | 41 ms | 34.3 s | 36 ms | 101 ms | 2 | 6 ms | 0 | 2 | - | code:NOT_LEADER_OR_FOLLOWER 1; retries 2 | passed |
+| Kafka | stop_leader | 2 | ok | 2 | false | 61 ms | 48.4 s | 28 ms | 88 ms | 3 | 7 ms | 0 | 2 | - | code:NOT_LEADER_OR_FOLLOWER 1; retries 2 | passed |
+| Kafka | stop_leader | 3 | ok | 2 | true | 1.03 s | 40 ms | 50 ms | 104 ms | 3 | 759 ms | 0 | 2 | - | code:NOT_LEADER_OR_FOLLOWER 1; retries 2 | passed |
+| Kafka | stop_leader | 4 | ok | 2 | false | 67 ms | 50.3 s | 25 ms | 94 ms | 3 | 6 ms | 0 | 2 | - | code:NOT_LEADER_OR_FOLLOWER 1; retries 2 | passed |
+| Kafka | stop_leader | 5 | ok | 3 | false | 1.08 s | 68 ms | 39 ms | 152 ms | 1 | 902 ms | 0 | 10 | - | code:NOT_LEADER_OR_FOLLOWER 5; retries 10 | passed |
+| Kafka | partition_leader | 1 | ok | 3 | true | 30.0 s | 10 ms | 38 ms | 12.2 s | 1 | 29.7 s | 0 | 5 | - | code:REQUEST_TIMED_OUT 5; retries 5 | passed |
+| Kafka | partition_leader | 2 | ok | 1 | true | 30.0 s | 8 ms | 33 ms | 12.0 s | 2 | 29.8 s | 0 | 5 | - | code:REQUEST_TIMED_OUT 5; retries 5 | passed |
+| Kafka | partition_leader | 3 | ok | 2 | false | 30.0 s | 12 ms | 54 ms | 7.89 s | 3 | 29.7 s | 0 | 5 | - | code:REQUEST_TIMED_OUT 5; retries 5 | passed |
+| Kafka | partition_leader | 4 | ok | 3 | false | 30.0 s | 8 ms | 29 ms | 8.74 s | 1 | 29.7 s | 0 | 5 | - | code:REQUEST_TIMED_OUT 5; retries 5 | passed |
+| Kafka | partition_leader | 5 | ok | 1 | false | 30.0 s | 10 ms | 29 ms | 8.51 s | 2 | 29.7 s | 0 | 5 | - | code:REQUEST_TIMED_OUT 5; retries 5 | passed |
+| VTOP | kill9_leader | 1 | ok | 3 | false | 28.9 s | 6 ms | 276 ms | 13.0 s | 2 | 28.8 s | 193 | 193 | 1 | connection lost 1; name not resolvable 87; node not serving (handshake closed) 105 | passed |
+| VTOP | kill9_leader | 2 | ok | 1 | true | 24.9 s | 1 ms | 609 ms | 12.0 s | 3 | 25.0 s | 144 | 144 | 1 | connection lost 1; name not resolvable 49; node not serving (handshake closed) 94 | passed |
+| VTOP | kill9_leader | 3 | ok | 2 | false | 25.7 s | -354 ms | 824 ms | 12.8 s | 3 | 26.0 s | 186 | 186 | 1 | connection lost 2; name not resolvable 84; node not serving (handshake closed) 100 | passed |
+| VTOP | kill9_leader | 4 | ok | 2 | false | 25.8 s | 5 ms | 251 ms | 13.4 s | 1 | 25.6 s | 226 | 226 | 1 | connection lost 1; name not resolvable 108; node not serving (handshake closed) 117 | passed |
+| VTOP | kill9_leader | 5 | ok | 1 | true | 25.2 s | -0 ms | 47 ms | 12.7 s | 3 | 25.1 s | 195 | 195 | 1 | connection lost 1; name not resolvable 90; node not serving (handshake closed) 104 | passed |
+| VTOP | stop_leader | 1 | ok | 1 | true | 16.7 s | -4 ms | 274 ms | 2.20 s | 3 | 16.4 s | 112 | 112 | 1 | connection lost 1; node not serving (handshake closed) 111 | passed |
+| VTOP | stop_leader | 2 | ok | 1 | true | 15.5 s | -3 ms | 194 ms | 3.02 s | 3 | 15.3 s | 110 | 110 | 1 | connection lost 1; node not serving (handshake closed) 109 | passed |
+| VTOP | stop_leader | 3 | ok | 1 | true | 17.0 s | -9 ms | 194 ms | 2.57 s | 3 | 16.7 s | 118 | 118 | 1 | connection lost 1; node not serving (handshake closed) 117 | passed |
+| VTOP | stop_leader | 4 | ok | 1 | true | 19.3 s | -1 ms | 200 ms | 2.16 s | 2 | 22.3 s | 135 | 135 | 1 | connection lost 1; node not serving (handshake closed) 127; quorum not reached (Overloaded) 7 | passed |
+| VTOP | stop_leader | 5 | ok | 2 | false | 13.6 s | -17 ms | 218 ms | 2.17 s | 3 | 13.3 s | 104 | 104 | 1 | connection lost 1; node not serving (handshake closed) 103 | passed |
+| VTOP | partition_leader | 1 | ok | 2 | false | 30.1 s | 12 ms | 105 ms | 12.8 s | 1 | 29.9 s | 19 | 19 | 1 | node not serving (handshake closed) 3; quorum not reached (Overloaded) 15; request timeout 1 | passed |
+| VTOP | partition_leader | 2 | ok | 1 | true | 30.2 s | 30 ms | 24 ms | 12.9 s | 3 | 29.9 s | 7 | 7 | 1 | node not serving (handshake closed) 6; request timeout 1 | passed |
+| VTOP | partition_leader | 3 | ok | 2 | false | 30.1 s | 16 ms | 242 ms | 13.3 s | 1 | 29.9 s | 21 | 21 | 1 | node not serving (handshake closed) 9; quorum not reached (Overloaded) 11; request timeout 1 | passed |
+| VTOP | partition_leader | 4 | ok | 1 | true | 30.1 s | 12 ms | 29 ms | 12.8 s | 3 | 29.9 s | 7 | 7 | 1 | node not serving (handshake closed) 6; request timeout 1 | passed |
+| VTOP | partition_leader | 5 | ok | 1 | true | 30.1 s | 9 ms | 234 ms | 12.9 s | 3 | 29.9 s | 7 | 7 | 1 | node not serving (handshake closed) 6; request timeout 1 | passed |
 
 ## Method
 
@@ -151,8 +151,8 @@ The unavailability window is the longest gap between acknowledgements after the 
 | VTOP metadata Raft | `election_timeout_min_ms` | `300` | binary defaults |
 | VTOP metadata Raft | `heartbeat_interval_ms` | `60` | binary defaults |
 | VTOP native driver | `backoff_ms` | `100` | vtop/failover-driver.sh, set to the JVM client's request.timeout.ms and retry.backoff.ms defaults |
-| VTOP native driver | `lease_observer_poll_ms` | `100` | vtop/failover-driver.sh `LEASE_POLL_SECONDS`: the lease observer's poll, which feeds only the time to new leader, never the producer |
 | VTOP native driver | `request_timeout_ms` | `30000` | vtop/failover-driver.sh, set to the JVM client's request.timeout.ms and retry.backoff.ms defaults |
+| VTOP lease observer | `poll_ms` | `100` | vtop/failover-driver.sh LEASE_POLL_SECONDS: the lease observer, which feeds only the time to new leader, never the producer |
 | both observers | poll interval | `100 ms` | `metadata_probe.py`, `failover-driver.sh` |
 
 No `matched-timeouts` profile was run: these are the shipped defaults, and the failover times follow from them more than from either mechanism.
@@ -190,14 +190,15 @@ No `matched-timeouts` profile was run: these are the shipped defaults, and the f
   not the cluster's election, sets the window.
 - **What VTOP's promotion adds** (verified boundary, fenced epochs, the transition record in metadata) costs
   little time next to the lease expiry; it is why no acknowledged record may be lost, and the read-back table
-  above is the evidence for this run. Issue #611 describes a suspected path where a promotion could truncate a
-  quorum-acknowledged record; this benchmark's read-backs did not hit it, which is not evidence that it cannot
-  happen (#611 needs its deterministic test).
+  above is the evidence for this run. Issue #611 (a promotion could truncate a quorum-acknowledged record a
+  replica held and the candidate lacked) was confirmed by a deterministic test and fixed in #616 (commit
+  1c6ab48); an engine whose `vtop_commit` (below) descends from it has the fix. The read-backs here are
+  evidence for this run only, not a proof that no such path remains.
 - **The clients differ.** The JVM producer buffers records while it has no leader and sends them as soon as
   metadata names one; the native driver re-reads the lease only after its produce ends (connection lost,
   refused, or a 30 s request timeout). Part of every VTOP window is that client's behaviour, not the cluster's.
 
-- **Produce refused by a serving leader.** In partition_leader repetition 2 (16 attempts), a VTOP leader answered produce attempts with a refusal rather than an acknowledgement. The read-back of it passed: 0 acknowledged records lost, 0 duplicated. The driver log of each such repetition (`logs/vtop-<fault>-<rep>/driver.log`) has the exact lines.
+- **Produce refused by a serving leader.** In stop_leader repetition 4 (7 attempts), partition_leader repetition 1 (15 attempts), partition_leader repetition 3 (11 attempts), a VTOP leader answered produce attempts with a refusal rather than an acknowledgement. The read-back of each passed: 0 acknowledged records lost, 0 duplicated. The driver log of each such repetition (`logs/vtop-<fault>-<rep>/driver.log`) has the exact lines.
 
 ## Not measured here
 
@@ -229,15 +230,17 @@ No `matched-timeouts` profile was run: these are the shipped defaults, and the f
 | `docker_storage_driver` | `overlayfs` |
 | `volume_filesystem` | `/dev/vda1 ext4` |
 | `kafka_image` | `apache/kafka:4.3.2@sha256:852a0d49fc4e656b022e7f23785411802c9a088c78a7c5e39f33969de9c227a7` |
-| `vtop_commit` | `71270e1872f6d6d4d2e7c0c905a8135646a685f3` |
-| `harness_commit` | `f2827ba67711101db77d563952aa8b5240c8fb66` |
-| `vtop_image` | `vtop-bench:71270e1872f6` |
+| `vtop_commit` | `fa0b16633fdc115708b82af8cde5df4d9039db29` |
+| `harness_commit` | `bfa9fa48d28e2c87d2facbbe815fc5ae36b8fe0b` |
+| `vtop_image` | `vtop-bench:fa0b16633fdc` |
 | `client_kafka` | `kafka-verifiable-producer.sh 4.3.2 (JVM)` |
 | `client_vtop` | `vtop-node produce (native protocol, TLS) via vtop/failover-driver.sh` |
 | `client_java` | `openjdk version "21.0.12.1" 2026-08-18 LTS` |
 | `observer_image` | `python:3.13-slim@sha256:bf44cdfcb76cd3b41e879bc058fc37ec5872002ccfde7fcb765e218cde0cd79c` |
 | `profile` | `defaults` |
-| run | `failover-20261110T185855Z`, started 2026-11-10T18:58:57+00:00, finished 2026-11-10T20:08:53+00:00 |
+| run | `failover-20261111T032549Z`, started 2026-11-11T03:25:56+00:00, finished 2026-11-11T04:37:52+00:00 |
 | charts | matplotlib 3.10.3 |
 
-9 unrelated containers were running on the same Docker host when the run started (`environment.json`, `other_containers_at_start_count`). Both systems shared the VM with them, one system at a time; they are noise neither system chose, and part of why these are laptop numbers.
+19 unrelated containers were running on the same Docker host when the run started (`environment.json`, `other_containers_at_start_count`). Both systems shared the VM with them, one system at a time; they are noise neither system chose, and part of why these are laptop numbers.
+
+**Host contention, recorded, not removed.** The host was shared and nothing was stopped. Sampled every 30 s (144 samples, `host_noise.csv`): one-minute load average 9.58 on average and 23.79 at the highest, on 18 logical CPUs; CPU idle 57.4% on average, 0.16% at the lowest; up to 21 Docker containers besides this benchmark's, of them up to 7 `rust:` build containers; Lima VMs running: `vtop-bench-483a`. Each repetition's own summary is in `environment.json` (`host_noise.per_repetition`); the highest load maxima were in kafka-kill9_leader-2 (23.63), kafka-kill9_leader-3 (22.95), kafka-kill9_leader-1 (22.85).

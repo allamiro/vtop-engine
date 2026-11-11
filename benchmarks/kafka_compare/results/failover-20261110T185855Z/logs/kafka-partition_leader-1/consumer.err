@@ -1,3 +1,0 @@
-[2026-11-10 19:47:56,893] ERROR Error processing message, terminating consumer process:  (org.apache.kafka.tools.consumer.ConsoleConsumer)
-org.apache.kafka.common.errors.TimeoutException
-Processed a total of 475000 messages

@@ -1,0 +1,44 @@
+1794370613496615 start total=475000 rate=5000 batch=100 request_timeout_ms=30000
+1794370613508388 attempt=1 produce holder=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=1 addr=vtop-2:9400 first=0
+1794370613518626 attempt=1 exit=1 acked=0 reason=error: tls vtop-2:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794370613630701 attempt=2 produce holder=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=1 addr=vtop-2:9400 first=0
+1794370613639515 attempt=2 exit=1 acked=0 reason=error: tls vtop-2:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794370613753336 attempt=3 produce holder=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=1 addr=vtop-2:9400 first=0
+1794370613765501 attempt=3 exit=1 acked=0 reason=error: tls vtop-2:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794370613879993 attempt=4 produce holder=aaaaaaaa-0000-0000-0000-0000000000a2 epoch=1 addr=vtop-2:9400 first=0
+1794370681213367 attempt=4 exit=3 acked=175100 reason=produce interrupted: no answer to a 100-record batch within 30000 ms 
+1794370681322938 attempt=5 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=175100
+1794370681794758 attempt=5 exit=1 acked=189400 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794370681910080 attempt=6 lease_unreadable
+1794370682026047 attempt=7 lease_unreadable
+1794370682168591 attempt=8 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=189400
+1794370682175636 attempt=8 exit=1 acked=189400 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794370682285144 attempt=9 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=189400
+1794370682293009 attempt=9 exit=1 acked=189400 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794370682401706 attempt=10 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=189400
+1794370682409630 attempt=10 exit=1 acked=189400 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794370682517066 attempt=11 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=189400
+1794370682524544 attempt=11 exit=1 acked=189400 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794370682632468 attempt=12 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=189400
+1794370682639243 attempt=12 exit=1 acked=189400 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794370682746326 attempt=13 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=189400
+1794370682753216 attempt=13 exit=1 acked=189400 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794370682861483 attempt=14 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=189400
+1794370682870898 attempt=14 exit=1 acked=189400 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794370682980142 attempt=15 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=189400
+1794370682991489 attempt=15 exit=1 acked=189400 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794370683101336 attempt=16 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=189400
+1794370683110304 attempt=16 exit=1 acked=189400 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794370683222852 attempt=17 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=189400
+1794370683230615 attempt=17 exit=1 acked=189400 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794370683342019 attempt=18 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=189400
+1794370683352854 attempt=18 exit=1 acked=189400 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794370683467318 attempt=19 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=189400
+1794370683477845 attempt=19 exit=1 acked=189400 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794370683586677 attempt=20 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=189400
+1794370683594389 attempt=20 exit=1 acked=189400 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794370683702002 attempt=21 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=189400
+1794370683708634 attempt=21 exit=1 acked=189400 reason=error: produce rejected: Overloaded quorum not reached: 0 follower ack(s), need majority of 3 
+1794370683816585 attempt=22 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=2 addr=vtop-1:9400 first=189400
+1794370711172696 attempt=22 exit=0 acked=475000 reason=
+1794370711173101 done acked=475000 attempts=22

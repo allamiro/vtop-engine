@@ -1,4 +1,0 @@
-[2026-11-10 19:24:05,046] WARN Couldn't resolve server kafka-1:9092 from bootstrap.servers as DNS resolution failed for kafka-1 (org.apache.kafka.clients.ClientUtils)
-[2026-11-10 19:24:26,299] ERROR Error processing message, terminating consumer process:  (org.apache.kafka.tools.consumer.ConsoleConsumer)
-org.apache.kafka.common.errors.TimeoutException
-Processed a total of 475000 messages

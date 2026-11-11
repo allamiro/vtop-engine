@@ -108,11 +108,59 @@ def readback_sentence(rows: list[dict[str, str]]) -> str:
 
 
 def no_outage(row: dict[str, str]) -> bool:
-    """Whether the longest acknowledgement gap after the fault is within twice the longest gap of
-    the steady 30 s before it: then the producer saw no outage that steady-state jitter does not
-    also produce, and the "window" is that jitter, not a failover."""
+    """Whether the producer saw no outage from the fault, so the "window" is not a failover time:
+    the longest acknowledgement gap after the fault is within twice the longest gap of the steady
+    30 s before it, or it began only after a new leader had already been named (an orderly stop
+    whose leadership moved first, with an ordinary gap later in the window)."""
     gap, steady = _f(row["unavailability_ms"]), _f(row["baseline_max_gap_ms"])
-    return gap is not None and steady is not None and gap <= 2 * steady
+    start, to_leader = _f(row["gap_start_ms"]), _f(row["time_to_leader_ms"])
+    if gap is None:
+        return False
+    within_jitter = steady is not None and gap <= 2 * steady
+    after_handover = start is not None and to_leader is not None and start >= to_leader
+    return within_jitter or after_handover
+
+
+# A 30 s-before p99 above this means the producer was over a second behind its fixed-rate
+# schedule BEFORE any fault: the offered rate was not being sustained in that window.
+BEHIND_SCHEDULE_MS = 1000.0
+
+
+def contention_note(env: dict[str, Any], rows: list[dict[str, str]]) -> str:
+    """Repetitions whose pre-fault window or host cannot be read as a quiet steady state,
+    named with what the run recorded about them; none is dropped from any table."""
+    per = (env.get("host_noise") or {}).get("per_repetition") or {}
+    try:
+        cpus = float(env["comparable"]["host_logical_cpus"])
+    except (KeyError, TypeError, ValueError):
+        cpus = None
+    tag = lambda row: f"{row['system']}-{row['fault']}-{row['repetition']}"  # noqa: E731
+    behind = [row for row in rows if row["status"] == "ok" and (_f(row["p99_before_ms"]) or 0) > BEHIND_SCHEDULE_MS]
+    loaded = [row for row in rows if cpus and (per.get(tag(row)) or {}).get("load1_max", 0) > cpus]
+    if not behind and not loaded:
+        return ""
+
+    def noise(row):
+        n = per.get(tag(row)) or {}
+        if not n.get("samples"):
+            return "no host sample"
+        return (f"host load up to {n['load1_max']}, CPU idle down to {n['cpu_idle_pct_min']}%, "
+                f"up to {n['docker_rust_builds_max']} `rust:` build containers")
+
+    parts = ["**Pre-fault windows that were not a quiet steady state.** Kept in every table above, and named "
+             "here."]
+    if behind:
+        parts.append("In " + "; ".join(
+            f"{SHORT[r['system']]} {r['fault']} repetition {r['repetition']} (30 s-before p99 "
+            f"{fmt_ms(float(r['p99_before_ms']))}, steady-state longest gap {fmt_ms(float(r['baseline_max_gap_ms']))}; "
+            f"{noise(r)})" for r in behind)
+            + " the producer was more than a second behind its schedule before any fault, so the offered rate was "
+            "not sustained there and that p99 is queueing, not service latency.")
+    if loaded:
+        parts.append(f"The host was oversubscribed (one-minute load above its {cpus:g} logical CPUs) during "
+                     + ", ".join(f"{SHORT[r['system']]} {r['fault']} repetition {r['repetition']}" for r in loaded)
+                     + ": every number from those repetitions carries that contention.")
+    return " ".join(parts)
 
 
 def fmt_summary(s: stats.Summary | None, n_all: int, unit=fmt_ms) -> str:
@@ -405,8 +453,13 @@ def write_markdown(run: fschema.FailoverRun, images: dict[str, str], csv_rel: di
                         f"({fmt_ms(float(row['unavailability_ms']))}, starting {fmt_ms(float(row['gap_start_ms']))} "
                         f"after the fault, against a {fmt_ms(float(row['baseline_max_gap_ms']))} steady-state "
                         "longest gap)" for row in quiet)
-            + " the gap is within twice the steady-state one: the producer saw no outage, and that value is "
-            "jitter, not a failover time. It is still counted in the median and range above.")
+            + " the gap is within twice the steady-state one or began after a new leader had been named: the "
+            "producer saw no outage from the fault, and that value is not a failover time. It is still counted "
+            "in the median and range above.")
+        add("")
+    contention = contention_note(env, rows)
+    if contention:
+        add(contention)
         add("")
     batch_note = vtop_batch_pacing_note(env, rows)
     if batch_note:
@@ -668,9 +721,10 @@ READING = """\
   not the cluster's election, sets the window.
 - **What VTOP's promotion adds** (verified boundary, fenced epochs, the transition record in metadata) costs
   little time next to the lease expiry; it is why no acknowledged record may be lost, and the read-back table
-  above is the evidence for this run. Issue #611 describes a suspected path where a promotion could truncate a
-  quorum-acknowledged record; this benchmark's read-backs did not hit it, which is not evidence that it cannot
-  happen (#611 needs its deterministic test).
+  above is the evidence for this run. Issue #611 (a promotion could truncate a quorum-acknowledged record a
+  replica held and the candidate lacked) was confirmed by a deterministic test and fixed in #616 (commit
+  1c6ab48); an engine whose `vtop_commit` (below) descends from it has the fix. The read-backs here are
+  evidence for this run only, not a proof that no such path remains.
 - **The clients differ.** The JVM producer buffers records while it has no leader and sends them as soon as
   metadata names one; the native driver re-reads the lease only after its produce ends (connection lost,
   refused, or a 30 s request timeout). Part of every VTOP window is that client's behaviour, not the cluster's."""

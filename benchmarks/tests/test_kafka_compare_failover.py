@@ -401,7 +401,7 @@ def test_unknown_columns_are_refused_at_write_time(tmp_path):
 
 # ------------------------------------------------------------------ rendering (#600)
 
-COMMITTED_RUN = os.path.join(os.path.dirname(__file__), "..", "kafka_compare", "results", "failover-20261110T185855Z")
+COMMITTED_RUN = os.path.join(os.path.dirname(__file__), "..", "kafka_compare", "results", "failover-20261111T032549Z")
 
 
 def test_the_committed_run_renders_byte_identically_twice(tmp_path):
@@ -536,6 +536,11 @@ def test_the_latency_caveat_is_derived_and_absent_for_a_run_with_the_fixed_produ
 
     env = json.load(open(os.path.join(COMMITTED_RUN, "environment.json")))
     rows = fschema.load_failover_run(COMMITTED_RUN).rows
+    # The committed run was taken with the fixed producer, so it carries no caveat.
+    assert failover_report.vtop_batch_pacing_note(env, rows) == ""
+    # A run that records neither fix (as failover-20261110T185855Z did) gets both caveats.
+    env["comparable"].pop("vtop_pacing")
+    env["comparable"].pop("vtop_ack_stamp")
     note = failover_report.vtop_batch_pacing_note(env, rows)
     assert "up to 19.8 ms before their scheduled send time" in note  # (100 - 1) / 5000 s
     assert "after fsyncing its acked-floor file" in note
@@ -585,13 +590,26 @@ def test_the_box_chart_labels_the_unclamped_median(tmp_path, monkeypatch):
 
 def test_the_report_names_a_repetition_whose_gap_is_steady_state_jitter(tmp_path):
     pytest.importorskip("matplotlib")
+    import csv
+
     from kafka_compare import report
 
+    # The shape failover-20261110T185855Z had in Kafka stop_leader repetition 2: a 35 ms
+    # longest gap, starting 615 ms after the fault, against a 30 ms steady-state gap.
+    run = _copy_committed(tmp_path)
+    with open(run / "failover.csv", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    target = next(r for r in rows if r["system"] == "kafka" and r["fault"] == "stop_leader"
+                  and r["repetition"] == "2")
+    target.update(unavailability_ms="35.0", gap_start_ms="615.3", baseline_max_gap_ms="30.0")
+    with open(run / "failover.csv", "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fschema.COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
     doc = tmp_path / "d.md"
-    assert report.main([COMMITTED_RUN, "--img-dir", str(tmp_path / "img"), "--doc", str(doc)]) == 0
+    assert report.main([str(run), "--img-dir", str(tmp_path / "img"), "--doc", str(doc)]) == 0
     text = doc.read_text()
-    # Kafka stop_leader repetition 2: 35 ms, 615 ms after the fault, against a 30 ms steady-state gap.
-    assert "In Kafka stop_leader repetition 2 (35 ms, starting 615 ms after the fault, against a 30 ms " \
+    assert "Kafka stop_leader repetition 2 (35 ms, starting 615 ms after the fault, against a 30 ms " \
            "steady-state longest gap)" in text
     assert "Kafka kill9_leader repetition" not in text.split("the producer saw no outage")[0]
 
@@ -815,3 +833,39 @@ def test_a_passed_read_back_releases_the_volumes(tmp_path, monkeypatch):
     failover.run_rep(ctx, "vtop", "kill9_leader", 1)
     assert ctx["kept_volumes"] == [] and downs == ["vtop"] and ctx["losses"] == []
 
+
+
+def _fo_row(**values):
+    row = {"system": "vtop", "fault": "kill9_leader", "repetition": "2", "status": "ok",
+           "unavailability_ms": "25000.0", "baseline_max_gap_ms": "40.0", "gap_start_ms": "1.0",
+           "time_to_leader_ms": "12000.0", "p99_before_ms": "28.0"}
+    row.update(values)
+    return row
+
+
+def test_a_gap_that_begins_after_the_new_leader_was_named_is_not_an_outage():
+    from kafka_compare import failover_report
+
+    # Kafka stop, rep 2 of failover-20261111T032549Z: leadership moved in 88 ms, longest gap 48 s later.
+    assert failover_report.no_outage(_fo_row(system="kafka", fault="stop_leader", unavailability_ms="61.0",
+                                             baseline_max_gap_ms="28.0", gap_start_ms="48404.6",
+                                             time_to_leader_ms="87.6"))
+    assert not failover_report.no_outage(_fo_row())  # a real 25 s window from the fault
+    assert not failover_report.no_outage(_fo_row(time_to_leader_ms=""))
+
+
+def test_the_contention_note_names_repetitions_behind_schedule_or_on_an_oversubscribed_host():
+    from kafka_compare import failover_report
+
+    env = {"comparable": {"host_logical_cpus": "18"}, "host_noise": {"per_repetition": {
+        "vtop-kill9_leader-2": {"samples": 5, "load1_max": 19.66, "cpu_idle_pct_min": 22.11,
+                                "docker_rust_builds_max": 5},
+        "vtop-kill9_leader-5": {"samples": 5, "load1_max": 7.85, "cpu_idle_pct_min": 32.28,
+                                "docker_rust_builds_max": 4}}}}
+    behind = _fo_row(p99_before_ms="26327.1", baseline_max_gap_ms="609.3")
+    quiet = _fo_row(repetition="5", p99_before_ms="30.0")
+    note = failover_report.contention_note(env, [behind, quiet])
+    assert "VTOP kill9_leader repetition 2 (30 s-before p99 26.3 s" in note and "more than a second behind" in note
+    assert "above its 18 logical CPUs) during VTOP kill9_leader repetition 2:" in note
+    assert "repetition 5" not in note  # a quiet repetition is not named
+    assert failover_report.contention_note(env, [quiet]) == ""
