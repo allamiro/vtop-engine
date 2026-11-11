@@ -528,9 +528,14 @@ fn reject_out_of_range_part_size(
 /// transport when the transport cannot be held under one (#481). `None` in,
 /// `None` out: an unset cap builds nothing, so the default pipeline carries no
 /// shaper at all.
+///
+/// `slot` is where the process's budget lives: always the process-global one
+/// in production (`transport::process_shaper_slot`); a unit test passes its
+/// own, so two tests asking for different caps at once cannot collide in it.
 fn egress_shaper_for(
     transport: &dyn EgressTransport,
     cap: Option<u64>,
+    slot: &transport::ShaperSlot,
 ) -> Result<Option<Arc<transport::EgressShaper>>, VtopError> {
     let Some(cap) = cap else {
         return Ok(None);
@@ -542,7 +547,7 @@ fn egress_shaper_for(
             transport.name()
         )));
     }
-    transport::process_egress_shaper(cap).map(Some)
+    transport::shared_shaper(slot, cap).map(Some)
 }
 
 impl S3NativeBackend {
@@ -583,7 +588,11 @@ impl S3NativeBackend {
         // The egress cap next (#481): refused here, naming the cap and the
         // transport, when the resolved transport cannot be held under it —
         // never accepted and then ignored.
-        let shaper = egress_shaper_for(transport.as_ref(), cfg.max_egress_bytes_per_second)?;
+        let shaper = egress_shaper_for(
+            transport.as_ref(),
+            cfg.max_egress_bytes_per_second,
+            transport::process_shaper_slot(),
+        )?;
         if !cfg.verify_tls {
             tracing::warn!(
                 "verify_tls is false: plaintext endpoints are permitted (lab use only). \
@@ -3131,7 +3140,11 @@ mod egress_ceiling {
         let cap = 8 * 1024 * 1024;
         for transport in rows {
             let name = transport.name().to_owned();
-            let verdict = egress_shaper_for(transport.as_ref(), Some(cap));
+            // A slot of the test's own (review): the process-global one is
+            // reserved for the constructor test, which holds a 4 MiB/s budget
+            // there while it runs; asking it for 8 MiB/s in parallel would be
+            // refused as a conflicting cap and fail one of the two at random.
+            let verdict = egress_shaper_for(transport.as_ref(), Some(cap), test_slot());
             if transport.tuning_support().egress_ceiling {
                 let shaper = verdict
                     .unwrap_or_else(|e| panic!("[{name}] declares it honours the cap: {e}"))
@@ -3147,7 +3160,7 @@ mod egress_ceiling {
                 );
             }
             assert!(
-                egress_shaper_for(transport.as_ref(), None)
+                egress_shaper_for(transport.as_ref(), None, test_slot())
                     .unwrap()
                     .is_none(),
                 "[{name}] no cap, no shaper — for every transport"

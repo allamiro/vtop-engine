@@ -487,7 +487,7 @@ pub fn process_egress_shaper(rate_bytes_per_second: u64) -> Result<Arc<EgressSha
 
 /// [`process_egress_shaper`] over an explicit slot, so the sharing rule is
 /// tested without the process-global one other tests may be using.
-fn shared_shaper(
+pub(crate) fn shared_shaper(
     slot: &Mutex<Weak<EgressShaper>>,
     rate_bytes_per_second: u64,
 ) -> Result<Arc<EgressShaper>, VtopError> {
