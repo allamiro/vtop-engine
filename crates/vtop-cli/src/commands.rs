@@ -74,6 +74,15 @@ pub enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Check a config file (and a `streams.yaml` beside it) without starting
+    /// anything: no state store, object store or source is contacted. Exits
+    /// non-zero only for an invalid config; a valid but risky setting, such
+    /// as `upload.require_strong_verification: false`, is printed as a
+    /// warning and still passes.
+    Validate {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Apply state-store schema migrations with a deployment identity.
     Migrate {
         #[arg(long)]
@@ -482,6 +491,30 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                     "verification FAILED for {manifest} (see report above)"
                 )))
             }
+        }
+        Command::Validate { config } => {
+            // `load` parses and validates both files; an error is the
+            // non-zero exit. Warnings never fail the check (#629): each is a
+            // documented opt-out, and refusing it here would only push
+            // operators to skip the check.
+            let (cfg, _streams) = load(config)?;
+            let warnings = cfg.warnings();
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "ok", "warnings": warnings})
+                );
+            } else {
+                for warning in &warnings {
+                    println!("WARNING: {warning}");
+                }
+                println!(
+                    "{}: config is valid ({} warning(s))",
+                    config.display(),
+                    warnings.len()
+                );
+            }
+            Ok(())
         }
         Command::Migrate { config } => {
             let cfg = VtopConfig::from_path(config)?;

@@ -3950,6 +3950,7 @@ dependencies = [
  "glob",
  "rdkafka",
  "regex",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

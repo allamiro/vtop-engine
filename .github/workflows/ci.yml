@@ -46,6 +46,7 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       dashboards: ${{ steps.filter.outputs.dashboards }}
       benchmarks: ${{ steps.filter.outputs.benchmarks }}
+      benchmark_charts: ${{ steps.filter.outputs.benchmark_charts }}
       scripts: ${{ steps.filter.outputs.scripts }}
       shell: ${{ steps.filter.outputs.shell }}
       kafka: ${{ steps.filter.outputs.kafka }}
@@ -145,6 +146,13 @@ jobs:
               - 'observability/**'
             benchmarks:
               - 'benchmarks/**'
+            # The Kafka-comparison charts and reports: their generators, the
+            # committed runs they are drawn from, the pinned plotting stack,
+            # and the output itself (a hand edit to a generated file is drift).
+            benchmark_charts:
+              - 'benchmarks/kafka_compare/**'
+              - 'docs/benchmarks/**'
+              - '.github/workflows/ci.yml'
             scripts:
               - 'scripts/**'
               - 'docker-compose*.yml'
@@ -1713,6 +1721,55 @@ jobs:
             python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f"
           done
           echo "all dashboard JSON valid"
+
+  # The Kafka-comparison charts and reports (#600) are generated from the
+  # committed CSVs and must stay exactly that: this job regenerates every one
+  # and fails on any difference, as the dashboards job does for its JSON.
+  # regenerate.py hands EVERY committed run under benchmarks/kafka_compare/
+  # results/ to report.py, which picks the generator per run (a failover run
+  # goes to failover_report.py), so a new run or generator is covered when its
+  # results are committed, with no change here.
+  #
+  # SVG and Markdown are compared byte for byte. PNG bytes cannot be: Pillow's
+  # macOS and manylinux wheels deflate with different zlib builds, so the same
+  # pixels compress to different bytes (measured: identical pixels on macOS
+  # arm64, Linux arm64 and Linux x86_64, different files). regenerate.py puts
+  # back the committed bytes of a PNG whose decoded pixels, size, mode and
+  # metadata are unchanged, so `git diff` sees a PNG only when it looks
+  # different. The plotting stack is pinned exactly in requirements-report.txt
+  # and regenerate.py refuses any other, and refuses a DejaVu Sans from outside
+  # matplotlib's own bundled copy.
+  benchmark-charts:
+    name: benchmark charts (regenerate + no drift)
+    needs: changes
+    if: needs.changes.outputs.benchmark_charts == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install the pinned plotting stack
+        run: pip install --disable-pip-version-check -r benchmarks/kafka_compare/requirements-report.txt pytest==9.2.0
+      # The benchmarks job runs without matplotlib, so the report tests that
+      # need it skip there; here they run.
+      - name: Report and drift-check tests, with matplotlib
+        working-directory: benchmarks
+        run: python -m pytest tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py
+      - name: Regenerate every chart and report and fail on drift
+        run: |
+          python3 benchmarks/kafka_compare/regenerate.py
+          # --porcelain reports modified AND untracked files, so a new chart
+          # whose output was never committed fails too; `git diff` alone would
+          # ignore the untracked file and pass.
+          drift="$(git status --porcelain -- docs/benchmarks/)"
+          if [ -n "$drift" ]; then
+            echo "::error::Committed benchmark charts or reports differ from what the committed CSVs produce. Run 'python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/kafka_compare/regenerate.py' and commit the result."
+            echo "$drift"
+            git diff --stat -- docs/benchmarks/
+            exit 1
+          fi
 
   # The Postgres backend (Phase 3) must pass the SAME behavioural battery as
   # SQLite, and its DB-level invariant trigger must reject a bypass. Runs against
