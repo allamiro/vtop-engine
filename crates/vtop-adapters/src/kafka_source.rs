@@ -419,13 +419,26 @@ struct PartitionLiveness {
     reassigned_at_high: HashMap<(String, i32), i64>,
     /// For a partition that has not delivered since an assign at
     /// `Offset::Stored` and whose start is otherwise unknown (no committed
-    /// offset, `auto.offset.reset=latest`): the high watermark the first stall
-    /// check saw. Its start is the end of the log as it was at the assign,
-    /// which is at or below this, so records past it are records the fetcher
-    /// should have delivered (review of #644). Recorded lazily so the assign
-    /// path makes no extra broker call.
+    /// offset, `auto.offset.reset=latest`): where the fetcher would have
+    /// started, which is the end of the log as it was at the assign (review of
+    /// #644). The stall check finds it from record timestamps (see
+    /// `STORED_END_SKEW`); when the broker cannot say, the high watermark of
+    /// the first check stands in, which is at or above the true start. A stall
+    /// re-assigns such a partition at this offset, never at `Offset::Stored`,
+    /// which would resolve to the NEW end and skip what piled up.
     end_baseline: HashMap<(String, i32), i64>,
+    /// Wall-clock time (ms since the epoch) of the last assign(), for finding
+    /// where a partition assigned at the end of the log started.
+    assigned_at_ms: i64,
 }
+
+/// How far before an assign() the stall check looks, by record timestamp, for
+/// where a partition assigned at the end of the log started (review of #644).
+/// Record timestamps come from producers' clocks: the margin keeps a producer
+/// clock that runs behind from hiding records written after the assign. Its
+/// cost is reading up to this much from before the assign once, on recovery
+/// from a stall: never-committed records, so at worst read early, never lost.
+const STORED_END_SKEW: Duration = Duration::from_secs(60);
 
 impl PartitionLiveness {
     /// A fresh assign() restarts every fetcher, so every idle run starts over,
@@ -435,6 +448,19 @@ impl PartitionLiveness {
         self.end_baseline.clear();
         self.reassigned_at_high
             .retain(|key, _| assignment.binary_search(key).is_ok());
+        self.assigned_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    }
+
+    /// Record where a partition assigned at the end of the log started, unless
+    /// already known.
+    fn note_baseline(&mut self, key: &(String, i32), start: i64) {
+        self.end_baseline.entry(key.clone()).or_insert(start);
+    }
+
+    fn has_baseline(&self, key: &(String, i32)) -> bool {
+        self.end_baseline.contains_key(key)
     }
 
     /// The offset a due partition would read next: `next` when it is known,
@@ -600,6 +626,39 @@ fn list_offsets(
         }
     }
     answers
+}
+
+/// The first offset whose record timestamp is at or after `timestamp_ms`, for
+/// each of `partitions`, in one bounded ListOffsets call per leader: `Some`
+/// for an offset, `None` when every record is older (the start is the end of
+/// the log). A partition the broker did not answer for is absent; `None`
+/// overall when the call itself failed.
+fn offsets_at_time(
+    consumer: &BaseConsumer,
+    partitions: &[(String, i32)],
+    timestamp_ms: i64,
+) -> Option<HashMap<(String, i32), Option<i64>>> {
+    let mut tpl = TopicPartitionList::new();
+    for (topic, partition) in partitions {
+        tpl.add_partition_offset(topic, *partition, Offset::Offset(timestamp_ms))
+            .ok()?;
+    }
+    let listed = consumer
+        .offsets_for_times(tpl, Duration::from_secs(WATERMARK_TIMEOUT_SECONDS))
+        .ok()?;
+    let mut answers = HashMap::new();
+    for (topic, partition) in partitions {
+        let Some(element) = listed.find_partition(topic, *partition) else {
+            continue;
+        };
+        let answer = match (element.error(), element.offset()) {
+            (Ok(()), Offset::Offset(offset)) => Some(offset),
+            (Ok(()), Offset::End) => None,
+            _ => continue,
+        };
+        answers.insert((topic.clone(), *partition), answer);
+    }
+    Some(answers)
 }
 
 pub struct KafkaSource {
@@ -983,10 +1042,11 @@ impl KafkaSource {
     /// Runs after a completed pass, and asks the broker only for partitions
     /// that have delivered nothing for `STALL_PASSES` passes and
     /// `STALL_AFTER`, at most once per `STALL_CHECK_INTERVAL`: a consumer
-    /// whose partitions all deliver never asks at all. At most three bounded
+    /// whose partitions all deliver never asks at all. At most four bounded
     /// calls, each one request per leader for every due partition: the high
-    /// watermarks, then the group's committed offsets and the low watermarks
-    /// for a partition that has not delivered since `Offset::Stored`.
+    /// watermarks, then, for a partition that has not delivered since
+    /// `Offset::Stored`, the group's committed offsets and either the low
+    /// watermarks (earliest) or the offsets at the assign's time (latest).
     ///
     /// A partition is stalled when it would read next below the high
     /// watermark. A stalled partition is logged and the whole assignment is
@@ -1026,6 +1086,34 @@ impl KafkaSource {
             Some(consumer) => list_offsets(consumer, &need_low, Offset::Beginning),
             None => HashMap::new(),
         };
+        // A partition that started at the END of the log (latest, nothing
+        // committed): find where, from record timestamps, once per assign
+        // (review of #644). No record since then means the start is the
+        // current end, exactly.
+        let need_start: Vec<(String, i32)> = if reset_to_earliest {
+            Vec::new()
+        } else {
+            unresolved
+                .iter()
+                .filter(|key| !committed.contains_key(*key) && !self.liveness.has_baseline(key))
+                .cloned()
+                .collect()
+        };
+        if !need_start.is_empty() {
+            let since = self
+                .liveness
+                .assigned_at_ms
+                .saturating_sub(STORED_END_SKEW.as_millis() as i64);
+            let starts = self
+                .consumer
+                .as_ref()
+                .and_then(|consumer| offsets_at_time(consumer, &need_start, since));
+            for (key, start) in starts.into_iter().flatten() {
+                if let Some(&high) = highs.get(&key) {
+                    self.liveness.note_baseline(&key, start.unwrap_or(high));
+                }
+            }
+        }
 
         let now = Instant::now();
         let mut stalled = false;
@@ -1033,16 +1121,30 @@ impl KafkaSource {
             let Some(&high) = highs.get(key) else {
                 continue;
             };
-            let next = next_read_offset(
+            let resolved = next_read_offset(
                 self.delivered.get(key).copied(),
                 committed.get(key).copied(),
                 lows.get(key).copied(),
                 reset_to_earliest,
             );
-            let next = self.liveness.next_or_baseline(key, next, high);
+            let next = self.liveness.next_or_baseline(key, resolved, high);
             let Some(lag) = self.liveness.stalled_lag(key, next, high) else {
                 continue;
             };
+            // Measured from the end-of-log baseline: re-assign at THAT offset.
+            // At Offset::Stored, latest would resolve to the new end and skip
+            // every record that piled up during the stall (review of #644).
+            // Pinned like a rewind's landing; never over a position this
+            // process already holds, and never from the broker's group offset
+            // (#614: the clamp must not come from the broker).
+            if resolved.is_none() {
+                if let Some(start) = next {
+                    let cur = self.cursors.entry(key.clone()).or_default();
+                    if cur.last_read_offset.is_none() && cur.committed_offset.is_none() {
+                        cur.committed_offset = Some(start);
+                    }
+                }
+            }
             let (idle_passes, idle_for) = self
                 .liveness
                 .idle
@@ -2027,6 +2129,14 @@ mod tests {
         assert_eq!(live.stalled_lag(&key, later, 57), Some(7));
         // A known offset always wins over the baseline.
         assert_eq!(live.next_or_baseline(&key, Some(40), 57), Some(40));
+
+        // A start found from record timestamps is used on the FIRST check
+        // and is not overwritten by a later one.
+        let other = tp("a", 1);
+        live.note_baseline(&other, 3);
+        live.note_baseline(&other, 9);
+        assert_eq!(live.next_or_baseline(&other, None, 57), Some(3));
+        assert_eq!(live.stalled_lag(&other, Some(3), 57), Some(54));
 
         // Delivery and a fresh assign both drop the baseline.
         live.record_pass(&assigned, |_| true, Instant::now());

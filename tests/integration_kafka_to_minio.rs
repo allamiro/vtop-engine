@@ -1134,3 +1134,63 @@ async fn a_partition_that_stops_while_others_deliver_is_reassigned() {
         started.elapsed()
     );
 }
+
+/// Review of #644: with `auto.offset.reset=latest` and nothing committed, a
+/// partition that stalls before its first delivery is assigned at
+/// `Offset::Stored`, which resolves to the END of the log. Recovering it
+/// with another `Stored` assign would start at the new end and skip every
+/// record that piled up while it was stalled. The recovery assigns it at an
+/// explicit offset instead, so all of them are read.
+///
+/// The victim's fetcher is stopped before it delivers anything. Ten records
+/// arrive before the first stall check and five after it; all fifteen must
+/// be read.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_partition_started_at_the_end_of_the_log_recovers_without_skipping() {
+    let (busy, _busy_cleanup) = fresh_topic("stall_latest_busy", 0).await;
+    let (victim, _victim_cleanup) = fresh_topic("stall_latest_victim", 0).await;
+    let group = unique_group("stall-latest");
+    let mut cfg = kafka_cfg(&bootstrap(), &group);
+    cfg.auto_offset_reset = "latest".into();
+    let mut adapter = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
+    let sources = vec![kafka_source(&busy), kafka_source(&victim)];
+
+    // Both partitions resolve to the end of the (empty) log; the busy one
+    // then delivers on every pass.
+    let mut busy_read = 0;
+    let warmup = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while busy_read == 0 {
+        assert!(
+            std::time::Instant::now() < warmup,
+            "precondition: the busy topic is read"
+        );
+        produce(&busy, 2);
+        busy_read += read_pass(&mut adapter, &sources).await[0];
+    }
+    adapter
+        .stop_fetcher_behind_the_adapter(&victim, 0)
+        .expect("stop the victim's fetcher");
+    produce(&victim, 10);
+
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(50);
+    let mut victim_read = 0;
+    let mut produced_late = false;
+    while victim_read < 15 && std::time::Instant::now() < deadline {
+        // Five more after the first stall check could have run.
+        if !produced_late && started.elapsed() > std::time::Duration::from_secs(14) {
+            produce(&victim, 5);
+            produced_late = true;
+        }
+        produce(&busy, 2);
+        victim_read += read_pass(&mut adapter, &sources).await[1];
+    }
+    assert_eq!(
+        victim_read,
+        15,
+        "records produced while the partition was stalled were skipped or never read \
+         (within {:?})",
+        started.elapsed()
+    );
+}
