@@ -1,0 +1,9 @@
+run_id,cycle,elapsed_seconds,files_seeded,bytes_seeded,bytes_archived,backlog_bytes,cycle_batches
+competing-flow-bulk-capped-20261110T080623Z-lhycxj,1,57.327,250,8362638,8362638,0,250
+competing-flow-bulk-capped-20261110T080623Z-lhycxj,2,95.054,500,16478189,16478189,0,250
+competing-flow-bulk-capped-20261110T080623Z-lhycxj,3,132.205,750,24736458,24736458,0,250
+competing-flow-bulk-capped-20261110T080623Z-lhycxj,4,166.794,1000,32687660,32687660,0,250
+competing-flow-bulk-capped-20261110T080623Z-lhycxj,5,204.014,1250,41345731,41345731,0,250
+competing-flow-bulk-capped-20261110T080623Z-lhycxj,6,240.55,1500,49808500,49808500,0,250
+competing-flow-bulk-capped-20261110T080623Z-lhycxj,7,278.013,1750,58456317,58456317,0,250
+competing-flow-bulk-capped-20261110T080623Z-lhycxj,8,314.609,2000,66909668,66909668,0,250
