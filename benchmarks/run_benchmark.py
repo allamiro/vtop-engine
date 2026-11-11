@@ -652,10 +652,13 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
                     })
 
             cycle += 1
-            # The engine's own busy time, per cycle (#483): a goodput read
-            # against a link's rate divides by this, not by a wall clock that
-            # also holds the seeding and the recovery pass. Stamped from the
-            # two clock reads around the call, never after the bookkeeping.
+            # The engine's busy time, per cycle (#483): a goodput read against
+            # a link's rate divides by this, not by a wall clock that also
+            # holds the seeding and the recovery pass. Stamped from the two
+            # clock reads around the `process_once` call, never after the
+            # bookkeeping — so in container mode it also holds the
+            # `docker compose exec` that launches the engine (roughly
+            # 0.1-0.2 s), which a reader of a short cycle has to allow for.
             writer.row("cycle_metrics.csv", {
                 "run_id": run_id, "cycle": cycle,
                 "started_seconds": round(cycle_started_at - start_mono, 3),

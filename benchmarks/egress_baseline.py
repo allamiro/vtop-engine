@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
 import json
 import math
 import os
@@ -260,7 +261,15 @@ def cmd_run(args) -> int:
         work = os.path.join(args.run_root, f"seed-{name}-{os.getpid()}")
         os.makedirs(work)
         for path in pool[:n]:
-            os.link(path, os.path.join(work, os.path.basename(path)))
+            dest = os.path.join(work, os.path.basename(path))
+            try:
+                os.link(path, dest)
+            except OSError as exc:
+                # A pool on another filesystem than the run root cannot be
+                # hard-linked (EXDEV); copy it instead of failing the run.
+                if exc.errno != errno.EXDEV:
+                    raise
+                shutil.copyfile(path, dest)
         seed_args = ["--seed-dir", work]
         body = scenario_yaml(args.profile, c, pif, name, competitor=args.competitor,
                              duration=args.duration)
@@ -294,12 +303,15 @@ def cmd_run(args) -> int:
             w.writerow(["run_id", "phase", "profile", "config", "c", "pif", "rep", "objects",
                         "competitor", "exit_code", "started_utc", "wall_seconds",
                         "vm_loadavg_before", "vm_loadavg_after", "vm",
-                        "engine_cpu_seconds", "store_cpu_seconds"])
+                        "engine_cpu_seconds", "store_cpu_seconds", "attempt_id"])
+        # `run_id` is blank when the harness refused before creating a run
+        # directory; `attempt_id` identifies every row, refused or not.
         w.writerow([run_id, args.phase, args.profile, label, "" if c is None else c,
                     "" if pif is None else pif, args.rep, n,
                     "bulk:60 (scenario 18)" if args.phase == "contended" else args.competitor,
                     proc.returncode, started, round(wall, 1), load_before, _vm_loadavg(),
-                    args.vm, cpu_used["engine"], cpu_used["store"]])
+                    args.vm, cpu_used["engine"], cpu_used["store"],
+                    f"{args.vm}:{name}:{os.getpid()}"])
     return proc.returncode
 
 
@@ -499,6 +511,20 @@ def within_noise(threshold: float, values: list[float]) -> bool:
     return bool(values) and min(values) <= threshold <= max(values)
 
 
+def _fraction(run: dict) -> float:
+    """A gated run's fraction of its link, refused if absent: a blank read as
+    zero would count the run as leaving the whole link unused and could open
+    the gate on a run that was never calibrated."""
+    value = str(run.get("fraction_of_link", "")).strip()
+    try:
+        return float(value)
+    except ValueError:
+        raise ValueError(
+            f"run {run.get('run_id', '?')} ({run.get('profile')}, {run.get('config')}, "
+            f"{run.get('phase')}) has no fraction_of_link ({value!r}): a gated run without a "
+            "link reference cannot be judged, and is not counted as zero") from None
+
+
 def evaluate_gate(runs: list[dict], objects: list[dict]) -> dict:
     """The gate exactly as the doc fixes it. `runs` rows are runs.csv rows;
     grid runs carry `phase` grid, confirmation runs `phase` confirm."""
@@ -511,12 +537,12 @@ def evaluate_gate(runs: list[dict], objects: list[dict]) -> dict:
         points: dict[str, list[float]] = {}
         conns: dict[str, int] = {}
         for r in grid:
-            points.setdefault(r["config"], []).append(_f(r["fraction_of_link"]))
+            points.setdefault(r["config"], []).append(_fraction(r))
             conns[r["config"]] = int(_f(r["c"])) * int(_f(r["pif"]))
         if not points:
             continue
         best[profile] = best_config(points, conns)
-        conf = [_f(r["fraction_of_link"]) for r in runs if r["profile"] == profile
+        conf = [_fraction(r) for r in runs if r["profile"] == profile
                 and r["phase"] == "confirm" and r["config"] == best[profile]]
         unused = [1 - f for f in conf]
         med = statistics.median(unused) if unused else float("nan")
@@ -670,8 +696,15 @@ def aggregate_points(runs: list[dict], objects: list[dict]) -> list[dict]:
             "competitor_jain_index": med_of("competitor_jain_index"),
             "host_contended_runs": sum(1 for r in rs if r.get("host_contention")),
         }
-        row["bottleneck"] = name_bottleneck(
-            profile, _f(fmed, 0.0), verify_share, _f(ecores, 0.0), _f(scores, 0.0))
+        if not objs:
+            # Nothing committed: no goodput and no stage times, so no
+            # bottleneck can be named from measurements; say so rather than
+            # let the defaults name one.
+            row["verify_share_of_batch"] = ""
+            row["bottleneck"] = "none named: no object committed"
+        else:
+            row["bottleneck"] = name_bottleneck(
+                profile, _f(fmed, 0.0), verify_share, _f(ecores, 0.0), _f(scores, 0.0))
         rows.append(row)
     return rows
 
@@ -765,13 +798,22 @@ def svg_small_multiples(points: list[dict], profiles: tuple[str, ...], value: st
                             and r["config"] == config_label(c, pif)), None)
                 if row is None or row.get(value, "") == "":
                     continue
-                pts.append((xpos(ip, c), ypos(_f(row[value]))))
+                pts.append((xpos(ip, c), ypos(_f(row[value])), _f(row[value])))
             if len(pts) > 1:
-                d = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+                d = " ".join(f"{x:.1f},{y:.1f}" for x, y, _v in pts)
                 out.append(f'<polyline class="s{i}" points="{d}" fill="none" stroke-width="2" '
                            f'stroke-linejoin="round" stroke-linecap="round"/>')
-            for x, y in pts:
-                out.append(f'<circle class="f{i}" cx="{x:.1f}" cy="{y:.1f}" r="4"/>')
+            for x, y, v in pts:
+                if v > y_max:
+                    # Off the scale: an upward triangle at the top edge and the
+                    # value written beside it, never a dot that reads as the
+                    # axis maximum.
+                    out.append(f'<path class="f{i}" d="M{x:.1f},{y - 7:.1f} L{x - 5:.1f},{y + 2:.1f} '
+                               f'L{x + 5:.1f},{y + 2:.1f} Z"/>')
+                    out.append(f'<text class="t2" x="{x + 7:.1f}" y="{y + 4 + 12 * i:.1f}" '
+                               f'font-size="10">{fmt(v)} (off scale)</text>')
+                else:
+                    out.append(f'<circle class="f{i}" cx="{x:.1f}" cy="{y:.1f}" r="4"/>')
     out.append(f'<text class="t2" x="{ml + (width - ml - mr) / 2:.1f}" y="{mt + ph + 40}" '
                'font-size="12" text-anchor="middle">max_concurrency (objects in flight), '
                'median of the grid repetitions</text>')
@@ -800,12 +842,17 @@ PROFILE_CONDITIONS = {
     "wan100-policed": ("100 ms", "0% configured", "policer-induced",
                        "10 Mbit/s policer, 5000 B bucket", "none (policer, no queue)"),
 }
+# Failures the table points at an issue for, so a row is never read without
+# where its cause is being worked out.
+TRACKED_FAILURES = {("wan100-policed", "default"): "#663"}
 HARDWARE = "Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared)"
 TRANSPORT = "tcp_tls (s3_native; plain HTTP to the lab MinIO)"
 MEASUREMENT_HEADER = [
     "Hardware", "RTT", "Loss rate", "Loss model", "Bottleneck rate", "Buffer depth",
     "Competitor state", "Transport", "Bottleneck", "Date", "Configuration", "Runs",
-    "Goodput, Mbit/s: median (min-max)", "Of link reference", "object_upload p95",
+    "Goodput, Mbit/s: median (min-max)",
+    "Of link reference (100 ms: this run's iperf3 C; policed: 10 Mbit/s token rate)",
+    "object_upload p95",
     "Verify mean", "CPU-s per GiB", "Competitor with / without VTOP, Mbit/s",
 ]
 
@@ -859,6 +906,9 @@ def measurement_rows(points: list[dict], dates: dict[tuple, str]) -> list[str]:
                           "session's benchmark on the host")
         if int(_f(r["objects_failed"])):
             cells[12] += f"; {r['objects_failed']} object(s) failed"
+            tracked = TRACKED_FAILURES.get((r["profile"], r["config"]))
+            if tracked:
+                cells[12] += f" (tracked in {tracked})"
         lines.append("| " + " | ".join(str(c) for c in cells) + " |")
     return lines
 

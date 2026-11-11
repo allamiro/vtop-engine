@@ -35,7 +35,7 @@ busy time; "Of link reference" divides it by that run's iperf3 calibration on
 the 100 ms profiles and by the token rate on the policed one; the verify
 column is the read-back alone, kept apart from `object_upload`.
 
-| Hardware | RTT | Loss rate | Loss model | Bottleneck rate | Buffer depth | Competitor state | Transport | Bottleneck | Date | Configuration | Runs | Goodput, Mbit/s: median (min-max) | Of link reference | object_upload p95 | Verify mean | CPU-s per GiB | Competitor with / without VTOP, Mbit/s |
+| Hardware | RTT | Loss rate | Loss model | Bottleneck rate | Buffer depth | Competitor state | Transport | Bottleneck | Date | Configuration | Runs | Goodput, Mbit/s: median (min-max) | Of link reference (100 ms: this run's iperf3 C; policed: 10 Mbit/s token rate) | object_upload p95 | Verify mean | CPU-s per GiB | Competitor with / without VTOP, Mbit/s |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 1, parts_in_flight 1, 5 MiB parts | 2 | 525.72 (518.72-532.72) | n/a | 0.3 s | 0.03 s | 7.9 | n/a |
 | Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 1, parts_in_flight 2, 5 MiB parts | 2 | 1028.52 (781.36-1275.68) | n/a | 0.2 s | 0.02 s | 5.9 | n/a |
@@ -87,7 +87,7 @@ column is the read-back alone, kept apart from `object_upload`.
 | Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% configured | policer-induced | 10 Mbit/s policer, 5000 B bucket | none (policer, no queue) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-11 | max_concurrency 4, parts_in_flight 2, 5 MiB parts | 1 | 1.53 (1.53-1.53) | 0.153 | 456.0 s | 4.97 s | 24.5 | n/a |
 | Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% configured | policer-induced | 10 Mbit/s policer, 5000 B bucket | none (policer, no queue) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-11 | max_concurrency 16, parts_in_flight 1, 5 MiB parts; 1 of 1 runs overlapped another session's benchmark on the host | 1 | 2.76 (2.76-2.76) | 0.276 | 989.2 s | 4.99 s | 23.7 | n/a |
 | Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% configured | policer-induced | 10 Mbit/s policer, 5000 B bucket | none (policer, no queue) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-10 | max_concurrency 16, parts_in_flight 2, 5 MiB parts | 1 | 2.46 (2.46-2.46); 1 object(s) failed | 0.246 | 1164.1 s | 5.02 s | 17.3 | n/a |
-| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% configured | policer-induced | 10 Mbit/s policer, 5000 B bucket | none (policer, no queue) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-10 to 2026-11-11 | default (8 in flight, 8 MiB parts, 4 parts in flight); 2 of 3 runs overlapped another session's benchmark on the host | 3 | no object committed; 48 object(s) failed | n/a | n/a | n/a | n/a | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% configured | policer-induced | 10 Mbit/s policer, 5000 B bucket | none (policer, no queue) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | none named: no object committed | 2026-11-10 to 2026-11-11 | default (8 in flight, 8 MiB parts, 4 parts in flight); 2 of 3 runs overlapped another session's benchmark on the host | 3 | no object committed; 48 object(s) failed (tracked in #663) | n/a | n/a | n/a | n/a | n/a |
 | Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-11 | max_concurrency 8, parts_in_flight 1, 5 MiB parts, confirmation runs; 5 of 5 runs overlapped another session's benchmark on the host | 5 | 9.09 (8.89-9.12) | 0.962 | 147.0 s | 8.98 s | 18.4 | n/a |
 | Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-11 | max_concurrency 16, parts_in_flight 1, 5 MiB parts, confirmation runs; 5 of 5 runs overlapped another session's benchmark on the host | 5 | 9.34 (9.08-9.38) | 0.980 | 296.6 s | 11.07 s | 20.9 | n/a |
 | Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 to 2026-11-11 | default (8 in flight, 8 MiB parts, 4 parts in flight), confirmation runs | 5 | 9.19 (9.00-9.25) | 0.960 | 143.0 s | 7.74 s | 11.8 | n/a |
@@ -184,10 +184,13 @@ above, the datagram issues (#485, #486, #488) do not open.**
 |---|---|---|---|---|---|
 | Unused goodput `U`, 100 ms, 10 Mbit/s, 0% loss | `max_concurrency` 8, `parts_in_flight` 1 | 5 | **0.039** (0.008–0.049) | > 0.20 | no |
 | Unused goodput `U`, 100 ms, 10 Mbit/s, 1% `gemodel` | `max_concurrency` 16, `parts_in_flight` 1 | 5 | **0.024** (0.019–0.034) | > 0.20 | no |
-| `object_upload` p95 ratio `R`, 1% over 0% | `max_concurrency` 16, `parts_in_flight` 1 | 5 + 5 (160 objects each) | **0.98** (0.95–1.02 across run pairs) | > 2.0 | no |
+| `object_upload` p95 ratio `R`, 1% over 0% | `max_concurrency` 16, `parts_in_flight` 1 | 5 + 5 (160 objects each) | **0.98** (0.95–1.02 across all 25 run pairs) | > 2.0 | no |
 
 Neither threshold falls inside the range of the repetitions that decide it, so
-by the noise rule the verdict is not within noise.
+by the noise rule the verdict is not within noise. The ratio's range is taken
+over every pairing of a lossy confirmation run with a clean one (5 × 5): the
+runs are independent, on different VMs at different times, and their
+repetition numbers share nothing that would make one pairing the right one.
 
 **Per profile, does the tuned TCP path close the gap?**
 
@@ -232,8 +235,8 @@ What this does and does not say:
   is 3.9 (76.0 s over 19.4 s, grid p95s). The gate fixed the ratio at the
   best-tuned configuration and is judged there; the single-flow ratio is
   derived context, not the gate.
-- **Outside the gate, the policed uplink leaves most of its rate unused** —
-  see below. The gate was fixed on the two queue-backed profiles before any
+- **Outside the gate, the policed uplink leaves most of its rate unused, and
+  the shipped default committed nothing there** (#663) — see below. The gate was fixed on the two queue-backed profiles before any
   number was read, and it is not moved now that one has been.
 
 ### The grid
@@ -278,9 +281,10 @@ Clean LAN, goodput in Mbit/s (no link reference; not part of the gate):
 
 Read from the grid, not beyond it:
 
-- On the clean 100 ms link, connections are what matter and parts do not:
-  every `parts_in_flight` value above 1 measured at or slightly below
-  `parts_in_flight` 1 at the same width.
+- On the clean 100 ms link, connections are what matter and parts do not: up
+  to eight in flight, every `parts_in_flight` value above 1 measured at or
+  slightly below `parts_in_flight` 1 at the same width; at sixteen the three
+  medians are within 0.002 of one another, inside their repetitions' spread.
 - On the lossy link, parts in flight substitute for objects in flight — at one
   object, four parts raised the fraction from 0.250 to 0.637 — because each
   part is its own TCP connection with its own loss response.
@@ -300,17 +304,32 @@ only if the engine or the store kept 80% of the VM's six vCPUs busy; none did
 row is named the store's I/O path, which this sweep does not separate further.
 
 - **Verification never limited a row.** The verify stage reads each 20 MiB
-  object back. It took 2.5–2.9% of batch time on every profile (median 8.7 s on
-  the clean 100 ms link, 7.0 s on the lossy one, 0.09 s on the LAN; p95
-  13.7 s, 13.0 s and 0.4 s). It is recorded per object in `objects.csv`
-  (`verify_ms`) and per row in the table below, apart from `object_upload`, so
-  no wire figure here absorbs it — and no change of wire would remove it.
-- **CPU never limited a shaped row.** The engine container used at most 0.03
-  cores on the 100 ms profiles. Engine CPU-seconds per GiB committed (from the
-  container's cgroup counter around each run) had a median of 12.8 on the
-  clean 100 ms profile (7.3–24.8), 12.2 on the lossy one (7.5–29.3) and 7.9 on
-  the LAN (4.4–10.9), grid and confirmation runs together. These are not on a pinned core: the VM's vCPUs float over the
-  host's cores, and the hypervisor does not expose pinning.
+  object back. Pooled per profile it took 2.5–2.9% of batch time; per row
+  (`verify_share_of_batch` in `points.csv`, grid and confirmation rows that
+  committed anything) it ranged 2.3–9.9% on the clean 100 ms profile, 2.1–7.9%
+  on the lossy one, 0.3–0.8% on the policed one and 0.3–6.2% on the LAN — no
+  row near the 25% the rule names verification at. Per object it took a median
+  of 8.7 s on the clean 100 ms link, 7.0 s on the lossy one and 0.09 s on the
+  LAN (p95 13.7 s, 13.0 s and 0.4 s).
+- **Where verification is and is not counted.** It is recorded per object
+  (`objects.csv`, `verify_ms`) and per row in the table below, apart from
+  `object_upload`, so the `object_upload` figures and the `R` ratio do not
+  absorb it. Goodput `G` does: by the definition fixed above, `G` divides by
+  the engine's whole cycle time, which contains every stage — verification,
+  manifests and checksums included. That is deliberate (it is what the TCP
+  path delivers end to end, and no change of wire removes a read-back), and it
+  means `G` and `U` carry the verify stage's few percent rather than isolate
+  the wire. In container mode each cycle's time also includes the
+  `docker compose exec` that launches it (about 0.1–0.2 s per cycle, one or two
+  cycles per run against cycles of 75–600 s on the 100 ms profiles).
+- **CPU never limited a shaped row.** In grid and confirmation runs the engine
+  container used at most 0.03 cores on the 100 ms profiles; the contended rows,
+  scenario 18's gzip-compressed small batches, used 0.16–0.26. Engine
+  CPU-seconds per GiB committed (from the container's cgroup counter around
+  each run) had a median of 12.8 on the clean 100 ms profile (7.3–24.8), 12.2
+  on the lossy one (7.5–29.3) and 7.9 on the LAN (4.4–10.9), grid and
+  confirmation runs together. These are not on a pinned core: the VM's vCPUs
+  float over the host's cores, and the hypervisor does not expose pinning.
 
 ### The policed uplink: outside the gate, and a finding
 
@@ -320,18 +339,19 @@ run per configuration except the default:
 
 | Configuration | Runs | Goodput, Mbit/s | Of the 10 Mbit/s token rate | Objects failed |
 |---|---|---|---|---|
-| default (8 in flight, 8 MiB parts, 4 parts in flight) | 3 | none committed | 0 | 48 of 48 |
+| default (8 in flight, 8 MiB parts, 4 parts in flight) | 3 | none committed (#663) | 0 | 48 of 48 |
 | `max_concurrency` 1, `parts_in_flight` 1 | 1 | 0.48 | 0.048 | 0 |
 | `max_concurrency` 4, `parts_in_flight` 2 | 1 | 1.53 | 0.153 | 0 |
 | `max_concurrency` 16, `parts_in_flight` 1 | 1 | 2.76 | 0.276 | 0 |
 | `max_concurrency` 16, `parts_in_flight` 2 | 1 | 2.46 | 0.246 | 1 of 32 |
 
 - **The shipped default committed nothing** in three runs: every one of its 16
-  objects ended `failed` after the cycle had run about half an hour. The
-  per-batch record the harness keeps does not carry the engine's error text,
-  so the cause is not established here; it is consistent with, and not shown
-  to be, the per-request deadline (`upload.request_timeout_seconds`, 300 s) at
-  the share of the policer each of 32 part connections was getting.
+  objects ended `failed` after the cycle had run about half an hour. This
+  failure is tracked in #663. The per-batch record the harness keeps does not
+  carry the engine's error text, so the cause is not established here; it is
+  consistent with, and not shown to be, the per-request deadline
+  (`upload.request_timeout_seconds`, 300 s) at the share of the policer each of
+  32 part connections was getting.
 - **The best measured configuration left 72% of the token rate unused.** The
   policer drops whatever exceeds a 5000-byte bucket and holds nothing, so a
   loss-based flow on a 100 ms round trip spends most of its time recovering;
@@ -423,12 +443,21 @@ objects"; any RTT other than 100 ms and the LAN; anything on a real WAN.
   stay in `sweep_index.csv`.
 - **The host was noisy, and that is recorded rather than removed.** Other
   work ran on the same Mac throughout — Docker Desktop with about ten unrelated
-  containers, other sessions' builds — and was not stopped. Over the sweep
-  the host's one-minute load average had a mean of 18.5 and a maximum of 60 on
-  18 cores, and the CPU was 42% idle on average (`host_noise.csv`, every 30 s,
-  22:44Z to 02:29Z). From 01:06:58Z on 2026-11-11 to past the last run,
-  another session's Kafka/MinIO benchmark ran on the same host
-  (`rq4_presence.csv`); every run whose wall-clock span overlapped it carries
+  containers, and other sessions' work in it — and was not stopped. Over the
+  sweep the host's one-minute load average had a mean of 18.5 and a maximum of
+  60 on 18 cores (`host_noise.csv`, sampled every 30–35 s, median 31 s, 22:44Z
+  to 02:29Z). The CPU was 45.5% idle on average over 403 samples; 29 further
+  samples read exactly 0.0% idle, several at a load average of 7–10, which
+  looks like the sampler failing to parse `top` rather than saturation, so they
+  are left out of that mean (42.5% with them). The sampler's
+  `rustc_procs`/`cargo_procs` columns read 0 throughout: they count macOS
+  processes, and other sessions' builds ran inside Docker Desktop's VM where the
+  sampler cannot see them, so those columns show nothing either way. From
+  01:06:58Z on 2026-11-11 (the containers' creation time, from `docker ps`) to
+  past the last run, another session's Kafka/MinIO benchmark ran on the same
+  host (`rq4_presence.csv`; a `docker ps` every 30 s from 01:09:30Z, whose first
+  look at 01:09:16Z showed the containers up for two minutes, so the opening
+  152 s are their uptime rather than sampled); every run whose wall-clock span overlapped it carries
   that label in `runs.csv` (`host_contention`) and the table rows say how many
   of their runs did. All 15 tuned confirmation runs, three policed runs and all
   three contended rows overlapped it; no 100 ms or LAN grid run and none of the

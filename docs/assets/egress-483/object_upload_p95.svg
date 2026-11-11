@@ -88,10 +88,13 @@
 <text class="t2" x="990.0" y="320" font-size="11" text-anchor="middle">16</text>
 <polyline class="s0" points="718.0,113.7 990.0,84.0" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
 <circle class="f0" cx="718.0" cy="113.7" r="4"/>
-<circle class="f0" cx="990.0" cy="84.0" r="4"/>
+<path class="f0" d="M990.0,77.0 L985.0,86.0 L995.0,86.0 Z"/>
+<text class="t2" x="997.0" y="88.0" font-size="10">989.241 (off scale)</text>
 <polyline class="s1" points="854.0,84.0 990.0,84.0" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<circle class="f1" cx="854.0" cy="84.0" r="4"/>
-<circle class="f1" cx="990.0" cy="84.0" r="4"/>
+<path class="f1" d="M854.0,77.0 L849.0,86.0 L859.0,86.0 Z"/>
+<text class="t2" x="861.0" y="100.0" font-size="10">456.009 (off scale)</text>
+<path class="f1" d="M990.0,77.0 L985.0,86.0 L995.0,86.0 Z"/>
+<text class="t2" x="997.0" y="100.0" font-size="10">1164.13 (off scale)</text>
 <text class="t2" x="530.0" y="344" font-size="12" text-anchor="middle">max_concurrency (objects in flight), median of the grid repetitions</text>
 <text class="t2" x="14" y="194.0" font-size="12" text-anchor="middle" transform="rotate(-90 14 194.0)">seconds</text>
 </svg>

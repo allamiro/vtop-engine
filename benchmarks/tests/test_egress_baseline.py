@@ -282,3 +282,36 @@ def test_a_run_overlapping_an_outside_workload_is_labelled_not_dropped():
     across = {"started_utc": "2026-11-11T01:05:00+00:00", "wall_seconds": "600"}
     after = {"started_utc": "2026-11-11T01:41:00+00:00", "wall_seconds": "60"}
     assert [eb.contention_label(m, windows) for m in (before, across, after)] == ["", "rq4", ""]
+
+
+def test_a_confirmation_run_without_a_link_reference_is_refused_not_counted_as_zero():
+    runs = _gate_runs([0.93, 0.94, 0.95], [0.90, 0.91, 0.92])
+    next(r for r in runs if r["profile"] == "wan100" and r["phase"] == "confirm")[
+        "fraction_of_link"] = ""
+    with pytest.raises(ValueError, match="no fraction_of_link"):
+        eb.evaluate_gate(runs, _objects(runs, {"wan100": 60000, "wan100-loss1": 66000}))
+
+
+def test_a_point_that_committed_nothing_names_no_bottleneck():
+    run = {"run_id": "r", "profile": "wan100-policed", "config": "default", "phase": "grid",
+           "c": "", "pif": "", "fraction_of_link": "", "goodput_mbps": "nan", "link_mbps": "10",
+           "busy_seconds": "0", "store_cpu_seconds": "1", "engine_cores_busy": "",
+           "manifest_mean_ms": "", "cpu_seconds_per_gib": "", "objects_failed": "16",
+           "competitor_goodput_mbps_with": "", "competitor_goodput_mbps_without": "",
+           "vtop_goodput_mbps_with": "", "competitor_jain_index": ""}
+    failed = [{"run_id": "r", "status": "failed", "object_upload_ms": "", "verify_ms": "",
+               "batch_total_ms": "0"}]
+    (point,) = eb.aggregate_points([run], failed)
+    assert point["bottleneck"] == "none named: no object committed"
+    assert point["verify_share_of_batch"] == ""
+
+
+def test_a_value_above_the_chart_scale_is_marked_off_scale_not_drawn_at_the_top():
+    def render(value):
+        point = {"profile": "wan100", "phase": "grid", "config": "c1-p1", "v": value}
+        return eb.svg_small_multiples([point], ("wan100",), "v", "t", "y", 400, [0, 400])
+
+    inside, outside = render("300"), render("900")
+    assert "(off scale)" in outside and "(off scale)" not in inside
+    # The legend draws circles too; the off-scale point must not add one.
+    assert outside.count("<circle") == inside.count("<circle") - 1

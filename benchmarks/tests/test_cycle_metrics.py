@@ -35,7 +35,8 @@ def _scenario(tmp_path):
 
 def _committed(batch_id, compressed):
     return {"batch_id": batch_id, "committed": True, "final_state": "source_committed",
-            "metrics": {"compressed_bytes": compressed, "uncompressed_bytes": compressed,
+            # Uncompressed differs, so a sum of the wrong field cannot pass.
+            "metrics": {"compressed_bytes": compressed, "uncompressed_bytes": compressed * 4,
                         "total_ms": 1, "object_upload_ms": 1}}
 
 
@@ -74,6 +75,8 @@ def test_each_cycle_records_its_own_duration_and_committed_bytes(tmp_path, monke
     # stretched by anything near another 0.3 s of harness work.
     assert CYCLE_SECONDS <= float(first["cycle_seconds"]) < 2 * CYCLE_SECONDS, (
         f"a {CYCLE_SECONDS}s process_once was recorded as {first['cycle_seconds']}s")
+    # Both columns are rounded to the millisecond independently, so allow two
+    # milliseconds of rounding between them.
     assert float(second["started_seconds"]) >= (
-        float(first["started_seconds"]) + float(first["cycle_seconds"])), (
+        float(first["started_seconds"]) + float(first["cycle_seconds"]) - 0.002), (
         f"the second cycle cannot start before the first returned: {rows}")
