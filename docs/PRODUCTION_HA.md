@@ -432,7 +432,7 @@ CREATE UNIQUE INDEX uq_file_range
 CREATE INDEX ix_state        ON batches (state);
 CREATE INDEX ix_source_time  ON batches (source_type, source_name, updated_at);
 CREATE INDEX ix_incomplete   ON batches (state)
-  WHERE state NOT IN ('SOURCE_COMMITTED','FAILED');   -- hot incomplete set
+  WHERE state NOT IN ('SOURCE_COMMITTED','FAILED','SUPERSEDED');   -- hot incomplete set
 ```
 
 **Multi-writer recovery [PROPOSED]:** claim incomplete rows with
@@ -484,8 +484,10 @@ PostgreSQL deployment a durable directory.
 ledger and the digests and checks, per source unit (a Kafka topic-partition
 under one consumer group, a file or spool file at one inode), that committed
 ranges tile:
-- a stretch a FAILED or REPLAY_REQUIRED row names, below a later commit, is a
-  range that failed and was never re-archived (the #552 shape);
+- a stretch a FAILED, REPLAY_REQUIRED or SUPERSEDED row names, below a later
+  commit, is a range that failed and was never re-archived (the #552 shape);
+  a SUPERSEDED row above the last commit is such a hole too, never pending
+  (#567: nothing reads it again);
 - a stretch nothing names is lost data for a file or spool (bytes are
   contiguous, e.g. the #558 rotation shape), and is reported but not failed
   for Kafka (compaction and transaction markers occupy offsets with no

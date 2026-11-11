@@ -1175,8 +1175,11 @@ async fn recovery_does_not_commit_a_verified_range_above_a_failed_one() {
          would have clamped the rewind to byte 28 and skipped it"
     );
     assert_eq!(reread[0].record_count, Some(4));
-    // #624: and the held-back row is settled in the same pass, without a
-    // restart - the re-read committed past it.
+    // #624: the held-back row is settled by the running engine only when its
+    // marker is proven to be this file (review of #567); these legacy markers
+    // name no inode, so it stays VERIFIED for the next recovery, as before.
+    // `a_held_back_verified_range_is_settled_without_a_restart_...` covers
+    // the settle with markers that carry their identity.
     assert_eq!(
         engine
             .store
@@ -1185,7 +1188,7 @@ async fn recovery_does_not_commit_a_verified_range_above_a_failed_one() {
             .unwrap()
             .unwrap()
             .state,
-        BatchState::SourceCommitted
+        BatchState::Verified
     );
 }
 
@@ -1370,8 +1373,11 @@ fn inode_of(path: &Path) -> Option<u64> {
 }
 
 /// A file ledger row in BATCHING over `[start, end)` of `path`, created at
-/// `at`.
+/// `at`, read when the file was 28 bytes long - with the fingerprint of
+/// those bytes, as the file adapter records it (#578): recovery retires a
+/// range only for a marker proven to be the cursor's file.
 fn file_row(id: &str, path: &str, inode: Option<u64>, range: (u64, u64), at: &str) -> BatchRecord {
+    let head = std::fs::read(path).unwrap();
     let marker = ProgressMarker::File {
         path: path.into(),
         inode,
@@ -1379,7 +1385,7 @@ fn file_row(id: &str, path: &str, inode: Option<u64>, range: (u64, u64), at: &st
         end_byte: range.1,
         file_size: 28,
         mtime: String::new(),
-        content_fingerprint: None,
+        content_fingerprint: vtop_core::types::ContentFingerprint::of(&head[..28]),
         tail_fingerprint: None,
     };
     BatchRecord {
@@ -1663,6 +1669,56 @@ async fn a_replay_row_above_the_committed_point_is_still_rewound_and_retired_onc
     );
     let outcomes = engine.process_once(SourceType::File).await.unwrap();
     assert!(outcomes.is_empty(), "{outcomes:?}");
+}
+
+/// #567 (review): SUPERSEDED is terminal, so a range is retired only when its
+/// marker is proven to be the file the committed point belongs to. A legacy
+/// marker names no inode and cannot be told from another file that lived at
+/// the path - a rotated-away file's failed range, say - so it keeps the
+/// replay path, exactly as before, even under a later commit at the path.
+#[tokio::test]
+async fn a_legacy_marker_without_an_inode_is_never_retired() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    std::fs::write(&input, "line-0\nline-1\nline-2\nline-3\n").unwrap();
+    let inode = inode_of(&input);
+    let db = dir.path().join("state.db");
+    let url = format!("sqlite://{}", db.display());
+    let path = input.to_string_lossy().into_owned();
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        hand_back_row(
+            &store,
+            &file_row("b-legacy", &path, None, (0, 14), "2026-01-01T00:00:00Z"),
+        )
+        .await;
+        commit_row(
+            &store,
+            &file_row("b-retry", &path, inode, (0, 28), "2026-01-01T00:00:02Z"),
+        )
+        .await;
+    }
+    let cfg = file_config(work.to_str().unwrap(), &url, vec![path.clone()], "mock");
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(
+        (summary.superseded, summary.replay_required),
+        (0, 1),
+        "a marker with no inode is not proven to be this file: {summary:?}"
+    );
+    assert_eq!(
+        engine
+            .store
+            .get_batch("b-legacy")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        BatchState::ReplayRequired
+    );
 }
 
 // ---- #624: a held-back VERIFIED range is settled while the engine runs -------

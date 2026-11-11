@@ -1451,32 +1451,59 @@ impl SourceAdapter for FileSource {
         Some(i128::from(c.read_byte))
     }
 
-    /// The cursor's committed byte, when the cursor describes the marker's
-    /// file: the inode it last saw (or the restart seed's) is the marker's,
-    /// and its content is not proven to be another file's. A marker with no
-    /// inode (a legacy row) cannot be told apart from any file at its path,
-    /// and is answered for the one there, as `read_position` does.
+    /// The cursor's committed byte - only when the cursor is PROVEN to
+    /// describe the marker's file (review of #567). Recovery retires a range
+    /// as SUPERSEDED, a terminal state, on this answer, so "not proven to be
+    /// another file" is not enough:
+    ///
+    /// - the marker and the cursor (the file it last read, or the restart
+    ///   seed's) name the same inode - a legacy marker with none cannot be
+    ///   told from any other file that lived at the path;
+    /// - both carry a content fingerprint (#578), and they are the same
+    ///   content: equal, or - fingerprints of different lengths, which say
+    ///   nothing about each other - both match the first bytes of the file now
+    ///   at the path, which still has that inode;
+    /// - a marker's tail fingerprint (#620) matches the bytes now below its
+    ///   end.
     fn committed_through(&self, marker: &ProgressMarker) -> Option<i128> {
         let ProgressMarker::File {
             path,
-            inode: marker_inode,
-            content_fingerprint: marker_content,
+            inode: Some(marker_inode),
+            end_byte,
+            content_fingerprint: Some(marker_content),
+            tail_fingerprint: marker_tail,
             ..
         } = marker
         else {
             return None;
         };
         let c = self.cursors.get(path)?;
-        let seen = c.seen.as_ref();
-        if marker_inode.is_some() && seen.and_then(|seen| seen.inode) != *marker_inode {
+        let seen = c.seen.as_ref()?;
+        if seen.inode != Some(*marker_inode) {
             return None;
         }
-        if seen
-            .and_then(|seen| seen.content.as_ref())
-            .zip(marker_content.as_ref())
-            .is_some_and(|(seen, marker)| seen.same_content(marker) == Some(false))
-        {
+        let seen_content = seen.content.as_ref()?;
+        let same = seen_content.same_content(marker_content);
+        if same == Some(false) {
             return None;
+        }
+        if same.is_none() || marker_tail.is_some() {
+            let (current_inode, _, head, below) =
+                Self::probe_with_tail(Path::new(path), *end_byte, marker_tail.as_ref());
+            if current_inode != Some(*marker_inode) {
+                return None;
+            }
+            if same.is_none()
+                && !(seen_content.matches_head(&head) && marker_content.matches_head(&head))
+            {
+                return None;
+            }
+            if marker_tail
+                .as_ref()
+                .is_some_and(|tail| !tail.matches_bytes(&below))
+            {
+                return None;
+            }
         }
         Some(i128::from(c.committed_byte))
     }
@@ -2205,42 +2232,98 @@ mod tests {
         assert_eq!(reads2[0].records, vec![b"two".to_vec(), b"three".to_vec()]);
     }
 
-    /// #567: the committed point is answered only for the file the cursor
-    /// describes - the restart seed's, here - and is the committed byte, not
-    /// the read head. A marker of another inode, or of content proven to be
-    /// another file's, gets no answer: that file's committed point is unknown.
+    /// #567 (review): recovery retires a handed-back range as SUPERSEDED on
+    /// this answer, and SUPERSEDED is terminal - so the committed point is
+    /// answered only when the cursor POSITIVELY describes the marker's file:
+    /// the same inode, and content shown to be the same. A marker with no inode
+    /// (a legacy row), or with no content fingerprint, cannot show it, and gets
+    /// no answer; fingerprints of different lengths are settled against the
+    /// file at the path, and so is the tail (#620). Answered, it is the
+    /// committed byte, not the read head.
+    #[cfg(unix)]
     #[test]
-    fn the_committed_point_is_answered_only_for_the_cursors_file() {
-        let path = "/logs/committed-through.log".to_string();
-        let page = |byte: u8| ContentFingerprint::of(&[byte; 64]).unwrap();
-        let marker =
-            |inode: Option<u64>, content: Option<ContentFingerprint>| ProgressMarker::File {
-                path: path.clone(),
-                inode,
-                start_byte: 0,
-                end_byte: 10,
-                file_size: 64,
-                mtime: String::new(),
-                content_fingerprint: content,
-                tail_fingerprint: None,
-            };
+    fn the_committed_point_is_answered_only_for_a_marker_proven_to_be_the_cursors_file() {
+        use std::os::unix::fs::MetadataExt;
+        let bytes: Vec<u8> = (0..100u8).map(|i| b'a' + i % 26).collect();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let fp = |b: &[u8]| ContentFingerprint::of(b);
+        let marker = |inode: Option<u64>,
+                      content: Option<ContentFingerprint>,
+                      tail: Option<ContentFingerprint>| ProgressMarker::File {
+            path: path.clone(),
+            inode,
+            start_byte: 0,
+            end_byte: 30,
+            file_size: 100,
+            mtime: String::new(),
+            content_fingerprint: content,
+            tail_fingerprint: tail,
+        };
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
-        assert_eq!(fs.committed_through(&marker(Some(7), None)), None);
-        fs.seed_committed_from(&path, 40, Some(7), Some(64), Some(page(b'a')), None);
-        fs.cursors.get_mut(&path).unwrap().read_byte = 55;
-        assert_eq!(fs.committed_through(&marker(Some(7), None)), Some(40));
+        let whole = fp(&bytes);
         assert_eq!(
-            fs.committed_through(&marker(Some(7), Some(page(b'a')))),
+            fs.committed_through(&marker(Some(inode), whole.clone(), None)),
+            None
+        );
+        fs.seed_committed_from(&path, 40, Some(inode), Some(100), whole.clone(), None);
+        fs.cursors.get_mut(&path).unwrap().read_byte = 55;
+
+        // Proven: the same fingerprint, or a shorter one of the same file's
+        // first bytes, settled against the file at the path.
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), whole.clone(), None)),
             Some(40)
         );
-        assert_eq!(fs.committed_through(&marker(Some(8), None)), None);
         assert_eq!(
-            fs.committed_through(&marker(Some(7), Some(page(b'b')))),
-            None,
-            "a replacement at the same inode"
+            fs.committed_through(&marker(Some(inode), fp(&bytes[..50]), None)),
+            Some(40)
         );
-        // A legacy marker names no inode: it is answered for the file there.
-        assert_eq!(fs.committed_through(&marker(None, None)), Some(40));
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), whole.clone(), fp(&bytes[..30]))),
+            Some(40),
+            "a tail that matches the bytes below the range's end"
+        );
+        // Not proven.
+        assert_eq!(
+            fs.committed_through(&marker(None, whole.clone(), None)),
+            None,
+            "no inode"
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), None, None)),
+            None,
+            "no content"
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode + 1), whole.clone(), None)),
+            None,
+            "another inode"
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), fp(&[b'z'; 100]), None)),
+            None,
+            "other content of the same length"
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), fp(&[b'z'; 50]), None)),
+            None,
+            "other content of another length: the file's head says so"
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), whole.clone(), fp(&[b'z'; 30]))),
+            None,
+            "the bytes below the range's end are not the ones it was read with"
+        );
+        // A cursor that recorded no content proves nothing either.
+        fs.seed_committed_from(&path, 40, Some(inode), Some(100), None, None);
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), whole, None)),
+            None
+        );
     }
 
     /// The batch rewind returns one result per marker, in order, and one that

@@ -19,8 +19,11 @@
 //!   SUPERSEDED row names is a range that failed and was never re-archived.
 //!   SUPERSEDED (#567) says only that the source committed PAST the range,
 //!   which is what recovery can check; whether a committed range covers its
-//!   bytes is this audit's question, so a superseded row is judged exactly
-//!   as a failed one, never excused. A hole nothing
+//!   bytes is this audit's question, so a superseded row is never excused:
+//!   below the last committed point it is judged as a failed one, and above
+//!   it - where a FAILED or REPLAY_REQUIRED row is pending, because the
+//!   source will read it again - it is a failed hole, never pending, because
+//!   nothing will. A hole nothing
 //!   names is unexplained: for a file or spool that is lost data (bytes are
 //!   contiguous); for Kafka it may be compaction or transaction markers,
 //!   which occupy offsets but carry no records, so it is reported apart and
@@ -837,16 +840,20 @@ fn audit_unit(unit: Unit, rows: Vec<Row>, unproven: &[(u64, u64)]) -> Option<Uni
         .first()
         .map_or(audited_from, |hole| hole.start.min(audited_from));
     // A superseded row above the last commit is not pending - nothing will
-    // read it again - and no commit covers it: a failed hole (#567).
-    report.failed_holes.extend(
+    // read it again - and no commit covers it: a failed hole (#567). Merged
+    // into spans first, so overlapping retired ranges are one hole naming
+    // every row, as overlapping failed ranges below a commit are (review).
+    let superseded_above = spans(
         rows.iter()
-            .filter(|row| row.state == BatchState::Superseded && row.end > committed_through)
-            .map(|row| Hole {
-                start: row.start.max(committed_through),
-                end: row.end,
-                failed_batches: vec![row.batch_id.clone()],
-            }),
+            .filter(|row| row.state == BatchState::Superseded && row.end > committed_through),
     );
+    report
+        .failed_holes
+        .extend(superseded_above.iter().map(|span| Hole {
+            start: span.start.max(committed_through),
+            end: span.end,
+            failed_batches: span.rows.iter().map(|row| row.batch_id.clone()).collect(),
+        }));
     report.pending.extend(
         rows.iter()
             .filter(|row| !row.state.is_terminal() && row.end > committed_through)
@@ -1998,6 +2005,23 @@ mod tests {
                 failed_batches: vec!["retired".into()]
             }],
             "{above:?}"
+        );
+
+        // Overlapping retired ranges above every commit are one hole naming
+        // both, as overlapping failed ranges below a commit are (review).
+        let overlapping = audit([
+            bytes("a", Committed, 0, 10),
+            bytes("r1", Superseded, 10, 20),
+            bytes("r2", Superseded, 15, 30),
+        ]);
+        assert_eq!(
+            overlapping[0].failed_holes,
+            vec![Hole {
+                start: 10,
+                end: 30,
+                failed_batches: vec!["r1".into(), "r2".into()]
+            }],
+            "{overlapping:?}"
         );
     }
 

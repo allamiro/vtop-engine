@@ -277,13 +277,41 @@ async fn a_superseded_row_is_terminal_and_never_recovery_work(store: &dyn StateS
         ),
         "BATCHING -> SUPERSEDED must be refused, got {refused:?}"
     );
+    // A VERIFIED row holds an archived object whose commit is still to be
+    // decided: it is never retired directly (review).
+    store
+        .save_batch_state(&sample_record("sup-verified"))
+        .await
+        .unwrap();
+    for st in &LEGAL_WALK[..6] {
+        store
+            .update_batch_state("sup-verified", *st, &p)
+            .await
+            .unwrap();
+    }
+    let refused = store
+        .update_batch_state("sup-verified", BatchState::Superseded, &p)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(VtopError::IllegalStateTransition {
+                from: BatchState::Verified,
+                to: BatchState::Superseded,
+            })
+        ),
+        "VERIFIED -> SUPERSEDED must be refused, got {refused:?}"
+    );
 
     let claimed = store
         .claim_incomplete_batches("sup-engine", NOW, LEASE)
         .await
         .unwrap();
     let ids: Vec<&str> = claimed.iter().map(|r| r.batch_id.as_str()).collect();
+    // Both handed-back states are recovery work until retired (review: the
+    // FAILED row's own token would otherwise hide a backend that skipped it).
     assert!(ids.contains(&"sup-replay"), "{ids:?}");
+    assert!(ids.contains(&"sup-failed"), "{ids:?}");
     for id in ["sup-replay", "sup-failed"] {
         store
             .update_batch_state(id, BatchState::Superseded, &p)
