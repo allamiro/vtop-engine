@@ -589,6 +589,48 @@ impl PartitionLiveness {
     }
 }
 
+/// One stalled partition found by a stall check, logged once the check knows
+/// what it did about it.
+struct StallReport {
+    key: (String, i32),
+    next_offset: i64,
+    high: i64,
+    lag: u64,
+    idle_passes: u32,
+    idle_secs: u64,
+    recovery: Recovery,
+}
+
+/// What a stall check did about one stalled partition, for its log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallOutcome {
+    Reassigned,
+    Rebuilt,
+    RebuildDeferred,
+}
+
+impl StallOutcome {
+    /// Logged once the outcome is known, so a deferred rebuild never reads
+    /// as a recovery (review of #644).
+    fn message(self) -> &'static str {
+        match self {
+            StallOutcome::Reassigned => {
+                "kafka partition re-assigned after stall: it delivered nothing while the broker \
+                 holds records for it, so its fetcher is restarted (#623)"
+            }
+            StallOutcome::Rebuilt => {
+                "kafka consumer rebuilt after stall: a re-assign did not bring this partition \
+                 back and no record has arrived since, so a new consumer reads it (#623)"
+            }
+            StallOutcome::RebuildDeferred => {
+                "kafka partition still stalled; its consumer rebuild is deferred because where a \
+                 partition assigned at the end of the log started could not be established, and \
+                 is tried again at the next check (#623)"
+            }
+        }
+    }
+}
+
 /// Recoveries of one partition at one high watermark (#623). See
 /// `PartitionLiveness::reassigned_at_high`.
 const MAX_RECOVERIES_PER_HIGH: u8 = 2;
@@ -725,6 +767,35 @@ fn offsets_at_time(
         answers.insert((topic.clone(), *partition), answer);
     }
     Some(answers)
+}
+
+/// Where each of `keys`, assigned at the end of the log with nothing
+/// committed, started: the first offset since the assign, or the end of the
+/// log when no record is that new. `None` when any answer is missing.
+/// `high_watermarks` and `first_since_assign` are the broker lookups, passed
+/// in so the order they run in can be tested.
+///
+/// The high watermark is read FIRST (review of #644). Read after the
+/// timestamp lookup, a record appended in between would sit below the
+/// fallback and be skipped for good, although it arrived after the assign.
+/// Read before, any record appended after it carries a time after the
+/// assign, so the timestamp lookup finds it and the fallback is not used.
+fn end_of_log_starts(
+    keys: &[(String, i32)],
+    high_watermarks: impl FnOnce(&[(String, i32)]) -> HashMap<(String, i32), i64>,
+    first_since_assign: impl FnOnce(&[(String, i32)]) -> Option<HashMap<(String, i32), Option<i64>>>,
+) -> Option<Vec<((String, i32), i64)>> {
+    let highs = high_watermarks(keys);
+    let starts = first_since_assign(keys)?;
+    let mut pins = Vec::with_capacity(keys.len());
+    for key in keys {
+        let start = match starts.get(key)? {
+            Some(start) => *start,
+            None => *highs.get(key)?,
+        };
+        pins.push((key.clone(), start));
+    }
+    Some(pins)
 }
 
 pub struct KafkaSource {
@@ -1201,6 +1272,7 @@ impl KafkaSource {
         let now = Instant::now();
         let mut stalled: Vec<(String, i32)> = Vec::new();
         let mut rebuild: Vec<((String, i32), i64)> = Vec::new();
+        let mut reports: Vec<StallReport> = Vec::new();
         for key in &due {
             let Some(&high) = highs.get(key) else {
                 continue;
@@ -1257,19 +1329,15 @@ impl KafkaSource {
                 // not use up the partition's last recovery at this watermark.
                 Recovery::RebuildConsumer => rebuild.push((key.clone(), high)),
             }
-            tracing::warn!(
-                topic = %key.0,
-                partition = key.1,
-                next_offset = next.unwrap_or_default(),
-                high_watermark = high,
+            reports.push(StallReport {
+                key: key.clone(),
+                next_offset: next.unwrap_or_default(),
+                high,
                 lag,
                 idle_passes,
-                idle_secs = idle_for.as_secs(),
-                stall_reassigns_total = self.stall_reassigns,
-                recovery = ?recovery,
-                "kafka partition re-assigned after stall: it delivered nothing while the broker \
-                 holds records for it, so its fetcher is restarted (#623)"
-            );
+                idle_secs: idle_for.as_secs(),
+                recovery,
+            });
         }
         let rebuilt = !rebuild.is_empty() && self.rebuild_consumer_after_stall();
         if rebuilt {
@@ -1279,6 +1347,36 @@ impl KafkaSource {
             }
         } else if !stalled.is_empty() {
             self.reassign_stalled(&stalled);
+        }
+        // Logged once the outcome is known (review of #644).
+        for report in reports {
+            let StallReport {
+                key,
+                next_offset,
+                high,
+                lag,
+                idle_passes,
+                idle_secs,
+                recovery,
+            } = report;
+            let outcome = match (rebuilt, recovery) {
+                (true, _) => StallOutcome::Rebuilt,
+                (false, Recovery::Reassign) => StallOutcome::Reassigned,
+                (false, Recovery::RebuildConsumer) => StallOutcome::RebuildDeferred,
+            };
+            tracing::warn!(
+                topic = %key.0,
+                partition = key.1,
+                next_offset,
+                high_watermark = high,
+                lag,
+                idle_passes,
+                idle_secs,
+                stall_reassigns_total = self.stall_reassigns,
+                outcome = ?outcome,
+                "{}",
+                outcome.message()
+            );
         }
     }
 
@@ -1378,9 +1476,6 @@ impl KafkaSource {
                 self.cursors.entry(key).or_default().committed_offset = Some(start);
             }
         }
-        tracing::warn!(
-            "kafka consumer rebuilt after a stall that a re-assign did not clear (#623)"
-        );
         self.consumer = None;
         self.assigned.clear();
         self.delivered.clear();
@@ -1421,15 +1516,11 @@ impl KafkaSource {
         }
         let consumer = self.consumer.as_ref()?;
         let since = end_start_lookup_time(self.liveness.assigned_at_ms);
-        let starts = offsets_at_time(consumer, &uncommitted, since)?;
-        let highs = list_offsets(consumer, &uncommitted, Offset::End);
-        for key in uncommitted {
-            let start = match starts.get(&key)? {
-                Some(start) => *start,
-                None => *highs.get(&key)?,
-            };
-            pins.push((key, start));
-        }
+        pins.extend(end_of_log_starts(
+            &uncommitted,
+            |keys| list_offsets(consumer, keys, Offset::End),
+            |keys| offsets_at_time(consumer, keys, since),
+        )?);
         Some(pins)
     }
 
@@ -2431,6 +2522,45 @@ mod tests {
         live.note_reassigned(&key, 655_147);
         assert_eq!(live.stalled_lag(&key, Some(77_054), 655_147), None);
         assert_eq!(live.recovery(&key, 655_148), Recovery::Reassign);
+    }
+
+    /// Review of #644: the end-of-log fallback is the high watermark read
+    /// BEFORE the timestamp lookup. Read after it, a record appended in
+    /// between (offset 50 here) lands below the pin and is skipped for good,
+    /// although it arrived after the assign; read before, the timestamp
+    /// lookup sees that record and the pin stays at or below it.
+    #[test]
+    fn the_end_of_log_fallback_is_read_before_the_timestamp_lookup() {
+        let key = tp("t", 0);
+        let log_end = std::cell::Cell::new(50_i64);
+        let pins = end_of_log_starts(
+            std::slice::from_ref(&key),
+            |keys| keys.iter().map(|k| (k.clone(), log_end.get())).collect(),
+            |keys| {
+                // Nothing since the assign yet - then a producer appends 50.
+                let answer = keys.iter().map(|k| (k.clone(), None)).collect();
+                log_end.set(51);
+                Some(answer)
+            },
+        );
+        assert_eq!(
+            pins,
+            Some(vec![(key, 50)]),
+            "offset 50 arrived after the assign and must still be read"
+        );
+    }
+
+    /// Review of #644: only an outcome that restarted something says so. A
+    /// deferred rebuild must not read as a recovery.
+    #[test]
+    fn a_deferred_rebuild_is_not_logged_as_a_recovery() {
+        let deferred = StallOutcome::RebuildDeferred.message();
+        assert!(!deferred.contains("restarted") && !deferred.contains("re-assigned"));
+        assert!(deferred.contains("deferred"));
+        assert_ne!(
+            StallOutcome::Reassigned.message(),
+            StallOutcome::Rebuilt.message()
+        );
     }
 
     fn latest_source_assigned_to(keys: &[(String, i32)]) -> KafkaSource {
