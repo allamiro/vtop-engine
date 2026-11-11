@@ -574,6 +574,74 @@ fn an_overflowing_append_is_refused_without_discarding_a_kept_suffix() {
     assert_eq!(h.node.next_offset(), 10);
 }
 
+/// #616 review (codex P1). A retry of a batch in the AGREED prefix does not
+/// reach the kept dispute, so it settles nothing, and the duplicate path
+/// acks it. That ack must not report durability at or past the dispute's
+/// start. The leader counts an ack against its whole tail, not against the
+/// retried batch, so an ack of 10 would certify the new leader's record at
+/// 5, which this replica does not hold.
+#[test]
+fn a_retry_of_the_agreed_prefix_is_not_acked_past_a_kept_dispute() {
+    let h = kept_extension();
+    let leader = Uuid::from_u128(0xA9);
+    let ack = h
+        .node
+        .apply_append(&append_request(&h.range, NEW_EPOCH, leader, 3))
+        .expect("a duplicate of an agreed record is acked");
+    assert!(
+        ack.local_committed_offset <= 5,
+        "a retry of offset 3 was acked through {} over records disputed from 5",
+        ack.local_committed_offset
+    );
+    let ack = h
+        .node
+        .apply_append_batch(&[
+            append_request(&h.range, NEW_EPOCH, leader, 2),
+            append_request(&h.range, NEW_EPOCH, leader, 3),
+        ])
+        .expect("a duplicate group of agreed records is acked");
+    assert!(
+        ack.local_committed_offset <= 5,
+        "a group retry was acked through {} over records disputed from 5",
+        ack.local_committed_offset
+    );
+    assert_eq!(h.node.next_offset(), 10, "and nothing was discarded");
+}
+
+/// #616 review (cubic P2). A newer fence whose caller HOLDS the kept records
+/// (it agrees with this replica through 10) resolves the old dispute, which
+/// must stop capping what the replica reports. Left in place it made every
+/// reconnect re-send records already held in agreement, and capped this
+/// replica's acks below records it holds.
+#[test]
+fn a_newer_fence_that_agrees_with_the_kept_records_retires_the_old_dispute() {
+    let h = kept_extension();
+    assert_eq!(h.node.replication_status(), (5, 5), "precondition");
+    h.meta.set(NEWER_EPOCH);
+    let fenced = h
+        .node
+        .fence(
+            NEWER_EPOCH,
+            &[
+                EpochStart {
+                    epoch: OLD_EPOCH,
+                    start_offset: 0,
+                },
+                EpochStart {
+                    epoch: NEWER_EPOCH,
+                    start_offset: 10,
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!((fenced.truncated_records, fenced.next_offset), (0, 10));
+    assert_eq!(
+        h.node.replication_status(),
+        (10, 10),
+        "a dispute the epoch-20 fence resolved still capped the status"
+    );
+}
+
 /// #611, the other way a fence can be told to discard records that may be
 /// acknowledged: the replica's disputed records come from a leadership NEWER
 /// than the caller's at the divergence point. Here the caller holds epoch-19

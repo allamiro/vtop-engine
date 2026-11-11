@@ -629,10 +629,22 @@ impl InProcessFollower {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state
+            let outcome = state
                 .segment
                 .truncate_to(offset)
-                .map_err(|source| BrokerError::InvalidConfig(source.to_string()))?
+                .map_err(|source| BrokerError::InvalidConfig(source.to_string()))?;
+            // A kept dispute that started at or above the new tail is gone
+            // with the records it described (#611). Retired under the state
+            // lock, so a status snapshot sees the truncation and the
+            // retirement together or neither (#616 review).
+            let mut kept = self
+                .kept_dispute
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if kept.is_some_and(|dispute| dispute.from >= offset) {
+                *kept = None;
+            }
+            outcome
         };
 
         let mut guard = self
@@ -649,15 +661,6 @@ impl InProcessFollower {
             }
         }
         drop(guard);
-        // A kept dispute that started at or above the new tail is gone with
-        // the records it described (#611).
-        let mut kept = self
-            .kept_dispute
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if kept.is_some_and(|dispute| dispute.from >= offset) {
-            *kept = None;
-        }
         Ok(outcome)
     }
 
@@ -692,12 +695,19 @@ impl InProcessFollower {
         if dispute.epoch != epoch || reaches <= dispute.from {
             return Ok(());
         }
-        if self.next_offset() <= dispute.from {
-            *self
-                .kept_dispute
+        {
+            // Under the state lock, like every change to the dispute.
+            let state = self
+                .state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            return Ok(());
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.segment.next_offset() <= dispute.from {
+                *self
+                    .kept_dispute
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                return Ok(());
+            }
         }
         match self.truncate_to(dispute.from) {
             Ok(outcome) => {
@@ -738,25 +748,35 @@ impl InProcessFollower {
     /// buffer keeps them, and the first one to arrive settles the dispute
     /// and lands. Under-reporting is safe: a batch the replica already holds
     /// in agreement is acked as a duplicate.
+    ///
+    /// ONE snapshot (#616 review): the dispute is read under the state lock,
+    /// and every install or retirement of it happens under that lock too. Read
+    /// as two, a settle that truncated the suffix and retired the dispute
+    /// between the reads made this report the pre-truncation tail uncapped.
     pub fn replication_status(&self) -> (u64, u64) {
-        let (committed, next) = {
-            let state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                state.segment.committed_offset(),
-                state.segment.next_offset(),
-            )
-        };
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let committed = self.ack_through(state.segment.committed_offset());
+        let next = self.ack_through(state.segment.next_offset());
+        drop(state);
+        (committed, next)
+    }
+
+    /// `offset`, capped at the start of a kept dispute (#616 review): every
+    /// acknowledgement and every status this replica gives. A duplicate
+    /// retry of the agreed prefix settles nothing, and the leader counts an
+    /// ack against its whole tail, not the retried batch, so an uncapped ack
+    /// certified records from the dispute's start that this replica does not
+    /// hold in agreement. Callers hold the state lock: lock order is state,
+    /// then the dispute.
+    fn ack_through(&self, offset: u64) -> u64 {
         let kept = *self
             .kept_dispute
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match kept {
-            Some(dispute) => (committed.min(dispute.from), next.min(dispute.from)),
-            None => (committed, next),
-        }
+        kept.map_or(offset, |dispute| offset.min(dispute.from))
     }
 
     /// This replica's epoch history; empty means "unknown", never "no changes".
@@ -969,6 +989,24 @@ impl InProcessFollower {
         leader_epoch_starts: &[crate::fencing_epochs::EpochStart],
         fencing_epoch: u64,
     ) -> Result<u64, (ErrorCode, String)> {
+        // A NEWER fence judges this replica afresh (#616 review): a dispute
+        // kept for an older epoch is retired here, and replaced below if this
+        // fence keeps a suffix again. Left in place it capped this replica's
+        // status and acks below records a newer caller agrees with. Retired
+        // under the state lock, like every change to it.
+        {
+            let _state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut kept = self
+                .kept_dispute
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if kept.is_some_and(|dispute| dispute.epoch < fencing_epoch) {
+                *kept = None;
+            }
+        }
         if leader_epoch_starts.is_empty() {
             return Ok(0);
         }
@@ -1100,6 +1138,12 @@ impl InProcessFollower {
             })
         };
         if !supersedes {
+            // Installed under the state lock (#616 review): a status snapshot
+            // sees the log and the dispute together.
+            let _state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             *self
                 .kept_dispute
                 .lock()
@@ -1387,7 +1431,7 @@ impl InProcessFollower {
             // ORIGINALLY written under, which the request does not carry.
             if state.segment.committed_offset() >= batch_end {
                 return Ok(ReplicaAppendResponse {
-                    local_committed_offset: state.segment.committed_offset(),
+                    local_committed_offset: self.ack_through(state.segment.committed_offset()),
                 });
             }
             return Err((
@@ -1481,7 +1525,7 @@ impl InProcessFollower {
                     self.run_retention(&mut state.segment);
                 }
                 let response = ReplicaAppendResponse {
-                    local_committed_offset: state.segment.committed_offset(),
+                    local_committed_offset: self.ack_through(state.segment.committed_offset()),
                 };
                 drop(state);
                 if barrier {
@@ -1513,7 +1557,7 @@ impl InProcessFollower {
     ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
         if requests.is_empty() {
             return Ok(ReplicaAppendResponse {
-                local_committed_offset: self.local_committed_offset(),
+                local_committed_offset: self.replication_status().0,
             });
         }
         if requests.len() == 1 {
@@ -1667,11 +1711,12 @@ impl InProcessFollower {
         }
         if self.hold_fsync.load(Ordering::SeqCst) {
             return Ok(ReplicaAppendResponse {
-                local_committed_offset: state.segment.committed_offset(),
+                local_committed_offset: self.ack_through(state.segment.committed_offset()),
             });
         }
         match state.segment.commit() {
             Ok(local_committed_offset) => {
+                let local_committed_offset = self.ack_through(local_committed_offset);
                 // One pass per batch, after the commit, and never under an
                 // fsync hold — the hold path returned above (#290). The floor
                 // persist rides the same barrier (#240) but AFTER the state
