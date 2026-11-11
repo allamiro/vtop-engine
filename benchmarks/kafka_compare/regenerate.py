@@ -9,8 +9,9 @@ Every run directory COMMITTED under benchmarks/kafka_compare/results/ is
 handed to report.py, the one entry point that knows which generator a run
 needs (a failover run goes on to failover_report.py by its failover.csv). A new
 kind of run is covered the day its results are committed, with no change here
-or in CI. An uncommitted local run is ignored: the drift check is about what
-the repository says.
+or in CI. An uncommitted local run, staged or not, is ignored: the drift check
+is about what HEAD says, so every comparison here (runs, stale output, the
+committed PNG bytes) reads HEAD, never the index or the working tree.
 
 Refuses, exit 2, writing nothing first:
 - a plotting stack other than requirements-report.txt pins, or a DejaVu Sans
@@ -61,6 +62,13 @@ class Refused(Exception):
 def _git(repo: str, *args: str, binary: bool = False):
     out = subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
     return out.stdout if binary else out.stdout.decode()
+
+
+def _committed_names(repo: str, prefix: str) -> list[str]:
+    """Paths under `prefix` in HEAD. Not `git ls-files`: that reads the index, where a staged but
+    uncommitted run would count as committed."""
+    out = _git(repo, "ls-tree", "-r", "-z", "--name-only", "HEAD", "--", prefix)
+    return [name for name in out.split("\0") if name]
 
 
 # ------------------------------------------------------------------ environment
@@ -119,7 +127,7 @@ def check_font() -> None:
 
 def committed_runs(repo: str = REPO) -> list[str]:
     """Every run directory (results/<run-id>) with at least one committed file, sorted."""
-    names = _git(repo, "ls-files", "-z", "--", RESULTS).split("\0")
+    names = _committed_names(repo, RESULTS)
     runs = set()
     for name in filter(None, names):
         parts = name[len(RESULTS) + 1:].split("/")
@@ -163,7 +171,7 @@ def orphans(written: Iterable[str], repo: str = REPO) -> list[str]:
     OUTPUT carrying the generated mark."""
     written = {os.path.realpath(path) for path in written}
     stale = []
-    for name in filter(None, _git(repo, "ls-files", "-z", "--", OUTPUT).split("\0")):
+    for name in _committed_names(repo, OUTPUT):
         path = os.path.realpath(os.path.join(repo, name))
         if path in written:
             continue
@@ -196,9 +204,9 @@ def keep_committed_pngs(written: Iterable[str], repo: str = REPO) -> list[str]:
             continue
         name = os.path.relpath(path, os.path.realpath(repo))
         try:
-            committed = _git(repo, "show", f":{name}", binary=True)  # the index: what will be committed
+            committed = _git(repo, "show", f"HEAD:{name}", binary=True)
         except subprocess.CalledProcessError:
-            continue  # new, untracked output: `git status` reports it
+            continue  # output HEAD does not have: `git status` reports it
         with open(path, "rb") as handle:
             fresh = handle.read()
         if fresh != committed and same_png(fresh, committed):

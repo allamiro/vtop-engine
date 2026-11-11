@@ -93,8 +93,10 @@ Charts use one colour per system everywhere (Kafka blue `#2a78d6`, VTOP orange `
 colour-vision-deficiency separation, never red vs green), marker shape as a second channel, and a footer with
 the environment, profile, repetitions and run date. Measured numbers come from the CSV; the conditions,
 run id, dates and matrix come from `environment.json`. Output is deterministic for a given CSV,
-`environment.json` and plotting stack (fixed rcParams, fixed SVG hash salt, no timestamps in metadata, the
-stack pinned in [`requirements-report.txt`](requirements-report.txt), matplotlib's bundled DejaVu Sans).
+`environment.json` and matplotlib version (3.10.3, with the rest of the plotting stack pinned beside it in
+[`requirements-report.txt`](requirements-report.txt); fixed rcParams, fixed SVG hash salt, no timestamps in
+metadata, matplotlib's bundled DejaVu Sans). The report's Environment table names the matplotlib version it
+was drawn with.
 
 CI's `benchmark charts (regenerate + no drift)` job runs [`regenerate.py`](regenerate.py), which hands every
 committed run under `results/` to `report.py` and fails on any difference in `docs/benchmarks/`. It refuses

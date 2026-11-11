@@ -53,9 +53,61 @@ def test_an_empty_pin_file_is_refused(tmp_path):
         regenerate.read_pins(str(pins))
 
 
-def test_the_committed_pins_are_exact_and_name_the_plotting_stack():
+PLOTTING_STACK = {"matplotlib", "contourpy", "cycler", "fonttools", "kiwisolver", "numpy", "packaging", "pillow",
+                  "pyparsing", "python-dateutil", "tzdata"}
+
+
+def test_the_committed_pins_are_exactly_the_plotting_stack():
+    assert set(regenerate.read_pins()) == PLOTTING_STACK
+
+
+def _requirement_name(spec):
+    name = spec.split(";")[0]
+    for stop in " <>=!~[(":
+        name = name.split(stop)[0]
+    return name.strip().lower().replace("_", "-")
+
+
+def test_every_package_matplotlib_runs_on_is_pinned():
+    """The pins cover matplotlib's whole installed dependency closure, so no unpinned package can change
+    the output under them."""
+    pytest.importorskip("matplotlib")
+    from importlib import metadata
+
+    seen, todo = set(), ["matplotlib"]
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        for spec in metadata.requires(name) or []:
+            if "extra ==" in spec:
+                continue
+            dep = _requirement_name(spec)
+            try:
+                metadata.version(dep)
+            except metadata.PackageNotFoundError:
+                continue  # an environment marker excluded it here
+            todo.append(dep)
+    assert seen - set(regenerate.read_pins()) == set()
+
+
+def test_every_pin_is_checked_against_what_is_installed():
     pins = regenerate.read_pins()
-    assert {"matplotlib", "numpy", "pillow"} <= set(pins)
+    asked = []
+
+    def installed(name):
+        asked.append(name)
+        return pins[name]
+
+    regenerate.check_stack(pins, installed)
+    assert sorted(asked) == sorted(pins)
+    for name in pins:  # and any one of them off by a version is refused, by name
+        def off(other, name=name):
+            return "0.0.0" if other == name else pins[other]
+
+        with pytest.raises(regenerate.Refused, match=f"{name} 0.0.0"):
+            regenerate.check_stack(pins, off)
 
 
 def test_refuses_a_stack_that_is_not_the_pinned_one():
@@ -82,6 +134,15 @@ def test_only_committed_runs_are_regenerated(repo):
     put(repo, "benchmarks/kafka_compare/results/local-run/results.csv")  # a developer's uncommitted run
     assert regenerate.committed_runs(str(repo)) == [
         os.path.join(str(repo), "benchmarks/kafka_compare/results", run) for run in ("a-run", "b-run")]
+
+
+def test_a_staged_but_uncommitted_run_is_not_a_committed_run(repo):
+    put(repo, "benchmarks/kafka_compare/results/a-run/results.csv")
+    commit(repo)
+    put(repo, "benchmarks/kafka_compare/results/staged-run/results.csv")
+    git(repo, "add", "-A")
+    assert regenerate.committed_runs(str(repo)) == [
+        os.path.join(str(repo), "benchmarks/kafka_compare/results/a-run")]
 
 
 def test_refuses_when_no_run_is_committed(repo):
