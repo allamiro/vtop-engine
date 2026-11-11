@@ -504,9 +504,9 @@ impl Generations {
 pub struct Hole {
     pub start: u64,
     pub end: u64,
-    /// The failed or replay-required rows whose ranges overlap the hole:
-    /// the ranges that failed and were never archived again. Empty when
-    /// nothing in the ledger names the hole.
+    /// The failed, replay-required or superseded (#567) rows whose ranges
+    /// overlap the hole: ranges that were handed back and never archived
+    /// again. Empty when nothing in the ledger names the hole.
     pub failed_batches: Vec<String>,
 }
 
