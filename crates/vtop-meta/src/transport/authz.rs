@@ -158,6 +158,12 @@ pub fn classify(command: &MetadataCommand) -> (CommandClass, Option<Uuid>) {
         | MetadataCommand::SplitRange {
             holder_node_uuid, ..
         } => (CommandClass::NodeScoped, Some(*holder_node_uuid)),
+        // A version report is a node's account of itself (#634), and a raise
+        // of the feature level is judged on it: a node that could report for
+        // another could vouch for a node still on an older release.
+        MetadataCommand::ReportNodeVersion { node_uuid, .. } => {
+            (CommandClass::NodeScoped, Some(*node_uuid))
+        }
         _ => (CommandClass::ClusterScoped, None),
     }
 }

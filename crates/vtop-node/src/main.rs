@@ -15,6 +15,7 @@ mod meta_node;
 mod observe;
 mod promotion;
 mod tls;
+mod version_report;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

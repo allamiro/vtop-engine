@@ -14,7 +14,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -58,6 +58,9 @@ pub struct FlowControlConfig {
     pub reconnect_backoff: Duration,
     /// Bound of recently sent batches retained for reconnect catch-up.
     pub max_retransmission_bytes: usize,
+    /// How this leader opens each follower session (#634): the hello it
+    /// sends and the finalized level it holds followers to.
+    pub version: super::version::ReplicaVersionPolicy,
 }
 
 impl Default for FlowControlConfig {
@@ -69,6 +72,7 @@ impl Default for FlowControlConfig {
             connect_timeout: Duration::from_secs(2),
             reconnect_backoff: Duration::from_millis(50),
             max_retransmission_bytes: 8 * 1024 * 1024,
+            version: super::version::ReplicaVersionPolicy::default(),
         }
     }
 }
@@ -354,6 +358,9 @@ pub struct ReplicaPeerServer {
     local_id: Uuid,
     handler: Arc<dyn ReplicaPeerHandler>,
     exposure: PlaintextExposure,
+    /// The finalized level dialers are held to (#634); unknown until the
+    /// node that owns this server reads one.
+    cluster_level: super::version::ClusterFeatureLevel,
 }
 
 impl ReplicaPeerServer {
@@ -367,7 +374,16 @@ impl ReplicaPeerServer {
             local_id,
             handler,
             exposure: PlaintextExposure::LoopbackOnly,
+            cluster_level: super::version::ClusterFeatureLevel::unknown(),
         })
+    }
+
+    /// Hold dialers to the cluster's finalized feature level as `level`
+    /// reads it (#634). Without this the server judges against an unknown
+    /// level and refuses no peer, which is what a static range wants.
+    pub fn with_cluster_level(mut self, level: super::version::ClusterFeatureLevel) -> Self {
+        self.cluster_level = level;
+        self
     }
 
     /// A replica endpoint with NO TLS, on loopback only (#294 slice 3).
@@ -423,6 +439,7 @@ impl ReplicaPeerServer {
             local_id,
             handler,
             exposure: PlaintextExposure::LoopbackOnly,
+            cluster_level: super::version::ClusterFeatureLevel::unknown(),
         }
     }
 
@@ -507,14 +524,17 @@ impl ReplicaPeerServer {
                     };
                     let acceptor = self.acceptor.clone();
                     let handler = Arc::clone(&self.handler);
-                    let local_id = self.local_id;
+                    let version = super::version::ReplicaVersionPolicy::new(
+                        self.local_id,
+                        self.cluster_level.clone(),
+                    );
                     connections.spawn(async move {
                         // A session that ends on a protocol refusal is SAID
                         // (#453): the leader on the other end sees only a
                         // missing ack, and without this line nobody sees why.
                         // Ordinary ends — a leader gone, a reset — stay quiet,
                         // as before.
-                        match serve_follower_connection(acceptor, tcp, handler, local_id).await {
+                        match serve_follower_connection(acceptor, tcp, handler, version).await {
                             // A leader gone, a reset: an ordinary end, quiet.
                             Ok(()) | Err(crate::BrokerError::Protocol(ProtocolError::Io(_))) => {}
                             Err(crate::BrokerError::Protocol(ProtocolError::Limit(what))) => {
@@ -536,6 +556,15 @@ impl ReplicaPeerServer {
                                     ),
                                 );
                             }
+                            // Said, like a protocol refusal (#634): the peer
+                            // is told, but the operator who has to upgrade
+                            // it reads this side's log.
+                            Err(crate::BrokerError::ReplicaVersion(why)) => {
+                                warn_rate_limited(
+                                    "replica-server",
+                                    &format!("replica session from {peer} refused: {why}"),
+                                );
+                            }
                             Err(_) => {}
                         }
                     });
@@ -552,7 +581,7 @@ async fn serve_follower_connection(
     acceptor: Option<TlsAcceptor>,
     tcp: TcpStream,
     handler: Arc<dyn ReplicaPeerHandler>,
-    local_id: Uuid,
+    version: super::version::ReplicaVersionPolicy,
 ) -> BrokerResult<()> {
     // Judged before the handshake or the first frame (#294 slice 6): a peer
     // speaking the other transport is refused by name instead of failing as
@@ -583,13 +612,37 @@ async fn serve_follower_connection(
     // that a certificate was unreadable, which stays an error. The two want
     // opposite treatment, and `dispatch_replica_frame` is where that is spent.
     let peer_id = peer_uuid_from_server_stream(&stream)?;
-    // `local_id` is this node's own identity, unused on the serving side.
-    let _ = local_id;
+    // The FIRST frame says which release dialed (#634): a hello is answered
+    // and the session continues at the version both speak; anything else is
+    // a dialer before the handshake, whose first request is served as it
+    // always was - unless the cluster's finalized level has moved past what
+    // such a peer can run, and then it is refused by name.
+    //
+    // `_session` is the version the session runs at: what a later wire
+    // change (one only a peer at a newer protocol may be sent) branches on.
+    let (mut first, _session) = match read_frame(&mut stream, REPLICA_LIMITS).await {
+        Ok(Some(frame)) => {
+            match super::version::accept_session(&mut stream, frame, &version).await? {
+                super::version::Accepted::Hello(peer) => (None, peer),
+                super::version::Accepted::Legacy(frame) => {
+                    (Some(*frame), super::version::PeerVersion::Legacy)
+                }
+                super::version::Accepted::Refused(why) => {
+                    return Err(crate::BrokerError::ReplicaVersion(why))
+                }
+            }
+        }
+        Ok(None) => return Ok(()),
+        Err(problem) => return Err(problem.into()),
+    };
     loop {
-        let frame = match read_frame(&mut stream, REPLICA_LIMITS).await {
-            Ok(Some(frame)) => frame,
-            Ok(None) => return Ok(()),
-            Err(problem) => return Err(problem.into()),
+        let frame = match first.take() {
+            Some(frame) => frame,
+            None => match read_frame(&mut stream, REPLICA_LIMITS).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Ok(()),
+                Err(problem) => return Err(problem.into()),
+            },
         };
         let response = dispatch_replica_frame(handler.as_ref(), peer_id, frame);
         if let Some(response) = response {
@@ -940,6 +993,7 @@ impl NetworkedReplicaSet {
                 node_id: config.node_id,
                 durable_offset: AtomicU64::new(0),
                 connected: AtomicBool::new(false),
+                protocol: AtomicU16::new(0),
                 cmd_tx,
                 hwm_tx,
                 budget: Arc::clone(&budget),
@@ -972,6 +1026,16 @@ impl NetworkedReplicaSet {
             .iter()
             .find(|follower| follower.node_id == node_id)
             .map(|follower| follower.durable_offset.load(Ordering::SeqCst))
+    }
+
+    /// The replica protocol `node_id`'s latest session negotiated (#634):
+    /// [`vtop_protocol::REPLICA_PROTOCOL_LEGACY`] for a follower that
+    /// predates the handshake, 0 before any session opened.
+    pub fn follower_protocol(&self, node_id: Uuid) -> Option<u16> {
+        self.followers
+            .iter()
+            .find(|follower| follower.node_id == node_id)
+            .map(|follower| follower.protocol.load(Ordering::SeqCst))
     }
 
     pub fn follower_connected(&self, node_id: Uuid) -> Option<bool> {
@@ -1074,6 +1138,9 @@ struct FollowerChannel {
     node_id: Uuid,
     durable_offset: AtomicU64,
     connected: AtomicBool,
+    /// The replica protocol the current session negotiated (#634); 0 before
+    /// the first session.
+    protocol: AtomicU16,
     cmd_tx: mpsc::Sender<FollowerCmd>,
     /// Newest committed high-water mark for this follower; see the construction
     /// site for why this is a cell rather than a queued command.
@@ -1308,6 +1375,35 @@ impl FollowerDriver {
             }
             None => MaybeTls::Plain(tcp),
         };
+        // The version exchange opens every session (#634), inside the same
+        // establishment budget. A follower that predates it answers with a
+        // typed refusal and is spoken to as before; one the cluster's level
+        // has left behind is refused by name, and this driver keeps retrying
+        // on its backoff until the follower is upgraded.
+        match tokio::time::timeout_at(
+            deadline,
+            super::version::open_session(&mut stream, &self.flow.version),
+        )
+        .await
+        {
+            Ok(Ok(peer)) => self
+                .channel
+                .protocol
+                .store(peer.protocol(), Ordering::SeqCst),
+            Ok(Err(error)) => {
+                if matches!(error, crate::BrokerError::ReplicaVersion(_)) {
+                    warn_rate_limited(
+                        "replica-driver",
+                        &format!(
+                            "replica {} at {}: {error}",
+                            self.config.node_id, self.config.addr
+                        ),
+                    );
+                }
+                return SessionOutcome::Disconnected;
+            }
+            Err(_) => return SessionOutcome::Disconnected,
+        }
         // Catch-up probe + bounded retransmission. Mark connected only after the
         // optional status exchange succeeds so tests do not observe a false ready.
         let range = retransmission
@@ -1914,6 +2010,8 @@ pub struct ReplicaStatusClient {
     /// `None` is a plaintext plane, chosen deliberately.
     connector: Option<TlsConnector>,
     timeout: Duration,
+    /// How each one-shot session opens (#634).
+    version: super::version::ReplicaVersionPolicy,
 }
 
 impl ReplicaStatusClient {
@@ -1921,6 +2019,7 @@ impl ReplicaStatusClient {
         Ok(Self {
             connector: Some(build_client_connector(material)?),
             timeout: Duration::from_secs(5),
+            version: super::version::ReplicaVersionPolicy::default(),
         })
     }
 
@@ -1938,12 +2037,22 @@ impl ReplicaStatusClient {
         Self {
             connector: None,
             timeout: Duration::from_secs(5),
+            version: super::version::ReplicaVersionPolicy::default(),
         }
     }
 
     /// Deadline covering connect, handshake, and the round trip.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Open each session with this node's identity, holding the replica to
+    /// the finalized level it reads (#634). Without it, the hello names no
+    /// node and no replica is refused - what an operator's one-shot tool
+    /// wants, since the replica judges the tool anyway.
+    pub fn with_version_policy(mut self, version: super::version::ReplicaVersionPolicy) -> Self {
+        self.version = version;
         self
     }
 
@@ -2005,6 +2114,7 @@ impl ReplicaStatusClient {
                 }
                 None => MaybeTls::Plain(tcp),
             };
+            super::version::open_session(&mut stream, &self.version).await?;
             let frame = WireFrame {
                 request_id: 1,
                 stream_id: 0,
@@ -2083,6 +2193,7 @@ impl ReplicaStatusClient {
                 }
                 None => MaybeTls::Plain(tcp),
             };
+            super::version::open_session(&mut stream, &self.version).await?;
             let frame = WireFrame {
                 request_id: 1,
                 stream_id: 0,
@@ -2177,6 +2288,7 @@ impl ReplicaStatusClient {
                 }
                 None => MaybeTls::Plain(tcp),
             };
+            super::version::open_session(&mut stream, &self.version).await?;
             let frame = WireFrame {
                 request_id: 1,
                 stream_id: 0,
@@ -2353,9 +2465,14 @@ mod tests {
             .write_all(&[0x16, 0x03, 0x01, 0x00, 0x40])
             .await
             .unwrap();
-        let refused = serve_follower_connection(None, tcp, Arc::new(Unreached), Uuid::from_u128(1))
-            .await
-            .unwrap_err();
+        let refused = serve_follower_connection(
+            None,
+            tcp,
+            Arc::new(Unreached),
+            super::super::version::ReplicaVersionPolicy::default(),
+        )
+        .await
+        .unwrap_err();
         let crate::BrokerError::CrossMode(message) = refused else {
             panic!("expected a cross-mode refusal, got {refused}")
         };
@@ -2464,6 +2581,65 @@ mod tests {
             "and the consequence an operator will meet next — no fence means no \
              promotion on this plane: {}",
             error.message
+        );
+    }
+
+    /// #634: how a dialer recognizes a replica that predates the version
+    /// handshake. Such a replica hands the hello (a kind-1 `ClientHello`) to
+    /// THIS dispatcher's catch-all arm, unchanged since the plane existed,
+    /// which answers `InvalidRequest` and keeps the session open. If the arm
+    /// ever answered differently, a new leader would stop recognizing - and
+    /// stop replicating to - every replica still on an older release.
+    #[test]
+    fn a_dispatcher_before_the_handshake_answers_a_hello_with_a_typed_refusal() {
+        struct NoReplica;
+        impl ReplicaPeerHandler for NoReplica {
+            fn node_id(&self) -> Uuid {
+                Uuid::nil()
+            }
+            fn apply_append(
+                &self,
+                _: &ReplicaAppendRequest,
+            ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+                unreachable!("a hello is not an append")
+            }
+            fn apply_append_batch(
+                &self,
+                _: &[ReplicaAppendRequest],
+            ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+                unreachable!("a hello is not an append")
+            }
+            fn observe_hwm(&self, _: &CommittedHwmUpdate) -> Result<(), (ErrorCode, String)> {
+                unreachable!("a hello is not a high-water mark")
+            }
+            fn status(
+                &self,
+                _: &RangeIdentity,
+            ) -> Result<ReplicaStatusResponse, (ErrorCode, String)> {
+                unreachable!("a hello is not a status request")
+            }
+        }
+        let hello = super::super::version::local_hello(Uuid::from_u128(1));
+        let reply = dispatch_replica_frame(
+            &NoReplica,
+            None,
+            WireFrame {
+                request_id: 0,
+                stream_id: 0,
+                message: hello.to_message(),
+            },
+        )
+        .expect("the catch-all answers");
+        assert!(
+            matches!(
+                reply.message,
+                Message::Error(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                })
+            ),
+            "{:?}",
+            reply.message
         );
     }
 

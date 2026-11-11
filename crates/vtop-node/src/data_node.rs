@@ -620,7 +620,9 @@ fn replica_server(
         PlaneTransport::PlaintextOnAnyInterface => {
             ReplicaPeerServer::plaintext_on_any_interface(config.node_uuid, handler)
         }
-    })
+    }
+    // Dialers are held to the level this node read (#634).
+    .with_cluster_level(crate::version_report::cluster_level_for(config.node_uuid)))
 }
 
 /// A replica-status client dialing the replica plane the way this node
@@ -628,14 +630,16 @@ fn replica_server(
 fn replica_status_client(
     config: &DataNodeConfig,
 ) -> Result<vtop_broker::replication::ReplicaStatusClient, String> {
-    if config.replica_transport.is_tls() {
+    let client = if config.replica_transport.is_tls() {
         vtop_broker::replication::ReplicaStatusClient::new(tls::replica_material(
             config.replica_tls_paths()?,
         )?)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?
     } else {
-        Ok(vtop_broker::replication::ReplicaStatusClient::plaintext())
-    }
+        vtop_broker::replication::ReplicaStatusClient::plaintext()
+    };
+    // A promotion's fence is held to the level this node read (#634).
+    Ok(client.with_version_policy(crate::version_report::version_policy(config.node_uuid)))
 }
 
 /// The leader's replica set, dialing followers the way the plane is served
@@ -645,21 +649,21 @@ fn start_replica_set(
     follower_configs: Vec<NetworkFollowerConfig>,
 ) -> Result<NetworkedReplicaSet, String> {
     let handle = tokio::runtime::Handle::current();
+    // Followers are held to the level this node read (#634).
+    let flow = FlowControlConfig {
+        version: crate::version_report::version_policy(config.node_uuid),
+        ..FlowControlConfig::default()
+    };
     if config.replica_transport.is_tls() {
         NetworkedReplicaSet::start_on_handle_with_memory(
             handle,
             follower_configs,
             tls::replica_material(config.replica_tls_paths()?)?,
-            FlowControlConfig::default(),
+            flow,
             None,
         )
     } else {
-        NetworkedReplicaSet::start_plaintext_on_handle(
-            handle,
-            follower_configs,
-            FlowControlConfig::default(),
-            None,
-        )
+        NetworkedReplicaSet::start_plaintext_on_handle(handle, follower_configs, flow, None)
     }
     .map_err(|error| error.to_string())
 }
@@ -867,7 +871,23 @@ pub async fn serve(
         }
     }
 
-    match config.role {
+    // Tell metadata what this node runs, and read back the level the cluster
+    // finalized for the replica plane to hold peers to (#634). Only where
+    // metadata is configured: a static range has nobody to tell, and its
+    // replica plane refuses no peer. Spawned after the last startup refusal
+    // and stopped when the role returns, so it never outlives the node.
+    let version_task = match config.lease.as_ref() {
+        Some(lease) => Some(tokio::spawn(crate::version_report::run(
+            lease_admin_client(lease)?,
+            config.node_uuid,
+            crate::version_report::cluster_level_for(config.node_uuid),
+            Duration::from_millis(lease.renew_interval_ms.max(100)),
+            shutdown.clone(),
+        ))),
+        None => None,
+    };
+
+    let served = match config.role {
         DataRole::Follower => {
             run_follower(
                 config,
@@ -922,7 +942,11 @@ pub async fn serve(
             )
             .await
         }
+    };
+    if let Some(task) = version_task {
+        task.abort();
     }
+    served
 }
 
 #[allow(clippy::too_many_arguments)]

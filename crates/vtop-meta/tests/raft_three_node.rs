@@ -1482,6 +1482,148 @@ async fn a_lineage_carrying_report_never_reaches_an_old_level_log() {
     );
 }
 
+/// #634: a data node's version report is a command kind no release before
+/// it can decode, so a tier at the previous release's level - every voter
+/// may still be on it - must never get one into its log, while a data node
+/// upgraded ahead of the tier keeps asking. Once the level is raised, the
+/// report is recorded on every voter, and the cluster-versions read serves
+/// it back with the level in force.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_version_report_never_reaches_a_log_below_its_level() {
+    use vtop_meta::transport::AdminReadClusterVersionsRequest;
+    use vtop_meta::{
+        Consensus, ConsensusError, OpenraftConsensus, LINEAGE_VERDICTS_FEATURE_LEVEL,
+        NODE_VERSION_REPORTS_FEATURE_LEVEL,
+    };
+
+    let seed = SEED ^ 0x634;
+    let mut cluster = Cluster::boot(seed).await;
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone());
+    let data_node = Uuid::from_u128(0x10);
+    let report = |env: CommandEnvelope| MetadataCommand::ReportNodeVersion {
+        env,
+        node_uuid: data_node,
+        release: "0.8.0".to_owned(),
+        max_replica_protocol: 2,
+        supported_feature_level: NODE_VERSION_REPORTS_FEATURE_LEVEL,
+    };
+    let last_log = |cluster: &Cluster| {
+        cluster
+            .leader()
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0)
+    };
+    let env = cluster.envelope();
+    consensus
+        .propose(register_cmd(env, data_node))
+        .await
+        .unwrap();
+
+    // The highest level a tier of the previous release can be at.
+    let previous = LINEAGE_VERDICTS_FEATURE_LEVEL;
+    assert!(previous < NODE_VERSION_REPORTS_FEATURE_LEVEL);
+    let env = cluster.envelope();
+    consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: previous,
+        })
+        .await
+        .unwrap();
+
+    let before = last_log(&cluster);
+    for _ in 0..3 {
+        let env = cluster.envelope();
+        match consensus.propose(report(env)).await {
+            Err(ConsensusError::FeatureNotEnabled { needed, enabled }) => {
+                assert_eq!(
+                    (needed, enabled),
+                    (NODE_VERSION_REPORTS_FEATURE_LEVEL, previous)
+                );
+            }
+            other => panic!(
+                "a version report was not refused at level {previous} (seed={seed:#x}): {other:?}"
+            ),
+        }
+    }
+    assert_eq!(
+        last_log(&cluster),
+        before,
+        "a refused version report reached the log an older voter must decode"
+    );
+
+    let env = cluster.envelope();
+    consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: NODE_VERSION_REPORTS_FEATURE_LEVEL,
+        })
+        .await
+        .unwrap();
+    let env = cluster.envelope();
+    let recorded = consensus.propose(report(env)).await.unwrap();
+    assert_eq!(
+        recorded.response,
+        MetadataResponse::Ack {
+            generation: u64::from(NODE_VERSION_REPORTS_FEATURE_LEVEL)
+        },
+        "the report answers with the level in force"
+    );
+    let _ = cluster.leader().raft.trigger().heartbeat().await;
+    cluster
+        .wait_applied_at_least(recorded.log_id.index - 1)
+        .await;
+    for (id, node) in &cluster.nodes {
+        let versions = node.store.with_storage(|s| s.state().cluster_versions());
+        let entry = versions
+            .nodes
+            .iter()
+            .find(|entry| entry.node_uuid == data_node)
+            .unwrap_or_else(|| panic!("node {id} lost the data node (seed={seed:#x})"));
+        assert_eq!(
+            entry.report.as_ref().map(|r| r.release.as_str()),
+            Some("0.8.0"),
+            "node {id} (seed={seed:#x})"
+        );
+    }
+
+    let read = vtop_meta::transport::AdminHandler::read_cluster_versions(
+        &consensus,
+        AdminReadClusterVersionsRequest {
+            include_nodes: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read.versions.feature_level,
+        NODE_VERSION_REPORTS_FEATURE_LEVEL
+    );
+    assert!(!read.truncated);
+    assert!(read
+        .versions
+        .nodes
+        .iter()
+        .any(|entry| entry.node_uuid == data_node && entry.report.is_some()));
+    let level_only = vtop_meta::transport::AdminHandler::read_cluster_versions(
+        &consensus,
+        AdminReadClusterVersionsRequest {
+            include_nodes: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(level_only.versions.nodes.is_empty());
+    assert_eq!(
+        level_only.versions.feature_level,
+        NODE_VERSION_REPORTS_FEATURE_LEVEL
+    );
+}
+
 /// #636: below feature level 8 the operator's override cannot enter the log
 /// - neither the attestation nor a report that used one - and the
 /// lineage-unproven refusal reason is held back with them. An older voter

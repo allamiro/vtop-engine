@@ -42,11 +42,11 @@ const GOLDEN_SET_RANGE_REPLICA_SET_HEX: &str = concat!(
     "0000000000000003",                 // expected generation 3
 );
 
-/// AttestUnprovenPromotion (#636), derived by hand from the layout: kind 38,
+/// AttestUnprovenPromotion (#636), derived by hand from the layout: kind 39,
 /// the envelope, topic, range, the attested replica, the operator as a
 /// length-prefixed string.
 const GOLDEN_ATTEST_UNPROVEN_PROMOTION_HEX: &str = concat!(
-    "0026",                             // kind 38
+    "0027",                             // kind 39
     "00112233445566778899aabbccddee07", // request id
     "0102030405060708",                 // issued_at_ms
     "ffeeddccbbaa99887766554433221100", // topic
@@ -54,6 +54,20 @@ const GOLDEN_ATTEST_UNPROVEN_PROMOTION_HEX: &str = concat!(
     "bbbbbbbb000000000000000000000031", // attested replica
     "0003",                             // operator: 3 bytes
     "6f7073",                           // "ops"
+);
+
+/// ReportNodeVersion (#634), derived by hand from the layout: kind 38, the
+/// envelope, the node, the release as a u16-length string, the max replica
+/// protocol (u16) and the supported feature level (u32).
+const GOLDEN_REPORT_NODE_VERSION_HEX: &str = concat!(
+    "0026",                             // kind 38
+    "00112233445566778899aabbccddee07", // request id
+    "0102030405060708",                 // issued_at_ms
+    "bbbbbbbb000000000000000000000031", // node
+    "0005",                             // release length 5
+    "302e382e30",                       // "0.8.0"
+    "0002",                             // max replica protocol 2
+    "00000007",                         // supported feature level 7
 );
 
 /// ReportPromotionOutcome (kind 30) as every release since v0.5.0 writes it -
@@ -397,6 +411,28 @@ fn set_range_replica_set_command_matches_golden_vector() {
     assert_eq!(
         command.feature_level(),
         5,
+        "gated: older voters cannot decode it"
+    );
+}
+
+#[test]
+fn report_node_version_command_matches_golden_vector() {
+    let command = MetadataCommand::ReportNodeVersion {
+        env: CommandEnvelope {
+            request_id: Uuid::parse_str("00112233-4455-6677-8899-aabbccddee07").unwrap(),
+            issued_at_ms: 0x0102_0304_0506_0708,
+        },
+        node_uuid: Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000031").unwrap(),
+        release: "0.8.0".to_owned(),
+        max_replica_protocol: 2,
+        supported_feature_level: 7,
+    };
+    let encoded = command.encode().unwrap();
+    assert_eq!(to_hex(&encoded), GOLDEN_REPORT_NODE_VERSION_HEX);
+    assert_eq!(MetadataCommand::decode(&encoded).unwrap(), command);
+    assert_eq!(
+        command.feature_level(),
+        7,
         "gated: older voters cannot decode it"
     );
 }

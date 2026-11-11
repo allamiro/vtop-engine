@@ -1100,6 +1100,50 @@ impl AdminHandler for OpenraftConsensus {
         .map_err(to_transport_error)
     }
 
+    async fn read_cluster_versions(
+        &self,
+        request: crate::transport::wire::AdminReadClusterVersionsRequest,
+    ) -> TransportResult<crate::transport::wire::AdminReadClusterVersionsResponse> {
+        let Some(store) = self.store.as_ref() else {
+            return Err(to_transport_error(ConsensusError::Message(
+                "this node was built without applied state and cannot serve reads".to_owned(),
+            )));
+        };
+        // Fence FIRST, as every admin read does: a raise judged on a lagging
+        // copy could miss the member that joined, or the report that lags.
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(classify_read_error)
+            .map_err(to_transport_error)?;
+        Ok(store.with_storage(|storage| {
+            let read_at_applied_index = storage.last_applied();
+            let state = storage.state();
+            let (versions, truncated) = if request.include_nodes {
+                let mut versions = state.cluster_versions();
+                let truncated =
+                    versions.nodes.len() > crate::transport::wire::MAX_CLUSTER_VERSION_NODES;
+                versions
+                    .nodes
+                    .truncate(crate::transport::wire::MAX_CLUSTER_VERSION_NODES);
+                (versions, truncated)
+            } else {
+                (
+                    crate::versions::ClusterVersions {
+                        feature_level: state.feature_level(),
+                        nodes: Vec::new(),
+                    },
+                    false,
+                )
+            };
+            crate::transport::wire::AdminReadClusterVersionsResponse {
+                versions,
+                truncated,
+                read_at_applied_index,
+            }
+        }))
+    }
+
     async fn read_segment_placement(
         &self,
         request: crate::transport::wire::AdminReadSegmentPlacementRequest,

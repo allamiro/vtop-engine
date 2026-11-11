@@ -43,7 +43,8 @@ const CATEGORY_TOPIC_RETENTION_POLICY: u8 = 17;
 const CATEGORY_RANGE_TRANSITION: u8 = 18;
 const CATEGORY_LINEAGE_TRANSITION: u8 = 19;
 const CATEGORY_RANGE_REPLICA_SET: u8 = 20;
-const CATEGORY_PROMOTION_ATTESTATION: u8 = 21;
+const CATEGORY_NODE_VERSION: u8 = 21;
+const CATEGORY_PROMOTION_ATTESTATION: u8 = 22;
 
 /// Consumer-group names reuse the topic-name bound so group identity stays
 /// allocation-bounded on the wire and in snapshots.
@@ -170,6 +171,12 @@ pub enum MetaKey {
         topic_uuid: Uuid,
         range_uuid: Uuid,
     },
+    /// What a data node last reported it runs (#634). Its own key rather
+    /// than a wider node record, so a cluster whose nodes never report
+    /// carries no record a release before the report can read.
+    NodeVersion {
+        node_uuid: Uuid,
+    },
 }
 
 /// Validate a topic name against the shared 249-byte semantics.
@@ -220,6 +227,7 @@ impl MetaKey {
             MetaKey::LineageTransition { .. } => CATEGORY_LINEAGE_TRANSITION,
             MetaKey::RangeReplicaSet { .. } => CATEGORY_RANGE_REPLICA_SET,
             MetaKey::PromotionAttestation { .. } => CATEGORY_PROMOTION_ATTESTATION,
+            MetaKey::NodeVersion { .. } => CATEGORY_NODE_VERSION,
         }
     }
 
@@ -335,6 +343,7 @@ impl MetaKey {
                 put_uuid(&mut out, *topic_uuid);
                 put_uuid(&mut out, *range_uuid);
             }
+            MetaKey::NodeVersion { node_uuid } => put_uuid(&mut out, *node_uuid),
         }
         out
     }
@@ -448,6 +457,9 @@ impl MetaKey {
             CATEGORY_PROMOTION_ATTESTATION => MetaKey::PromotionAttestation {
                 topic_uuid: reader.uuid("topic uuid")?,
                 range_uuid: reader.uuid("range uuid")?,
+            },
+            CATEGORY_NODE_VERSION => MetaKey::NodeVersion {
+                node_uuid: reader.uuid("node uuid")?,
             },
             CATEGORY_TOPIC_RETENTION_POLICY => MetaKey::TopicRetentionPolicy {
                 topic_uuid: reader.uuid("topic uuid")?,
@@ -577,6 +589,9 @@ impl fmt::Display for MetaKey {
                 formatter,
                 "/meta/0/promotion-attestation/{topic_uuid}/{range_uuid}"
             ),
+            MetaKey::NodeVersion { node_uuid } => {
+                write!(formatter, "/meta/0/node-version/{node_uuid}")
+            }
         }
     }
 }
@@ -588,6 +603,9 @@ mod tests {
     fn every_key() -> Vec<MetaKey> {
         vec![
             MetaKey::ClusterConfig,
+            MetaKey::NodeVersion {
+                node_uuid: Uuid::from_u128(1),
+            },
             MetaKey::RangeReplicaSet {
                 topic_uuid: Uuid::from_u128(2),
                 range_uuid: Uuid::from_u128(3),

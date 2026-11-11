@@ -30,6 +30,7 @@
 pub mod committed_floor;
 pub mod fencing_epochs;
 pub mod group_commit;
+pub mod kept_dispute;
 pub mod memory_budget;
 pub mod replication;
 pub mod retention_stats;
@@ -132,6 +133,12 @@ pub enum BrokerError {
     /// file stay [`BrokerError::Io`], which names the path.
     #[error("committed-floor file: {0}")]
     CommittedFloor(String),
+    /// The kept-dispute record beside the fencing-epoch journal (#635) is in
+    /// a shape this build must not read as "no dispute": written by a newer
+    /// release, or not a record at all. Plain I/O failures stay
+    /// [`BrokerError::Io`].
+    #[error("kept-dispute record: {0}")]
+    KeptDispute(String),
     /// A boundary-marker publication that could not complete (#240): no
     /// replication to convince, a v1 range whose merged producer identity
     /// cannot carry the marker, a fence landing before publication, or a
@@ -167,6 +174,13 @@ pub enum BrokerError {
     /// sides, see `vtop_meta::transport::cross_mode_refusal`.
     #[error("{0}")]
     CrossMode(String),
+    /// A replica peer this node will not run a session with, or one that
+    /// will not run one with this node (#634): the version handshake found
+    /// it below the cluster's finalized feature level, or found no protocol
+    /// in common. Its own variant because the remedy is an upgrade, not a
+    /// retry or a configuration change.
+    #[error("replica version: {0}")]
+    ReplicaVersion(String),
     #[error("segment storage error: {0}")]
     Segment(#[from] vtop_log::LogError),
 }

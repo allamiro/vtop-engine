@@ -15,14 +15,15 @@ use crate::command::{
     decode_promotion_outcome, encode_promotion_outcome, MetadataCommand, MetadataError,
     MetadataResponse, NodeState, PromotionAttestation, PromotionOutcome, RangeAssignment,
     VerificationMethod, MAX_ASSIGNED_RANGES, MAX_ATTESTATION_OPERATOR_BYTES, MAX_NODE_ADDR_BYTES,
-    MAX_TIER_BACKEND_ID_BYTES, MAX_TIER_OBJECT_URI_BYTES, MAX_TIER_VERSION_ID_BYTES,
-    MAX_TRANSITION_QUORUM,
+    MAX_RELEASE_BYTES, MAX_TIER_BACKEND_ID_BYTES, MAX_TIER_OBJECT_URI_BYTES,
+    MAX_TIER_VERSION_ID_BYTES, MAX_TRANSITION_QUORUM, NODE_VERSION_REPORTS_FEATURE_LEVEL,
 };
 use crate::keys::{validate_group_name, validate_topic_name, MetaKey};
 use crate::placement::{
     select_replicas, PlacementCandidate, DEFAULT_PLACEMENT_WEIGHT, MAX_FAILURE_DOMAIN_BYTES,
     MAX_REPLICAS, MAX_TRANSIENT_REPLICAS, MIN_PLACEMENT_WEIGHT,
 };
+use crate::versions::{ClusterVersions, NodeVersionEntry, NodeVersionRecord};
 use crate::wire::{
     put_bounded_str, put_bytes32, put_i64, put_u16, put_u32, put_u64, put_u8, put_uuid, CodecError,
     Reader,
@@ -74,9 +75,13 @@ const VALUE_TAG_CLUSTER_CONFIG: u8 = 22;
 /// feature level 5, so a cluster that never records one carries no tag an
 /// older node cannot read.
 const VALUE_TAG_RANGE_REPLICA_SET: u8 = 23;
+/// A data node's version report (#634); written only by a command gated at
+/// [`NODE_VERSION_REPORTS_FEATURE_LEVEL`], so a cluster below it carries no
+/// tag an older node cannot read.
+const VALUE_TAG_NODE_VERSION: u8 = 24;
 /// An operator's live promotion attestation (#636); written only by a
 /// command gated at feature level 8.
-const VALUE_TAG_PROMOTION_ATTESTATION: u8 = 24;
+const VALUE_TAG_PROMOTION_ATTESTATION: u8 = 25;
 
 /// The replica set a range's quorum is counted over (#553).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -554,6 +559,7 @@ pub enum MetaValue {
     LineageTransition(LineageTransitionRecord),
     ClusterConfig(ClusterConfigRecord),
     RangeReplicaSet(RangeReplicaSetRecord),
+    NodeVersion(NodeVersionRecord),
     PromotionAttestation(PromotionAttestation),
 }
 
@@ -866,6 +872,12 @@ impl MetaValue {
             MetaValue::PromotionAttestation(attestation) => {
                 put_u8(&mut out, VALUE_TAG_PROMOTION_ATTESTATION);
                 attestation.encode_into(&mut out)?;
+            }
+            MetaValue::NodeVersion(report) => {
+                put_u8(&mut out, VALUE_TAG_NODE_VERSION);
+                put_bounded_str(&mut out, &report.release, MAX_RELEASE_BYTES, "release")?;
+                put_u16(&mut out, report.max_replica_protocol);
+                put_u32(&mut out, report.supported_feature_level);
             }
         }
         Ok(out)
@@ -1250,6 +1262,11 @@ impl MetaValue {
             VALUE_TAG_PROMOTION_ATTESTATION => {
                 MetaValue::PromotionAttestation(PromotionAttestation::decode_from(&mut reader)?)
             }
+            VALUE_TAG_NODE_VERSION => MetaValue::NodeVersion(NodeVersionRecord {
+                release: reader.bounded_str(MAX_RELEASE_BYTES, "release")?,
+                max_replica_protocol: reader.u16("max replica protocol")?,
+                supported_feature_level: reader.u32("supported feature level")?,
+            }),
             other => {
                 return Err(CodecError::UnknownTag {
                     what: "record value tag",
@@ -1582,10 +1599,17 @@ impl MetaStateMachine {
     }
 
     fn set_feature_level(&mut self, requested: u32) -> MetadataResponse {
-        if requested > crate::command::SUPPORTED_FEATURE_LEVEL {
+        self.raise_feature_level(requested, crate::command::SUPPORTED_FEATURE_LEVEL)
+    }
+
+    /// [`Self::set_feature_level`] for a build that supports `supported`:
+    /// separate so the data-node gate (#634), which only a level above this
+    /// release's can exercise, is tested as the release that adds one will
+    /// run it.
+    fn raise_feature_level(&mut self, requested: u32, supported: u32) -> MetadataResponse {
+        if requested > supported {
             return reject(MetadataError::invalid_transition(format!(
-                "feature level {requested} is newer than this release supports ({})",
-                crate::command::SUPPORTED_FEATURE_LEVEL
+                "feature level {requested} is newer than this release supports ({supported})"
             )));
         }
         let current = self.feature_level();
@@ -1593,6 +1617,23 @@ impl MetaStateMachine {
         // is already in force - an idempotent Ack, so a retried enable is
         // not an error.
         if requested > current {
+            // Not before every live range member reports it (#634). Judged
+            // HERE as well as by the CLI that proposed it: a node that became
+            // a member, or reported, between the CLI's read and this apply is
+            // judged too, because this is the one place nothing can change
+            // underneath the decision. Deterministic, since every voter that
+            // accepts a level above the report level runs this check (an
+            // older release refuses the level outright, above).
+            let blockers = if requested > NODE_VERSION_REPORTS_FEATURE_LEVEL {
+                self.cluster_versions().blockers(requested)
+            } else {
+                Vec::new()
+            };
+            if !blockers.is_empty() {
+                return reject(MetadataError::invalid_transition(
+                    crate::versions::describe_blockers(requested, &blockers),
+                ));
+            }
             self.records.insert(
                 MetaKey::ClusterConfig.encode(),
                 MetaValue::ClusterConfig(ClusterConfigRecord {
@@ -1602,6 +1643,101 @@ impl MetaStateMachine {
         }
         MetadataResponse::Ack {
             generation: u64::from(self.feature_level()),
+        }
+    }
+
+    /// Record what a data node runs (#634), replacing its previous report.
+    ///
+    /// Only a REGISTERED node's report is kept. A node metadata has no record
+    /// of could not be marked dead, so a report from one that then vanished
+    /// would hold every later raise back with nothing an operator could do.
+    /// Answers with the cluster's feature level as the generation, so the
+    /// reporter learns the level in force from the same round trip.
+    fn report_node_version(
+        &mut self,
+        node_uuid: Uuid,
+        release: &str,
+        max_replica_protocol: u16,
+        supported_feature_level: u32,
+    ) -> MetadataResponse {
+        if release.is_empty() || release.len() > MAX_RELEASE_BYTES {
+            return reject(MetadataError::limit(format!(
+                "a release must be 1..={MAX_RELEASE_BYTES} bytes, got {}",
+                release.len()
+            )));
+        }
+        // A node that implements less than the level that lets it report
+        // could not have sent this; a protocol of 0 is no protocol.
+        if supported_feature_level < NODE_VERSION_REPORTS_FEATURE_LEVEL || max_replica_protocol == 0
+        {
+            return reject(MetadataError::invalid_transition(format!(
+                "a version report needs a supported level of at least \
+                 {NODE_VERSION_REPORTS_FEATURE_LEVEL} and a replica protocol above 0, got level \
+                 {supported_feature_level} and protocol {max_replica_protocol}"
+            )));
+        }
+        if !matches!(
+            self.record(&MetaKey::Node { node_uuid }),
+            Some(MetaValue::Node(_))
+        ) {
+            return reject(MetadataError::NotFound);
+        }
+        self.records.insert(
+            MetaKey::NodeVersion { node_uuid }.encode(),
+            MetaValue::NodeVersion(NodeVersionRecord {
+                release: release.to_owned(),
+                max_replica_protocol,
+                supported_feature_level,
+            }),
+        );
+        MetadataResponse::Ack {
+            generation: u64::from(self.feature_level()),
+        }
+    }
+
+    /// Every registered node, whether metadata can name it as a range
+    /// member, and what it last reported (#634): what a feature raise is
+    /// judged on.
+    ///
+    /// A range member is a node holding a range's lease or named in a
+    /// range's recorded replica set. Walks every record once; it runs on a
+    /// raise and on an operator's read, never on a hot path.
+    pub fn cluster_versions(&self) -> ClusterVersions {
+        let mut members = std::collections::BTreeSet::new();
+        let mut nodes = Vec::new();
+        let mut reports = BTreeMap::new();
+        for (key, value) in &self.records {
+            match value {
+                MetaValue::Range(range) => {
+                    if let Some(lease) = &range.lease {
+                        members.insert(lease.holder_node_uuid);
+                    }
+                }
+                MetaValue::RangeReplicaSet(set) => members.extend(set.members.iter().copied()),
+                MetaValue::Node(node) => {
+                    if let Ok(MetaKey::Node { node_uuid }) = MetaKey::decode(key) {
+                        nodes.push((node_uuid, node.state));
+                    }
+                }
+                MetaValue::NodeVersion(report) => {
+                    if let Ok(MetaKey::NodeVersion { node_uuid }) = MetaKey::decode(key) {
+                        reports.insert(node_uuid, report.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        ClusterVersions {
+            feature_level: self.feature_level(),
+            nodes: nodes
+                .into_iter()
+                .map(|(node_uuid, state)| NodeVersionEntry {
+                    node_uuid,
+                    state,
+                    range_member: members.contains(&node_uuid),
+                    report: reports.remove(&node_uuid),
+                })
+                .collect(),
         }
     }
 
@@ -1801,6 +1937,18 @@ impl MetaStateMachine {
             MetadataCommand::SetFeatureLevel { feature_level, .. } => {
                 self.set_feature_level(*feature_level)
             }
+            MetadataCommand::ReportNodeVersion {
+                node_uuid,
+                release,
+                max_replica_protocol,
+                supported_feature_level,
+                ..
+            } => self.report_node_version(
+                *node_uuid,
+                release,
+                *max_replica_protocol,
+                *supported_feature_level,
+            ),
             MetadataCommand::SetRangeReplicaSet {
                 topic_uuid,
                 range_uuid,
@@ -5728,6 +5876,7 @@ fn key_matches_value(key: &MetaKey, value: &MetaValue) -> bool {
                 MetaKey::PromotionAttestation { .. },
                 MetaValue::PromotionAttestation(_)
             )
+            | (MetaKey::NodeVersion { .. }, MetaValue::NodeVersion(_))
     )
 }
 
@@ -6026,6 +6175,172 @@ mod tests {
         let restored =
             MetaStateMachine::decode_snapshot(&machine.encode_snapshot().unwrap()).unwrap();
         assert_eq!(restored.feature_level(), SUPPORTED_FEATURE_LEVEL);
+    }
+
+    fn report_version(
+        machine: &mut MetaStateMachine,
+        index: u64,
+        node: u128,
+        supported_feature_level: u32,
+    ) -> MetadataResponse {
+        machine.apply(
+            index,
+            &MetadataCommand::ReportNodeVersion {
+                env: envelope(u128::from(index) + 2_000),
+                node_uuid: Uuid::from_u128(node),
+                release: format!("0.{supported_feature_level}.0"),
+                max_replica_protocol: 2,
+                supported_feature_level,
+            },
+        )
+    }
+
+    /// #634: a registered node's report is recorded, replaces the one
+    /// before it, answers with the level in force, and survives a snapshot;
+    /// one from a node metadata does not know, or one no node could send, is
+    /// refused.
+    #[test]
+    fn a_data_node_reports_what_it_runs_and_the_report_is_snapshotted() {
+        let (mut machine, node, _, _) = leaseable_range(1);
+        assert_eq!(
+            report_version(&mut machine, 3, 9, 7),
+            reject(MetadataError::NotFound),
+            "an unregistered node could never be marked dead, so its report is not kept"
+        );
+        assert!(is_rejected(&report_version(&mut machine, 4, 1, 6)));
+        let empty_release = machine.apply(
+            5,
+            &MetadataCommand::ReportNodeVersion {
+                env: envelope(5),
+                node_uuid: node,
+                release: String::new(),
+                max_replica_protocol: 2,
+                supported_feature_level: 7,
+            },
+        );
+        assert!(is_rejected(&empty_release), "{empty_release:?}");
+
+        assert_eq!(
+            report_version(&mut machine, 6, 1, 7),
+            MetadataResponse::Ack {
+                generation: u64::from(machine.feature_level())
+            }
+        );
+        assert_eq!(
+            report_version(&mut machine, 7, 1, 8),
+            MetadataResponse::Ack {
+                generation: u64::from(machine.feature_level())
+            },
+            "a later report replaces the earlier one"
+        );
+        let versions = machine.cluster_versions();
+        assert_eq!(versions.nodes.len(), 1);
+        assert_eq!(
+            versions.nodes[0]
+                .report
+                .as_ref()
+                .map(|report| report.supported_feature_level),
+            Some(8)
+        );
+        let restored =
+            MetaStateMachine::decode_snapshot(&machine.encode_snapshot().unwrap()).unwrap();
+        assert_eq!(restored.cluster_versions(), versions);
+    }
+
+    /// #634, the gate: a level above the report level is refused while any
+    /// live range member reports less, the refusal names it, and the same
+    /// raise succeeds once it has upgraded. Driven as a build that supports
+    /// one level more than this release, because that is the only build
+    /// that can ask for a level the gate holds back.
+    #[test]
+    fn a_raise_waits_for_every_live_range_member_to_report_it() {
+        let (mut machine, leader, topic, range) = leaseable_range(1);
+        for (index, node) in [(3, 2u128), (4, 3), (5, 4)] {
+            machine.apply(
+                index,
+                &MetadataCommand::RegisterNode {
+                    env: envelope(u128::from(index)),
+                    node_uuid: Uuid::from_u128(node),
+                    addr: format!("n{node}:9200"),
+                    expected_generation: None,
+                },
+            );
+        }
+        let generation = range_of(&machine, topic, range).generation;
+        assert!(matches!(
+            machine.apply(
+                6,
+                &MetadataCommand::GrantRangeLease {
+                    env: envelope(6),
+                    topic_uuid: topic,
+                    range_uuid: range,
+                    holder_node_uuid: leader,
+                    expected_range_generation: generation,
+                },
+            ),
+            MetadataResponse::LeaseGranted { .. }
+        ));
+        // The report level itself is judged on the metadata tier alone: no
+        // data node can have reported before it is in force.
+        assert_eq!(
+            machine.apply(
+                7,
+                &MetadataCommand::SetFeatureLevel {
+                    env: envelope(7),
+                    feature_level: NODE_VERSION_REPORTS_FEATURE_LEVEL,
+                },
+            ),
+            MetadataResponse::Ack {
+                generation: u64::from(NODE_VERSION_REPORTS_FEATURE_LEVEL)
+            }
+        );
+        let next = NODE_VERSION_REPORTS_FEATURE_LEVEL + 1;
+
+        // The leader has not reported, node 2 (a follower, known only by its
+        // report) runs the older release, node 3 is a placeholder that serves
+        // no range, and node 4 reported old but is marked dead.
+        report_version(&mut machine, 8, 2, NODE_VERSION_REPORTS_FEATURE_LEVEL);
+        report_version(&mut machine, 9, 4, NODE_VERSION_REPORTS_FEATURE_LEVEL);
+        machine.apply(
+            10,
+            &MetadataCommand::SetNodeState {
+                env: envelope(10),
+                node_uuid: Uuid::from_u128(4),
+                state: NodeState::Dead,
+                expected_generation: 0,
+            },
+        );
+        let refused = machine.raise_feature_level(next, next);
+        let MetadataResponse::Rejected(MetadataError::InvalidTransition(why)) = &refused else {
+            panic!("a raise with an unreported member and an old one must be refused: {refused:?}");
+        };
+        assert!(why.contains(&format!("{leader} (never reported)")), "{why}");
+        assert!(
+            why.contains(&format!(
+                "{} (release 0.{NODE_VERSION_REPORTS_FEATURE_LEVEL}.0",
+                Uuid::from_u128(2)
+            )),
+            "{why}"
+        );
+        assert!(!why.contains(&Uuid::from_u128(3).to_string()), "{why}");
+        assert!(!why.contains(&Uuid::from_u128(4).to_string()), "{why}");
+        assert_eq!(machine.feature_level(), NODE_VERSION_REPORTS_FEATURE_LEVEL);
+
+        // The leader reports; node 2 still holds the raise back.
+        report_version(&mut machine, 11, 1, next);
+        let still = machine.raise_feature_level(next, next);
+        assert!(is_rejected(&still), "{still:?}");
+        assert_eq!(machine.feature_level(), NODE_VERSION_REPORTS_FEATURE_LEVEL);
+
+        // Node 2 is upgraded and reports again: the same raise now succeeds.
+        report_version(&mut machine, 12, 2, next);
+        assert_eq!(
+            machine.raise_feature_level(next, next),
+            MetadataResponse::Ack {
+                generation: u64::from(next)
+            }
+        );
+        assert_eq!(machine.feature_level(), next);
     }
 
     fn set_replica_set(

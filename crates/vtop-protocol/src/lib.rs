@@ -695,6 +695,175 @@ impl Message {
     }
 }
 
+/// The replica plane's protocol versions (#634).
+///
+/// The replica plane had no negotiation: a session opened with its first
+/// request, and every peer spoke the same frames. That is version 1, what
+/// every release before the handshake speaks. Version 2 opens the session
+/// with a [`ReplicaHello`] and is otherwise the same frames; it exists so a
+/// LATER wire change (a field in the fence reply, say) can ship as version
+/// 3 and be sent only to a peer that negotiated it.
+pub const REPLICA_PROTOCOL_LEGACY: u16 = 1;
+/// The first replica protocol that opens with a version exchange (#634).
+pub const REPLICA_PROTOCOL_HANDSHAKE: u16 = 2;
+/// The highest replica protocol this build speaks.
+pub const REPLICA_PROTOCOL_MAX: u16 = REPLICA_PROTOCOL_HANDSHAKE;
+
+/// Marks the replica fields inside a hello's nonce (#634).
+const REPLICA_HELLO_MARKER: [u8; 4] = *b"VTRP";
+
+/// A replica session's opening version exchange (#634), sent by the side
+/// that dials.
+///
+/// # Why it rides kind 1
+///
+/// Every replica peer since the plane existed DECODES a [`ClientHello`]
+/// (kind 1) - the frame decoder knows the kind - and its replica dispatcher
+/// answers it with an `InvalidRequest` error and keeps the session open. A
+/// NEW kind would instead fail an older peer's frame decoder and drop the
+/// connection, and the frame header has no field an older peer ignores: it
+/// refuses a higher minor and any flag. So the hello is a well-formed
+/// `ClientHello` with role [`Role::Peer`], and the replica fields sit in its
+/// 32-byte `session_nonce` behind a marker (the replica plane has no other
+/// use for the nonce). An older peer's typed refusal is how a newer one
+/// learns to speak version 1 to it.
+///
+/// Nonce layout: marker `VTRP` (4), `min_protocol` u16, `max_protocol` u16,
+/// `supported_feature_level` u32, then 20 bytes a reader ignores, so a later
+/// release can add a field without a new frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicaHello {
+    pub node_id: Uuid,
+    pub min_protocol: u16,
+    pub max_protocol: u16,
+    /// The highest metadata feature level the sender implements.
+    pub supported_feature_level: u32,
+}
+
+/// The answer to a [`ReplicaHello`] from a peer that speaks the handshake,
+/// carried in a [`ServerHello`] the same way.
+///
+/// Nonce layout: marker `VTRP` (4), `selected_protocol` u16, `max_protocol`
+/// u16, `supported_feature_level` u32, then 20 ignored bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicaHelloAccept {
+    pub node_id: Uuid,
+    /// The version both sides speak for the rest of the session: the lower
+    /// of the two maxima.
+    pub selected_protocol: u16,
+    pub max_protocol: u16,
+    pub supported_feature_level: u32,
+}
+
+fn replica_nonce(first: u16, second: u16, level: u32) -> [u8; 32] {
+    let mut nonce = [0_u8; 32];
+    nonce[..4].copy_from_slice(&REPLICA_HELLO_MARKER);
+    nonce[4..6].copy_from_slice(&first.to_be_bytes());
+    nonce[6..8].copy_from_slice(&second.to_be_bytes());
+    nonce[8..12].copy_from_slice(&level.to_be_bytes());
+    nonce
+}
+
+fn replica_fields(nonce: &[u8; 32]) -> Option<(u16, u16, u32)> {
+    if nonce[..4] != REPLICA_HELLO_MARKER {
+        return None;
+    }
+    Some((
+        u16::from_be_bytes([nonce[4], nonce[5]]),
+        u16::from_be_bytes([nonce[6], nonce[7]]),
+        u32::from_be_bytes([nonce[8], nonce[9], nonce[10], nonce[11]]),
+    ))
+}
+
+impl ReplicaHello {
+    /// The hello as the wire carries it: a [`ClientHello`] an older replica
+    /// peer decodes and refuses by type.
+    pub fn to_message(self) -> Message {
+        Message::ClientHello(ClientHello {
+            cluster_id: Uuid::nil(),
+            principal_id: self.node_id,
+            role: Role::Peer,
+            minimum_major: PROTOCOL_MAJOR,
+            maximum_major: PROTOCOL_MAJOR,
+            requested_max_frame_bytes: 0,
+            requested_max_records: 0,
+            requested_max_inflight_requests: 0,
+            initial_window_bytes: 0,
+            session_nonce: replica_nonce(
+                self.min_protocol,
+                self.max_protocol,
+                self.supported_feature_level,
+            ),
+        })
+    }
+
+    /// `None` unless `message` is a replica hello.
+    pub fn from_message(message: &Message) -> Option<Self> {
+        let Message::ClientHello(hello) = message else {
+            return None;
+        };
+        if hello.role != Role::Peer {
+            return None;
+        }
+        let (min_protocol, max_protocol, supported_feature_level) =
+            replica_fields(&hello.session_nonce)?;
+        Some(Self {
+            node_id: hello.principal_id,
+            min_protocol,
+            max_protocol,
+            supported_feature_level,
+        })
+    }
+}
+
+impl ReplicaHelloAccept {
+    pub fn to_message(self) -> Message {
+        Message::ServerHello(ServerHello {
+            cluster_id: Uuid::nil(),
+            node_id: self.node_id,
+            selected_major: PROTOCOL_MAJOR,
+            selected_minor: PROTOCOL_MINOR,
+            max_frame_bytes: 0,
+            max_records: 0,
+            max_inflight_requests: 0,
+            initial_window_bytes: 0,
+            session_nonce: replica_nonce(
+                self.selected_protocol,
+                self.max_protocol,
+                self.supported_feature_level,
+            ),
+        })
+    }
+
+    /// `None` unless `message` is an answer to a replica hello.
+    pub fn from_message(message: &Message) -> Option<Self> {
+        let Message::ServerHello(hello) = message else {
+            return None;
+        };
+        let (selected_protocol, max_protocol, supported_feature_level) =
+            replica_fields(&hello.session_nonce)?;
+        Some(Self {
+            node_id: hello.node_id,
+            selected_protocol,
+            max_protocol,
+            supported_feature_level,
+        })
+    }
+}
+
+/// The replica protocol two peers share: the lower of their maxima, if it
+/// is one both speak. `None` when their ranges do not overlap.
+pub fn negotiate_replica_protocol(
+    local_min: u16,
+    local_max: u16,
+    peer_min: u16,
+    peer_max: u16,
+) -> Option<u16> {
+    let selected = local_max.min(peer_max);
+    (selected >= local_min.max(peer_min) && local_min <= local_max && peer_min <= peer_max)
+        .then_some(selected)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WireFrame {
     pub request_id: u64,
@@ -2073,6 +2242,86 @@ impl<'a> Decoder<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// #634: the replica hello is a kind-1 frame that today's decoder - the
+    /// one every replica peer before the handshake runs, unchanged - reads
+    /// as an ordinary `ClientHello`, and its answer a kind-2 `ServerHello`.
+    /// Both carry the replica fields back out, and a client-plane hello
+    /// (another role, or no marker) is not mistaken for one.
+    #[test]
+    fn a_replica_hello_is_a_hello_frame_an_older_peer_decodes() {
+        use super::*;
+        let hello = ReplicaHello {
+            node_id: uuid::Uuid::from_u128(0x634),
+            min_protocol: REPLICA_PROTOCOL_HANDSHAKE,
+            max_protocol: 9,
+            supported_feature_level: 7,
+        };
+        let frame = WireFrame {
+            request_id: 0,
+            stream_id: 0,
+            message: hello.to_message(),
+        };
+        let encoded = encode_frame(&frame, ProtocolLimits::default()).unwrap();
+        assert_eq!(u16::from_be_bytes([encoded[8], encoded[9]]), 1, "kind 1");
+        assert_eq!(&encoded[4..8], &[0, 1, 0, 0], "frame protocol 1.0");
+        let decoded = decode_frame(&encoded, ProtocolLimits::default()).unwrap();
+        assert!(matches!(decoded.message, Message::ClientHello(_)));
+        assert_eq!(ReplicaHello::from_message(&decoded.message), Some(hello));
+
+        let accept = ReplicaHelloAccept {
+            node_id: uuid::Uuid::from_u128(0x635),
+            selected_protocol: REPLICA_PROTOCOL_HANDSHAKE,
+            max_protocol: REPLICA_PROTOCOL_MAX,
+            supported_feature_level: 8,
+        };
+        let encoded = encode_frame(
+            &WireFrame {
+                request_id: 0,
+                stream_id: 0,
+                message: accept.to_message(),
+            },
+            ProtocolLimits::default(),
+        )
+        .unwrap();
+        let decoded = decode_frame(&encoded, ProtocolLimits::default()).unwrap();
+        assert_eq!(
+            ReplicaHelloAccept::from_message(&decoded.message),
+            Some(accept)
+        );
+
+        let Message::ClientHello(mut client) = hello.to_message() else {
+            unreachable!()
+        };
+        client.role = Role::Producer;
+        assert_eq!(
+            ReplicaHello::from_message(&Message::ClientHello(client.clone())),
+            None
+        );
+        client.role = Role::Peer;
+        client.session_nonce = [7; 32];
+        assert_eq!(
+            ReplicaHello::from_message(&Message::ClientHello(client)),
+            None
+        );
+        assert_eq!(ReplicaHello::from_message(&Message::Ping), None);
+    }
+
+    /// #634: both sides speak the lower version, and two ranges that do not
+    /// meet share none.
+    #[test]
+    fn replica_protocols_negotiate_down_to_the_lower_maximum() {
+        use super::negotiate_replica_protocol as negotiate;
+        assert_eq!(negotiate(2, 2, 2, 2), Some(2));
+        assert_eq!(
+            negotiate(2, 2, 2, 5),
+            Some(2),
+            "a newer peer is met at ours"
+        );
+        assert_eq!(negotiate(2, 5, 2, 3), Some(3), "an older peer at its own");
+        assert_eq!(negotiate(4, 5, 2, 3), None, "no version in common");
+        assert_eq!(negotiate(2, 2, 3, 1), None, "an inverted range is no range");
+    }
+
     /// The admission sizer and the encoder agree to the byte (#453): a
     /// leader refusing on the sizer refuses exactly the frames the wire
     /// would refuse to encode.

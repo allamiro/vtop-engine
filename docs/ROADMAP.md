@@ -250,8 +250,8 @@ reopen quietly.
   that kept such a suffix and was outvoted discards it on the established
   leader's first append or committed high-water mark past its start,
   instead of acking a record it does not hold (#261) or exposing the kept
-  records as committed. That memory does not survive a restart, which leaves
-  it in the same position as a replica that was absent from the fence.
+  records as committed. Until it is settled, that dispute caps the replica's
+  acks and reconnect status at its start.
   **The protection is the fenced replica's, so it holds only on upgraded
   replicas.** There is no wire or feature-level change and the fence frames
   are identical, so nothing tells a candidate which replicas run this
@@ -262,6 +262,57 @@ reopen quietly.
   keep the rolling upgrade itself from triggering it. An older candidate
   facing an upgraded replica judges the kept answer refused (its offset is
   higher) or Unknown, never a grant.
+- **#635** - the #611 dispute lived in memory only. A replica restarted
+  between the fence reply that kept the suffix and its settlement came back
+  holding the old records with nothing marking them, reported its full log,
+  and acked the new leader's record at the disputed offset as a duplicate of
+  a different one (#261). The dispute (fence epoch, first disputed offset,
+  and, when this replica's history can say, the epoch that owned that
+  offset) is now written beside the fencing-epoch journal, as
+  `fencing-epochs.kept-dispute`, and fsynced before the fence replies. Every
+  retirement, whether by settlement, truncation, a newer fence or the node's
+  own fence as a candidate, clears it durably before anything is acked past
+  it. A restart restores it, so it caps acks and status and is settled
+  exactly as before. A record the log has provably moved past, or one that
+  starts below the replica's committed mark or below the caller's tail its
+  fence bounded it by, is discarded at open, never settled over the new
+  leader's records. A lease adoption of a newer epoch is not such evidence:
+  adoption alone retires nothing. A dispute is retired only by its
+  settlement, a truncation past its start, a newer fence, or the node's own
+  fence as a candidate, and each of these clears the record.
+  The record holds two checksummed frames, so a crash while it changes
+  reads back the old state or the new one, never neither. **Older releases refuse the
+  directory while a dispute may be pending:** the journal's header is
+  version 2 from before the record is written until after it is cleared,
+  and every earlier release opens only version 1, so a downgrade cannot
+  silently serve the suffix. A crash between clearing the record and
+  lowering the header leaves the header at 2 until this release next opens
+  the directory, which lowers it. A crash sweep
+  (`kept_dispute_crash_sweep.rs`) cuts the fence and the settlement at every
+  storage operation and every byte of every write.
+- **#634** - a data node's release was invisible to the cluster, so a
+  feature level was raised on the metadata tier's word alone, and the
+  replica plane had no version on the wire. Data nodes now report
+  `(release, max replica protocol, supported feature level)` to metadata (a
+  new command kind, feature level 7) from startup until it is recorded, and
+  `vtopctl meta node-versions` lists the reports. A raise above level 7 is
+  refused while any live range member reports less: a lease holder, a
+  member of a recorded replica set, or any node that has reported, unless
+  marked dead. The refusal names the nodes. The CLI and the state machine
+  both judge the raise, so the check and the raise cannot race. The replica session now
+  opens with a version exchange carried in the hello frames every older
+  peer already decodes. A peer before the handshake answers it with a typed
+  refusal and is spoken to in the old protocol, and both sides use the lower
+  version. A peer below the finalized level is refused on both ends, and
+  one before the handshake is refused once the level is above 7. Limits: no
+  release supports a level above 7 yet, so the gate and the replica-plane
+  refusal have nothing to refuse until one does. They are exercised in tests
+  as that release will run them. A node is reported once per process, not on
+  every renewal, because the renewals share one Raft queue and an unchanged
+  report carries nothing. A data node with no metadata configured
+  holds no peer to a level. A follower metadata cannot name, because it
+  never reported and no recorded replica set lists it, does not hold a raise
+  back; after the raise the handshake refuses it if it is behind.
 
 One observation rode along without becoming a fix: scenario 09 once left a
 promotion unacquired within its deadline (#318). The flake has not recurred —
