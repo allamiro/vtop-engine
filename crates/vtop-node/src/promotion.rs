@@ -64,11 +64,19 @@
 //! the replica's answer Unknown, because the candidate cannot see the
 //! replica's retained base.
 //!
-//! **Open: followers are never truncated by an election.** A replica holding
-//! uncommitted records above the established boundary keeps them. This code
-//! correctly refuses to *expose* them, but if that replica later wins the lease
-//! they resurface. The truncation primitive exists and is bounded; what is
-//! missing is this module driving it from the divergence point.
+//! **Closed (#611): the fence discards only what is proven unacknowledged.**
+//! A replica ahead of the candidate keeps its records through the fence and
+//! refuses the vote. It used to compare the candidate's tail adoption as a
+//! divergence and truncate down to the candidate first. See the comment above
+//! the vote restriction in [`establish`].
+//!
+//! **Open: an absent replica is not truncated by an election.** A replica
+//! that was not fenced and holds uncommitted records above the established
+//! boundary keeps them. This code correctly refuses to *expose* them, but
+//! if that replica later wins the lease they resurface, and the catch-up
+//! path can ack the new leader's records over them as duplicates (#261). A
+//! replica that WAS fenced and outvoted discards them on the new leader's
+//! first append over them (#611), unless it restarted in between.
 //!
 //! **Closed, from Raft §5.4.2 (#240):** a new leader must not commit entries
 //! from a previous term by counting replicas. The boundary this module
@@ -169,11 +177,25 @@ pub struct ReplicaProbe {
 /// vector says. That is the normal shape of a fresh range, where a lease-led
 /// broker has adopted no epoch yet and so sends an empty vector (live-chaos
 /// scenarios 09 and 11-13 caught a first draft that refused it).
+///
+/// The mirror rule holds for the candidate's own tail (#611):
+/// `candidate_tail` is where the candidate's log ENDS, every record it holds
+/// whether durable or not (#616 review: its durable vote can sit below
+/// records it holds, and a dispute about those is real). A divergence at or above it
+/// concerns records only the REPLICA holds. Typically that is the
+/// candidate's adoption of the new epoch at its tail, against records the
+/// candidate never received. The replica agrees with every record the
+/// candidate holds, keeps the rest (the fence no longer discards records
+/// the candidate cannot prove unacknowledged), and answers above the
+/// candidate. Counting that answer is what lets the vote restriction refuse
+/// a candidate that lacks an acknowledged record. Leaving it Unknown would
+/// turn the refusal into a quorum miss and name nobody better.
 pub fn fenced_lineage(
     candidate: &[EpochStart],
     answered: &[EpochStart],
     answered_tail: u64,
     truncated_records: u64,
+    candidate_tail: u64,
 ) -> AnswerLineage {
     if answered_tail == 0 {
         return if truncated_records > 0 {
@@ -184,7 +206,9 @@ pub fn fenced_lineage(
     }
     match compare_lineages(candidate, answered) {
         Lineage::Unknown => AnswerLineage::Unknown,
-        Lineage::DivergesAt(offset) if offset < answered_tail => AnswerLineage::Unknown,
+        Lineage::DivergesAt(offset) if offset < answered_tail && offset < candidate_tail => {
+            AnswerLineage::Unknown
+        }
         Lineage::Agreed | Lineage::DivergesAt(_) if truncated_records > 0 => {
             AnswerLineage::Reconciled { truncated_records }
         }
@@ -412,34 +436,53 @@ pub fn establish(
     // k-th largest can sit below an acknowledged record whose surviving
     // holders straddle the candidate.
     //
-    // These are POST-RECONCILIATION offsets — the fence reconciles before it
-    // answers (#263) — and that is correct, not a leak in the restriction.
-    // A same-epoch prefix relationship is not divergence (`compare_lineage`
-    // answers Agreed and reconciliation touches nothing), so the replica
-    // ahead of the candidate still answers with its full offset and refuses
-    // the candidate here. Truncation before answering happens only on
-    // GENUINE lineage divergence, and there a pre-truncation offset would be
-    // the wrong vote input: offsets are only comparable within an agreed
-    // lineage, and counting bytes from a contradicted leadership line as
-    // log-completeness is the exact mistake epoch qualification (#258)
-    // exists to prevent.
+    // These are POST-RECONCILIATION offsets: the fence reconciles before it
+    // answers (#263). That is sound only because reconciliation discards
+    // nothing that could be acknowledged. A record it discards can no longer
+    // refuse the candidate here.
     //
-    // Can a divergent reconciliation delete an ACKNOWLEDGED record before
-    // the vote is read? Only if some past promotion already violated this
-    // restriction. The argument is inductive: a record acknowledged on a
-    // quorum intersects every later epoch's fence-majority, so with this
-    // gate in force at every promotion, the intersecting voter refuses any
-    // candidate whose log lacks the record — meaning every granted epoch's
-    // leader holds every previously acknowledged record, every subsequent
-    // leadership line contains them, and any suffix a voter loses to
-    // `DivergesAt` was written under a superseded line and never
-    // acknowledged. The truncation-below-HWM guard stays as the last
-    // resort for histories that predate the restriction — and it now
-    // survives restarts, seeded from the follower's persisted
-    // `committed-floor` instead of rebuilt at zero; making the
-    // property local rather than inductive — a fence that votes before it
-    // reconciles — is a protocol reordering that belongs to #240's
-    // remaining design conversation, not to this gate.
+    // A same-epoch prefix is not divergence, but the vectors do not show a
+    // bare prefix. The candidate adopts the new epoch at its own tail before
+    // it sends its history, and the replica adopts it at its tail, so a
+    // replica ahead of the candidate compares `DivergesAt(candidate tail)`.
+    // Until #611 that verdict truncated the replica down to the candidate.
+    // With RF=3, a record the deposed leader and this replica acknowledged
+    // was lost when the replica had not yet learned the commit mark. The
+    // replica then granted the vote it should have refused.
+    //
+    // Two rules close it. They answer one question: whose records are
+    // acknowledged?
+    //
+    // * The replica discards a disputed suffix only when the candidate
+    //   PROVES it unacknowledged (`fencing_epochs::caller_supersedes_suffix`).
+    //   The candidate must hold a record at the divergence point, written
+    //   under an epoch newer than every record the replica would lose. Its
+    //   adoption of the fence epoch at its tail owns no record and proves
+    //   nothing. A replica that merely holds more, or holds records from a
+    //   leadership the candidate never followed, keeps them.
+    // * The candidate counts such an answer (`fenced_lineage`): a divergence
+    //   at or above its own tail concerns only records it lacks. So the
+    //   replica's full offset arrives here and refuses the candidate below.
+    //
+    // The inductive argument then holds without exception. A record
+    // acknowledged on a quorum intersects every later fence-majority. The
+    // intersecting voter keeps the record through the fence, since no
+    // candidate lacking it can supersede it. If the candidate simply holds
+    // less, the voter's offset is above the candidate's and it refuses
+    // here. If the candidate holds a different record below its own tail,
+    // the answer is Unknown and never counted. Every granted epoch's leader
+    // therefore holds every previously acknowledged record, and a suffix a
+    // voter does lose (the candidate's newer epoch owns a record there) was
+    // written under a superseded line and never acknowledged.
+    //
+    // A kept suffix whose holder is outvoted is provably unacknowledged once
+    // the candidate is established. The replica discards it on the new
+    // leader's first append over it, not as an ack of a record it does not
+    // hold (#261). It remembers that in memory only: across a restart it is
+    // the same gap as a replica absent from the fence. The
+    // truncation-below-HWM guard stays as the last resort for histories
+    // that predate the restriction, seeded across restarts from the
+    // follower's persisted `committed-floor`.
     let votes = answered
         .values()
         .filter(|offset| **offset <= candidate_offset)
@@ -913,44 +956,77 @@ mod tests {
         // Lagging but agreeing: the replica's only difference is where it
         // adopted 3, at its own tail.
         assert_eq!(
-            fenced_lineage(&candidate, &starts(&[(1, 0), (2, 50), (3, 90)]), 90, 0),
+            fenced_lineage(&candidate, &starts(&[(1, 0), (2, 50), (3, 90)]), 90, 0, 100),
             AnswerLineage::Agreed
         );
         // Lagging so far it never saw epoch 2: every record it holds is
         // epoch 1's, as on the candidate.
         assert_eq!(
-            fenced_lineage(&candidate, &starts(&[(1, 0), (3, 40)]), 40, 0),
+            fenced_lineage(&candidate, &starts(&[(1, 0), (3, 40)]), 40, 0, 100),
             AnswerLineage::Agreed
         );
         // Diverged and reconciled: it discarded what a rival epoch wrote and
         // re-anchored 3 where the candidate has it.
         assert_eq!(
-            fenced_lineage(&candidate, &starts(&[(1, 0), (2, 50), (3, 100)]), 100, 4),
+            fenced_lineage(
+                &candidate,
+                &starts(&[(1, 0), (2, 50), (3, 100)]),
+                100,
+                4,
+                100
+            ),
             AnswerLineage::Reconciled {
                 truncated_records: 4
             }
         );
         // No history on the replica (records, no journal): Unknown.
         assert_eq!(
-            fenced_lineage(&candidate, &[], 100, 0),
+            fenced_lineage(&candidate, &[], 100, 0, 100),
             AnswerLineage::Unknown
         );
         // No history on the CANDIDATE: nothing is provable about anyone.
         assert_eq!(
-            fenced_lineage(&[], &starts(&[(1, 0), (3, 90)]), 90, 0),
+            fenced_lineage(&[], &starts(&[(1, 0), (3, 90)]), 90, 0, 100),
             AnswerLineage::Unknown
         );
         // A replica holding nothing disputes nothing, even against a
         // candidate with no history (a fresh range's first promotion).
-        assert_eq!(fenced_lineage(&[], &[], 0, 0), AnswerLineage::Agreed);
+        assert_eq!(fenced_lineage(&[], &[], 0, 0, 0), AnswerLineage::Agreed);
         assert_eq!(
-            fenced_lineage(&[], &starts(&[(3, 0)]), 0, 0),
+            fenced_lineage(&[], &starts(&[(3, 0)]), 0, 0, 0),
             AnswerLineage::Agreed
+        );
+        // #611: AHEAD of the candidate in the candidate's own last epoch.
+        // The two disagree only from 100, where the candidate's adoption of
+        // 3 owns no record, so every record the candidate holds is agreed.
+        // The replica kept 100..120 and its answer counts, above the
+        // candidate, which is the vote it refuses.
+        assert_eq!(
+            fenced_lineage(
+                &candidate,
+                &starts(&[(1, 0), (2, 50), (3, 120)]),
+                120,
+                0,
+                100
+            ),
+            AnswerLineage::Agreed
+        );
+        // The same answer judged by a candidate that HOLDS records past 100:
+        // the replica's records there are not the candidate's, unproven.
+        assert_eq!(
+            fenced_lineage(
+                &candidate,
+                &starts(&[(1, 0), (2, 50), (3, 120)]),
+                120,
+                0,
+                110
+            ),
+            AnswerLineage::Unknown
         );
         // A divergence below the replica's tail that it did not act on (the
         // retention-confined dispute): its offset is not proven.
         assert_eq!(
-            fenced_lineage(&candidate, &starts(&[(1, 0), (7, 50), (3, 90)]), 90, 0),
+            fenced_lineage(&candidate, &starts(&[(1, 0), (7, 50), (3, 90)]), 90, 0, 100),
             AnswerLineage::Unknown
         );
     }

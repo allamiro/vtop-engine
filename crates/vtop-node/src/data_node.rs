@@ -3268,6 +3268,14 @@ impl crate::lease_agent::CandidateLocalView for SwitchingLocalView {
             .and_then(|view| view.sealed_prefix_end())
     }
 
+    fn local_next_offset(&self) -> Option<u64> {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|view| view.local_next_offset())
+    }
+
     fn fence_for_probe(&self, fencing_epoch: u64) -> Result<u64, String> {
         // NO DELEGATE IS NO VOTE (review, #439). An empty slot is not an
         // empty log: the supervisor clears the old role before installing

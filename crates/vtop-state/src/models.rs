@@ -83,6 +83,13 @@ pub struct CommittedCursor {
     /// alone. `None` for a row that predates the field, or a file that was
     /// empty when read.
     pub content_fingerprint: Option<ContentFingerprint>,
+    /// The fingerprint of the bytes ending at `end_byte` that the same row's
+    /// marker took (#620): a file rewritten at the same inode while the
+    /// engine was down, with the same first page, is caught by it. `None`
+    /// for a row that predates the field (judged as before), a marker at
+    /// byte 0, and every spool row. Read out of the stored JSON - the
+    /// column already holds it, so no migration.
+    pub tail_fingerprint: Option<ContentFingerprint>,
 }
 
 /// Where the ledger says a Kafka partition resumes, for one consumer group
@@ -116,14 +123,9 @@ pub struct CommittedKafkaOffset {
 /// the comparisons are of hex text, so an uppercase digest would call the
 /// unchanged file a replacement.
 pub(crate) fn parse_content_fingerprint(json: &str) -> Option<ContentFingerprint> {
-    let fingerprint: ContentFingerprint = serde_json::from_str(json).ok()?;
-    let plausible = (1..=ContentFingerprint::MAX_LEN as u64).contains(&fingerprint.len)
-        && fingerprint.sha256.len() == 64
-        && fingerprint
-            .sha256
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
-    plausible.then_some(fingerprint)
+    serde_json::from_str::<ContentFingerprint>(json)
+        .ok()
+        .filter(ContentFingerprint::is_plausible)
 }
 
 /// Patch applied when advancing a batch's state. Fields set to `Some` are

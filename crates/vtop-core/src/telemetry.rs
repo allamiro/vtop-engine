@@ -219,7 +219,7 @@ impl Metrics {
         )?;
         let source_replay_refused_total = cv(
             "source_replay_refused_total",
-            "Failed ranges the source could not hand back for re-reading (for a file: it left its path and no file proven to be it was found); each is a range missing from the archive (see logs for the path)",
+            "Failed ranges the source refused to hand back for re-reading, or whose re-read it then refused; each is a range missing from the archive (see logs for the path). For a file: its file cannot be proven reachable - truncated, replaced or rewritten in place, or rotated away and then removed, compressed, copied by copytruncate, or truncated or rewritten before its re-read",
             vec!["tenant", "source_type"],
         )?;
 

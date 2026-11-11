@@ -23,8 +23,10 @@
 //!
 //! Either way the file must be PROVEN to be the one the range was read from
 //! before a byte is read from it ([`proves`]): the same inode, the same first
-//! page (the fingerprint the range's marker recorded, #578), and no shorter
-//! than it was when the range was read. A `copytruncate` copy fails this by
+//! page (the fingerprint the range's marker recorded, #578), the same page
+//! below the marker's position when it recorded one (#620), and no shorter
+//! than it was when the range was read. A commit counts towards a held file
+//! only by the same content test ([`HeldFile::holds`]). A `copytruncate` copy fails this by
 //! design - it has a new inode, and a fingerprint and a length are not proof
 //! of identity - so a range read before a `copytruncate` is still refused.
 //!
@@ -32,6 +34,7 @@
 //! a file that has left its path is closed [`HOLD_FOR`] after it was last used
 //! unless a re-read through it is in progress.
 
+use crate::continuity::Tail;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use vtop_core::types::ContentFingerprint;
@@ -67,6 +70,10 @@ pub(crate) struct HeldFile {
     /// shorter, so a re-read through a descriptor now shorter than this would
     /// read a truncated file as if it were the range (review of #621).
     pub min_len: u64,
+    /// The page that ends where a read of it last stopped, or where a range
+    /// proven against it ends (#620): a rewrite that keeps the first page
+    /// changes it.
+    pub tail: Option<Tail>,
     pub touched: Instant,
 }
 
@@ -86,8 +93,23 @@ impl HeldFile {
             read_end,
             committed,
             min_len: min_len.max(read_end),
+            tail: None,
             touched: Instant::now(),
         }
+    }
+
+    /// Whether a range whose marker recorded `content` (its first page) and
+    /// `tail` (the page ending where it ends) was read from the content this
+    /// descriptor reaches NOW, not merely from its inode (review of #621): a
+    /// file rewritten in place keeps the inode, and a late commit of its old
+    /// content must not count as archiving the new. A marker without a
+    /// first-page fingerprint proves nothing and answers no.
+    pub fn holds(&self, content: Option<&ContentFingerprint>, tail: Option<&Tail>) -> bool {
+        let Some(content) = content else {
+            return false;
+        };
+        head_of(&self.file).is_ok_and(|head| content.matches_head(&head))
+            && tail.is_none_or(|tail| tail_matches(&self.file, tail))
     }
 
     /// The file was seen at least `len` bytes long.
@@ -107,8 +129,14 @@ impl HeldFile {
     }
 
     /// Whether this descriptor still reaches the file a range was read from.
-    pub fn proves(&self, content: &ContentFingerprint, size_when_read: u64, start: u64) -> bool {
-        proves(&self.file, self.inode, content, size_when_read, start)
+    pub fn proves(
+        &self,
+        content: &ContentFingerprint,
+        size_when_read: u64,
+        start: u64,
+        tail: Option<&Tail>,
+    ) -> bool {
+        proves(&self.file, self.inode, content, size_when_read, start, tail)
     }
 }
 
@@ -178,18 +206,21 @@ impl RotatedFile {
 /// Whether `file` is PROVEN to be the file a range was read from: the inode
 /// the range's marker recorded, the first bytes its fingerprint covers, at
 /// least as long as the file was when the range was read (an append-only file
-/// never shrinks), and long enough to hold the range's start. Anything less,
-/// and nothing is read from it.
+/// never shrinks), and long enough to hold the range's start. When the marker
+/// also recorded the page ending at its position (`tail`, #620), the file
+/// must still hold those bytes there: neither a rewrite that kept the first
+/// page nor a reused inode whose file starts like the old one is the file.
+/// Anything less, and nothing is read from it.
 ///
-/// These are the continuity checks of `crate::continuity` as they stand: the
-/// tail fingerprint proposed for #620 belongs here too once it lands, so a
-/// rotated file whose first page repeats another file's is not taken for it.
+/// These are the continuity checks of `crate::continuity`, applied to a
+/// descriptor instead of a path.
 pub(crate) fn proves(
     file: &std::fs::File,
     inode: u64,
     content: &ContentFingerprint,
     size_when_read: u64,
     start: u64,
+    tail: Option<&Tail>,
 ) -> bool {
     let Ok(metadata) = file.metadata() else {
         return false;
@@ -202,29 +233,45 @@ pub(crate) fn proves(
         return false;
     }
     head_of(file).is_ok_and(|head| content.matches_head(&head))
+        && tail.is_none_or(|tail| tail_matches(file, tail))
+}
+
+/// Whether `file` still holds, ending at `tail.end`, the bytes `tail`
+/// fingerprinted there (#620). A file too short to hold them yields fewer
+/// bytes, which never match.
+pub(crate) fn tail_matches(file: &std::fs::File, tail: &Tail) -> bool {
+    let from = tail.end.saturating_sub(tail.fingerprint.len);
+    read_at_most(file, from, tail.end - from)
+        .is_ok_and(|bytes| tail.fingerprint.matches_bytes(&bytes))
 }
 
 /// The first bytes of `file`, read at an offset so the descriptor's position
 /// is left alone.
-#[cfg(unix)]
 pub(crate) fn head_of(file: &std::fs::File) -> std::io::Result<Vec<u8>> {
+    read_at_most(file, 0, ContentFingerprint::MAX_LEN as u64)
+}
+
+/// Up to `len` bytes of `file` from `from`, read at an offset so the
+/// descriptor's position is left alone; fewer at the end of the file.
+#[cfg(unix)]
+fn read_at_most(file: &std::fs::File, from: u64, len: u64) -> std::io::Result<Vec<u8>> {
     use std::os::unix::fs::FileExt;
-    let mut head = vec![0u8; ContentFingerprint::MAX_LEN];
+    let mut bytes = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
     let mut filled = 0;
-    while filled < head.len() {
-        match file.read_at(&mut head[filled..], filled as u64) {
+    while filled < bytes.len() {
+        match file.read_at(&mut bytes[filled..], from + filled as u64) {
             Ok(0) => break,
             Ok(n) => filled += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
     }
-    head.truncate(filled);
-    Ok(head)
+    bytes.truncate(filled);
+    Ok(bytes)
 }
 
 #[cfg(not(unix))]
-pub(crate) fn head_of(_file: &std::fs::File) -> std::io::Result<Vec<u8>> {
+fn read_at_most(_file: &std::fs::File, _from: u64, _len: u64) -> std::io::Result<Vec<u8>> {
     // Without inodes nothing can be proven (`inode_of` is `None`), so no
     // caller gets this far.
     Ok(Vec::new())
@@ -244,6 +291,7 @@ pub(crate) fn find(
     content: &ContentFingerprint,
     size_when_read: u64,
     start: u64,
+    tail: Option<&Tail>,
 ) -> Option<(PathBuf, std::fs::File)> {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
@@ -276,7 +324,7 @@ pub(crate) fn find(
     }
     candidates.into_iter().find_map(|candidate| {
         let file = std::fs::File::open(&candidate).ok()?;
-        proves(&file, inode, content, size_when_read, start).then_some((candidate, file))
+        proves(&file, inode, content, size_when_read, start, tail).then_some((candidate, file))
     })
 }
 
@@ -288,6 +336,7 @@ pub(crate) fn find(
     _content: &ContentFingerprint,
     _size_when_read: u64,
     _start: u64,
+    _tail: Option<&Tail>,
 ) -> Option<(PathBuf, std::fs::File)> {
     None
 }
