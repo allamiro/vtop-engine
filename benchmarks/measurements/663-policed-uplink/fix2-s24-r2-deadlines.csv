@@ -1,0 +1,6 @@
+sdk_operation_timeout_settings,operations
+"TimeoutConfig { connect_timeout: Set(10s), read_timeout: Set(300s), operation_timeout: Set(900s), operation_attempt_timeout: Set(300s) }",80
+"TimeoutConfig { connect_timeout: Set(10s), read_timeout: Disabled, operation_timeout: Set(7044s), operation_attempt_timeout: Set(2348s) }",32
+"TimeoutConfig { connect_timeout: Set(10s), read_timeout: Disabled, operation_timeout: Set(3975s), operation_attempt_timeout: Set(1325s) }",16
+"TimeoutConfig { connect_timeout: Set(10s), read_timeout: Disabled, operation_timeout: Set(903s), operation_attempt_timeout: Set(301s) }",16
+retry_attempts_in_fix2_s24_r2,0

@@ -207,8 +207,16 @@ upload:
   # command_timeout_seconds: 300
   # Wall-clock limit for ONE attempt of ONE request on the native S3 backend
   # (#556). Without it a store that accepts a connection and never answers
-  # blocks the engine forever. Size it for the slowest link a part crosses.
+  # blocks the engine forever.
   # request_timeout_seconds: 300
+  # A request that carries a body (an object, a part, a manifest) is allowed
+  # request_timeout_seconds PLUS its size at this rate, per attempt (#663):
+  # the slowest rate one request's body may cross the link at and still be
+  # waited for. Every upload in flight shares the uplink, so this is a
+  # per-request rate: at the default width (8 batches x 4 parts) 4 KiB/s each
+  # is about 1 Mbit/s for the whole link. Lower it for a slower uplink or a
+  # wider configuration. Must be > 0.
+  # request_min_bytes_per_second: 4096
   # command_max_output_bytes: 1048576
   # command_env_allowlist:
   #   - AWS_CONFIG_FILE

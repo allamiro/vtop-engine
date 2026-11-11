@@ -91,6 +91,11 @@ pub struct S3NativeConfig {
     /// Wall-clock limit for one attempt of one request (#556); see
     /// `UploadConfig::request_timeout_seconds`. Must be non-zero.
     pub request_timeout_seconds: u64,
+    /// The slowest rate a request BODY may cross the link at and still be
+    /// waited for (#663); see `UploadConfig::request_min_bytes_per_second`.
+    /// A body-carrying attempt is allowed `request_timeout_seconds` plus its
+    /// size at this rate. Must be non-zero.
+    pub request_min_bytes_per_second: u64,
 }
 
 /// How long a connection attempt may take. A store that is up accepts in
@@ -123,6 +128,57 @@ pub fn request_timeouts(request_timeout_seconds: u64) -> aws_smithy_types::timeo
         .build()
 }
 
+/// How long ONE attempt of a request carrying `body_bytes` may take (#663):
+/// the fixed allowance for the exchange, plus the body's size at the slowest
+/// rate the engine still waits for.
+///
+/// A fixed deadline is really a deadline on the request's share of the link.
+/// The engine puts its width times the parts in flight on the uplink at once,
+/// and on a slow link each request gets a small fraction of the rate: on the
+/// policed-uplink profile an 8 MiB part needed far longer than 300 s at its
+/// share, so every attempt was cut at 300 s, sent again from its first byte,
+/// and cut again, and nothing ever committed. A deadline that grows with the
+/// body keeps waiting for a request that is moving its bytes, and still ends
+/// one that is not moving them fast enough to be worth waiting for.
+///
+/// A zero rate is treated as one byte per second rather than dividing by
+/// zero; configuration refuses zero before it gets here.
+pub fn body_attempt_timeout(
+    request_timeout_seconds: u64,
+    body_bytes: u64,
+    min_bytes_per_second: u64,
+) -> std::time::Duration {
+    let body_seconds = body_bytes.div_ceil(min_bytes_per_second.max(1));
+    std::time::Duration::from_secs(request_timeout_seconds.saturating_add(body_seconds))
+}
+
+/// The deadlines for one request that carries a body (#663): the same
+/// connect bound as every request, the attempt allowance from
+/// [`body_attempt_timeout`], and the SDK's three attempts of it for the whole
+/// operation.
+///
+/// The read timeout is DISABLED here, not raised. The SDK's connector starts
+/// it when the request is handed over and stops it at the response head, so
+/// it times the body's transmission too; at the client-wide value it would
+/// cut a slow body at the same fixed point this function exists to remove.
+/// The attempt timeout encloses everything the read timeout bounded, so
+/// nothing is left unbounded, and one disabled value keeps every body request
+/// on one connector rather than one per distinct deadline (the SDK builds and
+/// keeps a connector for each distinct read timeout it is given).
+pub fn body_request_timeouts(
+    request_timeout_seconds: u64,
+    body_bytes: u64,
+    min_bytes_per_second: u64,
+) -> aws_smithy_types::timeout::TimeoutConfig {
+    let attempt = body_attempt_timeout(request_timeout_seconds, body_bytes, min_bytes_per_second);
+    aws_smithy_types::timeout::TimeoutConfig::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .disable_read_timeout()
+        .operation_attempt_timeout(attempt)
+        .operation_timeout(attempt.saturating_mul(OPERATION_ATTEMPTS))
+        .build()
+}
+
 pub struct S3NativeBackend {
     client: Client,
     /// Present only when a cap is configured (#481). The PROCESS's shaper
@@ -144,6 +200,11 @@ pub struct S3NativeBackend {
     /// headers and the body share it - and an object a slow link can still
     /// deliver in that time is not cut off.
     body_deadline: std::time::Duration,
+    /// The fixed per-attempt allowance (#556) and the slowest rate a request
+    /// body is waited for (#663): together they set each body-carrying
+    /// request's deadlines, per request, in [`Self::body_timeouts`].
+    request_timeout_seconds: u64,
+    request_min_bytes_per_second: u64,
 }
 
 /// Enforce the transport policy BEFORE any client is built (#75).
@@ -611,6 +672,13 @@ impl S3NativeBackend {
                     .into(),
             ));
         }
+        if cfg.request_min_bytes_per_second == 0 {
+            return Err(VtopError::Config(
+                "upload.request_min_bytes_per_second must be > 0: zero would leave a body \
+                 upload with no deadline at all"
+                    .into(),
+            ));
+        }
         let mut loader = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(cfg.region.clone()))
             .timeout_config(request_timeouts(cfg.request_timeout_seconds));
@@ -651,7 +719,37 @@ impl S3NativeBackend {
             process_slot: transport::process_shaper_slot(),
             body_deadline: std::time::Duration::from_secs(cfg.request_timeout_seconds)
                 .saturating_mul(OPERATION_ATTEMPTS),
+            request_timeout_seconds: cfg.request_timeout_seconds,
+            request_min_bytes_per_second: cfg.request_min_bytes_per_second,
         })
+    }
+
+    /// The per-request override that gives a body-carrying request its own
+    /// deadlines (#663); see [`body_request_timeouts`]. Applied to every
+    /// request that sends object bytes - objects, parts, manifests - and to
+    /// nothing else, so a request without a body keeps the fixed deadline.
+    fn body_timeouts(
+        &self,
+        operation: &str,
+        target: &str,
+        body_bytes: u64,
+    ) -> aws_sdk_s3::config::Builder {
+        let timeouts = body_request_timeouts(
+            self.request_timeout_seconds,
+            body_bytes,
+            self.request_min_bytes_per_second,
+        );
+        tracing::debug!(
+            operation,
+            target,
+            body_bytes,
+            attempt_timeout_s = timeouts
+                .operation_attempt_timeout()
+                .map(|d| d.as_secs())
+                .unwrap_or_default(),
+            "request deadline scaled to its body"
+        );
+        aws_sdk_s3::config::Builder::default().timeout_config(timeouts)
     }
 
     /// The egress shaper, when a cap is configured (#481). `None` is the
@@ -697,6 +795,9 @@ impl S3NativeBackend {
         let body = ByteStream::from_path(local_path)
             .await
             .map_err(|e| VtopError::Upload(format!("reading {}: {e}", local_path.display())))?;
+        // A file body's length is exact; the lower bound is only a fallback.
+        let (low, high) = body.size_hint();
+        let body_bytes = high.unwrap_or(low);
 
         let mut req = self
             .client
@@ -723,6 +824,8 @@ impl S3NativeBackend {
         }
 
         let out = req
+            .customize()
+            .config_override(self.body_timeouts("put_object", uri, body_bytes))
             .send()
             .await
             .map_err(|e| sdk_failure("put_object", uri, e))?;
@@ -1211,6 +1314,8 @@ impl UploadBackend for S3NativeBackend {
         data: Bytes,
     ) -> Result<UploadedPart, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
+        let target = format!("{object_uri}#{part_number}");
+        let body_bytes = data.len() as u64;
         let out = self
             .client
             .upload_part()
@@ -1219,9 +1324,11 @@ impl UploadBackend for S3NativeBackend {
             .upload_id(upload_id)
             .part_number(part_number as i32)
             .body(self.egress_body(ByteStream::from(data)))
+            .customize()
+            .config_override(self.body_timeouts("upload_part", &target, body_bytes))
             .send()
             .await
-            .map_err(|e| sdk_failure("upload_part", &format!("{object_uri}#{part_number}"), e))?;
+            .map_err(|e| sdk_failure("upload_part", &target, e))?;
         let etag = out.e_tag().map(str::to_owned).ok_or_else(|| {
             VtopError::Upload(format!(
                 "upload_part {object_uri}#{part_number}: service returned no etag"
@@ -1330,6 +1437,7 @@ pub fn config_from_upload(upload: &vtop_core::config::UploadConfig) -> S3NativeC
         tuning,
         max_egress_bytes_per_second: upload.max_egress_bytes_per_second,
         request_timeout_seconds: upload.request_timeout_seconds,
+        request_min_bytes_per_second: upload.request_min_bytes_per_second,
     }
 }
 
@@ -2796,6 +2904,7 @@ mod tests {
             tuning: Default::default(),
             max_egress_bytes_per_second: None,
             request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
         };
         let err = match S3NativeBackend::new(&cfg).await {
             Err(err) => err,
@@ -3058,6 +3167,8 @@ mod egress_ceiling {
             shaper,
             process_slot: slot,
             body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
+            request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
         };
         let payload = Bytes::from_static(b"bytes the process ceiling must see");
         let untouched = |b: ByteStream| {
@@ -3181,6 +3292,7 @@ mod egress_ceiling {
             tuning: Default::default(),
             max_egress_bytes_per_second: cap,
             request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
         };
         let unset = S3NativeBackend::new(&build(None)).await.unwrap();
         assert!(
@@ -3247,6 +3359,8 @@ mod egress_ceiling {
             shaper,
             process_slot: test_slot(),
             body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
+            request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
         };
         let payload = Bytes::from_static(b"the pipeline an unset cap must not touch");
 
@@ -3348,6 +3462,8 @@ mod egress_ceiling {
             shaper,
             process_slot: test_slot(),
             body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
+            request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
         }
     }
 
@@ -3487,6 +3603,115 @@ mod egress_ceiling {
             shaper.admitted_bytes() - before,
             2 * payload.len() as u64,
             "a retried part crosses the wire twice and must cross the shaper twice"
+        );
+    }
+}
+
+#[cfg(test)]
+mod body_deadline {
+    //! The per-attempt deadline of a request that carries a body (#663).
+    use super::*;
+    use std::time::Duration;
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn the_allowance_grows_with_the_body_at_the_configured_floor() {
+        // The default part (8 MiB) at the default floor (4 KiB/s): the fixed
+        // 300 s plus 2048 s for the body. On the policed uplink a part needed
+        // far longer than 300 s at its share of the link; the fixed 300 s cut
+        // every attempt.
+        assert_eq!(
+            body_attempt_timeout(300, 8 * MIB, 4 * 1024),
+            Duration::from_secs(300 + 2048)
+        );
+        // Twice the body, twice the body's allowance; the fixed part stays.
+        assert_eq!(
+            body_attempt_timeout(300, 16 * MIB, 4 * 1024),
+            Duration::from_secs(300 + 4096)
+        );
+        // A partial second rounds UP: a body is never given less time than it
+        // needs at the floor.
+        assert_eq!(
+            body_attempt_timeout(300, 4097, 4096),
+            Duration::from_secs(302)
+        );
+    }
+
+    #[test]
+    fn a_body_too_small_to_matter_keeps_the_fixed_deadline() {
+        assert_eq!(body_attempt_timeout(300, 0, 4096), Duration::from_secs(300));
+        assert_eq!(body_attempt_timeout(300, 1, 4096), Duration::from_secs(301));
+        // A floor at the body's size per second restores the fixed deadline
+        // plus one second.
+        assert_eq!(
+            body_attempt_timeout(300, 8 * MIB, 8 * MIB),
+            Duration::from_secs(301)
+        );
+    }
+
+    #[test]
+    fn extreme_inputs_saturate_instead_of_overflowing_or_dividing_by_zero() {
+        assert_eq!(
+            body_attempt_timeout(u64::MAX, u64::MAX, 1),
+            Duration::from_secs(u64::MAX)
+        );
+        // Zero is refused by configuration; here it means one byte a second.
+        assert_eq!(body_attempt_timeout(1, 10, 0), Duration::from_secs(11));
+        let timeouts = body_request_timeouts(u64::MAX, u64::MAX, 1);
+        assert_eq!(
+            timeouts.operation_timeout(),
+            Some(Duration::from_secs(u64::MAX).saturating_mul(OPERATION_ATTEMPTS))
+        );
+    }
+
+    #[test]
+    fn a_body_request_is_bounded_per_attempt_and_whole_but_not_by_the_read_timeout() {
+        let timeouts = body_request_timeouts(300, 8 * MIB, 4 * 1024);
+        let attempt = Duration::from_secs(300 + 2048);
+        assert_eq!(timeouts.connect_timeout(), Some(CONNECT_TIMEOUT));
+        assert_eq!(timeouts.operation_attempt_timeout(), Some(attempt));
+        assert_eq!(
+            timeouts.operation_timeout(),
+            Some(attempt * OPERATION_ATTEMPTS),
+            "the whole operation is allowed the SDK's three attempts of the scaled allowance"
+        );
+        // The connector times the body's transmission under the read timeout,
+        // so leaving the client-wide value in place would cut a slow body at
+        // the old fixed point. Disabled - not merely unset, which would let the
+        // client-wide value through - and enclosed by the attempt timeout.
+        assert_eq!(timeouts.read_timeout(), None);
+        let mut merged = timeouts.clone();
+        merged.take_defaults_from(&request_timeouts(300));
+        assert_eq!(
+            merged.read_timeout(),
+            None,
+            "the client-wide read timeout must not fill the disabled one back in"
+        );
+        assert_eq!(merged.operation_attempt_timeout(), Some(attempt));
+    }
+
+    #[tokio::test]
+    async fn the_backend_refuses_a_zero_floor() {
+        let error = match S3NativeBackend::new(&S3NativeConfig {
+            region: "us-east-1".into(),
+            endpoint_url: Some("http://127.0.0.1:9".into()),
+            force_path_style: true,
+            verify_tls: false,
+            transport: "tcp_tls".into(),
+            tuning: Default::default(),
+            max_egress_bytes_per_second: None,
+            request_timeout_seconds: 300,
+            request_min_bytes_per_second: 0,
+        })
+        .await
+        {
+            Ok(_) => panic!("a zero floor leaves a body upload with no deadline"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("upload.request_min_bytes_per_second"),
+            "the refusal must name the setting: {error}"
         );
     }
 }

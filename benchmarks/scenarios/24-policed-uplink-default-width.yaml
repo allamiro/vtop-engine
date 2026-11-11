@@ -1,0 +1,47 @@
+name: policed-uplink-default-width
+description: >-
+  The regression for #663. Scenario 15's link - a 10 Mbit/s token-bucket
+  policer with no queue, at 100 ms - carrying the #483 baseline's workload
+  at the SHIPPED upload defaults: sixteen 20 MiB objects, eight in flight,
+  each sent as 8 MiB parts four at a time. Before #663 this committed
+  nothing: two dozen part uploads shared the policed link, each got about
+  11 KB/s, an 8 MiB part needed far longer than the fixed 300 s request
+  deadline, and every attempt was cut and re-sent from its first byte until
+  every batch failed. The run asserts the outcome rather than recording it:
+  require_all_committed fails it (exit 6) unless every object commits. Read
+  its goodput against the policer's 10 Mbit/s token rate; the iperf3 probe's
+  number is recorded but not gated, as in scenario 15. Requires the netem
+  stack, docker compose -f benchmarks/docker-compose.benchmark.yml
+  --profile netem --profile containerized up -d, and unshapes the middlebox
+  when it ends. One run takes about fifteen minutes with the fix (about 870 s of upload); before it, about half an hour of failures.
+volume: 16
+# Exactly 20 MiB per file, the #483 baseline's object; compression none, so
+# the wire carries the object's own bytes and goodput reads straight against
+# the token rate.
+file_size: 20971520
+format: jsonl
+whole_file: true
+compression: none
+checksum: sha256
+backend: s3_native
+bucket: "vtop-bench-soak"
+# The engine dials the middlebox, which forwards at L3 to MinIO, as in
+# scenarios 14-16; a host-mode run would reach the store across no qdisc.
+runner_mode: container
+endpoint_url: http://netem:9200
+shaping_driver: netem
+shaping_latency_ms: 100
+shaping_jitter_ms: 0
+# Scenario 15's policer and nothing else: no bottleneck queue, no loss.
+shaping_policer_kbps: 10000
+# One object per batch: the file is the object, and a 20 MiB JSONL file ends
+# at the first line that reaches 20 MiB, so the cap leaves room for it.
+batch_max_records: 1
+batch_max_bytes: 22020096
+batch_max_age_seconds: 3600
+# No max_concurrent_batches and no transports block: the shipped width and
+# multipart settings are what is under test.
+duration_seconds: 0
+fault: none
+sys_sample_interval: 1.0
+require_all_committed: true

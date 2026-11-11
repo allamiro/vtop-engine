@@ -587,6 +587,7 @@ mod tests {
             verify_tls: true,
             transport: "tcp_tls".into(),
             request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
             profile: None,
             command_binary: Some(path.to_string_lossy().into_owned()),
             command_timeout_seconds: 2,

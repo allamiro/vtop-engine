@@ -120,7 +120,16 @@ def _write_binary_file(path: str, target_bytes: int) -> int:
     return target_bytes
 
 
-def _pick_size(size_class: str) -> int:
+def _pick_size(size_class: str | int) -> int:
+    # An exact size (#663): a workload of identical objects, e.g. the 20 MiB
+    # objects the #483 baseline and scenario 24 measure, instead of a range.
+    # A bool is an int to Python and is never a size.
+    if isinstance(size_class, int) and not isinstance(size_class, bool):
+        if size_class <= 0:
+            raise ValueError(f"file_size must be a positive number of bytes, got {size_class}")
+        return size_class
+    if isinstance(size_class, str) and size_class.isdigit():
+        return _pick_size(int(size_class))
     if size_class == "mixed":
         cls = random.choices(["small", "medium", "large"], weights=[70, 25, 5])[0]
     else:

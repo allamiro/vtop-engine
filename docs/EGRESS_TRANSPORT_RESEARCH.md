@@ -348,10 +348,16 @@ run per configuration except the default:
 - **The shipped default committed nothing** in three runs: every one of its 16
   objects ended `failed` after the cycle had run about half an hour. This
   failure is tracked in #663. The per-batch record the harness keeps does not
-  carry the engine's error text, so the cause is not established here; it is
-  consistent with, and not shown to be, the per-request deadline
-  (`upload.request_timeout_seconds`, 300 s) at the share of the policer each of
-  32 part connections was getting.
+  carry the engine's error text, so the cause was not established by these
+  runs. #663 established it with engine logs and `ss -ti` on the same link
+  (`benchmarks/measurements/663-policed-uplink/`): a 20 MiB object is three
+  parts, so the default put 24 part uploads on the policer at once; each moved
+  about 11 KB/s, an 8 MiB part needed about 760 s, and every attempt was cut
+  by the fixed 300 s per-attempt deadline and re-sent from its first byte
+  until the operation's 900 s ran out. No store throttle, stall or width
+  decision was involved. Since #663 a request body's deadline grows with its
+  size (`upload.request_min_bytes_per_second`), and scenario 24 asserts that
+  every object commits on this link.
 - **The best measured configuration left 72% of the token rate unused.** The
   policer drops whatever exceeds a 5000-byte bucket and holds nothing, so a
   loss-based flow on a 100 ms round trip spends most of its time recovering;

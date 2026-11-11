@@ -983,7 +983,8 @@ path needed by the distributed options is already implemented (§6.3).
 | `engine.work_dir` / `log_level` | scratch dir; verbosity |
 | `engine.ledger_retention_days` / `ledger_prune_batch` | committed-row retention (§6.6; SQLite engine-side only) |
 | `engine.state_store_timeout_seconds` | wall-clock bound on every state-store request (default 30 s; whole-ledger scans get 10x) — a blackholed Postgres fails the request instead of hanging the engine (#556) |
-| `upload.request_timeout_seconds` | wall-clock bound on one attempt of one object-store request on the native S3 backend (default 300 s; the SDK's retries apply) (#556) |
+| `upload.request_timeout_seconds` | wall-clock bound on one attempt of one object-store request on the native S3 backend (default 300 s; the SDK's retries apply) (#556); a request that carries a body gets this plus its size at `request_min_bytes_per_second` |
+| `upload.request_min_bytes_per_second` | the slowest rate one request's body may cross the link at and still be waited for, native S3 backend (default 4096, must be > 0) (#663): each attempt of an object, part or manifest upload is allowed `request_timeout_seconds` plus its size at this rate, so a slow or policed uplink stretches the deadline instead of failing every body. Per request: the width times the parts in flight share the link |
 | `engine.ledger_digest_dir` | where prune digests are written and read (default: beside a SQLite database file; else under `work_dir`, which is scratch) |
 | `batching.max_records` / `max_bytes` / `max_batch_age_seconds` | seal thresholds |
 | `batching.max_concurrent_batches` | uploads kept in flight per cycle (default 8); the ceiling when the adaptive width is on |
