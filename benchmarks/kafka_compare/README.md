@@ -9,7 +9,8 @@ measurements [#596](https://github.com/allamiro/vtop-engine/issues/596), charts 
 
 ## Run it
 
-Needs Docker (with Compose v2) and Python 3.10+ (matplotlib 3.10, which `report.py` needs, requires it).
+Needs Docker (with Compose v2) and Python 3.10+; the charts need 3.11+ (the plotting stack pinned in
+[`requirements-report.txt`](requirements-report.txt) requires it).
 `run.py` refuses to start when `Cargo.toml`, `Cargo.lock`, `.cargo/`, `crates/` or `docker/` differ from
 `HEAD`: the image it benchmarks is tagged and recorded as `HEAD`, so it must be built from `HEAD`.
 
@@ -18,9 +19,13 @@ Needs Docker (with Compose v2) and Python 3.10+ (matplotlib 3.10, which `report.
 # Builds vtop-bench:<HEAD sha> from docker/Dockerfile if it is not there yet.
 python3 benchmarks/kafka_compare/run.py
 
-# Charts (PNG + SVG in docs/benchmarks/img/) and docs/benchmarks/kafka-comparison.md.
-python3 -m pip install 'matplotlib==3.10.*'
+# Charts (PNG + SVG in docs/benchmarks/img/) and docs/benchmarks/kafka-comparison.md, with the exact
+# plotting stack the committed output was drawn with.
+python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt
 python3 benchmarks/kafka_compare/report.py benchmarks/kafka_compare/results/<run-id>
+
+# Every committed run at once, as CI's drift check does (then `git diff -- docs/benchmarks/` must be empty).
+python3 benchmarks/kafka_compare/regenerate.py
 ```
 
 Useful knobs: `--sizes 100,1024`, `--reps 3`, `--sat-records 100:3000000,1024:1000000` (records per
@@ -88,7 +93,15 @@ Charts use one colour per system everywhere (Kafka blue `#2a78d6`, VTOP orange `
 colour-vision-deficiency separation, never red vs green), marker shape as a second channel, and a footer with
 the environment, profile, repetitions and run date. Measured numbers come from the CSV; the conditions,
 run id, dates and matrix come from `environment.json`. Output is deterministic for a given CSV,
-`environment.json` and matplotlib version (fixed rcParams, fixed SVG hash salt, no timestamps in metadata).
+`environment.json` and plotting stack (fixed rcParams, fixed SVG hash salt, no timestamps in metadata, the
+stack pinned in [`requirements-report.txt`](requirements-report.txt), matplotlib's bundled DejaVu Sans).
+
+CI's `benchmark charts (regenerate + no drift)` job runs [`regenerate.py`](regenerate.py), which hands every
+committed run under `results/` to `report.py` and fails on any difference in `docs/benchmarks/`. It refuses
+another plotting stack, a font from outside matplotlib, no committed run, two runs writing one file, and
+committed output that no run writes. SVG and Markdown must match byte for byte. PNGs must match pixel for
+pixel, not byte for byte: Pillow's macOS and Linux wheels compress identical pixels to different bytes, so a
+PNG whose decoded image is unchanged keeps its committed bytes.
 
 ## Fairness rules applied (#595)
 
@@ -127,4 +140,3 @@ with `kafka.advertised_host`.
 - VTOP runs without its metadata plane (static leadership): no lease, no failover, no durable offsets.
 - No per-node CPU/RSS or bytes-written sampling, no end-to-end latency.
 - Laptop numbers: Docker Desktop on one host, sharing the VM with whatever else runs there.
-- CI does not yet regenerate the images and check for drift.
