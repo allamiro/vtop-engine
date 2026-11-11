@@ -434,11 +434,7 @@ impl InProcessFollower {
     /// [`Self::settle_kept_dispute`]), and any lineage held for `epoch` is
     /// dropped durably meanwhile: a restart forgets the dispute (#635), and
     /// must not then file the kept records under the leader's entries.
-    fn take_leader_lineage_locked(
-        &self,
-        epoch: u64,
-        leader: &[crate::fencing_epochs::EpochStart],
-    ) {
+    fn take_leader_lineage_locked(&self, epoch: u64, leader: &[crate::fencing_epochs::EpochStart]) {
         if self.held_fencing_epoch() != epoch {
             // A newer grant overtook the fence; its own fence brings its own
             // history.
@@ -595,10 +591,8 @@ impl InProcessFollower {
         // A lineage reloaded from its sidecar (#640) resumes where the log
         // opened: records a crash lost are re-sent by the same leader.
         journal.settle_leader_lineage_at_open(next_offset);
-        self.lineage_following.store(
-            journal.leader_lineage_epoch().is_some(),
-            Ordering::SeqCst,
-        );
+        self.lineage_following
+            .store(journal.leader_lineage_epoch().is_some(), Ordering::SeqCst);
         *self
             .fencing_epoch_journal
             .lock()

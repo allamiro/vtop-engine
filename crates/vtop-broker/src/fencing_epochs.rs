@@ -569,7 +569,11 @@ impl FencingEpochJournal {
     /// reload: the kept records are this replica's own, and filing them
     /// under the leader's entries would make them look like the leader's.
     pub fn drop_leader_lineage(&mut self, epoch: u64) -> BrokerResult<()> {
-        if self.lineage.as_ref().is_some_and(|held| held.epoch == epoch) {
+        if self
+            .lineage
+            .as_ref()
+            .is_some_and(|held| held.epoch == epoch)
+        {
             self.write_lineage(None)?;
             self.lineage = None;
         }
@@ -894,7 +898,9 @@ fn decode_lineage(bytes: &[u8]) -> Result<LeaderLineage, String> {
     let epoch = u64::from_be_bytes(bytes[10..18].try_into().expect("fixed width"));
     let anchor = u64::from_be_bytes(bytes[18..26].try_into().expect("fixed width"));
     let entries: Vec<EpochStart> = bytes[LINEAGE_HEADER_BYTES..body]
-        .chunks_exact(ENTRY_BYTES)
+        .as_chunks::<ENTRY_BYTES>()
+        .0
+        .iter()
         .map(|entry| EpochStart {
             epoch: u64::from_be_bytes(entry[0..8].try_into().expect("fixed width")),
             start_offset: u64::from_be_bytes(entry[8..16].try_into().expect("fixed width")),
@@ -1878,7 +1884,9 @@ mod tests {
                 .unwrap());
             assert_eq!(j.leader_lineage_epoch(), None);
             // Nor one that cannot vouch for this replica's tail, nor none.
-            assert!(!j.take_leader_lineage(20, &starts(&[(19, 6)]), 5, 0).unwrap());
+            assert!(!j
+                .take_leader_lineage(20, &starts(&[(19, 6)]), 5, 0)
+                .unwrap());
             assert!(!j.take_leader_lineage(20, &[], 5, 0).unwrap());
         }
         assert_eq!(journal(&dir).leader_lineage_epoch(), None);
@@ -1960,7 +1968,9 @@ mod tests {
             "no torn or stale bytes after the rewrite"
         );
         let decoded: Vec<(u64, u64)> = body
-            .chunks_exact(ENTRY_BYTES)
+            .as_chunks::<ENTRY_BYTES>()
+            .0
+            .iter()
             .map(|entry| {
                 (
                     u64::from_be_bytes(entry[0..8].try_into().unwrap()),

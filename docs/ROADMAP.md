@@ -246,6 +246,30 @@ reopen quietly.
   keep the rolling upgrade itself from triggering it. An older candidate
   facing an upgraded replica judges the kept answer refused (its offset is
   higher) or Unknown, never a grant.
+- **#640** - a follower filed the records a new leader caught it up on under
+  the wrong epoch. It recorded an epoch it adopted at its own tail, so when
+  it was behind, the records the new leader then sent it were filed under the
+  new epoch, while the leader filed the same bytes under the epoch that wrote
+  them. The two histories diverged below both tails, every later fence answer
+  between them was Unknown (#577), and after a second failover no candidate
+  could be established, though no acknowledged record was lost. The fence
+  that installs a leader already carries that leader's history; a fenced
+  follower whose own history agrees with it below its tail now keeps it (in a
+  `fencing-epochs.leader` sidecar, so a restart keeps it too) and files every
+  record that leader sends under the leader's entries. After a catch-up its
+  vector equals the leader's. A follower the fence did not reach, or one that
+  kept a dispute that has not settled, adopts at its tail as before.
+  **Compatibility:** the journal format is unchanged, so an older binary
+  reads it as its own and simply resumes adopting at its tail. The sidecar is
+  a name older binaries never open, and this release reads a missing, torn or
+  newer-version sidecar as "no lineage", the old behaviour. **Journals
+  mislabelled by an earlier release are not rewritten**: nothing on a replica
+  tells a record it was caught up on under an epoch from one that epoch's
+  leader wrote, so such a replica's answer stays Unknown against a correctly
+  labelled history (and is never counted) until it is repaired with `vtopctl
+  node repair` from a replica whose history is right (#315). No wire or
+  feature-level change: an older follower keeps mislabelling until upgraded,
+  which costs elections availability, never an acknowledged record.
 
 One observation rode along without becoming a fix: scenario 09 once left a
 promotion unacquired within its deadline (#318). The flake has not recurred —

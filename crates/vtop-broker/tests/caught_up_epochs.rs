@@ -104,14 +104,21 @@ impl Replica {
             )
             .unwrap(),
         );
-        node.set_fencing_epoch_journal(FencingEpochJournal::open(dir.join("fencing-epochs")).unwrap());
+        node.set_fencing_epoch_journal(
+            FencingEpochJournal::open(dir.join("fencing-epochs")).unwrap(),
+        );
         (meta, node)
     }
 
     /// A process death and restart: nothing in memory survives, and the
     /// lease watcher adopts metadata's current grant.
     fn restart(self, granted: u64) -> Self {
-        let Replica { dir, id, meta, node } = self;
+        let Replica {
+            dir,
+            id,
+            meta,
+            node,
+        } = self;
         // The old handles go before the same files are reopened.
         drop(node);
         drop(meta);
@@ -186,7 +193,10 @@ fn up_to_the_fence_at_20() -> (Replica, Replica) {
     c.meta.set(C_EPOCH);
     c.node.fence_locally(C_EPOCH).unwrap();
     let answer = r.node.fence(C_EPOCH, &c.node.epoch_starts()).unwrap();
-    assert_eq!(answer.truncated_records, 0, "R keeps the records C lacks (#611)");
+    assert_eq!(
+        answer.truncated_records, 0,
+        "R keeps the records C lacks (#611)"
+    );
     assert_eq!(answer.next_offset, R_TAIL);
 
     // Epoch 20 goes to R. C's watcher adopts it first, at C's tail.
