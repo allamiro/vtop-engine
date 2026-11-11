@@ -451,7 +451,29 @@ impl EgressShaper {
 /// dropped can configure a fresh one. A body in flight holds a strong
 /// reference, so the budget cannot be replaced while bytes are still passing
 /// through it.
-static PROCESS_SHAPER: Mutex<Weak<EgressShaper>> = Mutex::new(Weak::new());
+static PROCESS_SHAPER: ShaperSlot = Mutex::new(Weak::new());
+
+/// Where a process's live egress budget is kept (#481).
+pub(crate) type ShaperSlot = Mutex<Weak<EgressShaper>>;
+
+/// The process-global slot every production backend consults. Tests build
+/// backends over a slot of their own instead, so a cap one test holds live
+/// cannot reach another test's uncapped backend.
+pub(crate) fn process_shaper_slot() -> &'static ShaperSlot {
+    &PROCESS_SHAPER
+}
+
+/// The budget live in `slot`, if any backend in the process configured one
+/// and still holds it (#481, review). An UNCAPPED backend asks this for every
+/// body it sends: the cap is the process's ceiling, so while any backend in
+/// the process has one in force, every body of every `s3_native` backend
+/// passes it - whichever order the backends were built in. With no cap
+/// configured anywhere, the slot is empty and nothing is wrapped.
+pub(crate) fn live_shaper(slot: &ShaperSlot) -> Option<Arc<EgressShaper>> {
+    slot.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .upgrade()
+}
 
 /// The shaper for a cap of `rate_bytes_per_second`, shared by the whole
 /// process (#481). The first backend to ask creates it; every later backend

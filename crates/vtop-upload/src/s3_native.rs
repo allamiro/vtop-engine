@@ -130,6 +130,11 @@ pub struct S3NativeBackend {
     /// object, manifest and part sent by any backend in the process draws on
     /// the same budget.
     shaper: Option<Arc<transport::EgressShaper>>,
+    /// Where this process's live egress budget is kept (#481, review). A
+    /// backend built WITHOUT a cap still consults it for every body, so a cap
+    /// another backend in the process has in force binds this one too. Always
+    /// the process-global slot outside tests.
+    process_slot: &'static transport::ShaperSlot,
     /// The bound on reading a response BODY (review of #568). The SDK's
     /// timeouts end when `send()` returns the headers; a body consumed after
     /// that is outside them, and the SDK's stalled-stream protection only
@@ -634,6 +639,7 @@ impl S3NativeBackend {
         Ok(Self {
             client: Client::from_conf(s3_conf),
             shaper,
+            process_slot: transport::process_shaper_slot(),
             body_deadline: std::time::Duration::from_secs(cfg.request_timeout_seconds)
                 .saturating_mul(OPERATION_ATTEMPTS),
         })
@@ -652,10 +658,22 @@ impl S3NativeBackend {
     /// with one it is wrapped so each attempt's bytes pass the shared shaper.
     /// A new body-carrying request must route through this too, or its bytes
     /// escape both the cap and the account.
+    ///
+    /// "No cap" means no cap ANYWHERE in the process (review): a backend
+    /// configured without one still takes the process's live budget, looked
+    /// up per body rather than at construction, so a capped backend built
+    /// after this one binds it as well. A cap is the process's ceiling; a
+    /// second, uncapped backend sending at line rate beside it would exceed
+    /// that ceiling and escape its counter. With no cap configured by any
+    /// backend the slot is empty and the body is untouched, as before.
     fn egress_body(&self, body: ByteStream) -> ByteStream {
-        match &self.shaper {
+        let shaper = match &self.shaper {
+            Some(own) => Some(Arc::clone(own)),
+            None => transport::live_shaper(self.process_slot),
+        };
+        match shaper {
             None => body,
-            Some(shaper) => ByteStream::new(transport::shape_body(shaper, body.into_inner())),
+            Some(shaper) => ByteStream::new(transport::shape_body(&shaper, body.into_inner())),
         }
     }
 
@@ -3007,6 +3025,73 @@ mod egress_ceiling {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
+    /// A fresh slot for one test's backends, so a budget another test holds
+    /// live in the process-global slot cannot reach them.
+    fn test_slot() -> &'static transport::ShaperSlot {
+        Box::leak(Box::new(Mutex::new(std::sync::Weak::new())))
+    }
+
+    /// The process ceiling binds a backend configured WITHOUT a cap (#481,
+    /// review), in either construction order: while any backend in the
+    /// process holds a live budget, every body an uncapped backend sends
+    /// passes, and is counted by, that budget. With none live - before the
+    /// capped backend exists, and after it is gone - the uncapped backend's
+    /// body is the untouched value it was before the cap existed.
+    #[tokio::test]
+    async fn an_uncapped_backend_shares_the_live_process_budget_in_either_order() {
+        let slot = test_slot();
+        let backend = |shaper: Option<Arc<transport::EgressShaper>>| S3NativeBackend {
+            client: Client::from_conf(
+                aws_sdk_s3::Config::builder()
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .build(),
+            ),
+            shaper,
+            process_slot: slot,
+            body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
+        };
+        let payload = Bytes::from_static(b"bytes the process ceiling must see");
+        let untouched = |b: ByteStream| {
+            format!("{:?}", b.into_inner())
+                == format!("{:?}", ByteStream::from(payload.clone()).into_inner())
+        };
+
+        // Built first, while no cap is live anywhere: today's body.
+        let early = backend(None);
+        assert!(untouched(
+            early.egress_body(ByteStream::from(payload.clone()))
+        ));
+
+        // A capped backend arrives; it registers the process's budget.
+        let shaper = transport::EgressShaper::new(1024 * 1024).unwrap();
+        *slot.lock().unwrap() = Arc::downgrade(&shaper);
+        let capped = backend(Some(Arc::clone(&shaper)));
+        drop(shaper);
+        let late = backend(None);
+
+        for (who, uncapped) in [("built before the cap", &early), ("built after it", &late)] {
+            let live = Arc::clone(capped.egress_shaper().unwrap());
+            let before = live.admitted_bytes();
+            let body = uncapped.egress_body(ByteStream::from(payload.clone()));
+            assert_eq!(body.collect().await.unwrap().into_bytes(), payload);
+            assert_eq!(
+                live.admitted_bytes() - before,
+                payload.len() as u64,
+                "[{who}] an uncapped backend beside a capped one must send through the \
+                 process's budget, not around it"
+            );
+        }
+
+        // The capped backend is gone and with it the only budget: back to today.
+        drop(capped);
+        assert!(untouched(
+            early.egress_body(ByteStream::from(payload.clone()))
+        ));
+        assert!(untouched(
+            late.egress_body(ByteStream::from(payload.clone()))
+        ));
+    }
+
     /// A transport that declares it cannot be held under a ceiling.
     struct Unpaceable;
     impl EgressTransport for Unpaceable {
@@ -3119,6 +3204,19 @@ mod egress_ceiling {
             msg.contains("1048576") && msg.contains("4194304"),
             "the refusal names both caps: {msg}"
         );
+        // And the backend built WITHOUT a cap, BEFORE the capped ones (review):
+        // through the real constructor it shares their budget per body, so a
+        // library caller mixing the two cannot exceed the process ceiling.
+        let payload = Bytes::from_static(b"an uncapped backend beside a capped one");
+        let shaper = Arc::clone(capped.egress_shaper().unwrap());
+        let before = shaper.admitted_bytes();
+        let body = unset.egress_body(ByteStream::from(payload.clone()));
+        assert_eq!(body.collect().await.unwrap().into_bytes(), payload);
+        assert_eq!(
+            shaper.admitted_bytes() - before,
+            payload.len() as u64,
+            "the uncapped backend's bytes must pass, and be counted by, the live budget"
+        );
     }
 
     #[test]
@@ -3134,6 +3232,7 @@ mod egress_ceiling {
                     .build(),
             ),
             shaper,
+            process_slot: test_slot(),
             body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
         };
         let payload = Bytes::from_static(b"the pipeline an unset cap must not touch");
@@ -3234,6 +3333,7 @@ mod egress_ceiling {
         S3NativeBackend {
             client: Client::from_conf(conf),
             shaper,
+            process_slot: test_slot(),
             body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
         }
     }
