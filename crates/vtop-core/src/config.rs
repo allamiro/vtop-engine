@@ -14,6 +14,14 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VtopConfig {
+    /// Dotted paths of the keys the YAML document set (#670), filled in by
+    /// [`VtopConfig::from_path`] / [`VtopConfig::from_yaml_str`]; empty for a
+    /// config built any other way, which then explains every setting as a
+    /// built-in default. Only `vtopctl validate --print-effective` reads it,
+    /// to say where a value came from. Never serialized, and holds key names
+    /// only, never values.
+    #[serde(skip)]
+    pub configured_fields: std::collections::BTreeSet<String>,
     pub engine: EngineConfig,
     pub batching: BatchingConfig,
     pub compression: CompressionConfig,
@@ -1139,8 +1147,20 @@ impl VtopConfig {
     pub fn from_path(path: &Path) -> Result<Self, VtopError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| VtopError::Config(format!("reading {}: {e}", path.display())))?;
-        let cfg: VtopConfig = serde_yaml::from_str(&text)?;
+        let cfg = Self::from_yaml_str(&text)?;
         cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Parse a YAML document without validating it, recording which keys it
+    /// set in [`VtopConfig::configured_fields`] (#670).
+    ///
+    /// The typed parse runs first and alone decides acceptance and every
+    /// error's text; presence is recorded only after it succeeded, so a refused
+    /// file reads exactly as it did before presence was recorded.
+    pub fn from_yaml_str(text: &str) -> Result<Self, VtopError> {
+        let mut cfg: VtopConfig = serde_yaml::from_str(text)?;
+        cfg.configured_fields = crate::effective_config::present_keys(text);
         Ok(cfg)
     }
 
@@ -1444,6 +1464,11 @@ pub struct StreamConfig {
     /// floor stays global and cannot be lowered by a stream.
     #[serde(default)]
     pub checksum: Option<ChecksumConfig>,
+    /// Keys this entry set in `streams.yaml` (#670), filled in by
+    /// [`StreamsConfig::from_path`] / [`StreamsConfig::from_yaml_str`]. Key
+    /// names only; never serialized.
+    #[serde(skip)]
+    pub configured_fields: std::collections::BTreeSet<String>,
     pub source_name: String,
     pub source_type: SourceType,
     pub format: TelemetryFormat,
@@ -1525,7 +1550,20 @@ impl StreamsConfig {
     pub fn from_path(path: &Path) -> Result<Self, VtopError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| VtopError::Config(format!("reading {}: {e}", path.display())))?;
-        Ok(serde_yaml::from_str(&text)?)
+        Self::from_yaml_str(&text)
+    }
+
+    /// Parse a `streams.yaml` document, recording which keys each stream set
+    /// in its [`StreamConfig::configured_fields`] (#670). As for
+    /// [`VtopConfig::from_yaml_str`], the typed parse alone decides acceptance
+    /// and error text.
+    pub fn from_yaml_str(text: &str) -> Result<Self, VtopError> {
+        let mut streams: StreamsConfig = serde_yaml::from_str(text)?;
+        let present = crate::effective_config::present_keys(text);
+        for (index, stream) in streams.streams.iter_mut().enumerate() {
+            stream.configured_fields = crate::effective_config::stream_keys(&present, index);
+        }
+        Ok(streams)
     }
 
     /// Find the stream definition that matches a discovered source name.
@@ -1780,6 +1818,84 @@ upload:
     // ----------------------------------------------------------------------
     // Per-transport egress tuning shape (#480)
     // ----------------------------------------------------------------------
+
+    /// `validate` without `--print-effective` must stay byte-identical (#670),
+    /// and that includes a refused file: recording which keys were present must
+    /// not change a single parse error's text, its path or its line/column.
+    /// The expected strings are what `main` printed before presence existed.
+    #[test]
+    fn recording_present_keys_leaves_every_parse_error_unchanged() {
+        let base = tuning_base();
+        let cases = [
+            (
+                base.replace("  work_dir: /tmp/work\n", ""),
+                "engine: missing field `work_dir` at line 3 column 3",
+            ),
+            (
+                base.replace("batching: {}", "batching: {max_records: lots}"),
+                "batching.max_records: invalid type: string \"lots\", expected usize at line 6 column 25",
+            ),
+            (
+                format!("{base}  transports:\n    tcp_tls:\n      max_concurrancy: 4\n"),
+                "upload.transports.tcp_tls: unknown field `max_concurrancy`, expected one of \
+                 `target_rate_bytes_per_second`, `max_concurrency`, `part_size_bytes`, \
+                 `parts_in_flight`, `redundancy` at line 16 column 7",
+            ),
+            (
+                base.replace("  name: vtop-engine", "  name: vtop-engine\n  name: twice"),
+                "engine: duplicate field `name` at line 3 column 3",
+            ),
+            (
+                base.replace("batching: {}", "batching: [1, 2]"),
+                "batching: invalid type: sequence, expected struct BatchingConfig at line 6 column 11",
+            ),
+            (String::new(), "missing field `engine`"),
+        ];
+        for (doc, expected) in &cases {
+            let err = VtopConfig::from_yaml_str(doc).expect_err("each document is invalid");
+            assert_eq!(err.to_string(), format!("serde_yaml error: {expected}"));
+        }
+        let stream_cases = [
+            (
+                "streams:\n- source_name: a\n  source_type: file\n",
+                "streams[0]: missing field `format` at line 2 column 3",
+            ),
+            (
+                "streams:\n- source_name: a\n  source_type: nope\n  format: raw\n",
+                "streams[0].source_type: unknown variant `nope`, expected one of `kafka`, `file`, \
+                 `syslog_spool` at line 3 column 16",
+            ),
+            (
+                "streams:\n- source_name: a\n  source_type: file\n  format: raw\n  tenant: [x]\n",
+                "streams[0].tenant: invalid type: sequence, expected a string at line 5 column 11",
+            ),
+        ];
+        for (doc, expected) in stream_cases {
+            let err = StreamsConfig::from_yaml_str(doc).expect_err("each document is invalid");
+            assert_eq!(err.to_string(), format!("serde_yaml error: {expected}"));
+        }
+    }
+
+    /// A document the engine accepts is never refused because its keys were
+    /// being recorded: a duplicate key inside a map-typed field is let through
+    /// by the typed parse (last one wins), and a `serde_yaml::Value` walk would
+    /// have refused it.
+    #[test]
+    fn recording_present_keys_never_refuses_an_accepted_document() {
+        let doc = format!(
+            "{}  transports:\n    tcp_tls:\n      max_concurrency: 2\n    tcp_tls:\n      max_concurrency: 3\n",
+            tuning_base()
+        );
+        let typed: VtopConfig = serde_yaml::from_str(&doc).expect("accepted today");
+        let recorded = VtopConfig::from_yaml_str(&doc).expect("still accepted");
+        assert_eq!(
+            format!("{:?}", typed.upload.transports),
+            format!("{:?}", recorded.upload.transports)
+        );
+        assert!(recorded
+            .configured_fields
+            .contains("upload.transports.tcp_tls.max_concurrency"));
+    }
 
     fn tuning_base() -> &'static str {
         r#"
