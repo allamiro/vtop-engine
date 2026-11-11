@@ -364,6 +364,199 @@ impl MultiTopicAcc {
     }
 }
 
+/// Passes in a row an assigned partition must deliver nothing before the
+/// stall check looks at it (#623).
+///
+/// Counted in passes AND in time (`STALL_AFTER`), because neither alone means
+/// "the consumer kept asking and got nothing": a pass count alone is reached
+/// in under a second with short poll windows, and wall time alone is reached
+/// when the engine simply stopped reading for a while (backpressure).
+const STALL_PASSES: u32 = 8;
+
+/// How long an assigned partition must deliver nothing before the stall check
+/// looks at it (#623). See `STALL_PASSES`.
+const STALL_AFTER: Duration = Duration::from_secs(10);
+
+/// The most often the stall check asks the broker (#623). It asks only when a
+/// partition has been idle for `STALL_PASSES` and `STALL_AFTER`, so a busy
+/// consumer never asks at all, and an idle one asks once per interval.
+const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A run of passes in which one partition delivered nothing.
+#[derive(Debug, Clone, Copy)]
+struct IdleRun {
+    passes: u32,
+    since: Instant,
+}
+
+/// Per-partition liveness, for finding a partition that has stopped being
+/// read while the broker holds records for it (#623).
+///
+/// The adapter's assignment is sticky, so nothing else re-assigns a partition
+/// whose fetcher has died: a fresh assign() happens only when the topic set
+/// changes, a record is rejected, or a poll fails. Before this, the only other
+/// retry re-assigned EVERY partition after any pass that read nothing while a
+/// partition assigned at `Offset::Stored` had not delivered yet. That missed a
+/// dead partition while other partitions had traffic, and it could stop the
+/// whole consumer: each re-assign restarts every fetcher, the restart does not
+/// finish within a short poll window, so that pass also reads nothing, and the
+/// next pass re-assigns again, until a restart.
+///
+/// Kept free of rdkafka types, and the clock is passed in, so the decisions
+/// are unit-testable without a broker.
+#[derive(Debug, Default)]
+struct PartitionLiveness {
+    /// Assigned partitions that delivered nothing in the passes since their
+    /// last delivery or the last assign().
+    idle: HashMap<(String, i32), IdleRun>,
+    /// When the stall check last asked the broker.
+    last_check: Option<Instant>,
+    /// The high watermark at which each partition was last re-assigned for a
+    /// stall. A partition whose re-assign did not help, with no new records
+    /// since, holds records it cannot deliver (a transaction marker at the
+    /// end of the log, for example), not a dead fetcher, and re-assigning it
+    /// again would only restart every fetcher once per interval for nothing.
+    reassigned_at_high: HashMap<(String, i32), i64>,
+}
+
+impl PartitionLiveness {
+    /// A fresh assign() restarts every fetcher, so every idle run starts over.
+    fn on_assign(&mut self, assignment: &[(String, i32)]) {
+        self.idle.clear();
+        self.reassigned_at_high
+            .retain(|key, _| assignment.binary_search(key).is_ok());
+    }
+
+    /// Record one completed pass over `assigned`, the set given to the last
+    /// `on_assign`. A partition progressed if it delivered anything (kept or
+    /// rejected: either way its fetcher is alive) or if its topic filled its
+    /// budget, which leaves a partition crowded out rather than stalled.
+    ///
+    /// Runs on every pass, so it allocates only when a partition starts an
+    /// idle run.
+    fn record_pass(
+        &mut self,
+        assigned: &[(String, i32)],
+        progressed: impl Fn(&(String, i32)) -> bool,
+        now: Instant,
+    ) {
+        for key in assigned {
+            if progressed(key) {
+                self.idle.remove(key);
+            } else if let Some(run) = self.idle.get_mut(key) {
+                run.passes += 1;
+            } else {
+                self.idle.insert(
+                    key.clone(),
+                    IdleRun {
+                        passes: 1,
+                        since: now,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The partitions idle long enough to ask the broker about, sorted; empty
+    /// when the check ran less than `STALL_CHECK_INTERVAL` ago.
+    fn due(&mut self, now: Instant) -> Vec<(String, i32)> {
+        if self
+            .last_check
+            .is_some_and(|at| now.saturating_duration_since(at) < STALL_CHECK_INTERVAL)
+        {
+            return Vec::new();
+        }
+        let mut due: Vec<(String, i32)> = self
+            .idle
+            .iter()
+            .filter(|(_, run)| {
+                run.passes >= STALL_PASSES
+                    && now.saturating_duration_since(run.since) >= STALL_AFTER
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        if !due.is_empty() {
+            self.last_check = Some(now);
+        }
+        due.sort();
+        due
+    }
+
+    /// The lag of a due partition that is stalled: the broker holds records at
+    /// or past `next`, the offset it would read next, and it was not already
+    /// re-assigned at this high watermark. `None` when `next` is unknown.
+    fn stalled_lag(&self, key: &(String, i32), next: Option<i64>, high: i64) -> Option<u64> {
+        let next = next.filter(|n| *n >= 0)?;
+        if high <= next || self.reassigned_at_high.get(key) == Some(&high) {
+            return None;
+        }
+        Some(high.saturating_sub(next) as u64)
+    }
+
+    fn note_reassigned(&mut self, key: &(String, i32), high: i64) {
+        self.reassigned_at_high.insert(key.clone(), high);
+    }
+}
+
+/// The offset a partition would read next, for the stall check (#623): where
+/// it last delivered up to, or else where `Offset::Stored` resolves - the
+/// group's committed offset, or the low watermark when nothing is committed
+/// and `auto.offset.reset` starts at the beginning. `None` when none of these
+/// is known: a partition that starts at the END of the log has no backlog to
+/// measure until it delivers.
+fn next_read_offset(
+    delivered: Option<i64>,
+    group_committed: Option<i64>,
+    low_watermark: Option<i64>,
+    reset_to_earliest: bool,
+) -> Option<i64> {
+    delivered
+        .or(group_committed)
+        .or(low_watermark.filter(|_| reset_to_earliest))
+}
+
+/// Whether `auto.offset.reset` starts a partition with nothing committed at
+/// the beginning of the log (librdkafka's spellings).
+fn resets_to_earliest(auto_offset_reset: &str) -> bool {
+    matches!(
+        auto_offset_reset.to_ascii_lowercase().as_str(),
+        "earliest" | "smallest" | "beginning"
+    )
+}
+
+/// The offset at `at` (`Offset::Beginning` or `Offset::End`, i.e. the low or
+/// high watermark) for each of `partitions`, in one bounded ListOffsets call
+/// per leader. A partition the broker did not answer for is absent.
+fn list_offsets(
+    consumer: &BaseConsumer,
+    partitions: &[(String, i32)],
+    at: Offset,
+) -> HashMap<(String, i32), i64> {
+    let mut answers = HashMap::new();
+    if partitions.is_empty() {
+        return answers;
+    }
+    let mut tpl = TopicPartitionList::new();
+    for (topic, partition) in partitions {
+        if tpl.add_partition_offset(topic, *partition, at).is_err() {
+            return answers;
+        }
+    }
+    let Ok(listed) =
+        consumer.offsets_for_times(tpl, Duration::from_secs(WATERMARK_TIMEOUT_SECONDS))
+    else {
+        return answers;
+    };
+    for (topic, partition) in partitions {
+        if let Some(element) = listed.find_partition(topic, *partition) {
+            if let (Ok(()), Offset::Offset(offset)) = (element.error(), element.offset()) {
+                answers.insert((topic.clone(), *partition), offset);
+            }
+        }
+    }
+    answers
+}
+
 pub struct KafkaSource {
     cfg: KafkaSourceConfig,
     format: TelemetryFormat,
@@ -419,16 +612,19 @@ pub struct KafkaSource {
     /// Partitions paused mid-pass (topic hit its budget); resumed at the
     /// start of the next pass.
     paused: Vec<(String, i32)>,
-    /// Partitions assigned at `Offset::Stored` that have not delivered yet.
+    /// Which assigned partitions have stopped delivering, and since when
+    /// (#623).
     ///
-    /// Stored resolution needs the group coordinator, which a FRESH broker
-    /// creates lazily on the first group operation; an assign() that lands
-    /// before then leaves dead fetchers. The pre-sticky code retried
-    /// implicitly by re-assigning every pass — sticky assignment must retry
-    /// EXPLICITLY: while any of these partitions is pending and a pass reads
-    /// nothing at all, the next pass re-assigns (there are no warm fetchers
-    /// worth protecting when zero records are flowing).
-    stored_pending: std::collections::HashSet<(String, i32)>,
+    /// Sticky assignment never restarts a fetcher on its own, and a fetcher
+    /// can die: `Offset::Stored` resolution needs the group coordinator, which
+    /// a FRESH broker creates lazily on the first group operation, and an
+    /// assign() that lands before then leaves dead fetchers. The stall check
+    /// (`check_stalled_partitions`) re-assigns when a partition has delivered
+    /// nothing for `STALL_PASSES` passes and `STALL_AFTER` while the broker
+    /// holds records for it, whatever the other partitions do.
+    liveness: PartitionLiveness,
+    /// Re-assigns the stall check has made in this process, for the log.
+    stall_reassigns: u64,
     /// Partition ids per topic, cached with a TTL.
     ///
     /// assign() needs the partition list, but fetching metadata on EVERY read
@@ -470,7 +666,8 @@ impl KafkaSource {
             reported_lost_through: HashMap::new(),
             pending_lost: BTreeMap::new(),
             paused: Vec::new(),
-            stored_pending: std::collections::HashSet::new(),
+            liveness: PartitionLiveness::default(),
+            stall_reassigns: 0,
             partitions: HashMap::new(),
         })
     }
@@ -733,6 +930,118 @@ impl KafkaSource {
                  reads it behind until the next commit"
             ),
         }
+    }
+
+    /// Re-assign when an assigned partition has stopped being read while the
+    /// broker holds records for it, whatever the other partitions do (#623).
+    ///
+    /// Runs after a completed pass, and asks the broker only for partitions
+    /// that have delivered nothing for `STALL_PASSES` passes and
+    /// `STALL_AFTER`, at most once per `STALL_CHECK_INTERVAL`: a consumer
+    /// whose partitions all deliver never asks at all. At most three bounded
+    /// calls, each one request per leader for every due partition: the high
+    /// watermarks, then the group's committed offsets and the low watermarks
+    /// for a partition that has not delivered since `Offset::Stored`.
+    ///
+    /// A partition is stalled when it would read next below the high
+    /// watermark. A stalled partition is logged and the whole assignment is
+    /// re-assigned on the next pass, which restarts its fetcher; that costs
+    /// every fetcher one restart, and happens at most once per interval.
+    /// Never fails the pass: a broker that does not answer leaves things as
+    /// they are until the next check.
+    fn check_stalled_partitions(&mut self) {
+        let due = self.liveness.due(Instant::now());
+        if due.is_empty() {
+            return;
+        }
+        let Some(consumer) = self.consumer.as_ref() else {
+            return;
+        };
+        let highs = list_offsets(consumer, &due, Offset::End);
+        let reset_to_earliest = resets_to_earliest(&self.cfg.auto_offset_reset);
+        // Where Offset::Stored resolved is not known here for a partition
+        // that has not delivered since the assign: ask the group, then the
+        // low watermark when the group has committed nothing.
+        let unresolved: Vec<(String, i32)> = due
+            .iter()
+            .filter(|key| highs.contains_key(*key) && !self.delivered.contains_key(*key))
+            .cloned()
+            .collect();
+        let committed = self.group_committed_offsets(&unresolved);
+        let need_low: Vec<(String, i32)> = if reset_to_earliest {
+            unresolved
+                .iter()
+                .filter(|key| !committed.contains_key(*key))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let lows = match self.consumer.as_ref() {
+            Some(consumer) => list_offsets(consumer, &need_low, Offset::Beginning),
+            None => HashMap::new(),
+        };
+
+        let now = Instant::now();
+        let mut stalled = false;
+        for key in &due {
+            let Some(&high) = highs.get(key) else {
+                continue;
+            };
+            let next = next_read_offset(
+                self.delivered.get(key).copied(),
+                committed.get(key).copied(),
+                lows.get(key).copied(),
+                reset_to_earliest,
+            );
+            let Some(lag) = self.liveness.stalled_lag(key, next, high) else {
+                continue;
+            };
+            let (idle_passes, idle_for) = self
+                .liveness
+                .idle
+                .get(key)
+                .map(|run| (run.passes, now.saturating_duration_since(run.since)))
+                .unwrap_or_default();
+            self.liveness.note_reassigned(key, high);
+            self.stall_reassigns += 1;
+            stalled = true;
+            tracing::warn!(
+                topic = %key.0,
+                partition = key.1,
+                next_offset = next.unwrap_or_default(),
+                high_watermark = high,
+                lag,
+                idle_passes,
+                idle_secs = idle_for.as_secs(),
+                stall_reassigns_total = self.stall_reassigns,
+                "kafka partition re-assigned after stall: it delivered nothing while the broker \
+                 holds records for it, so its fetcher is restarted (#623)"
+            );
+        }
+        if stalled {
+            self.assigned.clear();
+        }
+    }
+
+    /// TEST SEAM (#623): stop one partition's fetcher on the underlying
+    /// consumer without the adapter knowing, which is what a dead fetcher
+    /// looks like from here. Only the live-broker stall test calls this.
+    #[doc(hidden)]
+    pub fn stop_fetcher_behind_the_adapter(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Result<(), VtopError> {
+        let consumer = self
+            .consumer
+            .as_ref()
+            .ok_or_else(|| VtopError::Source("no kafka consumer yet".into()))?;
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition(topic, partition);
+        consumer
+            .pause(&tpl)
+            .map_err(|e| VtopError::Source(format!("pause {topic}-{partition}: {e}")))
     }
 
     /// The marker's consumer group, when it is not the one this adapter
@@ -1066,8 +1375,19 @@ impl SourceAdapter for KafkaSource {
             })?;
             // Defensively clear any pause state a retained toppar might carry
             // across the re-assign; a silently-paused partition reads as an
-            // empty topic forever.
-            let _ = consumer.resume(&tpl);
+            // empty topic. A failure is logged, not discarded (#623), and does
+            // not fail the pass: the partitions it did resume are readable,
+            // and one left paused stops delivering, which the stall check
+            // re-assigns once records wait for it.
+            if let Err(e) = consumer.resume(&tpl) {
+                tracing::warn!(
+                    error = %e,
+                    partitions = desired.len(),
+                    "kafka resume after assign failed: a partition left paused is re-assigned \
+                     by the stall check once records wait for it (#623)"
+                );
+            }
+            self.liveness.on_assign(&assignment_set);
             self.assigned = assignment_set;
             self.delivered.clear();
             // Seed delivered with the offsets just assigned, so idle
@@ -1079,11 +1399,6 @@ impl SourceAdapter for KafkaSource {
                     self.delivered.insert((topic.clone(), *p), *want);
                 }
             }
-            self.stored_pending = desired
-                .iter()
-                .filter(|(_, _, off)| matches!(off, Offset::Stored))
-                .map(|(t, p, _)| (t.clone(), *p))
-                .collect();
             self.paused.clear();
         } else {
             if !self.paused.is_empty() {
@@ -1238,19 +1553,11 @@ impl SourceAdapter for KafkaSource {
 
         // Persist the pass's delivery positions and pause state for the next
         // pass's sticky-assignment decisions.
+        let progressed: std::collections::HashSet<(usize, i32)> =
+            delivered_local.keys().copied().collect();
         for ((idx, p), next) in delivered_local {
             let key = (sources[idx].source_name.clone(), p);
-            self.stored_pending.remove(&key);
             self.delivered.insert(key, next);
-        }
-        // Fresh-broker retry (#115 regression caught by e2e): a Stored
-        // assignment that raced the lazily-created group coordinator leaves
-        // dead fetchers, and a sticky assignment would never retry it. If the
-        // pass read NOTHING while Stored partitions are still pending, force a
-        // fresh assign next pass — with zero records flowing there are no warm
-        // fetchers to protect.
-        if total_records == 0 && !self.stored_pending.is_empty() {
-            self.assigned.clear();
         }
         for (idx, was_paused) in paused.iter().enumerate() {
             if *was_paused {
@@ -1258,6 +1565,25 @@ impl SourceAdapter for KafkaSource {
                     self.paused.push((sources[idx].source_name.clone(), p));
                 }
             }
+        }
+        // Per-partition liveness (#623). This replaces a retry that
+        // re-assigned every partition after ANY pass that read nothing while a
+        // partition assigned at Offset::Stored had not delivered yet. That
+        // retry never fired while other partitions had traffic, and it could
+        // stop the whole consumer: the re-assign restarts every fetcher, the
+        // restart does not finish within a 250ms window, so the next pass also
+        // read nothing and re-assigned again, until a restart.
+        if !self.assigned.is_empty() {
+            self.liveness.record_pass(
+                &self.assigned,
+                |(topic, p)| {
+                    topic_index
+                        .get(topic.as_str())
+                        .is_some_and(|&idx| paused[idx] || progressed.contains(&(idx, *p)))
+                },
+                Instant::now(),
+            );
+            self.check_stalled_partitions();
         }
 
         // Demux into one ReadResult per (topic, partition), routed to the
@@ -1553,6 +1879,170 @@ impl SourceAdapter for KafkaSource {
 mod tests {
 
     use super::*;
+
+    fn tp(topic: &str, partition: i32) -> (String, i32) {
+        (topic.to_string(), partition)
+    }
+
+    /// A 250ms pass, the engine's default poll window.
+    const PASS: Duration = Duration::from_millis(250);
+
+    /// #623, hypothesis 1: one partition stops delivering while the others
+    /// carry traffic. The retry this replaced re-assigned only after a pass
+    /// that read NOTHING, which never happens while other partitions deliver,
+    /// so the partition stayed unread until a restart. Liveness is per
+    /// partition: it is due once it has delivered nothing for STALL_PASSES
+    /// passes and STALL_AFTER, whatever the other partitions do.
+    #[test]
+    fn a_partition_that_stops_while_others_deliver_is_found_stalled() {
+        let assigned = vec![tp("a", 0), tp("a", 1), tp("b", 0)];
+        let mut live = PartitionLiveness::default();
+        live.on_assign(&assigned);
+        let start = Instant::now();
+        let dead = tp("a", 1);
+        let passes = (STALL_AFTER.as_millis() / PASS.as_millis()) as u32 + 1;
+        let mut due_at = None;
+        for pass in 1..=passes {
+            let now = start + PASS * pass;
+            // a-0 and b-0 deliver on every pass, so no pass reads nothing and
+            // the retry this replaced would never have fired.
+            live.record_pass(&assigned, |key| *key != dead, now);
+            let due = live.due(now);
+            if !due.is_empty() && due_at.is_none() {
+                assert_eq!(due, vec![dead.clone()], "only the silent partition is due");
+                due_at = Some(pass);
+            }
+        }
+        let due_at = due_at.expect("the silent partition must become due");
+        assert!(due_at > STALL_PASSES, "not before STALL_PASSES passes");
+        assert!(
+            PASS * (due_at - 1) >= STALL_AFTER,
+            "not before STALL_AFTER of idleness, got {due_at} passes"
+        );
+        // Records wait for it: it is stalled, with the lag the log reports.
+        assert_eq!(live.stalled_lag(&dead, Some(100), 140), Some(40));
+    }
+
+    #[test]
+    fn an_idle_partition_is_not_due_until_both_thresholds_pass() {
+        let assigned = vec![tp("a", 0)];
+        let start = Instant::now();
+
+        // Many passes in a short time: short poll windows, not a stall.
+        let mut live = PartitionLiveness::default();
+        live.on_assign(&assigned);
+        for pass in 1..=(STALL_PASSES * 4) {
+            live.record_pass(
+                &assigned,
+                |_| false,
+                start + Duration::from_millis(10) * pass,
+            );
+        }
+        assert!(live.due(start + Duration::from_secs(1)).is_empty());
+
+        // A long time with few passes: the engine stopped reading for a
+        // while (backpressure), and the partition was not asked often enough
+        // to say it is stalled.
+        let mut live = PartitionLiveness::default();
+        live.on_assign(&assigned);
+        for pass in 1..STALL_PASSES {
+            live.record_pass(&assigned, |_| false, start + STALL_AFTER * pass);
+        }
+        assert!(live.due(start + STALL_AFTER * STALL_PASSES).is_empty());
+        live.record_pass(&assigned, |_| false, start + STALL_AFTER * STALL_PASSES);
+        assert_eq!(
+            live.due(start + STALL_AFTER * STALL_PASSES),
+            vec![tp("a", 0)]
+        );
+    }
+
+    /// A partition that delivers, or whose topic filled its budget (crowded
+    /// out, not stalled), starts its idle run over. So does every partition
+    /// on a fresh assign(), which restarts every fetcher.
+    #[test]
+    fn delivery_a_full_topic_and_a_fresh_assign_each_start_the_idle_run_over() {
+        let assigned = vec![tp("a", 0)];
+        let start = Instant::now();
+        let mut live = PartitionLiveness::default();
+        live.on_assign(&assigned);
+        let idle_until = |live: &mut PartitionLiveness, from: u32| {
+            for pass in from..from + STALL_PASSES + 1 {
+                live.record_pass(&assigned, |_| false, start + STALL_AFTER * pass);
+            }
+        };
+        idle_until(&mut live, 0);
+        live.record_pass(&assigned, |_| true, start + STALL_AFTER * 20);
+        assert!(live.due(start + STALL_AFTER * 20).is_empty());
+
+        idle_until(&mut live, 30);
+        live.on_assign(&assigned);
+        assert!(live.due(start + STALL_AFTER * 40).is_empty());
+    }
+
+    /// The broker is asked at most once per STALL_CHECK_INTERVAL, however
+    /// many passes run in between.
+    #[test]
+    fn the_stall_check_asks_the_broker_at_most_once_per_interval() {
+        let assigned = vec![tp("a", 0)];
+        let start = Instant::now();
+        let mut live = PartitionLiveness::default();
+        live.on_assign(&assigned);
+        for pass in 1..=STALL_PASSES {
+            live.record_pass(&assigned, |_| false, start + STALL_AFTER * pass);
+        }
+        let first = start + STALL_AFTER * STALL_PASSES;
+        assert_eq!(live.due(first), vec![tp("a", 0)]);
+        assert!(live.due(first + PASS).is_empty());
+        assert!(live.due(first + STALL_CHECK_INTERVAL - PASS).is_empty());
+        assert_eq!(live.due(first + STALL_CHECK_INTERVAL), vec![tp("a", 0)]);
+    }
+
+    /// Stalled means records are waiting: the high watermark is past the
+    /// offset the partition would read next. An idle partition that is caught
+    /// up is not stalled, and one whose re-assign did not help is not
+    /// re-assigned again until a new record arrives, so an undeliverable tail
+    /// (a transaction marker) cannot restart every fetcher once per interval.
+    #[test]
+    fn a_partition_is_stalled_only_while_records_wait_for_it() {
+        let key = tp("a", 0);
+        let mut live = PartitionLiveness::default();
+        assert_eq!(live.stalled_lag(&key, Some(40), 40), None, "caught up");
+        assert_eq!(live.stalled_lag(&key, Some(41), 40), None);
+        assert_eq!(live.stalled_lag(&key, None, 40), None, "next unknown");
+        assert_eq!(
+            live.stalled_lag(&key, Some(-1001), 40),
+            None,
+            "a sentinel offset is not a position"
+        );
+        assert_eq!(live.stalled_lag(&key, Some(39), 40), Some(1));
+
+        live.note_reassigned(&key, 40);
+        assert_eq!(live.stalled_lag(&key, Some(39), 40), None);
+        assert_eq!(live.stalled_lag(&key, Some(39), 41), Some(2));
+        // The bookmark is kept across an assign of the same partition, and
+        // dropped with a partition that is no longer assigned.
+        live.on_assign(std::slice::from_ref(&key));
+        assert_eq!(live.stalled_lag(&key, Some(39), 40), None);
+        live.on_assign(&[tp("b", 0)]);
+        assert_eq!(live.stalled_lag(&key, Some(39), 40), Some(1));
+    }
+
+    #[test]
+    fn the_next_offset_is_the_delivery_position_else_where_stored_resolves() {
+        assert_eq!(next_read_offset(Some(7), Some(5), Some(0), true), Some(7));
+        assert_eq!(next_read_offset(None, Some(5), Some(0), true), Some(5));
+        assert_eq!(next_read_offset(None, None, Some(3), true), Some(3));
+        assert_eq!(
+            next_read_offset(None, None, Some(3), false),
+            None,
+            "a partition that starts at the end has no backlog to measure"
+        );
+        assert!(resets_to_earliest("earliest"));
+        assert!(resets_to_earliest("smallest"));
+        assert!(resets_to_earliest("Beginning"));
+        assert!(!resets_to_earliest("latest"));
+        assert!(!resets_to_earliest("error"));
+    }
 
     #[test]
     fn a_rewind_never_goes_below_the_groups_committed_offset() {
