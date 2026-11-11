@@ -111,6 +111,11 @@ compression:
 # not implemented yet.
 # manifest_mac_key_env: VTOP_MANIFEST_MAC_KEY
 
+# Global algorithm; streams.yaml may override it per stream via checksum.algorithm.
+# Keep this strong during rolling upgrades: older engines ignore the stream key.
+checksum:
+  algorithm: sha256
+
 sources:
   kafka:
     enabled: true

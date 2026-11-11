@@ -6,7 +6,10 @@
 # `format` is OPTIONAL. If a source has NO mapping here, the engine auto-detects
 # its format (CEF / JSON / JSONL / syslog / text) from the data — so different
 # formats can flow through the same engine at once. Add a mapping only to
-# override detection or to set a tenant, storage rename, or retention class.
+# override detection or to set a tenant, storage rename, retention class, or checksum.
+# checksum.algorithm overrides config.yaml for this stream only (sha256/blake3/none).
+# Upgrade every engine before relying on it: older engines silently ignore it.
+# The global upload.require_strong_verification floor cannot be lowered here.
 #
 # In the lab: cef_events is mapped explicitly below; json_events,
 # syslog_events, and mixed_events are intentionally left UNMAPPED so you can see
@@ -17,6 +20,8 @@ streams:
     source_type: kafka
     format: cef
     tenant: default
+    checksum:
+      algorithm: sha256             # native S3: service checksum; no body read-back
     s3_source_name: security
     retention_class: standard
 
@@ -25,5 +30,7 @@ streams:
     source_type: file
     format: cef
     tenant: default
+    checksum:
+      algorithm: blake3             # native S3: read stored bytes back to hash them
     s3_source_name: auth
     retention_class: standard

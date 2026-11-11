@@ -8,7 +8,7 @@
 //! when recovery's storage re-check accepted such a result. These helpers live
 //! outside `engine.rs` to keep the engine's own diff to its call sites.
 
-use vtop_core::config::VtopConfig;
+use vtop_core::config::{StreamsConfig, VtopConfig};
 use vtop_core::telemetry;
 use vtop_state::BatchRecord;
 
@@ -20,8 +20,8 @@ use vtop_state::BatchRecord;
 /// with `VTOP_METRICS_ADDR` set (`metrics_server::maybe_start`). The one-shot
 /// commands serve no endpoint and deliberately build no registry, so for
 /// them the WARN is the whole signal.
-pub(crate) fn announce(config: &VtopConfig) {
-    for warning in config.warnings() {
+pub(crate) fn announce(config: &VtopConfig, streams: &StreamsConfig) {
+    for warning in streams.warnings(config) {
         tracing::warn!("{warning}");
     }
     if let Some(mx) = telemetry::metrics() {

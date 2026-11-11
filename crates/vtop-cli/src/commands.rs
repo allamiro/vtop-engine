@@ -266,6 +266,7 @@ fn load(config: &Path) -> Result<(VtopConfig, StreamsConfig), VtopError> {
     } else {
         StreamsConfig { streams: vec![] }
     };
+    streams.validate(&cfg)?;
     Ok((cfg, streams))
 }
 
@@ -559,8 +560,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             // non-zero exit. Warnings never fail the check (#629): each is a
             // documented opt-out, and refusing it here would only push
             // operators to skip the check.
-            let (cfg, _streams) = load(config)?;
-            let warnings = cfg.warnings();
+            let (cfg, streams) = load(config)?;
+            let warnings = streams.warnings(&cfg);
             if cli.json {
                 println!(
                     "{}",

@@ -1440,6 +1440,10 @@ impl VtopConfig {
 /// A single configured stream mapping from `streams.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamConfig {
+    /// Override the global checksum for this stream. The strong-verification
+    /// floor stays global and cannot be lowered by a stream.
+    #[serde(default)]
+    pub checksum: Option<ChecksumConfig>,
     pub source_name: String,
     pub source_type: SourceType,
     pub format: TelemetryFormat,
@@ -1452,12 +1456,72 @@ pub struct StreamConfig {
     pub retention_class: Option<String>,
 }
 
+/// Resolve the algorithm at the point a new batch is written. Recovery and
+/// scrub instead use the algorithm persisted in that batch's manifest.
+pub fn effective_algorithm(
+    config: &VtopConfig,
+    stream: Option<&StreamConfig>,
+) -> ChecksumAlgorithm {
+    stream
+        .and_then(|stream| stream.checksum.as_ref())
+        .map_or(config.checksum.algorithm, |checksum| checksum.algorithm)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamsConfig {
     pub streams: Vec<StreamConfig>,
 }
 
 impl StreamsConfig {
+    /// Validate cross-file invariants before any source or store is opened.
+    ///
+    /// A stream cannot lower the global strong-verification floor (#669): an
+    /// explicit per-stream `checksum.algorithm: none` while
+    /// `upload.require_strong_verification` is on is refused here, naming the
+    /// stream. A stream that merely inherits the global algorithm is judged
+    /// exactly as before this setting existed.
+    pub fn validate(&self, config: &VtopConfig) -> Result<(), VtopError> {
+        for stream in &self.streams {
+            let lowers_floor = stream
+                .checksum
+                .as_ref()
+                .is_some_and(|checksum| !checksum.algorithm.is_enabled());
+            if lowers_floor && config.upload.require_strong_verification {
+                return Err(VtopError::Config(format!(
+                    "stream {:?}: checksum.algorithm is none but upload.require_strong_verification is true",
+                    stream.source_name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Global warnings with stream overrides accounted for, followed by each
+    /// explicit stream opt-out. Existing configurations keep their old text.
+    pub fn warnings(&self, config: &VtopConfig) -> Vec<String> {
+        let mut warnings = config.warnings();
+        if !config.checksum.algorithm.is_enabled()
+            && self
+                .streams
+                .iter()
+                .any(|stream| effective_algorithm(config, Some(stream)).is_enabled())
+        {
+            for warning in &mut warnings {
+                *warning = warning.replace(
+                    "EVERY batch is verified by size alone",
+                    "every batch inheriting the global algorithm is verified by size alone",
+                );
+            }
+        }
+        warnings.extend(self.streams.iter()
+            .filter(|stream| stream.checksum.is_some() && !effective_algorithm(config, Some(stream)).is_enabled())
+            .map(|stream| format!(
+                "stream {:?}: checksum.algorithm is none, so EVERY batch of this stream is verified by size alone; same-size corruption is not detected",
+                stream.source_name
+            )));
+        warnings
+    }
+
     pub fn from_path(path: &Path) -> Result<Self, VtopError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| VtopError::Config(format!("reading {}: {e}", path.display())))?;
@@ -1514,6 +1578,67 @@ upload:
             weak.warnings()[0].contains("EVERY batch"),
             "with checksums off every batch is size-only: {:?}",
             weak.warnings()
+        );
+    }
+
+    /// #669: a stream's own algorithm wins, else the global one; only an
+    /// explicit per-stream `none` is refused under the strong floor, and with
+    /// the floor off it is a warning naming the stream.
+    #[test]
+    fn stream_checksum_resolves_and_cannot_lower_the_floor() {
+        let yaml = r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources: {}
+upload:
+  bucket: telemetry-data
+checksum:
+  algorithm: blake3
+"#;
+        let mut cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        let streams: StreamsConfig = serde_yaml::from_str(
+            r#"
+streams:
+  - {source_name: inherits, source_type: file, format: raw}
+  - {source_name: strong, source_type: file, format: raw, checksum: {algorithm: sha256}}
+  - {source_name: lowers, source_type: file, format: raw, checksum: {algorithm: none}}
+"#,
+        )
+        .unwrap();
+        let algo = |i: usize, cfg: &VtopConfig| effective_algorithm(cfg, Some(&streams.streams[i]));
+        assert_eq!(algo(0, &cfg), ChecksumAlgorithm::Blake3);
+        assert_eq!(algo(1, &cfg), ChecksumAlgorithm::Sha256);
+        assert_eq!(algo(2, &cfg), ChecksumAlgorithm::None);
+        assert_eq!(effective_algorithm(&cfg, None), ChecksumAlgorithm::Blake3);
+
+        let err = streams.validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("\"lowers\"") && err.contains("none"), "{err}");
+
+        // Inheriting a global `none` is not a stream lowering the floor: that
+        // case is judged as it was before #669 (refused per batch at run time).
+        let inheriting = StreamsConfig {
+            streams: streams.streams[..2].to_vec(),
+        };
+        cfg.checksum.algorithm = ChecksumAlgorithm::None;
+        inheriting.validate(&cfg).unwrap();
+
+        cfg.checksum.algorithm = ChecksumAlgorithm::Blake3;
+        cfg.upload.require_strong_verification = false;
+        streams.validate(&cfg).unwrap();
+        let warnings = streams.warnings(&cfg);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("\"lowers\"") && w.contains("size alone")),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("\"inherits\"")),
+            "{warnings:?}"
         );
     }
 
