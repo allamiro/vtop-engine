@@ -63,10 +63,24 @@ For every batch, VTOP:
 
 ---
 
+## Measured against Apache Kafka
+
+[![Produce throughput at saturation, VTOP's Kafka gateway vs Apache Kafka, same JVM client, profile defaults, single host](docs/benchmarks/img/kafka-compare-produce-throughput.png)](docs/benchmarks/kafka-comparison.md)
+
+On one host (an Apple M5 Max laptop; each three-node cluster in turn in the same Docker Desktop VM, 2 CPUs
+and `2g` of memory per node; profile `defaults`), the same JVM producer reached a higher saturation throughput against
+Apache Kafka than against VTOP's Kafka gateway at both record sizes measured, where under `defaults` a Kafka
+`acks=all` acknowledgement does not wait for an fsync and a VTOP quorum acknowledgement does. Indicative, not
+a production benchmark: the method, the latency and consume results, the raw CSV and every condition are in
+[docs/benchmarks/kafka-comparison.md](docs/benchmarks/kafka-comparison.md).
+
+---
+
 ## Table of contents
 
 - [Overview](#overview)
 - [Status](#status)
+- [Measured against Apache Kafka](#measured-against-apache-kafka)
 - [Why VTOP exists](#why-vtop-exists)
 - [Core rule](#core-rule)
 - [How it works](#how-it-works)
@@ -389,6 +403,11 @@ Workflow file:
 The CLI binary is `vtopctl`.
 
 ```bash
+# Check a config without contacting anything. Exits non-zero only for an
+# invalid config; a risky opt-out is printed as a WARNING and still passes.
+cargo run -p vtop-cli -- validate \
+  --config examples/config.yaml
+
 cargo run -p vtop-cli -- run \
   --config examples/config.yaml
 
@@ -776,6 +795,7 @@ VTOP is currently a prototype. The following limits are known and intentional.
 | Binary / pre-compressed inputs | **supported** via the file source `whole_file` mode (archived verbatim, byte-exact) | streaming for very large files |
 | Local filesystem backend | **available** (`backend: localfs`, objects under `local_path/<bucket>/<key>`; sidecars are inventory hints only) | — |
 | Checksums | **SHA-256 and BLAKE3**, or disabled (size-only); strong verification defaults on and `require_strong_verification: false` is an explicit weak-mode opt-out | — |
+| Size-only verification | `upload.require_strong_verification: false` **accepts same-size corruption**: a corrupted or replaced object of the recorded size is committed as verified. It is announced, not refused: one WARN at engine startup and a `vtopctl validate` warning naming the key, `vtop_verification_mode{mode="size_only"} 1` from startup (exported by `vtopctl run` with `VTOP_METRICS_ADDR`), and a WARN with the batch id for every size-only verification, counted in `vtop_verification_backend_limited_total` where `vtop_verified_total` counts it: at VERIFIED in the running engine, at the commit in recovery (#629) | — |
 
 ---
 
