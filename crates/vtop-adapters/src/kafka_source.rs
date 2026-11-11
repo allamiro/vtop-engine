@@ -476,6 +476,25 @@ impl PartitionLiveness {
         next.or_else(|| self.end_baseline.get(key).copied())
     }
 
+    /// Where a due partition assigned at the end of the log would read next:
+    /// the start an earlier lookup established, else what this check's start
+    /// lookup answered for it - its first offset since the assign, or `high`
+    /// (read BEFORE the lookup) when no record is that new. A failed lookup,
+    /// or an answer that omits the partition or carries an error for it,
+    /// establishes nothing: the partition stays unresolved and is asked again
+    /// at the next check (#623; review of #644).
+    fn end_start(
+        &mut self,
+        key: &(String, i32),
+        answer: Option<&HashMap<(String, i32), Option<i64>>>,
+        high: i64,
+    ) -> Option<i64> {
+        if let Some(start) = answer.and_then(|answer| answer.get(key)) {
+            self.note_baseline(key, start.unwrap_or(high));
+        }
+        self.next_or_baseline(key, None)
+    }
+
     /// Record one completed pass over `assigned`, the set given to the last
     /// `on_assign`. A partition progressed only if IT delivered something
     /// (kept or rejected: either way its fetcher is alive). Its topic filling
@@ -1249,18 +1268,14 @@ impl KafkaSource {
             .filter(|key| may_use_end(key))
             .cloned()
             .collect();
-        if !need_start.is_empty() {
+        let starts = if need_start.is_empty() {
+            None
+        } else {
             let since = end_start_lookup_time(self.liveness.assigned_at_ms);
-            let starts = self
-                .consumer
+            self.consumer
                 .as_ref()
-                .and_then(|consumer| offsets_at_time(consumer, &need_start, since));
-            for (key, start) in starts.into_iter().flatten() {
-                if let Some(&high) = highs.get(&key) {
-                    self.liveness.note_baseline(&key, start.unwrap_or(high));
-                }
-            }
-        }
+                .and_then(|consumer| offsets_at_time(consumer, &need_start, since))
+        };
 
         let now = Instant::now();
         let mut stalled: Vec<(String, i32)> = Vec::new();
@@ -1283,7 +1298,7 @@ impl KafkaSource {
                 reset_to_earliest,
             );
             let next = if resolved.is_none() && end_measured.contains(key) {
-                self.liveness.next_or_baseline(key, resolved)
+                self.liveness.end_start(key, starts.as_ref(), high)
             } else {
                 resolved
             };
@@ -2675,6 +2690,57 @@ mod tests {
             Some(15),
             "every record since the assign is recovered"
         );
+    }
+
+    /// Review of #644 (Codex 4533729305): the start lookup for a partition
+    /// assigned at the end of the log either (a) fails outright, or (b)
+    /// succeeds but omits the partition (or answers it with an error). In
+    /// both cases the start stays unresolved and the next check asks again;
+    /// nothing is decided from a start the check made up. When an answer for
+    /// the partition does arrive, every record since the assign is recovered.
+    #[test]
+    fn an_unanswered_start_lookup_is_retried_not_replaced() {
+        let key = tp("a", 0);
+        let answered = |start: Option<i64>| -> HashMap<(String, i32), Option<i64>> {
+            [(tp("a", 0), start)].into_iter().collect()
+        };
+        let omitted: HashMap<(String, i32), Option<i64>> =
+            [(tp("other", 0), Some(3))].into_iter().collect();
+        for (case, first, second) in [
+            ("(a) the lookup failed", None, None),
+            (
+                "(b) the answer omits the partition",
+                Some(&omitted),
+                Some(&omitted),
+            ),
+        ] {
+            let mut live = PartitionLiveness::default();
+            live.on_assign(std::slice::from_ref(&key));
+            // 10 records waiting at the first check, 15 at the second.
+            let next = live.end_start(&key, first, 10);
+            assert_eq!(
+                live.stalled_lag(&key, next, 10),
+                None,
+                "{case}: first check"
+            );
+            let next = live.end_start(&key, second, 15);
+            assert_eq!(
+                live.stalled_lag(&key, next, 15),
+                None,
+                "{case}: second check"
+            );
+            // The lookup answers: the partition started at 0.
+            let next = live.end_start(&key, Some(&answered(Some(0))), 15);
+            assert_eq!(
+                live.stalled_lag(&key, next, 15),
+                Some(15),
+                "{case}: every record since the assign is recovered"
+            );
+        }
+        // An answer of "no record since the assign" is the high watermark
+        // read before the lookup: exact, so it is recorded.
+        let mut live = PartitionLiveness::default();
+        assert_eq!(live.end_start(&key, Some(&answered(None)), 15), Some(15));
     }
 
     /// Review of #644: an end-of-log baseline (and the recovery pin it leads
