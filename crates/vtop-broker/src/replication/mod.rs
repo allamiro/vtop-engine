@@ -204,7 +204,14 @@ pub struct InProcessFollower {
     /// Records a fence disputed but KEPT (#611): the epoch of that fence and
     /// the first offset in dispute. See [`KeptDispute`].
     kept_dispute: Mutex<Option<KeptDispute>>,
+    /// Runs between reading the high-water mark and installing a dispute
+    /// from it, so a unit test can land a concurrent mark exactly there.
+    #[cfg(test)]
+    before_dispute_install: Mutex<Option<DisputeInstallHook>>,
 }
+
+#[cfg(test)]
+type DisputeInstallHook = Box<dyn Fn() + Send + Sync>;
 
 /// A suffix a fence found in dispute and kept (#611), because the fencing
 /// caller could not prove that no quorum had acknowledged it.
@@ -304,6 +311,8 @@ impl InProcessFollower {
             online: AtomicBool::new(true),
             hold_fsync: AtomicBool::new(false),
             kept_dispute: Mutex::new(None),
+            #[cfg(test)]
+            before_dispute_install: Mutex::new(None),
         })
     }
 
@@ -908,6 +917,16 @@ impl InProcessFollower {
         epoch: u64,
         leader_epoch_starts: &[crate::fencing_epochs::EpochStart],
     ) -> Result<FenceOutcome, (ErrorCode, String)> {
+        // The whole fence is one critical section with every append and every
+        // high-water mark (#649 review, cubic 4532895325): both hold the meta
+        // lock from their checks through their effect. Without it a mark
+        // could land between this replica reading its own mark and keeping a
+        // dispute from it, after the mark's settle had seen no dispute, and
+        // leave the dispute below the mark, where no settle may truncate and
+        // every later append is refused (the #616 wedge). Lock order is meta,
+        // then state, then the dispute and the journal, as on the append
+        // path; nothing below takes the meta lock again.
+        let meta = self.meta_fencing_epoch.lock();
         let held = self.held_fencing_epoch();
         if epoch < held {
             return Err((
@@ -915,7 +934,7 @@ impl InProcessFollower {
                 format!("fence request at epoch {epoch} is below this replica's held epoch {held}"),
             ));
         }
-        let granted = self.meta_fencing_epoch.lock().fencing_epoch;
+        let granted = meta.fencing_epoch;
         if epoch > granted {
             return Err((
                 ErrorCode::Fenced,
@@ -933,7 +952,7 @@ impl InProcessFollower {
         // sees an empty vector, compares as Unknown, and truncates nothing —
         // on this fence and every later one, and in the `epoch_starts` this
         // fence returns to the caller.
-        self.adopt_fencing_epoch(epoch);
+        self.adopt_fencing_epoch_locked(epoch);
 
         // Reconcile WHILE STOPPED. This is the only moment it is sound: the
         // replica has just been fenced, so nothing can append between the
@@ -965,13 +984,15 @@ impl InProcessFollower {
         let local_committed_offset = state.segment.committed_offset();
         let next_offset = state.segment.next_offset();
         drop(state);
-        Ok(FenceOutcome {
+        let outcome = FenceOutcome {
             fencing_epoch: self.held_fencing_epoch(),
             local_committed_offset,
             next_offset,
             epoch_starts: self.epoch_starts(),
             truncated_records,
-        })
+        };
+        drop(meta);
+        Ok(outcome)
     }
 
     /// Discard anything written under a leadership `leader_epoch_starts` does
@@ -1027,6 +1048,15 @@ impl InProcessFollower {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let from = self.cluster_committed.get();
+        #[cfg(test)]
+        if let Some(hook) = self
+            .before_dispute_install
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            hook();
+        }
         if from < state.segment.next_offset() {
             *self
                 .kept_dispute
@@ -1999,4 +2029,161 @@ fn records_from_wire(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fencing_epochs::EpochStart;
+    use std::time::Duration;
+    use vtop_log::{ActiveSegment, KeyRange, RangeLineage, SegmentConfig, SegmentDescriptor};
+    use vtop_protocol::ProduceRecord;
+
+    fn range() -> RangeIdentity {
+        RangeIdentity {
+            topic: "events.v1".to_owned(),
+            topic_epoch: 1,
+            range_id: Uuid::from_u128(0xC1),
+            range_generation: 0,
+        }
+    }
+
+    fn append(
+        epoch: u64,
+        producer: u128,
+        offset: u64,
+        sequence: u64,
+        value: &str,
+    ) -> ReplicaAppendRequest {
+        ReplicaAppendRequest {
+            range: range(),
+            fencing_epoch: epoch,
+            leader_node_id: Uuid::from_u128(0xA1),
+            expected_base_offset: offset,
+            producer_id: Uuid::from_u128(producer),
+            producer_epoch: 1,
+            first_sequence: sequence,
+            records: vec![ProduceRecord {
+                timestamp_millis: 1_000,
+                key: b"k".to_vec(),
+                value: value.as_bytes().to_vec(),
+            }],
+        }
+    }
+
+    /// #649 review (cubic P1, 4532895325). An uncomparable replica's fence
+    /// read its high-water mark and then installed a dispute from it, while
+    /// a mark from the leader could land in between: its settle saw no
+    /// dispute yet, and its advance came after the install. The dispute then
+    /// sat below the mark, the settle's truncation was refused as below the
+    /// acknowledged mark, and the replica refused every append (the #616
+    /// wedge). The hook lands that mark exactly in the gap.
+    ///
+    /// Invariant: no kept dispute ever starts below the mark, and the
+    /// leader's next record lands.
+    #[test]
+    fn a_mark_landing_while_a_fence_keeps_a_dispute_never_leaves_it_below_the_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = ActiveSegment::create(
+            dir.path().join("range.active"),
+            SegmentDescriptor {
+                segment_id: Uuid::from_u128(0xE1),
+                topic: range().topic,
+                topic_epoch: 1,
+                lineage: RangeLineage {
+                    range_id: range().range_id,
+                    generation: 0,
+                    key_range: KeyRange::full(),
+                    parents: Vec::new(),
+                },
+                base_offset: 0,
+            },
+            SegmentConfig::default(),
+        )
+        .unwrap();
+        let meta = MetaFencingEpoch::new(18);
+        // No fencing-epoch journal: its history is unknown.
+        let node = Arc::new(
+            InProcessFollower::new(
+                Uuid::from_u128(0xA2),
+                segment,
+                ProducerEpochJournal::open(dir.path().join("epochs")).unwrap(),
+                range(),
+                18,
+                meta.clone(),
+                ClusterCommittedOffset::new(0),
+            )
+            .unwrap(),
+        );
+        for offset in 0..5 {
+            node.apply_append(&append(18, 0xB1, offset, offset, &format!("v{offset}")))
+                .unwrap();
+        }
+        node.cluster_committed().advance_to(5);
+        for offset in 5..10 {
+            node.apply_append(&append(
+                18,
+                0xB9,
+                offset,
+                offset - 5,
+                &format!("stale-{offset}"),
+            ))
+            .unwrap();
+        }
+        meta.set(19);
+        node.adopt_fencing_epoch(19);
+
+        type Marking = std::thread::JoinHandle<Result<(), (ErrorCode, String)>>;
+        let observer: Arc<Mutex<Option<Marking>>> = Arc::new(Mutex::new(None));
+        {
+            let marking = Arc::clone(&node);
+            let observer = Arc::clone(&observer);
+            *node.before_dispute_install.lock().unwrap() = Some(Box::new(move || {
+                let (done, finished) = std::sync::mpsc::channel();
+                let marking = Arc::clone(&marking);
+                *observer.lock().unwrap() = Some(std::thread::spawn(move || {
+                    let outcome = marking.observe_hwm(&CommittedHwmUpdate {
+                        range: range(),
+                        fencing_epoch: 19,
+                        committed_high_watermark: 7,
+                    });
+                    let _ = done.send(());
+                    outcome
+                }));
+                // Give the mark every chance to land before the install.
+                let _ = finished.recv_timeout(Duration::from_millis(300));
+            }));
+        }
+        node.fence(
+            19,
+            &[
+                EpochStart {
+                    epoch: 18,
+                    start_offset: 0,
+                },
+                EpochStart {
+                    epoch: 19,
+                    start_offset: 5,
+                },
+            ],
+        )
+        .expect("fenced");
+        // Drop the hook (and the replica it holds) before judging.
+        *node.before_dispute_install.lock().unwrap() = None;
+        let marking = observer.lock().unwrap().take().expect("the hook ran");
+        let marked = marking.join().unwrap();
+        // Refused or accepted, the mark must not leave a dispute below it.
+        let _ = marked;
+
+        let (_, reported) = node.replication_status();
+        let mark = node.cluster_committed().get();
+        assert!(
+            reported == node.next_offset() || reported >= mark,
+            "a dispute from {reported} was left below the mark {mark} (next offset {})",
+            node.next_offset()
+        );
+        let next = node.next_offset();
+        node.apply_append(&append(19, 0xB1, next, next, &format!("v{next}")))
+            .expect("the leader's next record must land, not be refused below the mark");
+    }
 }

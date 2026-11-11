@@ -254,16 +254,18 @@ reopen quietly.
   truncated at once. A suffix in a comparable history that the leader
   cannot yet prove superseded is kept in dispute, from the divergence (or,
   below the replica's high-water mark, from past both the mark and the
-  leader's tail). A replica whose own history cannot be compared (no
-  journal, or a broken one) keeps everything above its own high-water mark
-  in dispute (#649 review). A kept dispute caps the replica's status and
+  leader's tail). A replica that holds records but whose own history cannot
+  be compared (no journal, or a broken one) keeps everything above its own
+  high-water mark in dispute (#649 review). A kept dispute caps the replica's status and
   acks, so the leader keeps the records it must send, and the leader's
   first append or mark over it discards it; the replica then catches up and
   never reports a disputed suffix as held, takes it under the new mark, or
   acks the leader's records over it. Nothing at or below a replica's own
-  mark is touched. An uncomparable history stays uncomparable: its answers
-  never count toward a promotion, and the replica needs `vtopctl node
-  repair` to install one. A leader with no history of its own cannot
+  mark is touched. Such a replica stays uncomparable: its answers never
+  count toward a promotion, and it needs `vtopctl node repair` to install a
+  history. An empty replica with no history is not in that position: it
+  holds nothing to dispute, the candidate judges its answer Agreed, and it
+  counts. A leader with no history of its own cannot
   reconcile anyone; its fences leave every log as it is. Plaintext planes
   skip the session fence, since they refuse fences and do not fail over.
   **The protection is the fenced replica's, so it holds only on upgraded
