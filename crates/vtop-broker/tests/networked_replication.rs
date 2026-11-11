@@ -310,6 +310,27 @@ fn harness_with_gate(
     followers_by_name: FollowerAddressing,
     gate_follower1: Option<Arc<AtomicBool>>,
 ) -> NetworkHarness {
+    harness_at(
+        FENCING_EPOCH,
+        flow,
+        group_commit,
+        slow_follower2,
+        memory,
+        followers_by_name,
+        gate_follower1,
+    )
+}
+
+/// The harness with every replica statically at `epoch`.
+fn harness_at(
+    epoch: u64,
+    flow: FlowControlConfig,
+    group_commit: Option<GroupCommitConfig>,
+    slow_follower2: Option<(Duration, Arc<AtomicBool>)>,
+    memory: Option<Arc<MemoryBudgetPool>>,
+    followers_by_name: FollowerAddressing,
+    gate_follower1: Option<Arc<AtomicBool>>,
+) -> NetworkHarness {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -317,7 +338,7 @@ fn harness_with_gate(
         .unwrap();
 
     let range = range_identity();
-    let meta = MetaFencingEpoch::new(FENCING_EPOCH);
+    let meta = MetaFencingEpoch::new(epoch);
     let cluster_committed = ClusterCommittedOffset::new(0);
 
     let leader_cert = cert_for_cn(&LEADER.to_string());
@@ -346,7 +367,7 @@ fn harness_with_gate(
                 segment,
                 epochs,
                 range.clone(),
-                FENCING_EPOCH,
+                epoch,
                 meta.clone(),
                 ClusterCommittedOffset::new(0),
             )
@@ -427,7 +448,7 @@ fn harness_with_gate(
         leader_segment,
         leader_epochs,
         range.clone(),
-        FENCING_EPOCH,
+        epoch,
         meta.clone(),
         LEADER,
         Some(cluster_committed.clone()),
@@ -1151,5 +1172,44 @@ fn a_deposed_leader_absent_from_the_election_discards_its_unacknowledged_suffix_
         deposed.next_offset(),
         deposed.local_committed_offset(),
         deposed.cluster_committed().get()
+    );
+}
+
+/// #649 review (cubic P1). Epoch 0 is a valid static configuration: a
+/// leader and followers configured with `fencing_epoch: 0` and no lease
+/// serve at it. The session fence used to treat a held epoch of 0 as "no
+/// grant yet" and refuse to open any session, so such a range never
+/// connected a follower and no produce reached a quorum.
+///
+/// Invariant: a static range at epoch 0 opens its (fenced) sessions and
+/// commits on a quorum.
+#[test]
+fn a_static_range_at_epoch_zero_still_replicates() {
+    let h = harness_at(
+        0,
+        FlowControlConfig {
+            ack_timeout: Duration::from_millis(500),
+            ..FlowControlConfig::default()
+        },
+        None,
+        None,
+        None,
+        FollowerAddressing::Resolved,
+        None,
+    );
+    assert!(
+        await_within(Duration::from_secs(5), || {
+            [FOLLOWER_1, FOLLOWER_2]
+                .iter()
+                .all(|node| h.replica_set.follower_connected(*node) == Some(true))
+        }),
+        "the follower sessions of a static epoch-0 range never opened: connected {:?}",
+        [FOLLOWER_1, FOLLOWER_2].map(|node| h.replica_set.follower_connected(node))
+    );
+    produce_at(&h.leader, h.range.clone(), 0, 0);
+    assert!(
+        await_within(Duration::from_secs(5), || h.cluster_committed.get() == 1),
+        "the epoch-0 record never committed: mark {}",
+        h.cluster_committed.get()
     );
 }

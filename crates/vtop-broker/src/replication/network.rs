@@ -159,10 +159,16 @@ impl LeaderLineage for crate::LocalBroker {
         // appends, discarding records it holds and may have acknowledged.
         // A candidate's broker is built before it adopts its grant, holding
         // the configured epoch; this keeps its sessions waiting until then.
+        //
+        // Epoch 0 is not refused here (#649 review): a static range
+        // configured at `fencing_epoch: 0` serves at it with an active lease
+        // view, and refusing it left every follower session unopened. A
+        // lease-driven broker waiting for its first grant is caught by the
+        // inactive lease view instead, whatever epoch it holds.
         let fencing_epoch = {
             let meta = self.meta_fencing_epoch().lock();
             let held = self.held_fencing_epoch();
-            if held == 0 || !meta.lease_active || meta.fencing_epoch != held {
+            if !meta.lease_active || meta.fencing_epoch != held {
                 return None;
             }
             held
@@ -833,7 +839,50 @@ pub struct NetworkedReplicaSet {
 /// Where a driver finds the leader it reconciles followers against (#641).
 /// Weak: the leader's broker holds this replica set, so a strong reference
 /// back would keep both alive forever.
-type LineageCell = Arc<std::sync::OnceLock<std::sync::Weak<dyn LeaderLineage>>>;
+type LineageCell = Arc<LineageSource>;
+
+/// The attached leader, and the one lineage read in flight for the whole
+/// set (#649 review).
+#[derive(Default)]
+struct LineageSource {
+    leader: std::sync::OnceLock<std::sync::Weak<dyn LeaderLineage>>,
+    /// A read that outlived its caller's deadline. A blocking task cannot be
+    /// cancelled, so it is kept here and the next session awaits it rather
+    /// than starting another: a lease lock stalled behind a slow fsync then
+    /// costs one blocked thread, not one per reconnect.
+    in_flight: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Option<LeaderLineageSnapshot>>>>,
+}
+
+impl LineageSource {
+    fn attached(&self) -> bool {
+        self.leader.get().is_some()
+    }
+
+    /// The leader's lineage, read off the runtime: the broker reads its lease
+    /// view under the lock its produce path holds through an fsync, and a
+    /// stalled disk must not park a runtime worker. `None` when it is not
+    /// available within `within`, or the leader holds no live grant.
+    async fn read(
+        &self,
+        leader: Arc<dyn LeaderLineage>,
+        within: Duration,
+    ) -> Option<LeaderLineageSnapshot> {
+        timeout(within, async {
+            let mut slot = self.in_flight.lock().await;
+            let read = slot.get_or_insert_with(|| {
+                tokio::task::spawn_blocking(move || leader.leader_lineage())
+            });
+            // Polled through the slot, so a deadline that fires here leaves
+            // the read where the next session finds it.
+            let outcome = read.await;
+            *slot = None;
+            outcome.ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
 
 enum RuntimeBinding {
     Owned(Runtime),
@@ -975,7 +1024,7 @@ impl NetworkedReplicaSet {
             None => None,
         };
         let handle = runtime.handle();
-        let lineage: LineageCell = Arc::new(std::sync::OnceLock::new());
+        let lineage: LineageCell = Arc::new(LineageSource::default());
         let mut channels = Vec::with_capacity(followers.len());
         let mut shutdown = Vec::with_capacity(followers.len());
         for config in followers {
@@ -1057,7 +1106,7 @@ impl NetworkedReplicaSet {
     /// caller. A plaintext plane does not fail over (`refuse_plaintext_promotion`
     /// in vtop-node), so it has no deposed leader to reconcile.
     pub fn reconcile_followers_against(&self, leader: std::sync::Weak<dyn LeaderLineage>) -> bool {
-        if self.lineage.set(leader).is_err() {
+        if self.lineage.leader.set(leader).is_err() {
             return false;
         }
         for follower in &self.followers {
@@ -1355,9 +1404,7 @@ impl FollowerDriver {
     /// attached since (#641). It must end before it writes a record or a
     /// mark, so the next session opens fenced.
     fn session_predates_lineage(&self, fence: SessionFence) -> bool {
-        fence == SessionFence::NotRequired
-            && self.connector.is_some()
-            && self.lineage.get().is_some()
+        fence == SessionFence::NotRequired && self.connector.is_some() && self.lineage.attached()
     }
 
     /// Open the session with the fence a promotion probe sends (#641; see
@@ -1378,25 +1425,17 @@ impl FollowerDriver {
         if self.connector.is_none() {
             return Ok((SessionFence::NotRequired, None));
         }
-        let Some(cell) = self.lineage.get() else {
+        let Some(cell) = self.lineage.leader.get() else {
             return Ok((SessionFence::NotRequired, None));
         };
         // The leader is gone: this replica set is being torn down.
         let Some(leader) = cell.upgrade() else {
             return Err(SessionOutcome::Disconnected);
         };
-        // Off the runtime: the broker reads its lease view under the lock
-        // its produce path holds through an fsync, and a stalled disk must
-        // not park a runtime worker.
-        let lineage = match timeout(
-            self.flow.connect_timeout,
-            tokio::task::spawn_blocking(move || leader.leader_lineage()),
-        )
-        .await
-        {
-            Ok(Ok(Some(lineage))) => lineage,
-            // No live grant (yet, or any more): nothing to replicate under.
-            _ => return Err(SessionOutcome::Disconnected),
+        // No live grant (yet, or any more), or no answer in time: nothing to
+        // replicate under. At most one read is in flight for the set.
+        let Some(lineage) = self.lineage.read(leader, self.flow.connect_timeout).await else {
+            return Err(SessionOutcome::Disconnected);
         };
         let request_id = *next_request_id;
         *next_request_id = next_request_id.wrapping_add(1);
@@ -1560,6 +1599,11 @@ impl FollowerDriver {
                     })
                 })
         });
+        // A leader attached while this session was opening unfenced: it ends
+        // before its status read can prune the buffer (#649 review).
+        if self.session_predates_lineage(session_fence) {
+            return SessionOutcome::Disconnected;
+        }
         if let Some(range) = range {
             let request_id = *next_request_id;
             *next_request_id = next_request_id.wrapping_add(1);
@@ -2935,5 +2979,71 @@ mod tests {
             }
             _ => panic!("expected replicate command"),
         }
+    }
+
+    /// #649 review (cubic P2). A blocking lineage read cannot be cancelled.
+    /// Each session used to start its own and abandon it at the deadline, so
+    /// a lease lock stalled behind a slow fsync gathered one blocked thread
+    /// per reconnect. Now the set keeps one read in flight: later sessions
+    /// wait on it instead of starting another, and its answer is used once
+    /// it comes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_lineage_read_is_awaited_again_not_started_again() {
+        struct Stalled {
+            calls: std::sync::atomic::AtomicUsize,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl LeaderLineage for Stalled {
+            fn leader_lineage(&self) -> Option<LeaderLineageSnapshot> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+                Some(LeaderLineageSnapshot {
+                    range: RangeIdentity {
+                        topic: "t".to_owned(),
+                        topic_epoch: 1,
+                        range_id: Uuid::from_u128(1),
+                        range_generation: 0,
+                    },
+                    fencing_epoch: 7,
+                    epoch_starts: Vec::new(),
+                })
+            }
+        }
+        let (release, stalled) = std::sync::mpsc::channel();
+        let leader = Arc::new(Stalled {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            release: std::sync::Mutex::new(stalled),
+        });
+        let source = LineageSource::default();
+        for attempt in 0..3 {
+            let read = source
+                .read(
+                    Arc::clone(&leader) as Arc<dyn LeaderLineage>,
+                    Duration::from_millis(30),
+                )
+                .await;
+            assert!(
+                read.is_none(),
+                "attempt {attempt} got an answer from a stalled read"
+            );
+        }
+        assert_eq!(
+            leader.calls.load(Ordering::SeqCst),
+            1,
+            "each timed-out session started its own blocking read"
+        );
+        release.send(()).unwrap();
+        let read = source
+            .read(
+                Arc::clone(&leader) as Arc<dyn LeaderLineage>,
+                Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(read.map(|lineage| lineage.fencing_epoch), Some(7));
+        assert_eq!(leader.calls.load(Ordering::SeqCst), 1);
     }
 }

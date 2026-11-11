@@ -1892,12 +1892,19 @@ impl ReplicaSet for InProcessReplicaSet {
 /// Where a fencing caller's log ends, when its history says so: the start of
 /// its entry for `fencing_epoch`, the adoption it records at its own tail
 /// before it fences anyone (#611). `None` when the history carries no such
-/// entry. Canonicalized, so an idle adoption at the same offset collapses
-/// into it.
+/// entry.
+///
+/// Found wherever it sits, not only in last place (#649 review): a leader's
+/// session fence (#641) reads its epoch before its history, so an epoch it
+/// adopted in between can follow the entry. Read from the raw vector, not
+/// the canonical one, which would fold the entry into a newer epoch adopted
+/// idle at the same offset. An epoch starts once on any one replica, so
+/// there is at most one such entry.
 fn caller_tail(caller: &[crate::fencing_epochs::EpochStart], fencing_epoch: u64) -> Option<u64> {
-    crate::fencing_epochs::canonicalize_lineage(caller)
-        .last()
-        .filter(|entry| entry.epoch == fencing_epoch)
+    caller
+        .iter()
+        .rev()
+        .find(|entry| entry.epoch == fencing_epoch)
         .map(|entry| entry.start_offset)
 }
 

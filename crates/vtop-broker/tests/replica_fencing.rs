@@ -1646,3 +1646,47 @@ fn the_first_hwm_arms_the_floor_and_later_frames_wait_for_the_barrier() {
         "quiesce persists the quiet tail the last commit barrier could not see"
     );
 }
+
+/// #649 review (cubic P1). A leader's session fence (#641) reads its epoch
+/// first and its history second, so the history can already carry an epoch
+/// newer than the one fenced at, adopted between the two reads. Below the
+/// mark, the kept stretch starts at the caller's own entry for the fence
+/// epoch. That entry was looked for only in last place, so a newer entry
+/// after it hid it, nothing was kept, and the replica went on reporting and
+/// serving its record at 10, which the caller never had.
+///
+/// Invariant: the caller's entry for the fence epoch is found wherever it
+/// sits, and the record past it is kept in dispute exactly as without the
+/// newer entry.
+#[test]
+fn a_dispute_below_the_mark_finds_the_callers_tail_behind_a_newer_epoch() {
+    let h = caught_up_under_its_own_epoch(9);
+    h.meta.set(NEWEST_EPOCH);
+    let fenced = h
+        .node
+        .fence(
+            NEWER_EPOCH,
+            &[
+                EpochStart {
+                    epoch: OLD_EPOCH,
+                    start_offset: 0,
+                },
+                EpochStart {
+                    epoch: NEWER_EPOCH,
+                    start_offset: 10,
+                },
+                EpochStart {
+                    epoch: NEWEST_EPOCH,
+                    start_offset: 11,
+                },
+            ],
+        )
+        .expect("fenced");
+    assert_eq!((fenced.truncated_records, fenced.next_offset), (0, 11));
+    assert_eq!(
+        h.node.replication_status(),
+        (10, 10),
+        "the caller's tail at 10 was lost behind its epoch-21 entry, and the record at 10 \
+         it never had was not kept in dispute"
+    );
+}

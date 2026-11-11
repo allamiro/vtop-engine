@@ -428,6 +428,9 @@ struct Cluster {
 struct Session {
     leader: usize,
     epoch: u64,
+    /// The leader's process: a restarted leader's connections are gone too
+    /// (#649 review).
+    leader_process: Arc<InProcessFollower>,
     follower: Arc<InProcessFollower>,
 }
 
@@ -694,23 +697,34 @@ impl Cluster {
 
     /// The sessions L held with R and C at epoch 18 before the sweep began.
     fn open_setup_sessions(&mut self) {
+        let Some(leader_process) = self.up(L) else {
+            return;
+        };
         for follower in [R, C] {
             self.sessions[follower] = self.up(follower).map(|replica| Session {
                 leader: L,
                 epoch: OLD_EPOCH,
+                leader_process: Arc::clone(&leader_process),
                 follower: replica,
             });
         }
     }
 
-    /// Whether `leader` holds a live session with `follower` at `epoch`.
+    /// Whether `leader` holds a live session with `follower` at `epoch`: the
+    /// same leader process and the same follower process that opened it.
+    /// Either one restarting drops its connections, so the next send opens
+    /// a new, fenced session.
     fn has_session(&self, leader: usize, epoch: u64, follower: usize) -> bool {
-        let Some(replica) = self.nodes[follower].replica.as_ref() else {
+        let (Some(replica), Some(leader_process)) = (
+            self.nodes[follower].replica.as_ref(),
+            self.nodes[leader].replica.as_ref(),
+        ) else {
             return false;
         };
         self.sessions[follower].as_ref().is_some_and(|session| {
             session.leader == leader
                 && session.epoch == epoch
+                && Arc::ptr_eq(&session.leader_process, leader_process)
                 && Arc::ptr_eq(&session.follower, replica)
         })
     }
@@ -754,10 +768,11 @@ impl Cluster {
             }
         };
         self.after_step(follower);
-        if opened && self.still_the_same(follower, &replica) {
+        if opened && self.still_the_same(follower, &replica) && self.still_the_same(leader, &own) {
             self.sessions[follower] = Some(Session {
                 leader,
                 epoch,
+                leader_process: own,
                 follower: replica,
             });
             return true;

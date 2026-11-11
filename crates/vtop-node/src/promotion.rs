@@ -68,14 +68,17 @@
 //! epoch, some never acknowledged, at offsets the new leader had since
 //! written. Its reconnect status counted them, the new leader's mark put them
 //! under the committed boundary, and its appends there were acked as
-//! duplicates over different bytes (#261). Now every leader-to-follower
-//! session opens with the same fence the probe sends, at the leader's epoch
-//! and with its history (`NetworkedReplicaSet::reconcile_followers_against`),
-//! before the status read and before any record or mark. The returning
-//! replica keeps the suffix in dispute exactly as an outvoted voter does
-//! (#611) and discards it on the leader's first append or mark over it. A
-//! fenced voter that restarted before that is fenced again by its next
-//! session. Plaintext planes skip the session fence; they do not fail over.
+//! duplicates over different bytes (#261). Now, once a leader is attached to
+//! its replica set (`NetworkedReplicaSet::reconcile_followers_against`),
+//! every session it opens with a follower starts with the same fence the
+//! probe sends, at the leader's epoch and with its history, before the
+//! status read and before any record or mark. A session opened before the
+//! attachment is dropped before it carries a record or a mark. The fence
+//! truncates a suffix the leader provably supersedes; one it cannot yet
+//! prove is kept in dispute exactly as an outvoted voter keeps it (#611) and
+//! discarded on the leader's first append or mark over it. A fenced voter
+//! that restarted before that is fenced again by its next session.
+//! Plaintext planes skip the session fence; they do not fail over.
 //!
 //! **Closed, from Raft §5.4.2 (#240):** a new leader must not commit entries
 //! from a previous term by counting replicas. The boundary this module

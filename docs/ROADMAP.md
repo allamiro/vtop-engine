@@ -236,15 +236,20 @@ reopen quietly.
   instead of acking a record it does not hold (#261) or exposing the kept
   records as committed. That memory does not survive a restart, which leaves
   it in the same position as a replica that was absent from the fence.
-  Neither is left unreconciled any more (#641): every leader-to-follower
-  session opens with the probe's own fence frame, at the leader's epoch and
-  with its history, before the status read and before any record or mark. A
-  deposed leader that missed the election, or a voter that restarted, keeps
-  its old-epoch suffix in dispute there and discards it on the leader's
-  first append or mark over it, then catches up. It no longer reports that
-  suffix as held, takes it under the new mark, or acks the leader's records
-  over it. Plaintext planes skip the session fence, since they refuse fences
-  and do not fail over.
+  Neither is left unreconciled any more (#641): once a leader is attached to
+  its replica set, every session it opens with a follower starts with the
+  probe's own fence frame, at the leader's epoch and with its history,
+  before the status read and before any record or mark. A session opened
+  before the attachment is dropped before it carries a record or a mark.
+  The fence reconciles a deposed leader that missed the election, or a
+  voter that restarted, exactly as it reconciles a voter: histories that
+  agree, or that cannot be compared, leave the log as it is; a suffix the
+  leader provably supersedes is truncated at once; and a suffix it cannot
+  yet prove superseded is kept in dispute and discarded on the leader's
+  first append or mark over it. Either way the replica then catches up, and
+  no longer reports a disputed suffix as held, takes it under the new mark,
+  or acks the leader's records over it. Plaintext planes skip the session
+  fence, since they refuse fences and do not fail over.
   **The protection is the fenced replica's, so it holds only on upgraded
   replicas.** There is no wire or feature-level change and the fence frames
   are identical, so nothing tells a candidate which replicas run this
