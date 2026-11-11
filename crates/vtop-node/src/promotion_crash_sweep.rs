@@ -86,19 +86,19 @@
 //! And liveness: some candidate is established, and every node catches up,
 //! within a bounded number of elections once faults stop.
 //!
-//! # Known gaps: #635, #640, #641
+//! # Known gaps: #640, #641
 //!
 //! Each failing run is matched against these by signature
 //! (`Outcome::known_issues`) and printed with its issue number. A failure
 //! that matches none of them fails the test, so the sweep stays a guard.
 //!
-//! * #635. A kept dispute is held in memory. A replica restarted between
-//!   its fence and the settlement forgets it, and the established leader's
-//!   first append over the suffix is acked as a duplicate of a record the
-//!   replica does not hold (#261). Signature: the violation is on a node
-//!   restarted while it held a kept dispute that its fence reply had
-//!   announced, at or above the dispute's start. A fence that died before
-//!   replying leaves the replica absent from the election, which is #641.
+//! * #635, fixed by #643 and no longer expected. A kept dispute was held in
+//!   memory only, so a replica restarted between its fence and the
+//!   settlement forgot it, and the established leader's first append over
+//!   the suffix was acked as a duplicate of a record the replica did not
+//!   hold (#261). The dispute now survives a restart. A violation on a node
+//!   restarted while it held one is a new failure again; the report still
+//!   names such restarts.
 //! * #640. A follower's fencing-epoch journal records an adopted epoch at its
 //!   own tail, so records a new leader later catches it up on are filed
 //!   under that epoch rather than the one that wrote them. After a second
@@ -291,10 +291,7 @@ impl Outcome {
     /// `None` when any violation matches none of them: a new failure, which
     /// fails the sweep.
     ///
-    /// * #635: an ack or disagreement on a node that was restarted while it
-    ///   held a kept dispute its fence reply had announced, at or above the
-    ///   dispute's start. A lost acknowledged record counts only inside the
-    ///   range of such a dispute, on a node that acked falsely there.
+    /// * #635 is fixed (#643) and matched no longer.
     /// * #640: no leader finished, and the last election failed for want of
     ///   a provable quorum: answers came back but were judged Unknown. Every
     ///   acknowledged record must still be durable on a majority, or the run
@@ -302,11 +299,6 @@ impl Outcome {
     /// * #641: an ack or disagreement on a node that was never fenced at the
     ///   final leader's epoch, where it holds a record nobody acknowledged.
     fn known_issues(&self) -> Option<BTreeSet<u32>> {
-        let after_a_forgotten_dispute = |node: usize, offset: u64| {
-            self.forgotten_disputes
-                .iter()
-                .any(|(forgot, from)| *forgot == node && offset >= *from)
-        };
         let unfenced_holding_an_unacknowledged_record = |node: usize, holds: &Option<String>| {
             self.final_epoch
                 .is_some_and(|epoch| !self.fenced_at[node].contains(&epoch))
@@ -314,57 +306,16 @@ impl Outcome {
                     .as_ref()
                     .is_some_and(|value| !self.acknowledged.values().any(|acked| acked == value))
         };
-        // A lost record is #635's only inside the range a forgotten dispute
-        // covered, on a node that then acked a record it did not hold there
-        // (#646 review): the false ack is how #635 loses a record. A loss
-        // anywhere else is independent of it and stays a new failure.
-        let disputes_that_acked_falsely: Vec<(usize, u64)> = self
-            .forgotten_disputes
-            .iter()
-            .copied()
-            .filter(|(node, from)| {
-                self.violations.iter().any(|violation| {
-                    matches!(
-                        violation,
-                        Violation::AckWithoutTheRecord { node: acked, offset, .. }
-                            if acked == node && offset >= from
-                    )
-                })
-            })
-            .collect();
-        let lost_to_635 = |offset: u64| {
-            disputes_that_acked_falsely
-                .iter()
-                .any(|(_, from)| offset >= *from)
-        };
         let mut issues = BTreeSet::new();
         for violation in &self.violations {
             let issue = match violation {
-                Violation::AckWithoutTheRecord {
-                    node,
-                    offset,
-                    holds,
-                    ..
-                }
-                | Violation::DivergedBelowMark {
-                    node,
-                    offset,
-                    holds,
-                    ..
-                } => {
-                    if after_a_forgotten_dispute(*node, *offset) {
-                        635
-                    } else if unfenced_holding_an_unacknowledged_record(*node, holds) {
+                Violation::AckWithoutTheRecord { node, holds, .. }
+                | Violation::DivergedBelowMark { node, holds, .. } => {
+                    if unfenced_holding_an_unacknowledged_record(*node, holds) {
                         641
                     } else {
                         return None;
                     }
-                }
-                Violation::AckedRecordLost { offset, .. }
-                | Violation::AcknowledgedRecordReplaced { offset, .. }
-                    if lost_to_635(*offset) =>
-                {
-                    635
                 }
                 Violation::AckedRecordLost { .. }
                 | Violation::AcknowledgedRecordReplaced { .. } => return None,
@@ -1436,7 +1387,6 @@ struct Sweep {
 
 fn issue_title(issue: u32) -> &'static str {
     match issue {
-        635 => "a kept dispute is forgotten on restart",
         640 => "no provable quorum after a catch-up",
         641 => "a deposed leader keeps its suffix under the mark",
         _ => "unknown",
@@ -1562,11 +1512,10 @@ fn assert_sweep(shape: Shape) {
     };
     eprintln!(
         "{shape:?}: {} runs, {} passed ({} of them with a node whose open refused after the \
-         crash), expected failures: {} #635, {} #640, {} #641; {} new failures",
+         crash), expected failures: {} #640, {} #641; {} new failures",
         result.runs,
         result.passed,
         result.passed_with_a_node_refusing_to_open.len(),
-        count(635),
         count(640),
         count(641),
         result.new_failures.len()
@@ -1583,7 +1532,7 @@ fn assert_sweep(shape: Shape) {
     assert!(
         result.new_failures.is_empty(),
         "{} of {} crash points lost an acknowledged record, acked a record a replica \
-         does not hold, or never finished, for a reason #635, #640 and #641 do not \
+         does not hold, or never finished, for a reason #640 and #641 do not \
          explain. First:\n{}",
         result.new_failures.len(),
         result.runs,
