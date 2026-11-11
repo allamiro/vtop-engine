@@ -1176,6 +1176,7 @@ async fn a_partition_started_at_the_end_of_the_log_recovers_without_skipping() {
     let started = std::time::Instant::now();
     let deadline = started + std::time::Duration::from_secs(50);
     let mut victim_read = 0;
+    let mut busy_during = 0;
     let mut produced_late = false;
     while victim_read < 15 && std::time::Instant::now() < deadline {
         // Five more after the first stall check could have run.
@@ -1184,13 +1185,59 @@ async fn a_partition_started_at_the_end_of_the_log_recovers_without_skipping() {
             produced_late = true;
         }
         produce(&busy, 2);
-        victim_read += read_pass(&mut adapter, &sources).await[1];
+        let pass = read_pass(&mut adapter, &sources).await;
+        busy_during += pass[0];
+        victim_read += pass[1];
     }
+    // Only the victim stalled: a regression that stopped both partitions
+    // must not pass as a recovery (review of #644).
+    assert!(
+        busy_during > 0,
+        "the busy topic stopped delivering after the victim was paused"
+    );
     assert_eq!(
         victim_read,
         15,
         "records produced while the partition was stalled were skipped or never read \
          (within {:?})",
         started.elapsed()
+    );
+}
+
+/// Review of #644: a HEALTHY partition that started at the end of the log
+/// (`latest`, nothing committed) and has had nothing new since is idle, not
+/// stalled - even when records were written shortly before the assign. The
+/// stall check must not mistake those for records the fetcher failed to
+/// deliver and rewind onto them: `latest` skips them on purpose.
+///
+/// Before the fix the start was looked up from 60s before the assign, found
+/// the seeded record, and the partition was rewound and read it.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn an_idle_partition_started_at_the_end_is_not_rewound_onto_older_records() {
+    let (busy, _busy_cleanup) = fresh_topic("stall_latest_idle_busy", 0).await;
+    // Written moments before the assign; latest must skip it.
+    let (idle, _idle_cleanup) = fresh_topic("stall_latest_idle", 1).await;
+    let group = unique_group("stall-latest-idle");
+    let mut cfg = kafka_cfg(&bootstrap(), &group);
+    cfg.auto_offset_reset = "latest".into();
+    let mut adapter = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
+    let sources = vec![kafka_source(&busy), kafka_source(&idle)];
+
+    // Long enough for the idle partition to become due and be checked
+    // (STALL_AFTER plus a check interval), with the busy topic delivering.
+    let started = std::time::Instant::now();
+    let mut busy_read = 0;
+    let mut idle_read = 0;
+    while started.elapsed() < std::time::Duration::from_secs(25) {
+        produce(&busy, 2);
+        let pass = read_pass(&mut adapter, &sources).await;
+        busy_read += pass[0];
+        idle_read += pass[1];
+    }
+    assert!(busy_read > 0, "precondition: the busy topic is read");
+    assert_eq!(
+        idle_read, 0,
+        "a healthy idle partition was rewound onto a record from before its assign"
     );
 }

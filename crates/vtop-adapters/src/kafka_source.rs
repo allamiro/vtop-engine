@@ -418,27 +418,20 @@ struct PartitionLiveness {
     /// again would only restart every fetcher once per interval for nothing.
     reassigned_at_high: HashMap<(String, i32), i64>,
     /// For a partition that has not delivered since an assign at
-    /// `Offset::Stored` and whose start is otherwise unknown (no committed
-    /// offset, `auto.offset.reset=latest`): where the fetcher would have
+    /// `Offset::Stored`, where the group answered that nothing is committed
+    /// and `auto.offset.reset` is `latest`: where the fetcher would have
     /// started, which is the end of the log as it was at the assign (review of
-    /// #644). The stall check finds it from record timestamps (see
-    /// `STORED_END_SKEW`); when the broker cannot say, the high watermark of
-    /// the first check stands in, which is at or above the true start. A stall
-    /// re-assigns such a partition at this offset, never at `Offset::Stored`,
-    /// which would resolve to the NEW end and skip what piled up.
+    /// #644). The stall check finds it from record timestamps, from the
+    /// assign's own time (`end_start_lookup_time`); when the broker cannot
+    /// say, the high watermark of the first check stands in, which is at or
+    /// above the true start. A stall re-assigns such a partition at this
+    /// offset, never at `Offset::Stored`, which would resolve to the NEW end
+    /// and skip what piled up.
     end_baseline: HashMap<(String, i32), i64>,
     /// Wall-clock time (ms since the epoch) of the last assign(), for finding
     /// where a partition assigned at the end of the log started.
     assigned_at_ms: i64,
 }
-
-/// How far before an assign() the stall check looks, by record timestamp, for
-/// where a partition assigned at the end of the log started (review of #644).
-/// Record timestamps come from producers' clocks: the margin keeps a producer
-/// clock that runs behind from hiding records written after the assign. Its
-/// cost is reading up to this much from before the assign once, on recovery
-/// from a stall: never-committed records, so at worst read early, never lost.
-const STORED_END_SKEW: Duration = Duration::from_secs(60);
 
 impl PartitionLiveness {
     /// A fresh assign() restarts every fetcher, so every idle run starts over,
@@ -584,6 +577,37 @@ fn next_read_offset(
     delivered
         .or(group_committed)
         .or(low_watermark.filter(|_| reset_to_earliest))
+}
+
+/// Whether the stall check may measure an unresolved partition from an
+/// end-of-log baseline, and pin its recovery there (review of #644): only
+/// when the group was asked and answered that nothing is committed, and the
+/// policy starts at the end. A failed lookup is "don't know": a pin past a
+/// commit the broker could not report would skip the records between them.
+/// `error` keeps librdkafka's own behaviour; no start is invented for it.
+fn may_measure_from_end(group_answered: bool, has_commit: bool, auto_offset_reset: &str) -> bool {
+    group_answered && !has_commit && resets_to_latest(auto_offset_reset)
+}
+
+/// The record time from which the stall check looks for where a partition
+/// assigned at the end of the log started: the assign itself, with no margin
+/// before it (review of #644). A margin finds records written shortly
+/// before the assign, which `latest` skips on purpose, and makes a healthy
+/// idle partition look stalled and get rewound onto them. The cost is the
+/// other direction of clock skew: a record written after the assign by a
+/// producer whose clock runs behind this host's carries an earlier time and
+/// is not found, so a stall recovery can start past it.
+fn end_start_lookup_time(assigned_at_ms: i64) -> i64 {
+    assigned_at_ms
+}
+
+/// Whether `auto.offset.reset` starts a partition with nothing committed at
+/// the end of the log (librdkafka's spellings).
+fn resets_to_latest(auto_offset_reset: &str) -> bool {
+    matches!(
+        auto_offset_reset.to_ascii_lowercase().as_str(),
+        "latest" | "largest" | "end"
+    )
 }
 
 /// Whether `auto.offset.reset` starts a partition with nothing committed at
@@ -1072,11 +1096,20 @@ impl KafkaSource {
             .filter(|key| highs.contains_key(*key) && !self.delivered.contains_key(*key))
             .cloned()
             .collect();
-        let committed = self.group_committed_offsets(&unresolved);
+        // A partition whose group answer is unknown (the lookup failed, or
+        // its answer carried an error) is skipped until the next check: "no
+        // answer" is not "nothing committed" (review of #644).
+        let answers = self
+            .group_committed_answers(&unresolved)
+            .unwrap_or_default();
+        let committed: HashMap<(String, i32), i64> = answers
+            .iter()
+            .filter_map(|(key, at)| at.map(|at| (key.clone(), at)))
+            .collect();
         let need_low: Vec<(String, i32)> = if reset_to_earliest {
             unresolved
                 .iter()
-                .filter(|key| !committed.contains_key(*key))
+                .filter(|key| matches!(answers.get(*key), Some(None)))
                 .cloned()
                 .collect()
         } else {
@@ -1086,24 +1119,29 @@ impl KafkaSource {
             Some(consumer) => list_offsets(consumer, &need_low, Offset::Beginning),
             None => HashMap::new(),
         };
-        // A partition that started at the END of the log (latest, nothing
-        // committed): find where, from record timestamps, once per assign
-        // (review of #644). No record since then means the start is the
-        // current end, exactly.
-        let need_start: Vec<(String, i32)> = if reset_to_earliest {
-            Vec::new()
-        } else {
-            unresolved
-                .iter()
-                .filter(|key| !committed.contains_key(*key) && !self.liveness.has_baseline(key))
-                .cloned()
-                .collect()
+        // A partition that started at the END of the log (latest, the group
+        // answered that nothing is committed): find where, from record
+        // timestamps, once per assign (review of #644). No record since then
+        // means the start is the current end, exactly.
+        let may_use_end = |key: &(String, i32)| {
+            may_measure_from_end(
+                answers.contains_key(key),
+                committed.contains_key(key),
+                &self.cfg.auto_offset_reset,
+            )
         };
+        let need_start: Vec<(String, i32)> = unresolved
+            .iter()
+            .filter(|key| may_use_end(key) && !self.liveness.has_baseline(key))
+            .cloned()
+            .collect();
+        let end_measured: std::collections::HashSet<(String, i32)> = unresolved
+            .iter()
+            .filter(|key| may_use_end(key))
+            .cloned()
+            .collect();
         if !need_start.is_empty() {
-            let since = self
-                .liveness
-                .assigned_at_ms
-                .saturating_sub(STORED_END_SKEW.as_millis() as i64);
+            let since = end_start_lookup_time(self.liveness.assigned_at_ms);
             let starts = self
                 .consumer
                 .as_ref()
@@ -1121,13 +1159,23 @@ impl KafkaSource {
             let Some(&high) = highs.get(key) else {
                 continue;
             };
+            let delivered = self.delivered.get(key).copied();
+            if delivered.is_none() && !answers.contains_key(key) {
+                // Where Stored resolved is unknown this time: no measure, no
+                // baseline, no pin. Asked again at the next check.
+                continue;
+            }
             let resolved = next_read_offset(
-                self.delivered.get(key).copied(),
+                delivered,
                 committed.get(key).copied(),
                 lows.get(key).copied(),
                 reset_to_earliest,
             );
-            let next = self.liveness.next_or_baseline(key, resolved, high);
+            let next = if resolved.is_none() && end_measured.contains(key) {
+                self.liveness.next_or_baseline(key, resolved, high)
+            } else {
+                resolved
+            };
             let Some(lag) = self.liveness.stalled_lag(key, next, high) else {
                 continue;
             };
@@ -1136,7 +1184,8 @@ impl KafkaSource {
             // every record that piled up during the stall (review of #644).
             // Pinned like a rewind's landing; never over a position this
             // process already holds, and never from the broker's group offset
-            // (#614: the clamp must not come from the broker).
+            // (#614: the clamp must not come from the broker). Only reached
+            // when the group answered that nothing is committed.
             if resolved.is_none() {
                 if let Some(start) = next {
                     let cur = self.cursors.entry(key.clone()).or_default();
@@ -1241,6 +1290,43 @@ impl KafkaSource {
             }
         }
         answers
+    }
+
+    /// The group's committed offsets for the stall check, telling "nothing
+    /// committed" apart from "could not ask" (review of #644): `None` when
+    /// the lookup failed, else per partition `Some(offset)`, or `None` for an
+    /// answer of nothing committed. A partition whose answer carries an error
+    /// is left out: it is unknown, like a failed lookup.
+    fn group_committed_answers(
+        &mut self,
+        partitions: &[(String, i32)],
+    ) -> Option<HashMap<(String, i32), Option<i64>>> {
+        if partitions.is_empty() {
+            return Some(HashMap::new());
+        }
+        let consumer = self.consumer().ok()?;
+        let mut wanted = TopicPartitionList::new();
+        for (topic, partition) in partitions {
+            wanted.add_partition(topic, *partition);
+        }
+        let committed = consumer
+            .committed_offsets(wanted, Duration::from_secs(WATERMARK_TIMEOUT_SECONDS))
+            .ok()?;
+        let mut answers = HashMap::new();
+        for (topic, partition) in partitions {
+            let Some(element) = committed.find_partition(topic, *partition) else {
+                continue;
+            };
+            if element.error().is_err() {
+                continue;
+            }
+            let at = match element.offset() {
+                Offset::Offset(at) => Some(at),
+                _ => None,
+            };
+            answers.insert((topic.clone(), *partition), at);
+        }
+        Some(answers)
     }
 
     fn consumer(&mut self) -> Result<&BaseConsumer, VtopError> {
@@ -2144,6 +2230,36 @@ mod tests {
         live.on_assign(&assigned);
         assert_eq!(live.next_or_baseline(&key, None, 70), None);
         assert_eq!(live.next_or_baseline(&key, None, 70), Some(70));
+    }
+
+    /// Review of #644: an end-of-log baseline (and the recovery pin it leads
+    /// to) is allowed only when the group was ASKED and has no committed
+    /// offset, and the policy really starts at the end. A failed lookup is
+    /// "don't know", not "nothing committed": a pin past an existing commit
+    /// would skip the records between them. `error` (or anything that is not
+    /// a `latest` spelling) must keep librdkafka's own behaviour.
+    #[test]
+    fn an_end_of_log_baseline_needs_an_answer_from_the_group_and_latest() {
+        assert!(may_measure_from_end(true, false, "latest"));
+        assert!(may_measure_from_end(true, false, "Largest"));
+        assert!(may_measure_from_end(true, false, "end"));
+        assert!(
+            !may_measure_from_end(false, false, "latest"),
+            "a failed group lookup is not 'nothing committed'"
+        );
+        assert!(!may_measure_from_end(true, true, "latest"));
+        assert!(!may_measure_from_end(true, false, "error"));
+        assert!(!may_measure_from_end(true, false, "earliest"));
+    }
+
+    /// Review of #644: where a partition assigned at the end of the log
+    /// started is looked up from the assign's own time, with no margin
+    /// before it. A margin found records written shortly BEFORE the assign,
+    /// which `latest` skips on purpose, and made a healthy idle partition
+    /// look stalled and get rewound onto them.
+    #[test]
+    fn the_end_of_log_start_is_looked_up_from_the_assign_not_before_it() {
+        assert_eq!(end_start_lookup_time(1_000_000), 1_000_000);
     }
 
     #[test]
