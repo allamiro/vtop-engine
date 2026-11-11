@@ -442,7 +442,17 @@ class CompetitorSample:
 
     `seconds` is what the report says it measured, not what the spec asked for:
     the two differ when a flow is cut short, and only the first is a fact about
-    this run.
+    this run. It is the RECEIVER's (`end.sum_received.seconds`), and it is what
+    the goodput is a rate over.
+
+    `sender_seconds` is the SENDER's measured window (`end.sum_sent.seconds`),
+    and it is the window the interval stream covers and is laid out on (#610).
+    The two are not the same length: the receiver's clock runs on until the
+    flow's tail has drained the bottleneck's queue and crossed the one-way delay
+    (0.14-0.19 s longer on the lab's 10 Mbit/s, 100 ms, one-BDP link, measured).
+    The competitor sends nothing during that drain, so it is not contended time,
+    and laying the sender's stream out on the receiver's longer window left its
+    opening uncovered.
 
     `intervals` is the same window cut into seconds. It is carried rather than
     discarded because the flow's average over the whole window is NOT the
@@ -453,6 +463,7 @@ class CompetitorSample:
 
     mbps: float
     seconds: float
+    sender_seconds: float
     bytes: int
     retransmits: int | None
     congestion: str
@@ -472,6 +483,10 @@ class CompetitorSample:
 
     def describe(self) -> dict[str, Any]:
         return {"goodput_mbps": self.mbps, "measured_seconds": self.seconds,
+                # The window the interval stream covers and the contended window
+                # is placed by (#610): the sender's, shorter than the receiver's
+                # by the queue's drain.
+                "sender_seconds": self.sender_seconds,
                 "bytes": self.bytes, "retransmits": self.retransmits,
                 "congestion_control": self.congestion,
                 # How finely the window can be cut. A reader comparing the
@@ -653,7 +668,7 @@ def _require_the_engine_outlasts_the_window(spec: CompetitorSpec, scenario) -> N
 
 
 def _measured_intervals(report: Any, out: str, spec: CompetitorSpec, phase: str,
-                        measured_seconds: float,
+                        sender_seconds: float,
                         arrivals: list[float | None] | None = None,
                         ) -> tuple[CompetitorInterval, ...]:
     """The report's per-second stream, ramp excluded, on the window's own clock.
@@ -677,7 +692,11 @@ def _measured_intervals(report: Any, out: str, spec: CompetitorSpec, phase: str,
         entries begin at zero again. Trusting `start` would therefore be off by
         the whole ramp against an iperf3 that did NOT restart it, so the origin
         is DERIVED: the last measured entry ends where the window ends, and the
-        receiver's summary says how long the window was.
+        SENDER's summary says how long the window was. Not the receiver's
+        (#610): the stream is the sender's, and the receiver's clock runs past
+        it by the queue's drain, so a stream laid out on the receiver's window
+        leaves the window's opening uncovered. On iperf 3.21 the last measured
+        entry ends exactly at `sum_sent.seconds`, so the origin is zero.
       * the first measured entry straddles that restart. Its `seconds` reaches
         back across the ramp while its `bytes` are the post-restart ones only,
         so iperf3's own `bits_per_second` for it reads at half the flow's actual
@@ -694,7 +713,7 @@ def _measured_intervals(report: Any, out: str, spec: CompetitorSpec, phase: str,
         raise ShapingError(
             f"the {phase} competitor's iperf3 report carries no interval stream "
             f"(`intervals`): {out[:400]}. Without it the competing flow has only a "
-            f"whole-window average over {measured_seconds}s, and VTOP's share is a rate "
+            f"whole-window average over {sender_seconds}s, and VTOP's share is a rate "
             "over the engine cycles inside that window — a fairness index assembled from "
             "the two would be comparing rates over two different spans. Run the lab's own "
             "iperf3 (the netshoot middlebox), not a build or a wrapper that strips the "
@@ -736,10 +755,11 @@ def _measured_intervals(report: Any, out: str, spec: CompetitorSpec, phase: str,
             "share of the window cannot be compared against a flow the report will not "
             "resolve past its own ramp")
     # The origin the whole mapping hangs on. The stream's last measured entry
-    # ends where the window ends, and the receiver's summary gives the window's
-    # length, so the difference is where the stream's clock puts the window's
-    # start — zero on an iperf3 that restarts it, the ramp on one that does not.
-    origin = max(entry[0] for entry in reported) - measured_seconds
+    # ends where the window ends, and the SENDER's summary gives the window's
+    # length (#610), so the difference is where the stream's clock puts the
+    # window's start — zero on an iperf3 that restarts it, the ramp on one that
+    # does not.
+    origin = max(entry[0] for entry in reported) - sender_seconds
     stream = []
     for end, seconds, count, arrived, live in reported:
         finish = end - origin
@@ -844,13 +864,15 @@ def competitor_bytes_over(sample: CompetitorSample, opened_at: float,
             "while it was reporting; this is a report with a hole in it, not a scenario knob")
     # THE DENOMINATOR NEEDS THE WHOLE WINDOW TOO (review). The receiver's total
     # is spread in proportion to the stream's bytes, so `total` must be the
-    # stream's bytes over the SAME window the receiver's total covers. A hole
+    # stream's bytes over the SAME window the receiver's total covers. That is
+    # the sender's window (#610): the receiver's total is the bytes the sender
+    # put on the link during it, arriving up to one queue's drain later. A hole
     # anywhere — even one wholly outside the span above, which the coverage check
     # there cannot see — drops that second's bytes from `total` and scales the
     # span's share of the receiver's total UP by exactly that much: the competing
     # flow recorded as having received more during VTOP's span than it did, and
     # the index skewed by a second nobody measured. Checked across the whole
-    # measured window, 0 to the report's own `seconds`.
+    # measured window, 0 to the sender's own `sender_seconds`.
     reached = 0.0
     window_hole: tuple[float, float] | None = None
     for slot in sorted(sample.intervals, key=lambda entry: entry.start):
@@ -858,12 +880,12 @@ def competitor_bytes_over(sample: CompetitorSample, opened_at: float,
             window_hole = (reached, slot.start)
             break
         reached = max(reached, slot.end)
-    if window_hole is None and reached < sample.seconds - STREAM_JOIN_TOLERANCE_SECONDS:
-        window_hole = (reached, sample.seconds)
+    if window_hole is None and reached < sample.sender_seconds - STREAM_JOIN_TOLERANCE_SECONDS:
+        window_hole = (reached, sample.sender_seconds)
     if window_hole is not None:
         raise ShapingError(
             f"the competing flow's stream says nothing about {window_hole[0]:.3f}-"
-            f"{window_hole[1]:.3f}s of its {sample.seconds:g}s measured window. The receiver's "
+            f"{window_hole[1]:.3f}s of its {sample.sender_seconds:g}s measured window. The receiver's "
             "total is spread across the span VTOP was measured over in proportion to the "
             "stream's bytes, so every second of the window has to be in the stream: a missing "
             "one leaves its bytes out of the proportion and hands them to the seconds that "
@@ -984,10 +1006,29 @@ def parse_report(out: str, spec: CompetitorSpec, phase: str,
     # operator after the wrong fault. Read on EVERY phase rather than only the
     # contended one, so an iperf3 whose report this module cannot use is found
     # by the first solo window instead of after three of them have run.
-    intervals = _measured_intervals(report, out, spec, phase, seconds, interval_arrivals)
+    # THE SENDER'S WINDOW, which the stream is laid out on (#610). Only the
+    # sender's summary says how long it was, so a report without one is refused
+    # rather than laid out on the receiver's clock, which is longer by the
+    # queue's drain and leaves the window's opening uncovered.
     sent = end.get("sum_sent") or {}
+    try:
+        sender_seconds = round(float(sent["seconds"]), 3)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ShapingError(
+            f"the {phase} competitor's iperf3 report carries no sender summary "
+            f"(end.sum_sent.seconds): {out[:400]}. The interval stream is the sender's, so "
+            "only the sender's summary says how long the window it describes was; the "
+            "receiver's runs on past it by the bottleneck queue's drain, and laying the "
+            "stream out on that longer window leaves its opening uncovered"
+        ) from exc
+    if sender_seconds <= 0:
+        raise ShapingError(
+            f"the {phase} competitor's iperf3 report says its sender measured "
+            f"{sender_seconds}s, so its interval stream describes no window to lay out")
+    intervals = _measured_intervals(report, out, spec, phase, sender_seconds,
+                                    interval_arrivals)
     return CompetitorSample(
-        mbps=mbps, seconds=seconds, bytes=transferred,
+        mbps=mbps, seconds=seconds, sender_seconds=sender_seconds, bytes=transferred,
         # Linux iperf3 reports the sender's retransmissions; other platforms
         # and other modes do not, and None records "not reported" rather than
         # a zero that reads as "none happened".
@@ -1377,7 +1418,13 @@ class Contention:
                 "charged to a span nobody located. This is a runner bug")
         launched_at = self._launched_at
         collected_at, closing_bytes = self._collected
-        measured = self.contended.seconds
+        # THE CONTENDED WINDOW IS THE SENDER'S (#610). Every line of the stream
+        # is written as one of the SENDER's intervals ends, so the window those
+        # lines place is the sender's, and its length is `sender_seconds`. The
+        # receiver's `seconds` runs on past it by the queue's drain, during
+        # which the competitor sends nothing: not contended time, and not part
+        # of the window VTOP has to outlast. It stays the goodput's denominator.
+        measured = self.contended.sender_seconds
 
         # WHERE THE MEASURED WINDOW SAT ON THIS RUN'S CLOCK (review, twice).
         #

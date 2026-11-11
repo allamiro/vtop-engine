@@ -148,7 +148,7 @@ def stream_arrivals(text, opened_at, omit, exchange=0.0):
     What a real iperf3 does: the start event as it connects, each interval's
     line as that interval ends, the end event as the window closes. The window
     clock is the one the module derives — the last measured interval ends where
-    the receiver's summary says the window did — so a fixture with a hole or an
+    the sender's summary says the window did — so a fixture with a hole or an
     uneven stream is dated exactly as a live one would be.
 
     EXCEPT THE LAST INTERVAL (#481, measured on iperf 3.21). iperf3 writes that
@@ -161,7 +161,11 @@ def stream_arrivals(text, opened_at, omit, exchange=0.0):
     measured = [event["data"]["sum"] for event in events
                 if event["event"] == "interval" and not event["data"]["sum"].get("omitted")]
     end = next((event["data"] for event in events if event["event"] == "end"), {}) or {}
-    seconds = float((end.get("sum_received") or {}).get("seconds", 0.0))
+    # The SENDER's window (#610): iperf3 writes each interval line when the
+    # sender's interval ends, and the stream covers the sender's window, which
+    # end.sum_sent.seconds measures. The receiver's clock runs on past it by the
+    # queue's drain; a fixture that dated lines by it would stamp them late.
+    seconds = float((end.get("sum_sent") or end.get("sum_received") or {}).get("seconds", 0.0))
     origin = (max(float(entry["end"]) for entry in measured) - seconds) if measured else 0.0
     final = max((index for index, event in enumerate(events) if event["event"] == "interval"),
                 default=None)
@@ -2383,3 +2387,158 @@ def test_a_source_stamp_later_than_its_arrival_is_refused_as_another_kernels_clo
     lines, stamps = comp.split_source_stamps("11.999000 {}", (12.0,), "probe")
     assert (lines, stamps) == ("{}", (11.999,)), (
         "a line written a millisecond before it was read is exactly what a shared clock looks like")
+
+
+# ---------------------------------------- the stream on the sender's clock (#610)
+#
+# Two real contended reports from the hosted-runner diagnostic run
+# (workflow run 42948066440, iperf 3.21 in nicolaka/netshoot:v0.16, kernel
+# 7.0.0-1019-azure), each with the source stamp of every line. Both were refused
+# live: the window was laid out on the receiver's clock (sum_received.seconds),
+# which is longer than the sender's stream by the time the flow's tail took to
+# drain the queue, so the window's opening read as a hole.
+
+REAL_REPORTS = os.path.join(os.path.dirname(__file__), "fixtures", "iperf3_sender_clock")
+REAL_SPEC = CompetitorSpec(mode="bulk", seconds=120, omit=3)
+
+
+def real_report(name):
+    with open(os.path.join(REAL_REPORTS, f"{name}-with-vtop-sender.jsonl")) as f:
+        out = f.read().rstrip("\n")
+    with open(os.path.join(REAL_REPORTS, f"{name}-with-vtop-line-stamps.json")) as f:
+        stamps = tuple(json.load(f)["stamps"])
+    return out, stamps
+
+
+def real_end(out):
+    return next(json.loads(line)["data"] for line in out.splitlines()
+                if json.loads(line)["event"] == "end")
+
+
+def without_interval(out, stamps, measured_index):
+    """The same report with one MEASURED interval line (0-based among the
+    measured ones) and its stamp removed: a real stream with a real hole in it."""
+    lines = out.splitlines()
+    seen = -1
+    for index, line in enumerate(lines):
+        event = json.loads(line)
+        if event["event"] == "interval" and not event["data"]["sum"].get("omitted"):
+            seen += 1
+            if seen == measured_index:
+                return ("\n".join(lines[:index] + lines[index + 1:]),
+                        stamps[:index] + stamps[index + 1:])
+    raise AssertionError(f"no measured interval {measured_index}")
+
+
+@pytest.mark.parametrize("name, receiver_extra", [("z42d9q", 0.143383), ("5cpiq6", 0.149431)])
+def test_a_real_hosted_runner_report_is_laid_out_on_the_senders_own_window(name, receiver_extra):
+    out, stamps = real_report(name)
+    end = real_end(out)
+    # The premise, read from the report rather than assumed: the receiver's
+    # clock outran the sender's by the queue's drain, and the stream ends exactly
+    # where the sender's summary says its window did.
+    assert end["sum_received"]["seconds"] - end["sum_sent"]["seconds"] == pytest.approx(
+        receiver_extra, abs=1e-6)
+
+    sample = parse_report(out, REAL_SPEC, "with VTOP", stamps)
+    # THE REFUSAL, REPRODUCED AND GONE: the window's whole span, which used to
+    # read "the competing flow's stream says nothing about 0.000-0.14Xs".
+    received, touched = competitor.competitor_bytes_over(
+        sample, 1_000.0, 1_000.0 + 10.0, 1_000.0 + 90.0)
+    assert touched >= 80 and 0 < received < sample.bytes
+
+    assert sample.sender_seconds == round(end["sum_sent"]["seconds"], 3), (
+        "the window the stream is laid out on is the sender's own: the stream is the sender's")
+    assert sample.seconds == round(end["sum_received"]["seconds"], 3), (
+        "the goodput's window stays the receiver's")
+    assert sample.mbps == round(end["sum_received"]["bits_per_second"] / 1e6, 3), (
+        "and so does the goodput: received bytes over the receiver's seconds")
+    assert sample.intervals[0].start == pytest.approx(0.0, abs=1e-3), (
+        "the first measured interval begins where the window does; on the receiver's clock "
+        f"it began {receiver_extra:.3f}s in, and that gap was the refusal")
+    assert sample.intervals[-1].end == pytest.approx(sample.sender_seconds, abs=1e-3)
+
+
+def test_a_hole_inside_the_senders_own_window_is_still_refused():
+    # The guarantee the check exists for is unchanged: a missing second inside
+    # the window the stream describes is refused, whether it is under VTOP's
+    # span, beside it, or the window's very first one.
+    out, stamps = real_report("z42d9q")
+    middle = parse_report(*_holed(out, stamps, 60))
+    with pytest.raises(ShapingError, match="says nothing about"):
+        competitor.competitor_bytes_over(middle, 1_000.0, 1_050.0, 1_070.0)
+    with pytest.raises(ShapingError, match="of its 120.001s measured window"):
+        competitor.competitor_bytes_over(middle, 1_000.0, 1_010.0, 1_020.0)
+    first = parse_report(*_holed(out, stamps, 0))
+    with pytest.raises(ShapingError, match="0.000-1.00[0-9]s of its 120.001s measured window"):
+        competitor.competitor_bytes_over(first, 1_000.0, 1_010.0, 1_090.0)
+
+
+def _holed(out, stamps, measured_index):
+    holed, holed_stamps = without_interval(out, stamps, measured_index)
+    return holed, REAL_SPEC, "with VTOP", holed_stamps
+
+
+def test_a_report_without_the_senders_summary_is_refused():
+    # The stream is placed on the sender's window, and only the sender's own
+    # summary says how long that was. A report without one is refused by name
+    # rather than placed on the receiver's clock, which is the mismatch #610
+    # found.
+    no_sender = iperf_stream(iperf_intervals([9.0] * 3), end={
+        "sum_received": {"bits_per_second": 8e6, "seconds": 3.0, "bytes": 3_000_000}})
+    with pytest.raises(ShapingError, match="sum_sent"):
+        parse_report(no_sender, spec(3), "with VTOP")
+
+
+def test_the_contended_window_is_the_senders_and_the_receivers_drain_is_not_contended():
+    # A scripted flow whose receiver's clock runs 0.05 s past the sender's, as a
+    # shaped link's does. Placed on the receiver's clock, the window's opening
+    # was a hole and the run was refused; on the sender's, it is measured, and
+    # the window close() places is the sender's length.
+    steps = int(round(SCRIPTED_WINDOW_SECONDS / SCRIPTED_STEP_SECONDS))
+    drained = SCRIPTED_WINDOW_SECONDS + 0.05
+    report = iperf_stream(
+        iperf_intervals([9.0] * steps, step=SCRIPTED_STEP_SECONDS),
+        end={"sum_sent": {"bits_per_second": 9e6, "seconds": SCRIPTED_WINDOW_SECONDS,
+                          "bytes": int(9e6 * SCRIPTED_WINDOW_SECONDS / 8)},
+             "sum_received": {"bits_per_second": 8e6, "seconds": drained,
+                              "bytes": int(8e6 * drained / 8)},
+             "sender_tcp_congestion": "cubic"})
+    handle = run_with_report(report)
+    assert handle.jain is not None
+    opened, closed = handle._window
+    assert closed - opened == pytest.approx(SCRIPTED_WINDOW_SECONDS, abs=0.01), (
+        "the contended window is the sender's: the competitor sends nothing while its "
+        "tail drains, so the receiver's extra seconds are not contended time")
+    assert handle.contended.seconds == round(drained, 3) and handle.contended.mbps == 8.0, (
+        "and the goodput is still the receiver's bytes over the receiver's seconds")
+
+
+def test_an_engine_that_outlasts_the_senders_window_but_not_the_drain_is_not_a_solo_tail():
+    # VTOP has to outlast the window the competitor was SENDING in. The receiver's
+    # clock runs on by the queue's drain (here 0.2 s), when the competitor sends
+    # nothing; a block that ends inside that drain left no contended second
+    # without VTOP, and judged against the receiver's longer window it was
+    # refused as a solo tail (#610).
+    steps = int(round(SCRIPTED_WINDOW_SECONDS / SCRIPTED_STEP_SECONDS))
+    drained = SCRIPTED_WINDOW_SECONDS + 0.2
+    report = iperf_stream(
+        iperf_intervals([9.0] * steps, step=SCRIPTED_STEP_SECONDS),
+        end={"sum_sent": {"bits_per_second": 9e6, "seconds": SCRIPTED_WINDOW_SECONDS,
+                          "bytes": int(9e6 * SCRIPTED_WINDOW_SECONDS / 8)},
+             "sum_received": {"bits_per_second": 8e6, "seconds": drained,
+                              "bytes": int(8e6 * drained / 8)},
+             "sender_tcp_congestion": "cubic"})
+    engine = ScriptedEngine()
+    box = ScriptedCompetitor([9.0, 8.0, 9.0], contended_report=report, teardown=1.0,
+                             during=cycles_inside_the_window(engine, [(0, 1_000)]))
+    with contended(scripted_spec(), vtop_bytes=engine, run=box, log=lambda _m: None) as handle:
+        box.handle = handle
+        handle.start_with_vtop()
+        sender_end = box.opened_at + SCRIPTED_WINDOW_SECONDS
+        wait_for(lambda: time.monotonic() > sender_end + 0.05, "passed the sender's window")
+        assert time.monotonic() < box.opened_at + drained, (
+            "the scenario under test needs the block to end inside the receiver's drain")
+        handle.close()
+    assert handle.jain is not None, (
+        "a block that outlasted every second the competitor sent in is measured, not refused")

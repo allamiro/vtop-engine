@@ -809,6 +809,22 @@ number, because each of them produces a plausible result:
   flow, and an index that flatters VTOP by exactly the missing stretch. Two
   intervals that meet at a boundary are contiguous, to within the rounding
   iperf3 prints its interval bounds at.
+- **The stream is laid out on the sender's window, and the goodput is the
+  receiver's (#610).** The interval stream is the sender's. On iperf 3.21 it
+  covers exactly `end.sum_sent.seconds`, the last measured interval ending
+  there. `end.sum_received.seconds` is the server's own clock, which runs on
+  until the flow's tail has drained the bottleneck queue and crossed the
+  one-way delay. That made it 0.14–0.19 s longer on the 10 Mbit/s, 100 ms,
+  one-BDP link, measured on a GitHub-hosted runner. The stream used to be laid
+  out on the receiver's window, which left the window's opening uncovered, so
+  the coverage check refused the run. The check passed only when iperf3's first
+  measured interval happened to reach back across the omit restart.
+  So the stream's origin, the window it must cover, and the contended window
+  `close()` places all come from the sender's length, recorded as
+  `sender_seconds` beside `measured_seconds` for each phase. The competitor
+  sends nothing while its tail drains, so the drain is not contended time.
+  Goodput stays received bytes over the receiver's seconds. A report without a
+  sender summary is refused by name.
 
 A contended run adds roughly `2 x (window + 3 s)` of wall clock beyond the
 engine's `duration_seconds` — the two solo windows, each with its omitted
