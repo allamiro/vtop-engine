@@ -277,6 +277,109 @@ pub fn probe_with_tail(
     Some((metadata, head, bytes))
 }
 
+/// What a file must be shown to be, for [`proves`]: the evidence a range's
+/// marker, or a cursor, recorded of the file it read.
+#[derive(Debug, Clone, Copy)]
+pub struct Identity<'a> {
+    pub inode: u64,
+    /// First-page fingerprints (#578) the file must start with - every one
+    /// of them. At least one: without a first page nothing is proven.
+    pub contents: &'a [&'a ContentFingerprint],
+    /// Pages the file must still hold, each ending at its offset (#620) -
+    /// every one recorded.
+    pub tails: &'a [&'a Tail],
+    /// The length the file must have at least. An append-only file never
+    /// gets shorter, so one shorter than a length it was seen at, a position
+    /// read up to, or a range's end has been truncated or rewritten since.
+    pub min_len: u64,
+}
+
+/// POSITIVE identity (#567, #621): whether `file` is proven to be the file
+/// `identity` describes - the same inode, no shorter than `min_len`, starting
+/// with every first page, and holding every tail where it ends. Not "not
+/// proven another file": a decision that cannot be undone, or that skips
+/// bytes when it is wrong, rests on this, so anything unknown answers no.
+///
+/// The one test of its kind, used by every caller that must know which file
+/// a recorded position belongs to: the committed point a range is retired
+/// against (`committed_through`, #567), the file a failed range is re-read
+/// from after a rotation (`rotated::proves`, #621), the file a commit counts
+/// towards, and the row a restart is seeded from (`seed_choice`, #621).
+/// Reads at offsets, so a descriptor's position is left alone.
+pub fn proves(file: &std::fs::File, identity: &Identity<'_>) -> bool {
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if inode_of(&metadata) != Some(identity.inode) || metadata.len() < identity.min_len {
+        return false;
+    }
+    if identity.contents.is_empty() {
+        return false;
+    }
+    let Ok(head) = read_at_most(file, 0, ContentFingerprint::MAX_LEN as u64) else {
+        return false;
+    };
+    if !identity
+        .contents
+        .iter()
+        .all(|content| content.matches_head(&head))
+    {
+        return false;
+    }
+    identity.tails.iter().all(|tail| {
+        let from = tail.end.saturating_sub(tail.fingerprint.len);
+        read_at_most(file, from, tail.end - from)
+            .is_ok_and(|bytes| tail.fingerprint.matches_bytes(&bytes))
+    })
+}
+
+/// [`proves`] for the file now at `path`. A path that cannot be opened is
+/// not proven to be anything.
+pub fn proves_at_path(path: &std::path::Path, identity: &Identity<'_>) -> bool {
+    std::fs::File::open(path).is_ok_and(|file| proves(&file, identity))
+}
+
+/// Up to `len` bytes of `file` from `from`, read at an offset so the
+/// descriptor's position is left alone; fewer at the end of the file.
+#[cfg(unix)]
+pub(crate) fn read_at_most(file: &std::fs::File, from: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut bytes = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match file.read_at(&mut bytes[filled..], from + filled as u64) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    bytes.truncate(filled);
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn read_at_most(
+    _file: &std::fs::File,
+    _from: u64,
+    _len: u64,
+) -> std::io::Result<Vec<u8>> {
+    // Without inodes nothing can be proven (`inode_of` is `None`), so no
+    // caller gets this far.
+    Ok(Vec::new())
+}
+
+#[cfg(unix)]
+fn inode_of(md: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(md.ino())
+}
+
+#[cfg(not(unix))]
+fn inode_of(_md: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
 /// Whether a commit for a range ending at `end_byte` still describes the file
 /// now at the path, so that moving the cursor to it is meaningful.
 ///

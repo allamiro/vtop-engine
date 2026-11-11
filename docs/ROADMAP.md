@@ -242,7 +242,30 @@ reopen quietly.
   leader's first append or committed high-water mark past its start,
   instead of acking a record it does not hold (#261) or exposing the kept
   records as committed. Until it is settled, that dispute caps the replica's
-  acks and reconnect status at its start.
+  acks and reconnect status at its start. A replica absent from the fence,
+  such as a deposed leader that missed the election, is no longer left
+  unreconciled (#641). Once a leader is attached to its replica set, every
+  session it opens with a follower starts with the probe's own fence frame,
+  at the leader's epoch and with its history, before the status read and
+  before any record or mark. A session opened before the attachment is
+  dropped before it carries a record or a mark. The fence reconciles the
+  returning replica exactly as it reconciles a voter. Histories that agree
+  leave the log as it is. A suffix the leader provably supersedes is
+  truncated at once. A suffix the leader cannot yet prove superseded is kept
+  in dispute, from the divergence (or, below the replica's high-water mark,
+  from past both the mark and the leader's tail), and settled as above; the
+  replica then catches up and never reports a disputed suffix as held, takes
+  it under the new mark, or acks the leader's records over it. Nothing at or
+  below a replica's own mark is touched. A replica that holds records but
+  whose own history cannot be compared (no journal, or a broken one) gets no
+  session at all (#649 review): the leader cannot tell which of its records
+  match, so it sends it nothing and takes no ack from it, leaves its log as
+  it is, and reports that it needs `vtopctl node repair`. Its answers never
+  count toward a promotion either. An empty replica with no history is not
+  in that position: it holds nothing to dispute, the candidate judges its
+  answer Agreed, and it counts. A leader with no history of its own cannot
+  reconcile anyone; its fences leave every log as it is. Plaintext planes
+  skip the session fence, since they refuse fences and do not fail over.
   **The protection is the fenced replica's, so it holds only on upgraded
   replicas.** There is no wire or feature-level change and the fence frames
   are identical, so nothing tells a candidate which replicas run this
