@@ -1339,3 +1339,125 @@ async fn recovery_commits_a_verified_range_above_a_failed_row_that_a_retry_alrea
         "[0,28) is committed; a re-read here would duplicate it: {outcomes:?}"
     );
 }
+
+/// #629: recovery's storage re-check accepted a size-only (backend-limited)
+/// result for a VERIFIED row without a word, so a commit made on size alone
+/// left no trace in the counter the running engine uses for exactly that. It
+/// must count it under the same labels (tenant, source type, format).
+#[tokio::test]
+async fn recovery_counts_a_size_only_acceptance_like_the_running_engine() {
+    let m = vtop_core::telemetry::init().expect("metrics registry");
+    // A tenant no other test uses: the registry is process-wide.
+    let tenant = "tenant-629-recovery";
+    let labels = [tenant, "file", TelemetryFormat::Raw.extension()];
+    let before = m
+        .verification_backend_limited_total
+        .with_label_values(&labels)
+        .get();
+
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    std::fs::write(&input, "line-0\n").unwrap();
+    let url = format!("sqlite://{}", dir.path().join("state.db").display());
+    let marker = ProgressMarker::File {
+        path: input.to_string_lossy().into_owned(),
+        inode: None,
+        start_byte: 0,
+        end_byte: 7,
+        file_size: 7,
+        mtime: String::new(),
+        content_fingerprint: None,
+        tail_fingerprint: None,
+    };
+    let object_uri = "s3://telemetry-data/x/b-629.raw.gz";
+    let manifest_uri = "s3://telemetry-data/x/b-629.manifest.json";
+    // Checksums disabled: the only thing the re-check can confirm is size.
+    let (manifest, manifest_path) = write_recovery_manifest(
+        &work,
+        "b-629",
+        &input.to_string_lossy(),
+        marker.clone(),
+        object_uri,
+        manifest_uri,
+        14,
+        "none",
+        "",
+    );
+    let now = chrono::Utc::now().to_rfc3339();
+    let rec = BatchRecord {
+        batch_id: "b-629".into(),
+        tenant: tenant.into(),
+        source_type: SourceType::File,
+        source_name: input.to_string_lossy().into_owned(),
+        format: TelemetryFormat::Raw,
+        state: BatchState::Batching,
+        progress_start: marker.clone(),
+        progress_end: marker,
+        object_uri: Some(object_uri.into()),
+        manifest_uri: Some(manifest_uri.into()),
+        object_sha256: Some(String::new()),
+        manifest_sha256: Some(manifest.manifest.sha256.clone()),
+        manifest_version_id: None,
+        object_size_bytes: Some(14),
+        record_count: Some(1),
+        error_message: None,
+        owner: None,
+        lease_expires_at: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        store.save_batch_state(&rec).await.unwrap();
+        for st in [
+            BatchState::Sealed,
+            BatchState::Compressed,
+            BatchState::Checksummed,
+            BatchState::ObjectUploaded,
+            BatchState::ManifestUploaded,
+            BatchState::Verified,
+        ] {
+            store
+                .update_batch_state("b-629", st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    let mut cfg = file_config(
+        work.to_str().unwrap(),
+        &url,
+        vec![input.to_string_lossy().into_owned()],
+        "mock", // testkit config has require_strong_verification: false
+    );
+    cfg.engine.tenant = tenant.into();
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let staged = dir.path().join("staged");
+    std::fs::write(&staged, b"fourteen-bytes").unwrap();
+    engine
+        .backend
+        .put_object(&staged, object_uri, None)
+        .await
+        .unwrap();
+    engine
+        .backend
+        .put_manifest(&manifest_path, manifest_uri, None)
+        .await
+        .unwrap();
+
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(summary.committed, 1, "the size-only re-check commits");
+    let after = m
+        .verification_backend_limited_total
+        .with_label_values(&labels)
+        .get();
+    assert_eq!(
+        after - before,
+        1,
+        "recovery committed b-629 on size alone and must count it in \
+         vtop_verification_backend_limited_total{labels:?}: before {before}, after {after}"
+    );
+}

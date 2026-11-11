@@ -243,6 +243,22 @@ under the default, batches produced with checksums disabled **refuse to
 commit**, and running that way requires both opt-outs deliberately: the
 algorithm choice and the strength opt-out, each visible in configuration.
 
+**The opt-out is announced, not hidden (#629).** A size-only check
+**accepts same-size corruption**: a corrupted or replaced object of the
+recorded size is committed as verified. With
+`upload.require_strong_verification: false`, an engine started for `run`,
+`process-once` or `replay` logs one WARN at startup naming that consequence
+and the key, and sets `vtop_verification_mode{mode="size_only"}` to 1 (the
+`strong` series reads 0), so an alert can fire before any batch moves.
+`vtopctl validate --config <file>` prints the same warning and still exits 0;
+there is no strict or production profile for it to refuse in. Every batch
+committed on size alone logs a WARN with its batch id and increments
+`vtop_verification_backend_limited_total` — in the running engine and in
+recovery's storage re-check of a VERIFIED row alike; under the strong
+default, the re-check logs the size-only result it refuses. The per-batch WARN
+is not rate-limited: it replaces that batch's INFO `verification_passed`
+line, so it is no more frequent than the batch log itself.
+
 **ETag caveat:** S3 multipart ETags are **not** reliable MD5 checksums. The
 authoritative integrity value is VTOP's own **SHA-256/BLAKE3 manifest checksum**,
 never the ETag.
@@ -792,7 +808,7 @@ path needed by the distributed options is already implemented (§6.3).
 | `upload.command_binary` / `command_timeout_seconds` / `command_max_output_bytes` | hardened external-tool path and invocation bounds (compatibility backends only) |
 | `upload.command_env_allowlist` | exact runtime environment names copied into an otherwise empty command environment |
 | `upload.create_bucket` | auto-create per-format buckets |
-| `upload.require_strong_verification` | defaults true — false explicitly permits size-only commit |
+| `upload.require_strong_verification` | defaults true — false explicitly permits size-only commit, which accepts same-size corruption; warned at startup and by `vtopctl validate` (#629) |
 | `partitioning.template` | object key layout |
 
 ### 13.2 Current environment variables — implemented

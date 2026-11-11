@@ -945,7 +945,39 @@ fn default_template() -> String {
     crate::partitioning::DEFAULT_TEMPLATE.to_string()
 }
 
+/// What `upload.require_strong_verification: false` costs, in the words the
+/// startup log and `vtopctl validate` both print (#629). Before this, the only
+/// sign of the opt-out was a WARN per batch, so an engine left in lab mode in
+/// production said nothing until traffic flowed, and then said it among the
+/// INFO lines.
+pub const SIZE_ONLY_VERIFICATION_WARNING: &str =
+    "upload.require_strong_verification is false: a batch the object store can only \
+     confirm by size and existence is committed as verified, so this engine accepts \
+     same-size corruption (a corrupted or replaced object of the recorded size is \
+     archived and its source progress committed). Set \
+     upload.require_strong_verification: true unless this is a lab or a backend \
+     with no content digest";
+
 impl VtopConfig {
+    /// Settings that are valid but unsafe enough to say so on every start
+    /// and in `vtopctl validate` (#629). Never a reason to refuse: each one
+    /// is an explicit, documented opt-out.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if !self.upload.require_strong_verification {
+            let mut w = SIZE_ONLY_VERIFICATION_WARNING.to_string();
+            if !self.checksum.algorithm.is_enabled() {
+                // With no digest at all, the weak path is not a fallback
+                // for an awkward backend: it is every batch.
+                w.push_str(
+                    "; checksum.algorithm is none, so EVERY batch is verified by size alone",
+                );
+            }
+            warnings.push(w);
+        }
+        warnings
+    }
+
     /// Load and validate config from a YAML file.
     pub fn from_path(path: &Path) -> Result<Self, VtopError> {
         let text = std::fs::read_to_string(path)
@@ -1245,6 +1277,49 @@ impl StreamsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #629: the size-only opt-out is a warning, never an error, and the
+    /// warning names its consequence and the key that turns it off.
+    #[test]
+    fn size_only_verification_is_warned_about_not_refused() {
+        let yaml = r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources: {}
+upload:
+  bucket: telemetry-data
+"#;
+        let strong: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            strong.warnings().is_empty(),
+            "the default is strong verification and warns about nothing: {:?}",
+            strong.warnings()
+        );
+
+        let mut weak = strong.clone();
+        weak.upload.require_strong_verification = false;
+        weak.validate().expect("the opt-out stays valid config");
+        let warnings = weak.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("accepts same-size corruption")
+                && warnings[0].contains("upload.require_strong_verification"),
+            "{}",
+            warnings[0]
+        );
+        assert!(!warnings[0].contains("EVERY batch"), "{}", warnings[0]);
+
+        weak.checksum.algorithm = ChecksumAlgorithm::None;
+        assert!(
+            weak.warnings()[0].contains("EVERY batch"),
+            "with checksums off every batch is size-only: {:?}",
+            weak.warnings()
+        );
+    }
 
     #[test]
     fn rejects_kafka_auto_commit() {

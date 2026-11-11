@@ -13,5 +13,6 @@ pub mod node_tools;
 pub mod segment_tools;
 pub mod testkit;
 pub mod tier_tools;
+mod verification_mode;
 
 pub use engine::{BatchOutcome, Engine, Pipeline, RecoverySummary};

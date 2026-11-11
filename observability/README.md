@@ -69,7 +69,8 @@ GET /readyz    readiness
 | `vtop_verified_total` | counter | Batches that passed verification |
 | `vtop_commits_total` | counter | **Must never exceed `verified_total`** — the invariant, measurable |
 | `vtop_verification_failures_total` | counter | **Any non-zero value is an incident** |
-| `vtop_verification_backend_limited_total` | counter | Verified by size only, no checksum |
+| `vtop_verification_backend_limited_total` | counter | Batches committed on a size-only check under `upload.require_strong_verification: false`, by the running engine or by recovery's storage re-check — each also logged as a WARN with its batch id. Such a commit **accepts same-size corruption** (#629) |
+| `vtop_verification_mode{tenant,mode}` | gauge | Set once at startup: `mode="size_only"` is 1 when `upload.require_strong_verification` is false, `mode="strong"` is 1 otherwise. Alert on `vtop_verification_mode{mode="size_only"} == 1` to catch a lab setting left in production before any batch moves (#629) |
 | `vtop_replay_required_total` | counter | Work being repeated |
 | `vtop_failed_total` | counter | Batches that hit FAILED |
 | `vtop_records_total`, `vtop_bytes_in_total`, `vtop_bytes_out_total` | counters | Volume; rates via `rate()` |

@@ -1454,6 +1454,7 @@ impl Engine {
                  Do not run replicas against this database (see #66/#93)"
             );
         }
+        crate::verification_mode::announce(&config);
         let mut engine = Self::new_with_state_store(config, streams, state_store).await?;
         engine._instance_locks = locks;
         // Reclaim multipart sessions no source will replay (#482, review):
@@ -2242,7 +2243,14 @@ impl Engine {
             tracing::warn!(uri, reason = %result.message, "recovery re-check: stored content mismatch");
             return false;
         }
-        !result.backend_limited || !self.config.upload.require_strong_verification
+        if result.backend_limited {
+            return crate::verification_mode::recheck_accepts_size_only(
+                &self.config,
+                rec,
+                &result.message,
+            );
+        }
+        true
     }
 
     /// Recovery scan run at startup. Seeds adapters from committed batches and

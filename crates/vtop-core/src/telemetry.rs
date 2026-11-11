@@ -24,7 +24,8 @@
 //!   panel at all.
 
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    TextEncoder,
 };
 use std::sync::OnceLock;
 
@@ -61,8 +62,16 @@ pub struct Metrics {
     pub verification_failures_total: IntCounterVec,
 
     /// Verified by size/existence only. The default policy refuses to commit;
-    /// this counter records explicit compatibility/lab opt-outs.
+    /// this counter records explicit compatibility/lab opt-outs, whether the
+    /// running engine or recovery's storage re-check accepted the result.
     pub verification_backend_limited_total: IntCounterVec,
+
+    /// Which verification results this engine will commit on, set once at
+    /// startup (#629): `mode="size_only"` reads 1 when
+    /// `upload.require_strong_verification` is false, `mode="strong"` reads 1
+    /// otherwise. The counter above only moves when a batch does; this can be
+    /// alerted on before any traffic.
+    pub verification_mode: IntGaugeVec,
 
     /// Batches sent back to be re-read from source. Safe by design, but a
     /// sustained rate means work is being repeated.
@@ -162,9 +171,17 @@ impl Metrics {
         )?;
         let verification_backend_limited_total = cv(
             "verification_backend_limited_total",
-            "Size-only verifications committed under an explicit require_strong_verification=false opt-out",
+            "Size-only verifications committed under an explicit require_strong_verification=false opt-out, by the running engine or recovery's re-check; each accepts same-size corruption",
             labels3(),
         )?;
+        let verification_mode = IntGaugeVec::new(
+            Opts::new(
+                "verification_mode",
+                "1 for the verification mode this engine started in: size_only means upload.require_strong_verification is false and same-size corruption is accepted",
+            ),
+            &["tenant", "mode"],
+        )?;
+        registry.register(Box::new(verification_mode.clone()))?;
         let replay_required_total = cv(
             "replay_required_total",
             "Batches marked REPLAY_REQUIRED and re-read from source",
@@ -265,6 +282,7 @@ impl Metrics {
             commits_total,
             verification_failures_total,
             verification_backend_limited_total,
+            verification_mode,
             replay_required_total,
             failed_total,
             records_total,
