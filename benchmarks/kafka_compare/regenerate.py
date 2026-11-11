@@ -17,7 +17,10 @@ Refuses, exit 2, writing nothing first:
 - a plotting stack other than requirements-report.txt pins, or a DejaVu Sans
   resolved from outside matplotlib's own data (a system copy of the font is
   not the one the committed images were drawn with);
-- no committed run at all (a drift check over nothing proves nothing).
+- no committed run at all (a drift check over nothing proves nothing);
+- a committed run whose files on disk differ from HEAD (staged, unstaged or
+  untracked): report.py reads the run from disk, and the check vouches for
+  what HEAD says.
 Refuses, exit 2, after regenerating:
 - two runs writing the same file: the last would silently win, and the drift
   check would vouch only for it;
@@ -138,6 +141,22 @@ def committed_runs(repo: str = REPO) -> list[str]:
     return sorted(runs)
 
 
+def check_runs_unchanged(runs: Iterable[str], repo: str = REPO) -> None:
+    """Refuse when a committed run's files on disk are not HEAD's: report.py reads the run from disk,
+    so a staged, unstaged or untracked change inside it would be regenerated as if HEAD said it.
+    Raw data is not edited in place; a re-run is a new run directory."""
+    changed = []
+    for run in runs:
+        rel = os.path.relpath(run, repo)
+        # Against HEAD, not the index: a staged edit is as uncommitted as an unstaged one.
+        diff = _git(repo, "diff", "--name-only", "HEAD", "--", rel).split("\n")
+        untracked = _git(repo, "ls-files", "--others", "--exclude-standard", "--", rel).split("\n")
+        changed += [name for name in diff + untracked if name]
+    if changed:
+        raise Refused("a committed run differs from HEAD on disk (commit it, or restore it with "
+                      "`git restore --staged --worktree`): " + ", ".join(sorted(set(changed))))
+
+
 def run_report(run_dir: str) -> list[str]:
     """report.py on one run, in its own interpreter as a developer runs it; the paths it wrote."""
     proc = subprocess.run([sys.executable, REPORT, run_dir], capture_output=True, text=True)
@@ -226,6 +245,7 @@ def main(argv: list[str] | None = None) -> int:
         check_stack(read_pins())
         check_font()
         runs = committed_runs()
+        check_runs_unchanged(runs)
         owner = regenerate(runs)
         stale = orphans(owner)
         if stale:

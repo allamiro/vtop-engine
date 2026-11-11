@@ -145,6 +145,45 @@ def test_a_staged_but_uncommitted_run_is_not_a_committed_run(repo):
         os.path.join(str(repo), "benchmarks/kafka_compare/results/a-run")]
 
 
+RUN = "benchmarks/kafka_compare/results/a-run"
+
+
+def _committed_run(repo):
+    put(repo, f"{RUN}/results.csv", b"committed\n")
+    put(repo, f"{RUN}/environment.json", b"{}")
+    commit(repo)
+    return os.path.join(str(repo), RUN)
+
+
+def test_a_committed_run_as_head_has_it_is_accepted(repo):
+    regenerate.check_runs_unchanged([_committed_run(repo)], str(repo))
+
+
+def test_refuses_an_unstaged_edit_to_a_committed_run(repo):
+    run = _committed_run(repo)
+    put(repo, f"{RUN}/results.csv", b"edited\n")
+    with pytest.raises(regenerate.Refused, match=f"{RUN}/results.csv"):
+        regenerate.check_runs_unchanged([run], str(repo))
+
+
+def test_refuses_a_staged_edit_to_a_committed_run(repo):
+    run = _committed_run(repo)
+    put(repo, f"{RUN}/results.csv", b"edited\n")
+    git(repo, "add", "-A")
+    with pytest.raises(regenerate.Refused, match=f"{RUN}/results.csv"):
+        regenerate.check_runs_unchanged([run], str(repo))
+
+
+def test_refuses_a_deleted_or_added_file_in_a_committed_run(repo):
+    run = _committed_run(repo)
+    os.remove(os.path.join(run, "environment.json"))
+    put(repo, f"{RUN}/failover.csv")
+    with pytest.raises(regenerate.Refused) as caught:
+        regenerate.check_runs_unchanged([run], str(repo))
+    assert f"{RUN}/environment.json" in str(caught.value)
+    assert f"{RUN}/failover.csv" in str(caught.value)
+
+
 def test_refuses_when_no_run_is_committed(repo):
     put(repo, "README.md")
     commit(repo)
