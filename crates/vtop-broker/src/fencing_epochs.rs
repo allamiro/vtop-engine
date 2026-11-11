@@ -750,6 +750,23 @@ impl FencingEpochJournal {
     /// the new tail on still come from the same leader. That is in memory
     /// only; every open recomputes it.
     pub fn replay_leader_lineage_at_open(&mut self, tail: u64) -> BrokerResult<bool> {
+        self.follow_held_leader_lineage(tail)
+    }
+
+    /// File the records through `tail` by the lineage this replica holds,
+    /// under that lineage's own epoch, whatever epoch is being adopted now
+    /// (#640, #648 review). Returns whether the lineage still has entries
+    /// the log has not reached; `false` with none held, or one waiting on a
+    /// dispute.
+    ///
+    /// The open's replay, and the first step of adopting a newer epoch: every
+    /// path that left records in the log without following the lineage (a
+    /// crash before the journal was re-derived, an append group refused
+    /// after its earlier members were applied) is completed before the
+    /// newer epoch is recorded at the tail, which would otherwise seal those
+    /// records under whatever the journal said. Never past an entry of a
+    /// later epoch, so it cannot re-file records another leader sent.
+    pub fn follow_held_leader_lineage(&mut self, tail: u64) -> BrokerResult<bool> {
         let Some(lineage) = self.lineage.as_mut() else {
             return Ok(false);
         };

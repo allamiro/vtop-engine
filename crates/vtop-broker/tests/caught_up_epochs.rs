@@ -573,3 +573,52 @@ fn a_restart_between_the_fence_and_the_settlement_keeps_the_waiting_lineage() {
     assert_eq!(r.node.next_offset(), 8);
     assert_eq!(r.node.epoch_starts(), c.node.epoch_starts());
 }
+
+/// #648 review (Codex P2): an append group whose later member is refused
+/// leaves its earlier members in the log, and the refusal returned before
+/// the lineage was followed. Here the first member carries 5..11 (R's 5..10
+/// and its first epoch-20 record at 10) and the second is malformed, so C
+/// holds 10 still filed under 18. Metadata then moves to 21 before any retry:
+/// adopting 21 must first file what C holds by the lineage it still holds,
+/// or it records 21 at 11 over a record filed under the wrong epoch.
+#[test]
+fn a_refused_append_group_leaves_no_record_filed_outside_the_lineage() {
+    let (r, c) = up_to_the_fence_at_20();
+    r.append(R_EPOCH, R_TAIL);
+    let caught_up = ReplicaAppendRequest {
+        producer_id: Uuid::from_u128(0x3000),
+        records: (SHARED..=R_TAIL)
+            .map(|offset| ProduceRecord {
+                timestamp_millis: 1_000,
+                key: b"k".to_vec(),
+                value: format!("o{offset}").into_bytes(),
+            })
+            .collect(),
+        ..record(R_EPOCH, SHARED)
+    };
+    let malformed = ReplicaAppendRequest {
+        producer_id: Uuid::from_u128(0x3001),
+        expected_base_offset: 99,
+        ..record(R_EPOCH, 99)
+    };
+    assert!(
+        c.node.apply_append_batch(&[caught_up, malformed]).is_err(),
+        "precondition: the group is refused"
+    );
+    assert_eq!(
+        c.node.next_offset(),
+        R_TAIL + 1,
+        "precondition: the first member stayed in the log"
+    );
+    c.grant(R_EPOCH + 1);
+    let mut expected = r.node.epoch_starts();
+    expected.push(EpochStart {
+        epoch: R_EPOCH + 1,
+        start_offset: R_TAIL + 1,
+    });
+    assert_eq!(
+        c.node.epoch_starts(),
+        expected,
+        "the record at 10 is epoch 20's, as R files it; 21 begins at the tail"
+    );
+}

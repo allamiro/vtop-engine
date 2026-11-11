@@ -394,7 +394,16 @@ impl InProcessFollower {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Some(journal) = guard.as_mut() {
-                    if journal.record_adoption(epoch, next_offset).is_err() {
+                    // Records already in the log under the lineage the
+                    // replica holds are filed by it first (#648 review): an
+                    // append group refused after its earlier members were
+                    // applied returned before following it, and the newer
+                    // epoch recorded at the tail below would seal them under
+                    // whatever the journal said.
+                    let adopted = journal
+                        .follow_held_leader_lineage(next_offset)
+                        .and_then(|_| journal.record_adoption(epoch, next_offset));
+                    if adopted.is_err() {
                         self.fencing_epoch_history_broken
                             .store(true, Ordering::SeqCst);
                     }
