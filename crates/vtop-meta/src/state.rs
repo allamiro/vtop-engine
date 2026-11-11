@@ -1533,7 +1533,11 @@ impl MetaStateMachine {
             // underneath the decision. Deterministic, since every voter that
             // accepts a level above the report level runs this check (an
             // older release refuses the level outright, above).
-            let blockers = self.cluster_versions().blockers(requested);
+            let blockers = if requested > NODE_VERSION_REPORTS_FEATURE_LEVEL {
+                self.cluster_versions().blockers(requested)
+            } else {
+                Vec::new()
+            };
             if !blockers.is_empty() {
                 return reject(MetadataError::invalid_transition(
                     crate::versions::describe_blockers(requested, &blockers),
