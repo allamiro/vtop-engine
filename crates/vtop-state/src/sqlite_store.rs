@@ -10,7 +10,9 @@
 //! trait (Phase 1 of the HA plan). The Postgres implementation (Phase 3) lives
 //! behind a Cargo feature and implements the same trait.
 
-use crate::models::{parse_content_fingerprint, BatchPatch, BatchRecord, CommittedCursor};
+use crate::models::{
+    parse_content_fingerprint, BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset,
+};
 use crate::store::StateStore;
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -80,6 +82,20 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
 /// offset instead, and after a rotation or a copytruncate that is the old
 /// content's row: pruning deleted the restart cursor (review of #564).
 ///
+/// A Kafka row's successor must also be of its partition and consumer group:
+/// those rows are where the partition resumes (#614), and a topic's newest
+/// row on another partition says nothing about this one. Neither field exists
+/// on a file or spool marker, and `IS` compares the two NULLs as equal, so
+/// those rows are grouped by path alone, as before. The two comparisons
+/// filter the rows the index range seek finds; they do not replace it.
+///
+/// "Newer" is a row-value comparison on `(created_at, batch_id)`: the same
+/// order as `created_at >, or equal and batch_id >`, written so the planner
+/// can serve it as a range on the index's last two columns. With the OR form,
+/// adding the two comparisons above tipped SQLite onto
+/// `idx_batches_commit_cursor`, which seeks on the path only, and the plan
+/// test below caught it.
+///
 /// The successor probe expressions must stay textually identical to the
 /// `idx_batches_commit_newest` expressions above: SQLite matches expression
 /// indexes structurally, and without the index every candidate row rescans
@@ -93,8 +109,11 @@ macro_rules! prune_predicate_sql {
                   AND n.source_type = b.source_type \
                   AND COALESCE(json_extract(n.progress_end_json, '$.path'), n.source_name) \
                       = COALESCE(json_extract(b.progress_end_json, '$.path'), b.source_name) \
-                  AND (n.created_at > b.created_at \
-                       OR (n.created_at = b.created_at AND n.batch_id > b.batch_id)) \
+                  AND json_extract(n.progress_end_json, '$.partition') \
+                      IS json_extract(b.progress_end_json, '$.partition') \
+                  AND json_extract(n.progress_end_json, '$.consumer_group') \
+                      IS json_extract(b.progress_end_json, '$.consumer_group') \
+                  AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
               )"
     };
 }
@@ -199,6 +218,20 @@ impl SqliteStateStore {
                 }
             }
         }
+        // A row is born only as batching (#625), in the database too, so a
+        // write that skips save_batch_state cannot create one born verified.
+        // A trigger, not a CHECK: an existing table gains it without a
+        // rebuild. Run apart from SCHEMA, whose split on ';' would cut the
+        // trigger body. Every release inserts only batching, so an older
+        // binary opening this file is unaffected.
+        sqlx::raw_sql(
+            "CREATE TRIGGER IF NOT EXISTS trg_batches_insert_as_batching \
+             BEFORE INSERT ON batches WHEN NEW.state <> 'batching' \
+             BEGIN SELECT RAISE(ABORT, 'a batch must be inserted as batching'); END",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         Ok(())
     }
 
@@ -251,6 +284,7 @@ impl StateStore for SqliteStateStore {
     /// created once. A duplicate id must fail loudly rather than silently
     /// overwrite an existing — possibly already-committed — row.
     async fn save_batch_state(&self, rec: &BatchRecord) -> Result<(), VtopError> {
+        crate::store::require_batching_insert(rec)?;
         let ps = serde_json::to_string(&rec.progress_start)?;
         let pe = serde_json::to_string(&rec.progress_end)?;
         sqlx::query(
@@ -377,6 +411,48 @@ impl StateStore for SqliteStateStore {
         row.map(row_to_record).transpose()
     }
 
+    async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
+        // Aggregated in SQL (#77): per (topic, partition, consumer group), the
+        // NEWEST committed row's end offset, in the order `committed_cursors`
+        // and pruning use - so the row read here always survives a prune.
+        let rows = sqlx::query(
+            "WITH committed AS ( \
+                 SELECT json_extract(progress_end_json, '$.topic') AS topic, \
+                        CAST(json_extract(progress_end_json, '$.partition') AS INTEGER) AS part, \
+                        json_extract(progress_end_json, '$.consumer_group') AS grp, \
+                        CAST(json_extract(progress_end_json, '$.end_offset') AS INTEGER) AS end_offset, \
+                        created_at, batch_id \
+                 FROM batches WHERE state = ? AND source_type = ? \
+             ), latest AS ( \
+                 SELECT topic, part, grp, end_offset, ROW_NUMBER() OVER ( \
+                            PARTITION BY topic, part, grp \
+                            ORDER BY created_at DESC, batch_id DESC) AS rn \
+                 FROM committed \
+             ) \
+             SELECT topic, part, grp, end_offset FROM latest WHERE rn = 1",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(SourceType::Kafka.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let topic: Option<String> = r.get("topic");
+                let partition: Option<i64> = r.get("part");
+                let group: Option<String> = r.get("grp");
+                let end: Option<i64> = r.get("end_offset");
+                Some(CommittedKafkaOffset {
+                    topic: topic?,
+                    partition: i32::try_from(partition?).ok()?,
+                    consumer_group: group?,
+                    end_offset: end?,
+                })
+            })
+            .collect())
+    }
+
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
         self.query_records("SELECT * FROM batches ORDER BY created_at DESC", None)
             .await
@@ -487,14 +563,15 @@ impl StateStore for SqliteStateStore {
                         CAST(json_extract(progress_end_json, '$.end_byte') AS INTEGER) AS end_byte, \
                         CAST(json_extract(progress_end_json, '$.file_size') AS INTEGER) AS file_size, \
                         CAST(progress_end_json -> '$.content_fingerprint' AS TEXT) AS content, \
+                        CAST(progress_end_json -> '$.tail_fingerprint' AS TEXT) AS tail, \
                         created_at, batch_id \
                  FROM batches WHERE state = ? AND source_type = ? \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, ROW_NUMBER() OVER ( \
+                 SELECT path, inode, end_byte, file_size, content, tail, ROW_NUMBER() OVER ( \
                             PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size, content FROM latest WHERE rn = 1",
+             SELECT path, inode, end_byte, file_size, content, tail FROM latest WHERE rn = 1",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(source_type.as_str())
@@ -509,12 +586,14 @@ impl StateStore for SqliteStateStore {
                 let end: Option<i64> = r.get("end_byte");
                 let size: Option<i64> = r.get("file_size");
                 let content: Option<String> = r.get("content");
+                let tail: Option<String> = r.get("tail");
                 Some(CommittedCursor {
                     path: path?,
                     inode: inode.and_then(|i| i.parse().ok()),
                     end_byte: end?.max(0) as u64,
                     observed_size: size.map(|s| s.max(0) as u64),
                     content_fingerprint: content.as_deref().and_then(parse_content_fingerprint),
+                    tail_fingerprint: tail.as_deref().and_then(parse_content_fingerprint),
                 })
             })
             .collect())
@@ -807,6 +886,35 @@ mod tests {
             .unwrap();
         // Reopening is idempotent: the column is added once.
         SqliteStateStore::connect(&url).await.unwrap();
+    }
+
+    /// #625, in the database: a write that skips `save_batch_state` (a tool
+    /// with its own connection, a future import) still cannot create a row in
+    /// any state but BATCHING.
+    #[tokio::test]
+    async fn sqlite_refuses_a_direct_insert_in_any_state_but_batching() {
+        let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
+        let insert = |id: &'static str, state: &'static str| {
+            sqlx::query(
+                "INSERT INTO batches (batch_id, tenant, source_type, source_name, format, \
+                 state, progress_start_json, progress_end_json, created_at, updated_at) \
+                 VALUES (?, 'default', 'kafka', 'app', 'cef', ?, '{}', '{}', 't', 't')",
+            )
+            .bind(id)
+            .bind(state)
+            .execute(&store.pool)
+        };
+        for state in ["verified", "source_committed", "sealed"] {
+            let err = insert("direct-refused", state)
+                .await
+                .expect_err("a direct insert in a later state must be refused");
+            assert!(
+                err.to_string().contains("must be inserted as batching"),
+                "expected the trigger's message for {state}, got: {err}"
+            );
+        }
+        assert!(store.get_batch("direct-refused").await.unwrap().is_none());
+        insert("direct-batching", "batching").await.unwrap();
     }
 
     // The SQLite backend must pass the same behavioural contract every backend

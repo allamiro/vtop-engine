@@ -49,6 +49,19 @@ head-on.
 | Ecosystem | Clients in every language, Connect, Streams, MirrorMaker, ksqlDB, decades of operational tooling. VTOP has `vtopctl` and dashboards-as-code. | #225 (Kafka wire-compatibility gateway) — inherit the client ecosystem instead of rebuilding it |
 | Scale features | Quotas, throttled reassignment, multi-tenancy, tiered storage at scale, thousands-of-partition operations. | Post-v0.2.0; benchmarks tracked in #92/#98/#130 |
 
+### Measured
+
+The rows above compare guarantees. Speed is measured separately, with the
+same Kafka client against both systems on the same host:
+[`benchmarks/kafka-comparison.md`](benchmarks/kafka-comparison.md) (phase 1 of
+#595: produce throughput and latency, consume throughput, profile `defaults`,
+single-host laptop numbers). Every measured number there (tables, charts,
+ratios) is generated from a committed CSV, and its stated conditions
+(machine, limits, images, commit, matrix) from the run's committed
+`environment.json`; read it with those conditions, including that under
+`defaults` a Kafka acknowledgement does not wait for an fsync and a VTOP
+quorum acknowledgement does.
+
 ## VTOP vs LinkedIn Northguard/Xinfra
 
 Northguard is LinkedIn's closed-source log storage successor to Kafka;

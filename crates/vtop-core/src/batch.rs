@@ -208,7 +208,11 @@ impl AdaptiveBatcher {
 
         let records = std::mem::take(&mut self.records);
         let record_count = records.len();
-        let batch_id = build_batch_id(&self.source_name, &progress_end);
+        // Named by the whole range the batch holds, not its last read (#622).
+        let batch_id = build_batch_id(
+            &self.source_name,
+            &ProgressMarker::spanning(&progress_start, &progress_end),
+        );
 
         let mut batch = TelemetryBatch {
             batch_id,
@@ -245,11 +249,13 @@ fn now_or_epoch() -> chrono::DateTime<Utc> {
 }
 
 /// Build a deterministic, filesystem-safe batch id of the form
-/// `vtop-<UTCstamp>-<source>-<range>-<short-uuid>`.
-pub fn build_batch_id(source_name: &str, end_marker: &ProgressMarker) -> String {
+/// `vtop-<UTCstamp>-<source>-<range>-<short-uuid>`. `range` is the marker's
+/// range token: pass the batch's whole range ([`ProgressMarker::spanning`]),
+/// not its last read's end marker, or the id names only that read (#622).
+pub fn build_batch_id(source_name: &str, range: &ProgressMarker) -> String {
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
     let safe_source = sanitize_token(source_name);
-    let range = end_marker.range_token();
+    let range = range.range_token();
     let suffix = Uuid::new_v4().simple().to_string();
     let short = &suffix[..8];
     format!("vtop-{stamp}-{safe_source}-{range}-{short}")
@@ -378,6 +384,28 @@ mod tests {
         assert!(id.starts_with("vtop-"));
         assert!(id.contains("app_events"));
         assert!(id.contains("p0-481000-482499"));
+    }
+
+    /// #622: a batch sealed from several reads is named by its whole range;
+    /// its end marker (the last read's, carrying that read's start) is kept.
+    #[test]
+    fn a_batch_of_several_reads_is_named_by_its_whole_range() {
+        let mut b = AdaptiveBatcher::new(
+            "default",
+            SourceType::Kafka,
+            "app_events",
+            TelemetryFormat::Cef,
+            BatchLimits::default(),
+        );
+        b.push(b"a".to_vec(), &kafka_marker(100, 100), None);
+        b.push(b"b".to_vec(), &kafka_marker(150, 150), None);
+        let batch = b.seal(kafka_marker(150, 249)).unwrap();
+        assert!(
+            batch.batch_id.contains("-p0-100-249-"),
+            "{}",
+            batch.batch_id
+        );
+        assert_eq!(batch.progress_end, kafka_marker(150, 249));
     }
 
     // The tests below kill specific surviving mutants reported by cargo-mutants

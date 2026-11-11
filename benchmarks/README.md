@@ -255,7 +255,8 @@ scenario only: `engine_mode`, `engine_metrics_address`,
 `engine_<name>_window` and `engine_<name>_max_per_second` for a counter,
 `engine_<name>_min` and `engine_<name>_max` for a gauge. Surfaced today:
 `commits_total`, `failed_total`, `records_total`, `bytes_in_total`,
-`bytes_out_total`, `upload_throttled_total` (counters) and
+`bytes_out_total`, `upload_throttled_total`, `upload_egress_bytes_total`
+(counters; the last exists only when an egress cap is set, #481) and
 `inflight_batches`, `upload_width` (gauges). A counter column the endpoint
 never exposed is **blank**: "never incremented" and "this binary does not
 have the series" cannot be told apart from the endpoint. The run-level
@@ -263,8 +264,8 @@ have the series" cannot be told apart from the endpoint. The run-level
 `total_output_bytes` come from the same counters' increase inside the window.
 
 **Adding a column for a new series is one line**: an entry in
-`SUMMARY_SERIES` in `lib/engine_run.py`, e.g.
-`("vtop_upload_egress_bytes_total", "counter")` when #481 adds it. The
+`SUMMARY_SERIES` in `lib/engine_run.py`, as
+`("vtop_upload_egress_bytes_total", "counter")` was for #481. The
 declared kind is checked against the endpoint's `# TYPE` line, and a mismatch
 refuses the run.
 
@@ -775,7 +776,14 @@ number, because each of them produces a plausible result:
   seconds of the flow. Those two ends are kept as a consistency check: stamps
   that place the window outside them are refused, and so is a stream whose
   per-line estimates disagree by more than 0.25 s — lines stamped in a burst
-  were buffered before the stamper and date nothing. A competitor whose iperf3
+  were buffered before the stamper and date nothing. The report's **final**
+  interval line is left out of both the placement and that check (#481):
+  iperf3 prints it only after its end-of-test exchange with the server, which
+  crosses the shaped link, so it is late by about two round trips plus the
+  queue (0.21–0.75 s measured with iperf 3.21 on 100 ms links, against at most
+  2.5 ms for every other line; `measurements/481-egress-ceiling/stream_placement/`).
+  Its lateness is recorded as `competitor_window_final_line_delay_seconds`.
+  A competitor whose iperf3
   lacks `--json-stream` is refused by name, and a whole-document `-J` report
   is refused rather than read without a placement. Cycles are then attributed
   to the placed window: one that ran while `docker exec` was still starting or
@@ -783,8 +791,9 @@ number, because each of them produces a plausible result:
   the stream's last measured second. `summary.json` records
   `competitor_window_unaccounted_seconds` (the plumbing's overhead around the
   window), `competitor_window_setup_seconds` (how much of it fell before
-  measuring began) and `competitor_window_sync_spread_seconds` (how far the
-  per-line estimates disagreed).
+  measuring began), `competitor_window_sync_spread_seconds` (how far the
+  per-line estimates disagreed, final line excluded) and
+  `competitor_window_final_line_delay_seconds`.
 - An iperf3 report with **no `intervals` stream** is refused, at the first solo
   window rather than after all three have run. Without it the competing flow
   has only a whole-window average, and the index would be back to comparing
@@ -835,6 +844,94 @@ against that one, on the same driver, on the same machine, close together in
 time. It does not say what the engine would do over a real WAN of the same
 nominal rate, and the ±10% calibration band bounds the emulator's error, not
 the claim.
+
+### The operator egress ceiling (#481)
+
+`upload_max_egress_bytes_per_second` writes the engine's
+`upload.max_egress_bytes_per_second` through, as given; unset writes nothing.
+It is recorded as a flat column of the same name in `metrics.csv`,
+`summary.json` and the matrix, and the engine's own counter
+`vtop_upload_egress_bytes_total` is a surfaced series (§3). Only `s3_native`
+can honour a cap; every other backend refuses one at startup.
+
+| scenario | engine | what it measures |
+|---|---|---|
+| `19`/`20`/`21-egress-cap-rate-{1,4,16}mib` | `run` | the rate criterion: every one-second bucket of the shaper's counter at or below R, and the window's total within 10% of R × 60 s (the bucket's design predicts 31/32 of R) |
+| `22-competing-flow-bulk-uncapped` / `23-…-capped` | `process-once` | scenario 18's link and competitor with a load that actually contends (≈8 MB of uncompressed JSONL per cycle, eight 1 MiB batches in flight); the pair differs in the cap alone |
+
+Judge a rate run with:
+
+```bash
+python3 benchmarks/egress_cap_check.py benchmarks/results/<run_id>
+```
+
+It writes `egress_buckets.csv` (one row per scheduled bucket, with the scrape
+latencies that bound it) and `egress_verdict.json`, and exits 1 on a failed
+criterion. Seconds before the counter first appears count as zero bytes, not
+as missing: the engine creates it on the shaper's first admission.
+
+Two things about the rate workload were found on the lab rather than reasoned
+about. A long-lived engine commits a cycle's sources only after **every** batch
+of that cycle has verified, so a large pre-seeded input becomes one cycle that
+commits nothing inside a minute and the run is refused. The scenarios
+therefore start small and seed concurrently at about 1.3 × R. That needs a line
+format, because the runner refuses a concurrent seeder over whole-file input.
+The seeder alone could not hold 16 MiB/s through a Docker Desktop bind mount,
+so scenario 21 also pre-seeds a backlog (its comment has the numbers).
+The dataset generated before launch is pinned by the scenario key
+`initial_seed` (0, the default, keeps OS entropy for every other scenario):
+with two up-front files, an unlucky draw alone limits scenario 19 to 0.864 of
+R × 60 before the cap does anything. The key postdates the runs recorded
+below, which drew that volume from OS entropy.
+
+The netem lab needs a kernel with the `ifb` driver. Docker Desktop's linuxkit
+kernel has none, and `lib/netem.py` now says so instead of reporting the
+middlebox as claimed. On macOS, run the pair in a Linux VM with a stock
+kernel. The runner must then run on that VM's kernel too, for example in a
+container with the docker socket mounted, or the competitor's stamps are read
+against another kernel's clock.
+
+**Recorded** in [`measurements/481-egress-ceiling/`](measurements/481-egress-ceiling/)
+(local `results/` are never committed, so that directory is the record:
+`environment.json` names the machine, the binary and the noise).
+
+| run | R | worst 1 s bucket / R | 60 s total / R | verdict |
+|---|---|---|---|---|
+| `egress-cap-rate-1mib-20261110T012508Z-ukqkoq` | 1 MiB/s | 0.9785 | 0.9336 | pass |
+| `egress-cap-rate-4mib-20261110T012635Z-nr8xv2` | 4 MiB/s | 0.9812 | 0.9271 | pass |
+| `egress-cap-rate-16mib-20261110T012737Z-nvmv45` | 16 MiB/s | 0.9918 | 0.8700 | **fail** (total): the seeder delivered 888 MB, under R × 60 s, so the window measured the seeder |
+| `egress-cap-rate-16mib-20261110T012926Z-681a6q` | 16 MiB/s | 0.9725 | 0.9362 | pass, with the pre-seeded backlog |
+
+The ratios are `egress_cap_check.py`'s, re-run over the committed
+`engine_metrics_selected.csv` after the checker learned to recover each
+bucket's interval at the runner's precision (`delta / delta_per_second`)
+rather than from the millisecond-rounded `interval_seconds`; that moved
+them in the fourth decimal and no verdict. No bucket in any run exceeded R.
+The median bucket of each passing run is 0.968–0.969 of R, the predicted
+0.969; single buckets scatter to ±0.01 of
+that, which is the scrape-edge uncertainty (§3). Every total sits below that prediction because of the
+engine's own gaps (startup, and the seconds between a cycle's last verify and
+the next cycle's first upload, visible as dips in `egress_buckets.csv`), not
+because of the shaper.
+
+The competitor pair is recorded in `competitor_pair.json`, from a second lab
+session at `bulk:120` / `duration_seconds: 300` (scenarios 22 and 23 as they
+are now). Beside an uncapped VTOP the competing flow got **4.723 Mbit/s**
+against 9.55 alone (49%); beside VTOP capped at 256 KiB/s it got **7.759
+Mbit/s** against 9.547 alone (81%). Over the engine cycles each window wholly
+contained, VTOP's committed-body rate was 3.184 Mbit/s uncapped (4 cycles,
+82.9 s) and 1.741 Mbit/s capped (1 cycle, 37.3 s). The two solo windows of
+each run agreed within 0.08% and 0.21%. One session on one host, one link
+shape and one cap; the capped run's share rests on a single contained cycle.
+
+History, kept in the same file and not current results: the first session's
+uncapped control at `bulk:60` (5.06 Mbit/s beside VTOP against 9.558 alone),
+two capped `bulk:60` attempts refused by the stream-placement check (spreads
+0.349 s and 0.285 s, from iperf3's final interval line, which is now left out
+of the placement — see above), and two more capped `bulk:60` attempts refused
+because no ~40 s capped cycle fitted wholly inside a 60 s window, which is why
+the pair moved to 120 s windows.
+
 ### The HTTP/3 counterparty, and the topology it adds (#484)
 
 Neither the lab's MinIO nor AWS S3's own endpoint serves HTTP/3, so the
@@ -1015,7 +1112,8 @@ automatically picks it up.
 | Runtime duration | ✅ any (`duration_seconds`) | 5 min / 30 min / 1 h presets easy to add |
 | Sustained backpressure | ✅ `seed_concurrently` + `backlog_multiplier` | a real deficit, not just sustained load — scenario `11-backpressure-soak` (#98) |
 | Bandwidth-shaped upload | ✅ toxiproxy on the `shaped` profile, `shaping_*` keys | the upload link as the bottleneck — scenario `13-backpressure-soak-shaped` (#403) |
-| Engine's own metrics | ⚠️ `engine_mode: run` (implemented; no bundled scenario yet) | one long-lived `vtopctl run` per window, `/metrics` scraped per second into `engine_metrics.csv` (#510). Not bundled on purpose: `run_matrix.py --all` refuses a matrix that mixes engine modes, so one run-mode file among the per-cycle ones would stop `--all`; #481 adds the first |
+| Engine's own metrics | ✅ `engine_mode: run` | one long-lived `vtopctl run` per window, `/metrics` scraped per second into `engine_metrics.csv` (#510) — scenarios `19`-`21` (#481's rate criterion). `run_matrix.py --all` refuses a matrix that mixes engine modes, so run those three as their own matrix |
+| Operator egress ceiling | ✅ `upload_max_egress_bytes_per_second` | the cap's rate from the engine's own counter (`19`-`21`, judged by `egress_cap_check.py`) and the competitor's goodput with and without it (`22`/`23`) — see [The operator egress ceiling](#the-operator-egress-ceiling-481) |
 | Proxy hop in front of the store | ✅ nginx on the `h3` profile, `h3_proxy: true` | the topology control a transport comparison needs, and the lab's only HTTP/3 counterparty — scenario `17-proxy-hop-tcp-baseline` (#484) |
 | Lossy / policed / queued link | ✅ the netem middlebox on the `netem` profile | loss, a policer and a real bottleneck queue, which a TCP-terminating proxy cannot produce — scenarios `14-lossy-wan`, `15-policed-uplink`, `16-contended-bottleneck` (#477) |
 | What the upload costs a neighbour | ✅ `shaping_competitor`, netem only | one plain-TCP bulk flow in the same queue, measured alone / with VTOP / alone again — scenario `18-competing-flow` (#478). The competitor's goodput, not VTOP's, is what authorises a concurrency or rate knob |
@@ -1067,6 +1165,17 @@ VTOP_META_SATURATION_JSON=benchmarks/results/native-meta-saturation/summary.json
 
 This is a research harness — it does **not** implement multi-group metadata
 sharding (epic #93). Multi-hour dedicated soaks remain deferred.
+
+## VTOP vs Apache Kafka, same client (#595)
+
+`kafka_compare/` runs a three-node VTOP cluster (Kafka gateway on the range
+leader) and a three-broker Apache Kafka cluster in containers with identical
+limits, one at a time, and drives both with the same JVM Kafka perf tools:
+saturation throughput, latency at fixed fractions of Kafka's saturation, and
+consume throughput, each cell proven by a byte-exact read-back first.
+`kafka_compare/report.py` turns a run's CSV into the charts and
+`docs/benchmarks/kafka-comparison.md`, and refuses partial or mixed data. See
+[`kafka_compare/README.md`](kafka_compare/README.md).
 
 ## Design principles
 

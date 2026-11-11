@@ -65,6 +65,9 @@ CSV_HEADERS: dict[str, list[str]] = {
         # point of the proxied baseline is that it is NOT comparable to the
         # direct one.
         "h3_proxy",
+        # The operator egress ceiling (#481); blank when unset. The with- and
+        # without-cap runs of one scenario differ in this column alone.
+        "upload_max_egress_bytes_per_second",
     ],
     "batch_metrics.csv": [
         "run_id", "batch_id", "scenario_name", "batch_start_time", "batch_end_time",
