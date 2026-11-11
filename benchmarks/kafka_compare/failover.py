@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 from kafka_compare import failover_schema as fschema  # noqa: E402
 from kafka_compare import failover_stats as fstats  # noqa: E402
-from kafka_compare import perftool, schema  # noqa: E402
+from kafka_compare import host_noise, perftool, schema  # noqa: E402
 from kafka_compare import run as phase1  # noqa: E402
 
 REPO = phase1.REPO
@@ -669,6 +669,7 @@ def run_rep(ctx: dict, system: str, fault: str, rep: int) -> None:
     os.makedirs(logs)
     row = base_row(ctx, system, fault, rep)
     started = time.monotonic()
+    started_unix = time.time()
     timeline: list[dict] = []
     log(f"{tag}: start")
     try:
@@ -720,6 +721,7 @@ def run_rep(ctx: dict, system: str, fault: str, rep: int) -> None:
     if row.get("verify", "").startswith("FAILED"):
         ctx["losses"].append(tag)
     row["wall_seconds"] = round(time.monotonic() - started, 1)
+    ctx.setdefault("rep_windows", {})[tag] = (started_unix, time.time())
     fschema.append_rows(ctx["csv"], [row])
     if timeline:
         fschema.append_rows(ctx["timeline"], timeline, fschema.TIMELINE_COLUMNS)
@@ -743,6 +745,24 @@ def key_mode() -> int:
     work directory (mkdtemp, 0700) is what keeps other host users out.
     """
     return 0o644 if platform.system() == "Linux" else 0o600
+
+
+NOISE_INTERVAL_S = 30
+
+
+def record_host_noise(env: dict, ctx: dict, sampler: host_noise.Sampler, path: str) -> None:
+    """Stop the sampler and put its run and per-repetition summaries in environment.json
+    (outside `comparable`: noise describes the run, it does not define the environment)."""
+    sampler.stop()
+    rows = host_noise.read(path)
+    env["host_noise"] = {
+        "file": "host_noise.csv", "interval_s": NOISE_INTERVAL_S,
+        "what": "host load average and CPU idle, Docker containers running (all, this benchmark's kc-*, "
+                "rust:* builds) and Lima VMs running, sampled during the run; nothing was stopped",
+        "run": host_noise.summarize(rows),
+        "per_repetition": {tag: host_noise.summarize(host_noise.window(rows, start, end))
+                           for tag, (start, end) in sorted(ctx.get("rep_windows", {}).items())},
+    }
 
 
 def mint_certs(directory: str) -> None:
@@ -810,6 +830,10 @@ def main(argv: list[str] | None = None) -> int:
     fschema.write_header(ctx["timeline"], fschema.TIMELINE_COLUMNS)
     phase1.save_environment(run_dir, env)
     log(f"run {run_id} -> {run_dir} (fingerprint {ctx['fingerprint']}, raw data in {work})")
+    # The host is shared and not quieted; what else ran is sampled, not assumed away.
+    noise_path = os.path.join(run_dir, "host_noise.csv")
+    sampler = host_noise.Sampler(noise_path, NOISE_INTERVAL_S)
+    sampler.start()
     try:
         for fault in faults:
             for rep in range(1, args.reps + 1):
@@ -817,6 +841,7 @@ def main(argv: list[str] | None = None) -> int:
                     run_rep(ctx, system, fault, rep)
                     phase1.save_environment(run_dir, env)
     except BaseException as exc:
+        record_host_noise(env, ctx, sampler, noise_path)
         env["run_state"] = "interrupted"
         env["events"].append({"at": utc_now(), "event": f"run interrupted: {exc!r}"[:900]})
         phase1.save_environment(run_dir, env)
@@ -828,6 +853,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:  # best effort on the way out
                 pass
         raise
+    record_host_noise(env, ctx, sampler, noise_path)
     env["run_state"] = "complete"
     env["finished_at"] = utc_now()
     env["fingerprint_check"] = schema.fingerprint(env)

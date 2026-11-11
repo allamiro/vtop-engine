@@ -518,8 +518,34 @@ def write_markdown(run: fschema.FailoverRun, images: dict[str, str], csv_rel: di
             "(`environment.json`, `other_containers_at_start_count`). Both systems shared the VM with them, one "
             "system at a time; they are noise neither system chose, and part of why these are laptop numbers.")
         add("")
+    noise = host_noise_paragraph(env)
+    if noise:
+        add(noise)
+        add("")
     with open(doc_path, "w") as handle:
         handle.write("\n".join(lines))
+
+
+def host_noise_paragraph(env: dict[str, Any]) -> str:
+    """The host contention the run recorded (environment.json `host_noise`), if it recorded any."""
+    noise = env.get("host_noise") or {}
+    run = noise.get("run") or {}
+    if not run.get("samples"):
+        return ""
+    per = noise.get("per_repetition") or {}
+    busiest = sorted(((s.get("load1_max", 0), tag) for tag, s in per.items() if s.get("samples")), reverse=True)[:3]
+    lima = run.get("lima_running_seen") or []
+    idle = (f"; CPU idle {run['cpu_idle_pct_mean']}% on average, {run['cpu_idle_pct_min']}% at the lowest"
+            if run.get("cpu_idle_pct_mean") is not None else "")
+    return (f"**Host contention, recorded, not removed.** The host was shared and nothing was stopped. Sampled "
+            f"every {noise['interval_s']} s ({run['samples']} samples, `{noise['file']}`): one-minute load average "
+            f"{run['load1_mean']} on average and {run['load1_max']} at the highest, on "
+            f"{env['comparable']['host_logical_cpus']} logical CPUs{idle}; up to {run['docker_other_max']} Docker "
+            f"containers besides this benchmark's, of them up to {run['docker_rust_builds_max']} `rust:` build "
+            "containers; Lima VMs running: " + (", ".join(f"`{name}`" for name in lima) if lima else "none")
+            + ". Each repetition's own summary is in `environment.json` (`host_noise.per_repetition`)"
+            + ("; the highest load maxima were in " + ", ".join(f"{tag} ({load})" for load, tag in busiest)
+               if busiest else "") + ".")
 
 
 def _sentence(text: str) -> str:
