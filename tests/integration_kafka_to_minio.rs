@@ -25,6 +25,36 @@
 use vtop_adapters::kafka_source::build_client_config;
 use vtop_core::config::KafkaSourceConfig;
 
+/// Run `$op` (an expression ending in `.await` that yields a `Result`),
+/// waiting out a group coordinator that is not ready yet (#665): a warm-up
+/// error is retried, a little later, until [`COORDINATOR_WARM_UP`] runs out;
+/// any other error fails the test at once with `$what`. Every broker call in
+/// this file that needs the group coordinator - a read (it asks for the
+/// group's committed offsets), a commit, a rewind - goes through this or
+/// through [`group_offset`], so a broker that has just started cannot fail a
+/// test for a reason that is not the test's.
+macro_rules! through_warm_up {
+    ($what:expr, $op:expr) => {{
+        let deadline = std::time::Instant::now() + COORDINATOR_WARM_UP;
+        loop {
+            match $op {
+                Ok(value) => break value,
+                Err(e)
+                    if coordinator_warming_up(&format!("{e} {e:?}"))
+                        && std::time::Instant::now() < deadline =>
+                {
+                    eprintln!(
+                        "{}: the group coordinator is not ready yet ({e}); retrying",
+                        $what
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                Err(e) => panic!("{}: {e}", $what),
+            }
+        }
+    }};
+}
+
 fn kafka_cfg(bootstrap: &str, group: &str) -> KafkaSourceConfig {
     KafkaSourceConfig {
         enabled: true,
@@ -106,10 +136,12 @@ async fn read_returns_records_from_a_non_empty_topic() {
     // the AGGREGATE: the stall this test guards against is "no records at all",
     // which is partition-count independent. Testing only reads[0] would let a
     // regression that starves every partition but the first slip through.
-    let reads = adapter
-        .read_batch_candidates(&src, 100, 1 << 20, std::time::Duration::from_secs(10))
-        .await
-        .expect("read failed");
+    let reads = through_warm_up!(
+        "read failed",
+        adapter
+            .read_batch_candidates(&src, 100, 1 << 20, std::time::Duration::from_secs(10))
+            .await
+    );
 
     let total: usize = reads.iter().map(|r| r.records.len()).sum();
     assert!(
@@ -148,10 +180,11 @@ async fn reading_alone_does_not_advance_progress() {
     let mut a = KafkaSource::new(kafka_cfg(&bootstrap(), &group), TelemetryFormat::Cef).unwrap();
     let src = seeded_topic(&mut a).await;
 
-    let first = a
-        .read_batch_candidates(&src, 100, 1 << 20, std::time::Duration::from_secs(10))
-        .await
-        .unwrap();
+    let first = through_warm_up!(
+        "read_batch_candidates failed",
+        a.read_batch_candidates(&src, 100, 1 << 20, std::time::Duration::from_secs(10))
+            .await
+    );
     // Aggregate over partitions: the invariant is about data being re-readable
     // anywhere in the topic, not about which partition it landed in.
     let first_total: usize = first.iter().map(|r| r.records.len()).sum();
@@ -162,10 +195,11 @@ async fn reading_alone_does_not_advance_progress() {
     // A new consumer in the same group must re-read the same data, because
     // nothing was ever committed.
     let mut b = KafkaSource::new(kafka_cfg(&bootstrap(), &group), TelemetryFormat::Cef).unwrap();
-    let replay = b
-        .read_batch_candidates(&src, 100, 1 << 20, std::time::Duration::from_secs(10))
-        .await
-        .unwrap();
+    let replay = through_warm_up!(
+        "read_batch_candidates failed",
+        b.read_batch_candidates(&src, 100, 1 << 20, std::time::Duration::from_secs(10))
+            .await
+    );
     let replay_total: usize = replay.iter().map(|r| r.records.len()).sum();
     assert!(
         replay_total > 0,
@@ -236,10 +270,12 @@ async fn one_pass_reads_many_topics_and_demuxes_by_marker_topic() {
             format: seeded.format.clone(),
         },
     ];
-    let report = adapter
-        .read_all_batch_candidates(&sources, 1000, 1 << 20, std::time::Duration::from_secs(10))
-        .await
-        .expect("multiplexed read failed");
+    let report = through_warm_up!(
+        "multiplexed read failed",
+        adapter
+            .read_all_batch_candidates(&sources, 1000, 1 << 20, std::time::Duration::from_secs(10))
+            .await
+    );
 
     assert_eq!(
         report.outcomes.len(),
@@ -282,10 +318,12 @@ async fn one_pass_reads_many_topics_and_demuxes_by_marker_topic() {
     producer
         .flush(std::time::Duration::from_secs(10))
         .expect("flush second round");
-    let report2 = adapter
-        .read_all_batch_candidates(&sources, 1000, 1 << 20, std::time::Duration::from_secs(10))
-        .await
-        .expect("second multiplexed read failed");
+    let report2 = through_warm_up!(
+        "second multiplexed read failed",
+        adapter
+            .read_all_batch_candidates(&sources, 1000, 1 << 20, std::time::Duration::from_secs(10))
+            .await
+    );
     let b_idx = sources
         .iter()
         .position(|s| s.source_name == topic_b)
@@ -377,10 +415,12 @@ async fn oversized_topic_is_isolated_and_retried_after_budget_change() {
     )
     .unwrap();
 
-    let first = adapter
-        .read_all_batch_candidates(&sources, 100, 16, std::time::Duration::from_secs(10))
-        .await
-        .expect("one bad topic must not fail the shared pass");
+    let first = through_warm_up!(
+        "one bad topic must not fail the shared pass",
+        adapter
+            .read_all_batch_candidates(&sources, 100, 16, std::time::Duration::from_secs(10))
+            .await
+    );
     let oversized_error = first.outcomes[0]
         .result
         .as_ref()
@@ -400,10 +440,12 @@ async fn oversized_topic_is_isolated_and_retried_after_budget_change() {
         "healthy topic was discarded with its peer"
     );
 
-    let retry = adapter
-        .read_all_batch_candidates(&sources, 100, 64, std::time::Duration::from_secs(10))
-        .await
-        .expect("retry pass");
+    let retry = through_warm_up!(
+        "retry pass",
+        adapter
+            .read_all_batch_candidates(&sources, 100, 64, std::time::Duration::from_secs(10))
+            .await
+    );
     let retried_records: usize = retry.outcomes[0]
         .result
         .as_ref()
@@ -434,10 +476,11 @@ async fn commit_advances_progress_for_a_new_consumer() {
     let mut a = KafkaSource::new(kafka_cfg(&bootstrap(), &group), TelemetryFormat::Cef).unwrap();
     let src = seeded_topic(&mut a).await;
 
-    let read = a
-        .read_batch_candidates(&src, 1000, 1 << 20, std::time::Duration::from_secs(10))
-        .await
-        .unwrap();
+    let read = through_warm_up!(
+        "read_batch_candidates failed",
+        a.read_batch_candidates(&src, 1000, 1 << 20, std::time::Duration::from_secs(10))
+            .await
+    );
     let read_total: usize = read.iter().map(|r| r.records.len()).sum();
     assert!(read_total > 0, "precondition: topic has records");
 
@@ -446,17 +489,19 @@ async fn commit_advances_progress_for_a_new_consumer() {
     // only the first would leave the rest replayable and the assertion below
     // would (correctly) fail.
     for r in &read {
-        a.commit_progress(&r.progress_end)
-            .await
-            .expect("commit_progress failed");
+        through_warm_up!(
+            "commit_progress failed",
+            a.commit_progress(&r.progress_end).await
+        );
     }
     drop(a);
 
     let mut b = KafkaSource::new(kafka_cfg(&bootstrap(), &group), TelemetryFormat::Cef).unwrap();
-    let after = b
-        .read_batch_candidates(&src, 1000, 1 << 20, std::time::Duration::from_secs(5))
-        .await
-        .unwrap();
+    let after = through_warm_up!(
+        "read_batch_candidates failed",
+        b.read_batch_candidates(&src, 1000, 1 << 20, std::time::Duration::from_secs(5))
+            .await
+    );
     let after_total: usize = after.iter().map(|r| r.records.len()).sum();
     assert!(
         after_total == 0,
@@ -693,22 +738,10 @@ fn only_a_coordinator_that_is_not_ready_yet_is_waited_out() {
 async fn stale_commit(topic: &str, group: &str, end: i64) -> i64 {
     let mut a = KafkaSource::new(kafka_cfg(&bootstrap(), group), TelemetryFormat::Raw).unwrap();
     let marker = kafka_marker(topic, group, 0, end);
-    let deadline = std::time::Instant::now() + COORDINATOR_WARM_UP;
-    loop {
-        match a.commit_progress(&marker).await {
-            Ok(()) => break,
-            Err(e)
-                if coordinator_warming_up(&e.to_string())
-                    && std::time::Instant::now() < deadline =>
-            {
-                eprintln!("stale commit: the group coordinator is not ready yet ({e}); retrying");
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-            Err(e) => {
-                panic!("Kafka refused the stale commit; the premise of #614 no longer holds: {e}")
-            }
-        }
-    }
+    through_warm_up!(
+        "Kafka refused the stale commit; the premise of #614 no longer holds",
+        a.commit_progress(&marker).await
+    );
     // Read it back: a commit that was dropped, or landed elsewhere, must not
     // pass as planted.
     let at = group_offset(topic, group);
@@ -792,10 +825,12 @@ async fn read_until_a_new_commit(engine: &mut vtop_cli::Engine) -> Vec<i64> {
         .map(|b| b.batch_id)
         .collect();
     for _ in 0..15 {
-        engine
-            .process_once(vtop_core::types::SourceType::Kafka)
-            .await
-            .expect("a read pass");
+        through_warm_up!(
+            "a read pass",
+            engine
+                .process_once(vtop_core::types::SourceType::Kafka)
+                .await
+        );
         let mut starts: Vec<i64> = engine
             .store
             .list_batches()
@@ -1147,10 +1182,12 @@ async fn a_pass_that_reads_nothing_does_not_stop_the_consumer_reading() {
         KafkaSource::new(kafka_cfg(&bootstrap(), &group), TelemetryFormat::Cef).unwrap();
     // A concrete position for the busy topic, as recovery or the ledger's
     // seed gives one; the empty topic resolves at Offset::Stored.
-    adapter
-        .replay_from_marker(&kafka_marker(&busy, &group, 0, 0))
-        .await
-        .expect("rewind");
+    through_warm_up!(
+        "rewind",
+        adapter
+            .replay_from_marker(&kafka_marker(&busy, &group, 0, 0))
+            .await
+    );
     let sources = vec![kafka_source(&busy), kafka_source(&quiet)];
 
     let mut warm = 0;
@@ -1404,10 +1441,12 @@ async fn a_single_partition_that_stops_right_after_its_first_commit_is_read_agai
             }
         }
     }
-    adapter
-        .commit_progress(&kafka_marker(&topic, &group, 0, last_end))
-        .await
-        .expect("commit the first batch");
+    through_warm_up!(
+        "commit the first batch",
+        adapter
+            .commit_progress(&kafka_marker(&topic, &group, 0, last_end))
+            .await
+    );
     adapter
         .stop_fetcher_behind_the_adapter(&topic, 0)
         .expect("stop the fetcher");
