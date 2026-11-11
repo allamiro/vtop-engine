@@ -919,6 +919,53 @@ mod tests {
         );
     }
 
+    /// The spool counterpart of the file source's test of the same name
+    /// (#621, the shared `continuity::proves`): equal first-page fingerprints
+    /// in the marker and the cursor say both read the same content, not that
+    /// the spool at the path STILL holds it. A spool rewritten in place - the
+    /// same inode, longer, other first bytes; spool markers record no tail -
+    /// passed every other check and lent the old content's committed byte to a
+    /// range of it, retiring that range as SUPERSEDED for good (#567).
+    #[cfg(unix)]
+    #[test]
+    fn equal_fingerprints_still_have_to_match_the_spool_now_at_the_path() {
+        use std::os::unix::fs::MetadataExt;
+        let old: Vec<u8> = (0..100u8).map(|i| b'a' + i % 26).collect();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&old).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let content = ContentFingerprint::of(&old);
+        let marker = ProgressMarker::SyslogSpool {
+            spool_id: "s".into(),
+            path: path.clone(),
+            inode: Some(inode),
+            start_byte: 0,
+            end_byte: 30,
+            received_time_start: None,
+            received_time_end: None,
+            file_size: Some(100),
+            content_fingerprint: content.clone(),
+        };
+        let mut s = SyslogSpoolSource::new(vec![path.clone()]);
+        s.seed_committed_from(&path, 40, Some(inode), Some(100), content);
+        assert_eq!(s.committed_through(&marker), Some(40), "the spool read");
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[b'Z'; 120])
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(
+            s.committed_through(&marker),
+            None,
+            "the spool at the path no longer starts with what both recorded"
+        );
+    }
+
     #[tokio::test]
     async fn reads_spool_and_resumes() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
