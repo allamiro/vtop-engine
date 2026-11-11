@@ -226,6 +226,61 @@ reopen quietly.
   levels) a data node records the report without verdicts AND without the
   Unknown answers, which that form's readers would count by offset. Records
   written before verdicts carry none and are judged exactly as before.
+- **#611** - the fence discarded acknowledged records before the vote was
+  read. A candidate adopts the new epoch at its own tail before it sends its
+  history, so a replica holding records the candidate never received compared
+  the two as diverged at the candidate's tail and truncated down to it,
+  provided its own high-water mark was at or below that. In a three-replica
+  range a record the dead leader and that replica had acknowledged was lost,
+  and the replica then voted for the candidate that lacked it. A fence now discards a suffix only
+  when the candidate holds a record at the divergence point written under an
+  epoch newer than every record discarded, which is proof that none of them
+  was acknowledged. Otherwise the replica keeps the records, answers with its
+  full offset, the candidate counts that answer, and the election restriction
+  refuses the candidate and names the replica as the one to lead. A replica
+  that kept such a suffix and was outvoted discards it on the established
+  leader's first append or committed high-water mark past its start,
+  instead of acking a record it does not hold (#261) or exposing the kept
+  records as committed. Until it is settled, that dispute caps the replica's
+  acks and reconnect status at its start.
+  **The protection is the fenced replica's, so it holds only on upgraded
+  replicas.** There is no wire or feature-level change and the fence frames
+  are identical, so nothing tells a candidate which replicas run this
+  release. A replica still on an older release truncates exactly as before,
+  during its own fence and before any candidate judges its answer. Until
+  every data node of a range runs this release, a failover can still lose an
+  acknowledged write that way. PRODUCTION_HA's upgrade procedure says how to
+  keep the rolling upgrade itself from triggering it. An older candidate
+  facing an upgraded replica judges the kept answer refused (its offset is
+  higher) or Unknown, never a grant.
+- **#635** - the #611 dispute lived in memory only. A replica restarted
+  between the fence reply that kept the suffix and its settlement came back
+  holding the old records with nothing marking them, reported its full log,
+  and acked the new leader's record at the disputed offset as a duplicate of
+  a different one (#261). The dispute (fence epoch, first disputed offset,
+  and, when this replica's history can say, the epoch that owned that
+  offset) is now written beside the fencing-epoch journal, as
+  `fencing-epochs.kept-dispute`, and fsynced before the fence replies. Every
+  retirement, whether by settlement, truncation, a newer fence or the node's
+  own fence as a candidate, clears it durably before anything is acked past
+  it. A restart restores it, so it caps acks and status and is settled
+  exactly as before. A record the log has provably moved past, or one that
+  starts below the replica's committed mark or below the caller's tail its
+  fence bounded it by, is discarded at open, never settled over the new
+  leader's records. A lease adoption of a newer epoch is not such evidence:
+  adoption alone retires nothing. A dispute is retired only by its
+  settlement, a truncation past its start, a newer fence, or the node's own
+  fence as a candidate, and each of these clears the record.
+  The record holds two checksummed frames, so a crash while it changes
+  reads back the old state or the new one, never neither. **Older releases refuse the
+  directory while a dispute may be pending:** the journal's header is
+  version 2 from before the record is written until after it is cleared,
+  and every earlier release opens only version 1, so a downgrade cannot
+  silently serve the suffix. A crash between clearing the record and
+  lowering the header leaves the header at 2 until this release next opens
+  the directory, which lowers it. A crash sweep
+  (`kept_dispute_crash_sweep.rs`) cuts the fence and the settlement at every
+  storage operation and every byte of every write.
 
 One observation rode along without becoming a fix: scenario 09 once left a
 promotion unacquired within its deadline (#318). The flake has not recurred —
