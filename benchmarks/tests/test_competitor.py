@@ -141,7 +141,7 @@ SCRIPTED_WINDOW_SECONDS = 0.3
 SCRIPTED_STEP_SECONDS = 0.05
 
 
-def stream_arrivals(text, opened_at, omit):
+def stream_arrivals(text, opened_at, omit, exchange=0.0):
     """Where each line of a scripted stream would ARRIVE, for a flow whose
     measured window opened at `opened_at`.
 
@@ -150,6 +150,12 @@ def stream_arrivals(text, opened_at, omit):
     clock is the one the module derives — the last measured interval ends where
     the receiver's summary says the window did — so a fixture with a hole or an
     uneven stream is dated exactly as a live one would be.
+
+    EXCEPT THE LAST INTERVAL (#481, measured on iperf 3.21). iperf3 writes that
+    line, and the end event after it, only once its end-of-test exchange with
+    the server has crossed the link: `exchange` is how long that took. Zero is
+    an unshaped link; about two round trips plus the bottleneck's queue is a
+    shaped one.
     """
     events = [json.loads(line) for line in text.splitlines() if line.strip()]
     measured = [event["data"]["sum"] for event in events
@@ -157,18 +163,22 @@ def stream_arrivals(text, opened_at, omit):
     end = next((event["data"] for event in events if event["event"] == "end"), {}) or {}
     seconds = float((end.get("sum_received") or {}).get("seconds", 0.0))
     origin = (max(float(entry["end"]) for entry in measured) - seconds) if measured else 0.0
+    final = max((index for index, event in enumerate(events) if event["event"] == "interval"),
+                default=None)
     stamps = []
-    for event in events:
+    for index, event in enumerate(events):
         if event["event"] == "interval":
             entry = event["data"]["sum"]
             if entry.get("omitted"):
                 stamps.append(opened_at - omit + float(entry["end"]))
+            elif index == final:
+                stamps.append(opened_at + seconds + exchange)
             else:
                 stamps.append(opened_at + float(entry["end"]) - origin)
         elif event["event"] == "start":
             stamps.append(opened_at - omit)
         else:
-            stamps.append(opened_at + seconds)
+            stamps.append(opened_at + seconds + exchange)
     return stamps
 
 
@@ -189,7 +199,8 @@ class ScriptedCompetitor:
     """
 
     def __init__(self, rates, seconds=30.0, refuse=None, delay=0.0, output=None, during=None,
-                 contended_report=None, setup=0.0, teardown=0.0, stamps=None):
+                 contended_report=None, setup=0.0, teardown=0.0, stamps=None,
+                 exchange=0.0):
         self.rates = list(rates)
         self.seconds = seconds
         self.refuse = refuse
@@ -214,6 +225,9 @@ class ScriptedCompetitor:
         # A test about a runner whose stamps are WRONG supplies a function from
         # the honest stamps to the ones it returns.
         self.stamps = stamps
+        # How long iperf3's end-of-test exchange with the server took: the
+        # report's final line is written only after it (see stream_arrivals).
+        self.exchange = exchange
         self.entered_at = None
         self.opened_at = None
         self.calls = []
@@ -247,7 +261,7 @@ class ScriptedCompetitor:
         else:
             text = iperf_report(self.rates.pop(0), SCRIPTED_WINDOW_SECONDS,
                                 step=SCRIPTED_STEP_SECONDS)
-        honest = stream_arrivals(text, self.opened_at, omit)
+        honest = stream_arrivals(text, self.opened_at, omit, self.exchange)
         returns_at = max(honest) + self.teardown
         time.sleep(max(0.0, returns_at - time.monotonic()))
         stamps = honest if self.stamps is None else self.stamps(honest)
@@ -1605,7 +1619,7 @@ def cycles_at(engine, placements):
 
 
 def run_with_report(report, vtop_bytes=2_400, placements=None, setup=0.0, teardown=0.0,
-                    stamps=None):
+                    stamps=None, exchange=0.0):
     """One contended run whose middle phase reports exactly `report`.
 
     The two solo windows stay flat and agreeing, so a drift refusal never fires
@@ -1615,7 +1629,8 @@ def run_with_report(report, vtop_bytes=2_400, placements=None, setup=0.0, teardo
     during = (cycles_at(engine, placements) if placements
               else cycles_inside_the_window(engine, [(0, vtop_bytes)]))
     box = ScriptedCompetitor([9.0, 8.0, 9.0], during=during, contended_report=report,
-                             setup=setup, teardown=teardown, stamps=stamps)
+                             setup=setup, teardown=teardown, stamps=stamps,
+                             exchange=exchange)
     with contended(scripted_spec(), vtop_bytes=engine, run=box, log=lambda _m: None) as handle:
         box.handle = handle
         handle.start_with_vtop()
@@ -2044,9 +2059,99 @@ def test_a_stream_that_arrived_in_a_burst_is_refused_rather_than_placed():
     with pytest.raises(ShapingError, match="buffered") as exc:
         run_with_report(overheaded_report(), placements=[(0.3, 1_000_000)],
                         stamps=lambda honest: [max(honest)] * len(honest))
-    assert "0.8" in str(exc.value) or "0.7" in str(exc.value), (
+    # Eight 0.1s lines stamped at once. The final one is not judged (it is
+    # written after the end-of-test exchange), so the seven that are, ending at
+    # 0.1-0.7s, place the opening 0.6s apart.
+    assert "0.600s" in str(exc.value), (
         "the refusal says how far the lines' placements disagreed, which is what separates a "
         "buffered stream from a jittery one")
+
+
+# What the end-of-test exchange cost on the shaped link in the two capped runs
+# that were refused (#481): 0.349s and 0.285s, against a 0.25s tolerance. Two
+# round trips of the lab's 100 ms link, plus the queue in front of the control
+# messages.
+SHAPED_EXCHANGE_SECONDS = 0.35
+
+
+def test_the_final_line_written_after_the_end_of_test_exchange_does_not_refuse_a_live_stream():
+    # THE FINDING (#481, measured on iperf 3.21). iperf3 takes the last
+    # interval's end when its test timer fires, then exchanges results with the
+    # server over the control connection, and prints that line only when the
+    # server answers. On a shaped link the exchange takes two round trips plus
+    # the queue, so that ONE line's placement is late by it while every other
+    # line is within a fraction of a millisecond. Judged with the rest, it
+    # refused two capped runs as "buffered" streams whose live lines were in
+    # step — the measurement the issue's acceptance criterion needs.
+    handle = run_with_report(overheaded_report(), placements=[(0.3, 1_000_000)],
+                             exchange=SHAPED_EXCHANGE_SECONDS)
+
+    assert handle.window_sync_spread_seconds < 0.05, (
+        f"the lines written as their intervals ended agree to within "
+        f"{handle.window_sync_spread_seconds}s; the final line's lateness is the end-of-test "
+        "exchange crossing the link, not the pipe, and must not be counted in the spread")
+    assert handle.window_final_line_delay_seconds == pytest.approx(
+        SHAPED_EXCHANGE_SECONDS, abs=0.05), (
+        "the final line's lateness is RECORDED rather than dropped: it is how long the "
+        "end-of-test exchange took on the shaped link, and a reader of the run can see it")
+    assert handle.vtop_attributed_cycles == 1 and handle.vtop_bytes_in_window == 1_000_000, (
+        "and the run goes on to place the window and charge it with the engine's cycle")
+    record = handle.describe()
+    assert record["competitor_window_final_line_delay_seconds"] == (
+        handle.window_final_line_delay_seconds), "the delay reaches summary.json"
+
+
+def test_the_window_is_placed_from_the_live_lines_and_never_from_the_final_one():
+    # The earliest estimate is the placement. Every line is late by its own
+    # write, so the late final line can never be the earliest — but a final
+    # line placed EARLY (a stamper or fixture bug) must not move the window
+    # either, because nothing about its stamp dates its interval's end.
+    def early_final(honest):
+        stamps = list(honest)
+        stamps[-2] -= 0.3  # the final interval's line; the end event is last
+        return stamps
+
+    handle = run_with_report(overheaded_report(), placements=[(0.6, 1_000_000)],
+                             setup=OVERHEAD_SECONDS, stamps=early_final)
+    assert handle.window_setup_seconds == pytest.approx(OVERHEAD_SECONDS, abs=0.1), (
+        f"the window opened {OVERHEAD_SECONDS}s after the launch and the live lines say so; "
+        f"a placement taken from the final line would have put it "
+        f"{handle.window_setup_seconds}s in")
+
+
+def test_a_late_line_inside_the_stream_is_still_refused():
+    # The exclusion is the final line and nothing else. A line in the MIDDLE of
+    # the stream that arrived late was not written as its interval ended, and
+    # that is the buffering this check exists for — so the tolerance still
+    # refuses it, at the same 0.25s.
+    def one_late(honest):
+        stamps = list(honest)
+        stamps[4] += SHAPED_EXCHANGE_SECONDS  # the fourth interval of eight
+        return stamps
+
+    with pytest.raises(ShapingError, match="buffered") as exc:
+        run_with_report(overheaded_report(), placements=[(0.3, 1_000_000)], stamps=one_late)
+    assert "0.350s" in str(exc.value), (
+        "the refusal names the spread the late middle line produced")
+
+
+def test_only_the_reports_final_interval_is_marked_as_written_after_the_exchange():
+    sample = parse_report(iperf_report(8.0, seconds=6.0, omit=3), spec(seconds=6, omit=3),
+                          "probe")
+    marks = [slot.dates_its_end for slot in sample.intervals]
+    assert marks == [True] * 5 + [False], (
+        f"of the six measured intervals only the last is written after the end-of-test "
+        f"exchange; got {marks}")
+
+    # A zero-length last entry (iperf3's rounding artifact) is dropped, and the
+    # mark goes with it rather than onto the line before, which WAS written live.
+    intervals = iperf_intervals([8.0] * 6)
+    intervals.append({"sum": {"start": 6.0, "end": 6.0, "seconds": 0.0, "bytes": 0,
+                              "omitted": False}})
+    sample = parse_report(iperf_report(8.0, seconds=6.0, intervals=intervals),
+                          spec(seconds=6), "probe")
+    assert all(slot.dates_its_end for slot in sample.intervals), (
+        "with the final entry dropped as zero-length, every remaining line was written live")
 
 
 def test_stamps_that_contradict_the_commands_own_two_ends_are_refused():

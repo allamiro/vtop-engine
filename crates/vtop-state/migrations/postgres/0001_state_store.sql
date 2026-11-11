@@ -70,7 +70,26 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
 );
 
 -- Database-level backstop for the verify-before-source-commit invariant.
+--
+-- A row is also born only as batching (#625): born verified, it could be
+-- committed without ever having been verified. Every engine release inserts
+-- only batching, so an older binary on an upgraded database is unaffected.
+-- CREATE OR REPLACE means re-running `vtopctl migrate` installs the new body.
+--
+-- Schema version marker: the first non-empty line of the body, the line right
+-- after `$fn$` (the body itself starts with that line's newline). Keep it
+-- there: engine startup (PgStateStore::check_schema) reads only that line,
+-- and refuses a trigger function whose body does not open with a marker of
+-- at least MIN_SCHEMA_VERSION, so a schema restored from an older
+-- archive, never re-migrated, or re-migrated by an older release (whose
+-- CREATE OR REPLACE installs its own, unmarked or lower-marked body) is
+-- reported as needing `vtopctl migrate`. It is in the body, not a COMMENT ON
+-- FUNCTION, because CREATE OR REPLACE keeps a comment. Version 2 is the first
+-- with the #625 insert check; bodies before it carry no marker. ANY change to
+-- the trigger or its function MUST bump this number and MIN_SCHEMA_VERSION
+-- together.
 CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$
+-- vtop-state-schema 2
 BEGIN
     IF NEW.state = 'source_committed' THEN
         IF TG_OP = 'INSERT' THEN
@@ -80,6 +99,10 @@ BEGIN
             RAISE EXCEPTION 'commit before verified: batch % is %', OLD.batch_id, OLD.state
                 USING ERRCODE = 'check_violation';
         END IF;
+    END IF;
+    IF TG_OP = 'INSERT' AND NEW.state <> 'batching' THEN
+        RAISE EXCEPTION 'batch % must be inserted as batching, not %', NEW.batch_id, NEW.state
+            USING ERRCODE = 'check_violation';
     END IF;
     RETURN NEW;
 END;

@@ -112,6 +112,16 @@ DEFAULTS: dict[str, Any] = {
     # per-connection toxic gives two flows no shared queue, and lib/shaping.py
     # refuses the combination by name.
     "shaping_competitor": "",
+    # THE OPERATOR EGRESS CEILING (#481): `upload.max_egress_bytes_per_second`,
+    # written through to the engine's config. "" = unset, which is the engine's
+    # own default and today's pipeline. Present — zero and sub-minimum values
+    # included — it is written as given, so the engine refuses what an
+    # operator's config would be refused for, and a backend that cannot shape
+    # its bytes refuses it at startup instead of running uncapped under a
+    # capped name. Measured against the engine's own
+    # vtop_upload_egress_bytes_total, which only `engine_mode: run` can scrape
+    # (benchmarks/egress_cap_check.py reads it).
+    "upload_max_egress_bytes_per_second": "",
 }
 
 
@@ -129,6 +139,32 @@ def reseed_count(volume: int, multiplier: float) -> int:
     # file fewer every round — permanently understating both bytes_seeded and
     # the very deficit this knob exists to create (review).
     return max(1, round(volume * multiplier))
+
+
+def initial_seed(scenario) -> int:
+    """The scenario's `initial_seed`: the RNG seed for the dataset generated
+    before the engine starts, or 0 for OS entropy (every scenario's behaviour
+    before the key existed, and still the default).
+
+    The concurrent seeder's rounds were already reproducible (seed 10000 +
+    round number); the up-front volume was not. For a scenario whose up-front
+    volume is two files, that draw alone decides whether the first seconds of
+    the window can feed the thing under test (#481, review), so a scenario may
+    pin it. Refused unless it is a non-negative integer: a typo must not fall
+    back to entropy and run a different workload under the same name.
+    """
+    raw = scenario.get("initial_seed", 0)
+    if raw in (None, ""):
+        return 0
+    if isinstance(raw, bool):
+        raise ValueError(f"initial_seed must be a non-negative integer, got {raw!r}")
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        raise ValueError(f"initial_seed must be a non-negative integer, got {raw!r}") from None
+    if value < 0:
+        raise ValueError(f"initial_seed must be a non-negative integer, got {raw!r}")
+    return value
 
 
 @dataclass

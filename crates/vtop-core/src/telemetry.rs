@@ -119,6 +119,21 @@ pub struct Metrics {
     /// retrying at the same width is the overload it is complaining about.
     /// `stage` says which upload (`object_upload`, `manifest_upload`).
     pub upload_throttled_total: IntCounterVec,
+
+    /// Request-body bytes admitted through the egress shaper (#481) — VTOP's
+    /// own account of what it handed the wire under
+    /// `upload.max_egress_bytes_per_second`, counted when a byte is released
+    /// to the HTTP client, retries included (a re-sent body passes the shaper
+    /// again). It is NOT a host network counter: TLS and HTTP framing, TCP
+    /// retransmission and request headers are not in it.
+    ///
+    /// EXPORTED ONLY WHEN A CAP IS CONFIGURED. With no cap there is no shaper
+    /// in the path — the pipeline is byte-for-byte today's — so nothing admits
+    /// bytes and the family carries no sample at all, rather than a zero that
+    /// would read as "nothing was uploaded". Unlabelled on purpose: the cap is
+    /// process-wide, so the account is too. Unshaped volume is
+    /// `bytes_out_total`.
+    pub upload_egress_bytes_total: IntCounterVec,
 }
 
 fn labels3() -> Vec<&'static str> {
@@ -200,6 +215,14 @@ impl Metrics {
             "Uploads the object store answered with a throttle (HTTP 429/503 or an S3 SlowDown/Throttling code) after the backend's own retries; a sustained rate means the store wants less concurrency, not more retries",
             vec!["tenant", "source_type", "format", "stage"],
         )?;
+        // Zero label dimensions, as a Vec rather than a plain counter: a vec
+        // with no child emits no sample, so the family appears only once the
+        // shaper creates its child — exactly when a cap is configured (#481).
+        let upload_egress_bytes_total = cv(
+            "upload_egress_bytes_total",
+            "Request-body bytes admitted through the upload egress shaper, retries included; present only when upload.max_egress_bytes_per_second is set. Application-layer accounting, not a host network counter",
+            vec![],
+        )?;
         let retention_lost_records_total = cv(
             "retention_lost_records_total",
             "Records source-side retention removed before the engine read them; any increase is data loss upstream of the archive (see logs for topic/partition)",
@@ -278,6 +301,7 @@ impl Metrics {
             source_read_errors_total,
             retention_lost_records_total,
             upload_throttled_total,
+            upload_egress_bytes_total,
         })
     }
 
@@ -373,5 +397,28 @@ mod tests {
                 "missing stage {s}"
             );
         }
+    }
+
+    #[test]
+    fn the_egress_counter_is_absent_until_a_shaper_touches_it() {
+        // A private registry, not the global one: another test in this binary
+        // may have created the child already. #481: with no cap there is no
+        // shaper, and a zero sample would read as "nothing was uploaded" to a
+        // harness summing it — so the family must carry NO sample until the
+        // shaper creates its child, and then an exact count.
+        let m = Metrics::new().unwrap();
+        let text = m.encode().unwrap();
+        assert!(
+            !text.contains("vtop_upload_egress_bytes_total"),
+            "an unshaped process must not export the egress account: {text}"
+        );
+        m.upload_egress_bytes_total
+            .with_label_values::<&str>(&[])
+            .inc_by(4096);
+        let text = m.encode().unwrap();
+        assert!(
+            text.contains("vtop_upload_egress_bytes_total 4096"),
+            "a shaped process exports the exact admitted count, unlabelled: {text}"
+        );
     }
 }
