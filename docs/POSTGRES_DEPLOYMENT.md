@@ -108,11 +108,13 @@ migration job per database; engine replicas should start only after it succeeds.
   (#625). Re-running `vtopctl migrate` replaces the trigger function in
   place. Every release inserts only `batching`, so an older engine on the
   upgraded schema is unaffected.
-- Schema version marker. The first line of the trigger function's body is
-  the SQL comment `-- vtop-state-schema 2`. Engine startup requires the
-  trigger to be enabled and its function body to carry a marker of at least
-  the version the engine was built for (2 since #625), not just a trigger
-  with that name. A missing or unparseable marker counts as an old schema.
+- Schema version marker. The first non-empty line of the trigger function's
+  body (`prosrc`) is the SQL comment `-- vtop-state-schema 2`, written on the
+  line right after `$fn$`. Engine startup reads only that line: it requires
+  the trigger to be enabled and its function body to open with a marker of
+  at least the version the engine was built for (2 since #625), not just a
+  trigger with that name. A missing or unparseable marker, or one on any
+  later line, counts as an old schema.
   An engine from this release therefore refuses to start, with instructions
   to run `vtopctl migrate`, until the migration has run, so run it before
   rolling out the engines, as above. The marker is part of the body, so

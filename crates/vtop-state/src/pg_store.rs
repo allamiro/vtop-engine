@@ -42,8 +42,9 @@ use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 /// operators apply the same artifact outside the engine if desired.
 const MIGRATION: &str = include_str!("../migrations/postgres/0001_state_store.sql");
 
-/// The invariant trigger's function body carries a line
-/// `-- vtop-state-schema N`. Startup requires at least this N. 2 is the first
+/// The first non-empty line of the invariant trigger's function body is
+/// `-- vtop-state-schema N` (the body starts with the newline after `$fn$`,
+/// hence "non-empty"). Startup requires at least this N. 2 is the first
 /// body that refuses an insert in any state but batching (#625); a schema from
 /// before it carries no marker. The marker lives in the body, not in a
 /// `COMMENT ON FUNCTION`, because `CREATE OR REPLACE` replaces the body but
@@ -52,14 +53,13 @@ const MIGRATION: &str = include_str!("../migrations/postgres/0001_state_store.sq
 const SCHEMA_MARKER_PREFIX: &str = "-- vtop-state-schema ";
 const MIN_SCHEMA_VERSION: u32 = 2;
 
-/// Whether the trigger function's body names a schema version this engine
-/// accepts. A missing or unparseable marker is an old schema.
+/// Whether the trigger function's body opens with a schema version this
+/// engine accepts. A marker anywhere but the first non-empty line, or a
+/// missing or unparseable one, is an old schema.
 fn schema_marker_is_current(function_body: Option<&str>) -> bool {
     function_body
-        .and_then(|body| {
-            body.lines()
-                .find_map(|line| line.trim().strip_prefix(SCHEMA_MARKER_PREFIX))
-        })
+        .and_then(|body| body.lines().map(str::trim).find(|line| !line.is_empty()))
+        .and_then(|line| line.strip_prefix(SCHEMA_MARKER_PREFIX))
         .and_then(|v| v.trim().parse::<u32>().ok())
         .is_some_and(|v| v >= MIN_SCHEMA_VERSION)
 }
@@ -758,6 +758,13 @@ mod security_tests {
             );
         }
         assert!(!schema_marker_is_current(None));
+        // Only the first non-empty line counts.
+        assert!(!schema_marker_is_current(Some(
+            "\nBEGIN\n-- vtop-state-schema 2\n    RETURN NEW;\nEND;\n"
+        )));
+        assert!(!schema_marker_is_current(Some(
+            "\n-- an earlier comment\n-- vtop-state-schema 2\nBEGIN\nEND;\n"
+        )));
         assert!(schema_marker_is_current(Some(&body(
             "-- vtop-state-schema 2"
         ))));

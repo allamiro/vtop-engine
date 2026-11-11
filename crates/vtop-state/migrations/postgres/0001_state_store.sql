@@ -76,9 +76,11 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
 -- only batching, so an older binary on an upgraded database is unaffected.
 -- CREATE OR REPLACE means re-running `vtopctl migrate` installs the new body.
 --
--- Schema version marker: the first line of the body. Engine startup
--- (PgStateStore::check_schema) refuses a trigger function whose body lacks
--- a marker of at least MIN_SCHEMA_VERSION, so a schema restored from an older
+-- Schema version marker: the first non-empty line of the body, the line right
+-- after `$fn$` (the body itself starts with that line's newline). Keep it
+-- there: engine startup (PgStateStore::check_schema) reads only that line,
+-- and refuses a trigger function whose body does not open with a marker of
+-- at least MIN_SCHEMA_VERSION, so a schema restored from an older
 -- archive, never re-migrated, or re-migrated by an older release (whose
 -- CREATE OR REPLACE installs its own, unmarked or lower-marked body) is
 -- reported as needing `vtopctl migrate`. It is in the body, not a COMMENT ON
