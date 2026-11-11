@@ -261,7 +261,9 @@ reopen quietly.
   starts below the replica's committed mark or below the caller's tail its
   fence bounded it by, is discarded at open, never settled over the new
   leader's records. A lease adoption of a newer epoch is not such evidence:
-  only a fence retires a dispute, and every retirement clears the record.
+  adoption alone retires nothing. A dispute is retired only by its
+  settlement, a truncation past its start, a newer fence, or the node's own
+  fence as a candidate, and each of these clears the record.
   The record holds two checksummed frames, so a crash while it changes
   reads back the old state or the new one, never neither. **Older releases refuse the
   directory while a dispute may be pending:** the journal's header is
