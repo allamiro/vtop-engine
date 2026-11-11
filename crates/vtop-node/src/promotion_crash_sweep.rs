@@ -1674,6 +1674,33 @@ fn a_second_failover_after_a_catch_up_still_finishes_with_two_agreeing_replicas(
     );
 }
 
+/// The index of `node`'s `ordinal`-th (from 1) `kind` operation on `file`
+/// in the clean run of `shape`. Reproductions name a crash point this way,
+/// not by bare index, so a change that adds a storage operation elsewhere
+/// (#640 added the lineage sidecar's probe at open) moves the index without
+/// moving the crash.
+fn nth_op(
+    shape: Shape,
+    setup: &[SimDiskState],
+    node: usize,
+    kind: TraceKind,
+    file: &str,
+    ordinal: usize,
+) -> u64 {
+    let clean = run(shape, Fault::None, setup);
+    clean.traces[node]
+        .iter()
+        .filter(|entry| entry.kind == kind && entry.path == Path::new(file))
+        .nth(ordinal - 1)
+        .unwrap_or_else(|| {
+            panic!(
+                "the clean {shape:?} run has no {kind:?} #{ordinal} on {}'s {file}",
+                NAMES[node]
+            )
+        })
+        .index
+}
+
 /// #640. R leads at 20 after catching C up on 5..10, and L, back before the
 /// election, has caught up too. R's producer-epoch journal entry is torn
 /// as it takes its marker, so R refuses to reopen and stays out (that
@@ -1685,42 +1712,25 @@ fn a_second_failover_after_a_catch_up_still_finishes_with_two_agreeing_replicas(
 #[test]
 #[ignore = "#640: caught-up records are filed under the adopted epoch, so two healthy replicas cannot prove a quorum"]
 fn reproduction_two_caught_up_replicas_cannot_prove_a_quorum_after_the_leader_is_lost() {
-    // The torn writes are chosen from the clean trace by path and kind, not
-    // by a fixed op index, so a change to earlier storage calls cannot make
-    // this tear something else (#646 review): every producer-epoch-journal
-    // entry R writes after setup, torn in the middle.
     let setup = setup_disks();
-    let shape = Shape::AckedLeaderReturns;
-    let clean = run(shape, Fault::None, &setup);
-    let journal_writes: Vec<_> = clean.traces[R]
-        .iter()
-        .filter(|entry| {
-            entry.index >= clean.first_op[R]
-                && entry.kind == TraceKind::HandleWrite
-                && entry.path == Path::new(PRODUCER_EPOCHS)
-                && entry.len > 1
-        })
-        .cloned()
-        .collect();
-    assert!(
-        !journal_writes.is_empty(),
-        "precondition: R writes producer-epoch-journal entries after setup"
+    let op = nth_op(
+        Shape::AckedLeaderReturns,
+        &setup,
+        R,
+        TraceKind::HandleWrite,
+        PRODUCER_EPOCHS,
+        6,
     );
-    for entry in journal_writes {
-        let fault = Fault::Storage {
-            node: R,
-            plan: FaultPlan::CrashDuringWrite {
-                op: entry.index,
-                byte_cut: entry.len as usize / 2,
-            },
-        };
-        let outcome = run(shape, fault, &setup);
-        assert!(
-            outcome.violations.is_empty(),
-            "{}",
-            outcome.report(shape, &fault)
-        );
-    }
+    let fault = Fault::Storage {
+        node: R,
+        plan: FaultPlan::CrashDuringWrite { op, byte_cut: 28 },
+    };
+    let outcome = run(Shape::AckedLeaderReturns, fault, &setup);
+    assert!(
+        outcome.violations.is_empty(),
+        "{}",
+        outcome.report(Shape::AckedLeaderReturns, &fault)
+    );
 }
 
 /// Found by the sweep, not explained by #635: the documented "absent
@@ -1734,9 +1744,19 @@ fn reproduction_two_caught_up_replicas_cannot_prove_a_quorum_after_the_leader_is
 #[ignore = "#641: a deposed leader that returns is never fenced and keeps its unacknowledged suffix under the mark"]
 fn reproduction_a_returning_deposed_leader_keeps_its_unacknowledged_suffix_under_the_mark() {
     let setup = setup_disks();
+    // R's second length probe of its producer-epoch journal: op 67 before
+    // #640 added a storage operation at open.
+    let op = nth_op(
+        Shape::AckedLeaderStaysDown,
+        &setup,
+        R,
+        TraceKind::HandleLen,
+        PRODUCER_EPOCHS,
+        2,
+    );
     let fault = Fault::Storage {
         node: R,
-        plan: FaultPlan::CrashBefore(67),
+        plan: FaultPlan::CrashBefore(op),
     };
     let outcome = run(Shape::AckedLeaderStaysDown, fault, &setup);
     assert!(
