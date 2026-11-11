@@ -3,8 +3,9 @@
 **Verified Telemetry Object Protocol (VTOP)**
 
 Status: Draft / proposed protocol
-Version: 0.2 (reference implementation specification; 0.2 adds the optional
-keyed BLAKE3 manifest authenticator, §11.2 and §18)
+Version: 0.3 (reference implementation specification; 0.2 added the optional
+keyed BLAKE3 manifest authenticator, §11.2 and §18; 0.3 makes a manifest's
+`source_progress` span the whole batch, §11.2)
 
 > This document describes a **proposed protocol** and accompanies a **reference implementation** ("VTOP Engine"). It is a draft for technical review and is part of an **invention-disclosure support package**. It does not describe a shipped standard.
 
@@ -266,7 +267,7 @@ A conformant manifest:
 | Field | Type | Requirement | Description |
 |-------|------|-------------|-------------|
 | `protocol` | string | MUST | Constant `"VTOP"`. |
-| `version` | string | MUST | Protocol version (e.g. `"0.2"`). |
+| `version` | string | MUST | Protocol version (e.g. `"0.3"`). See the `source_progress` note below for what `0.3` changed. |
 | `batch_id` | string | MUST | Unique batch identifier. |
 | `tenant` | string | MUST | Tenant/source-owner identity. |
 | `source_type` | enum | MUST | `kafka` \| `file` \| `syslog_spool`. |
@@ -295,6 +296,32 @@ prove authenticity because anyone who can rewrite the document can recompute
 it. When `manifest.mac` is required by local policy, changing any bound field
 without the secret key fails authentication. A shared-key MAC does not provide
 public verifiability or non-repudiation.
+
+**`source_progress` spans the whole batch (version `0.3`, #622).** A batch is
+often built from several reads of one source unit. Its `source_progress` names
+the unit (and, for a file, the identity the last read saw) with the FIRST
+read's start (`start_byte` / `start_offset`) and the LAST read's end, so the
+range is exactly what the object holds, and the `batch_id` (and so the object
+and manifest keys) carries the same range. One exception: when the first and
+last reads do not name the same unit (another topic, partition or consumer
+group; another path, spool or known inode - a batch that spans a rotation),
+the manifest keeps the last read's own range, because the markers do not prove
+what lies between. The engine seals a window at such a discontinuity, so this
+is not expected, but where it happens the batch's start is only in the ledger's
+`progress_start`, and the coverage audit reports the stretch as unproven.
+
+Manifests of version `0.2` and earlier carry the last read's start instead:
+for a batch of several reads the start is too high, and the batch's first
+records lie below it. The reference implementation does not rewrite them: a
+rewrite changes the self-hash the ledger recorded (`manifest_sha256`) and any
+MAC, and an archive under Object Lock / WORM retention forbids it. An unsigned
+manifest's self-hash can be recomputed by anyone who can write the object, so
+this is a policy and storage constraint, not something the format enforces. An
+audit of them **MUST** take a batch's start from the state-store ledger
+(`progress_start` of the row with the manifest's `batch_id`) or, where that
+row was pruned, from the prune digest that replaced it, not from the manifest;
+their end is correct. The field's shape did not change, so every released
+verifier verifies manifests of both versions.
 
 > The manifest is written at the `MANIFEST_UPLOADED` step, before storage-side verification, so its embedded `state`/`verification_status` reflect that point in time and its hash stays stable. The authoritative post-verification state (`VERIFIED` → `SOURCE_COMMITTED`) lives in the state store.
 

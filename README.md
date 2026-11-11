@@ -605,7 +605,7 @@ tests/integration_file_to_minio.rs
 ```json
 {
   "protocol": "VTOP",
-  "version": "0.2",
+  "version": "0.3",
   "batch_id": "vtop-20260618T150000Z-app_events-p0-481000-482499-1a2b3c4d",
   "tenant": "default",
   "source_type": "kafka",

@@ -530,6 +530,24 @@ inode only - and a fingerprint is compared only with one of the same length,
 so they never split a unit. See the ledger format note in
 [`ARCHITECTURE.md`](ARCHITECTURE.md) §7.2.
 
+The audit reads ranges from the ledger, never from manifests, and the ledger
+has always recorded a batch's first read's start. A reconciliation built from
+manifests alone must know their version (#622): from `0.3` a manifest's
+`source_progress` runs from the batch's first read's start to its last read's
+end, and the `batch_id` carries the same range - when both reads name the same
+unit (topic, partition and group; path, spool and inode). A batch whose reads
+name two units (one that spans a rotation; the engine seals at the
+discontinuity, so this is not expected) keeps the last read's range in its
+manifest and id, and its start is only in the ledger's `progress_start`; treat
+it as a `0.2` manifest below, and the audit reports the stretch as unproven,
+as it does any rotation-spanning window. A manifest of `0.2` or earlier
+(and its batch id) carries the LAST read's start, so for a batch built from
+several reads it claims less than the object holds and shows a false hole
+below it. For those, take the start from the ledger row with the manifest's
+`batch_id` (its `progress_start`), or from the prune digest that replaced the
+row; the end is right in both. See
+[`VTOP_PROTOCOL_DRAFT.md`](VTOP_PROTOCOL_DRAFT.md) §11.2.
+
 ---
 
 ## 7. Object storage, idempotency & Object Lock / WORM
@@ -775,6 +793,8 @@ path needed by the distributed options is already implemented (§6.3).
 | `upload.command_env_allowlist` | exact runtime environment names copied into an otherwise empty command environment |
 | `upload.create_bucket` | auto-create per-format buckets |
 | `upload.require_strong_verification` | defaults true — false explicitly permits size-only commit |
+| `upload.max_egress_bytes_per_second` | operator ceiling on the process's total upload body bytes per second (#481), unset by default. One token bucket per process, shared by every backend in it, in front of each `s3_native` object, manifest and multipart-part body — application-layer rate policy over kernel TCP, not a network-aware mechanism; no one-second window admits more than the cap, retries included. Headers and the small XML bodies of `CreateMultipartUpload`, `CompleteMultipartUpload` and `CreateBucket` are neither shaped nor counted. Other backends refuse it at startup. Accounted in `vtop_upload_egress_bytes_total`, exported only when set |
+| `upload.max_concurrency_ceiling` | operator maximum above the concurrency knobs (#481), unset by default: `batching.max_concurrent_batches`, `batching.adaptive_width.min_width` and `upload.transports.*.max_concurrency` above it are refused naming both numbers, and the adaptive width controller's ceiling and floor are clamped to it |
 | `partitioning.template` | object key layout |
 
 ### 13.2 Current environment variables — implemented
@@ -940,6 +960,33 @@ Short procedures now; expand into a full ops runbook before go-live.
   remains is the one way to stall the tier - that voter cannot decode the
   raise itself. A node that refuses to start with "written by a newer
   release" is an old binary on a newer log: upgrade it.
+- **Upgrading data nodes past #611:** the fix lives in the FENCED replica,
+  which keeps records a promotion candidate merely lacks instead of
+  truncating them. A replica still on an older release truncates as before,
+  and nothing on the wire tells the candidate which kind answered. So until
+  every data node of a range runs this release, a failover can still lose an
+  acknowledged write. That needs a replica holding acknowledged records
+  above its own committed mark, which it has not learned yet because the
+  leader acknowledges the producer before the mark reaches followers. A
+  rolling upgrade causes failovers, so keep it from triggering that:
+  1. Upgrade a range's followers before the node that leads it.
+  2. Before restarting the leader (or any node whose restart moves a
+     lease), stop producers to the range and wait until every follower's
+     `vtop_broker_cluster_committed_offset{topic,range}` equals the
+     leader's. A fence then cannot
+     truncate an acknowledged record on any replica, old or new: the
+     truncation guard refuses below the mark.
+  3. Resume producers once the new leader is serving.
+- **Rolling a data node back past #635:** a replica holding a suffix a fence
+  kept in dispute marks its fencing-epoch journal version 2 until the new
+  leader settles it, usually within one append. A crash between clearing the
+  dispute and lowering the header can leave it at 2 until this release next
+  opens the directory, which lowers it. A release before #635 refuses
+  to start on it with `fencing-epoch journal: unsupported version 2`. That is
+  deliberate: the older release would ack the new leader's records over the
+  disputed ones. Start the newer release again and let the range's leader
+  settle the dispute (the header returns to 1), or replace the replica from
+  scratch. Do not edit the header by hand.
 - **Lineage verdicts on promotion records (#577), feature level 6:** a
   promotion counts a fenced replica's answer only when the candidate could
   prove the replica's epoch history agrees with its own (or the replica
@@ -951,16 +998,46 @@ Short procedures now; expand into a full ops runbook before go-live.
   this candidate could prove" only when the proven answers fall short of
   that majority - for example when the reachable replicas include ones with
   records but no epoch history (a log that predates its journal, a journal
-  restarted empty). Repair those replicas (`vtopctl node repair` installs the source's
-  history) rather than lowering anything. Recording the verdicts needs
+  restarted empty). Repair those replicas from a replica that HAS epoch
+  history (`vtopctl node repair` installs the source's history), rather than
+  lowering anything. Three costs to plan for (#612):
+  - **A range that holds records but where no replica has epoch history
+    cannot promote, and repair cannot fix it.** That means logs whose
+    records predate their epoch journal on every replica, or journals lost
+    on every replica. A repair whose source has no history installs none,
+    and warns when it transferred records (a repair that moved none leaves
+    a replica that disputes nothing). Every candidate holding records is Unknown to itself and
+    stands aside, and a candidate holding none stands aside for them, so
+    the range goes unled. (A fresh, empty range is not affected: a
+    candidate at 0 disputes nothing and promotes.) The transition record shows
+    `Refused{QuorumUnavailable}`, the same as an ordinary missing quorum;
+    the data node's warning names the lineage cause. There is no
+    in-product remedy yet.
+  - **A replica whose only dispute with the candidate is below its retained
+    base is not counted.** The replica itself finds the retained records in
+    agreement (#408), but the candidate cannot see its base, so the answer
+    is Unknown. With one replica of three down, that replica is needed for
+    the majority, and promotion waits until it is repaired or the other
+    replica returns.
+  - **A candidate holding no records stands aside** only when a replica
+    holding records answers Unknown to it (a wiped disk at epoch 0, for
+    example). The replica with history wins the range instead. Facing
+    replicas that hold nothing either, it promotes as before.
+
+  Recording the verdicts needs
   `vtopctl meta enable-features --level 6` once every metadata voter runs
   this release; until then promotions are recorded without them (and
   without the uncounted answers). Upgrade every data node and the `vtopctl`
   you audit with BEFORE raising the level: an older one cannot decode a
   verdict-carrying transition record, so its published-floor read fails
   closed (the node will not promote) and its `meta transitions` errors.
-  Records written before the raise carry no verdicts and are judged as they
-  always were.
+  Records written without verdicts are judged as they always were, with
+  every answer in them counted by offset. That includes records written
+  before the raise. It also includes records written after it by a data
+  node still on an older release: that node does not judge lineage, so its
+  records count answers this release would mark Unknown. Nothing enforces
+  the upgrade order, so raise the level only after every data node runs this
+  release.
 - **Change a range's replica set (#553):** a range's quorum is counted over
   the set metadata records for it (`vtopctl meta replica-set --config
   meta-admin.yaml --topic-uuid T --range-uuid R`; every `vtopctl meta`

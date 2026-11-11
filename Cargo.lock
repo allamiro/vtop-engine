@@ -4164,6 +4164,8 @@ dependencies = [
  "bytes",
  "futures",
  "hex",
+ "http-body 1.0.1",
+ "prometheus",
  "quote",
  "rustix",
  "serde",

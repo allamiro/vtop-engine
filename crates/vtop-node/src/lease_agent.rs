@@ -140,6 +140,16 @@ pub trait CandidateLocalView: Send + Sync {
     fn sealed_prefix_end(&self) -> Option<u64> {
         None
     }
+    /// Where this view's log ENDS: every record it holds, durable or not
+    /// (#611, #616 review). The candidate judges whether a replica's
+    /// divergence concerns a record the candidate holds, and records past
+    /// its durable vote are still records it holds. `None` when the view
+    /// cannot say, which keeps every dispute below a replica's tail unproven.
+    /// Read after the fence: the log is stopped then, and a later read can
+    /// only be larger, which only makes the judgement stricter.
+    fn local_next_offset(&self) -> Option<u64> {
+        None
+    }
     /// Stop this view's log at `fencing_epoch` and return the vote — the
     /// committed offset AS STOPPED (review, #410, twice). Every REMOTE
     /// vote in the promotion probe is read from a log the fence RPC has
@@ -165,6 +175,10 @@ impl CandidateLocalView for LocalBroker {
         self.local_offsets().0
     }
 
+    fn local_next_offset(&self) -> Option<u64> {
+        Some(self.local_offsets().1)
+    }
+
     fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
         self.epoch_starts()
     }
@@ -179,6 +193,10 @@ impl CandidateLocalView for LocalBroker {
 impl CandidateLocalView for vtop_broker::replication::InProcessFollower {
     fn local_committed_offset(&self) -> u64 {
         self.local_committed_offset()
+    }
+
+    fn local_next_offset(&self) -> Option<u64> {
+        Some(self.next_offset())
     }
 
     fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
@@ -371,6 +389,19 @@ impl ReplicaPlaneProbe {
             .collect();
         let leader_epoch_starts = &leader_epoch_starts;
         let candidate_lineage = &candidate_lineage;
+        // What the candidate HOLDS, for judging which disputes concern its
+        // records at all (#611): its next offset, not its durable vote (#616
+        // review), since a record past the vote is still a record it holds.
+        // A candidate that could not stop its own log, or a view that cannot
+        // say where its log ends, has no tail to judge by; MAX keeps every
+        // dispute below a replica's tail unproven, as before.
+        let candidate_tail = match local_committed_offset {
+            Some(committed) => self
+                .view
+                .local_next_offset()
+                .map_or(u64::MAX, |next| next.max(committed)),
+            None => u64::MAX,
+        };
         // ONE deadline per follower for the lookup AND the fence (review of
         // #566): a fence timeout that started only after a slow lookup let
         // one follower outlast the round, and the round's own deadline then
@@ -488,6 +519,7 @@ impl ReplicaPlaneProbe {
                         &answered,
                         response.next_offset,
                         response.truncated_records,
+                        candidate_tail,
                     );
                     if lineage == vtop_meta::AnswerLineage::Unknown {
                         tracing::warn!(
@@ -498,8 +530,12 @@ impl ReplicaPlaneProbe {
                             candidate_history = candidate_lineage.len(),
                             "replica's lineage could not be proven against this \
                              candidate's, so its offset does not count toward the \
-                             promotion quorum (#577); a replica with records but no \
-                             epoch history needs `vtopctl node repair`"
+                             promotion quorum (#577). If candidate_history is 0, this \
+                             candidate cannot judge anyone and a replica with history \
+                             should lead. If replica_history is 0, `vtopctl node repair` \
+                             can restore it only from a source replica that HAS epoch \
+                             history; from a source without one it installs nothing \
+                             (#612)"
                         );
                     }
                     Some(response.local_committed_offset)
@@ -1446,6 +1482,29 @@ impl Promoter {
                                 && answer.local_committed_offset.is_some()
                                 && !answer.lineage.is_provable()
                         });
+                        // A candidate that holds NOTHING cannot judge a
+                        // replica that holds records (#612 Q3): with no
+                        // history of its own, every such answer is Unknown.
+                        // Before #607 this round was LeaderBehind and the
+                        // candidate stood aside. Without that, it held the
+                        // lease through the quorum-miss budget and could
+                        // re-win with no hold-off, keeping the replica that
+                        // holds the records off the range. The Unknown
+                        // answers are not counted here either. They only
+                        // establish that a replica better placed to lead
+                        // exists.
+                        let candidate_empty_behind_unproven = probes.iter().any(|answer| {
+                            answer.node_id == self.node_uuid
+                                && answer.local_committed_offset == Some(0)
+                        }) && probes.iter().any(|answer| {
+                            answer.node_id != self.node_uuid
+                                && !answer.lineage.is_provable()
+                                && answer
+                                    .local_committed_offset
+                                    .is_some_and(|offset| offset > 0)
+                        });
+                        let candidate_unproven =
+                            candidate_unproven || candidate_empty_behind_unproven;
                         if unproven > 0 {
                             tracing::warn!(
                                 range = %self.range_uuid,
@@ -1458,7 +1517,10 @@ impl Promoter {
                                  this candidate could prove (#577); answers whose epoch \
                                  history could not be compared are not counted, whatever \
                                  their offsets. A replica holding records with no epoch \
-                                 history needs `vtopctl node repair`"
+                                 history can be repaired (`vtopctl node repair`) only from a \
+                                 replica that has one. If NO replica of the range has epoch \
+                                 history, repair cannot restore it and the range cannot \
+                                 promote: there is no in-product remedy yet (#612)"
                             );
                         } else {
                             tracing::warn!(
@@ -5674,24 +5736,25 @@ mod tests {
         );
     }
 
-    /// #577, the control: a replica that took three records from a rival
-    /// leadership the candidate never followed is reconciled by the fence -
-    /// it discards them - and then answers on the candidate's lineage.
-    /// Reconciled answers count, so the same majority establishes.
+    /// #577, the control: a replica that took five records from a deposed
+    /// leadership is reconciled by the fence. It discards them and then
+    /// answers on the candidate's lineage. Reconciled answers count, so the
+    /// same majority establishes.
+    ///
+    /// The discard is proven safe (#611). The candidate holds records from 5
+    /// under the rival epoch, a leadership established after the old one,
+    /// and they are not the replica's. So the old epoch's records from 5
+    /// never reached a quorum.
     #[tokio::test]
     async fn the_real_probe_counts_a_replica_that_reconciled_before_answering() {
         let candidate_dir = tempfile::tempdir().unwrap();
-        let (candidate, _) = lineage_replica(candidate_dir.path(), Uuid::from_u128(1), 5);
+        let (candidate, candidate_meta) =
+            lineage_replica(candidate_dir.path(), Uuid::from_u128(1), 5);
+        candidate_meta.set(LINEAGE_RIVAL_EPOCH);
+        candidate.adopt_fencing_epoch(LINEAGE_RIVAL_EPOCH);
+        append_lineage_records(&candidate, LINEAGE_RIVAL_EPOCH, 5..8);
         let follower_dir = tempfile::tempdir().unwrap();
-        let (follower, meta) = lineage_replica(follower_dir.path(), Uuid::from_u128(2), 5);
-        meta.set(LINEAGE_RIVAL_EPOCH);
-        follower.adopt_fencing_epoch(LINEAGE_RIVAL_EPOCH);
-        append_lineage_records(&follower, LINEAGE_RIVAL_EPOCH, 5..8);
-        assert_eq!(
-            follower.epoch_starts().len(),
-            2,
-            "precondition: the rival's epoch"
-        );
+        let (follower, meta) = lineage_replica(follower_dir.path(), Uuid::from_u128(2), 10);
         meta.set(LINEAGE_NEW_EPOCH);
 
         let (probes, _stop) =
@@ -5705,7 +5768,7 @@ mod tests {
         assert_eq!(
             answer.lineage,
             vtop_meta::AnswerLineage::Reconciled {
-                truncated_records: 3
+                truncated_records: 5
             }
         );
         let promotion = crate::promotion::establish(&probes, 3, Uuid::from_u128(1), None);
@@ -5717,6 +5780,178 @@ mod tests {
                     ..
                 }
             ),
+            "{promotion:?}"
+        );
+    }
+
+    /// #611: the shape the control above used to have, which is the loss.
+    /// The replica took three records from a rival leadership the candidate
+    /// never followed. In a three-replica range the rival leader (replica 3,
+    /// now down) and this replica are a quorum, so they may be acknowledged.
+    /// The candidate holds nothing from 5, so it proves nothing against
+    /// them. The replica keeps them and answers 8, its answer counts, and
+    /// the vote restriction refuses the candidate. It used to discard them
+    /// and promote the candidate at 5.
+    #[tokio::test]
+    async fn a_replica_holding_a_rival_leaderships_records_refuses_a_candidate_without_them() {
+        let candidate_dir = tempfile::tempdir().unwrap();
+        let (candidate, _) = lineage_replica(candidate_dir.path(), Uuid::from_u128(1), 5);
+        let follower_dir = tempfile::tempdir().unwrap();
+        let (follower, meta) = lineage_replica(follower_dir.path(), Uuid::from_u128(2), 5);
+        meta.set(LINEAGE_RIVAL_EPOCH);
+        follower.adopt_fencing_epoch(LINEAGE_RIVAL_EPOCH);
+        append_lineage_records(&follower, LINEAGE_RIVAL_EPOCH, 5..8);
+        meta.set(LINEAGE_NEW_EPOCH);
+        let follower_view = follower.clone();
+
+        let (probes, _stop) =
+            probe_with_one_reachable_follower(candidate as Arc<dyn CandidateLocalView>, follower)
+                .await;
+        assert_eq!(
+            follower_view.next_offset(),
+            8,
+            "the fence discarded the rival leadership's records"
+        );
+        let answer = probes
+            .iter()
+            .find(|probe| probe.node_id == Uuid::from_u128(2))
+            .expect("replica 2 answers");
+        assert_eq!(answer.local_committed_offset, Some(8));
+        assert_eq!(answer.lineage, vtop_meta::AnswerLineage::Agreed);
+        let promotion = crate::promotion::establish(&probes, 3, Uuid::from_u128(1), None);
+        assert_eq!(
+            promotion,
+            crate::promotion::Promotion::CandidateBehindVoters {
+                candidate_offset: 5,
+                votes: 1,
+                required: 2,
+                most_complete: (Uuid::from_u128(2), 8),
+            }
+        );
+    }
+
+    /// #611, through the REAL probe and fence. Safety invariant: a record
+    /// acknowledged on a quorum survives every promotion, so no candidate
+    /// that lacks it is established.
+    ///
+    /// RF=3, leader L (replica 3), replicas R (replica 2) and C (the
+    /// candidate, node 1). L appended offsets 5..10 under the old epoch and
+    /// R acked them, so they reached a quorum {L, R} and L acknowledged the
+    /// producer. L died before R learned the commit mark had moved past 5,
+    /// so R's high-water mark is still 5. C never got 5..10 and wins the
+    /// next epoch.
+    ///
+    /// C adopts the new epoch at its own tail before it sends its history,
+    /// so R sees `[old@0, new@5]` against its own `[old@0, new@10]`. That
+    /// is not a disagreement about any record C holds: C holds nothing at
+    /// or above 5. R must keep 5..10 and answer 10, which refuses C the
+    /// vote (Raft §5.4.1) and names R as the replica that should lead.
+    #[tokio::test]
+    async fn a_replica_ahead_of_the_candidate_in_its_own_epoch_keeps_its_records_and_refuses() {
+        let candidate_dir = tempfile::tempdir().unwrap();
+        let (candidate, _) = lineage_replica(candidate_dir.path(), Uuid::from_u128(1), 5);
+        let follower_dir = tempfile::tempdir().unwrap();
+        let (follower, meta) = lineage_replica(follower_dir.path(), Uuid::from_u128(2), 10);
+        // R learned only that 0..5 committed; 5..10 are acknowledged, but
+        // the mark that says so never reached it.
+        follower.cluster_committed().advance_to(5);
+        meta.set(LINEAGE_NEW_EPOCH);
+        let follower_view = follower.clone();
+
+        let (probes, _stop) =
+            probe_with_one_reachable_follower(candidate as Arc<dyn CandidateLocalView>, follower)
+                .await;
+
+        assert_eq!(
+            follower_view.next_offset(),
+            10,
+            "the fence discarded {} acknowledged record(s) from replica 2 to agree \
+             with a candidate that simply never received them",
+            10 - follower_view.next_offset()
+        );
+        let answer = probes
+            .iter()
+            .find(|probe| probe.node_id == Uuid::from_u128(2))
+            .expect("replica 2 answers");
+        assert_eq!(
+            answer.local_committed_offset,
+            Some(10),
+            "replica 2 must answer with everything it holds: {answer:?}"
+        );
+        let promotion = crate::promotion::establish(&probes, 3, Uuid::from_u128(1), None);
+        assert_eq!(
+            promotion,
+            crate::promotion::Promotion::CandidateBehindVoters {
+                candidate_offset: 5,
+                votes: 1,
+                required: 2,
+                most_complete: (Uuid::from_u128(2), 10),
+            },
+            "a candidate missing acknowledged records 5..10 must be refused, and \
+             the replica holding them named"
+        );
+    }
+
+    /// #616 review (cubic P1): "the candidate holds nothing at or above the
+    /// divergence" must be judged against what the candidate HOLDS (its next
+    /// offset), not its durable frontier.
+    ///
+    /// The candidate holds epoch-18 records to 5 durably and its own epoch-19
+    /// records 5..8 not yet durable (fsync held), so it votes 5 but holds
+    /// 8. The replica holds epoch-18 records to 5 durably, a different
+    /// epoch-18 record at 5 and epoch-19 records 6..10, none durable. It
+    /// keeps them (nothing proves them unacknowledged) and answers 5.
+    /// Divergence at 5 is inside the candidate's held suffix, so the answer
+    /// is NOT proven. Judged against the vote of 5 it came back Agreed and
+    /// counted as a grant: a replica holding a different record at 5 than
+    /// the candidate would have established it.
+    #[tokio::test]
+    async fn a_divergence_inside_the_candidates_undurable_suffix_is_not_proven() {
+        let candidate_dir = tempfile::tempdir().unwrap();
+        let (candidate, candidate_meta) =
+            lineage_replica(candidate_dir.path(), Uuid::from_u128(1), 5);
+        candidate_meta.set(LINEAGE_RIVAL_EPOCH);
+        candidate.adopt_fencing_epoch(LINEAGE_RIVAL_EPOCH);
+        candidate.set_hold_fsync(true);
+        append_lineage_records(&candidate, LINEAGE_RIVAL_EPOCH, 5..8);
+        assert_eq!(
+            (candidate.local_committed_offset(), candidate.next_offset()),
+            (5, 8),
+            "precondition: the candidate holds more than it votes"
+        );
+
+        let follower_dir = tempfile::tempdir().unwrap();
+        let (follower, meta) = lineage_replica(follower_dir.path(), Uuid::from_u128(2), 5);
+        follower.set_hold_fsync(true);
+        append_lineage_records(&follower, LINEAGE_OLD_EPOCH, 5..6);
+        meta.set(LINEAGE_RIVAL_EPOCH);
+        follower.adopt_fencing_epoch(LINEAGE_RIVAL_EPOCH);
+        append_lineage_records(&follower, LINEAGE_RIVAL_EPOCH, 6..10);
+        meta.set(LINEAGE_NEW_EPOCH);
+        let follower_view = follower.clone();
+
+        let (probes, _stop) =
+            probe_with_one_reachable_follower(candidate as Arc<dyn CandidateLocalView>, follower)
+                .await;
+        assert_eq!(
+            follower_view.next_offset(),
+            10,
+            "precondition: the replica kept its records"
+        );
+        let answer = probes
+            .iter()
+            .find(|probe| probe.node_id == Uuid::from_u128(2))
+            .expect("replica 2 answers");
+        assert_eq!(
+            answer.lineage,
+            vtop_meta::AnswerLineage::Unknown,
+            "a replica disagreeing about a record the candidate holds was judged \
+             {:?}: {answer:?}",
+            answer.lineage
+        );
+        let promotion = crate::promotion::establish(&probes, 3, Uuid::from_u128(1), None);
+        assert!(
+            !matches!(promotion, crate::promotion::Promotion::Established { .. }),
             "{promotion:?}"
         );
     }
@@ -5759,6 +5994,50 @@ mod tests {
                 }
             ),
             "{promotion:?}"
+        );
+    }
+
+    /// #612 Q3, the shape through the REAL probe and fence: a lease-led
+    /// broker on a wiped disk (epoch 0, no records, no history) against a
+    /// follower with history and ten records. The follower's answer is
+    /// Unknown, because nothing can be compared with an empty vector. The
+    /// candidate's own 0 is Agreed. The round is a quorum miss with one
+    /// unproven answer, which is the case the promoter now stands aside on.
+    #[tokio::test]
+    async fn the_real_probe_leaves_an_empty_candidate_unable_to_judge_a_replica_with_records() {
+        let candidate_dir = tempfile::tempdir().unwrap();
+        let candidate = Arc::new(test_broker(candidate_dir.path(), 0));
+        assert!(candidate.epoch_starts().is_empty(), "precondition");
+        let follower_dir = tempfile::tempdir().unwrap();
+        let (follower, meta) = lineage_replica(follower_dir.path(), Uuid::from_u128(2), 10);
+        meta.set(LINEAGE_NEW_EPOCH);
+
+        let (probes, _stop) =
+            probe_with_one_reachable_follower(candidate as Arc<dyn CandidateLocalView>, follower)
+                .await;
+        let own = probes
+            .iter()
+            .find(|probe| probe.node_id == Uuid::from_u128(1))
+            .expect("the candidate answers");
+        assert_eq!(
+            (own.local_committed_offset, own.lineage),
+            (Some(0), vtop_meta::AnswerLineage::Agreed)
+        );
+        let answer = probes
+            .iter()
+            .find(|probe| probe.node_id == Uuid::from_u128(2))
+            .expect("replica 2 answers");
+        assert_eq!(
+            (answer.local_committed_offset, answer.lineage),
+            (Some(10), vtop_meta::AnswerLineage::Unknown)
+        );
+        assert_eq!(
+            crate::promotion::establish(&probes, 3, Uuid::from_u128(1), None),
+            crate::promotion::Promotion::QuorumUnavailable {
+                answered: 1,
+                required: 2,
+                unproven: 1,
+            }
         );
     }
 
@@ -5861,6 +6140,72 @@ mod tests {
         assert!(!lost.ensure(7).await);
         assert!(!lost.take_quorum_miss());
         assert!(lost.take_stand_aside(), "an eligibility verdict");
+    }
+
+    /// #612 Q3: a candidate that holds NOTHING (a wiped disk, a lease-led
+    /// broker at epoch 0) has no history, so every follower holding records
+    /// answers Unknown and the round is a quorum miss. Its own answer is
+    /// Agreed (0 disputes nothing), so it used to hold the lease for the
+    /// quorum-miss budget and could re-win with no hold-off. Before #607
+    /// the same round was LeaderBehind and the candidate stood aside. It
+    /// stands aside again. The Unknown answers still count for nothing.
+    /// They only tell an empty candidate that a replica holding records
+    /// exists, and that replica is the one that can prove them.
+    #[tokio::test]
+    async fn an_empty_candidate_stands_aside_for_a_replica_holding_records_it_cannot_judge() {
+        let recorder = Arc::new(Recorder::default());
+        let mut empty = promoter(
+            Arc::clone(&recorder),
+            Some(fixed(
+                vec![
+                    at(1, Some(0)),
+                    at_with(2, 100, vtop_meta::AnswerLineage::Unknown),
+                    at(3, None),
+                ],
+                3,
+            )),
+        );
+        assert!(!empty.ensure(7).await);
+        assert!(
+            empty.take_stand_aside(),
+            "an empty candidate behind a replica holding records must stand aside"
+        );
+        assert!(
+            !empty.take_quorum_miss(),
+            "standing aside is an eligibility verdict, not a retryable miss"
+        );
+        assert_eq!(
+            recorder.last_reported(),
+            Some(vtop_meta::PromotionOutcome::Refused {
+                reason: vtop_meta::PromotionRefusal::QuorumUnavailable,
+            }),
+            "still recorded as the quorum miss it is: nothing Unknown was counted"
+        );
+
+        // A candidate that holds records is not affected: an unprovable
+        // replica beside it is the retryable miss it was.
+        let mut holding = promoter(
+            Arc::new(Recorder::default()),
+            Some(fixed(
+                vec![
+                    at(1, Some(40)),
+                    at_with(2, 100, vtop_meta::AnswerLineage::Unknown),
+                    at(3, None),
+                ],
+                3,
+            )),
+        );
+        assert!(!holding.ensure(7).await);
+        assert!(holding.take_quorum_miss());
+        assert!(!holding.take_stand_aside());
+
+        // Nor is an empty candidate whose followers are empty too: that is a
+        // fresh range, and every answer is Agreed.
+        let mut fresh = promoter(
+            Arc::new(Recorder::default()),
+            Some(fixed(vec![at(1, Some(0)), at(2, Some(0)), at(3, None)], 3)),
+        );
+        assert!(fresh.ensure(7).await, "a fresh range promotes at 0");
     }
 
     /// Review of #566: one deadline covers a follower's lookup AND its fence.
