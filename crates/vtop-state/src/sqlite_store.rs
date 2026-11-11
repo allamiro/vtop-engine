@@ -100,9 +100,12 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
 /// `idx_batches_commit_newest` expressions above: SQLite matches expression
 /// indexes structurally, and without the index every candidate row rescans
 /// the entire committed set (quadratic on the engine's idle-cycle pass).
+///
+/// A SUPERSEDED row (?4, #567) is deletable on age alone: it is never the
+/// row a restart cursor is read from, so nothing has to survive it.
 macro_rules! prune_predicate_sql {
     () => {
-        "b.state = ?1 AND b.updated_at < ?2 \
+        "b.updated_at < ?2 AND (b.state = ?4 OR (b.state = ?1 \
               AND EXISTS ( \
                 SELECT 1 FROM batches n \
                 WHERE n.state = ?1 \
@@ -114,7 +117,7 @@ macro_rules! prune_predicate_sql {
                   AND json_extract(n.progress_end_json, '$.consumer_group') \
                       IS json_extract(b.progress_end_json, '$.consumer_group') \
                   AND (n.created_at, n.batch_id) > (b.created_at, b.batch_id) \
-              )"
+              )))"
     };
 }
 
@@ -538,11 +541,13 @@ impl StateStore for SqliteStateStore {
         // `owner` string cannot slip in between an UPDATE and a follow-up read
         // and leave both holding the same generation, and a batch inserted
         // under the same owner name afterwards is not returned without a
-        // fence (review of #569).
+        // fence (review of #569). A row in either terminal state is never
+        // claimed. Before SUPERSEDED existed (#567), a range it now retires
+        // was claimed, rewritten and re-planned at every restart.
         let claimed = sqlx::query(
             "UPDATE batches SET owner = ?1, lease_expires_at = ?2, updated_at = ?3, \
                     claim_gen = claim_gen + 1 \
-             WHERE state != ?4 \
+             WHERE state NOT IN (?4, ?5) \
                AND (owner IS NULL OR owner = ?1 OR lease_expires_at IS NULL OR lease_expires_at <= ?3) \
              RETURNING *",
         )
@@ -550,6 +555,7 @@ impl StateStore for SqliteStateStore {
         .bind(lease_until)
         .bind(now)
         .bind(BatchState::SourceCommitted.as_str())
+        .bind(BatchState::Superseded.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -681,11 +687,14 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn list_incomplete_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
-        self.query_records(
-            "SELECT * FROM batches WHERE state != ? ORDER BY created_at ASC",
-            Some(BatchState::SourceCommitted.as_str().to_string()),
-        )
-        .await
+        let rows =
+            sqlx::query("SELECT * FROM batches WHERE state NOT IN (?, ?) ORDER BY created_at ASC")
+                .bind(BatchState::SourceCommitted.as_str())
+                .bind(BatchState::Superseded.as_str())
+                .fetch_all(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+        rows.into_iter().map(row_to_record).collect()
     }
 
     async fn list_failed_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
@@ -728,6 +737,7 @@ impl StateStore for SqliteStateStore {
             .bind(BatchState::SourceCommitted.as_str())
             .bind(older_than)
             .bind(limit)
+            .bind(BatchState::Superseded.as_str())
             .execute(&self.pool)
             .await
             .map_err(map_sqlx)?;
@@ -743,6 +753,7 @@ impl StateStore for SqliteStateStore {
             .bind(BatchState::SourceCommitted.as_str())
             .bind(older_than)
             .bind(limit)
+            .bind(BatchState::Superseded.as_str())
             .fetch_all(&self.pool)
             .await
             .map_err(map_sqlx)?;
@@ -757,6 +768,7 @@ impl StateStore for SqliteStateStore {
             .bind(BatchState::SourceCommitted.as_str())
             .bind(older_than)
             .bind(serde_json::to_string(batch_ids)?)
+            .bind(BatchState::Superseded.as_str())
             .execute(&self.pool)
             .await
             .map_err(map_sqlx)?;
@@ -1073,6 +1085,7 @@ mod tests {
             .bind(BatchState::SourceCommitted.as_str())
             .bind("2026-01-01T00:00:00Z")
             .bind(500u32)
+            .bind(BatchState::Superseded.as_str())
             .fetch_all(&store.pool)
             .await
             .unwrap();

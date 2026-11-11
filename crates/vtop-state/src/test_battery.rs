@@ -81,6 +81,8 @@ pub async fn run_all(store: &dyn StateStore) {
     committed_kafka_offsets_are_the_newest_row_of_each_partition_and_group(store).await;
     claims_respect_live_leases_and_take_over_expired_ones(store).await;
     committed_cursors_by_file_answer_each_file_that_lived_at_a_path(store).await;
+    // Last: it claims every claimable row on the shared store.
+    a_superseded_row_is_terminal_and_never_recovery_work(store).await;
 }
 
 /// #557: the claim fence. Two handles onto ONE ledger stand for two engines
@@ -221,6 +223,278 @@ pub async fn run_fencing_battery(a: &dyn StateStore, b: &dyn StateStore) {
 pub async fn run_prune_battery(store: &dyn StateStore) {
     prune_preserves_cursor_seeds_and_bounds_deletion(store).await;
     listed_prune_deletes_only_what_was_listed(store).await;
+    superseded_rows_are_pruned_like_committed_history(store).await;
+}
+
+/// #567: a FAILED / REPLAY_REQUIRED row whose range its source has since
+/// committed past is retired as SUPERSEDED - once. Before the state existed
+/// such a row never reached a terminal state: every restart claimed it again,
+/// wrote FAILED and REPLAY_REQUIRED over it and re-planned its rewind.
+async fn a_superseded_row_is_terminal_and_never_recovery_work(store: &dyn StateStore) {
+    const NOW: &str = "2060-01-01T00:00:00+00:00";
+    const LEASE: &str = "2060-01-01T00:05:00+00:00";
+    const AFTER_LEASE: &str = "2061-01-01T00:00:00+00:00";
+    let p = BatchPatch::default();
+
+    // A stale REPLAY_REQUIRED row, as an engine leaves one: writing
+    // REPLAY_REQUIRED releases its claim, so recovery claims it again first.
+    store
+        .save_batch_state(&sample_record("sup-replay"))
+        .await
+        .unwrap();
+    store
+        .mark_failed("sup-replay", "upload failed")
+        .await
+        .unwrap();
+    store
+        .update_batch_state("sup-replay", BatchState::ReplayRequired, &p)
+        .await
+        .unwrap();
+    // And a FAILED row, retired straight from FAILED.
+    store
+        .save_batch_state(&sample_record("sup-failed"))
+        .await
+        .unwrap();
+    store
+        .mark_failed("sup-failed", "upload failed")
+        .await
+        .unwrap();
+    // Neither in-flight nor VERIFIED work may be retired: only a range that
+    // was already handed back.
+    store
+        .save_batch_state(&sample_record("sup-inflight"))
+        .await
+        .unwrap();
+    let refused = store
+        .update_batch_state("sup-inflight", BatchState::Superseded, &p)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(VtopError::IllegalStateTransition {
+                from: BatchState::Batching,
+                to: BatchState::Superseded,
+            })
+        ),
+        "BATCHING -> SUPERSEDED must be refused, got {refused:?}"
+    );
+    // A VERIFIED row holds an archived object whose commit is still to be
+    // decided: it is never retired directly (review).
+    store
+        .save_batch_state(&sample_record("sup-verified"))
+        .await
+        .unwrap();
+    for st in &LEGAL_WALK[..6] {
+        store
+            .update_batch_state("sup-verified", *st, &p)
+            .await
+            .unwrap();
+    }
+    let refused = store
+        .update_batch_state("sup-verified", BatchState::Superseded, &p)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(VtopError::IllegalStateTransition {
+                from: BatchState::Verified,
+                to: BatchState::Superseded,
+            })
+        ),
+        "VERIFIED -> SUPERSEDED must be refused, got {refused:?}"
+    );
+
+    let claimed = store
+        .claim_incomplete_batches("sup-engine", NOW, LEASE)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = claimed.iter().map(|r| r.batch_id.as_str()).collect();
+    // Both handed-back states are recovery work until retired (review: the
+    // FAILED row's own token would otherwise hide a backend that skipped it).
+    assert!(ids.contains(&"sup-replay"), "{ids:?}");
+    assert!(ids.contains(&"sup-failed"), "{ids:?}");
+    for id in ["sup-replay", "sup-failed"] {
+        store
+            .update_batch_state(id, BatchState::Superseded, &p)
+            .await
+            .unwrap_or_else(|e| panic!("{id}: retiring a handed-back range: {e}"));
+        let row = store.get_batch(id).await.unwrap().unwrap();
+        assert_eq!(row.state, BatchState::Superseded, "{id}");
+        assert!(
+            !row.is_incomplete(),
+            "{id}: a superseded row is not incomplete"
+        );
+    }
+
+    // Never recovery work again: not listed, and not claimed - by this engine,
+    // or by another once every lease has run out.
+    let listed: Vec<String> = store
+        .list_incomplete_batches()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.batch_id)
+        .collect();
+    for (owner, at) in [("sup-engine", NOW), ("sup-other", AFTER_LEASE)] {
+        let reclaimed: Vec<String> = store
+            .claim_incomplete_batches(owner, at, AFTER_LEASE)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.batch_id)
+            .collect();
+        for id in ["sup-replay", "sup-failed"] {
+            assert!(
+                !listed.contains(&id.to_owned()),
+                "{id} is listed as incomplete: {listed:?}"
+            );
+            assert!(
+                !reclaimed.contains(&id.to_owned()),
+                "{id} was claimed again by {owner}: {reclaimed:?}"
+            );
+        }
+    }
+
+    // Terminal: nothing moves it, and it is no way into SOURCE_COMMITTED.
+    let before = store.get_batch("sup-replay").await.unwrap().unwrap();
+    for to in [
+        BatchState::Failed,
+        BatchState::ReplayRequired,
+        BatchState::Batching,
+        BatchState::Verified,
+    ] {
+        let result = store.update_batch_state("sup-replay", to, &p).await;
+        assert!(
+            matches!(
+                result,
+                Err(VtopError::IllegalStateTransition {
+                    from: BatchState::Superseded,
+                    ..
+                })
+            ),
+            "SUPERSEDED -> {to:?} must be refused, got {result:?}"
+        );
+    }
+    let result = store.mark_source_committed("sup-replay").await;
+    assert!(
+        matches!(
+            result,
+            Err(VtopError::CommitBeforeVerified {
+                actual: BatchState::Superseded
+            })
+        ),
+        "a superseded row must not commit, got {result:?}"
+    );
+    let after = store.get_batch("sup-replay").await.unwrap().unwrap();
+    assert_eq!(after.state, BatchState::Superseded);
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "a refused write changed the row"
+    );
+}
+
+/// #567: retention deletes SUPERSEDED rows as it deletes committed history,
+/// and lists them for the digest first - including one newer than every
+/// committed row of its source, which a committed row would never be (the
+/// newest committed row is the restart cursor). A superseded row is never a
+/// cursor, so pruning it moves none.
+async fn superseded_rows_are_pruned_like_committed_history(store: &dyn StateStore) {
+    let marker = |start: u64, end: u64| ProgressMarker::File {
+        path: "/logs/superseded".into(),
+        inode: Some(7),
+        start_byte: start,
+        end_byte: end,
+        file_size: end,
+        mtime: String::new(),
+        content_fingerprint: None,
+        tail_fingerprint: None,
+    };
+    let row = |id: &str, start: u64, end: u64, created: &str| {
+        let mut rec = sample_record(id);
+        rec.source_type = SourceType::File;
+        rec.source_name = "superseded-src".into();
+        rec.progress_start = marker(start, end);
+        rec.progress_end = marker(start, end);
+        rec.created_at = created.into();
+        rec
+    };
+    let p = BatchPatch::default();
+    // The commit that covers the stale ranges: the only committed row of its
+    // path, so it is the cursor and never a prune candidate.
+    store
+        .save_batch_state(&row("sp-commit", 0, 30, "2030-01-01T00:00:02Z"))
+        .await
+        .unwrap();
+    for st in LEGAL_WALK {
+        store.update_batch_state("sp-commit", st, &p).await.unwrap();
+    }
+    // Two retired ranges: one read before the commit, and one created after
+    // it (the newest row of the path).
+    for (id, start, end, created) in [
+        ("sp-old", 0, 10, "2030-01-01T00:00:01Z"),
+        ("sp-new", 10, 20, "2030-01-01T00:00:03Z"),
+    ] {
+        store
+            .save_batch_state(&row(id, start, end, created))
+            .await
+            .unwrap();
+        store.mark_failed(id, "upload failed").await.unwrap();
+        store
+            .update_batch_state(id, BatchState::Superseded, &p)
+            .await
+            .unwrap();
+    }
+    let cursors_before = store.committed_cursors(SourceType::File).await.unwrap();
+
+    let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    let past = "1970-01-01T00:00:00+00:00";
+    let ours = |rows: Vec<BatchRecord>| -> Vec<String> {
+        let mut ids: Vec<String> = rows
+            .into_iter()
+            .map(|r| r.batch_id)
+            .filter(|id| id.starts_with("sp-"))
+            .collect();
+        ids.sort();
+        ids
+    };
+    // Listed for the digest, and the age cutoff still protects them.
+    assert_eq!(
+        ours(store.prune_candidates(&future, 10_000).await.unwrap()),
+        ["sp-new", "sp-old"],
+        "both superseded rows are prune candidates, the committed cursor row is not"
+    );
+    assert!(ours(store.prune_candidates(past, 10_000).await.unwrap()).is_empty());
+    assert_eq!(
+        store
+            .prune_listed(past, &["sp-old".into(), "sp-new".into()])
+            .await
+            .unwrap(),
+        0,
+        "rows younger than the cutoff are not deleted"
+    );
+    // Deleted by the listed prune, as the engine's retention pass does...
+    assert_eq!(
+        store
+            .prune_listed(&future, &["sp-old".into(), "sp-commit".into()])
+            .await
+            .unwrap(),
+        1,
+        "only the superseded row goes; the cursor row stays though named"
+    );
+    assert!(store.get_batch("sp-old").await.unwrap().is_none());
+    // ...and by the unlisted one.
+    while store.prune_committed_history(&future, 100).await.unwrap() > 0 {}
+    assert!(store.get_batch("sp-new").await.unwrap().is_none());
+    assert_eq!(
+        store.get_batch("sp-commit").await.unwrap().map(|r| r.state),
+        Some(BatchState::SourceCommitted),
+        "the cursor row survives every prune"
+    );
+    assert_eq!(
+        store.committed_cursors(SourceType::File).await.unwrap(),
+        cursors_before,
+        "pruning superseded rows moves no restart cursor"
+    );
 }
 
 /// #614: the Kafka adapter resumes each partition from the ledger, not from
@@ -346,6 +620,7 @@ async fn insert_refuses_any_state_but_batching(store: &dyn StateStore) {
         BatchState::SourceCommitted,
         BatchState::Failed,
         BatchState::ReplayRequired,
+        BatchState::Superseded,
     ];
     for st in not_initial {
         let id = format!("born-{}", st.as_str());
@@ -766,6 +1041,20 @@ async fn committed_cursors_by_file_answer_each_file_that_lived_at_a_path(store: 
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+    // A SUPERSEDED row (#567) is terminal but never a committed cursor: its
+    // range was handed back, not archived by it. Newest of all, at a new
+    // inode and the furthest end, it must not appear.
+    let mut superseded = sample_record("at-10");
+    superseded.source_type = SourceType::File;
+    superseded.source_name = "/at.log".into();
+    superseded.progress_start = marker("/at.log", Some(44), 0);
+    superseded.progress_end = marker("/at.log", Some(44), 99_999);
+    store.save_batch_state(&superseded).await.unwrap();
+    store.mark_failed("at-10", "handed back").await.unwrap();
+    store
+        .update_batch_state("at-10", BatchState::Superseded, &p)
+        .await
+        .unwrap();
     let all = store
         .committed_cursors_by_file(SourceType::File)
         .await

@@ -34,7 +34,7 @@
 //! a file that has left its path is closed [`HOLD_FOR`] after it was last used
 //! unless a re-read through it is in progress.
 
-use crate::continuity::Tail;
+use crate::continuity::{self, Identity, Tail};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use vtop_core::types::ContentFingerprint;
@@ -108,8 +108,15 @@ impl HeldFile {
         let Some(content) = content else {
             return false;
         };
-        head_of(&self.file).is_ok_and(|head| content.matches_head(&head))
-            && tail.is_none_or(|tail| tail_matches(&self.file, tail))
+        continuity::proves(
+            &self.file,
+            &Identity {
+                inode: self.inode,
+                contents: &[content],
+                tails: tail.as_slice(),
+                min_len: tail.map_or(0, |tail| tail.end),
+            },
+        )
     }
 
     /// The file was seen at least `len` bytes long.
@@ -212,8 +219,9 @@ impl RotatedFile {
 /// page nor a reused inode whose file starts like the old one is the file.
 /// Anything less, and nothing is read from it.
 ///
-/// These are the continuity checks of `crate::continuity`, applied to a
-/// descriptor instead of a path.
+/// This is [`continuity::proves`], the one positive-identity test, with the
+/// range's evidence: the range must also fit, so the length is at least its
+/// start.
 pub(crate) fn proves(
     file: &std::fs::File,
     inode: u64,
@@ -222,59 +230,15 @@ pub(crate) fn proves(
     start: u64,
     tail: Option<&Tail>,
 ) -> bool {
-    let Ok(metadata) = file.metadata() else {
-        return false;
-    };
-    if inode_of(&metadata) != Some(inode) {
-        return false;
-    }
-    let len = metadata.len();
-    if len < size_when_read || start > len {
-        return false;
-    }
-    head_of(file).is_ok_and(|head| content.matches_head(&head))
-        && tail.is_none_or(|tail| tail_matches(file, tail))
-}
-
-/// Whether `file` still holds, ending at `tail.end`, the bytes `tail`
-/// fingerprinted there (#620). A file too short to hold them yields fewer
-/// bytes, which never match.
-pub(crate) fn tail_matches(file: &std::fs::File, tail: &Tail) -> bool {
-    let from = tail.end.saturating_sub(tail.fingerprint.len);
-    read_at_most(file, from, tail.end - from)
-        .is_ok_and(|bytes| tail.fingerprint.matches_bytes(&bytes))
-}
-
-/// The first bytes of `file`, read at an offset so the descriptor's position
-/// is left alone.
-pub(crate) fn head_of(file: &std::fs::File) -> std::io::Result<Vec<u8>> {
-    read_at_most(file, 0, ContentFingerprint::MAX_LEN as u64)
-}
-
-/// Up to `len` bytes of `file` from `from`, read at an offset so the
-/// descriptor's position is left alone; fewer at the end of the file.
-#[cfg(unix)]
-fn read_at_most(file: &std::fs::File, from: u64, len: u64) -> std::io::Result<Vec<u8>> {
-    use std::os::unix::fs::FileExt;
-    let mut bytes = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
-    let mut filled = 0;
-    while filled < bytes.len() {
-        match file.read_at(&mut bytes[filled..], from + filled as u64) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    bytes.truncate(filled);
-    Ok(bytes)
-}
-
-#[cfg(not(unix))]
-fn read_at_most(_file: &std::fs::File, _from: u64, _len: u64) -> std::io::Result<Vec<u8>> {
-    // Without inodes nothing can be proven (`inode_of` is `None`), so no
-    // caller gets this far.
-    Ok(Vec::new())
+    continuity::proves(
+        file,
+        &Identity {
+            inode,
+            contents: &[content],
+            tails: tail.as_slice(),
+            min_len: size_when_read.max(start),
+        },
+    )
 }
 
 /// Look for the file a range was read from where rotation leaves it: the
@@ -338,16 +302,5 @@ pub(crate) fn find(
     _start: u64,
     _tail: Option<&Tail>,
 ) -> Option<(PathBuf, std::fs::File)> {
-    None
-}
-
-#[cfg(unix)]
-fn inode_of(md: &std::fs::Metadata) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Some(md.ino())
-}
-
-#[cfg(not(unix))]
-fn inode_of(_md: &std::fs::Metadata) -> Option<u64> {
     None
 }

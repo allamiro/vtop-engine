@@ -86,7 +86,7 @@ isolated by a separate measurement in this phase; they are the explanation the c
    requests) exists in `vtop-broker` but is not wired into the node. The client caps a request at
    `batch.size` (16 KiB by default) whatever the record size, so a ceiling set per request shows up as a
    roughly constant MiB/s across record sizes and a record rate that falls as records grow, which is the shape
-   of VTOP's two cells here.
+   of VTOP's cells here.
 3. **Translation in the gateway.** Every Kafka record batch is decoded, validated (CRC, attributes) and
    re-appended through the native broker, which frames it again for the replica plane; Kafka validates the
    batch and appends it with offsets assigned in place, without taking its records apart. The cost is CPU and

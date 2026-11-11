@@ -489,11 +489,14 @@ impl FileSource {
     /// name the rotated file. Seeded from it, the restart took the current
     /// file for a rotation and archived it again from byte 0. So when the
     /// newest row's file is not the one at the path, the seed is the row of the
-    /// file that is - but only on POSITIVE identity: the same inode, the first
-    /// page its marker fingerprinted, and the page ending at its end (#620).
-    /// A row without both fingerprints (legacy), or a file that does not match
-    /// them, proves nothing, and the newest row stands: that costs a re-read
-    /// of the current file, never a skip.
+    /// file that is - but only on POSITIVE identity ([`continuity::proves`],
+    /// the same test #567's `committed_through` makes): the same inode, the
+    /// first page its marker fingerprinted, the page ending at its end (#620),
+    /// and at least that long. Overriding the newest row also needs the row
+    /// to CARRY the page below its end: a legacy row with a first page alone
+    /// is not evidence enough to depart from the default. Without that, or
+    /// without a match, the newest row stands: that costs a re-read of the
+    /// current file, never a skip.
     pub fn seed_choice(path: &str, newest_first: &[ArchivedEnd]) -> usize {
         let Some(newest) = newest_first.first() else {
             return 0;
@@ -509,18 +512,23 @@ impl FileSource {
             .enumerate()
             .skip(1)
             .find(|(_, row)| {
-                let (Some(content), Some(tail)) = (row.content.as_ref(), row.tail.as_ref()) else {
+                let (Some(inode), Some(content), Some(tail)) = (row.inode, &row.content, &row.tail)
+                else {
                     return false;
                 };
-                if row.inode != Some(current_inode) {
-                    return false;
-                }
-                let (inode, len, head, at_tail) =
-                    Self::probe_with_tail(Path::new(path), row.end_byte, Some(tail));
-                inode == Some(current_inode)
-                    && len >= row.end_byte
-                    && content.matches_head(&head)
-                    && tail.matches_bytes(&at_tail)
+                let tail = continuity::Tail {
+                    end: row.end_byte,
+                    fingerprint: tail.clone(),
+                };
+                continuity::proves_at_path(
+                    Path::new(path),
+                    &continuity::Identity {
+                        inode,
+                        contents: &[content],
+                        tails: &[&tail],
+                        min_len: row.end_byte,
+                    },
+                )
             })
             .map_or(0, |(i, _)| i)
     }
@@ -2930,6 +2938,81 @@ impl SourceAdapter for FileSource {
         Some(i128::from(c.read_byte))
     }
 
+    /// The cursor's committed byte - only when the cursor is PROVEN to
+    /// describe the marker's file (review of #567). Recovery retires a range
+    /// as SUPERSEDED, a terminal state, on this answer, so "not proven to be
+    /// another file" is not enough:
+    ///
+    /// - the marker and the cursor (the file it last read, or the restart
+    ///   seed's) name the same inode - a legacy marker with none cannot be
+    ///   told from any other file that lived at the path;
+    /// - both carry a content fingerprint (#578), and they are the same
+    ///   content: equal, or - fingerprints of different lengths, which say
+    ///   nothing about each other - both match the first bytes of the file now
+    ///   at the path, which still has that inode;
+    /// - a marker's tail fingerprint (#620) matches the bytes now below its
+    ///   end;
+    /// - the file is no shorter than the cursor's position, the length the
+    ///   cursor saw, or the length the marker's read saw: a truncation since
+    ///   (a rewrite in place that kept the first page) makes the committed
+    ///   byte another generation's (review of #567);
+    /// - and the cursor's OWN tail, where it recorded one, matches the bytes
+    ///   now below the cursor's position. Without it, a seed taken before an
+    ///   in-place rewrite that kept the inode and the first page would lend
+    ///   the old content's committed byte to a range of the new content
+    ///   (review of #567).
+    fn committed_through(&self, marker: &ProgressMarker) -> Option<i128> {
+        let ProgressMarker::File {
+            path,
+            inode: Some(marker_inode),
+            end_byte,
+            file_size: marker_size,
+            content_fingerprint: Some(marker_content),
+            tail_fingerprint: marker_tail,
+            ..
+        } = marker
+        else {
+            return None;
+        };
+        let c = self.cursors.get(path)?;
+        let seen = c.seen.as_ref()?;
+        if seen.inode != Some(*marker_inode) {
+            return None;
+        }
+        let seen_content = seen.content.as_ref()?;
+        if seen_content.same_content(marker_content) == Some(false) {
+            return None;
+        }
+        // The one positive-identity test (`continuity::proves`), shared with
+        // the restart seed's choice and the rotated-file re-read (#621):
+        // - both first pages must match the file now at the path - equal
+        //   fingerprints too, which say nothing about what the file holds NOW;
+        // - an append-only file never gets shorter: one now shorter than the
+        //   cursor's position, the length the cursor saw, the length the
+        //   marker's read saw, or the range's end has been truncated since -
+        //   a rewrite in place that can keep the inode and the first page -
+        //   and the cursor's committed byte belongs to the content before it
+        //   (review of #567, Codex);
+        // - the marker's tail, and the cursor's own, must still be where they
+        //   were taken.
+        let marker_tail = continuity::Tail::at(*end_byte, marker_tail.clone());
+        let tails: Vec<&continuity::Tail> = marker_tail.iter().chain(seen.tail.as_ref()).collect();
+        let proven = continuity::proves_at_path(
+            Path::new(path),
+            &continuity::Identity {
+                inode: *marker_inode,
+                contents: &[seen_content, marker_content],
+                tails: &tails,
+                min_len: c
+                    .committed_byte
+                    .max(seen.file_size)
+                    .max(*marker_size)
+                    .max(*end_byte),
+            },
+        );
+        proven.then(|| i128::from(c.committed_byte))
+    }
+
     fn source_type(&self) -> SourceType {
         SourceType::File
     }
@@ -3609,6 +3692,223 @@ mod tests {
             .unwrap();
         assert_eq!(reads2.len(), 1);
         assert_eq!(reads2[0].records, vec![b"two".to_vec(), b"three".to_vec()]);
+    }
+
+    /// #567 (review, Codex): a file rewritten in place with the same first
+    /// page but SHORTER agrees with the inode and with fingerprints capped at
+    /// one page, and - with no tail recorded - nothing else compared it, so
+    /// the old content's committed byte was lent to the new content's range.
+    /// The lengths show the truncation: the file is now shorter than the
+    /// cursor's position and than the length the cursor saw.
+    #[cfg(unix)]
+    #[test]
+    fn a_truncated_file_with_the_same_first_page_lends_no_committed_point() {
+        use std::os::unix::fs::MetadataExt;
+        let page: Vec<u8> = (0..4096u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let mut bytes = page.clone();
+        bytes.extend(std::iter::repeat_n(b'n', 5000 - 4096));
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let first_page = ContentFingerprint::of(&page);
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        // The old content was 10000 bytes long and committed through 10000.
+        fs.seed_committed_from(
+            &path,
+            10_000,
+            Some(inode),
+            Some(10_000),
+            first_page.clone(),
+            None,
+        );
+        let replacement = ProgressMarker::File {
+            path: path.clone(),
+            inode: Some(inode),
+            start_byte: 4_000,
+            end_byte: 5_000,
+            file_size: 5_000,
+            mtime: String::new(),
+            content_fingerprint: first_page,
+            tail_fingerprint: None,
+        };
+        assert_eq!(
+            fs.committed_through(&replacement),
+            None,
+            "the old generation's committed offset was lent to a truncated file's range"
+        );
+    }
+
+    /// #567 (review): recovery retires a handed-back range as SUPERSEDED on
+    /// this answer, and SUPERSEDED is terminal - so the committed point is
+    /// answered only when the cursor POSITIVELY describes the marker's file:
+    /// the same inode, and content shown to be the same. A marker with no inode
+    /// (a legacy row), or with no content fingerprint, cannot show it, and gets
+    /// no answer; fingerprints of different lengths are settled against the
+    /// file at the path, and so is the tail (#620). Answered, it is the
+    /// committed byte, not the read head.
+    #[cfg(unix)]
+    #[test]
+    fn the_committed_point_is_answered_only_for_a_marker_proven_to_be_the_cursors_file() {
+        use std::os::unix::fs::MetadataExt;
+        let bytes: Vec<u8> = (0..100u8).map(|i| b'a' + i % 26).collect();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let fp = |b: &[u8]| ContentFingerprint::of(b);
+        let marker = |inode: Option<u64>,
+                      content: Option<ContentFingerprint>,
+                      tail: Option<ContentFingerprint>| ProgressMarker::File {
+            path: path.clone(),
+            inode,
+            start_byte: 0,
+            end_byte: 30,
+            file_size: 100,
+            mtime: String::new(),
+            content_fingerprint: content,
+            tail_fingerprint: tail,
+        };
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let whole = fp(&bytes);
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), whole.clone(), None)),
+            None
+        );
+        fs.seed_committed_from(&path, 40, Some(inode), Some(100), whole.clone(), None);
+        fs.cursors.get_mut(&path).unwrap().read_byte = 55;
+
+        // Proven: the same fingerprint, or a shorter one of the same file's
+        // first bytes, settled against the file at the path.
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), whole.clone(), None)),
+            Some(40)
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), fp(&bytes[..50]), None)),
+            Some(40)
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), whole.clone(), fp(&bytes[..30]))),
+            Some(40),
+            "a tail that matches the bytes below the range's end"
+        );
+        // Not proven.
+        assert_eq!(
+            fs.committed_through(&marker(None, whole.clone(), None)),
+            None,
+            "no inode"
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), None, None)),
+            None,
+            "no content"
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode + 1), whole.clone(), None)),
+            None,
+            "another inode"
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), fp(&[b'z'; 100]), None)),
+            None,
+            "other content of the same length"
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), fp(&[b'z'; 50]), None)),
+            None,
+            "other content of another length: the file's head says so"
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), whole.clone(), fp(&[b'z'; 30]))),
+            None,
+            "the bytes below the range's end are not the ones it was read with"
+        );
+        // The cursor's own position must still be in this content (review
+        // of #567): a seed whose tail - the bytes below its committed byte -
+        // is no longer what the file holds there describes content that was
+        // rewritten in place, keeping the inode and the first page, and its
+        // committed byte is another generation's.
+        fs.seed_committed_from(
+            &path,
+            40,
+            Some(inode),
+            Some(100),
+            whole.clone(),
+            fp(&[b'z'; 40]),
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), whole.clone(), None)),
+            None,
+            "the seed's tail is not the file's: its committed byte is another generation's"
+        );
+        fs.seed_committed_from(
+            &path,
+            40,
+            Some(inode),
+            Some(100),
+            whole.clone(),
+            fp(&bytes[..40]),
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), whole.clone(), None)),
+            Some(40),
+            "the seed's tail is the file's"
+        );
+        // A cursor that recorded no content proves nothing either.
+        fs.seed_committed_from(&path, 40, Some(inode), Some(100), None, None);
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), whole, None)),
+            None
+        );
+    }
+
+    /// The committed point and the restart seed's choice (#621) share one
+    /// positive-identity test, which keeps the stricter rule of each: equal
+    /// first-page fingerprints in the marker and the cursor say they read the
+    /// same content, not that the file at the path STILL holds it. A file
+    /// rewritten in place - the same inode, longer, other first bytes - with
+    /// no tails recorded passed every other check and lent the old content's
+    /// committed byte to a range of it, retiring that range for good.
+    #[cfg(unix)]
+    #[test]
+    fn equal_fingerprints_still_have_to_match_the_file_now_at_the_path() {
+        use std::os::unix::fs::MetadataExt;
+        let old: Vec<u8> = (0..100u8).map(|i| b'a' + i % 26).collect();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&old).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let content = ContentFingerprint::of(&old);
+        let marker = ProgressMarker::File {
+            path: path.clone(),
+            inode: Some(inode),
+            start_byte: 0,
+            end_byte: 30,
+            file_size: 100,
+            mtime: String::new(),
+            content_fingerprint: content.clone(),
+            tail_fingerprint: None,
+        };
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        fs.seed_committed_from(&path, 40, Some(inode), Some(100), content, None);
+        assert_eq!(fs.committed_through(&marker), Some(40), "the file read");
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[b'Z'; 120])
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(
+            fs.committed_through(&marker),
+            None,
+            "the file at the path no longer starts with what both recorded"
+        );
     }
 
     /// The batch rewind returns one result per marker, in order, and one that

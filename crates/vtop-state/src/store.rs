@@ -176,8 +176,9 @@ pub trait StateStore: Send + Sync {
     /// Atomically claim every incomplete batch this `owner` may work on, and
     /// return the claimed rows (#93).
     ///
-    /// Claimable = not SOURCE_COMMITTED, and (already owned by `owner`, OR
-    /// never owned, OR the previous owner's lease has expired as of `now`).
+    /// Claimable = in neither terminal state (SOURCE_COMMITTED, SUPERSEDED -
+    /// #567), and (already owned by `owner`, OR never owned, OR the previous
+    /// owner's lease has expired as of `now`).
     /// The claim is ONE update — set owner and a fresh lease on exactly the
     /// claimable rows — so two engines recovering concurrently cannot both
     /// claim the same batch: a live engine's in-flight work is never touched,
@@ -263,8 +264,8 @@ pub trait StateStore: Send + Sync {
     /// All batches, newest first.
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError>;
 
-    /// Batches that have entered the store but not yet reached
-    /// `SOURCE_COMMITTED` — the recovery work-list.
+    /// Batches that have entered the store but reached neither terminal state
+    /// (`SOURCE_COMMITTED`, `SUPERSEDED`) — the recovery work-list.
     async fn list_incomplete_batches(&self) -> Result<Vec<BatchRecord>, VtopError>;
 
     /// Batches in the `FAILED` terminal state.
@@ -279,12 +280,15 @@ pub trait StateStore: Send + Sync {
     /// Commit source progress (legal only from `VERIFIED`).
     async fn mark_source_committed(&self, batch_id: &str) -> Result<(), VtopError>;
 
-    /// Incrementally delete old `SOURCE_COMMITTED` history rows (#128).
+    /// Incrementally delete old `SOURCE_COMMITTED` and `SUPERSEDED` history
+    /// rows (#128, #567).
     ///
     /// Deletes at most `limit` rows whose `updated_at` is lexicographically
     /// below `older_than` (RFC3339 UTC, the format every writer uses) and
-    /// returns the number deleted. Three protections are non-negotiable:
-    /// rows in any other state are never touched; rows at or after the
+    /// returns the number deleted. A SUPERSEDED row is never a restart
+    /// cursor, so it needs no newer row to be deleted. Three protections are
+    /// non-negotiable: rows in any other state are never touched; rows at or
+    /// after the
     /// cutoff are never touched; and for every source path (falling back to
     /// `source_name` when the progress marker carries no path), and for a
     /// Kafka row every (topic, partition, consumer group), the NEWEST

@@ -191,6 +191,25 @@ pub trait SourceAdapter: Send + Sync {
         None
     }
 
+    /// The committed point of `marker`'s source unit, in the unit the markers
+    /// use (a byte offset; for Kafka the next offset to read, one past the
+    /// last committed), and only when the adapter can show that this point
+    /// belongs to the unit the marker was read from; `None` when it cannot
+    /// (#567). What "the unit" takes is the adapter's: a Kafka partition
+    /// under this engine's consumer group, with the ledger's frontier for it;
+    /// a file or spool proven by inode and content to be the one the marker
+    /// names.
+    ///
+    /// Everything below it has been committed, and a rewind to `marker`
+    /// never lands below it - so a handed-back range that ends at or below it
+    /// would re-read nothing, and recovery retires it instead of planning
+    /// that rewind on every restart. At startup it is the ledger's newest
+    /// committed row of the unit (the restart seed), never a rewind's
+    /// landing or an offset some other engine wrote to the source.
+    fn committed_through(&self, _marker: &ProgressMarker) -> Option<i128> {
+        None
+    }
+
     /// Rewind several ranges at once, one result per marker in the same order.
     ///
     /// The default rewinds one at a time. An adapter whose rewind consults an
