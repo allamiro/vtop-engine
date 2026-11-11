@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -66,10 +67,17 @@ def sample() -> dict[str, Any]:
 
 
 class Sampler:
-    """Samples every `interval` seconds into `path` until `stop()`; the first sample at once."""
+    """Samples every `interval` seconds into `path` until `stop()`; the first sample at once.
+
+    Samples are scheduled from a monotonic deadline (start + k * interval), so the
+    cadence is `interval` and not `interval` plus the probe's own time. A probe that
+    raises is recorded in `errors` (time and exception) and sampling carries on: one
+    failed `docker ps` must not end the record, nor leave a gap no one is told about.
+    """
 
     def __init__(self, path: str, interval: float = 30.0, probe: Callable[[], dict[str, Any]] = sample):
         self.path, self.interval, self.probe = path, interval, probe
+        self.errors: list[str] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         with open(path, "w", newline="") as handle:
@@ -83,11 +91,25 @@ class Sampler:
         self._thread.join(timeout=60)
 
     def _loop(self) -> None:
+        origin = time.monotonic()
+        k = 0
         while True:
-            row = self.probe()
-            with open(self.path, "a", newline="") as handle:
-                csv.writer(handle).writerow(["" if row.get(c) is None else row[c] for c in COLUMNS])
-            if self._stop.wait(self.interval):
+            try:
+                row = self.probe()
+                with open(self.path, "a", newline="") as handle:
+                    csv.writer(handle).writerow(["" if row.get(c) is None else row[c] for c in COLUMNS])
+            except Exception as exc:  # recorded, and the next sample still runs
+                stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                self.errors.append(f"{stamp} {type(exc).__name__}: {exc}"[:300])
+            k += 1
+            # The next deadline still in the future: a probe slower than the interval
+            # skips the slots it overran rather than firing them back to back.
+            next_at = origin + k * self.interval
+            now = time.monotonic()
+            if next_at < now:
+                k = int((now - origin) // self.interval) + 1
+                next_at = origin + k * self.interval
+            if self._stop.wait(next_at - now):
                 return
 
 

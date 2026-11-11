@@ -20,6 +20,43 @@ def test_the_sampler_writes_a_row_at_once_and_stops(tmp_path):
     rows = host_noise.read(path)
     assert len(rows) >= 2 and tuple(rows[0]) == host_noise.COLUMNS
     assert rows[0]["lima_running"] == "vtop-bench-483a"
+    time.sleep(0.2)  # several intervals: a sampler still running would add rows
+    assert len(host_noise.read(path)) == len(rows)
+
+
+def test_a_failing_probe_is_recorded_and_sampling_goes_on(tmp_path):
+    calls = []
+
+    def probe():
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("docker ps timed out")
+        return _row(float(len(calls)), 1.0, 90.0, 9, 0, 0, "")
+
+    path = str(tmp_path / "host_noise.csv")
+    sampler = host_noise.Sampler(path, interval=0.05, probe=probe)
+    sampler.start()
+    time.sleep(0.3)
+    sampler.stop()
+    assert len(sampler.errors) == 1 and "RuntimeError: docker ps timed out" in sampler.errors[0]
+    assert len(host_noise.read(path)) >= 3  # samples after the failure still landed
+
+
+def test_samples_keep_the_interval_whatever_the_probe_costs(tmp_path):
+    stamps = []
+
+    def slow_probe():
+        stamps.append(time.monotonic())
+        time.sleep(0.06)  # 60% of the interval
+        return _row(1.0, 1.0, 90.0, 9, 0, 0, "")
+
+    sampler = host_noise.Sampler(str(tmp_path / "h.csv"), interval=0.1, probe=slow_probe)
+    sampler.start()
+    time.sleep(1.05)
+    sampler.stop()
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    # Waiting a full interval AFTER each probe would space them about 0.16 s apart.
+    assert len(gaps) >= 7 and sum(gaps) / len(gaps) < 0.13
 
 
 def test_the_summary_keeps_the_worst_of_the_run_and_every_vm_seen():

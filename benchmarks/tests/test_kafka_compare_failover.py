@@ -645,7 +645,7 @@ def test_an_archive_that_was_not_written_is_reported_not_ignored(tmp_path, monke
     assert "tar exit 2" in failed[0]
 
 
-def _failed_readback_run(tmp_path, monkeypatch, archiver):
+def _failed_readback_run(tmp_path, monkeypatch, archiver, verify=None):
     """The real run_vtop and run_rep over a repetition whose read-back FAILS, with Docker
     stubbed out: `archiver(node, host_dir)` plays the evidence tar for node 1-3 and returns
     its exit code (or raises). Returns (ctx, the systems `cluster_down` was called for)."""
@@ -680,8 +680,8 @@ def _failed_readback_run(tmp_path, monkeypatch, archiver):
     monkeypatch.setattr(failover, "vtop_up", fake_up)
     monkeypatch.setattr(failover, "vtop_meta", lambda *_a, **_k: {"current_leader": 1})
     monkeypatch.setattr(failover, "vtop_lease", lambda *_a: (failover.NODE_UUID[2], 4))
-    monkeypatch.setattr(failover, "vtop_tool", lambda *_a, **_k: subprocess.CompletedProcess(
-        [], 1, "", "record at offset 7 content mismatch"))
+    monkeypatch.setattr(failover, "vtop_tool", verify or (lambda *_a, **_k: subprocess.CompletedProcess(
+        [], 1, "", "record at offset 7 content mismatch")))
     monkeypatch.setattr(failover, "wait_until", lambda _t: None)
     monkeypatch.setattr(failover, "clock_probe", lambda _name: (0.0, 0.1))
     monkeypatch.setattr(failover, "inject", lambda *_a: fault_ms)
@@ -765,3 +765,53 @@ def test_verified_archives_release_the_volumes_for_teardown(tmp_path, monkeypatc
     assert ctx["kept_volumes"] == [] and downs == ["vtop"]
     assert ctx["losses"] == ["vtop-kill9_leader-1"]
     assert "volumes NOT archived" not in _csv_text(ctx)
+
+
+def _verify_raises(exc):
+    def verify(*_args, **_kwargs):
+        raise exc
+    return verify
+
+
+def test_a_read_back_that_times_out_is_a_failed_one_and_its_volumes_are_archived(tmp_path, monkeypatch):
+    import subprocess
+
+    from kafka_compare import failover
+
+    archived = []
+
+    def archiver(node, host_dir):
+        archived.append(node)
+        return _archive(b"tgz")(node, host_dir)
+
+    ctx, downs = _failed_readback_run(tmp_path, monkeypatch, archiver,
+                                      verify=_verify_raises(subprocess.TimeoutExpired(["vtop-node"], 600)))
+    failover.run_rep(ctx, "vtop", "kill9_leader", 1)
+    assert archived == [1, 2, 3]  # the evidence was taken before any teardown
+    assert ctx["kept_volumes"] == [] and downs == ["vtop"]
+    assert "FAILED: the read-back did not finish (TimeoutExpired" in _csv_text(ctx)
+    assert ctx["losses"] == ["vtop-kill9_leader-1"]
+
+
+def test_an_interrupted_read_back_keeps_every_volume(tmp_path, monkeypatch):
+    from kafka_compare import failover
+
+    ctx, downs = _failed_readback_run(tmp_path, monkeypatch, _archive(b"tgz"),
+                                      verify=_verify_raises(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        failover.run_rep(ctx, "vtop", "kill9_leader", 1)
+    assert downs == [] and all("read-back unfinished" in v for v in ctx["kept_volumes"])
+
+
+def test_a_passed_read_back_releases_the_volumes(tmp_path, monkeypatch):
+    import subprocess
+
+    from kafka_compare import failover
+
+    passed = subprocess.CompletedProcess(
+        [], 0, "verify_done records=200 next_offset=200 gaps=0 high_watermark=200\n", "")
+    ctx, downs = _failed_readback_run(tmp_path, monkeypatch, _archive(None, code=1),
+                                      verify=lambda *_a, **_k: passed)
+    failover.run_rep(ctx, "vtop", "kill9_leader", 1)
+    assert ctx["kept_volumes"] == [] and downs == ["vtop"] and ctx["losses"] == []
+

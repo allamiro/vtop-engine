@@ -622,6 +622,10 @@ def run_vtop(ctx: dict, fault: str, raw: str, logs: str, row: dict) -> tuple[lis
                error_classes="; ".join(f"{k}={v}" for k, v in summary["reasons"].items()), records_acked=acked)
 
     # Read the whole range back from whoever holds it now, byte-exact (vtop-node verify).
+    # Until the read-back has PASSED, the volumes are the evidence: marked kept before
+    # it starts, so a lease lookup or verify that hangs past its timeout, raises or is
+    # interrupted leaves them in place rather than to run_rep's `down -v`.
+    ctx["kept_volumes"] = [f"{SPEC['vtop']['project']}_vtop-{n}-data (read-back unfinished)" for n in (1, 2, 3)]
     holder = vtop_lease(ctx, raw)
     if holder is None:
         row["verify"] = "FAILED: no lease holder to read back from"
@@ -636,18 +640,24 @@ def run_vtop(ctx: dict, fault: str, raw: str, logs: str, row: dict) -> tuple[lis
                          f'server_name: "localhost"\n'
                          f"tls: {{ ca: /etc/vtop/tls/ca.pem, cert: /etc/vtop/tls/data-1.pem, "
                          f"key: /etc/vtop/tls/data-1-key.pem }}\n")
-        done = vtop_tool(ctx, raw, "verify", "--client-config", "/out/verify-client.yaml", "--addr",
-                         f"vtop-{node}:9400", "--expect-at-least", str(acked), "--max-offset-gaps",
-                         "0", "--value-bytes", str(ctx["vtop_value_bytes"]), "--batch", "512",
-                         entrypoint="vtop-node", timeout=600)
-        result = fstats.parse_vtop_verify(done.stdout, done.stderr, done.returncode)
-        with open(os.path.join(logs, "verify.out"), "w") as handle:
-            handle.write(done.stdout[-2000:] + "\n--- stderr ---\n" + done.stderr[-2000:])
-        if result.passed:
-            row.update(verify="passed", acked_lost=0, duplicates=0,
-                       unacked_present=max(0, (result.records or 0) - acked))
+        try:
+            done = vtop_tool(ctx, raw, "verify", "--client-config", "/out/verify-client.yaml", "--addr",
+                             f"vtop-{node}:9400", "--expect-at-least", str(acked), "--max-offset-gaps",
+                             "0", "--value-bytes", str(ctx["vtop_value_bytes"]), "--batch", "512",
+                             entrypoint="vtop-node", timeout=600)
+        except (subprocess.TimeoutExpired, RuntimeError, OSError) as exc:
+            # A read-back that did not finish is a failed one, and gets its evidence saved below.
+            row["verify"] = f"FAILED: the read-back did not finish ({type(exc).__name__}: {exc})"[:600]
         else:
-            row["verify"] = f"FAILED: {result.error or 'no verify_done line'} (exit {done.returncode})"
+            result = fstats.parse_vtop_verify(done.stdout, done.stderr, done.returncode)
+            with open(os.path.join(logs, "verify.out"), "w") as handle:
+                handle.write(done.stdout[-2000:] + "\n--- stderr ---\n" + done.stderr[-2000:])
+            if result.passed:
+                row.update(verify="passed", acked_lost=0, duplicates=0,
+                           unacked_present=max(0, (result.records or 0) - acked))
+                ctx["kept_volumes"] = []
+            else:
+                row["verify"] = f"FAILED: {result.error or 'no verify_done line'} (exit {done.returncode})"
     for name in ("driver.log", "lease.log"):
         shutil.copy2(os.path.join(raw, name), os.path.join(logs, name))
     if row.get("verify", "").startswith("FAILED"):
@@ -760,6 +770,8 @@ def record_host_noise(env: dict, ctx: dict, sampler: host_noise.Sampler, path: s
         "what": "host load average and CPU idle, Docker containers running (all, this benchmark's kc-*, "
                 "rust:* builds) and Lima VMs running, sampled during the run; nothing was stopped",
         "run": host_noise.summarize(rows),
+        # Samples that failed, with when and why; the summary covers only the rest.
+        "probe_errors": sampler.errors,
         "per_repetition": {tag: host_noise.summarize(host_noise.window(rows, start, end))
                            for tag, (start, end) in sorted(ctx.get("rep_windows", {}).items())},
     }
