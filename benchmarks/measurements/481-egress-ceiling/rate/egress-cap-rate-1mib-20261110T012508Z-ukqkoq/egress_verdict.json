@@ -1,0 +1,32 @@
+{
+  "buckets": 60,
+  "buckets_over_cap": [],
+  "buckets_whose_latency_bound_exceeds_cap": [],
+  "cap_bytes_per_second": 1048576.0,
+  "counter": "vtop_upload_egress_bytes_total",
+  "largest_bucket_bytes": {
+    "bytes": 1032192.0,
+    "index": 16,
+    "interval_seconds": 1.0081087920007012,
+    "ratio_to_cap": 0.984375
+  },
+  "max_scrape_latency_seconds": 0.005211,
+  "pass": true,
+  "pass_every_bucket_at_or_below_cap": true,
+  "pass_total_within_tolerance": true,
+  "predicted_ratio": 0.96875,
+  "ratio_to_cap": 0.933634,
+  "total_bytes": 58753441.0,
+  "total_tolerance": 0.1,
+  "window_seconds": 60.015,
+  "worst_bucket": {
+    "bytes": 1015808.0,
+    "elapsed_seconds": 21.066,
+    "index": 21,
+    "interval_seconds": 0.9900080419971733,
+    "rate": 1026060.352,
+    "rate_upper_bound": 1027596.544,
+    "ratio_to_cap": 0.978527
+  },
+  "zero_byte_buckets": 1
+}
