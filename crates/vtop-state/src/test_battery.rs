@@ -13,7 +13,7 @@
 //! [`run_all`] assumes it is handed a FRESH, empty store; each check uses
 //! uniquely-prefixed `batch_id`s so they remain independent on a shared store.
 
-use crate::{BatchPatch, BatchRecord, CommittedCursor, StateStore};
+use crate::{BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset, StateStore};
 use vtop_core::errors::VtopError;
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
@@ -77,6 +77,7 @@ pub async fn run_all(store: &dyn StateStore) {
     max_committed_end_bytes_aggregates_in_store(store).await;
     committed_cursors_never_mix_the_offsets_of_two_files(store).await;
     committed_cursors_carry_the_newest_rows_content_fingerprint(store).await;
+    committed_kafka_offsets_are_the_newest_row_of_each_partition_and_group(store).await;
     claims_respect_live_leases_and_take_over_expired_ones(store).await;
 }
 
@@ -218,6 +219,85 @@ pub async fn run_fencing_battery(a: &dyn StateStore, b: &dyn StateStore) {
 pub async fn run_prune_battery(store: &dyn StateStore) {
     prune_preserves_cursor_seeds_and_bounds_deletion(store).await;
     listed_prune_deletes_only_what_was_listed(store).await;
+}
+
+/// #614: the Kafka adapter resumes each partition from the ledger, not from
+/// the group's committed offset, which an engine whose claim has moved on can
+/// still overwrite. The answer is per (topic, partition, consumer group), and
+/// it is the NEWEST committed row's end offset: not a row of another
+/// partition or group, not a row that is only VERIFIED, and not the highest
+/// offset - a recreated topic numbers its records from zero again.
+async fn committed_kafka_offsets_are_the_newest_row_of_each_partition_and_group(
+    store: &dyn StateStore,
+) {
+    let topic = "kafka_resume_614";
+    let row = |id: &str, partition: i32, group: &str, end: i64, created: &str| {
+        let marker = ProgressMarker::Kafka {
+            topic: topic.into(),
+            partition,
+            start_offset: 0,
+            end_offset: end,
+            consumer_group: group.into(),
+        };
+        let mut r = sample_record(id);
+        r.source_name = topic.into();
+        r.progress_start = marker.clone();
+        r.progress_end = marker;
+        r.created_at = created.into();
+        r
+    };
+    let committed = [
+        row("ko-p0-a", 0, "g", 9, "2030-01-01T00:00:01Z"),
+        row("ko-p0-b", 0, "g", 19, "2030-01-01T00:00:02Z"),
+        row("ko-p1", 1, "g", 4, "2030-01-01T00:00:03Z"),
+        row("ko-p0-old-group", 0, "g-old", 99, "2030-01-01T00:00:04Z"),
+        // Partition 2's topic was recreated: the newer row ends LOWER.
+        row("ko-p2-old-topic", 2, "g", 500, "2030-01-01T00:00:05Z"),
+        row("ko-p2-new-topic", 2, "g", 7, "2030-01-01T00:00:06Z"),
+    ];
+    for rec in &committed {
+        store.save_batch_state(rec).await.unwrap();
+        for st in LEGAL_WALK {
+            store
+                .update_batch_state(&rec.batch_id, st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+    }
+    // Newer and higher, but only VERIFIED: never a resume point.
+    let verified = row("ko-p0-verified", 0, "g", 29, "2030-01-01T00:00:09Z");
+    store.save_batch_state(&verified).await.unwrap();
+    for st in &LEGAL_WALK[..6] {
+        store
+            .update_batch_state("ko-p0-verified", *st, &BatchPatch::default())
+            .await
+            .unwrap();
+    }
+
+    let mut got: Vec<CommittedKafkaOffset> = store
+        .committed_kafka_offsets()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|o| o.topic == topic)
+        .collect();
+    got.sort_by(|a, b| (a.partition, &a.consumer_group).cmp(&(b.partition, &b.consumer_group)));
+    let want = |partition: i32, group: &str, end: i64| CommittedKafkaOffset {
+        topic: topic.into(),
+        partition,
+        consumer_group: group.into(),
+        end_offset: end,
+    };
+    assert_eq!(
+        got,
+        vec![
+            want(0, "g", 19),
+            want(0, "g-old", 99),
+            want(1, "g", 4),
+            want(2, "g", 7),
+        ],
+        "one resume point per (topic, partition, consumer group): the newest committed row's"
+    );
 }
 
 async fn empty_store_is_empty(store: &dyn StateStore) {
@@ -363,6 +443,7 @@ async fn max_committed_end_bytes_aggregates_in_store(store: &dyn StateStore) {
         file_size: end,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     let mk = |id: &str, path: &str, end: u64| {
         let mut r = sample_record(id);
@@ -416,11 +497,13 @@ async fn max_committed_end_bytes_aggregates_in_store(store: &dyn StateStore) {
 /// #578: the restart cursor carries the content fingerprint (and, for a
 /// spool, the length) the NEWEST committed row recorded - read out of the
 /// stored JSON by both backends - and a newest row from before the field
-/// answers "unknown", never an older row's fingerprint.
+/// answers "unknown", never an older row's fingerprint. #620: the same for
+/// the fingerprint of the bytes below the end.
 async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn StateStore) {
     use vtop_core::types::ContentFingerprint;
     let old = ContentFingerprint::of(b"old first line\n");
     let new = ContentFingerprint::of(&[b'x'; 5000]);
+    let tail = |end: u64| ContentFingerprint::of_tail(format!("bytes below {end}\n").as_bytes());
     let file = |end: u64, content: Option<ContentFingerprint>| ProgressMarker::File {
         path: "/fp.log".into(),
         inode: Some(9),
@@ -429,6 +512,9 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
         file_size: end,
         // Carried to the seed for the deferred delete (#619): the newest's.
         mtime: format!("2026-01-01T00:00:00.{end:09}+00:00"),
+        // A row that records a first page records the bytes below its end
+        // too, as the adapter writes them.
+        tail_fingerprint: content.as_ref().and(tail(end)),
         content_fingerprint: content,
     };
     let spool = |end: u64, content: Option<ContentFingerprint>| ProgressMarker::SyslogSpool {
@@ -479,6 +565,7 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
             observed_size: Some(5000),
             content_fingerprint: new.clone(),
             observed_mtime: Some("2026-01-01T00:00:00.000005000+00:00".into()),
+            tail_fingerprint: tail(5000),
         })
     );
     let spools = store
@@ -494,6 +581,7 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
             observed_size: None,
             content_fingerprint: None,
             observed_mtime: None,
+            tail_fingerprint: None,
         }),
         "the newest row predates the fields: unknown, not an older row's values"
     );
@@ -516,6 +604,36 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
         (got.observed_size, got.content_fingerprint.clone()),
         (Some(51), old)
     );
+
+    // #620: a newest file row from before the tail field answers "unknown"
+    // for it, never the older row's tail.
+    let mut r = sample_record("fp-4");
+    r.source_type = SourceType::File;
+    r.progress_start = file(6000, new.clone());
+    r.progress_end = {
+        let mut legacy = file(6000, new.clone());
+        if let ProgressMarker::File {
+            tail_fingerprint, ..
+        } = &mut legacy
+        {
+            *tail_fingerprint = None;
+        }
+        legacy
+    };
+    store.save_batch_state(&r).await.unwrap();
+    for st in LEGAL_WALK {
+        store.update_batch_state("fp-4", st, &p).await.unwrap();
+    }
+    let files = store.committed_cursors(SourceType::File).await.unwrap();
+    let got = files.iter().find(|c| c.path == "/fp.log").unwrap();
+    assert_eq!(
+        (
+            got.end_byte,
+            got.content_fingerprint.clone(),
+            got.tail_fingerprint.clone()
+        ),
+        (6000, new, None)
+    );
 }
 
 /// #558: a restart seeds each file's cursor from the ledger. The ledger's
@@ -535,6 +653,7 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
         file_size: end * 10,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     let mk = |id: &str, path: &str, inode: Option<u64>, end: u64| {
         let mut r = sample_record(id);
@@ -639,6 +758,7 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
         observed_size: Some(end_byte * 10),
         content_fingerprint: None,
         observed_mtime: None,
+        tail_fingerprint: None,
     };
     assert_eq!(
         got,
@@ -699,6 +819,7 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
             observed_size: None,
             content_fingerprint: None,
             observed_mtime: None,
+            tail_fingerprint: None,
         }],
         "the spool answers with the newest inode and that inode's maximum"
     );
@@ -818,6 +939,14 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
         file_size: end,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
+    };
+    let kafka_marker = |partition: i32, group: &str| ProgressMarker::Kafka {
+        topic: "app_events".into(),
+        partition,
+        start_offset: 0,
+        end_offset: 10,
+        consumer_group: group.into(),
     };
     let record = |id: &str, source_type: SourceType, name: &str, marker: ProgressMarker| {
         let mut r = sample_record(id);
@@ -852,6 +981,20 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
             "dir-src",
             file_marker("/logs/b", 5),
         ),
+        // #614: the same topic's other partition and another consumer group,
+        // each older than pr-k02. Each is its own resume point and survives.
+        record(
+            "pr-k1p",
+            SourceType::Kafka,
+            "app_events",
+            kafka_marker(1, "vtop-engine"),
+        ),
+        record(
+            "pr-kog",
+            SourceType::Kafka,
+            "app_events",
+            kafka_marker(0, "vtop-engine-old"),
+        ),
         record(
             "pr-k01",
             SourceType::Kafka,
@@ -874,6 +1017,18 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
                 .unwrap();
         }
     }
+    let kafka_offsets = || async {
+        let mut offsets = store.committed_kafka_offsets().await.unwrap();
+        offsets.sort_by(|a, b| {
+            (&a.topic, a.partition, &a.consumer_group).cmp(&(
+                &b.topic,
+                b.partition,
+                &b.consumer_group,
+            ))
+        });
+        offsets
+    };
+    let kafka_before = kafka_offsets().await;
     // A VERIFIED row on the same path with a HIGHER end_byte: it must be
     // ignored by both the seed aggregate and the prune (state protection).
     let verified = record(
@@ -932,9 +1087,10 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
 
     // Deletable set under a future cutoff: pr-a10, pr-a20 (path /logs/a has a
     // newer committed row), pr-c90 (older than pr-c15 though its offset is
-    // higher), pr-k01 (newer kafka row exists). Protected: pr-a30, pr-b05 and
-    // pr-c15 (newest per path), pr-k02 (newest for its source), pr-v40 (not
-    // SOURCE_COMMITTED).
+    // higher), pr-k01 (a newer row of its partition and group exists).
+    // Protected: pr-a30, pr-b05 and pr-c15 (newest per path), pr-k02, pr-k1p
+    // and pr-kog (newest of their partition and consumer group, #614), pr-v40
+    // (not SOURCE_COMMITTED).
     let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
     assert_eq!(
         store.prune_committed_history(&future, 1).await.unwrap(),
@@ -958,7 +1114,14 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
         seeds().await,
         "cursor seeds are prune-invariant"
     );
-    for survivor in ["pr-a30", "pr-b05", "pr-c15", "pr-k02", "pr-v40"] {
+    assert_eq!(
+        kafka_before,
+        kafka_offsets().await,
+        "kafka resume points are prune-invariant"
+    );
+    for survivor in [
+        "pr-a30", "pr-b05", "pr-c15", "pr-k02", "pr-k1p", "pr-kog", "pr-v40",
+    ] {
         assert!(
             store.get_batch(survivor).await.unwrap().is_some(),
             "{survivor} must survive"
@@ -984,6 +1147,7 @@ async fn listed_prune_deletes_only_what_was_listed(store: &dyn StateStore) {
         file_size: end,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     for (id, end) in [("lp-10", 10), ("lp-20", 20), ("lp-30", 30), ("lp-40", 40)] {
         let mut rec = sample_record(id);

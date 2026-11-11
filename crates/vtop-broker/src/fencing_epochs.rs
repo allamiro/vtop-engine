@@ -520,6 +520,71 @@ pub fn canonicalize_lineage(entries: &[EpochStart]) -> Vec<EpochStart> {
     canonical
 }
 
+/// Whether a fence caller's history proves that NONE of this replica's
+/// records in `[divergence, tail)` was ever acknowledged (#611). That proof
+/// is the only licence a fence has to discard them before its vote is read.
+///
+/// The fence runs before the vote, so a record it discards cannot then
+/// refuse the candidate. Raft never truncates a voter at vote time. A
+/// truncation here is safe only for records no quorum can have
+/// acknowledged, and a divergence point alone does not show that. It shows
+/// where two histories stop agreeing, not which side holds the acknowledged
+/// records.
+///
+/// The proof: the caller HOLDS a record at `divergence`, written under an
+/// epoch newer than every epoch this replica attributes to the disputed
+/// stretch. That epoch's leader was established under the vote restriction,
+/// so it held every record acknowledged before it, and its record at
+/// `divergence` is not this replica's. So no record of this replica's at or
+/// above `divergence` was acknowledged before that epoch. None could be
+/// acknowledged after it either, because the majority that granted it
+/// refuses appends from older epochs.
+///
+/// Anything short of that keeps the records:
+///
+/// * The caller's entry for `fencing_epoch` is the adoption it made at its
+///   own tail for this fence. It owns no record yet (a leader appends under
+///   an epoch only after the epoch is established). A divergence there is
+///   this replica holding records the caller never received. That is the
+///   #611 loss: the caller may simply have missed an acknowledged write.
+///   The replica keeps the records and answers with its full offset, and
+///   the vote restriction then refuses the caller.
+/// * The disputed stretch on this replica includes an epoch as new as the
+///   caller's, or newer. Those records may belong to a leadership the
+///   caller never followed, and may be acknowledged there.
+/// * Either side cannot attribute the offsets at all.
+pub fn caller_supersedes_suffix(
+    mine: &[EpochStart],
+    caller: &[EpochStart],
+    divergence: u64,
+    tail: u64,
+    fencing_epoch: u64,
+) -> bool {
+    let caller = canonicalize_lineage(caller);
+    let Some(theirs) = caller
+        .iter()
+        .rev()
+        .find(|entry| entry.start_offset <= divergence)
+    else {
+        return false;
+    };
+    if theirs.epoch >= fencing_epoch {
+        return false;
+    }
+    let mine = canonicalize_lineage(mine);
+    if !mine.iter().any(|entry| entry.start_offset <= divergence) {
+        return false;
+    }
+    // Epochs ascend with offset, so the newest epoch this replica holds a
+    // record of in `[divergence, tail)` is its last entry starting below the
+    // tail. Its own adoption of `fencing_epoch` sits AT the tail and owns
+    // nothing.
+    let Some(newest_disputed) = mine.iter().rev().find(|entry| entry.start_offset < tail) else {
+        return false;
+    };
+    newest_disputed.epoch < theirs.epoch
+}
+
 /// Clamp a lineage vector to the history that governs exactly the retained
 /// window `[base, tail)` (#408): the entry owning `base`, re-anchored AT
 /// `base`, plus every entry starting inside the window.
@@ -678,6 +743,63 @@ mod tests {
                 start_offset,
             })
             .collect()
+    }
+
+    /// #611, case by case. The replica holds epoch-18 records to 10 and
+    /// adopted 20 at its tail; the fence is at 20.
+    #[test]
+    fn only_a_caller_holding_a_newer_record_at_the_divergence_supersedes() {
+        let mine = starts(&[(18, 0), (20, 10)]);
+        // The caller's only entry at 5 is its own adoption of the fence
+        // epoch at its tail: it holds nothing there.
+        assert!(!caller_supersedes_suffix(
+            &mine,
+            &starts(&[(18, 0), (20, 5)]),
+            5,
+            10,
+            20
+        ));
+        // An idle adoption of 19 at the same tail collapses into 20's.
+        assert!(!caller_supersedes_suffix(
+            &mine,
+            &starts(&[(18, 0), (19, 5), (20, 5)]),
+            5,
+            10,
+            20
+        ));
+        // The caller holds epoch-19 records from 5: newer than every record
+        // the replica would lose.
+        assert!(caller_supersedes_suffix(
+            &mine,
+            &starts(&[(18, 0), (19, 5), (20, 8)]),
+            5,
+            10,
+            20
+        ));
+        // The replica's disputed stretch includes epoch-19 records of its
+        // own from 7: not older than the caller's 19, so not superseded.
+        assert!(!caller_supersedes_suffix(
+            &starts(&[(18, 0), (19, 7), (20, 10)]),
+            &starts(&[(18, 0), (19, 5), (20, 8)]),
+            5,
+            10,
+            20
+        ));
+        // Neither side attributes the offset: nothing is proven.
+        assert!(!caller_supersedes_suffix(
+            &[],
+            &starts(&[(18, 0), (19, 5)]),
+            5,
+            10,
+            20
+        ));
+        assert!(!caller_supersedes_suffix(
+            &mine,
+            &starts(&[(19, 6)]),
+            5,
+            10,
+            20
+        ));
     }
 
     /// The transferred history keeps an entry AT the sealed-prefix end and

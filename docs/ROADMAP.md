@@ -209,16 +209,50 @@ reopen quietly.
   answer from the history the fence returned: Agreed, Reconciled (it
   discarded n records first) or Unknown, and only the first two count,
   even when nothing else is available - falling back to offsets then would
-  be a fence that fails open exactly when needed. A range whose replicas
-  cannot prove lineage is repaired (`vtopctl node repair`, #315), not
-  promoted on a guess; a candidate with no history stands aside for one that
-  has it. The verdicts are recorded with the quorum and the replica-set gate
+  be a fence that fails open exactly when needed. A replica that cannot
+  prove lineage is repaired from one that can (`vtopctl node repair`, #315),
+  not promoted on a guess. A candidate with no history stands aside for a
+  replica that has records: a candidate holding records it cannot vouch
+  for always did, and one holding none now does too (#612). The costs
+  (#612): a range that holds records but where NO replica has epoch
+  history (records that predate the journal on every replica, or journals
+  lost on every replica) cannot promote, and repair cannot fix it, since a
+  history-less source has nothing to install; and a
+  replica whose only dispute is below its retained base (#408) is not
+  counted. The verdicts are recorded with the quorum and the replica-set gate
   and `vtopctl meta transitions` count only the proven answers. Recording
   them is a new outcome tag inside the promotion report, so it is gated at
   feature level 6: below it (or against a metadata tier that predates
   levels) a data node records the report without verdicts AND without the
   Unknown answers, which that form's readers would count by offset. Records
   written before verdicts carry none and are judged exactly as before.
+- **#611** - the fence discarded acknowledged records before the vote was
+  read. A candidate adopts the new epoch at its own tail before it sends its
+  history, so a replica holding records the candidate never received compared
+  the two as diverged at the candidate's tail and truncated down to it,
+  provided its own high-water mark was at or below that. In a three-replica
+  range a record the dead leader and that replica had acknowledged was lost,
+  and the replica then voted for the candidate that lacked it. A fence now discards a suffix only
+  when the candidate holds a record at the divergence point written under an
+  epoch newer than every record discarded, which is proof that none of them
+  was acknowledged. Otherwise the replica keeps the records, answers with its
+  full offset, the candidate counts that answer, and the election restriction
+  refuses the candidate and names the replica as the one to lead. A replica
+  that kept such a suffix and was outvoted discards it on the established
+  leader's first append or committed high-water mark past its start,
+  instead of acking a record it does not hold (#261) or exposing the kept
+  records as committed. That memory does not survive a restart, which leaves
+  it in the same position as a replica that was absent from the fence.
+  **The protection is the fenced replica's, so it holds only on upgraded
+  replicas.** There is no wire or feature-level change and the fence frames
+  are identical, so nothing tells a candidate which replicas run this
+  release. A replica still on an older release truncates exactly as before,
+  during its own fence and before any candidate judges its answer. Until
+  every data node of a range runs this release, a failover can still lose an
+  acknowledged write that way. PRODUCTION_HA's upgrade procedure says how to
+  keep the rolling upgrade itself from triggering it. An older candidate
+  facing an upgraded replica judges the kept answer refused (its offset is
+  higher) or Unknown, never a grant.
 
 One observation rode along without becoming a fix: scenario 09 once left a
 promotion unacquired within its deadline (#318). The flake has not recurred —

@@ -476,11 +476,20 @@ async fn retry_text_busy<T>(
 /// this one deadline, so neither can restart the clock (#529 review). The
 /// setting is an unbounded `u64`, so an absurd value saturates to a
 /// practically-never deadline instead of panicking on `Instant` overflow.
-fn command_deadline(timeout: Duration) -> tokio::time::Instant {
+pub(crate) fn command_deadline(timeout: Duration) -> tokio::time::Instant {
     let now = tokio::time::Instant::now();
     now.checked_add(timeout)
         .unwrap_or_else(|| now + Duration::from_secs(30 * 365 * 24 * 60 * 60))
 }
+
+/// How long a command's output drains may run on after the tool has
+/// EXITED. Everything the tool wrote is already in the pipe by then (at most
+/// one pipe buffer, read in microseconds), so this only has to cover
+/// scheduling the drain; past it, a descendant is what holds the pipe open.
+/// Shared by the read-back (`ReadBackEvidence::classify`) and the write path
+/// (`CommandPolicy::capture`, #593), and never spent past the command's own
+/// deadline by either.
+pub(crate) const EXITED_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 impl ReadBackEvidence {
     /// The most stderr kept. Enough for any CLI's last error line; the rest
@@ -491,12 +500,6 @@ impl ReadBackEvidence {
     const MAX_BYTES: usize = 64 * 1024;
     /// How much of the last line the error message repeats.
     const MAX_SHOWN_CHARS: usize = 240;
-    /// How long the drain may run on after the tool has EXITED. Everything
-    /// the tool wrote is already in the pipe by then (at most one pipe
-    /// buffer, read in microseconds), so this only has to cover scheduling
-    /// the drain task; past it, a descendant is what holds the pipe open.
-    const EXITED_DRAIN_GRACE: Duration = Duration::from_secs(1);
-
     fn collect(
         child: &mut tokio::process::Child,
         backend: &str,
@@ -540,7 +543,7 @@ impl ReadBackEvidence {
     /// is already kept.
     async fn classify(mut self, detail: String, deadline: tokio::time::Instant) -> VtopError {
         let until = tokio::time::Instant::now()
-            .checked_add(Self::EXITED_DRAIN_GRACE)
+            .checked_add(EXITED_DRAIN_GRACE)
             .map_or(deadline, |grace| grace.min(deadline));
         let _ = tokio::time::timeout_at(until, &mut self.drain).await;
         let evidence = {
