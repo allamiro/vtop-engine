@@ -978,6 +978,7 @@ impl AdminClient {
                             .and_then(|leader| self.index_of(leader))
                             .filter(|named| !asked[*named]);
                         if named.is_some() {
+                            self.redirects.fetch_add(1, Ordering::Relaxed);
                             next = named;
                             continue;
                         }
