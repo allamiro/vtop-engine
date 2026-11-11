@@ -166,6 +166,10 @@ impl StateStore for Recorder {
         )
         .await
     }
+    async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError> {
+        self.write(self.inner.renew_claim(batch_id, lease_until), |_, _| {})
+            .await
+    }
     async fn max_committed_end_bytes(
         &self,
         source_type: SourceType,
@@ -177,6 +181,12 @@ impl StateStore for Recorder {
         source_type: SourceType,
     ) -> Result<Vec<CommittedCursor>, VtopError> {
         self.inner.committed_cursors(source_type).await
+    }
+    async fn committed_cursors_by_file(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<CommittedCursor>, VtopError> {
+        self.inner.committed_cursors_by_file(source_type).await
     }
     async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
         self.inner.committed_kafka_offsets().await

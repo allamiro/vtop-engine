@@ -98,6 +98,15 @@ impl StateStore for DeadlineStore {
             .await
     }
 
+    async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError> {
+        self.within(
+            "renew_claim",
+            self.point,
+            self.inner.renew_claim(batch_id, lease_until),
+        )
+        .await
+    }
+
     async fn claim_incomplete_batches(
         &self,
         owner: &str,
@@ -141,6 +150,18 @@ impl StateStore for DeadlineStore {
             "committed_kafka_offsets",
             self.scan,
             self.inner.committed_kafka_offsets(),
+        )
+        .await
+    }
+
+    async fn committed_cursors_by_file(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<CommittedCursor>, VtopError> {
+        self.within(
+            "committed_cursors_by_file",
+            self.scan,
+            self.inner.committed_cursors_by_file(source_type),
         )
         .await
     }
@@ -270,6 +291,9 @@ mod tests {
         ) -> Result<Vec<BatchRecord>, VtopError> {
             never!()
         }
+        async fn renew_claim(&self, _: &str, _: &str) -> Result<bool, VtopError> {
+            never!()
+        }
         async fn max_committed_end_bytes(
             &self,
             _: SourceType,
@@ -283,6 +307,12 @@ mod tests {
             never!()
         }
         async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
+            never!()
+        }
+        async fn committed_cursors_by_file(
+            &self,
+            _: SourceType,
+        ) -> Result<Vec<CommittedCursor>, VtopError> {
             never!()
         }
         async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
@@ -358,6 +388,10 @@ mod tests {
         expired(
             store.committed_kafka_offsets().await,
             "committed_kafka_offsets",
+        );
+        expired(
+            store.committed_cursors_by_file(SourceType::File).await,
+            "committed_cursors_by_file",
         );
         expired(store.list_batches().await, "list_batches");
         expired(

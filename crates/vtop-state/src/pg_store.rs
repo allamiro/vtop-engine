@@ -11,7 +11,8 @@
 //!    `vtop_core::state_machine` at write time AND by a database trigger, so the
 //!    DB rejects an illegal `-> source_committed` transition even if application
 //!    logic is ever bypassed. A `CHECK` also constrains the state to the known
-//!    enum.
+//!    enum, and startup refuses a schema whose `CHECK` predates a state this
+//!    build writes (`superseded`, #567).
 //! 2. **Serialization-failure retry.** Distributed Postgres-compatible stores
 //!    can abort a transaction with SQLSTATE `40001`; those are transient, so the
 //!    write is retried a bounded number of times.
@@ -46,12 +47,13 @@ const MIGRATION: &str = include_str!("../migrations/postgres/0001_state_store.sq
 /// `-- vtop-state-schema N` (the body starts with the newline after `$fn$`,
 /// hence "non-empty"). Startup requires at least this N. 2 is the first
 /// body that refuses an insert in any state but batching (#625); a schema from
-/// before it carries no marker. The marker lives in the body, not in a
+/// before it carries no marker. 3 is the migration that also admits
+/// `superseded` in the state CHECK (#567). The marker lives in the body, not in a
 /// `COMMENT ON FUNCTION`, because `CREATE OR REPLACE` replaces the body but
 /// keeps a comment: an older release's migrate would leave its older body
 /// under the newer comment.
 const SCHEMA_MARKER_PREFIX: &str = "-- vtop-state-schema ";
-const MIN_SCHEMA_VERSION: u32 = 2;
+const MIN_SCHEMA_VERSION: u32 = 3;
 
 /// Whether the trigger function's body opens with a schema version this
 /// engine accepts. A marker anywhere but the first non-empty line, or a
@@ -83,9 +85,11 @@ const MAX_CONFLICT_RETRIES: u32 = 5;
 /// partition resumes (#614; see the SQLite predicate). The
 /// successor probe's expressions must stay identical to
 /// idx_batches_commit_newest in migrations/postgres/0001_state_store.sql.
+/// A SUPERSEDED row ($4, #567) is deletable on age alone: it is never a
+/// restart cursor.
 macro_rules! pg_prune_predicate_sql {
     () => {
-        "b.state = $1 AND b.updated_at < $2 \
+        "b.updated_at < $2 AND (b.state = $4 OR (b.state = $1 \
           AND EXISTS ( \
             SELECT 1 FROM batches n \
             WHERE n.state = $1 \
@@ -98,9 +102,22 @@ macro_rules! pg_prune_predicate_sql {
                   IS NOT DISTINCT FROM (b.progress_end_json::jsonb ->> 'consumer_group') \
               AND (n.created_at > b.created_at \
                    OR (n.created_at = b.created_at AND n.batch_id > b.batch_id)) \
-          )"
+          )))"
     };
 }
+
+/// The states the `state_enum` CHECK must admit for this build to write every
+/// state it can reach. `superseded` arrived with #567; a schema migrated by an
+/// older release refuses it, so startup asks for `vtopctl migrate` instead of
+/// failing the first retirement.
+///
+/// Checked on the constraint itself, not only through the schema marker
+/// (version 3 since #567): the marker describes the function body a
+/// migration installed, and the CHECK is a separate object. A table restored
+/// on its own from an older archive, or a constraint replaced by hand, leaves
+/// a current marker over an old CHECK - and an older release's migrate leaves
+/// the widened CHECK under its older marker. Either half alone is refused.
+const STATE_ADDED_SINCE_FIRST_SCHEMA: &str = "superseded";
 
 /// Handle to the persistent Postgres-compatible state store.
 #[derive(Clone)]
@@ -112,6 +129,32 @@ pub struct PgStateStore {
 
 fn map_sqlx(e: sqlx::Error) -> VtopError {
     VtopError::State(redact_postgres_urls(&e.to_string()))
+}
+
+/// A `(path, inode, end_byte, file_size, content, tail)` row of a cursor
+/// query. The inode is read as text and parsed here so a u64 above i64::MAX
+/// stays exact; a malformed stored fingerprint reads as unknown (#620).
+fn committed_cursor_of(r: &sqlx::postgres::PgRow) -> Option<CommittedCursor> {
+    let path: Option<String> = r.get("path");
+    let inode: Option<String> = r.get("inode");
+    let end: Option<i64> = r.get("end_byte");
+    let size: Option<i64> = r.get("file_size");
+    let content: Option<String> = r.get("content");
+    let mtime: Option<String> = r.get("mtime");
+    let tail: Option<String> = r.get("tail");
+    Some(CommittedCursor {
+        path: path?,
+        inode: inode.and_then(|i| i.parse().ok()),
+        end_byte: end?.max(0) as u64,
+        observed_size: size.map(|s| s.max(0) as u64),
+        content_fingerprint: content
+            .as_deref()
+            .and_then(crate::models::parse_content_fingerprint),
+        observed_mtime: mtime.filter(|m| !m.is_empty()),
+        tail_fingerprint: tail
+            .as_deref()
+            .and_then(crate::models::parse_content_fingerprint),
+    })
 }
 
 /// Remove complete PostgreSQL URLs from any error before it can reach logs or
@@ -298,6 +341,27 @@ impl PgStateStore {
         if !schema_marker_is_current(body.as_deref()) {
             return Err(schema_migration_required());
         }
+
+        // The state CHECK must admit every state this build writes (#567),
+        // under a current marker or not: see STATE_ADDED_SINCE_FIRST_SCHEMA.
+        // Without it the first retirement would fail at runtime; refuse to
+        // start instead, with the same guidance as any other outdated schema.
+        let admits_every_state: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM pg_catalog.pg_constraint \
+                WHERE conrelid = 'batches'::regclass \
+                  AND conname = 'state_enum' \
+                  AND contype = 'c' \
+                  AND pg_catalog.pg_get_constraintdef(oid) LIKE '%''' || $1 || '''%' \
+             )",
+        )
+        .bind(STATE_ADDED_SINCE_FIRST_SCHEMA)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_schema_check)?;
+        if !admits_every_state {
+            return Err(schema_migration_required());
+        }
         Ok(())
     }
 
@@ -476,6 +540,26 @@ impl StateStore for PgStateStore {
             .await
     }
 
+    async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError> {
+        let Some(held) = self.fence.held(batch_id) else {
+            return Ok(false);
+        };
+        let lease_until = crate::store::normalize_rfc3339_utc("lease_until", lease_until)?;
+        // See the SQLite implementation (#624).
+        let renewed = with_retry(|| {
+            sqlx::query(
+                "UPDATE batches SET lease_expires_at = $1 WHERE batch_id = $2 AND claim_gen = $3",
+            )
+            .bind(&lease_until)
+            .bind(batch_id)
+            .bind(held)
+            .execute(&self.pool)
+        })
+        .await?
+        .rows_affected();
+        Ok(renewed == 1)
+    }
+
     async fn claim_incomplete_batches(
         &self,
         owner: &str,
@@ -496,7 +580,7 @@ impl StateStore for PgStateStore {
             sqlx::query(
                 "UPDATE batches SET owner = $1, lease_expires_at = $2, updated_at = $3, \
                         claim_gen = claim_gen + 1 \
-                 WHERE state != $4 \
+                 WHERE state NOT IN ($4, $5) \
                    AND (owner IS NULL OR owner = $1 OR lease_expires_at IS NULL OR lease_expires_at <= $3) \
                  RETURNING *",
             )
@@ -504,6 +588,7 @@ impl StateStore for PgStateStore {
             .bind(lease_until)
             .bind(now)
             .bind(BatchState::SourceCommitted.as_str())
+            .bind(BatchState::Superseded.as_str())
             .fetch_all(&self.pool)
         })
         .await?;
@@ -579,31 +664,41 @@ impl StateStore for PgStateStore {
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                let path: Option<String> = r.get("path");
-                let inode: Option<String> = r.get("inode");
-                let end: Option<i64> = r.get("end_byte");
-                let size: Option<i64> = r.get("file_size");
-                let content: Option<String> = r.get("content");
-                let mtime: Option<String> = r.get("mtime");
-                let tail: Option<String> = r.get("tail");
-                Some(CommittedCursor {
-                    path: path?,
-                    inode: inode.and_then(|i| i.parse().ok()),
-                    end_byte: end?.max(0) as u64,
-                    observed_size: size.map(|s| s.max(0) as u64),
-                    content_fingerprint: content
-                        .as_deref()
-                        .and_then(crate::models::parse_content_fingerprint),
-                    observed_mtime: mtime.filter(|m| !m.is_empty()),
-                    tail_fingerprint: tail
-                        .as_deref()
-                        .and_then(crate::models::parse_content_fingerprint),
-                })
-            })
-            .collect())
+        Ok(rows.iter().filter_map(committed_cursor_of).collect())
+    }
+
+    async fn committed_cursors_by_file(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<CommittedCursor>, VtopError> {
+        // See the SQLite implementation (#621): `committed_cursors`,
+        // partitioned by path and inode instead of by path.
+        let rows = sqlx::query(
+            "WITH committed AS ( \
+                 SELECT progress_end_json::jsonb ->> 'path' AS path, \
+                        progress_end_json::jsonb ->> 'inode' AS inode, \
+                        (progress_end_json::jsonb ->> 'end_byte')::bigint AS end_byte, \
+                        (progress_end_json::jsonb ->> 'file_size')::bigint AS file_size, \
+                        progress_end_json::jsonb ->> 'content_fingerprint' AS content, \
+                        progress_end_json::jsonb ->> 'tail_fingerprint' AS tail, \
+                        progress_end_json::jsonb ->> 'mtime' AS mtime, \
+                        created_at, batch_id \
+                 FROM batches WHERE state = $1 AND source_type = $2 \
+             ), latest AS ( \
+                 SELECT path, inode, end_byte, file_size, content, tail, mtime, \
+                        created_at, batch_id, ROW_NUMBER() OVER ( \
+                            PARTITION BY path, inode ORDER BY created_at DESC, batch_id DESC) AS rn \
+                 FROM committed \
+             ) \
+             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest \
+             WHERE rn = 1 ORDER BY path, created_at DESC, batch_id DESC",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(source_type.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows.iter().filter_map(committed_cursor_of).collect())
     }
 
     async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
@@ -648,11 +743,15 @@ impl StateStore for PgStateStore {
     }
 
     async fn list_incomplete_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
-        self.query_records(
-            "SELECT * FROM batches WHERE state != $1 ORDER BY created_at ASC",
-            Some(BatchState::SourceCommitted.as_str().to_string()),
+        let rows = sqlx::query(
+            "SELECT * FROM batches WHERE state NOT IN ($1, $2) ORDER BY created_at ASC",
         )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(BatchState::Superseded.as_str())
+        .fetch_all(&self.pool)
         .await
+        .map_err(map_sqlx)?;
+        rows.into_iter().map(row_to_record).collect()
     }
 
     async fn list_failed_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
@@ -708,6 +807,7 @@ impl StateStore for PgStateStore {
             .bind(BatchState::SourceCommitted.as_str())
             .bind(older_than)
             .bind(i64::from(limit))
+            .bind(BatchState::Superseded.as_str())
             .execute(&self.pool)
         })
         .await?;
@@ -729,6 +829,7 @@ impl StateStore for PgStateStore {
             .bind(BatchState::SourceCommitted.as_str())
             .bind(older_than)
             .bind(i64::from(limit))
+            .bind(BatchState::Superseded.as_str())
             .fetch_all(&self.pool)
         })
         .await?;
@@ -750,6 +851,7 @@ impl StateStore for PgStateStore {
             .bind(BatchState::SourceCommitted.as_str())
             .bind(older_than)
             .bind(batch_ids)
+            .bind(BatchState::Superseded.as_str())
             .execute(&self.pool)
         })
         .await?;
@@ -804,7 +906,9 @@ mod security_tests {
             "-- vtop-state-schema",
             "-- vtop-state-schema x",
             "-- vtop-state-schema 1",
-            "vtop-state-schema 2",
+            // #625's marker: its schema predates the #567 state CHECK.
+            "-- vtop-state-schema 2",
+            "vtop-state-schema 3",
             "-- must be inserted as batching",
         ] {
             assert!(
@@ -815,16 +919,16 @@ mod security_tests {
         assert!(!schema_marker_is_current(None));
         // Only the first non-empty line counts.
         assert!(!schema_marker_is_current(Some(
-            "\nBEGIN\n-- vtop-state-schema 2\n    RETURN NEW;\nEND;\n"
+            "\nBEGIN\n-- vtop-state-schema 3\n    RETURN NEW;\nEND;\n"
         )));
         assert!(!schema_marker_is_current(Some(
-            "\n-- an earlier comment\n-- vtop-state-schema 2\nBEGIN\nEND;\n"
+            "\n-- an earlier comment\n-- vtop-state-schema 3\nBEGIN\nEND;\n"
         )));
         assert!(schema_marker_is_current(Some(&body(
-            "-- vtop-state-schema 2"
+            "-- vtop-state-schema 3"
         ))));
         assert!(schema_marker_is_current(Some(&body(
-            "    -- vtop-state-schema 3"
+            "    -- vtop-state-schema 4"
         ))));
     }
 

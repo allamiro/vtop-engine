@@ -21,6 +21,8 @@ use vtop_core::types::{ContentFingerprint, ProgressMarker, SourceType, Telemetry
 struct SpoolCursor {
     read_byte: u64,
     committed_byte: u64,
+    /// See `FileCursor::confirmed_for` (#624).
+    confirmed_for: Option<continuity::ConfirmedFile>,
     /// What the spool looked like when this cursor last caught up with it.
     ///
     /// Kept so a cycle can decide NOT to open the file at all (#101). `None`
@@ -76,6 +78,7 @@ impl SyslogSpoolSource {
     pub fn seed_committed(&mut self, path: &str, committed_byte: u64) {
         let c = self.cursors.entry(path.to_string()).or_default();
         c.committed_byte = committed_byte;
+        c.confirmed_for = None;
         c.read_byte = committed_byte;
     }
 
@@ -120,6 +123,7 @@ impl SyslogSpoolSource {
                 "{why}; the read of the new content then failed"
             );
             cursor.committed_byte = 0;
+            cursor.confirmed_for = None;
             cursor.read_byte = 0;
             cursor.generations.discontinuity();
             cursor.seen = Some(seen);
@@ -144,6 +148,7 @@ impl SyslogSpoolSource {
         if let Some(why) = discontinuity {
             tracing::warn!(path, previous_read_byte = cursor.read_byte, "{why}");
             cursor.committed_byte = 0;
+            cursor.confirmed_for = None;
             cursor.generations.discontinuity();
         }
         cursor.generations.issue(start, end);
@@ -618,7 +623,34 @@ impl SourceAdapter for SyslogSpoolSource {
             )
         {
             let c = self.cursors.entry(path.clone()).or_default();
+            // Superseded by a commit this process confirmed (#624; see
+            // `FileSource::commit_progress`).
+            // Proven, not merely not disproven (review of #659); a spool
+            // marker records no tail.
+            if c.committed_byte >= *end_byte
+                && c.confirmed_for.as_ref().is_some_and(|file| {
+                    file.proves(
+                        Path::new(path),
+                        c.committed_byte,
+                        *marker_inode,
+                        marker_content.as_ref(),
+                        None,
+                        marker_file_size.unwrap_or(0).max(*end_byte),
+                    )
+                })
+            {
+                tracing::info!(
+                    path,
+                    end_byte,
+                    committed_byte = c.committed_byte,
+                    "syslog spool commit skipped: the range is superseded by a later committed \
+                     one, and committing it would move the cursor back"
+                );
+                return Ok(());
+            }
             c.committed_byte = *end_byte;
+            c.confirmed_for =
+                continuity::ConfirmedFile::of(*marker_inode, marker_content.as_ref(), None);
             // See `FileSource::commit_progress`: a recovered commit below the
             // seeded head restarts the head there; and, whatever its end, the
             // cursor adopts the identity the batch saw - the seed may be of
@@ -744,6 +776,57 @@ impl SourceAdapter for SyslogSpoolSource {
         Some(i128::from(c.read_byte))
     }
 
+    /// The cursor's committed byte, only when the cursor is PROVEN to describe
+    /// the marker's spool: the same inode, the same content - equal
+    /// fingerprints, or both matching the first bytes of the spool now at the
+    /// path, which still has that inode - and no truncation since, by any
+    /// length recorded or seen. See `FileSource::committed_through`
+    /// (review of #567); a spool marker records no tail.
+    fn committed_through(&self, marker: &ProgressMarker) -> Option<i128> {
+        let ProgressMarker::SyslogSpool {
+            path,
+            inode: Some(marker_inode),
+            end_byte,
+            file_size: marker_size,
+            content_fingerprint: Some(marker_content),
+            ..
+        } = marker
+        else {
+            return None;
+        };
+        let c = self.cursors.get(path)?;
+        let seen = c.seen.as_ref()?;
+        if seen.inode != Some(*marker_inode) {
+            return None;
+        }
+        let seen_content = seen.content.as_ref()?;
+        if seen_content.same_content(marker_content) == Some(false) {
+            return None;
+        }
+        // The one positive-identity test (`continuity::proves`), shared with
+        // the file source: both first pages must match the spool now at the
+        // path, and a spool never gets shorter - one now shorter than the
+        // cursor's position, the length the cursor saw, the length the
+        // marker's read saw, or the range's end was truncated since,
+        // rewritten in place, which can keep the inode and the first page,
+        // and the cursor's committed byte belongs to the content before it
+        // (review of #567, Codex). Spool markers record no tail.
+        let proven = continuity::proves_at_path(
+            Path::new(path),
+            &continuity::Identity {
+                inode: *marker_inode,
+                contents: &[seen_content, marker_content],
+                tails: &[],
+                min_len: c
+                    .committed_byte
+                    .max(seen.file_size)
+                    .max(marker_size.unwrap_or(0))
+                    .max(*end_byte),
+            },
+        );
+        proven.then(|| i128::from(c.committed_byte))
+    }
+
     fn source_type(&self) -> SourceType {
         SourceType::SyslogSpool
     }
@@ -768,6 +851,152 @@ fn inode_of(_md: &std::fs::Metadata) -> Option<u64> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// #567 (review, Codex): a spool rewritten in place with the same first
+    /// page but SHORTER - a truncation, as a copytruncate leaves it - agrees
+    /// with the inode and with fingerprints capped at one page, yet the
+    /// cursor's committed byte belongs to the old content. The lengths say
+    /// so: the spool is now shorter than the cursor's position and than the
+    /// length the cursor saw. No committed point is answered, so the range
+    /// keeps the replay path instead of being retired against the old offset.
+    #[cfg(unix)]
+    #[test]
+    fn a_truncated_spool_with_the_same_first_page_lends_no_committed_point() {
+        use std::os::unix::fs::MetadataExt;
+        let page: Vec<u8> = (0..4096u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let mut bytes = page.clone();
+        bytes.extend(std::iter::repeat_n(b'n', 5000 - 4096));
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let first_page = ContentFingerprint::of(&page);
+        let mut s = SyslogSpoolSource::new(vec![path.clone()]);
+        // The old content was 10000 bytes long and committed through 10000.
+        s.seed_committed_from(&path, 10_000, Some(inode), Some(10_000), first_page.clone());
+        let replacement = ProgressMarker::SyslogSpool {
+            spool_id: "s".into(),
+            path: path.clone(),
+            inode: Some(inode),
+            start_byte: 4_000,
+            end_byte: 5_000,
+            received_time_start: None,
+            received_time_end: None,
+            file_size: Some(5_000),
+            content_fingerprint: first_page,
+        };
+        assert_eq!(
+            s.committed_through(&replacement),
+            None,
+            "the old generation's committed offset was lent to a truncated spool's range"
+        );
+    }
+
+    /// #567 (review): as for `FileSource` - a spool's committed point is
+    /// answered only for a marker proven to be the cursor's spool: the same
+    /// inode and content shown to be the same, settled against the spool at
+    /// the path when the fingerprints are of different lengths.
+    #[cfg(unix)]
+    #[test]
+    fn the_committed_point_is_answered_only_for_a_marker_proven_to_be_the_cursors_spool() {
+        use std::os::unix::fs::MetadataExt;
+        let bytes: Vec<u8> = (0..100u8).map(|i| b'a' + i % 26).collect();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let fp = |b: &[u8]| ContentFingerprint::of(b);
+        let marker =
+            |inode: Option<u64>, content: Option<ContentFingerprint>| ProgressMarker::SyslogSpool {
+                spool_id: "s".into(),
+                path: path.clone(),
+                inode,
+                start_byte: 0,
+                end_byte: 30,
+                received_time_start: None,
+                received_time_end: None,
+                file_size: Some(100),
+                content_fingerprint: content,
+            };
+        let mut s = SyslogSpoolSource::new(vec![path.clone()]);
+        s.seed_committed_from(&path, 40, Some(inode), Some(100), fp(&bytes));
+        assert_eq!(
+            s.committed_through(&marker(Some(inode), fp(&bytes))),
+            Some(40)
+        );
+        assert_eq!(
+            s.committed_through(&marker(Some(inode), fp(&bytes[..50]))),
+            Some(40)
+        );
+        assert_eq!(
+            s.committed_through(&marker(None, fp(&bytes))),
+            None,
+            "no inode"
+        );
+        assert_eq!(
+            s.committed_through(&marker(Some(inode), None)),
+            None,
+            "no content"
+        );
+        assert_eq!(
+            s.committed_through(&marker(Some(inode + 1), fp(&bytes))),
+            None
+        );
+        assert_eq!(
+            s.committed_through(&marker(Some(inode), fp(&[b'z'; 50]))),
+            None,
+            "other content of another length"
+        );
+    }
+
+    /// The spool counterpart of the file source's test of the same name
+    /// (#621, the shared `continuity::proves`): equal first-page fingerprints
+    /// in the marker and the cursor say both read the same content, not that
+    /// the spool at the path STILL holds it. A spool rewritten in place - the
+    /// same inode, longer, other first bytes; spool markers record no tail -
+    /// passed every other check and lent the old content's committed byte to a
+    /// range of it, retiring that range as SUPERSEDED for good (#567).
+    #[cfg(unix)]
+    #[test]
+    fn equal_fingerprints_still_have_to_match_the_spool_now_at_the_path() {
+        use std::os::unix::fs::MetadataExt;
+        let old: Vec<u8> = (0..100u8).map(|i| b'a' + i % 26).collect();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&old).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let content = ContentFingerprint::of(&old);
+        let marker = ProgressMarker::SyslogSpool {
+            spool_id: "s".into(),
+            path: path.clone(),
+            inode: Some(inode),
+            start_byte: 0,
+            end_byte: 30,
+            received_time_start: None,
+            received_time_end: None,
+            file_size: Some(100),
+            content_fingerprint: content.clone(),
+        };
+        let mut s = SyslogSpoolSource::new(vec![path.clone()]);
+        s.seed_committed_from(&path, 40, Some(inode), Some(100), content);
+        assert_eq!(s.committed_through(&marker), Some(40), "the spool read");
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[b'Z'; 120])
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(
+            s.committed_through(&marker),
+            None,
+            "the spool at the path no longer starts with what both recorded"
+        );
+    }
 
     #[tokio::test]
     async fn reads_spool_and_resumes() {

@@ -160,6 +160,11 @@ pub enum MetaCommand {
     /// the commands it enables. Raising is permanent - there is no lowering -
     /// and asking for a level already in force is a no-op. The reply's
     /// generation is the level now in force.
+    ///
+    /// A level above 7 is also refused while any counted node - a live range
+    /// member, or any node that has reported, unless marked dead - has not
+    /// reported that level or higher (#634); the refusal names every such
+    /// node. See `node-versions`.
     EnableFeatures {
         #[command(flatten)]
         common: MetaCommonArgs,
@@ -167,6 +172,17 @@ pub enum MetaCommand {
         level: u32,
         #[arg(long)]
         request_id: Option<Uuid>,
+    },
+    /// What every registered node reported it runs (#634): its release, the
+    /// replica protocol it speaks and the feature level it implements, and
+    /// whether a feature raise counts it (a range member or a reporter, not
+    /// marked dead). With `--level`, also whether that level could be raised
+    /// now, naming every node it waits for; exits non-zero if not.
+    NodeVersions {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        level: Option<u32>,
     },
     /// The replica set metadata recorded for a range (#553): the nodes its
     /// quorum is counted over, the record's generation (the CAS token
@@ -1426,6 +1442,16 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                     vtop_meta::SUPPORTED_FEATURE_LEVEL
                 ));
             }
+            // Judged here as well as in the state machine (#634): the state
+            // machine's refusal is bounded to a few hundred bytes, and this
+            // one names every node the raise waits for.
+            if level > vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL {
+                let config = load_admin_config(&common.config)?;
+                let client = connect(&config)?;
+                let read = client.read_cluster_versions(true).await;
+                note_redirects(&client);
+                judge_feature_raise(level, read)?;
+            }
             let command = MetadataCommand::SetFeatureLevel {
                 env: CommandEnvelope {
                     request_id: request_id.unwrap_or_else(Uuid::new_v4),
@@ -1434,6 +1460,82 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 feature_level: level,
             };
             propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::NodeVersions { common, level } => {
+            let config = load_admin_config(&common.config)?;
+            let client = connect(&config)?;
+            let read = client
+                .read_cluster_versions(true)
+                .await
+                .map_err(|error| cluster_versions_unreadable(&error))?;
+            note_redirects(&client);
+            let versions = &read.versions;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "feature_level": versions.feature_level,
+                        "read_at_applied_index": read.read_at_applied_index,
+                        "truncated": read.truncated,
+                        "nodes": versions.nodes.iter().map(|node| serde_json::json!({
+                            "node_uuid": node.node_uuid,
+                            "state": node.state.as_str(),
+                            "range_member": node.range_member,
+                            "counted": node.counted(),
+                            "report": node.report.as_ref().map(|report| serde_json::json!({
+                                "release": report.release,
+                                "max_replica_protocol": report.max_replica_protocol,
+                                "supported_feature_level": report.supported_feature_level,
+                            })),
+                        })).collect::<Vec<_>>(),
+                        "blockers": level.map(|level| versions
+                            .blockers(level)
+                            .iter()
+                            .map(|blocker| blocker.node_uuid)
+                            .collect::<Vec<_>>()),
+                    }))
+                    .map_err(|error| error.to_string())?
+                );
+            } else {
+                println!(
+                    "feature level {} (read at applied index {})",
+                    versions.feature_level, read.read_at_applied_index
+                );
+                for node in &versions.nodes {
+                    let report = match &node.report {
+                        Some(report) => format!(
+                            "release {} replica protocol {} supports level {}",
+                            report.release,
+                            report.max_replica_protocol,
+                            report.supported_feature_level
+                        ),
+                        None => "never reported".to_owned(),
+                    };
+                    println!(
+                        "{} {} {}{}",
+                        node.node_uuid,
+                        node.state.as_str(),
+                        report,
+                        if node.counted() {
+                            ""
+                        } else if node.range_member || node.report.is_some() {
+                            " (dead: not counted)"
+                        } else {
+                            " (no range, no report: not counted)"
+                        }
+                    );
+                }
+                if read.truncated {
+                    println!(
+                        "(more than {} nodes are registered; the list stops there)",
+                        vtop_meta::transport::MAX_CLUSTER_VERSION_NODES
+                    );
+                }
+            }
+            match level {
+                Some(level) => judge_node_versions_listing(level, read),
+                None => Ok(()),
+            }
         }
         MetaCommand::ReplicaSet {
             common,
@@ -1981,6 +2083,73 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             };
             propose_and_print(&common.config, command, json).await
         }
+    }
+}
+
+/// `node-versions --level`'s verdict (#634): the same judgement as a raise,
+/// but with no state machine behind it to judge the nodes past a truncated
+/// list, so a truncated list that names no blocker is inconclusive.
+fn judge_node_versions_listing(
+    level: u32,
+    read: vtop_meta::transport::AdminReadClusterVersionsResponse,
+) -> Result<(), String> {
+    if read.truncated
+        && level > vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL
+        && read.versions.blockers(level).is_empty()
+    {
+        return Err(format!(
+            "feature level {level} cannot be judged: more than {} nodes are registered and the \
+             list stops there; `enable-features` would still be judged by the state machine",
+            vtop_meta::transport::MAX_CLUSTER_VERSION_NODES
+        ));
+    }
+    judge_feature_raise(level, Ok(read))
+}
+
+/// Whether a raise to `level` may be proposed, judged on a cluster-versions
+/// read (#634): `Err` names every counted node that has not reported `level`
+/// or higher, or says why the cluster could not be judged. A level at or
+/// below the report level is never judged on data nodes.
+fn judge_feature_raise(
+    level: u32,
+    read: Result<vtop_meta::transport::AdminReadClusterVersionsResponse, vtop_meta::TransportError>,
+) -> Result<(), String> {
+    let read = read.map_err(|error| {
+        format!(
+            "feature level {level} needs every counted node to report it, and {}",
+            cluster_versions_unreadable(&error)
+        )
+    })?;
+    // A level already in force is the no-op Ack the state machine gives
+    // it; refusing here would be stricter than the raise itself (review).
+    if read.versions.feature_level >= level {
+        return Ok(());
+    }
+    let blockers = read.versions.blockers(level);
+    if !blockers.is_empty() {
+        return Err(vtop_meta::describe_blockers(level, &blockers));
+    }
+    if read.truncated && level > vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL {
+        // The rest are judged where nothing can change underneath the
+        // decision: the state machine refuses the raise itself.
+        eprintln!(
+            "note: more than {} nodes are registered; those past the list are judged by the \
+             state machine when the raise is applied",
+            vtop_meta::transport::MAX_CLUSTER_VERSION_NODES
+        );
+    }
+    Ok(())
+}
+
+/// Why the cluster's versions could not be read, in words that say what to do.
+fn cluster_versions_unreadable(error: &vtop_meta::TransportError) -> String {
+    if vtop_meta::transport::predates_cluster_versions_read(error) {
+        format!(
+            "a metadata node predates version reports (#634): upgrade every metadata voter \
+             first ({error})"
+        )
+    } else {
+        format!("the cluster's versions could not be read: {error}")
     }
 }
 
@@ -3192,6 +3361,117 @@ fn mac_key_from_env(name: &str) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #634: `enable-features` refuses a level while one live range member
+    /// reports an older one, naming it, and lets the same raise through once
+    /// that node has upgraded and reported again. A tier that cannot say
+    /// what its nodes run is not judged as one whose nodes are all current.
+    #[test]
+    fn a_raise_waits_for_the_data_node_on_the_older_release() {
+        use vtop_meta::transport::AdminReadClusterVersionsResponse;
+        use vtop_meta::{ClusterVersions, NodeState, NodeVersionEntry, NodeVersionRecord};
+        let next = vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL + 1;
+        let node = |id: u128, supported: u32| NodeVersionEntry {
+            node_uuid: Uuid::from_u128(id),
+            state: NodeState::Active,
+            range_member: true,
+            report: Some(NodeVersionRecord {
+                release: format!("0.{supported}.0"),
+                max_replica_protocol: 2,
+                supported_feature_level: supported,
+            }),
+        };
+        let read = |nodes| {
+            Ok(AdminReadClusterVersionsResponse {
+                versions: ClusterVersions {
+                    feature_level: vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL,
+                    nodes,
+                },
+                truncated: false,
+                read_at_applied_index: 9,
+            })
+        };
+
+        let old = vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL;
+        let refused =
+            judge_feature_raise(next, read(vec![node(1, next), node(2, old), node(3, next)]))
+                .unwrap_err();
+        assert!(
+            refused.contains(&format!("{} (release 0.{old}.0", Uuid::from_u128(2))),
+            "the refusal must name the node on the older release: {refused}"
+        );
+        assert!(
+            !refused.contains(&Uuid::from_u128(1).to_string()),
+            "{refused}"
+        );
+
+        assert_eq!(
+            judge_feature_raise(
+                next,
+                read(vec![node(1, next), node(2, next), node(3, next)])
+            ),
+            Ok(()),
+            "after node 2 upgrades and reports, the raise proceeds"
+        );
+
+        let predates = judge_feature_raise(
+            next,
+            Err(vtop_meta::TransportError::Protocol(
+                "unexpected response kind 29".to_owned(),
+            )),
+        )
+        .unwrap_err();
+        assert!(predates.contains("predates version reports"), "{predates}");
+    }
+
+    /// #634 review: a level already in force is a no-op the state machine
+    /// acknowledges, so `enable-features` must not refuse it for a node that
+    /// has since fallen behind (it is the replica plane's to refuse now).
+    #[test]
+    fn a_level_already_in_force_is_not_judged_again() {
+        use vtop_meta::transport::AdminReadClusterVersionsResponse;
+        use vtop_meta::{ClusterVersions, NodeState, NodeVersionEntry};
+        let next = vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL + 1;
+        let read = Ok(AdminReadClusterVersionsResponse {
+            versions: ClusterVersions {
+                feature_level: next,
+                nodes: vec![NodeVersionEntry {
+                    node_uuid: Uuid::from_u128(1),
+                    state: NodeState::Active,
+                    range_member: true,
+                    report: None,
+                }],
+            },
+            truncated: false,
+            read_at_applied_index: 9,
+        });
+        assert_eq!(judge_feature_raise(next, read), Ok(()));
+    }
+
+    /// #634 review: `node-versions --level` has no state machine behind it to
+    /// judge the nodes past a truncated list, so a truncated list with no
+    /// blocker in it is inconclusive, not a pass.
+    #[test]
+    fn a_truncated_listing_cannot_clear_a_raise() {
+        use vtop_meta::transport::AdminReadClusterVersionsResponse;
+        use vtop_meta::ClusterVersions;
+        let next = vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL + 1;
+        let truncated = AdminReadClusterVersionsResponse {
+            versions: ClusterVersions {
+                feature_level: vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL,
+                nodes: Vec::new(),
+            },
+            truncated: true,
+            read_at_applied_index: 9,
+        };
+        let verdict = judge_node_versions_listing(next, truncated.clone()).unwrap_err();
+        assert!(verdict.contains("cannot be judged"), "{verdict}");
+        assert_eq!(
+            judge_node_versions_listing(vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL, truncated),
+            Ok(()),
+            "a level that is never judged on data nodes needs no full list"
+        );
+    }
 
     /// #240: a replica's epoch vector is held to the chain — an epoch no
     /// grant explains, or the holder's epoch starting below the boundary its

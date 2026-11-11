@@ -14,7 +14,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -58,6 +58,9 @@ pub struct FlowControlConfig {
     pub reconnect_backoff: Duration,
     /// Bound of recently sent batches retained for reconnect catch-up.
     pub max_retransmission_bytes: usize,
+    /// How this leader opens each follower session (#634): the hello it
+    /// sends and the finalized level it holds followers to.
+    pub version: super::version::ReplicaVersionPolicy,
 }
 
 impl Default for FlowControlConfig {
@@ -69,6 +72,7 @@ impl Default for FlowControlConfig {
             connect_timeout: Duration::from_secs(2),
             reconnect_backoff: Duration::from_millis(50),
             max_retransmission_bytes: 8 * 1024 * 1024,
+            version: super::version::ReplicaVersionPolicy::default(),
         }
     }
 }
@@ -129,6 +133,59 @@ pub async fn address_now(host: &str, within: Duration) -> Option<SocketAddr> {
             eprintln!("resolving replica peer {host:?} exceeded {within:?}");
             None
         }
+    }
+}
+
+/// What a leader's follower sessions reconcile against (#641): the range, the
+/// epoch this leader holds, and which epoch wrote each stretch of its log,
+/// read at the moment a session opens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaderLineageSnapshot {
+    pub range: RangeIdentity,
+    pub fencing_epoch: u64,
+    pub epoch_starts: Vec<crate::fencing_epochs::EpochStart>,
+}
+
+/// The leader a [`NetworkedReplicaSet`] replicates for, as its follower
+/// sessions need to see it (#641). See
+/// [`NetworkedReplicaSet::reconcile_followers_against`].
+pub trait LeaderLineage: Send + Sync {
+    /// `None` while this leader holds no live grant at the epoch it would
+    /// fence at. May block briefly; the driver calls it off the runtime.
+    fn leader_lineage(&self) -> Option<LeaderLineageSnapshot>;
+}
+
+impl LeaderLineage for crate::LocalBroker {
+    fn leader_lineage(&self) -> Option<LeaderLineageSnapshot> {
+        // Only an epoch this broker serves, judged as produce judges it. A
+        // session fence at someone else's epoch would install a dispute that
+        // the real leader of that epoch then settles with its ordinary
+        // appends, discarding records it holds and may have acknowledged.
+        // A candidate's broker is built before it adopts its grant, holding
+        // the configured epoch; this keeps its sessions waiting until then.
+        //
+        // Epoch 0 is not refused here (#649 review): a static range
+        // configured at `fencing_epoch: 0` serves at it with an active lease
+        // view, and refusing it left every follower session unopened. A
+        // lease-driven broker waiting for its first grant is caught by the
+        // inactive lease view instead, whatever epoch it holds.
+        let fencing_epoch = {
+            let meta = self.meta_fencing_epoch().lock();
+            let held = self.held_fencing_epoch();
+            if !meta.lease_active || meta.fencing_epoch != held {
+                return None;
+            }
+            held
+        };
+        // The epoch before the history. An adoption between the two reads
+        // puts a newer epoch in the history than the one fenced at, and the
+        // follower then treats that entry as this leader's own tail adoption:
+        // it keeps a disputed suffix rather than discarding it, the safe side.
+        Some(LeaderLineageSnapshot {
+            range: self.range().clone(),
+            fencing_epoch,
+            epoch_starts: self.epoch_starts(),
+        })
     }
 }
 
@@ -354,6 +411,9 @@ pub struct ReplicaPeerServer {
     local_id: Uuid,
     handler: Arc<dyn ReplicaPeerHandler>,
     exposure: PlaintextExposure,
+    /// The finalized level dialers are held to (#634); unknown until the
+    /// node that owns this server reads one.
+    cluster_level: super::version::ClusterFeatureLevel,
 }
 
 impl ReplicaPeerServer {
@@ -367,7 +427,16 @@ impl ReplicaPeerServer {
             local_id,
             handler,
             exposure: PlaintextExposure::LoopbackOnly,
+            cluster_level: super::version::ClusterFeatureLevel::unknown(),
         })
+    }
+
+    /// Hold dialers to the cluster's finalized feature level as `level`
+    /// reads it (#634). Without this the server judges against an unknown
+    /// level and refuses no peer, which is what a static range wants.
+    pub fn with_cluster_level(mut self, level: super::version::ClusterFeatureLevel) -> Self {
+        self.cluster_level = level;
+        self
     }
 
     /// A replica endpoint with NO TLS, on loopback only (#294 slice 3).
@@ -423,6 +492,7 @@ impl ReplicaPeerServer {
             local_id,
             handler,
             exposure: PlaintextExposure::LoopbackOnly,
+            cluster_level: super::version::ClusterFeatureLevel::unknown(),
         }
     }
 
@@ -507,14 +577,17 @@ impl ReplicaPeerServer {
                     };
                     let acceptor = self.acceptor.clone();
                     let handler = Arc::clone(&self.handler);
-                    let local_id = self.local_id;
+                    let version = super::version::ReplicaVersionPolicy::new(
+                        self.local_id,
+                        self.cluster_level.clone(),
+                    );
                     connections.spawn(async move {
                         // A session that ends on a protocol refusal is SAID
                         // (#453): the leader on the other end sees only a
                         // missing ack, and without this line nobody sees why.
                         // Ordinary ends — a leader gone, a reset — stay quiet,
                         // as before.
-                        match serve_follower_connection(acceptor, tcp, handler, local_id).await {
+                        match serve_follower_connection(acceptor, tcp, handler, version).await {
                             // A leader gone, a reset: an ordinary end, quiet.
                             Ok(()) | Err(crate::BrokerError::Protocol(ProtocolError::Io(_))) => {}
                             Err(crate::BrokerError::Protocol(ProtocolError::Limit(what))) => {
@@ -536,6 +609,15 @@ impl ReplicaPeerServer {
                                     ),
                                 );
                             }
+                            // Said, like a protocol refusal (#634): the peer
+                            // is told, but the operator who has to upgrade
+                            // it reads this side's log.
+                            Err(crate::BrokerError::ReplicaVersion(why)) => {
+                                warn_rate_limited(
+                                    "replica-server",
+                                    &format!("replica session from {peer} refused: {why}"),
+                                );
+                            }
                             Err(_) => {}
                         }
                     });
@@ -552,7 +634,7 @@ async fn serve_follower_connection(
     acceptor: Option<TlsAcceptor>,
     tcp: TcpStream,
     handler: Arc<dyn ReplicaPeerHandler>,
-    local_id: Uuid,
+    version: super::version::ReplicaVersionPolicy,
 ) -> BrokerResult<()> {
     // Judged before the handshake or the first frame (#294 slice 6): a peer
     // speaking the other transport is refused by name instead of failing as
@@ -583,14 +665,52 @@ async fn serve_follower_connection(
     // that a certificate was unreadable, which stays an error. The two want
     // opposite treatment, and `dispatch_replica_frame` is where that is spent.
     let peer_id = peer_uuid_from_server_stream(&stream)?;
-    // `local_id` is this node's own identity, unused on the serving side.
-    let _ = local_id;
+    // The FIRST frame says which release dialed (#634): a hello is answered
+    // and the session continues at the version both speak; anything else is
+    // a dialer before the handshake, whose first request is served as it
+    // always was - unless the cluster's finalized level has moved past what
+    // such a peer can run, and then it is refused by name.
+    //
+    // `session` is the version the session runs at: what a later wire
+    // change (one only a peer at a newer protocol may be sent) branches on,
+    // and what every later frame is judged by.
+    let (mut first, session) = match read_frame(&mut stream, REPLICA_LIMITS).await {
+        Ok(Some(frame)) => {
+            match super::version::accept_session(&mut stream, frame, &version).await? {
+                super::version::Accepted::Hello(peer) => (None, peer),
+                super::version::Accepted::Legacy(frame) => {
+                    (Some(*frame), super::version::PeerVersion::Legacy)
+                }
+                super::version::Accepted::Refused(why) => {
+                    return Err(crate::BrokerError::ReplicaVersion(why))
+                }
+            }
+        }
+        Ok(None) => return Ok(()),
+        Err(problem) => return Err(problem.into()),
+    };
     loop {
-        let frame = match read_frame(&mut stream, REPLICA_LIMITS).await {
-            Ok(Some(frame)) => frame,
-            Ok(None) => return Ok(()),
-            Err(problem) => return Err(problem.into()),
+        let frame = match first.take() {
+            Some(frame) => frame,
+            None => match read_frame(&mut stream, REPLICA_LIMITS).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Ok(()),
+                Err(problem) => return Err(problem.into()),
+            },
         };
+        // Re-judged on EVERY frame, not only the first (#634 review): the
+        // finalized level can rise while this session is open, and a peer it
+        // leaves behind must stop being served now, not on its next connect.
+        if let Err(why) = super::version::judge_peer(version.cluster_level.get(), session) {
+            write_frame(
+                &mut stream,
+                &super::version::refusal(frame.request_id, frame.stream_id, why.clone()),
+                REPLICA_LIMITS,
+            )
+            .await
+            .map_err(crate::BrokerError::from)?;
+            return Err(crate::BrokerError::ReplicaVersion(why));
+        }
         let response = dispatch_replica_frame(handler.as_ref(), peer_id, frame);
         if let Some(response) = response {
             write_frame(&mut stream, &response, REPLICA_LIMITS)
@@ -778,6 +898,57 @@ pub struct NetworkedReplicaSet {
     followers: Vec<Arc<FollowerChannel>>,
     flow: FlowControlConfig,
     _shutdown: Vec<mpsc::Sender<()>>,
+    /// The leader every follower session reconciles against (#641); unset
+    /// until [`Self::reconcile_followers_against`]. Shared with the drivers.
+    lineage: LineageCell,
+}
+
+/// Where a driver finds the leader it reconciles followers against (#641).
+/// Weak: the leader's broker holds this replica set, so a strong reference
+/// back would keep both alive forever.
+type LineageCell = Arc<LineageSource>;
+
+/// The attached leader, and the one lineage read in flight for the whole
+/// set (#649 review).
+#[derive(Default)]
+struct LineageSource {
+    leader: std::sync::OnceLock<std::sync::Weak<dyn LeaderLineage>>,
+    /// A read that outlived its caller's deadline. A blocking task cannot be
+    /// cancelled, so it is kept here and the next session awaits it rather
+    /// than starting another: a lease lock stalled behind a slow fsync then
+    /// costs one blocked thread, not one per reconnect.
+    in_flight: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Option<LeaderLineageSnapshot>>>>,
+}
+
+impl LineageSource {
+    fn attached(&self) -> bool {
+        self.leader.get().is_some()
+    }
+
+    /// The leader's lineage, read off the runtime: the broker reads its lease
+    /// view under the lock its produce path holds through an fsync, and a
+    /// stalled disk must not park a runtime worker. `None` when it is not
+    /// available within `within`, or the leader holds no live grant.
+    async fn read(
+        &self,
+        leader: Arc<dyn LeaderLineage>,
+        within: Duration,
+    ) -> Option<LeaderLineageSnapshot> {
+        timeout(within, async {
+            let mut slot = self.in_flight.lock().await;
+            let read = slot.get_or_insert_with(|| {
+                tokio::task::spawn_blocking(move || leader.leader_lineage())
+            });
+            // Polled through the slot, so a deadline that fires here leaves
+            // the read where the next session finds it.
+            let outcome = read.await;
+            *slot = None;
+            outcome.ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
 }
 
 enum RuntimeBinding {
@@ -920,6 +1091,7 @@ impl NetworkedReplicaSet {
             None => None,
         };
         let handle = runtime.handle();
+        let lineage: LineageCell = Arc::new(LineageSource::default());
         let mut channels = Vec::with_capacity(followers.len());
         let mut shutdown = Vec::with_capacity(followers.len());
         for config in followers {
@@ -940,6 +1112,7 @@ impl NetworkedReplicaSet {
                 node_id: config.node_id,
                 durable_offset: AtomicU64::new(0),
                 connected: AtomicBool::new(false),
+                protocol: AtomicU16::new(0),
                 cmd_tx,
                 hwm_tx,
                 budget: Arc::clone(&budget),
@@ -954,6 +1127,7 @@ impl NetworkedReplicaSet {
                 cmd_rx,
                 hwm_rx,
                 stop_rx,
+                lineage: Arc::clone(&lineage),
             };
             handle.spawn(driver.run());
             channels.push(channel);
@@ -964,7 +1138,54 @@ impl NetworkedReplicaSet {
             followers: channels,
             flow,
             _shutdown: shutdown,
+            lineage,
         })
+    }
+
+    /// Reconcile every follower against `leader` before it takes anything
+    /// from this replica set (#641). Returns false if a leader was already
+    /// attached; the first one stays.
+    ///
+    /// A replica that was absent from the election that made this leader
+    /// was never fenced by it. A deposed leader is the usual case: it comes
+    /// back holding records it wrote under its old epoch, some of them never
+    /// acknowledged, at offsets the new leader has since written. Nothing
+    /// told it those records lost. Its reconnect status then counted them as
+    /// held, the new leader's high-water mark put them under the committed
+    /// mark, and its appends at those offsets were acked as duplicates over
+    /// different bytes (#261).
+    ///
+    /// So every session opens with the same fence a promotion probe sends:
+    /// this leader's epoch and its epoch history, before the status probe
+    /// and before any record or high-water mark. The follower runs the
+    /// fence's reconciliation against it. A suffix this leader provably
+    /// supersedes is discarded there. One it cannot yet prove is kept as a
+    /// dispute (#611), which caps the status the leader prunes its buffer by
+    /// and is discarded by this leader's first append or mark over it. That
+    /// first write is the proof: only an established leader writes under its
+    /// epoch. Nothing at or below the follower's own high-water mark is ever
+    /// touched; the fence refuses instead. A follower that holds records
+    /// but has no history to compare gets no session at all (#649 review),
+    /// so it takes nothing and acks nothing until it is repaired.
+    ///
+    /// Sessions opened before this call carried no fence. Each is dropped
+    /// before it carries a record or a mark, so the next one opens fenced.
+    ///
+    /// Plaintext sessions skip the fence: a plaintext replica refuses it,
+    /// since it truncates against the caller's word and needs an identified
+    /// caller. A plaintext plane does not fail over (`refuse_plaintext_promotion`
+    /// in vtop-node), so it has no deposed leader to reconcile.
+    pub fn reconcile_followers_against(&self, leader: std::sync::Weak<dyn LeaderLineage>) -> bool {
+        if self.lineage.leader.set(leader).is_err() {
+            return false;
+        }
+        for follower in &self.followers {
+            follower.connected.store(false, Ordering::SeqCst);
+            // Best effort: a full queue still reaches the session's own check
+            // before its next write.
+            let _ = follower.cmd_tx.try_send(FollowerCmd::DropConnection);
+        }
+        true
     }
 
     pub fn follower_durable_offset(&self, node_id: Uuid) -> Option<u64> {
@@ -972,6 +1193,16 @@ impl NetworkedReplicaSet {
             .iter()
             .find(|follower| follower.node_id == node_id)
             .map(|follower| follower.durable_offset.load(Ordering::SeqCst))
+    }
+
+    /// The replica protocol `node_id`'s latest session negotiated (#634):
+    /// [`vtop_protocol::REPLICA_PROTOCOL_LEGACY`] for a follower that
+    /// predates the handshake, 0 before any session opened.
+    pub fn follower_protocol(&self, node_id: Uuid) -> Option<u16> {
+        self.followers
+            .iter()
+            .find(|follower| follower.node_id == node_id)
+            .map(|follower| follower.protocol.load(Ordering::SeqCst))
     }
 
     pub fn follower_connected(&self, node_id: Uuid) -> Option<bool> {
@@ -1074,6 +1305,9 @@ struct FollowerChannel {
     node_id: Uuid,
     durable_offset: AtomicU64,
     connected: AtomicBool,
+    /// The replica protocol the current session negotiated (#634); 0 before
+    /// the first session.
+    protocol: AtomicU16,
     cmd_tx: mpsc::Sender<FollowerCmd>,
     /// Newest committed high-water mark for this follower; see the construction
     /// site for why this is a cell rather than a queued command.
@@ -1175,6 +1409,17 @@ struct FollowerDriver {
     cmd_rx: mpsc::Receiver<FollowerCmd>,
     hwm_rx: watch::Receiver<Option<CommittedHwmUpdate>>,
     stop_rx: mpsc::Receiver<()>,
+    lineage: LineageCell,
+}
+
+/// How a session opened, as far as reconciliation goes (#641).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionFence {
+    /// No leader was attached, or the plane is plaintext: nothing to
+    /// reconcile against.
+    NotRequired,
+    /// The follower was fenced at this leader's epoch and history.
+    Reconciled,
 }
 
 impl FollowerDriver {
@@ -1236,6 +1481,137 @@ impl FollowerDriver {
         if let Some(addr) = address_now(&host, self.flow.connect_timeout / 2).await {
             self.config.addr = addr;
         }
+    }
+
+    /// True when this session opened without a fence but a leader has been
+    /// attached since (#641). It must end before it writes a record or a
+    /// mark, so the next session opens fenced.
+    fn session_predates_lineage(&self, fence: SessionFence) -> bool {
+        fence == SessionFence::NotRequired && self.connector.is_some() && self.lineage.attached()
+    }
+
+    /// Open the session with the fence a promotion probe sends (#641; see
+    /// [`NetworkedReplicaSet::reconcile_followers_against`]): this leader's
+    /// epoch and history, so the follower reconciles its log against this
+    /// leader before it reports a status, takes a mark, or acks a record.
+    ///
+    /// Returns the range the fence named, for the status probe. Any refusal
+    /// ends the session; the driver retries after its backoff. A follower
+    /// whose metadata view has not reached this leader's grant refuses until
+    /// it has, and it would refuse this leader's appends until then anyway.
+    async fn fence_session(
+        &self,
+        stream: &mut MaybeTls<TcpStream>,
+        next_request_id: &mut u64,
+    ) -> Result<(SessionFence, Option<RangeIdentity>), SessionOutcome> {
+        // Plaintext: see `reconcile_followers_against`.
+        if self.connector.is_none() {
+            return Ok((SessionFence::NotRequired, None));
+        }
+        let Some(cell) = self.lineage.leader.get() else {
+            return Ok((SessionFence::NotRequired, None));
+        };
+        // The leader is gone: this replica set is being torn down.
+        let Some(leader) = cell.upgrade() else {
+            return Err(SessionOutcome::Disconnected);
+        };
+        // No live grant (yet, or any more), or no answer in time: nothing to
+        // replicate under. At most one read is in flight for the set.
+        let Some(lineage) = self.lineage.read(leader, self.flow.connect_timeout).await else {
+            return Err(SessionOutcome::Disconnected);
+        };
+        let request_id = *next_request_id;
+        *next_request_id = next_request_id.wrapping_add(1);
+        let frame = WireFrame {
+            request_id,
+            stream_id: 0,
+            message: Message::ReplicaFenceRequest(vtop_protocol::ReplicaFenceRequest {
+                range: lineage.range.clone(),
+                fencing_epoch: lineage.fencing_epoch,
+                leader_epoch_starts: lineage
+                    .epoch_starts
+                    .iter()
+                    .map(|entry| vtop_protocol::ReplicaEpochStart {
+                        epoch: entry.epoch,
+                        start_offset: entry.start_offset,
+                    })
+                    .collect(),
+            }),
+        };
+        if write_frame(stream, &frame, REPLICA_LIMITS).await.is_err() {
+            return Err(SessionOutcome::Disconnected);
+        }
+        let reply = match timeout(
+            self.flow.connect_timeout,
+            read_frame(stream, REPLICA_LIMITS),
+        )
+        .await
+        {
+            Ok(Ok(Some(frame))) => frame,
+            _ => return Err(SessionOutcome::Disconnected),
+        };
+        if reply.request_id != request_id {
+            return Err(SessionOutcome::Disconnected);
+        }
+        let refusal = match reply.message {
+            // Exactly this leader's epoch, as the promotion probe requires: a
+            // higher one means a newer grant overtook this leader.
+            // A replica that holds records but has no history this leader
+            // can compare against (no journal, or a broken one) gets no
+            // session (#649 review). Its fence left it as it was, since
+            // nothing there can tell which of its records match this
+            // leader's. Given a session, it would report all of them as held,
+            // so this leader would prune what it must send, and its mark and
+            // appends would land over records that may differ (#261). Keeping
+            // a dispute from its mark instead would discard records it may
+            // hold validly, which this leader can re-send only while its
+            // bounded buffer still has them. Refused, it keeps its log, takes
+            // nothing, and acks nothing until `vtopctl node repair` installs
+            // a history. A leader with no history of its own compares nothing
+            // and refuses nobody; an empty replica has nothing to dispute.
+            Message::ReplicaFenceResponse(response)
+                if response.fencing_epoch == lineage.fencing_epoch
+                    && !lineage.epoch_starts.is_empty()
+                    && response.epoch_starts.is_empty()
+                    && response.next_offset > 0 =>
+            {
+                format!(
+                    "it holds {} record(s) but has no epoch history this leader can compare; \
+                     it gets no session until `vtopctl node repair` installs one",
+                    response.next_offset
+                )
+            }
+            Message::ReplicaFenceResponse(response)
+                if response.fencing_epoch == lineage.fencing_epoch =>
+            {
+                if response.truncated_records > 0 {
+                    eprintln!(
+                        "replica {}: discarded {} record(s) from offset {} that this leader \
+                         (epoch {}) supersedes, before the session carried anything (#641)",
+                        self.config.node_id,
+                        response.truncated_records,
+                        response.next_offset,
+                        lineage.fencing_epoch
+                    );
+                }
+                return Ok((SessionFence::Reconciled, Some(lineage.range)));
+            }
+            Message::ReplicaFenceResponse(response) => format!(
+                "it answered at epoch {} rather than this leader's {}",
+                response.fencing_epoch, lineage.fencing_epoch
+            ),
+            Message::Error(error) => format!("{:?} {}", error.code, error.message),
+            other => format!("unexpected reply {other:?}"),
+        };
+        warn_rate_limited(
+            "replica-driver",
+            &format!(
+                "replica {} at {}: the session fence at epoch {} was refused ({refusal}); no \
+                 record or mark is sent until it reconciles against this leader (#641)",
+                self.config.node_id, self.config.addr, lineage.fencing_epoch
+            ),
+        );
+        Err(SessionOutcome::Disconnected)
     }
 
     async fn connect_and_session(
@@ -1308,19 +1684,65 @@ impl FollowerDriver {
             }
             None => MaybeTls::Plain(tcp),
         };
+        // The version exchange opens every session (#634), inside the same
+        // establishment budget. A follower that predates it answers with a
+        // typed refusal and is spoken to as before; one the cluster's level
+        // has left behind is refused by name, and this driver keeps retrying
+        // on its backoff until the follower is upgraded.
+        let peer = match tokio::time::timeout_at(
+            deadline,
+            super::version::open_session(&mut stream, &self.flow.version),
+        )
+        .await
+        {
+            Ok(Ok(peer)) => {
+                self.channel
+                    .protocol
+                    .store(peer.protocol(), Ordering::SeqCst);
+                peer
+            }
+            Ok(Err(error)) => {
+                if matches!(error, crate::BrokerError::ReplicaVersion(_)) {
+                    warn_rate_limited(
+                        "replica-driver",
+                        &format!(
+                            "replica {} at {}: {error}",
+                            self.config.node_id, self.config.addr
+                        ),
+                    );
+                }
+                return SessionOutcome::Disconnected;
+            }
+            Err(_) => return SessionOutcome::Disconnected,
+        };
+        // Reconcile before anything else (#641): the status probe below
+        // prunes the retransmission buffer by what the follower reports, and
+        // it must report a log already judged against this leader.
+        let (session_fence, fenced_range) =
+            match self.fence_session(&mut stream, next_request_id).await {
+                Ok(fenced) => fenced,
+                Err(outcome) => return outcome,
+            };
         // Catch-up probe + bounded retransmission. Mark connected only after the
         // optional status exchange succeeds so tests do not observe a false ready.
-        let range = retransmission
-            .front()
-            .and_then(|batch| batch.requests.first().map(|r| r.range.clone()))
-            .or_else(|| {
-                pending.iter().find_map(|cmd| match cmd {
-                    FollowerCmd::Replicate { requests, .. } => {
-                        requests.first().map(|r| r.range.clone())
-                    }
-                    _ => None,
+        let range = fenced_range.or_else(|| {
+            retransmission
+                .front()
+                .and_then(|batch| batch.requests.first().map(|r| r.range.clone()))
+                .or_else(|| {
+                    pending.iter().find_map(|cmd| match cmd {
+                        FollowerCmd::Replicate { requests, .. } => {
+                            requests.first().map(|r| r.range.clone())
+                        }
+                        _ => None,
+                    })
                 })
-            });
+        });
+        // A leader attached while this session was opening unfenced: it ends
+        // before its status read can prune the buffer (#649 review).
+        if self.session_predates_lineage(session_fence) {
+            return SessionOutcome::Disconnected;
+        }
         if let Some(range) = range {
             let request_id = *next_request_id;
             *next_request_id = next_request_id.wrapping_add(1);
@@ -1369,6 +1791,9 @@ impl FollowerDriver {
                 _ => return SessionOutcome::Disconnected,
             }
         }
+        if self.session_predates_lineage(session_fence) {
+            return SessionOutcome::Disconnected;
+        }
         self.channel.connected.store(true, Ordering::SeqCst);
 
         // Re-send the current mark on every fresh session. `changed()` only
@@ -1384,6 +1809,9 @@ impl FollowerDriver {
             guard.clone()
         };
         if let Some(update) = current_hwm {
+            if self.session_predates_lineage(session_fence) {
+                return SessionOutcome::Disconnected;
+            }
             let frame = WireFrame {
                 request_id: 0,
                 stream_id: 0,
@@ -1401,6 +1829,16 @@ impl FollowerDriver {
         let mut inflight_bytes = 0usize;
 
         loop {
+            // Two reasons an open session ends before it writes anything,
+            // judged in this order so a session closes once, for the reason
+            // that outlasts the other: a peer the finalized level no longer
+            // admits (#634; refused, and said, until it is upgraded), then a
+            // leader attached after this session opened unfenced (#641; the
+            // next session is fenced and proceeds).
+            if !self.still_admitted(peer) || self.session_predates_lineage(session_fence) {
+                requeue_inflight(pending, &mut inflight, retransmission);
+                return SessionOutcome::Disconnected;
+            }
             // Drain pending catch-up / deferred replicates while the window allows.
             while can_send(&inflight, inflight_bytes, &self.flow) {
                 let Some(FollowerCmd::Replicate {
@@ -1413,7 +1851,8 @@ impl FollowerDriver {
                 else {
                     break;
                 };
-                if !window_allows(inflight.len(), inflight_bytes, bytes, &self.flow) {
+                let refused = !self.still_admitted(peer);
+                if refused || !window_allows(inflight.len(), inflight_bytes, bytes, &self.flow) {
                     pending.push_front(FollowerCmd::Replicate {
                         requests,
                         leader_committed_offset,
@@ -1421,6 +1860,10 @@ impl FollowerDriver {
                         response_tx,
                         catch_up_charged,
                     });
+                    if refused {
+                        requeue_inflight(pending, &mut inflight, retransmission);
+                        return SessionOutcome::Disconnected;
+                    }
                     break;
                 }
                 if let Err(outcome) = self
@@ -1455,6 +1898,13 @@ impl FollowerDriver {
                 }
                 frame = read_frame(&mut stream, REPLICA_LIMITS), if !inflight.is_empty() => {
                     match frame {
+                        // An ack from a peer the level has since left behind
+                        // is not counted (#634 review): the session closes,
+                        // and what it had in flight is sent again elsewhere.
+                        Ok(Some(_)) if !self.still_admitted(peer) => {
+                            requeue_inflight(pending, &mut inflight, retransmission);
+                            return SessionOutcome::Disconnected;
+                        }
                         Ok(Some(frame)) => {
                             if handle_response(
                                 frame,
@@ -1489,6 +1939,15 @@ impl FollowerDriver {
                         guard.clone()
                     };
                     if let Some(update) = update {
+                        // The mark stays in the cell; the next session,
+                        // fenced, sends it first thing (#641). A peer the
+                        // level no longer admits gets no mark at all (#634).
+                        if !self.still_admitted(peer)
+                            || self.session_predates_lineage(session_fence)
+                        {
+                            requeue_inflight(pending, &mut inflight, retransmission);
+                            return SessionOutcome::Disconnected;
+                        }
                         let frame = WireFrame {
                             request_id: 0,
                             stream_id: 0,
@@ -1517,6 +1976,34 @@ impl FollowerDriver {
                             response_tx,
                             catch_up_charged,
                         }) => {
+                            // Re-judged before every batch (#634 review): the
+                            // level can rise while a session is open, and a
+                            // peer it leaves behind must stop taking part now,
+                            // not when it next reconnects. Judged before the
+                            // #641 lineage check below: the batch is missed, as
+                            // a slow follower's is, since this peer is refused
+                            // until it is upgraded, while a session that only
+                            // predates the lineage keeps it for the next one.
+                            if !self.still_admitted(peer) {
+                                if catch_up_charged {
+                                    self.budget.release_catch_up(bytes as u64);
+                                }
+                                drop((requests, leader_committed_offset, response_tx));
+                                requeue_inflight(pending, &mut inflight, retransmission);
+                                return SessionOutcome::Disconnected;
+                            }
+                            // Kept for the next, fenced session (#641).
+                            if self.session_predates_lineage(session_fence) {
+                                pending.push_front(FollowerCmd::Replicate {
+                                    requests,
+                                    leader_committed_offset,
+                                    bytes,
+                                    response_tx,
+                                    catch_up_charged,
+                                });
+                                requeue_inflight(pending, &mut inflight, retransmission);
+                                return SessionOutcome::Disconnected;
+                            }
                             if !window_allows(inflight.len(), inflight_bytes, bytes, &self.flow) {
                                 // Slow follower: miss this ack rather than stall.
                                 // A transferred charge dies with the dropped
@@ -1553,6 +2040,27 @@ impl FollowerDriver {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Whether the peer of an OPEN session may still take part (#634
+    /// review). A session is judged when it opens, but the finalized level
+    /// can rise while it stays open; a peer the new level refuses must stop
+    /// receiving batches and stop counting toward quorum now, or the gate
+    /// would hold only for sessions opened after the raise.
+    fn still_admitted(&self, peer: super::version::PeerVersion) -> bool {
+        match super::version::judge_peer(self.flow.version.cluster_level.get(), peer) {
+            Ok(()) => true,
+            Err(why) => {
+                warn_rate_limited(
+                    "replica-driver",
+                    &format!(
+                        "replica {} at {}: open session closed: {why}",
+                        self.config.node_id, self.config.addr
+                    ),
+                );
+                false
             }
         }
     }
@@ -1914,6 +2422,8 @@ pub struct ReplicaStatusClient {
     /// `None` is a plaintext plane, chosen deliberately.
     connector: Option<TlsConnector>,
     timeout: Duration,
+    /// How each one-shot session opens (#634).
+    version: super::version::ReplicaVersionPolicy,
 }
 
 impl ReplicaStatusClient {
@@ -1921,6 +2431,7 @@ impl ReplicaStatusClient {
         Ok(Self {
             connector: Some(build_client_connector(material)?),
             timeout: Duration::from_secs(5),
+            version: super::version::ReplicaVersionPolicy::default(),
         })
     }
 
@@ -1938,12 +2449,22 @@ impl ReplicaStatusClient {
         Self {
             connector: None,
             timeout: Duration::from_secs(5),
+            version: super::version::ReplicaVersionPolicy::default(),
         }
     }
 
     /// Deadline covering connect, handshake, and the round trip.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Open each session with this node's identity, holding the replica to
+    /// the finalized level it reads (#634). Without it, the hello names no
+    /// node and no replica is refused - what an operator's one-shot tool
+    /// wants, since the replica judges the tool anyway.
+    pub fn with_version_policy(mut self, version: super::version::ReplicaVersionPolicy) -> Self {
+        self.version = version;
         self
     }
 
@@ -2005,6 +2526,7 @@ impl ReplicaStatusClient {
                 }
                 None => MaybeTls::Plain(tcp),
             };
+            super::version::open_session(&mut stream, &self.version).await?;
             let frame = WireFrame {
                 request_id: 1,
                 stream_id: 0,
@@ -2083,6 +2605,7 @@ impl ReplicaStatusClient {
                 }
                 None => MaybeTls::Plain(tcp),
             };
+            super::version::open_session(&mut stream, &self.version).await?;
             let frame = WireFrame {
                 request_id: 1,
                 stream_id: 0,
@@ -2177,6 +2700,7 @@ impl ReplicaStatusClient {
                 }
                 None => MaybeTls::Plain(tcp),
             };
+            super::version::open_session(&mut stream, &self.version).await?;
             let frame = WireFrame {
                 request_id: 1,
                 stream_id: 0,
@@ -2353,9 +2877,14 @@ mod tests {
             .write_all(&[0x16, 0x03, 0x01, 0x00, 0x40])
             .await
             .unwrap();
-        let refused = serve_follower_connection(None, tcp, Arc::new(Unreached), Uuid::from_u128(1))
-            .await
-            .unwrap_err();
+        let refused = serve_follower_connection(
+            None,
+            tcp,
+            Arc::new(Unreached),
+            super::super::version::ReplicaVersionPolicy::default(),
+        )
+        .await
+        .unwrap_err();
         let crate::BrokerError::CrossMode(message) = refused else {
             panic!("expected a cross-mode refusal, got {refused}")
         };
@@ -2464,6 +2993,65 @@ mod tests {
             "and the consequence an operator will meet next — no fence means no \
              promotion on this plane: {}",
             error.message
+        );
+    }
+
+    /// #634: how a dialer recognizes a replica that predates the version
+    /// handshake. Such a replica hands the hello (a kind-1 `ClientHello`) to
+    /// THIS dispatcher's catch-all arm, unchanged since the plane existed,
+    /// which answers `InvalidRequest` and keeps the session open. If the arm
+    /// ever answered differently, a new leader would stop recognizing - and
+    /// stop replicating to - every replica still on an older release.
+    #[test]
+    fn a_dispatcher_before_the_handshake_answers_a_hello_with_a_typed_refusal() {
+        struct NoReplica;
+        impl ReplicaPeerHandler for NoReplica {
+            fn node_id(&self) -> Uuid {
+                Uuid::nil()
+            }
+            fn apply_append(
+                &self,
+                _: &ReplicaAppendRequest,
+            ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+                unreachable!("a hello is not an append")
+            }
+            fn apply_append_batch(
+                &self,
+                _: &[ReplicaAppendRequest],
+            ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+                unreachable!("a hello is not an append")
+            }
+            fn observe_hwm(&self, _: &CommittedHwmUpdate) -> Result<(), (ErrorCode, String)> {
+                unreachable!("a hello is not a high-water mark")
+            }
+            fn status(
+                &self,
+                _: &RangeIdentity,
+            ) -> Result<ReplicaStatusResponse, (ErrorCode, String)> {
+                unreachable!("a hello is not a status request")
+            }
+        }
+        let hello = super::super::version::local_hello(Uuid::from_u128(1));
+        let reply = dispatch_replica_frame(
+            &NoReplica,
+            None,
+            WireFrame {
+                request_id: 0,
+                stream_id: 0,
+                message: hello.to_message(),
+            },
+        )
+        .expect("the catch-all answers");
+        assert!(
+            matches!(
+                reply.message,
+                Message::Error(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                })
+            ),
+            "{:?}",
+            reply.message
         );
     }
 
@@ -2666,5 +3254,71 @@ mod tests {
             }
             _ => panic!("expected replicate command"),
         }
+    }
+
+    /// #649 review (cubic P2). A blocking lineage read cannot be cancelled.
+    /// Each session used to start its own and abandon it at the deadline, so
+    /// a lease lock stalled behind a slow fsync gathered one blocked thread
+    /// per reconnect. Now the set keeps one read in flight: later sessions
+    /// wait on it instead of starting another, and its answer is used once
+    /// it comes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_lineage_read_is_awaited_again_not_started_again() {
+        struct Stalled {
+            calls: std::sync::atomic::AtomicUsize,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl LeaderLineage for Stalled {
+            fn leader_lineage(&self) -> Option<LeaderLineageSnapshot> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+                Some(LeaderLineageSnapshot {
+                    range: RangeIdentity {
+                        topic: "t".to_owned(),
+                        topic_epoch: 1,
+                        range_id: Uuid::from_u128(1),
+                        range_generation: 0,
+                    },
+                    fencing_epoch: 7,
+                    epoch_starts: Vec::new(),
+                })
+            }
+        }
+        let (release, stalled) = std::sync::mpsc::channel();
+        let leader = Arc::new(Stalled {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            release: std::sync::Mutex::new(stalled),
+        });
+        let source = LineageSource::default();
+        for attempt in 0..3 {
+            let read = source
+                .read(
+                    Arc::clone(&leader) as Arc<dyn LeaderLineage>,
+                    Duration::from_millis(30),
+                )
+                .await;
+            assert!(
+                read.is_none(),
+                "attempt {attempt} got an answer from a stalled read"
+            );
+        }
+        assert_eq!(
+            leader.calls.load(Ordering::SeqCst),
+            1,
+            "each timed-out session started its own blocking read"
+        );
+        release.send(()).unwrap();
+        let read = source
+            .read(
+                Arc::clone(&leader) as Arc<dyn LeaderLineage>,
+                Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(read.map(|lineage| lineage.fencing_epoch), Some(7));
+        assert_eq!(leader.calls.load(Ordering::SeqCst), 1);
     }
 }

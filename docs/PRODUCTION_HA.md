@@ -428,7 +428,7 @@ CREATE TABLE batches (
   CONSTRAINT state_enum CHECK (state IN (
     'DISCOVERED','BATCHING','SEALED','COMPRESSED','CHECKSUMMED',
     'OBJECT_UPLOADED','MANIFEST_UPLOADED','VERIFIED','SOURCE_COMMITTED',
-    'FAILED','REPLAY_REQUIRED')),
+    'FAILED','REPLAY_REQUIRED','SUPERSEDED')),
 
   -- THE INVARIANT (two equivalent guards, keep both):
   CONSTRAINT commit_needs_verify_state CHECK (
@@ -454,7 +454,7 @@ CREATE UNIQUE INDEX uq_file_range
 CREATE INDEX ix_state        ON batches (state);
 CREATE INDEX ix_source_time  ON batches (source_type, source_name, updated_at);
 CREATE INDEX ix_incomplete   ON batches (state)
-  WHERE state NOT IN ('SOURCE_COMMITTED','FAILED');   -- hot incomplete set
+  WHERE state NOT IN ('SOURCE_COMMITTED','SUPERSEDED');   -- hot incomplete set (= the recovery work-list)
 ```
 
 **Multi-writer recovery [PROPOSED]:** claim incomplete rows with
@@ -464,6 +464,8 @@ instances never recover the same batch. Required before fleet mode.
 ### 6.6 Ledger retention / pruning **[IMPLEMENTED — incremental delete, #128]**
 ```text
 - keep ACTIVE, FAILED, REPLAY_REQUIRED, and recent SOURCE_COMMITTED rows hot;
+- delete old SUPERSEDED rows (#567: handed-back ranges the source has since
+  committed past) on age alone - none is ever a restart cursor;
 - delete old SOURCE_COMMITTED rows incrementally, always retaining the
   per-path NEWEST committed row (by `(created_at, batch_id)`) so recovery cursor seeding
   is unchanged - the newest, not the highest end_byte, which after a
@@ -479,7 +481,8 @@ only: the PostgreSQL runtime identity is deliberately denied DELETE, so the
 engine refuses the setting there and pruning runs as a scheduled `vtopctl
 prune-ledger --older-than-days N` under a maintenance identity (see
 [`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md)).
-Rows in any non-committed state are never touched.
+Rows in any other state (in flight, VERIFIED, FAILED, REPLAY_REQUIRED) are
+never touched.
 
 **Pruning keeps an anchor (#560).** Every prune pass, the engine's and
 `vtopctl prune-ledger`'s alike, lists its CANDIDATE rows, writes them to a
@@ -503,8 +506,10 @@ PostgreSQL deployment a durable directory.
 ledger and the digests and checks, per source unit (a Kafka topic-partition
 under one consumer group, a file or spool file at one inode), that committed
 ranges tile:
-- a stretch a FAILED or REPLAY_REQUIRED row names, below a later commit, is a
-  range that failed and was never re-archived (the #552 shape);
+- a stretch a FAILED, REPLAY_REQUIRED or SUPERSEDED row names, below a later
+  commit, is a range that failed and was never re-archived (the #552 shape);
+  a SUPERSEDED row above the last commit is such a hole too, never pending
+  (#567: nothing reads it again);
 - a stretch nothing names is lost data for a file or spool (bytes are
   contiguous, e.g. the #558 rotation shape), and is reported but not failed
   for Kafka (compaction and transaction markers occupy offsets with no
@@ -1174,23 +1179,49 @@ Short procedures now; expand into a full ops runbook before go-live.
   remains is the one way to stall the tier - that voter cannot decode the
   raise itself. A node that refuses to start with "written by a newer
   release" is an old binary on a newer log: upgrade it.
-- **Upgrading data nodes past #611:** the fix lives in the FENCED replica,
-  which keeps records a promotion candidate merely lacks instead of
-  truncating them. A replica still on an older release truncates as before,
-  and nothing on the wire tells the candidate which kind answered. So until
-  every data node of a range runs this release, a failover can still lose an
-  acknowledged write. That needs a replica holding acknowledged records
-  above its own committed mark, which it has not learned yet because the
-  leader acknowledges the producer before the mark reaches followers. A
-  rolling upgrade causes failovers, so keep it from triggering that:
-  1. Upgrade a range's followers before the node that leads it.
-  2. Before restarting the leader (or any node whose restart moves a
-     lease), stop producers to the range and wait until every follower's
-     `vtop_broker_cluster_committed_offset{topic,range}` equals the
-     leader's. A fence then cannot
-     truncate an acknowledged record on any replica, old or new: the
-     truncation guard refuses below the mark.
-  3. Resume producers once the new leader is serving.
+- **Upgrade the data nodes (#634): roll, verify, finalize.** Once metadata
+  is at feature level 7, every data node with a `lease` block reports its
+  release, the replica protocol it speaks and the feature level it
+  implements; it starts at boot and asks again on its lease renewal cadence
+  until metadata records it. Metadata keeps the report only for a
+  registered node (`vtopctl meta register-node`).
+  1. **Roll the binaries**, one node at a time, a range's followers before
+     the node that leads it. Until you finalize, the cluster runs at the
+     level in force: a new node speaks the old replica protocol to a peer
+     that predates the version handshake, and nothing new switches on.
+  2. **Verify that every node reports the new release:** `vtopctl meta
+     node-versions --config meta-admin.yaml --level N` lists each
+     registered node with what it reported, and exits non-zero naming every
+     counted node that has not reported N or higher (including one that
+     never reported). A counted node is a live range member (a lease holder
+     or a member of a recorded replica set) or any node that has reported,
+     unless it is marked dead. "never reported" means the node
+     runs a release before #634, has no `lease` block, or is not registered.
+  3. **Finalize:** `vtopctl meta enable-features --level N`. It is refused,
+     naming the nodes, while any counted node has not reported N or higher. The
+     metadata state machine applies the same check, so a node that joins
+     between the check and the raise is caught too. After the raise, every
+     data node that has read the level refuses a replica peer below it on
+     both ends of a session, including a peer that predates the handshake,
+     and both logs name the cause. A node that will not return stops holding
+     a raise back once it is marked dead (`vtopctl meta set-node-state
+     --state dead`).
+
+  Level 7, where reporting starts, is the exception: no data node can
+  report before it is in force, so its raise is judged on the metadata tier
+  alone. It changes nothing on the replica plane, so raising it cannot cut
+  a peer off. Every level above 7 waits for the data nodes. A data node with
+  no metadata configured (a static range) reports nothing and holds no peer
+  to a level.
+
+  The #611 fix is not tied to a level. It lives in the fenced replica, so
+  while a range still has a replica on a release before it, a failover can
+  lose an acknowledged write through that replica's own truncation. A
+  rolling upgrade causes failovers. Until `node-versions` shows every node
+  of the range on a release with the fix, stop producers to the range
+  before restarting its leader, and wait until every follower's
+  `vtop_broker_cluster_committed_offset{topic,range}` equals the leader's:
+  the truncation guard then refuses below the mark on any replica.
 - **Rolling a data node back past #635:** a replica holding a suffix a fence
   kept in dispute marks its fencing-epoch journal version 2 until the new
   leader settles it, usually within one append. A crash between clearing the
@@ -1250,8 +1281,9 @@ Short procedures now; expand into a full ops runbook before go-live.
   before the raise. It also includes records written after it by a data
   node still on an older release: that node does not judge lineage, so its
   records count answers this release would mark Unknown. Nothing enforces
-  the upgrade order, so raise the level only after every data node runs this
-  release.
+  the upgrade order at levels 6 and 7 (the data-node gate starts above 7,
+  #634), and raising to 7 raises past 6, so raise either only after every
+  data node runs this release.
 - **Change a range's replica set (#553):** a range's quorum is counted over
   the set metadata records for it (`vtopctl meta replica-set --config
   meta-admin.yaml --topic-uuid T --range-uuid R`; every `vtopctl meta`
