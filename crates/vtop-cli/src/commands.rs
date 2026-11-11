@@ -270,6 +270,7 @@ fn load(config: &Path) -> Result<(VtopConfig, StreamsConfig), VtopError> {
     } else {
         StreamsConfig { streams: vec![] }
     };
+    streams.validate(&cfg)?;
     Ok((cfg, streams))
 }
 
@@ -591,7 +592,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             // documented opt-out, and refusing it here would only push
             // operators to skip the check.
             let (cfg, streams) = load(config)?;
-            let warnings = cfg.warnings();
+            let warnings = streams.warnings(&cfg);
             if *print_effective {
                 let effective =
                     vtop_core::effective_config::effective_streams(&cfg, Some(&streams));
