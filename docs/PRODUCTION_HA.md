@@ -243,6 +243,28 @@ under the default, batches produced with checksums disabled **refuse to
 commit**, and running that way requires both opt-outs deliberately: the
 algorithm choice and the strength opt-out, each visible in configuration.
 
+**The opt-out is announced, not hidden (#629).** A size-only check
+**accepts same-size corruption**: a corrupted or replaced object of the
+recorded size is committed as verified. With
+`upload.require_strong_verification: false`, an engine started for `run`,
+`process-once` or `replay` logs one WARN at startup naming that consequence
+and the key. `vtopctl run` with `VTOP_METRICS_ADDR` set, the one process
+that serves metrics, also sets `vtop_verification_mode{mode="size_only"}` to
+1 (the `strong` series reads 0), so an alert can fire before any batch
+moves; the one-shot commands build no registry and export nothing.
+`vtopctl validate --config <file>` prints the same warning and still exits 0;
+there is no strict or production profile for it to refuse in. Every
+size-only verification logs a WARN with its batch id, and
+`vtop_verification_backend_limited_total` counts it where
+`vtop_verified_total` counts verifications: when the running engine marks the
+batch VERIFIED, and when recovery commits a VERIFIED row whose storage
+re-check confirmed only size. A row recovery re-checks but holds back under
+a lower incomplete range is logged, not counted, so a restart does not count
+it again. Under the strong default, the re-check logs the size-only result it
+refuses. The per-batch WARN
+is not rate-limited: it replaces that batch's INFO `verification_passed`
+line, so it is no more frequent than the batch log itself.
+
 **ETag caveat:** S3 multipart ETags are **not** reliable MD5 checksums. The
 authoritative integrity value is VTOP's own **SHA-256/BLAKE3 manifest checksum**,
 never the ETag.
@@ -792,7 +814,7 @@ path needed by the distributed options is already implemented (§6.3).
 | `upload.command_binary` / `command_timeout_seconds` / `command_max_output_bytes` | hardened external-tool path and invocation bounds (compatibility backends only) |
 | `upload.command_env_allowlist` | exact runtime environment names copied into an otherwise empty command environment |
 | `upload.create_bucket` | auto-create per-format buckets |
-| `upload.require_strong_verification` | defaults true — false explicitly permits size-only commit |
+| `upload.require_strong_verification` | defaults true — false explicitly permits size-only commit, which accepts same-size corruption; warned at startup and by `vtopctl validate` (#629) |
 | `upload.max_egress_bytes_per_second` | operator ceiling on the process's total upload body bytes per second (#481), unset by default. One token bucket per process, shared by every backend in it, in front of each `s3_native` object, manifest and multipart-part body — application-layer rate policy over kernel TCP, not a network-aware mechanism; no one-second window admits more than the cap, retries included. Headers and the small XML bodies of `CreateMultipartUpload`, `CompleteMultipartUpload` and `CreateBucket` are neither shaped nor counted. Other backends refuse it at startup. Accounted in `vtop_upload_egress_bytes_total`, exported only when set |
 | `upload.max_concurrency_ceiling` | operator maximum above the concurrency knobs (#481), unset by default: `batching.max_concurrent_batches`, `batching.adaptive_width.min_width` and `upload.transports.*.max_concurrency` above it are refused naming both numbers, and the adaptive width controller's ceiling and floor are clamped to it |
 | `partitioning.template` | object key layout |
