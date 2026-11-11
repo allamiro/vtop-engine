@@ -183,6 +183,7 @@ fn committed_cursor_of(r: &sqlx::sqlite::SqliteRow) -> Option<CommittedCursor> {
     let end: Option<i64> = r.get("end_byte");
     let size: Option<i64> = r.get("file_size");
     let content: Option<String> = r.get("content");
+    let mtime: Option<String> = r.get("mtime");
     let tail: Option<String> = r.get("tail");
     Some(CommittedCursor {
         path: path?,
@@ -190,6 +191,7 @@ fn committed_cursor_of(r: &sqlx::sqlite::SqliteRow) -> Option<CommittedCursor> {
         end_byte: end?.max(0) as u64,
         observed_size: size.map(|s| s.max(0) as u64),
         content_fingerprint: content.as_deref().and_then(parse_content_fingerprint),
+        observed_mtime: mtime.filter(|m| !m.is_empty()),
         tail_fingerprint: tail.as_deref().and_then(parse_content_fingerprint),
     })
 }
@@ -625,14 +627,15 @@ impl StateStore for SqliteStateStore {
                         CAST(json_extract(progress_end_json, '$.file_size') AS INTEGER) AS file_size, \
                         CAST(progress_end_json -> '$.content_fingerprint' AS TEXT) AS content, \
                         CAST(progress_end_json -> '$.tail_fingerprint' AS TEXT) AS tail, \
+                        json_extract(progress_end_json, '$.mtime') AS mtime, \
                         created_at, batch_id \
                  FROM batches WHERE state = ? AND source_type = ? \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, tail, ROW_NUMBER() OVER ( \
+                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ROW_NUMBER() OVER ( \
                             PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size, content, tail FROM latest WHERE rn = 1",
+             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest WHERE rn = 1",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(source_type.as_str())
@@ -658,14 +661,15 @@ impl StateStore for SqliteStateStore {
                         CAST(json_extract(progress_end_json, '$.file_size') AS INTEGER) AS file_size, \
                         CAST(progress_end_json -> '$.content_fingerprint' AS TEXT) AS content, \
                         CAST(progress_end_json -> '$.tail_fingerprint' AS TEXT) AS tail, \
+                        json_extract(progress_end_json, '$.mtime') AS mtime, \
                         created_at, batch_id \
                  FROM batches WHERE state = ? AND source_type = ? \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, tail, ROW_NUMBER() OVER ( \
+                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ROW_NUMBER() OVER ( \
                             PARTITION BY inode ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed WHERE path = ? \
              ) \
-             SELECT path, inode, end_byte, file_size, content, tail FROM latest WHERE rn = 1",
+             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest WHERE rn = 1",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(source_type.as_str())

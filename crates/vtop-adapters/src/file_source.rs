@@ -2,8 +2,9 @@
 //!
 //! Reads append-only log files line by line, tracking byte offsets, file
 //! identity (inode), size, and mtime. Resumes from the last committed byte and
-//! never deletes source files unless explicitly configured and only after the
-//! batch is committed.
+//! never deletes source files unless explicitly configured, only after the
+//! batch is committed, and only once the file has gone a quiet period without
+//! a write (#619, see `DeleteCandidate`).
 
 use crate::base::{
     AdapterReadReport, DiscoveredSource, ReadResult, SourceAdapter, SourceReadOutcome,
@@ -12,8 +13,8 @@ use crate::continuity::{self, Discontinuity, Observed};
 use crate::rotated::{self, HeldFile, Replay, RotatedFile};
 use async_trait::async_trait;
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
 use vtop_core::errors::VtopError;
 use vtop_core::types::{ContentFingerprint, ProgressMarker, SourceType, TelemetryFormat};
@@ -37,7 +38,282 @@ struct FileCursor {
     /// file the rewound position belongs to, valid only while `read_byte` is
     /// still where the rewind put it (a later read supersedes it with `seen`).
     rewound_for: Option<(u64, u64)>,
+    /// A committed range that covers the whole file, waiting out the quiet
+    /// period before `delete_after_commit` may remove it (#619).
+    delete_candidate: Option<DeleteCandidate>,
 }
+
+/// A file that a committed range covers end to end, and what it looked like
+/// when that was established - the evidence `delete_after_commit` waits on.
+///
+/// WHY DELETION WAITS (#619). Most appenders open a log once with `O_APPEND`
+/// and keep the descriptor until they rotate. Deleting the path the moment the
+/// engine caught up did not stop them: every later line went into the
+/// unlinked inode, which no path names, until the writer reopened - silently,
+/// and every time the engine caught up on a live file. No portable test says
+/// "no process holds this open for writing" (`/proc/*/fd` is Linux-only, needs
+/// privileges to read other users' descriptors and cannot see writers in
+/// other containers' PID namespaces; inotify close events are Linux-only and
+/// miss a writer that opened before the watch). What can be observed is
+/// whether the file is still being WRITTEN: an append moves both its length
+/// and its mtime. So a file is deleted only once it has stayed exactly as the
+/// commit saw it - same inode, first page, length and mtime - for the quiet
+/// period, timed on the engine's own monotonic clock rather than by the
+/// file's mtime, which a writer, an archive extraction or a network
+/// filesystem's clock can set to anything.
+///
+/// THE RESIDUAL RISK, stated plainly: a writer that holds the file open, is
+/// silent for longer than the quiet period, and then writes again, writes
+/// into a deleted file. So does one whose write through that descriptor lands
+/// between the delete's final check and the unlink (see
+/// [`DeleteJob::run`]). The quiet period bounds how idle a live
+/// writer can be before either happens; it cannot prove there is none.
+///
+/// The wait is in memory: a restart starts it again, from the seed (see
+/// [`FileSource::arm_delete_from_seed`]). With a zero quiet period the commit
+/// that covers the file deletes it at once - through the same rename-and-check
+/// ([`DeleteJob::run`]), with no quiet-period protection.
+#[derive(Debug, Clone)]
+struct DeleteCandidate {
+    /// The identity the committed range was read from.
+    inode: Option<u64>,
+    content: Option<ContentFingerprint>,
+    /// The fingerprint of the bytes ending at `end_byte` the committed range
+    /// was read with (#620); `None` for a legacy marker.
+    tail: Option<ContentFingerprint>,
+    /// Where the committed range ends: the file's whole length.
+    end_byte: u64,
+    /// The file's mtime when the candidate was recorded. Unchanged, with the
+    /// length, it is the evidence that nothing wrote to the file since.
+    mtime: Option<SystemTime>,
+    /// When the candidate was recorded, on the engine's monotonic clock.
+    since: Instant,
+}
+
+/// How the file now open compares with a [`DeleteCandidate`].
+enum Compared {
+    /// The same file, fully covered, and not touched since: deletable.
+    Unchanged,
+    /// The same file, fully covered, its first page AND the page below the
+    /// committed end still the bytes that were read - but its mtime moved (a
+    /// producer stamping a finished drop, a `touch`). Not proof of a write,
+    /// so not a reason to give up the delete; but something touched it, so
+    /// the wait starts again from now.
+    Touched(Option<SystemTime>),
+    /// Another file, bytes the committed range does not cover, or a moved
+    /// mtime with no tail fingerprint to prove the content unchanged.
+    Different,
+}
+
+impl DeleteCandidate {
+    /// The bytes [`continuity::probe_with_tail`] must read for the tail test:
+    /// the page ending at the committed end, when a tail was recorded.
+    fn tail_window(&self) -> Option<(u64, u64)> {
+        self.tail.as_ref().map(|tail| (self.end_byte, tail.len))
+    }
+
+    /// How the file (metadata, first bytes and the bytes ending at the
+    /// committed end, from ONE descriptor) compares with what this candidate
+    /// recorded.
+    ///
+    /// A MOVED MTIME is a touch only when the tail proves it (#620, review of
+    /// #631). Without a tail, a same-length rewrite past the first page looks
+    /// exactly like a touch, and taking it for one deleted the rewritten
+    /// bytes unread a quiet period later; so a moved mtime ends the candidate
+    /// and the file is kept. With a tail, a rewrite that reaches the first or
+    /// the last page is caught, and a moved mtime with both pages and the
+    /// length unchanged restarts the wait instead - which is what lets a
+    /// touched file go. What neither page sees - a same-length change
+    /// confined between them - is the limit #620 documents for every read.
+    fn compare(&self, md: &std::fs::Metadata, head: &[u8], tail: &[u8]) -> Compared {
+        // EQUALITY on the length: an append-only file under a committed
+        // range is never shorter than the range, and a longer one has bytes
+        // nobody read.
+        if !is_the_file_read(self, md, head, tail) || md.len() != self.end_byte {
+            return Compared::Different;
+        }
+        let mtime = md.modified().ok();
+        if mtime == self.mtime {
+            Compared::Unchanged
+        } else if self.tail.is_some() {
+            Compared::Touched(mtime)
+        } else {
+            Compared::Different
+        }
+    }
+}
+
+/// Whether the file now open is the one a committed batch read: the same
+/// inode, the first page (#578) and the bytes below the committed end (#620)
+/// that the batch fingerprinted - [`delete_identity_ok`], the identity test
+/// the delete path shares with #620. The ONE identity test every
+/// `delete_after_commit` decision goes through: the covering commit, the
+/// delete decision, and the check after the file is moved aside.
+fn is_the_file_read(
+    candidate: &DeleteCandidate,
+    md: &std::fs::Metadata,
+    head: &[u8],
+    tail: &[u8],
+) -> bool {
+    delete_identity_ok(
+        candidate.inode,
+        candidate.content.as_ref(),
+        candidate.tail.as_ref(),
+        inode_of(md),
+        head,
+        tail,
+    )
+}
+
+/// What became of one attempt to delete a candidate.
+enum DeleteAttempt {
+    Deleted,
+    /// Left in place because the file is no longer what the candidate
+    /// recorded (written, rotated, replaced, or touched with no tail to prove
+    /// it unchanged), or is gone, so the candidate can never qualify again.
+    Changed(&'static str),
+    /// Left in place because only its mtime moved, and its first page, tail
+    /// and length prove the content unchanged: the candidate stands with the
+    /// new mtime, and its wait starts again.
+    Touched(Option<SystemTime>),
+    /// Left in place because an operation failed (the open, the rename, the
+    /// unlink), not because the file changed: the candidate stands and the
+    /// delete is tried again on a later pass (review of #631).
+    Failed(String),
+}
+
+/// One delete, packaged to run off the async executor (review of #631): it
+/// opens, reads, renames and unlinks, all blocking calls, and a pass may
+/// have many due at once.
+struct DeleteJob {
+    path: String,
+    candidate: DeleteCandidate,
+    #[cfg(test)]
+    hook: Option<DeleteHook>,
+    #[cfg(test)]
+    first_aside: Option<PathBuf>,
+}
+
+impl DeleteJob {
+    /// Run [`Self::run`] on the blocking pool.
+    async fn run_blocking(self) -> DeleteAttempt {
+        tokio::task::spawn_blocking(move || self.run())
+            .await
+            .unwrap_or_else(|error| {
+                DeleteAttempt::Failed(format!("the delete task failed: {error}"))
+            })
+    }
+
+    /// Delete the file if it is still exactly what the candidate recorded,
+    /// without losing a write that lands while that is decided.
+    ///
+    /// MOVED ASIDE, THEN CHECKED AGAIN (#619 A). A check followed by an unlink
+    /// lost any line appended between the two: it went into the inode being
+    /// unlinked. So the file is first renamed to a hidden name beside it, and
+    /// the check is repeated on the renamed file. A writer that opens the path
+    /// for each write now creates a new file there, which is read as one; a
+    /// write that landed before the rename is seen by the second check, and
+    /// the file is put back under its name and kept. What no check can see is
+    /// a writer still holding the file open that writes after the second
+    /// check - the residual [`DeleteCandidate`] states; the quiet period is
+    /// what makes that writer one that had already been silent for that long.
+    ///
+    /// A crash after the rename leaves the file under a hidden name in the
+    /// same directory (`.vtop-delete.<nanos>.<n>`), never deleted. It is
+    /// fully archived unless a write landed after the decision to delete it:
+    /// one the crash kept from being seen and put back, or one through a held
+    /// descriptor after the second check (the window above). If a configured
+    /// pattern matches that name it is discovered and archived again: a
+    /// duplicate of the archived bytes, plus any such write.
+    fn run(self) -> DeleteAttempt {
+        let path = Path::new(&self.path);
+        let candidate = &self.candidate;
+        let Some((md, head, tail)) = continuity::probe_with_tail(path, candidate.tail_window())
+        else {
+            // GONE is not a failure to retry (review of #631): a candidate
+            // kept for a vanished file outlives it, and would be held up
+            // against whatever is created at that name next.
+            return match path.try_exists() {
+                Ok(false) => DeleteAttempt::Changed("the file is gone"),
+                _ => DeleteAttempt::Failed("the file could not be opened".to_owned()),
+            };
+        };
+        match candidate.compare(&md, &head, &tail) {
+            Compared::Unchanged => {}
+            Compared::Touched(mtime) => return DeleteAttempt::Touched(mtime),
+            Compared::Different => {
+                return DeleteAttempt::Changed(
+                    "the file changed since the commit that covered it \
+                     (written, rotated, truncated, replaced, or touched with no tail to \
+                     prove it unchanged)",
+                )
+            }
+        }
+        #[cfg(test)]
+        if let Some(hook) = &self.hook {
+            hook(path);
+        }
+        if path.file_name().is_none() {
+            return DeleteAttempt::Changed("the path names no file to move aside");
+        }
+        #[cfg(test)]
+        let mut forced = self.first_aside.clone();
+        let next_name = || {
+            #[cfg(test)]
+            if let Some(name) = forced.take() {
+                return name;
+            }
+            aside_name(path)
+        };
+        let aside = match move_aside(path, next_name) {
+            Ok(aside) => aside,
+            // On Windows, also what a writer that still has it open causes.
+            Err(error) => {
+                return DeleteAttempt::Failed(format!("the file could not be moved aside: {error}"))
+            }
+        };
+        // The final check before the unlink: the same identity, first page
+        // AND tail, on the renamed file.
+        let Some((md, head, tail)) = continuity::probe_with_tail(&aside, candidate.tail_window())
+        else {
+            // Nothing says it changed; nor can it be checked. Kept, as a
+            // failed check always is, and tried again.
+            put_back(&aside, path);
+            return DeleteAttempt::Failed(
+                "the file could not be opened again after it was moved aside".to_owned(),
+            );
+        };
+        match candidate.compare(&md, &head, &tail) {
+            Compared::Unchanged => match std::fs::remove_file(&aside) {
+                Ok(()) => DeleteAttempt::Deleted,
+                Err(error) => {
+                    put_back(&aside, path);
+                    DeleteAttempt::Failed(format!(
+                        "the file was moved aside but could not be deleted: {error}"
+                    ))
+                }
+            },
+            Compared::Touched(mtime) => {
+                put_back(&aside, path);
+                DeleteAttempt::Touched(mtime)
+            }
+            Compared::Different => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "delete-after-commit: the file was written to while it was being deleted; \
+                     it is put back and kept, and the new bytes are read as usual"
+                );
+                put_back(&aside, path);
+                DeleteAttempt::Changed("written to while being deleted")
+            }
+        }
+    }
+}
+
+/// How long a file must go unwritten before `delete_after_commit` removes it,
+/// unless configured otherwise (`sources.file.delete_quiet_seconds`).
+const DEFAULT_DELETE_QUIET: Duration =
+    Duration::from_secs(vtop_core::config::DEFAULT_DELETE_QUIET_SECONDS);
 
 pub struct FileSource {
     paths: Vec<String>,
@@ -59,6 +335,17 @@ pub struct FileSource {
     /// masquerade as a change. A sync Mutex because `discover_sources`
     /// takes `&self`; it is locked briefly and never across an await.
     warned_aliases: std::sync::Mutex<HashMap<(u64, u64), BTreeSet<String>>>,
+    /// How long a fully archived file must stay unwritten before
+    /// `delete_after_commit` removes it (#619, see [`DeleteCandidate`]).
+    delete_quiet: Duration,
+    /// Runs after the delete decision and before the file is moved aside, so
+    /// a test can append exactly in the gap #619 (A) describes.
+    #[cfg(test)]
+    before_delete: Option<DeleteHook>,
+    /// The first aside name a delete tries, so a test can make it one that
+    /// is already taken.
+    #[cfg(test)]
+    first_aside: Option<PathBuf>,
     /// Per path, a descriptor on the file its cursor reads, kept while a
     /// range read from it is not committed (#621): when the file is rotated
     /// away, it is the way back to those ranges if one fails.
@@ -89,6 +376,9 @@ pub struct ArchivedEnd {
     pub tail: Option<ContentFingerprint>,
 }
 
+#[cfg(test)]
+type DeleteHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
 impl FileSource {
     pub fn new(paths: Vec<String>, format: TelemetryFormat, delete_after_commit: bool) -> Self {
         Self::with_mode(paths, format, delete_after_commit, false)
@@ -113,7 +403,22 @@ impl FileSource {
             max_held: rotated::MAX_HELD_FILES,
             hold_for: rotated::HOLD_FOR,
             refused_rereads: Vec::new(),
+            delete_quiet: DEFAULT_DELETE_QUIET,
+            #[cfg(test)]
+            before_delete: None,
+            #[cfg(test)]
+            first_aside: None,
         }
+    }
+
+    /// How long a fully archived file must stay unwritten before
+    /// `delete_after_commit` removes it (#619). Zero deletes as soon as a
+    /// commit covers the file - still through the rename-and-check, but with
+    /// no quiet-period protection, so it is safe only when nothing can still
+    /// hold the file open for writing.
+    pub fn with_delete_quiet_period(mut self, quiet: Duration) -> Self {
+        self.delete_quiet = quiet;
+        self
     }
 
     /// Seed a committed byte offset (used by the replay engine on startup).
@@ -172,6 +477,178 @@ impl FileSource {
                 tail: continuity::Tail::at(committed_byte, tail),
             });
         }
+    }
+
+    /// Re-arm the deferred delete of a file the engine had fully archived but
+    /// not yet deleted before a restart (#619), from the seed just given to
+    /// [`Self::seed_committed_from`] and the mtime the same committed batch
+    /// recorded (`archived_mtime`, the marker's `mtime`). The wait was in
+    /// memory; without this the file would stay forever, since nothing new
+    /// is ever committed for it. The quiet period starts again here, and the
+    /// delete itself checks the file against this identity as it would a
+    /// commit's.
+    ///
+    /// Armed only on evidence that the file is still the one archived:
+    /// - the seed names both the inode and the first page - a legacy row
+    ///   cannot tell this file from one that replaced it while the engine
+    ///   was down;
+    /// - the batch saw its file END at the committed offset (review of
+    ///   #631): one that read part of a longer file archived only that part,
+    ///   and a same-inode rewrite cut back to the offset with the first page
+    ///   kept passes every other test. The read's continuity check catches
+    ///   that by the length the batch saw, but a delete armed now could run
+    ///   before any read;
+    /// - the file still has the mtime that batch saw (review of #631): a
+    ///   same-inode, same-length rewrite past the first page while the
+    ///   engine was down agrees on all of the above, and arming with the
+    ///   file's CURRENT mtime as the baseline deleted it unread. This is the
+    ///   restart side of the rule that a moved mtime ends a candidate.
+    ///   `None` or an empty mtime (unknown) leaves the delete unarmed - unless
+    ///   the seed carries the tail fingerprint (#620). Then the delete checks
+    ///   the page below the committed end as well as the first, which is what
+    ///   proves a moved mtime a touch rather than a rewrite (see
+    ///   `DeleteCandidate::compare`), so the wait is armed from the file's
+    ///   current mtime, as a touch in process restarts it.
+    pub fn arm_delete_from_seed(&mut self, path: &str, archived_mtime: Option<&str>) {
+        if !self.delete_after_commit {
+            return;
+        }
+        let archived_mtime = archived_mtime.filter(|m| !m.is_empty());
+        let Some(cursor) = self.cursors.get_mut(path) else {
+            return;
+        };
+        let committed_byte = cursor.committed_byte;
+        let Some(seen) = cursor.seen.as_ref() else {
+            return;
+        };
+        if seen.inode.is_none() || seen.content.is_none() || seen.file_size != committed_byte {
+            return;
+        }
+        let Ok(md) = std::fs::metadata(path) else {
+            return;
+        };
+        // The seed's tail, when it is the one ending at the committed offset.
+        let tail = seen
+            .tail
+            .as_ref()
+            .filter(|tail| tail.end == committed_byte)
+            .map(|tail| tail.fingerprint.clone());
+        let now = Self::identity_of(&md);
+        let same_mtime = archived_mtime.is_some_and(|archived| now.mtime == archived);
+        if now.inode != seen.inode
+            || now.file_size != committed_byte
+            || !(same_mtime || tail.is_some())
+        {
+            return;
+        }
+        cursor.delete_candidate = Some(DeleteCandidate {
+            inode: seen.inode,
+            content: seen.content.clone(),
+            tail,
+            end_byte: committed_byte,
+            mtime: md.modified().ok(),
+            since: Instant::now(),
+        });
+    }
+
+    /// The delete `path`'s cursor is due for: a [`DeleteCandidate`] that has
+    /// waited out the quiet period (#619). `None` when there is none, or it
+    /// is still waiting.
+    fn due_delete(&self, path: &str) -> Option<DeleteJob> {
+        if !self.delete_after_commit {
+            return None;
+        }
+        let candidate = self.cursors.get(path)?.delete_candidate.clone()?;
+        if candidate.since.elapsed() < self.delete_quiet {
+            return None;
+        }
+        Some(DeleteJob {
+            path: path.to_owned(),
+            candidate,
+            #[cfg(test)]
+            hook: self.before_delete.clone(),
+            #[cfg(test)]
+            first_aside: self.first_aside.clone(),
+        })
+    }
+
+    /// Apply what a delete did to `path`'s cursor. Returns whether the file
+    /// was deleted.
+    fn settle_delete(&mut self, path: &str, attempt: DeleteAttempt) -> bool {
+        match attempt {
+            DeleteAttempt::Deleted => {
+                // The file this cursor described is gone. A new file at the
+                // path may be handed the freed inode number, and an inode
+                // check cannot tell it from the one it replaced, so the cursor
+                // must not outlive it (#558). Nor may a descriptor kept to
+                // re-read its ranges (#621): every one of them is archived, and
+                // held open it would keep the deleted file's space allocated.
+                // A rotated file being re-read under this path is a different
+                // file and stays.
+                self.cursors.remove(path);
+                self.held.remove(path);
+                tracing::info!(
+                    path,
+                    "deleted after commit: fully archived and unwritten for the quiet period"
+                );
+                true
+            }
+            DeleteAttempt::Changed(why) => {
+                // The file is no longer what the candidate recorded, so the
+                // candidate can never qualify again. A later commit that
+                // covers the file records a new one.
+                if let Some(c) = self.cursors.get_mut(path) {
+                    c.delete_candidate = None;
+                }
+                tracing::debug!(path, why, "delete-after-commit: file kept");
+                false
+            }
+            DeleteAttempt::Touched(mtime) => {
+                // Only the mtime moved, and the first page, the tail and the
+                // length prove the content did not. A file at its end yields
+                // no batch, so no new covering commit would ever record a
+                // candidate again: the wait restarts on this one instead.
+                if let Some(candidate) = self
+                    .cursors
+                    .get_mut(path)
+                    .and_then(|c| c.delete_candidate.as_mut())
+                {
+                    candidate.mtime = mtime;
+                    candidate.since = Instant::now();
+                }
+                tracing::debug!(
+                    path,
+                    "delete-after-commit: file kept; only its mtime moved (first page, tail \
+                     and length unchanged), so the quiet period starts again"
+                );
+                false
+            }
+            DeleteAttempt::Failed(why) => {
+                // Nothing says the file changed, so the candidate stands and
+                // the next pass tries again; dropping it would keep an
+                // archived file forever over one transient failure (review of
+                // #631). Debug, not warn: it repeats every pass while the
+                // cause lasts.
+                tracing::debug!(
+                    path,
+                    why,
+                    "delete-after-commit: file kept for now; the delete is retried"
+                );
+                false
+            }
+        }
+    }
+
+    /// Delete `path` if its cursor holds a [`DeleteCandidate`] that has waited
+    /// out the quiet period and the file is still exactly what it recorded
+    /// (#619), on the blocking pool. Returns whether the file was deleted;
+    /// its cursor goes with it.
+    async fn delete_if_quiet(&mut self, path: &str) -> bool {
+        let Some(job) = self.due_delete(path) else {
+            return false;
+        };
+        let attempt = job.run_blocking().await;
+        self.settle_delete(path, attempt)
     }
 
     /// Whether this cycle can skip opening `path` entirely (#100).
@@ -328,6 +805,7 @@ impl FileSource {
             tracing::warn!(path, previous_read_byte = cursor.read_byte, "{why}");
             cursor.committed_byte = 0;
             cursor.generations.discontinuity();
+            cursor.delete_candidate = None;
         }
         cursor.generations.issue(start, end);
         cursor.read_byte = end;
@@ -366,6 +844,7 @@ impl FileSource {
             cursor.committed_byte = 0;
             cursor.read_byte = 0;
             cursor.generations.discontinuity();
+            cursor.delete_candidate = None;
             cursor.seen = Some(opened);
             self.retire_held(path, read_byte_before, why);
         }
@@ -1064,7 +1543,7 @@ impl FileSource {
                 );
                 Err(error)
             }
-            PassOutcome::Nothing => Ok(Vec::new()),
+            PassOutcome::Nothing | PassOutcome::Deleted => Ok(Vec::new()),
         }
     }
 
@@ -1532,6 +2011,112 @@ fn alias_groups_to_warn(
     to_warn
 }
 
+/// The hidden name beside `path` that a file is moved to while it is deleted
+/// (#619). The clock and a process-wide counter make it unique per attempt,
+/// so a name left by a crash is never overwritten by a later attempt, nor one
+/// attempt by another in the same instant.
+///
+/// BOUNDED, and built from nothing of the file's own name (review of #631):
+/// derived from it, a legal name near the filesystem's 255-byte limit gave a
+/// hidden name over it, the rename failed with ENAMETOOLONG on every pass,
+/// and the archived file was never deleted. Under 80 bytes here, whatever
+/// the source is called.
+fn aside_name(path: &Path) -> PathBuf {
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_file_name(format!(".vtop-delete.{nanos}.{attempt}"))
+}
+
+/// How many aside names a delete tries before giving up for this pass.
+const ASIDE_ATTEMPTS: usize = 8;
+
+/// Move `path` to the first name `next_name` offers that nothing else has,
+/// and return that name. NEVER OVER AN EXISTING FILE (review of #631): a
+/// plain rename replaces its destination, and the destination could be a
+/// file a crash left mid-delete - which may hold bytes not yet archived -
+/// or anyone else's. A name already taken is skipped for the next one.
+fn move_aside(path: &Path, mut next_name: impl FnMut() -> PathBuf) -> std::io::Result<PathBuf> {
+    let mut taken = None;
+    for _ in 0..ASIDE_ATTEMPTS {
+        let aside = next_name();
+        match rename_noreplace(path, &aside) {
+            Ok(()) => return Ok(aside),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                taken = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(taken.unwrap_or_else(|| std::io::Error::other("no aside name to try")))
+}
+
+/// Rename that fails with `AlreadyExists` instead of replacing `to`:
+/// `renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on
+/// Apple platforms, both atomic. A filesystem or kernel that does not support
+/// the flag falls back to [`rename_unless_exists`].
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    use rustix::io::Errno;
+    match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(e) if e == Errno::INVAL || e == Errno::NOSYS || e == Errno::NOTSUP => {
+            rename_unless_exists(from, to)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    rename_unless_exists(from, to)
+}
+
+/// Where no atomic no-replace rename exists: refuse a destination that is
+/// already there, then rename. A file created at `to` between the two would
+/// still be replaced; with names unique by clock and counter, only a process
+/// guessing the next one could do that.
+fn rename_unless_exists(from: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(to).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "the aside name is taken",
+        ));
+    }
+    std::fs::rename(from, to)
+}
+
+/// Give a file moved aside for deletion its name back. A hard link, not a
+/// rename: a rename would replace a new file a writer has created at the path
+/// meanwhile, and that file has not been read either.
+fn put_back(aside: &Path, path: &Path) {
+    match std::fs::hard_link(aside, path) {
+        Ok(()) => {
+            if let Err(error) = std::fs::remove_file(aside) {
+                tracing::warn!(
+                    path = %path.display(),
+                    aside = %aside.display(),
+                    %error,
+                    "delete-after-commit: the file is back under its name, but the name it \
+                     was moved aside to could not be removed; both now name it"
+                );
+            }
+        }
+        Err(error) => tracing::error!(
+            path = %path.display(),
+            aside = %aside.display(),
+            %error,
+            "delete-after-commit: a file moved aside to be deleted could not be put back \
+             (a new file already has its name, or the filesystem has no hard links); it is \
+             left under the hidden name and may hold bytes not yet archived - move it back \
+             or archive it by hand"
+        ),
+    }
+}
+
 /// The (device, inode) pair that makes two directory entries provably one
 /// file. `metadata` follows symlinks, so a link and its target answer the
 /// same pair — which is exactly the aliasing #378 asks about.
@@ -1635,6 +2220,9 @@ enum PassOutcome {
     /// Nothing to read: the path is gone, and a rotated file's re-read has
     /// reached its end.
     Nothing,
+    /// Deleted by `delete_after_commit` before the pass (#619): fully
+    /// archived, so there was nothing left to read.
+    Deleted,
 }
 
 #[async_trait]
@@ -1768,12 +2356,17 @@ impl SourceAdapter for FileSource {
         max_bytes: usize,
         _max_wait: Duration,
     ) -> Result<Vec<ReadResult>, VtopError> {
+        let path = source.source_name.clone();
+        // A fully archived file that has stayed unwritten for the quiet period
+        // goes now (#619); nothing in it is left to read.
+        if self.delete_if_quiet(&path).await {
+            return Ok(Vec::new());
+        }
         // Cheapest signal first (#100): an unchanged, fully-read file is
         // skipped without an open (see `run_job`). The marker still reports
         // the cursor where it stands, so a skipped file is indistinguishable
         // from one that was read and had nothing to give — which is what it is.
         self.expire_rotated();
-        let path = source.source_name.clone();
         let job = self.read_job(&path);
         let start = job.start;
         let (outcome, drained) = Self::run_job(job, max_records, max_bytes, self.whole_file).await;
@@ -1807,10 +2400,41 @@ impl SourceAdapter for FileSource {
         // while the reads they gated went through tokio::fs. Only the cursor
         // snapshot is taken up front; each job stats and decides for itself
         // under the same bounded concurrency as the read it gates.
+        // Fully archived files that have stayed unwritten for the quiet period
+        // go first (#619): nothing in them is left to read, and reading one
+        // would only recreate the cursor its delete dropped.
+        //
+        // The deletes are blocking I/O (open, read, rename, unlink), so they
+        // run on the blocking pool under the same bound as the reads, never
+        // inline on the executor one after another (review of #631): a
+        // directory whose quiet periods run out together would otherwise
+        // serialize them all ahead of every read, the pre-pass #412 removed.
+        // Only the decision of which are due, and the cursor updates after,
+        // run here.
+        let due: Vec<(usize, DeleteJob)> = sources
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| self.due_delete(&s.source_name).map(|job| (i, job)))
+            .collect();
+        let attempts: Vec<(usize, DeleteAttempt)> = futures::stream::iter(
+            due.into_iter()
+                .map(|(i, job)| async move { (i, job.run_blocking().await) }),
+        )
+        .buffer_unordered(FILE_READ_CONCURRENCY)
+        .collect()
+        .await;
+        // A set, so the filter below stays linear however many go at once.
+        let mut deleted = std::collections::HashSet::new();
+        for (i, attempt) in attempts {
+            if self.settle_delete(&sources[i].source_name, attempt) {
+                deleted.insert(i);
+            }
+        }
         self.expire_rotated();
         let jobs: Vec<(usize, ReadJob)> = sources
             .iter()
             .enumerate()
+            .filter(|(i, _)| !deleted.contains(i))
             .map(|(i, s)| (i, self.read_job(&s.source_name)))
             .collect();
 
@@ -1824,6 +2448,15 @@ impl SourceAdapter for FileSource {
             .buffer_unordered(FILE_READ_CONCURRENCY)
             .collect()
             .await;
+        results.extend(deleted.into_iter().map(|i| {
+            (
+                i,
+                sources[i].source_name.clone(),
+                0,
+                PassOutcome::Deleted,
+                false,
+            )
+        }));
         // buffer_unordered completes in I/O order; report in source order.
         results.sort_by_key(|(i, ..)| *i);
         // COUNTED, not silent. The issue asks for deferred work to be visible,
@@ -2015,17 +2648,25 @@ impl SourceAdapter for FileSource {
             // And for a replacement that reuses the inode and is no shorter
             // (#578): only its first bytes differ from the batch's file.
             // And for a rewrite that kept the first page (#620): only the
-            // bytes below the batch's end differ.
-            let (cur_inode, size, head, tail) =
-                Self::probe_with_tail(Path::new(path), *end_byte, marker_tail.as_ref());
-            let identity_ok = delete_identity_ok(
-                *marker_inode,
-                marker_content.as_ref(),
-                marker_tail.as_ref(),
-                cur_inode,
-                &head,
-                &tail,
+            // bytes below the batch's end differ. One descriptor answers
+            // both, and the metadata it carries is what the deferred delete
+            // (#619) records as the file's state at this commit.
+            let probed = continuity::probe_with_tail(
+                Path::new(path),
+                marker_tail.as_ref().map(|tail| (*end_byte, tail.len)),
             );
+            let size = probed.as_ref().map_or(0, |(md, _, _)| md.len());
+            // A file that can no longer be opened is not the one read either.
+            let identity_ok = probed.as_ref().is_some_and(|(md, head, tail)| {
+                delete_identity_ok(
+                    *marker_inode,
+                    marker_content.as_ref(),
+                    marker_tail.as_ref(),
+                    inode_of(md),
+                    head,
+                    tail,
+                )
+            });
             if !still_current {
                 tracing::warn!(
                     path,
@@ -2036,12 +2677,33 @@ impl SourceAdapter for FileSource {
                     path,
                     "skipping delete-after-commit: file identity changed (possible rotation/replacement)"
                 );
-            } else if *end_byte >= size && std::fs::remove_file(path).is_ok() {
-                // The file this cursor described is gone. A new file at the
-                // path may be handed the freed inode number, and an inode
-                // check cannot tell it from the one it replaced, so the cursor
-                // must not outlive it (#558).
-                self.cursors.remove(path);
+            } else if *end_byte >= size {
+                // Fully archived - but a file the engine has caught up with
+                // may still be the one a writer is appending to, and deleting
+                // it now sends every later line into an unlinked inode (#619).
+                // It is deleted once it has stayed exactly like this for the
+                // quiet period; until then it is kept, and read as usual.
+                let candidate = DeleteCandidate {
+                    inode: *marker_inode,
+                    content: marker_content.clone(),
+                    tail: marker_tail.clone(),
+                    end_byte: *end_byte,
+                    mtime: probed.as_ref().and_then(|(md, _, _)| md.modified().ok()),
+                    since: Instant::now(),
+                };
+                self.cursors
+                    .entry(path.clone())
+                    .or_default()
+                    .delete_candidate = Some(candidate);
+                if !self.delete_quiet.is_zero() {
+                    tracing::debug!(
+                        path,
+                        quiet_seconds = self.delete_quiet.as_secs(),
+                        "fully archived file kept for now: a writer may still hold it open; it is \
+                         deleted once it has stayed unwritten for the quiet period"
+                    );
+                }
+                self.delete_if_quiet(path).await;
             }
         }
         Ok(())
@@ -3026,7 +3688,10 @@ mod tests {
         let read_inode = std::fs::metadata(&path).unwrap().ino();
         let spath = path.to_string_lossy().into_owned();
 
-        let mut fs = FileSource::new(vec![spath.clone()], TelemetryFormat::Raw, true);
+        // No quiet period (#619), or the wait alone would keep the file and
+        // the identity guard under test would never be reached.
+        let mut fs = FileSource::new(vec![spath.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
         let reads = fs
             .read_batch_candidates(&src(&spath), 100, 1 << 20, Duration::ZERO)
             .await
@@ -3064,7 +3729,9 @@ mod tests {
     async fn delete_after_commit_skips_on_identity_mismatch() {
         let f = write_log(&["a"]);
         let path = f.path().to_string_lossy().into_owned();
-        let mut fs = FileSource::with_mode(vec![path.clone()], TelemetryFormat::Raw, true, false);
+        // No quiet period (#619), so only the identity guard can keep it.
+        let mut fs = FileSource::with_mode(vec![path.clone()], TelemetryFormat::Raw, true, false)
+            .with_delete_quiet_period(Duration::ZERO);
         // Marker carries a stale inode (as if the file rotated since the read);
         // committing must NOT delete the now-different file on disk.
         let marker = ProgressMarker::File {
@@ -3462,7 +4129,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.log").to_string_lossy().into_owned();
         std::fs::write(&path, "aaa\nbbb\nccc\n").unwrap();
-        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true);
+        // No quiet period (#619): this test is about which commit may delete,
+        // not about how long a fully archived file waits.
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
         let old = fs
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
             .await
@@ -3506,7 +4176,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.log").to_string_lossy().into_owned();
         std::fs::write(&path, "aaa\nbbb\n").unwrap();
-        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true);
+        // No quiet period (#619): the cursor, not the wait, is under test.
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
         let read = fs
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
             .await
@@ -3844,7 +4516,9 @@ mod tests {
         let path = dir.path().join("app.log").to_string_lossy().into_owned();
         std::fs::write(&path, "old one\nold two\n").unwrap();
         let inode = std::fs::metadata(&path).unwrap().ino();
-        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true);
+        // No quiet period (#619), so only the content guard can keep it.
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
         let read = fs
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
             .await
@@ -4326,6 +5000,54 @@ mod tests {
         assert!(err.contains("identity changed"), "{err}");
     }
 
+    /// #621 with `delete_after_commit` (#619): the re-read of a rotated range
+    /// and the deferred delete work on the same path without stepping on each
+    /// other. The re-read's commit names the rotated file's inode, which is
+    /// not the file at the path, so it records no delete candidate: neither
+    /// the rotated file nor the new one is deleted for it. The new file, once
+    /// fully archived and unwritten for the quiet period, is deleted as usual,
+    /// and nothing the adapter held for that path outlives it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotated_re_read_and_delete_after_commit_share_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let rotated = format!("{path}.1");
+        std::fs::write(&path, "old 1\nold 2\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let first = read_all_one(&mut fs, &path).await;
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::write(&path, "new 1\n").unwrap();
+        fs.replay_from_marker(&first[0].progress_start)
+            .await
+            .expect("re-read through the held descriptor");
+
+        let again = read_all_one(&mut fs, &path).await;
+        assert_eq!(lines(&again), ["old 1", "old 2"]);
+        fs.commit_progress(&again[0].progress_end).await.unwrap();
+        assert!(
+            Path::new(&rotated).exists() && Path::new(&path).exists(),
+            "the re-read's commit deletes neither the rotated file nor the new one"
+        );
+
+        let next = read_all_one(&mut fs, &path).await;
+        assert_eq!(lines(&next), ["new 1"]);
+        fs.commit_progress(&next[0].progress_end).await.unwrap();
+        assert!(
+            !Path::new(&path).exists(),
+            "the new file, fully archived and quiet, is deleted as before"
+        );
+        assert!(
+            Path::new(&rotated).exists(),
+            "the rotated file is not this adapter's to delete"
+        );
+        assert!(
+            fs.held.is_empty() && fs.rotated.is_empty(),
+            "no descriptor outlives what it was kept for"
+        );
+    }
+
     /// Review of #621: a commit raises a held file's commit floor only if it
     /// was read from the content that file holds NOW, not merely from its
     /// inode. A window of the old content, committed late after the file was
@@ -4694,6 +5416,746 @@ mod tests {
             "a refused range leaves the new file's read alone"
         );
     }
+    // ---- delete_after_commit on a file still being written (#619) -----------
+
+    /// #619 (A): the delete decision is a check and the unlink an act, with
+    /// nothing holding the file in between. A line appended after the check
+    /// went into the inode that was then unlinked, with its cursor dropped:
+    /// nothing would ever read it. The seam appends exactly there.
+    #[tokio::test]
+    async fn a_line_appended_between_the_delete_check_and_the_unlink_is_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true);
+        // No quiet period, so the commit goes straight to the delete and the
+        // only thing under test is the gap between its check and its unlink.
+        fs.delete_quiet = Duration::ZERO;
+        let appender = path.clone();
+        let appended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let once = appended.clone();
+        fs.before_delete = Some(std::sync::Arc::new(move |_| {
+            if !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&appender)
+                    .unwrap()
+                    .write_all(b"three\n")
+                    .unwrap();
+            }
+        }));
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(read[0].records.len(), 2);
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert!(
+            appended.load(std::sync::atomic::Ordering::SeqCst),
+            "the seam never ran, so the delete was never attempted and this test proves nothing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("one\ntwo\nthree\n"),
+            "the line appended after the delete check was unlinked with the file, unarchived"
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from("app.log")],
+            "put back under its own name, with no hidden copy left beside it"
+        );
+        let next = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            next[0].records,
+            vec![b"three".to_vec()],
+            "the appended line is handed out for archiving, from where the commit left off"
+        );
+    }
+
+    /// #619 (B): most appenders open the log once with `O_APPEND` and keep the
+    /// descriptor. Catching up to the end and deleting the path does not stop
+    /// them: every later line goes into the unlinked inode, which no path
+    /// names, until the writer reopens. Not a race - it happened every time
+    /// the engine caught up on a live file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_a_writer_still_holds_open_is_not_deleted_when_the_engine_catches_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"one\ntwo\n").unwrap();
+        // The default configuration: what an operator who only set
+        // `delete_after_commit: true` gets.
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(read[0].records.len(), 2);
+        // Caught up: the committed range ends exactly at the end of the file.
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+
+        // The writer goes on through the descriptor it never closed.
+        writer.write_all(b"three\n").unwrap();
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "the file was deleted while a writer held it open; \"three\" went into an \
+             unlinked inode that nothing will read"
+        );
+        let next = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            next[0].records,
+            vec![b"three".to_vec()],
+            "the line written after the engine caught up is read for archiving"
+        );
+        fs.commit_progress(&next[0].progress_end).await.unwrap();
+        writer.write_all(b"four\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("one\ntwo\nthree\nfour\n"),
+            "still live after the second catch-up, so still not deleted"
+        );
+    }
+
+    /// The other half of #619: a kept file is not kept forever. Once it has
+    /// stayed exactly as its covering commit saw it for the quiet period, the
+    /// next read pass - the engine's path, `read_all_batch_candidates` -
+    /// deletes it, reports nothing to read for it, and drops its cursor.
+    #[tokio::test]
+    async fn a_fully_archived_file_is_deleted_once_it_has_stayed_unwritten_for_the_quiet_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let quiet = Duration::from_millis(50);
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(quiet);
+        let pass = fs
+            .read_all_batch_candidates(&[src(&path)], 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let reads = pass.outcomes[0].result.as_ref().unwrap();
+        assert_eq!(reads[0].records.len(), 2);
+        fs.commit_progress(&reads[0].progress_end).await.unwrap();
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "kept at the commit: it has not been quiet for {quiet:?} yet"
+        );
+
+        std::thread::sleep(quiet * 2);
+        let pass = fs
+            .read_all_batch_candidates(&[src(&path)], 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            pass.outcomes.len(),
+            1,
+            "one outcome per source, deleted or not"
+        );
+        assert!(
+            pass.outcomes[0].result.as_ref().unwrap().is_empty(),
+            "a deleted file has nothing to read"
+        );
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "unwritten for twice the quiet period after its covering commit, so deleted"
+        );
+        assert!(
+            !fs.cursors.contains_key(&path),
+            "the cursor described a file that no longer exists (#558)"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(
+            leftovers.is_empty(),
+            "nothing is left under the hidden name it was moved to: {leftovers:?}"
+        );
+    }
+
+    /// Waiting is not enough: the file must also be unchanged when the wait
+    /// is over. A line written after the commit, even one that lands before
+    /// the quiet period would have run out, means a writer is still there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_after_the_covering_commit_keeps_the_file_however_long_ago_the_commit_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"one\n").unwrap();
+        let quiet = Duration::from_millis(50);
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(quiet);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        writer.write_all(b"two\n").unwrap();
+        std::thread::sleep(quiet * 2);
+
+        let next = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "written to after its covering commit, so a writer may still hold it open"
+        );
+        assert_eq!(next[0].records, vec![b"two".to_vec()]);
+    }
+
+    /// The wait is in memory, so a restart inside it would leave a fully
+    /// archived file on disk forever: nothing new is ever committed for it.
+    /// The seed restarts the wait - but only from a row that names the inode
+    /// and the first page, since a legacy row cannot tell the file from one
+    /// that replaced it while the engine was down.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restart_inside_the_quiet_period_still_deletes_the_file_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut before = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true);
+        let read = before
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        before.commit_progress(&read[0].progress_end).await.unwrap();
+        assert!(std::path::Path::new(&path).exists(), "kept: not quiet yet");
+        let ProgressMarker::File {
+            inode,
+            end_byte,
+            file_size,
+            mtime,
+            content_fingerprint,
+            tail_fingerprint,
+            ..
+        } = read[0].progress_end.clone()
+        else {
+            panic!("expected a file marker");
+        };
+
+        let quiet = Duration::from_millis(50);
+        let mut legacy = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(quiet);
+        legacy.seed_committed_from(&path, end_byte, inode, Some(file_size), None, None);
+        legacy.arm_delete_from_seed(&path, Some(&mtime));
+        let mut after = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(quiet);
+        after.seed_committed_from(
+            &path,
+            end_byte,
+            inode,
+            Some(file_size),
+            content_fingerprint,
+            tail_fingerprint,
+        );
+        after.arm_delete_from_seed(&path, Some(&mtime));
+        std::thread::sleep(quiet * 2);
+
+        legacy
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "a seed without the first page cannot prove this is the file it archived"
+        );
+        let reads = after
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(reads.is_empty(), "a deleted file has nothing to read");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "fully archived and unwritten for the quiet period since the restart, so deleted"
+        );
+    }
+
+    /// Review of #631: a delete that FAILS (here the rename, because the path
+    /// was briefly empty) says nothing about the file, so the candidate must
+    /// survive it. Dropping it kept an archived file forever, since nothing
+    /// new is ever committed for it to record another.
+    #[tokio::test]
+    async fn a_delete_that_fails_is_tried_again_on_the_next_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let (from, to) = (path.clone(), elsewhere.clone());
+        let failed_once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let once = failed_once.clone();
+        fs.before_delete = Some(std::sync::Arc::new(move |_| {
+            if !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                std::fs::rename(&from, &to).unwrap();
+            }
+        }));
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert!(failed_once.load(std::sync::atomic::Ordering::SeqCst));
+        // Back under its name: same inode, same length, same mtime.
+        std::fs::rename(&elsewhere, &path).unwrap();
+        assert!(
+            fs.cursors[&path].delete_candidate.is_some(),
+            "a failed rename dropped the candidate"
+        );
+
+        let reads = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(reads.is_empty(), "a deleted file has nothing to read");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "the delete is retried once the failure has passed"
+        );
+    }
+
+    /// Review of #631: a seed whose batch read only PART of its file (it saw
+    /// the file longer than the committed offset) is not a fully archived
+    /// file. If the file was rewritten at the same inode while the engine was
+    /// down - cut back to exactly the committed offset, first page unchanged -
+    /// inode, first page and length all agree with the seed, and only the
+    /// length the batch saw tells it apart. The read's continuity check uses
+    /// that length and restarts at byte 0, but a delete armed by the seed ran
+    /// before any read, and with no quiet period deleted the unread rewrite.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_seed_from_a_partly_read_file_never_arms_its_delete() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let line = |tag: &str, i: usize| format!("{tag}-{i:04}-{}\n", "x".repeat(90));
+        let original: String = (0..164).map(|i| line("old", i)).collect();
+        assert_eq!(original.len(), 16_400);
+        std::fs::write(&path, &original).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let mut before = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true);
+        let read = before
+            .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let content = read[0].progress_end.content_fingerprint().cloned();
+        assert!(
+            content.as_ref().is_some_and(|c| c.len < 4_100),
+            "the fingerprint covers less than the 41 lines the rewrite keeps"
+        );
+
+        // While the engine is down: rewritten in place to the committed
+        // offset, the first 41 lines kept and the rest replaced.
+        let committed = 8_200u64;
+        let rewrite: String = (0..82)
+            .map(|i| line(if i < 41 { "old" } else { "NEW" }, i))
+            .collect();
+        assert_eq!(rewrite.len() as u64, committed);
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, &rewrite).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        // Its mtime put back, so only the length the batch saw tells it apart.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+        let ProgressMarker::File { mtime, .. } = read[0].progress_end.clone() else {
+            panic!("expected a file marker");
+        };
+
+        // The newest committed row read [.., 8200) of a file it saw at 16400.
+        let mut after = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        // No tail (a row from before #620): the observed-size guard alone is
+        // under test here, and a tail would also catch this rewrite.
+        after.seed_committed_from(&path, committed, Some(inode), Some(16_400), content, None);
+        after.arm_delete_from_seed(&path, Some(&mtime));
+        let reads = after
+            .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "the rewrite was never read; deleting it on the seed's word loses it"
+        );
+        assert!(std::fs::read_to_string(&path).unwrap() == rewrite);
+        assert_eq!(
+            reads[0].records.len(),
+            82,
+            "the shrunken file is read from byte 0, as the continuity check decides"
+        );
+    }
+
+    /// Review of #631: a file that is GONE is not a transient failure. A
+    /// retried candidate for a vanished path outlives the file it described,
+    /// and could be matched against whatever is created at that name next.
+    #[tokio::test]
+    async fn a_candidate_for_a_file_that_is_gone_is_dropped_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let quiet = Duration::from_millis(50);
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(quiet);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert!(fs.cursors[&path].delete_candidate.is_some());
+
+        std::fs::remove_file(&path).unwrap();
+        std::thread::sleep(quiet * 2);
+        // The read of the missing file fails; the delete before it must
+        // still have settled the candidate.
+        let _ = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await;
+        assert!(
+            fs.cursors
+                .get(&path)
+                .is_none_or(|c| c.delete_candidate.is_none()),
+            "the file is gone, yet its delete candidate is kept to be retried"
+        );
+    }
+
+    /// Commit a fully read file, then rewrite it in place with `after` (same
+    /// length) and stamp a new mtime. `with_tail: false` strips the marker's
+    /// tail fingerprint first, as for a range from before #620.
+    async fn commit_then_restamp(
+        path: &str,
+        original: &str,
+        after: &str,
+        with_tail: bool,
+        quiet: Duration,
+    ) -> FileSource {
+        std::fs::write(path, original).unwrap();
+        let mut fs = FileSource::new(vec![path.to_owned()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(quiet);
+        let read = fs
+            .read_batch_candidates(&src(path), 1_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let mut end = read[0].progress_end.clone();
+        assert!(
+            end.content_fingerprint().is_some_and(|c| c.len < 5_000),
+            "the first-page fingerprint stops before the rewritten lines"
+        );
+        if let ProgressMarker::File {
+            tail_fingerprint, ..
+        } = &mut end
+        {
+            assert!(
+                tail_fingerprint.is_some(),
+                "a read to the end records its tail"
+            );
+            if !with_tail {
+                *tail_fingerprint = None;
+            }
+        }
+        fs.commit_progress(&end).await.unwrap();
+        let mut file = std::fs::File::options().write(true).open(path).unwrap();
+        file.write_all(after.as_bytes()).unwrap();
+        file.set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000))
+            .unwrap();
+        drop(file);
+        fs
+    }
+
+    /// Lines 50-59 of 60, each 100 bytes: past the first page, inside the
+    /// last one.
+    fn sixty_lines(rewrite_from: usize) -> String {
+        (0..60)
+            .map(|i| {
+                let tag = if i < rewrite_from { "old" } else { "NEW" };
+                format!("{tag}-{i:04}-{}\n", "x".repeat(90))
+            })
+            .collect()
+    }
+
+    /// Review of #631 (P1): a same-length rewrite PAST the first page, with a
+    /// new mtime, agrees with the candidate on inode, first page and length.
+    /// Treating that as a harmless touch re-armed the delete, and one quiet
+    /// period later the rewritten bytes - never read - were deleted. With the
+    /// tail fingerprint (#620) the rewrite is seen in the page below the
+    /// committed end; without one, a moved mtime ends the candidate. Either
+    /// way the file is kept.
+    #[tokio::test]
+    async fn a_rewrite_past_the_first_page_with_a_new_mtime_is_never_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (original, rewrite) = (sixty_lines(60), sixty_lines(50));
+        assert_eq!(original.len(), rewrite.len());
+        let quiet = Duration::from_millis(50);
+        for (name, with_tail) in [("tail.log", true), ("no-tail.log", false)] {
+            let path = dir.path().join(name).to_string_lossy().into_owned();
+            let mut fs = commit_then_restamp(&path, &original, &rewrite, with_tail, quiet).await;
+            for _ in 0..3 {
+                std::thread::sleep(quiet * 2);
+                // A read of a deleted file fails; the assertion below says why.
+                let _ = fs
+                    .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+                    .await;
+            }
+            assert!(
+                std::fs::read_to_string(&path).ok().as_deref() == Some(rewrite.as_str()),
+                "{name}: rewritten past the first page with a new mtime, yet deleted after \
+                 the quiet period"
+            );
+        }
+    }
+
+    /// #620 on the delete path: a same-length rewrite past the first page that
+    /// puts the old mtime back agrees with the candidate on inode, first
+    /// page, length AND mtime, and - unchanged to a stat - is skipped by the
+    /// read pass too. Only the tail fingerprint, checked before the unlink,
+    /// tells it from the file that was archived.
+    #[tokio::test]
+    async fn a_rewrite_that_keeps_its_mtime_is_caught_by_the_tail_before_the_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let (original, rewrite) = (sixty_lines(60), sixty_lines(50));
+        std::fs::write(&path, &original).unwrap();
+        let quiet = Duration::from_millis(50);
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(quiet);
+        let read = fs
+            .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        let archived_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.write_all(rewrite.as_bytes()).unwrap();
+        file.set_modified(archived_mtime).unwrap();
+        drop(file);
+
+        std::thread::sleep(quiet * 2);
+        let _ = fs
+            .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+            .await;
+        assert!(
+            std::fs::read_to_string(&path).ok().as_deref() == Some(rewrite.as_str()),
+            "rewritten below the committed end with its mtime put back, yet deleted"
+        );
+    }
+
+    /// The other side of the moved-mtime rule (#620, review of #631): a file
+    /// only TOUCHED - same inode, first page, tail and length, new mtime - is
+    /// proven unchanged by the tail, so its wait restarts and it is deleted
+    /// once it has stayed quiet. Ending the candidate instead kept it
+    /// forever, since a file at its end yields no new covering commit.
+    /// Without a tail nothing proves the touch harmless, and it is kept.
+    #[tokio::test]
+    async fn a_touched_file_whose_tail_still_matches_restarts_the_wait_and_is_deleted_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = sixty_lines(60);
+        let quiet = Duration::from_millis(50);
+
+        let path = dir
+            .path()
+            .join("touched.log")
+            .to_string_lossy()
+            .into_owned();
+        let mut fs = commit_then_restamp(&path, &original, &original, true, quiet).await;
+        std::thread::sleep(quiet * 2);
+        fs.read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "touched after the commit: the quiet period starts again, so not deleted yet"
+        );
+        assert!(
+            fs.cursors[&path].delete_candidate.is_some(),
+            "a proven touch keeps the candidate"
+        );
+        std::thread::sleep(quiet * 2);
+        let reads = fs
+            .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(reads.is_empty(), "a deleted file has nothing to read");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "unchanged for the quiet period after the touch, so deleted"
+        );
+
+        let legacy = dir.path().join("legacy.log").to_string_lossy().into_owned();
+        let mut fs = commit_then_restamp(&legacy, &original, &original, false, quiet).await;
+        for _ in 0..3 {
+            std::thread::sleep(quiet * 2);
+            fs.read_batch_candidates(&src(&legacy), 1_000, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+        }
+        assert!(
+            std::path::Path::new(&legacy).exists(),
+            "without a tail, a moved mtime cannot be told from a rewrite: kept"
+        );
+    }
+
+    /// Review of #631: the name a file is moved aside to must not grow with
+    /// the file's own name. Built from it, a source name near the 255-byte
+    /// limit made a hidden name over it; the rename failed with
+    /// ENAMETOOLONG on every pass and the archived file was never deleted.
+    #[tokio::test]
+    async fn a_file_with_a_name_near_the_length_limit_is_still_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = format!("{}.log", "n".repeat(246));
+        assert_eq!(name.len(), 250);
+        let path = dir.path().join(&name).to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "fully archived, no quiet period, and a legal name: deleted"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(
+            leftovers.is_empty(),
+            "nothing left beside it: {leftovers:?}"
+        );
+    }
+
+    /// Review of #631: the restart counterpart of the moved-mtime rule. A
+    /// file rewritten past its first page while the engine was down, at the
+    /// same inode and length, agrees with the seed on everything the seed
+    /// recorded before #631 - and arming took the file's CURRENT mtime as the
+    /// baseline, so the rewrite was deleted one quiet period later, unread.
+    /// The delete is armed only when the file still has the mtime the
+    /// committed batch saw.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restart_never_arms_the_delete_of_a_file_rewritten_while_the_engine_was_down() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let line = |tag: &str, i: usize| format!("{tag}-{i:04}-{}\n", "x".repeat(90));
+        let original: String = (0..60).map(|i| line("old", i)).collect();
+        let rewrite: String = (0..60)
+            .map(|i| line(if i < 50 { "old" } else { "NEW" }, i))
+            .collect();
+        std::fs::write(&path, &original).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let mut before = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true);
+        let read = before
+            .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        before.commit_progress(&read[0].progress_end).await.unwrap();
+        let ProgressMarker::File {
+            end_byte,
+            file_size,
+            mtime,
+            content_fingerprint,
+            tail_fingerprint,
+            ..
+        } = read[0].progress_end.clone()
+        else {
+            panic!("expected a file marker");
+        };
+        assert_eq!(end_byte, file_size, "the batch read the file to its end");
+        assert!(
+            tail_fingerprint.is_some(),
+            "a read to the end records its tail"
+        );
+
+        // While the engine is down: rewritten past the first page, in place.
+        let mut file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.write_all(rewrite.as_bytes()).unwrap();
+        file.set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000))
+            .unwrap();
+        drop(file);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+
+        // Seeded from a row without the tail (before #620: the mtime is the
+        // only evidence, and it moved) and from one with it (#620: the tail
+        // check sees the rewritten lines).
+        for (row, tail) in [("no tail", None), ("a tail", tail_fingerprint)] {
+            let mut after = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+                .with_delete_quiet_period(Duration::ZERO);
+            after.seed_committed_from(
+                &path,
+                end_byte,
+                Some(inode),
+                Some(file_size),
+                content_fingerprint.clone(),
+                tail,
+            );
+            after.arm_delete_from_seed(&path, Some(&mtime));
+            let _ = after
+                .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+                .await;
+            assert!(
+                std::path::Path::new(&path).exists(),
+                "seeded from a row with {row}: rewritten while the engine was down, and \
+                 deleted on the seed's word"
+            );
+            assert!(std::fs::read_to_string(&path).unwrap() == rewrite);
+        }
+    }
+
+    /// Review of #631 (P1): moving a file aside must never replace a file
+    /// that already has the aside name - one left by a crash, or anyone
+    /// else's. A plain rename replaces it silently. The seam forces the
+    /// first aside name onto an existing file.
+    #[tokio::test]
+    async fn moving_a_file_aside_never_replaces_a_file_already_at_that_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let taken = dir.path().join(".vtop-delete.taken");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        std::fs::write(&taken, "a crash left this, and it is not archived\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        fs.first_aside = Some(taken.clone());
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&taken).ok().as_deref(),
+            Some("a crash left this, and it is not archived\n"),
+            "the file already at the aside name was replaced"
+        );
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "the delete still went ahead, under a fresh aside name"
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(".vtop-delete.taken")]);
+    }
+
     /// #620: a fixed header longer than one page. Every file that starts with
     /// it has the same first-page fingerprint, so the head alone cannot tell
     /// one such file from another: 70 lines of 64 bytes, 4480 bytes.
