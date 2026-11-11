@@ -1700,13 +1700,34 @@ impl MetaStateMachine {
     /// judged on.
     ///
     /// A range member is a node holding a range's lease or named in a
-    /// range's recorded replica set. Walks every record once; it runs on a
-    /// raise and on an operator's read, never on a hot path.
+    /// range's recorded replica set. Walks only the four categories that
+    /// say so - nodes, ranges, recorded sets, reports - never the segments,
+    /// cursors and transitions beside them: the caller holds the store lock
+    /// that apply also takes (review).
     pub fn cluster_versions(&self) -> ClusterVersions {
         let mut members = std::collections::BTreeSet::new();
         let mut nodes = Vec::new();
         let mut reports = BTreeMap::new();
-        for (key, value) in &self.records {
+        let nil = Uuid::nil();
+        let prefixes = [
+            MetaKey::Node { node_uuid: nil },
+            MetaKey::Range {
+                topic_uuid: nil,
+                range_uuid: nil,
+            },
+            MetaKey::RangeReplicaSet {
+                topic_uuid: nil,
+                range_uuid: nil,
+            },
+            MetaKey::NodeVersion { node_uuid: nil },
+        ]
+        .map(|key| key.encode()[..3].to_vec());
+        let records = prefixes.iter().flat_map(|prefix| {
+            self.records
+                .range(prefix.clone()..)
+                .take_while(move |(key, _)| key.starts_with(prefix))
+        });
+        for (key, value) in records {
             match value {
                 MetaValue::Range(range) => {
                     if let Some(lease) = &range.lease {
