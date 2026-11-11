@@ -360,8 +360,12 @@ What follows from that, in the engine:
   engine caught up on a live file. The delete itself renames the file to a
   hidden name in the same directory (`.vtop-delete.<nanos>.<n>`, bounded
   and independent of the file's own name, so a name near the 255-byte limit
-  still fits), checks the renamed file again, and unlinks it only if it is
-  still unchanged. A line appended between the decision and the rename is
+  still fits). The rename never replaces a file already at that name
+  (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on
+  Apple platforms; elsewhere, or on a filesystem without the flag, an
+  existence check first), and a taken name is skipped for the next. It then
+  checks the renamed file again, and unlinks it only if it is still
+  unchanged. A line appended between the decision and the rename is
   caught there, and the file is hard-linked back under its name and kept.
   Before, a check-then-unlink lost that line. A writer that opens the path
   for each write creates a new file once the rename has happened, and that
@@ -378,10 +382,15 @@ What follows from that, in the engine:
   blocking pool, as many at once as the reads.
 - **The wait is in memory, so a restart starts it again.** The seed re-arms
   it with a fresh clock, but only from a row that names the inode and the
-  first page, and whose batch saw the file end at the committed offset. A
-  batch that read part of a longer file never arms a delete from the seed:
-  a same-inode rewrite cut back to the committed offset would otherwise be
-  deleted before the first read's continuity check could see it.
+  first page, whose batch saw the file end at the committed offset, and
+  whose file still has the mtime that batch recorded (`CommittedCursor::
+  observed_mtime`, the marker's `mtime`). A batch that read part of a
+  longer file never arms a delete from the seed: a same-inode rewrite cut
+  back to the committed offset would otherwise be deleted before the first
+  read's continuity check could see it. Nor does a file whose mtime has
+  moved since: a same-inode, same-length rewrite past the first page while
+  the engine was down agrees with everything else the seed records. A row
+  with no mtime leaves the delete unarmed.
 
 Limits, stated plainly:
 

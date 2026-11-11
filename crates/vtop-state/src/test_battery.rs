@@ -427,7 +427,8 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
         start_byte: 0,
         end_byte: end,
         file_size: end,
-        mtime: String::new(),
+        // Carried to the seed for the deferred delete (#619): the newest's.
+        mtime: format!("2026-01-01T00:00:00.{end:09}+00:00"),
         content_fingerprint: content,
     };
     let spool = |end: u64, content: Option<ContentFingerprint>| ProgressMarker::SyslogSpool {
@@ -477,6 +478,7 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
             end_byte: 5000,
             observed_size: Some(5000),
             content_fingerprint: new.clone(),
+            observed_mtime: Some("2026-01-01T00:00:00.000005000+00:00".into()),
         })
     );
     let spools = store
@@ -491,6 +493,7 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
             end_byte: 40,
             observed_size: None,
             content_fingerprint: None,
+            observed_mtime: None,
         }),
         "the newest row predates the fields: unknown, not an older row's values"
     );
@@ -635,6 +638,7 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
         // 70, and /rot.log's old inode (9000) must not leak into the new one.
         observed_size: Some(end_byte * 10),
         content_fingerprint: None,
+        observed_mtime: None,
     };
     assert_eq!(
         got,
@@ -694,6 +698,7 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
             // These spool markers record no file length (as before #578).
             observed_size: None,
             content_fingerprint: None,
+            observed_mtime: None,
         }],
         "the spool answers with the newest inode and that inode's maximum"
     );

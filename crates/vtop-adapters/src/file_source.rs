@@ -69,7 +69,7 @@ struct FileCursor {
 /// writer can be before either happens; it cannot prove there is none.
 ///
 /// The wait is in memory: a restart starts it again, from the seed (see
-/// [`FileSource::seed_committed_from`]). With a zero quiet period the commit
+/// [`FileSource::arm_delete_from_seed`]). With a zero quiet period the commit
 /// that covers the file deletes it at once.
 #[derive(Debug, Clone)]
 struct DeleteCandidate {
@@ -151,6 +151,8 @@ struct DeleteJob {
     candidate: DeleteCandidate,
     #[cfg(test)]
     hook: Option<DeleteHook>,
+    #[cfg(test)]
+    first_aside: Option<PathBuf>,
 }
 
 impl DeleteJob {
@@ -206,13 +208,25 @@ impl DeleteJob {
         if let Some(hook) = &self.hook {
             hook(path);
         }
-        let Some(aside) = aside_name(path) else {
+        if path.file_name().is_none() {
             return DeleteAttempt::Changed("the path names no file to move aside");
-        };
-        if let Err(error) = std::fs::rename(path, &aside) {
-            // On Windows, also what a writer that still has it open causes.
-            return DeleteAttempt::Failed(format!("the file could not be moved aside: {error}"));
         }
+        #[cfg(test)]
+        let mut forced = self.first_aside.clone();
+        let next_name = || {
+            #[cfg(test)]
+            if let Some(name) = forced.take() {
+                return name;
+            }
+            aside_name(path)
+        };
+        let aside = match move_aside(path, next_name) {
+            Ok(aside) => aside,
+            // On Windows, also what a writer that still has it open causes.
+            Err(error) => {
+                return DeleteAttempt::Failed(format!("the file could not be moved aside: {error}"))
+            }
+        };
         let Some((md, head)) = continuity::probe(&aside) else {
             // Nothing says it changed; nor can it be checked. Kept, as a
             // failed check always is, and tried again.
@@ -274,6 +288,10 @@ pub struct FileSource {
     /// a test can append exactly in the gap #619 (A) describes.
     #[cfg(test)]
     before_delete: Option<DeleteHook>,
+    /// The first aside name a delete tries, so a test can make it one that
+    /// is already taken.
+    #[cfg(test)]
+    first_aside: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -301,6 +319,8 @@ impl FileSource {
             delete_quiet: DEFAULT_DELETE_QUIET,
             #[cfg(test)]
             before_delete: None,
+            #[cfg(test)]
+            first_aside: None,
         }
     }
 
@@ -357,42 +377,68 @@ impl FileSource {
                 inode,
                 file_size: observed_size.unwrap_or(0),
                 mtime: String::new(),
-                content: content.clone(),
+                content,
             });
         }
-        // A file the engine had fully archived, but not yet deleted, before a
-        // restart (#619): the deferred delete was in memory, and without this
-        // the file would stay forever, since nothing new is ever committed for
-        // it. The quiet period starts again here, and the delete itself checks
-        // the file against this identity as it would a commit's. Only a seed
-        // that names both the inode and the first page qualifies: a legacy row
-        // cannot tell this file from one that replaced it while the engine was
-        // down. And only one whose batch saw its file END at the committed
-        // offset (review of #631): a batch that read part of a longer file
-        // archived only that part, and a same-inode rewrite cut back to the
-        // offset with the first page kept would pass every other test here.
-        // The read's continuity check catches that rewrite by the length the
-        // batch saw, but a delete armed now could run before any read.
-        if self.delete_after_commit
-            && inode.is_some()
-            && content.is_some()
-            && observed_size == Some(committed_byte)
-        {
-            if let Ok(md) = std::fs::metadata(path) {
-                if md.len() == committed_byte {
-                    self.cursors
-                        .get_mut(path)
-                        .expect("seeded above")
-                        .delete_candidate = Some(DeleteCandidate {
-                        inode,
-                        content,
-                        end_byte: committed_byte,
-                        mtime: md.modified().ok(),
-                        since: Instant::now(),
-                    });
-                }
-            }
+    }
+
+    /// Re-arm the deferred delete of a file the engine had fully archived but
+    /// not yet deleted before a restart (#619), from the seed just given to
+    /// [`Self::seed_committed_from`] and the mtime the same committed batch
+    /// recorded (`archived_mtime`, the marker's `mtime`). The wait was in
+    /// memory; without this the file would stay forever, since nothing new
+    /// is ever committed for it. The quiet period starts again here, and the
+    /// delete itself checks the file against this identity as it would a
+    /// commit's.
+    ///
+    /// Armed only on evidence that the file is still the one archived:
+    /// - the seed names both the inode and the first page - a legacy row
+    ///   cannot tell this file from one that replaced it while the engine
+    ///   was down;
+    /// - the batch saw its file END at the committed offset (review of
+    ///   #631): one that read part of a longer file archived only that part,
+    ///   and a same-inode rewrite cut back to the offset with the first page
+    ///   kept passes every other test. The read's continuity check catches
+    ///   that by the length the batch saw, but a delete armed now could run
+    ///   before any read;
+    /// - the file still has the mtime that batch saw (review of #631): a
+    ///   same-inode, same-length rewrite past the first page while the
+    ///   engine was down agrees on all of the above, and arming with the
+    ///   file's CURRENT mtime as the baseline deleted it unread. This is the
+    ///   restart side of the rule that a moved mtime ends a candidate.
+    ///   `None` or an empty mtime (unknown) leaves the delete unarmed.
+    pub fn arm_delete_from_seed(&mut self, path: &str, archived_mtime: Option<&str>) {
+        if !self.delete_after_commit {
+            return;
         }
+        let Some(archived_mtime) = archived_mtime.filter(|m| !m.is_empty()) else {
+            return;
+        };
+        let Some(cursor) = self.cursors.get_mut(path) else {
+            return;
+        };
+        let committed_byte = cursor.committed_byte;
+        let Some(seen) = cursor.seen.as_ref() else {
+            return;
+        };
+        if seen.inode.is_none() || seen.content.is_none() || seen.file_size != committed_byte {
+            return;
+        }
+        let Ok(md) = std::fs::metadata(path) else {
+            return;
+        };
+        let now = Self::identity_of(&md);
+        if now.inode != seen.inode || now.file_size != committed_byte || now.mtime != archived_mtime
+        {
+            return;
+        }
+        cursor.delete_candidate = Some(DeleteCandidate {
+            inode: seen.inode,
+            content: seen.content.clone(),
+            end_byte: committed_byte,
+            mtime: md.modified().ok(),
+            since: Instant::now(),
+        });
     }
 
     /// The delete `path`'s cursor is due for: a [`DeleteCandidate`] that has
@@ -411,6 +457,8 @@ impl FileSource {
             candidate,
             #[cfg(test)]
             hook: self.before_delete.clone(),
+            #[cfg(test)]
+            first_aside: self.first_aside.clone(),
         })
     }
 
@@ -979,16 +1027,72 @@ fn alias_groups_to_warn(
 /// hidden name over it, the rename failed with ENAMETOOLONG on every pass,
 /// and the archived file was never deleted. Under 80 bytes here, whatever
 /// the source is called.
-fn aside_name(path: &Path) -> Option<PathBuf> {
+fn aside_name(path: &Path) -> PathBuf {
     static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    // `file_name` is `None` for a path ending in `..` or a root: nothing to
-    // move aside.
-    path.file_name()?;
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Some(path.with_file_name(format!(".vtop-delete.{nanos}.{attempt}")))
+    path.with_file_name(format!(".vtop-delete.{nanos}.{attempt}"))
+}
+
+/// How many aside names a delete tries before giving up for this pass.
+const ASIDE_ATTEMPTS: usize = 8;
+
+/// Move `path` to the first name `next_name` offers that nothing else has,
+/// and return that name. NEVER OVER AN EXISTING FILE (review of #631): a
+/// plain rename replaces its destination, and the destination could be a
+/// file a crash left mid-delete - which may hold bytes not yet archived -
+/// or anyone else's. A name already taken is skipped for the next one.
+fn move_aside(path: &Path, mut next_name: impl FnMut() -> PathBuf) -> std::io::Result<PathBuf> {
+    let mut taken = None;
+    for _ in 0..ASIDE_ATTEMPTS {
+        let aside = next_name();
+        match rename_noreplace(path, &aside) {
+            Ok(()) => return Ok(aside),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                taken = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(taken.unwrap_or_else(|| std::io::Error::other("no aside name to try")))
+}
+
+/// Rename that fails with `AlreadyExists` instead of replacing `to`:
+/// `renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on
+/// Apple platforms, both atomic. A filesystem or kernel that does not support
+/// the flag falls back to [`rename_unless_exists`].
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    use rustix::io::Errno;
+    match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(e) if e == Errno::INVAL || e == Errno::NOSYS || e == Errno::NOTSUP => {
+            rename_unless_exists(from, to)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    rename_unless_exists(from, to)
+}
+
+/// Where no atomic no-replace rename exists: refuse a destination that is
+/// already there, then rename. A file created at `to` between the two would
+/// still be replaced; with names unique by clock and counter, only a process
+/// guessing the next one could do that.
+fn rename_unless_exists(from: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(to).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "the aside name is taken",
+        ));
+    }
+    std::fs::rename(from, to)
 }
 
 /// Give a file moved aside for deletion its name back. A hard link, not a
@@ -3792,6 +3896,7 @@ mod tests {
             inode,
             end_byte,
             file_size,
+            mtime,
             content_fingerprint,
             ..
         } = read[0].progress_end.clone()
@@ -3803,9 +3908,11 @@ mod tests {
         let mut legacy = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
             .with_delete_quiet_period(quiet);
         legacy.seed_committed_from(&path, end_byte, inode, Some(file_size), None);
+        legacy.arm_delete_from_seed(&path, Some(&mtime));
         let mut after = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
             .with_delete_quiet_period(quiet);
         after.seed_committed_from(&path, end_byte, inode, Some(file_size), content_fingerprint);
+        after.arm_delete_from_seed(&path, Some(&mtime));
         std::thread::sleep(quiet * 2);
 
         legacy
@@ -3908,13 +4015,25 @@ mod tests {
             .map(|i| line(if i < 41 { "old" } else { "NEW" }, i))
             .collect();
         assert_eq!(rewrite.len() as u64, committed);
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::fs::write(&path, &rewrite).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        // Its mtime put back, so only the length the batch saw tells it apart.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+        let ProgressMarker::File { mtime, .. } = read[0].progress_end.clone() else {
+            panic!("expected a file marker");
+        };
 
         // The newest committed row read [.., 8200) of a file it saw at 16400.
         let mut after = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
             .with_delete_quiet_period(Duration::ZERO);
         after.seed_committed_from(&path, committed, Some(inode), Some(16_400), content);
+        after.arm_delete_from_seed(&path, Some(&mtime));
         let reads = after
             .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
             .await
@@ -4061,5 +4180,106 @@ mod tests {
             leftovers.is_empty(),
             "nothing left beside it: {leftovers:?}"
         );
+    }
+
+    /// Review of #631: the restart counterpart of the moved-mtime rule. A
+    /// file rewritten past its first page while the engine was down, at the
+    /// same inode and length, agrees with the seed on everything the seed
+    /// recorded before #631 - and arming took the file's CURRENT mtime as the
+    /// baseline, so the rewrite was deleted one quiet period later, unread.
+    /// The delete is armed only when the file still has the mtime the
+    /// committed batch saw.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restart_never_arms_the_delete_of_a_file_rewritten_while_the_engine_was_down() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let line = |tag: &str, i: usize| format!("{tag}-{i:04}-{}\n", "x".repeat(90));
+        let original: String = (0..60).map(|i| line("old", i)).collect();
+        let rewrite: String = (0..60)
+            .map(|i| line(if i < 50 { "old" } else { "NEW" }, i))
+            .collect();
+        std::fs::write(&path, &original).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let mut before = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true);
+        let read = before
+            .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        before.commit_progress(&read[0].progress_end).await.unwrap();
+        let ProgressMarker::File {
+            end_byte,
+            file_size,
+            mtime,
+            content_fingerprint,
+            ..
+        } = read[0].progress_end.clone()
+        else {
+            panic!("expected a file marker");
+        };
+        assert_eq!(end_byte, file_size, "the batch read the file to its end");
+
+        // While the engine is down: rewritten past the first page, in place.
+        let mut file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.write_all(rewrite.as_bytes()).unwrap();
+        file.set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000))
+            .unwrap();
+        drop(file);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+
+        let mut after = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        after.seed_committed_from(
+            &path,
+            end_byte,
+            Some(inode),
+            Some(file_size),
+            content_fingerprint,
+        );
+        after.arm_delete_from_seed(&path, Some(&mtime));
+        let _ = after
+            .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+            .await;
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "rewritten while the engine was down, and deleted on the seed's word"
+        );
+        assert!(std::fs::read_to_string(&path).unwrap() == rewrite);
+    }
+
+    /// Review of #631 (P1): moving a file aside must never replace a file
+    /// that already has the aside name - one left by a crash, or anyone
+    /// else's. A plain rename replaces it silently. The seam forces the
+    /// first aside name onto an existing file.
+    #[tokio::test]
+    async fn moving_a_file_aside_never_replaces_a_file_already_at_that_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let taken = dir.path().join(".vtop-delete.taken");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        std::fs::write(&taken, "a crash left this, and it is not archived\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        fs.first_aside = Some(taken.clone());
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&taken).ok().as_deref(),
+            Some("a crash left this, and it is not archived\n"),
+            "the file already at the aside name was replaced"
+        );
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "the delete still went ahead, under a fresh aside name"
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(".vtop-delete.taken")]);
     }
 }

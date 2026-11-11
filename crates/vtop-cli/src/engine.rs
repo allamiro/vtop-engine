@@ -2537,6 +2537,10 @@ impl Engine {
                         c.observed_size,
                         c.content_fingerprint,
                     );
+                    // A file archived but not yet deleted before the restart
+                    // (#619): re-armed only if it still has the mtime the
+                    // committed batch saw.
+                    fs.arm_delete_from_seed(&c.path, c.observed_mtime.as_deref());
                 }
             }
         }

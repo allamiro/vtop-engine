@@ -24,5 +24,10 @@ glob = { workspace = true }
 regex = { workspace = true }
 futures = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# renameat2(RENAME_NOREPLACE) / renameatx_np(RENAME_EXCL): delete_after_commit
+# moves a file aside without ever replacing another (#619).
+rustix = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
