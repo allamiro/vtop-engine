@@ -218,6 +218,20 @@ impl SqliteStateStore {
                 }
             }
         }
+        // A row is born only as batching (#625), in the database too, so a
+        // write that skips save_batch_state cannot create one born verified.
+        // A trigger, not a CHECK: an existing table gains it without a
+        // rebuild. Run apart from SCHEMA, whose split on ';' would cut the
+        // trigger body. Every release inserts only batching, so an older
+        // binary opening this file is unaffected.
+        sqlx::raw_sql(
+            "CREATE TRIGGER IF NOT EXISTS trg_batches_insert_as_batching \
+             BEFORE INSERT ON batches WHEN NEW.state <> 'batching' \
+             BEGIN SELECT RAISE(ABORT, 'a batch must be inserted as batching'); END",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         Ok(())
     }
 
@@ -270,6 +284,7 @@ impl StateStore for SqliteStateStore {
     /// created once. A duplicate id must fail loudly rather than silently
     /// overwrite an existing — possibly already-committed — row.
     async fn save_batch_state(&self, rec: &BatchRecord) -> Result<(), VtopError> {
+        crate::store::require_batching_insert(rec)?;
         let ps = serde_json::to_string(&rec.progress_start)?;
         let pe = serde_json::to_string(&rec.progress_end)?;
         sqlx::query(
@@ -871,6 +886,35 @@ mod tests {
             .unwrap();
         // Reopening is idempotent: the column is added once.
         SqliteStateStore::connect(&url).await.unwrap();
+    }
+
+    /// #625, in the database: a write that skips `save_batch_state` (a tool
+    /// with its own connection, a future import) still cannot create a row in
+    /// any state but BATCHING.
+    #[tokio::test]
+    async fn sqlite_refuses_a_direct_insert_in_any_state_but_batching() {
+        let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
+        let insert = |id: &'static str, state: &'static str| {
+            sqlx::query(
+                "INSERT INTO batches (batch_id, tenant, source_type, source_name, format, \
+                 state, progress_start_json, progress_end_json, created_at, updated_at) \
+                 VALUES (?, 'default', 'kafka', 'app', 'cef', ?, '{}', '{}', 't', 't')",
+            )
+            .bind(id)
+            .bind(state)
+            .execute(&store.pool)
+        };
+        for state in ["verified", "source_committed", "sealed"] {
+            let err = insert("direct-refused", state)
+                .await
+                .expect_err("a direct insert in a later state must be refused");
+            assert!(
+                err.to_string().contains("must be inserted as batching"),
+                "expected the trigger's message for {state}, got: {err}"
+            );
+        }
+        assert!(store.get_batch("direct-refused").await.unwrap().is_none());
+        insert("direct-batching", "batching").await.unwrap();
     }
 
     // The SQLite backend must pass the same behavioural contract every backend
