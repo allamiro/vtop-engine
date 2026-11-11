@@ -187,7 +187,22 @@ above, the datagram issues (#485, #486, #488) do not open.**
 | `object_upload` p95 ratio `R`, 1% over 0% | `max_concurrency` 16, `parts_in_flight` 1 | 5 + 5 (160 objects each) | **0.98** (0.95–1.02 across run pairs) | > 2.0 | no |
 
 Neither threshold falls inside the range of the repetitions that decide it, so
-by the noise rule the verdict is not within noise. The numbers come from
+by the noise rule the verdict is not within noise.
+
+**Per profile, does the tuned TCP path close the gap?**
+
+- 100 ms, 10 Mbit/s, 0% loss: **yes** — 0.961 of the link at eight in flight.
+- 100 ms, 10 Mbit/s, 1% `gemodel` loss: **yes** — 0.976 at sixteen in flight.
+- 100 ms, 10 Mbit/s policer, no queue: **no** — at best 0.276 of the token
+  rate (outside the gate; see below).
+- Clean LAN: not judged — it has no link reference, and the gate does not
+  cover it.
+
+**The comparison baseline for anything that follows is the best-measured TCP
+configuration, not the shipping default:** `max_concurrency` 8,
+`parts_in_flight` 1 (5 MiB parts) on a clean 100 ms link, and
+`max_concurrency` 16, `parts_in_flight` 1 on a lossy one. A datagram path, if
+one is ever built, is compared against those on the same link. The numbers come from
 `benchmarks/measurements/483-tcp-baseline/gate.json`, which
 `egress_baseline.py report` computes from the raw CSVs beside it.
 
