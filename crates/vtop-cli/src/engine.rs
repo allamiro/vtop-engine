@@ -6456,6 +6456,7 @@ mod tests {
                 file_size: 8_192,
                 mtime: String::new(),
                 content_fingerprint: content,
+                tail_fingerprint: None,
             };
         let mut plan = RewindPlan::default();
         plan.hold(&file(1, 0, page(b'A')));
