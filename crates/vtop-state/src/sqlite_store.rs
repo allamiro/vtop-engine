@@ -161,6 +161,9 @@ macro_rules! prune_listed_sql {
 #[derive(Clone)]
 pub struct SqliteStateStore {
     pool: SqlitePool,
+    /// The writes a power loss must not roll back go through here (#626): one
+    /// connection at `synchronous=FULL`. See [`SqliteStateStore::writer_for`].
+    durable: SqlitePool,
     /// The claim generations this process holds (#557).
     fence: crate::fence::ClaimFence,
 }
@@ -176,11 +179,22 @@ impl SqliteStateStore {
         let opts = parse_sqlite_opts(conn_str)?;
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect_with(opts)
+            .connect_with(opts.clone())
             .await
             .map_err(map_sqlx)?;
+        // An in-memory database has nothing to sync.
+        let durable = if is_in_memory(conn_str) {
+            pool.clone()
+        } else {
+            SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts.synchronous(sqlx::sqlite::SqliteSynchronous::Full))
+                .await
+                .map_err(map_sqlx)?
+        };
         let store = Self {
             pool,
+            durable,
             fence: Default::default(),
         };
         store.migrate().await?;
@@ -259,6 +273,31 @@ impl SqliteStateStore {
             .ok_or_else(|| VtopError::NotFound(format!("batch {batch_id}")))?;
         let actual: i64 = row.get("claim_gen");
         Ok((held != actual).then(|| crate::fence::claim_lost(batch_id, held, actual)))
+    }
+
+    /// The pool a transition to `to` is written through (#626).
+    ///
+    /// `VERIFIED` and `SOURCE_COMMITTED` go through the `synchronous=FULL`
+    /// connection, so each returns only after the WAL is synced; every other
+    /// write stays at NORMAL and is synced at the next checkpoint. In WAL
+    /// mode that sync covers every frame already in the file, so it also makes
+    /// the earlier NORMAL writes durable. What a power loss can roll back is
+    /// then the writes after the last `VERIFIED` or `SOURCE_COMMITTED`:
+    ///
+    /// - A file source's restart cursor is the newest committed row, so it
+    ///   cannot move back past a commit that returned, and no committed range
+    ///   is read and archived again.
+    /// - A `VERIFIED` row survives, so the Kafka offset commit that follows
+    ///   it can never be left without its row, and recovery commits the row
+    ///   rather than re-archiving the range.
+    ///
+    /// What can still be lost is the rows of batches in flight that had not
+    /// reached `VERIFIED`. Those are replayed, as after a plain crash.
+    fn writer_for(&self, to: BatchState) -> &SqlitePool {
+        match to {
+            BatchState::Verified | BatchState::SourceCommitted => &self.durable,
+            _ => &self.pool,
+        }
     }
 
     /// Shared read helper for the `list_*` queries. `sql` is `'static` because
@@ -380,7 +419,7 @@ impl StateStore for SqliteStateStore {
             .bind(batch_id)
             .bind(current.as_str())
             .bind(held)
-            .execute(&self.pool)
+            .execute(self.writer_for(validated))
             .await
             .map_err(map_sqlx)?
             .rows_affected();
@@ -683,9 +722,13 @@ impl StateStore for SqliteStateStore {
     }
 }
 
+fn is_in_memory(conn_str: &str) -> bool {
+    conn_str == "sqlite::memory:" || conn_str == ":memory:"
+}
+
 fn parse_sqlite_opts(conn_str: &str) -> Result<SqliteConnectOptions, VtopError> {
     // Accept "sqlite::memory:", "sqlite://path", "sqlite:path", or a bare path.
-    let opts = if conn_str == "sqlite::memory:" || conn_str == ":memory:" {
+    let opts = if is_in_memory(conn_str) {
         SqliteConnectOptions::from_str("sqlite::memory:").map_err(map_sqlx)?
     } else {
         let path = conn_str
@@ -696,24 +739,16 @@ fn parse_sqlite_opts(conn_str: &str) -> Result<SqliteConnectOptions, VtopError> 
         // fsyncs twice per transaction, and the ledger writes ~8 transactions
         // per batch — measured at 54% of total batch time under backlog (#87).
         //
-        // Durability trade, argued not assumed: NORMAL in WAL can lose the
-        // most recent commits on power loss (never corrupt the DB). Losing a
-        // ledger tail only rolls batches back to an EARLIER state, and every
-        // recovery action from an earlier state is idempotent at the archive
-        // layer: pre-verified states replay the still-uncommitted source range
-        // (duplicate object at worst — the documented at-least-once
-        // semantics), and a lost SOURCE_COMMITTED row retries an idempotent
-        // source commit. The invariant is untouched: source progress still
-        // advances only after verification actually verified stored content.
-        //
-        // The one asymmetric case (#120 review): source progress commits
-        // EXTERNALLY (Kafka broker) after the verified write; if a batch's
-        // entire ledger tail is lost, the offset stays advanced with no row to
-        // reconcile. That still loses no telemetry — verification durably put
-        // the object AND manifest in the store before the commit could run —
-        // it leaves an ORPHANED (archived, verified, unledgered) object,
-        // discoverable by manifest listing. Accepted for the same reason
-        // duplicates are.
+        // NORMAL in WAL syncs at checkpoints only, so a power loss can lose
+        // every commit since the last one (never corrupt the DB). Losing a
+        // ledger tail rolls batches back to an EARLIER state, which is safe:
+        // a pre-verified row replays its range, and source progress still
+        // advances only after verification. But it is not cheap: a file
+        // source resumes from the newest committed row that survived, and
+        // every range committed after it is read and archived again under a
+        // new key (#626). So VERIFIED and SOURCE_COMMITTED are written through
+        // a second connection at FULL (`writer_for`): one WAL sync each, and
+        // a lost tail can then hold only the batches still in flight.
         SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -847,6 +882,61 @@ mod tests {
         assert_eq!(
             c.get_batch("tok-race").await.unwrap().unwrap().state,
             BatchState::Failed
+        );
+    }
+
+    /// #626: VERIFIED and SOURCE_COMMITTED are written by the connection that
+    /// runs at `synchronous=FULL`, and no other transition is. `total_changes()`
+    /// counts the rows the connection it runs on has changed, so it shows
+    /// which connection actually wrote, not only which one is configured.
+    #[tokio::test]
+    async fn verified_and_source_committed_are_written_at_synchronous_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("durable.db").display());
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        let synchronous = |pool: &SqlitePool| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("PRAGMA synchronous")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(synchronous(&store.durable).await, 2, "FULL");
+        assert_eq!(synchronous(&store.pool).await, 1, "NORMAL");
+        let written_at_full =
+            || sqlx::query_scalar::<_, i64>("SELECT total_changes()").fetch_one(&store.durable);
+
+        store
+            .save_batch_state(&test_battery::sample_record("sync-1"))
+            .await
+            .unwrap();
+        let patch = BatchPatch::default();
+        for to in [
+            BatchState::Sealed,
+            BatchState::Compressed,
+            BatchState::Checksummed,
+            BatchState::ObjectUploaded,
+            BatchState::ManifestUploaded,
+        ] {
+            store
+                .update_batch_state("sync-1", to, &patch)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            written_at_full().await.unwrap(),
+            0,
+            "nothing before VERIFIED"
+        );
+        store.mark_verified("sync-1").await.unwrap();
+        assert_eq!(written_at_full().await.unwrap(), 1, "VERIFIED");
+        store.mark_source_committed("sync-1").await.unwrap();
+        assert_eq!(written_at_full().await.unwrap(), 2, "SOURCE_COMMITTED");
+        assert_eq!(
+            store.get_batch("sync-1").await.unwrap().unwrap().state,
+            BatchState::SourceCommitted
         );
     }
 
