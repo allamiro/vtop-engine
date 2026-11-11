@@ -284,11 +284,15 @@ def test_a_run_overlapping_an_outside_workload_is_labelled_not_dropped():
     assert [eb.contention_label(m, windows) for m in (before, across, after)] == ["", "rq4", ""]
 
 
-def test_a_confirmation_run_without_a_link_reference_is_refused_not_counted_as_zero():
+@pytest.mark.parametrize("value", ["", "nan", "inf"])
+def test_a_confirmation_run_without_a_finite_fraction_is_refused_not_judged(value):
+    # Blank would read as zero (the whole link unused, opening the gate);
+    # "nan" — what collect writes when a run has objects but no busy time —
+    # would make the median NaN, which compares false and closes it.
     runs = _gate_runs([0.93, 0.94, 0.95], [0.90, 0.91, 0.92])
     next(r for r in runs if r["profile"] == "wan100" and r["phase"] == "confirm")[
-        "fraction_of_link"] = ""
-    with pytest.raises(ValueError, match="no fraction_of_link"):
+        "fraction_of_link"] = value
+    with pytest.raises(ValueError, match="no finite fraction_of_link"):
         eb.evaluate_gate(runs, _objects(runs, {"wan100": 60000, "wan100-loss1": 66000}))
 
 

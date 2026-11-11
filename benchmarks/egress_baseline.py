@@ -514,15 +514,22 @@ def within_noise(threshold: float, values: list[float]) -> bool:
 def _fraction(run: dict) -> float:
     """A gated run's fraction of its link, refused if absent: a blank read as
     zero would count the run as leaving the whole link unused and could open
-    the gate on a run that was never calibrated."""
+    the gate on a run that was never calibrated. A non-finite value is refused
+    too: `float("nan")` parses, a NaN median compares false against the
+    threshold, and the gate would then read as closed on a run whose goodput
+    was never measured (no busy time in cycle_metrics.csv, for one)."""
     value = str(run.get("fraction_of_link", "")).strip()
     try:
-        return float(value)
+        fraction = float(value)
     except ValueError:
+        fraction = math.nan
+    if not math.isfinite(fraction):
         raise ValueError(
             f"run {run.get('run_id', '?')} ({run.get('profile')}, {run.get('config')}, "
-            f"{run.get('phase')}) has no fraction_of_link ({value!r}): a gated run without a "
-            "link reference cannot be judged, and is not counted as zero") from None
+            f"{run.get('phase')}) has no finite fraction_of_link ({value!r}): a gated run "
+            "without a measured goodput and link reference cannot be judged, and is "
+            "neither counted as zero nor allowed to turn a median into NaN")
+    return fraction
 
 
 def evaluate_gate(runs: list[dict], objects: list[dict]) -> dict:
