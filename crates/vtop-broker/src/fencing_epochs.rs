@@ -311,6 +311,41 @@ impl FencingEpochJournal {
         Ok(true)
     }
 
+    /// [`Self::seed_attested_history`] on the journal a replica holds, with
+    /// the guards every holder needs (#636): a broken history refuses (a
+    /// seed over a vector with a hole would hide the hole), a replica with no
+    /// journal refuses (there is nowhere to write), and a failed write marks
+    /// the history broken. One body for [`crate::LocalBroker`] and
+    /// [`crate::replication::InProcessFollower`], so the guards cannot drift.
+    ///
+    /// PRECONDITION, on every caller: metadata has recorded a promotion of
+    /// this replica made under an attestation naming it. Written before that
+    /// record, the seed is lineage nobody authorized.
+    pub(crate) fn seed_attested_history_in(
+        journal: &std::sync::Mutex<Option<FencingEpochJournal>>,
+        broken: &std::sync::atomic::AtomicBool,
+        epoch: u64,
+    ) -> BrokerResult<bool> {
+        let mut guard = journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if broken.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(BrokerError::EpochJournalCorrupt(
+                "this replica's epoch history is broken; an attested history cannot be written \
+                 over it"
+                    .to_owned(),
+            ));
+        }
+        let Some(journal) = guard.as_mut() else {
+            return Err(BrokerError::EpochJournalCorrupt(
+                "no epoch journal is attached to this replica".to_owned(),
+            ));
+        };
+        journal.seed_attested_history(epoch).inspect_err(|_| {
+            broken.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    }
+
     /// Record that `epoch` begins at `start_offset` on this replica.
     ///
     /// Idempotent for an epoch already recorded, so a replica that re-observes
@@ -920,6 +955,46 @@ mod tests {
         known.record(5, 40).unwrap();
         assert!(!known.seed_attested_history(7).unwrap());
         assert_eq!(known.entries(), starts(&[(3, 0), (5, 40)]).as_slice());
+    }
+
+    /// #656 review: the guarded seed every replica type calls, branch by
+    /// branch - an empty attached journal is seeded, a broken history and a
+    /// missing journal are refused and write nothing.
+    #[test]
+    fn the_guarded_attested_seed_refuses_a_broken_or_missing_journal() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
+
+        let dir = TempDir::new().unwrap();
+        let attached = Mutex::new(Some(journal(&dir)));
+        let healthy = AtomicBool::new(false);
+        assert!(FencingEpochJournal::seed_attested_history_in(&attached, &healthy, 9).unwrap());
+        assert_eq!(
+            attached.lock().unwrap().as_ref().unwrap().entries(),
+            starts(&[(9, 0)]).as_slice()
+        );
+
+        let other = TempDir::new().unwrap();
+        let broken_journal = Mutex::new(Some(journal(&other)));
+        let broken = AtomicBool::new(true);
+        assert!(matches!(
+            FencingEpochJournal::seed_attested_history_in(&broken_journal, &broken, 9),
+            Err(BrokerError::EpochJournalCorrupt(_))
+        ));
+        assert!(broken_journal
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .entries()
+            .is_empty());
+        assert!(broken.load(Ordering::SeqCst));
+
+        let none: Mutex<Option<FencingEpochJournal>> = Mutex::new(None);
+        assert!(matches!(
+            FencingEpochJournal::seed_attested_history_in(&none, &AtomicBool::new(false), 9),
+            Err(BrokerError::EpochJournalCorrupt(_))
+        ));
     }
 
     fn header_version(dir: &TempDir) -> u16 {

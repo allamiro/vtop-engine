@@ -1032,27 +1032,16 @@ impl InProcessFollower {
     /// attestation (#636), as [`crate::LocalBroker::adopt_attested_history`]
     /// does: a candidate promotes while it is still this follower, and the
     /// leader built after it reopens the same journal.
+    ///
+    /// PRECONDITION: call it only once metadata has recorded a promotion of
+    /// this replica made under an attestation naming it. Nothing here can
+    /// check that; written earlier, the seed is lineage nobody authorized.
     pub fn adopt_attested_history(&self, epoch: u64) -> crate::BrokerResult<bool> {
-        let mut guard = self
-            .fencing_epoch_journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
-            return Err(crate::BrokerError::EpochJournalCorrupt(
-                "this replica's epoch history is broken; an attested history cannot be written \
-                 over it"
-                    .to_owned(),
-            ));
-        }
-        let Some(journal) = guard.as_mut() else {
-            return Err(crate::BrokerError::EpochJournalCorrupt(
-                "no epoch journal is attached to this replica".to_owned(),
-            ));
-        };
-        journal.seed_attested_history(epoch).inspect_err(|_| {
-            self.fencing_epoch_history_broken
-                .store(true, Ordering::SeqCst);
-        })
+        crate::fencing_epochs::FencingEpochJournal::seed_attested_history_in(
+            &self.fencing_epoch_journal,
+            &self.fencing_epoch_history_broken,
+            epoch,
+        )
     }
 
     /// This replica's epoch history; empty means "unknown", never "no changes".

@@ -2852,20 +2852,31 @@ pub fn cross_check_epoch_vectors(
     from_epoch: u64,
     vectors: &[ReplicaEpochVector],
 ) -> EpochCrossCheck {
-    let granted: std::collections::BTreeMap<u64, (Uuid, Option<u64>)> = chain
+    // Per granted epoch: its holder, the boundary its promotion proved, and
+    // whether that promotion was made under an attestation naming the
+    // holder (#636) - whose history is then the holder's whole log, seeded
+    // at offset 0 on purpose.
+    let granted: std::collections::BTreeMap<u64, (Uuid, Option<u64>, bool)> = chain
         .iter()
         .map(|view| {
-            let boundary = match &view.outcome {
+            let (boundary, attested) = match &view.outcome {
                 TransitionOutcome::Reported {
                     outcome:
                         PromotionOutcome::Established {
-                            boundary_offset, ..
+                            boundary_offset,
+                            attestation,
+                            ..
                         },
                     ..
-                } => *boundary_offset,
-                _ => None,
+                } => (
+                    *boundary_offset,
+                    attestation
+                        .as_ref()
+                        .is_some_and(|attestation| attestation.replica_node_uuid == view.holder_to),
+                ),
+                _ => (None, false),
             };
-            (view.epoch_to, (view.holder_to, boundary))
+            (view.epoch_to, (view.holder_to, boundary, attested))
         })
         .collect();
     let replicas = vectors
@@ -2885,8 +2896,14 @@ pub fn cross_check_epoch_vectors(
                             epoch: start.epoch,
                             start_offset: start.start_offset,
                         }),
-                        Some((holder, Some(boundary)))
-                            if holder == node_uuid && start.start_offset < *boundary =>
+                        // The attested seed is the operator's statement,
+                        // not an overwrite: exactly offset 0, under an
+                        // attestation naming this holder. Any other start
+                        // below the boundary is still a finding.
+                        Some((holder, Some(boundary), attested))
+                            if holder == node_uuid
+                                && start.start_offset < *boundary
+                                && !(*attested && start.start_offset == 0) =>
                         {
                             Some(EpochFinding::BelowBoundary {
                                 epoch: start.epoch,
@@ -3473,6 +3490,77 @@ mod tests {
     /// were counted, so the vote recomputes from them - and it is listed as
     /// ATTESTED with who and when. An attestation naming a replica other
     /// than the holder fails the audit: no promotion could have used it.
+    /// #656 review: the history an attested promotion writes - the holder's
+    /// whole log owned by the attested epoch, from offset 0 - is what the
+    /// operator asked for, not an overwrite, so the epoch-vector cross-check
+    /// accepts it. Only that seed: the same start without the attestation,
+    /// or any other start below the boundary under it, is still a finding.
+    #[test]
+    fn the_attested_history_seed_is_not_a_boundary_finding() {
+        let holder = Uuid::from_u128(1);
+        let transition = |attested: bool| AdminTransitionView {
+            epoch_from: 0,
+            epoch_to: 1,
+            holder_from: None,
+            holder_to: holder,
+            grant: GrantKind::Election,
+            granted_at_ms: 1_000,
+            granted_apply_index: 10,
+            outcome: TransitionOutcome::Reported {
+                outcome: PromotionOutcome::Established {
+                    boundary_offset: Some(100),
+                    sealed_prefix_end: None,
+                    quorum: vec![vtop_meta::QuorumAnswer {
+                        node_uuid: holder,
+                        offset: 100,
+                        lineage: Some(vtop_meta::AnswerLineage::Unknown),
+                    }],
+                    votes: 1,
+                    required: 1,
+                    attestation: attested.then(|| vtop_meta::PromotionAttestation {
+                        attestation_id: Uuid::from_u128(0x636),
+                        replica_node_uuid: holder,
+                        operator: "oncall".to_owned(),
+                        attested_at_ms: 900,
+                    }),
+                },
+                reported_at_ms: 1_500,
+                reported_apply_index: 12,
+            },
+            mac: None,
+        };
+        let vector = |start_offset: u64| -> Vec<ReplicaEpochVector> {
+            vec![(
+                holder,
+                "a:1".to_owned(),
+                Ok(vec![ReplicaEpochStart {
+                    epoch: 1,
+                    start_offset,
+                }]),
+            )]
+        };
+        let findings = |attested: bool, start: u64| {
+            cross_check_epoch_vectors(&[transition(attested)], 1, &vector(start)).replicas[0]
+                .findings
+                .len()
+        };
+        assert_eq!(
+            findings(true, 0),
+            0,
+            "the attested seed was reported as an overwrite"
+        );
+        assert_eq!(
+            findings(false, 0),
+            1,
+            "an ordinary promotion keeps the check"
+        );
+        assert_eq!(
+            findings(true, 40),
+            1,
+            "only the seed at 0 is the operator's"
+        );
+    }
+
     #[test]
     fn an_attested_promotion_is_listed_and_its_vote_recomputes() {
         let (topic, range) = (Uuid::from_u128(0x20), Uuid::from_u128(0x21));

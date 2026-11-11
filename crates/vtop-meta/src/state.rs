@@ -2789,10 +2789,11 @@ impl MetaStateMachine {
         }
         // Whether this report is about the range's CURRENT epoch (#656
         // review). A report for an epoch the range has moved past is
-        // evidence about history - still recorded - but it is not the
-        // recovery an attestation was made for: it may neither use one (it
-        // can never serve) nor retire one (it would erase the override the
-        // current recovery needs).
+        // evidence about history, but it is not the recovery an attestation
+        // was made for: an ordinary one is still recorded and retires
+        // nothing (it would erase the override the current recovery needs);
+        // an attested one is refused (it can never serve, so it may not use
+        // an attestation up).
         let current = matches!(
             self.record(&MetaKey::Range {
                 topic_uuid,
@@ -2868,10 +2869,11 @@ impl MetaStateMachine {
             }
         }
         transition.outcome = reported;
-        // Any established promotion ends the attestation's life: the one
-        // that used it, or one that proved its lineage without it - a range
-        // that recovered on its own must not keep an override lying around
-        // for some later failure to pick up unasked.
+        // An established promotion AT THE CURRENT EPOCH ends the
+        // attestation's life: the one that used it, or one that proved its
+        // lineage without it - a range that recovered on its own must not
+        // keep an override lying around for some later failure to pick up
+        // unasked. A report for a past epoch retires nothing (#656 review).
         if established && current {
             self.records.remove(&attestation_key);
         }

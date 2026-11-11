@@ -323,7 +323,11 @@ impl Outcome {
                     if self.final_leader.is_none()
                         && matches!(
                             self.last_promotion,
-                            Some(Promotion::QuorumUnavailable { unproven, .. }) if unproven > 0
+                            // #636 names this shape `LineageUnproven`: enough
+                            // replicas answered, too few with a provable
+                            // lineage. The form below is what it was before.
+                            Some(Promotion::LineageUnproven { unproven, .. })
+                                | Some(Promotion::QuorumUnavailable { unproven, .. }) if unproven > 0
                         ) =>
                 {
                     640
