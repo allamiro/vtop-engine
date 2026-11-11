@@ -895,13 +895,22 @@ A GitHub-hosted runner also has `ifb` (#610). `.github/workflows/competitor-pair
 runs scenarios 22 and 23 there. It is dispatched by hand and takes about an hour,
 so it is not part of the default CI path. The runner is a shared, noisy host, so
 any pair it produces is a comparison between the two halves of one job, not an
-absolute. Its first attempt is recorded in
+absolute. Two runs are recorded in
 [`measurements/610-competitor-pair-hosted-runner/`](measurements/610-competitor-pair-hosted-runner/).
-It produced no number: ubuntu26 image, kernel 7.0.0-1019-azure, ifb from the
-stock modules, calibration 9.571–9.575 Mbit/s. All six contended windows were
-refused because the competitor's stream was missing the window's first
-0.100–0.169 s. That is the receiver's window minus the 120 s requested, a
-difference the Lima runs did not show. The cause is not yet explained (`record.json`).
+They used the ubuntu26 image and kernel 7.0.0-1019-azure, ifb came from the stock
+modules, and calibration read 9.533–9.575 Mbit/s. They produced no pair. Every
+capped half and all but one uncapped half were refused, because the competitor's
+stream was missing the window's first 0.100–0.169 s. The one accepted half was
+uncapped: 5.046 Mbit/s beside VTOP against 9.564 alone, 53%, Jain 0.956.
+
+The refused runs' raw reports show the cause (`record.json`, `refusal.cause`).
+The stream is the sender's and covers exactly `end.sum_sent.seconds`. The
+harness lays it into a window of `end.sum_received.seconds`, the receiver's
+clock, which is longer by the time the flow's tail takes to drain the queue
+(0.143–0.191 s measured). A window passes only when iperf3's first interval
+happens to straddle the omit restart and cover the gap. The fix proposed there
+is to place the stream on the sender's own window. It has not been applied yet,
+so the check is unchanged.
 
 **Recorded** in [`measurements/481-egress-ceiling/`](measurements/481-egress-ceiling/)
 (local `results/` are never committed, so that directory is the record:
