@@ -2165,3 +2165,144 @@ fn the_first_hwm_arms_the_floor_and_later_frames_wait_for_the_barrier() {
         "quiesce persists the quiet tail the last commit barrier could not see"
     );
 }
+
+/// #649 review (cubic P1). A leader's session fence (#641) reads its epoch
+/// first and its history second, so the history can already carry an epoch
+/// newer than the one fenced at, adopted between the two reads. Below the
+/// mark, the kept stretch starts at the caller's own entry for the fence
+/// epoch. That entry was looked for only in last place, so a newer entry
+/// after it hid it, nothing was kept, and the replica went on reporting and
+/// serving its record at 10, which the caller never had.
+///
+/// Invariant: the caller's entry for the fence epoch is found wherever it
+/// sits, and the record past it is kept in dispute exactly as without the
+/// newer entry.
+#[test]
+fn a_dispute_below_the_mark_finds_the_callers_tail_behind_a_newer_epoch() {
+    let h = caught_up_under_its_own_epoch(9);
+    h.meta.set(NEWEST_EPOCH);
+    let fenced = h
+        .node
+        .fence(
+            NEWER_EPOCH,
+            &[
+                EpochStart {
+                    epoch: OLD_EPOCH,
+                    start_offset: 0,
+                },
+                EpochStart {
+                    epoch: NEWER_EPOCH,
+                    start_offset: 10,
+                },
+                EpochStart {
+                    epoch: NEWEST_EPOCH,
+                    start_offset: 11,
+                },
+            ],
+        )
+        .expect("fenced");
+    assert_eq!((fenced.truncated_records, fenced.next_offset), (0, 11));
+    assert_eq!(
+        h.node.replication_status(),
+        (10, 10),
+        "the caller's tail at 10 was lost behind its epoch-21 entry, and the record at 10 \
+         it never had was not kept in dispute"
+    );
+}
+
+/// #649 review (cubic 4532766446, codex 4533115499). The follower's half of
+/// the rule for a replica that holds records but has no history to compare
+/// (no fencing-epoch journal, or a broken one). A fence leaves it exactly as
+/// it was, and its reply says it has no history, which is what lets a
+/// leader's session refuse it (`NetworkedReplicaSet`). Nothing here can tell
+/// which of its records match the caller's: keeping a dispute from its mark
+/// would discard records it may hold validly, which the leader can re-send
+/// only while its bounded buffer has them.
+///
+/// Invariant: the fence truncates nothing, keeps no dispute (the status is
+/// the whole log), and returns an empty history.
+#[test]
+fn an_uncomparable_replica_is_left_as_it_is_and_says_so() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    let segment = ActiveSegment::create(
+        dir.path().join("range.active"),
+        descriptor_for(&range, 0xE1),
+        SegmentConfig::default(),
+    )
+    .unwrap();
+    let meta = MetaFencingEpoch::new(OLD_EPOCH);
+    // No fencing-epoch journal: its history is unknown.
+    let node = Arc::new(
+        InProcessFollower::new(
+            FOLLOWER,
+            segment,
+            ProducerEpochJournal::open(dir.path().join("epochs")).unwrap(),
+            range.clone(),
+            OLD_EPOCH,
+            meta.clone(),
+            ClusterCommittedOffset::new(0),
+        )
+        .unwrap(),
+    );
+    let h = Harness {
+        _dir: dir,
+        range,
+        node,
+        meta,
+    };
+    for offset in 0..5 {
+        append_at(&h, OLD_EPOCH, OLD_LEADER, offset).unwrap();
+    }
+    h.node.cluster_committed().advance_to(5);
+    // The deposed leadership's own suffix, never acknowledged.
+    for offset in 5..10 {
+        h.node
+            .apply_append(&ReplicaAppendRequest {
+                range: h.range.clone(),
+                fencing_epoch: OLD_EPOCH,
+                leader_node_id: OLD_LEADER,
+                expected_base_offset: offset,
+                producer_id: Uuid::from_u128(0xB9),
+                producer_epoch: 1,
+                first_sequence: offset - 5,
+                records: vec![ProduceRecord {
+                    timestamp_millis: 1_000,
+                    key: b"k".to_vec(),
+                    value: format!("stale-{offset}").into_bytes(),
+                }],
+            })
+            .unwrap();
+    }
+    assert!(h.node.epoch_starts().is_empty(), "precondition: no history");
+
+    // It returns under epoch 19 and the leader's session fences it.
+    h.meta.set(NEW_EPOCH);
+    h.node.adopt_fencing_epoch(NEW_EPOCH);
+    let fenced = h
+        .node
+        .fence(
+            NEW_EPOCH,
+            &[
+                EpochStart {
+                    epoch: OLD_EPOCH,
+                    start_offset: 0,
+                },
+                EpochStart {
+                    epoch: NEW_EPOCH,
+                    start_offset: 5,
+                },
+            ],
+        )
+        .expect("fenced");
+    assert_eq!((fenced.truncated_records, fenced.next_offset), (0, 10));
+    assert!(
+        fenced.epoch_starts.is_empty(),
+        "the reply must say the history is unknown"
+    );
+    assert_eq!(
+        h.node.replication_status(),
+        (10, 10),
+        "the fence kept a dispute over records it cannot judge"
+    );
+}
