@@ -1,0 +1,55 @@
+Warmup first 98892 records. Steady state results will print after the complete test summary.
+11521 records sent, 2302.4 records/sec (2.25 MB/sec), 2681.4 ms avg latency, 4306.0 ms max latency.
+16440 records sent, 3286.7 records/sec (3.21 MB/sec), 5601.7 ms avg latency, 8308.0 ms max latency.
+14790 records sent, 2953.9 records/sec (2.88 MB/sec), 9230.9 ms avg latency, 9920.0 ms max latency.
+1365 records sent, 272.8 records/sec (0.27 MB/sec), 13626.3 ms avg latency, 14643.0 ms max latency.
+7815 records sent, 1562.4 records/sec (1.53 MB/sec), 16306.8 ms avg latency, 18024.0 ms max latency.
+9930 records sent, 1985.2 records/sec (1.94 MB/sec), 18785.9 ms avg latency, 19841.0 ms max latency.
+In steady state.
+1 records sent, 0.1 records/sec (0.00 MB/sec), 10088.0 ms avg latency, 10088.0 ms max latency.
+9483 records sent, 1888.3 records/sec (1.84 MB/sec), 7321.6 ms avg latency, 10091.0 ms max latency.
+15270 records sent, 3054.0 records/sec (2.98 MB/sec), 10642.1 ms avg latency, 11100.0 ms max latency.
+14355 records sent, 2868.1 records/sec (2.80 MB/sec), 11319.1 ms avg latency, 12063.0 ms max latency.
+12075 records sent, 2041.1 records/sec (1.99 MB/sec), 9798.7 ms avg latency, 12074.0 ms max latency.
+7365 records sent, 1069.4 records/sec (1.04 MB/sec), 12023.8 ms avg latency, 17176.0 ms max latency.
+23760 records sent, 4749.2 records/sec (4.64 MB/sec), 15518.3 ms avg latency, 17547.0 ms max latency.
+11805 records sent, 2351.6 records/sec (2.30 MB/sec), 9659.0 ms avg latency, 11803.0 ms max latency.
+16335 records sent, 3265.7 records/sec (3.19 MB/sec), 10408.8 ms avg latency, 10713.0 ms max latency.
+10995 records sent, 1471.1 records/sec (1.44 MB/sec), 10763.9 ms avg latency, 15614.0 ms max latency.
+18960 records sent, 3791.2 records/sec (3.70 MB/sec), 13487.7 ms avg latency, 16161.0 ms max latency.
+16140 records sent, 3216.4 records/sec (3.14 MB/sec), 10767.1 ms avg latency, 12621.0 ms max latency.
+17640 records sent, 3517.4 records/sec (3.44 MB/sec), 8981.9 ms avg latency, 9533.0 ms max latency.
+3360 records sent, 670.9 records/sec (0.66 MB/sec), 11106.5 ms avg latency, 13935.0 ms max latency.
+24795 records sent, 4829.6 records/sec (4.72 MB/sec), 12013.2 ms avg latency, 14114.0 ms max latency.
+19065 records sent, 3811.5 records/sec (3.72 MB/sec), 7901.5 ms avg latency, 11145.0 ms max latency.
+5655 records sent, 1129.4 records/sec (1.10 MB/sec), 8928.3 ms avg latency, 11314.0 ms max latency.
+5565 records sent, 1112.8 records/sec (1.09 MB/sec), 14569.1 ms avg latency, 15320.0 ms max latency.
+12345 records sent, 2469.0 records/sec (2.41 MB/sec), 15354.2 ms avg latency, 17122.0 ms max latency.
+11250 records sent, 2240.6 records/sec (2.19 MB/sec), 17153.5 ms avg latency, 17548.0 ms max latency.
+18465 records sent, 3517.8 records/sec (3.44 MB/sec), 12151.8 ms avg latency, 16985.0 ms max latency.
+6285 records sent, 1256.7 records/sec (1.23 MB/sec), 13014.1 ms avg latency, 13975.0 ms max latency.
+26220 records sent, 5244.0 records/sec (5.12 MB/sec), 11251.0 ms avg latency, 13495.0 ms max latency.
+5820 records sent, 995.9 records/sec (0.97 MB/sec), 6482.5 ms avg latency, 10602.0 ms max latency.
+18090 records sent, 3611.5 records/sec (3.53 MB/sec), 10793.2 ms avg latency, 12133.0 ms max latency.
+9585 records sent, 1916.6 records/sec (1.87 MB/sec), 15030.7 ms avg latency, 15391.0 ms max latency.
+24630 records sent, 4916.2 records/sec (4.80 MB/sec), 10291.5 ms avg latency, 14919.0 ms max latency.
+4515 records sent, 902.8 records/sec (0.88 MB/sec), 7859.6 ms avg latency, 10295.0 ms max latency.
+24675 records sent, 4934.0 records/sec (4.82 MB/sec), 10441.1 ms avg latency, 10697.0 ms max latency.
+494460 records sent, 2597.963494 records/sec (2.54 MB/sec), 11532.88 ms avg latency, 24953.00 ms max latency, 10873 ms 50th, 18213 ms 95th, 20674 ms 99th, 24642 ms 99.9th.
+395568 steady state records sent, 2518.210118 records/sec (2.46 MB/sec), 11367.26 ms avg latency, 17548.00 ms max latency, 10871 ms 50th, 16628 ms 95th, 17487 ms 99th, 17535 ms 99.9th.
+
+[2026-11-10 00:34:56,952] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 2874 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-10 00:34:56,953] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 2875 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-10 00:34:56,953] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 2876 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-10 00:34:56,954] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 2877 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-10 00:34:56,992] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 2878 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-10 00:35:47,925] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 10508 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-10 00:35:47,926] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 10509 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-10 00:35:47,926] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 10510 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-10 00:35:47,926] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 10511 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-10 00:35:47,966] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 10512 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-10 00:37:24,303] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 27477 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-10 00:37:24,305] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 27478 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-10 00:37:24,305] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 27479 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-10 00:37:24,345] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 27480 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)
+[2026-11-10 00:37:24,346] WARN [Producer clientId=perf-producer-client] Got error produce response with correlation id 27481 on topic-partition bench-0, retrying (2147483646 attempts left). Error: REQUEST_TIMED_OUT. Error Message: the bridge refused the append with RequestTimedOut (org.apache.kafka.clients.producer.internals.Sender)

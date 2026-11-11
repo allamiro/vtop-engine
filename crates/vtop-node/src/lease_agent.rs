@@ -530,8 +530,12 @@ impl ReplicaPlaneProbe {
                             candidate_history = candidate_lineage.len(),
                             "replica's lineage could not be proven against this \
                              candidate's, so its offset does not count toward the \
-                             promotion quorum (#577); a replica with records but no \
-                             epoch history needs `vtopctl node repair`"
+                             promotion quorum (#577). If candidate_history is 0, this \
+                             candidate cannot judge anyone and a replica with history \
+                             should lead. If replica_history is 0, `vtopctl node repair` \
+                             can restore it only from a source replica that HAS epoch \
+                             history; from a source without one it installs nothing \
+                             (#612)"
                         );
                     }
                     Some(response.local_committed_offset)
@@ -1478,6 +1482,29 @@ impl Promoter {
                                 && answer.local_committed_offset.is_some()
                                 && !answer.lineage.is_provable()
                         });
+                        // A candidate that holds NOTHING cannot judge a
+                        // replica that holds records (#612 Q3): with no
+                        // history of its own, every such answer is Unknown.
+                        // Before #607 this round was LeaderBehind and the
+                        // candidate stood aside. Without that, it held the
+                        // lease through the quorum-miss budget and could
+                        // re-win with no hold-off, keeping the replica that
+                        // holds the records off the range. The Unknown
+                        // answers are not counted here either. They only
+                        // establish that a replica better placed to lead
+                        // exists.
+                        let candidate_empty_behind_unproven = probes.iter().any(|answer| {
+                            answer.node_id == self.node_uuid
+                                && answer.local_committed_offset == Some(0)
+                        }) && probes.iter().any(|answer| {
+                            answer.node_id != self.node_uuid
+                                && !answer.lineage.is_provable()
+                                && answer
+                                    .local_committed_offset
+                                    .is_some_and(|offset| offset > 0)
+                        });
+                        let candidate_unproven =
+                            candidate_unproven || candidate_empty_behind_unproven;
                         if unproven > 0 {
                             tracing::warn!(
                                 range = %self.range_uuid,
@@ -1490,7 +1517,10 @@ impl Promoter {
                                  this candidate could prove (#577); answers whose epoch \
                                  history could not be compared are not counted, whatever \
                                  their offsets. A replica holding records with no epoch \
-                                 history needs `vtopctl node repair`"
+                                 history can be repaired (`vtopctl node repair`) only from a \
+                                 replica that has one. If NO replica of the range has epoch \
+                                 history, repair cannot restore it and the range cannot \
+                                 promote: there is no in-product remedy yet (#612)"
                             );
                         } else {
                             tracing::warn!(
@@ -5967,6 +5997,50 @@ mod tests {
         );
     }
 
+    /// #612 Q3, the shape through the REAL probe and fence: a lease-led
+    /// broker on a wiped disk (epoch 0, no records, no history) against a
+    /// follower with history and ten records. The follower's answer is
+    /// Unknown, because nothing can be compared with an empty vector. The
+    /// candidate's own 0 is Agreed. The round is a quorum miss with one
+    /// unproven answer, which is the case the promoter now stands aside on.
+    #[tokio::test]
+    async fn the_real_probe_leaves_an_empty_candidate_unable_to_judge_a_replica_with_records() {
+        let candidate_dir = tempfile::tempdir().unwrap();
+        let candidate = Arc::new(test_broker(candidate_dir.path(), 0));
+        assert!(candidate.epoch_starts().is_empty(), "precondition");
+        let follower_dir = tempfile::tempdir().unwrap();
+        let (follower, meta) = lineage_replica(follower_dir.path(), Uuid::from_u128(2), 10);
+        meta.set(LINEAGE_NEW_EPOCH);
+
+        let (probes, _stop) =
+            probe_with_one_reachable_follower(candidate as Arc<dyn CandidateLocalView>, follower)
+                .await;
+        let own = probes
+            .iter()
+            .find(|probe| probe.node_id == Uuid::from_u128(1))
+            .expect("the candidate answers");
+        assert_eq!(
+            (own.local_committed_offset, own.lineage),
+            (Some(0), vtop_meta::AnswerLineage::Agreed)
+        );
+        let answer = probes
+            .iter()
+            .find(|probe| probe.node_id == Uuid::from_u128(2))
+            .expect("replica 2 answers");
+        assert_eq!(
+            (answer.local_committed_offset, answer.lineage),
+            (Some(10), vtop_meta::AnswerLineage::Unknown)
+        );
+        assert_eq!(
+            crate::promotion::establish(&probes, 3, Uuid::from_u128(1), None),
+            crate::promotion::Promotion::QuorumUnavailable {
+                answered: 1,
+                required: 2,
+                unproven: 1,
+            }
+        );
+    }
+
     /// #577: the evidence a promotion reports carries each answer's verdict,
     /// the uncounted Unknown one included, and the vote and boundary are the
     /// counted answers' - so a reader recomputing them from the record gets
@@ -6066,6 +6140,72 @@ mod tests {
         assert!(!lost.ensure(7).await);
         assert!(!lost.take_quorum_miss());
         assert!(lost.take_stand_aside(), "an eligibility verdict");
+    }
+
+    /// #612 Q3: a candidate that holds NOTHING (a wiped disk, a lease-led
+    /// broker at epoch 0) has no history, so every follower holding records
+    /// answers Unknown and the round is a quorum miss. Its own answer is
+    /// Agreed (0 disputes nothing), so it used to hold the lease for the
+    /// quorum-miss budget and could re-win with no hold-off. Before #607
+    /// the same round was LeaderBehind and the candidate stood aside. It
+    /// stands aside again. The Unknown answers still count for nothing.
+    /// They only tell an empty candidate that a replica holding records
+    /// exists, and that replica is the one that can prove them.
+    #[tokio::test]
+    async fn an_empty_candidate_stands_aside_for_a_replica_holding_records_it_cannot_judge() {
+        let recorder = Arc::new(Recorder::default());
+        let mut empty = promoter(
+            Arc::clone(&recorder),
+            Some(fixed(
+                vec![
+                    at(1, Some(0)),
+                    at_with(2, 100, vtop_meta::AnswerLineage::Unknown),
+                    at(3, None),
+                ],
+                3,
+            )),
+        );
+        assert!(!empty.ensure(7).await);
+        assert!(
+            empty.take_stand_aside(),
+            "an empty candidate behind a replica holding records must stand aside"
+        );
+        assert!(
+            !empty.take_quorum_miss(),
+            "standing aside is an eligibility verdict, not a retryable miss"
+        );
+        assert_eq!(
+            recorder.last_reported(),
+            Some(vtop_meta::PromotionOutcome::Refused {
+                reason: vtop_meta::PromotionRefusal::QuorumUnavailable,
+            }),
+            "still recorded as the quorum miss it is: nothing Unknown was counted"
+        );
+
+        // A candidate that holds records is not affected: an unprovable
+        // replica beside it is the retryable miss it was.
+        let mut holding = promoter(
+            Arc::new(Recorder::default()),
+            Some(fixed(
+                vec![
+                    at(1, Some(40)),
+                    at_with(2, 100, vtop_meta::AnswerLineage::Unknown),
+                    at(3, None),
+                ],
+                3,
+            )),
+        );
+        assert!(!holding.ensure(7).await);
+        assert!(holding.take_quorum_miss());
+        assert!(!holding.take_stand_aside());
+
+        // Nor is an empty candidate whose followers are empty too: that is a
+        // fresh range, and every answer is Agreed.
+        let mut fresh = promoter(
+            Arc::new(Recorder::default()),
+            Some(fixed(vec![at(1, Some(0)), at(2, Some(0)), at(3, None)], 3)),
+        );
+        assert!(fresh.ensure(7).await, "a fresh range promotes at 0");
     }
 
     /// Review of #566: one deadline covers a follower's lookup AND its fence.

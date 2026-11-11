@@ -65,6 +65,7 @@ fn file_builder() -> ManifestBuilder {
             file_size: 2048,
             mtime: "2026-01-01T00:00:30Z".into(),
             content_fingerprint: None,
+            tail_fingerprint: None,
         },
         object_uri: "s3://telemetry-jsonl/tenant=default/source=_data_input_app.log/format=jsonl/year=2026/month=01/day=01/hour=00/obj.jsonl.gz".into(),
         manifest_uri: "s3://telemetry-jsonl/tenant=default/source=_data_input_app.log/format=jsonl/year=2026/month=01/day=01/hour=00/obj.manifest.json".into(),
@@ -81,7 +82,7 @@ fn kafka_manifest_json_contract() {
     assert_snapshot!("kafka_manifest", json);
 }
 
-/// The authenticated v0.2 shape is a separate contract: the MAC is nested
+/// The authenticated shape (since v0.2) is a separate contract: the MAC is nested
 /// beside the self-hash, deterministic for a fixed key, and never contains the
 /// key itself.
 #[test]
@@ -127,6 +128,32 @@ fn legacy_v01_self_hash_still_verifies() {
     legacy
         .verify_self_hash()
         .expect("the published v0.1 canonical hash must remain readable");
+}
+
+/// #622 bumped the version to 0.3 (`source_progress` now spans the whole
+/// batch). A v0.2 manifest the released engine wrote must still verify and,
+/// when keyed, authenticate: these are the hash and MAC v0.2 published for
+/// these inputs, pinned from the snapshots before the bump.
+#[test]
+fn legacy_v02_self_hash_and_mac_still_verify() {
+    let mut legacy = kafka_builder().build().unwrap();
+    legacy.version = "0.2".into();
+    legacy.manifest.sha256 =
+        "9cd45db4359fd86c26e274c376f2509fe20991a955a03b8112ccee01cd9a41ec".into();
+    legacy
+        .verify_self_hash()
+        .expect("the published v0.2 canonical hash must remain readable");
+
+    let key = ManifestMacKey::from_hex(&"42".repeat(32)).unwrap();
+    let mut signed = kafka_builder().build_with_mac(Some(&key)).unwrap();
+    signed.version = "0.2".into();
+    signed.manifest.sha256 =
+        "fd82d824211ab272a441145a51c2af5cc0507b024242de9f78d5604312330d13".into();
+    signed.manifest.mac =
+        Some("d3622fcb6781175783979aac84b90f7ed8c00032acd4136f033563be885f1296".into());
+    signed
+        .verify_authentication(Some(&key))
+        .expect("a keyed v0.2 manifest must still authenticate");
 }
 
 /// A manifest built twice from identical inputs must be byte-identical.

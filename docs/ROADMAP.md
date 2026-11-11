@@ -209,10 +209,17 @@ reopen quietly.
   answer from the history the fence returned: Agreed, Reconciled (it
   discarded n records first) or Unknown, and only the first two count,
   even when nothing else is available - falling back to offsets then would
-  be a fence that fails open exactly when needed. A range whose replicas
-  cannot prove lineage is repaired (`vtopctl node repair`, #315), not
-  promoted on a guess; a candidate with no history stands aside for one that
-  has it. The verdicts are recorded with the quorum and the replica-set gate
+  be a fence that fails open exactly when needed. A replica that cannot
+  prove lineage is repaired from one that can (`vtopctl node repair`, #315),
+  not promoted on a guess. A candidate with no history stands aside for a
+  replica that has records: a candidate holding records it cannot vouch
+  for always did, and one holding none now does too (#612). The costs
+  (#612): a range that holds records but where NO replica has epoch
+  history (records that predate the journal on every replica, or journals
+  lost on every replica) cannot promote, and repair cannot fix it, since a
+  history-less source has nothing to install; and a
+  replica whose only dispute is below its retained base (#408) is not
+  counted. The verdicts are recorded with the quorum and the replica-set gate
   and `vtopctl meta transitions` count only the proven answers. Recording
   them is a new outcome tag inside the promotion report, so it is gated at
   feature level 6: below it (or against a metadata tier that predates
