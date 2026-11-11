@@ -418,7 +418,7 @@ A conformant implementation:
 - On recovery, a batch already in `VERIFIED` (object and manifest durably written and verified, but progress not yet committed) **MAY** complete by committing source progress (`VERIFIED → SOURCE_COMMITTED`); its object **MUST NOT** be discarded.
 - On recovery, a batch in any state *before* `VERIFIED` **MUST** be transitioned to `FAILED` and then `REPLAY_REQUIRED`, and re-entered at `BATCHING`; its uncommitted source range **MUST** remain replayable.
 - **MUST NOT** double-commit a source progress marker that was already committed.
-- **MUST NOT** rewind a source unit for replay below its committed progress: everything below it is archived, and a rewind there would only archive it again. A replay of a range that starts below committed progress resumes at committed progress.
+- **MUST NOT** rewind a source unit for replay below its committed progress. The source does not replay below that point; a replay of a range that starts below it resumes at the committed progress. This does not mean the bytes below were archived: a range below committed progress that no committed range covers is a coverage hole (§12), which a coverage audit reports and replay does not repair.
 - **MUST** be safe to re-run from the last committed source progress marker without data loss; re-uploaded objects with identical content **SHOULD** be idempotent (same `batch_id` and naming yields the same object key).
 
 A mismatch between persisted state and the contents of object storage (e.g., an object exists but is not verified) **MUST** be resolved by re-verifying or re-uploading before any commit.

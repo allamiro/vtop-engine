@@ -1471,7 +1471,12 @@ impl SourceAdapter for FileSource {
     ///   nothing about each other - both match the first bytes of the file now
     ///   at the path, which still has that inode;
     /// - a marker's tail fingerprint (#620) matches the bytes now below its
-    ///   end.
+    ///   end;
+    /// - and the cursor's OWN tail, where it recorded one, matches the bytes
+    ///   now below the cursor's position. Without it, a seed taken before an
+    ///   in-place rewrite that kept the inode and the first page would lend
+    ///   the old content's committed byte to a range of the new content
+    ///   (review of #567).
     fn committed_through(&self, marker: &ProgressMarker) -> Option<i128> {
         let ProgressMarker::File {
             path,
@@ -1509,6 +1514,13 @@ impl SourceAdapter for FileSource {
                 .as_ref()
                 .is_some_and(|tail| !tail.matches_bytes(&below))
             {
+                return None;
+            }
+        }
+        if let Some(tail) = seen.tail.as_ref() {
+            let (current_inode, _, _, below) =
+                Self::probe_with_tail(Path::new(path), tail.end, Some(&tail.fingerprint));
+            if current_inode != Some(*marker_inode) || !tail.fingerprint.matches_bytes(&below) {
                 return None;
             }
         }
@@ -2354,6 +2366,37 @@ mod tests {
             fs.committed_through(&marker(Some(inode), whole.clone(), fp(&[b'z'; 30]))),
             None,
             "the bytes below the range's end are not the ones it was read with"
+        );
+        // The cursor's own position must still be in this content (review
+        // of #567): a seed whose tail - the bytes below its committed byte -
+        // is no longer what the file holds there describes content that was
+        // rewritten in place, keeping the inode and the first page, and its
+        // committed byte is another generation's.
+        fs.seed_committed_from(
+            &path,
+            40,
+            Some(inode),
+            Some(100),
+            whole.clone(),
+            fp(&[b'z'; 40]),
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), whole.clone(), None)),
+            None,
+            "the seed's tail is not the file's: its committed byte is another generation's"
+        );
+        fs.seed_committed_from(
+            &path,
+            40,
+            Some(inode),
+            Some(100),
+            whole.clone(),
+            fp(&bytes[..40]),
+        );
+        assert_eq!(
+            fs.committed_through(&marker(Some(inode), whole.clone(), None)),
+            Some(40),
+            "the seed's tail is the file's"
         );
         // A cursor that recorded no content proves nothing either.
         fs.seed_committed_from(&path, 40, Some(inode), Some(100), None, None);

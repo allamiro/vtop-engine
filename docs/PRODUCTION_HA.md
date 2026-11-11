@@ -432,7 +432,7 @@ CREATE UNIQUE INDEX uq_file_range
 CREATE INDEX ix_state        ON batches (state);
 CREATE INDEX ix_source_time  ON batches (source_type, source_name, updated_at);
 CREATE INDEX ix_incomplete   ON batches (state)
-  WHERE state NOT IN ('SOURCE_COMMITTED','FAILED','SUPERSEDED');   -- hot incomplete set
+  WHERE state NOT IN ('SOURCE_COMMITTED','SUPERSEDED');   -- hot incomplete set (= the recovery work-list)
 ```
 
 **Multi-writer recovery [PROPOSED]:** claim incomplete rows with
