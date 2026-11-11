@@ -82,8 +82,8 @@ reference keeps credentials out of config serialization and command arguments.
 ## Failure behavior
 
 If the table, required columns, or invariant trigger are absent, or the
-trigger is disabled or runs an older function body, engine startup fails with
-instructions to run `vtopctl migrate`. It does not try to repair the
+trigger is disabled or its function lacks a current schema version marker,
+engine startup fails with instructions to run `vtopctl migrate`. It does not try to repair the
 schema. If the runtime role lacks `USAGE` or `SELECT`, startup reports the
 missing runtime access. Migration failures remain fatal to the deployment step.
 
@@ -107,11 +107,19 @@ migration job per database; engine replicas should start only after it succeeds.
 - The invariant trigger also refuses an `INSERT` in any state but `batching`
   (#625). Re-running `vtopctl migrate` replaces the trigger function in
   place. Every release inserts only `batching`, so an older engine on the
-  upgraded schema is unaffected. Engine startup now requires the trigger to
-  be enabled and to run the #625 function body, not just to exist by name:
-  an engine from this release refuses to start, with instructions to run
-  `vtopctl migrate`, until the migration has run. Run it before rolling out
-  the engines, as above.
+  upgraded schema is unaffected.
+- Schema version marker. The migration sets
+  `COMMENT ON FUNCTION vtop_enforce_commit_after_verify() IS 'vtop-state-schema 2'`.
+  Engine startup requires the trigger to be enabled and its function to carry
+  a marker of at least the version the engine was built for (2 since #625),
+  not just a trigger with that name. A missing or unparseable marker counts
+  as an old schema. An engine from this release therefore refuses to start,
+  with instructions to run `vtopctl migrate`, until the migration has run, so
+  run it before rolling out the engines, as above. **Any future change to the
+  trigger or its function must bump this marker** in the migration together
+  with `MIN_SCHEMA_VERSION` in `pg_store.rs`. Do not run an older release's
+  `vtopctl migrate` against an upgraded database: `CREATE OR REPLACE`
+  installs the older function body but keeps the newer marker.
 - Restoring the ledger from a backup. Stop every engine first, and **always
   finish with `vtopctl migrate`**. A schema restored from an older archive
   (`pg_restore`, or `--schema-only`) carries that release's trigger
@@ -131,6 +139,7 @@ migration job per database; engine replicas should start only after it succeeds.
     then restore with `--data-only`.
 
   Then run `vtopctl migrate` before any engine starts. Startup refuses a
-  disabled trigger or an older function body.
+  disabled trigger, and a function restored from an older archive, which
+  has no current marker.
 - Test grants after role changes: runtime must be able to read/write ledger
   rows but must fail `CREATE TABLE`, `ALTER TABLE`, `DELETE`, and `TRUNCATE`.

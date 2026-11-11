@@ -42,6 +42,22 @@ use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 /// operators apply the same artifact outside the engine if desired.
 const MIGRATION: &str = include_str!("../migrations/postgres/0001_state_store.sql");
 
+/// The migration marks the invariant trigger's function with
+/// `COMMENT ... IS 'vtop-state-schema N'`. Startup requires at least this N.
+/// 2 is the first body that refuses an insert in any state but batching
+/// (#625); a schema from before it carries no marker.
+const SCHEMA_MARKER_PREFIX: &str = "vtop-state-schema ";
+const MIN_SCHEMA_VERSION: u32 = 2;
+
+/// Whether the trigger function's comment names a schema version this
+/// engine accepts. A missing or unparseable marker is an old schema.
+fn schema_marker_is_current(comment: Option<&str>) -> bool {
+    comment
+        .and_then(|c| c.strip_prefix(SCHEMA_MARKER_PREFIX))
+        .and_then(|v| v.parse::<u32>().ok())
+        .is_some_and(|v| v >= MIN_SCHEMA_VERSION)
+}
+
 /// Retry budget for transient serialization failures (SQLSTATE 40001). One
 /// retry per attempt with a small backoff; a single-node Postgres essentially
 /// never hits this, a distributed store occasionally does.
@@ -250,27 +266,23 @@ impl PgStateStore {
         .await
         .map_err(map_schema_check)?;
 
-        // The trigger must be enabled and call the CURRENT function body, not
-        // merely exist by name: a schema restored from an older archive, or
-        // never re-migrated, keeps the name with the body from before #625,
-        // and a restore that disabled it may never have enabled it again. The
-        // body is matched by the message the #625 check raises.
-        let trigger_present: bool = sqlx::query_scalar(
-            "SELECT EXISTS ( \
-                SELECT 1 FROM pg_catalog.pg_trigger t \
-                JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
-                JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid \
-                WHERE c.oid = 'batches'::regclass \
-                  AND t.tgname = 'trg_commit_after_verify' \
-                  AND NOT t.tgisinternal \
-                  AND t.tgenabled IN ('O', 'A') \
-                  AND p.prosrc LIKE '%must be inserted as batching%' \
-             )",
+        // The trigger must be enabled and call a function the migration marked
+        // with a current schema version, not merely exist by name: a schema
+        // restored from an older archive, or never re-migrated, keeps the name
+        // with the body from before #625, and a restore that disabled the
+        // trigger may never have enabled it again.
+        let marker: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT pg_catalog.obj_description(t.tgfoid, 'pg_proc') \
+             FROM pg_catalog.pg_trigger t \
+             WHERE t.tgrelid = 'batches'::regclass \
+               AND t.tgname = 'trg_commit_after_verify' \
+               AND NOT t.tgisinternal \
+               AND t.tgenabled IN ('O', 'A')",
         )
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(map_schema_check)?;
-        if !trigger_present {
+        if !schema_marker_is_current(marker.flatten().as_deref()) {
             return Err(schema_migration_required());
         }
         Ok(())
@@ -720,6 +732,22 @@ mod security_tests {
 
     fn options(url: &str) -> PgConnectOptions {
         PgConnectOptions::from_str(url).unwrap()
+    }
+
+    #[test]
+    fn only_a_current_schema_marker_passes_startup() {
+        for comment in [
+            None,
+            Some(""),
+            Some("vtop-state-schema"),
+            Some("vtop-state-schema x"),
+            Some("vtop-state-schema 1"),
+            Some("must be inserted as batching"),
+        ] {
+            assert!(!schema_marker_is_current(comment), "{comment:?}");
+        }
+        assert!(schema_marker_is_current(Some("vtop-state-schema 2")));
+        assert!(schema_marker_is_current(Some("vtop-state-schema 3")));
     }
 
     #[test]

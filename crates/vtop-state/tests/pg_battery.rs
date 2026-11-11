@@ -62,12 +62,15 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         "missing trigger must give migration guidance: {err}"
     );
 
-    // Nor is a trigger that exists by name but runs the body from before #625
-    // (a schema restored from an older archive, or never re-migrated), or one
-    // a restore left disabled.
+    // Nor is a trigger that exists by name but has no current schema marker,
+    // or one a restore left disabled. The first case is what restoring an
+    // archive from before #625 produces: the function recreated with the old
+    // body and no marker. (CREATE OR REPLACE would keep an existing comment,
+    // so the function is dropped and recreated, as a restore does.)
     for (setup, what) in [
         (
-            "CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$ \
+            "DROP FUNCTION vtop_enforce_commit_after_verify() CASCADE; \
+             CREATE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$ \
              BEGIN \
                  IF NEW.state = 'source_committed' THEN \
                      IF TG_OP = 'INSERT' THEN \
@@ -80,8 +83,10 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
                  END IF; \
                  RETURN NEW; \
              END; \
-             $fn$ LANGUAGE plpgsql;",
-            "a trigger function from before #625",
+             $fn$ LANGUAGE plpgsql; \
+             CREATE TRIGGER trg_commit_after_verify BEFORE INSERT OR UPDATE ON batches \
+                 FOR EACH ROW EXECUTE FUNCTION vtop_enforce_commit_after_verify();",
+            "a trigger function from before #625, with no schema marker",
         ),
         (
             "ALTER TABLE batches DISABLE TRIGGER trg_commit_after_verify",
@@ -100,6 +105,12 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
             "{what} must give migration guidance: {err}"
         );
     }
+    // `vtopctl migrate` repairs both: it installs the marked function and
+    // re-creates the trigger enabled.
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    PgStateStore::connect(&migrator_conn)
+        .await
+        .expect("the current schema must pass startup");
 
     // The deployment identity applies DDL once, then creates a deliberately
     // narrow role. PostgreSQL's default PUBLIC schema privileges are revoked so
