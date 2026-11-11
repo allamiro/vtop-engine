@@ -257,7 +257,10 @@ reopen quietly.
   follower whose own history agrees with it below its tail now keeps it (in a
   `fencing-epochs.leader` sidecar, so a restart keeps it too) and files every
   record that leader sends under the leader's entries. After a catch-up its
-  vector equals the leader's. A follower the fence did not reach, or one that
+  vector equals the leader's for the caught-up range (after a partial
+  catch-up, only that far). A crash between an append and that filing is
+  repaired when the replica next opens, before it answers anything. A
+  follower the fence did not reach, or one that
   kept a dispute that has not settled, adopts at its tail as before.
   **Compatibility:** the journal format is unchanged, so an older binary
   reads it as its own and simply resumes adopting at its tail. The sidecar is

@@ -74,8 +74,9 @@
 //! * **The sidecar is new, and only this code reads it.** An older binary does
 //!   not know the name, and range discovery ignores names it does not
 //!   recognise, so it is never misread. This code reads it with its own magic,
-//!   version and BLAKE3 checksum; a missing, torn, foreign or newer-version
-//!   sidecar reads as "no lineage", which is the pre-#640 behaviour, not a
+//!   version and BLAKE3 checksum, after bounding its length; a missing, torn,
+//!   oversized, foreign or newer-version sidecar reads as "no lineage", which
+//!   is the pre-#640 behaviour, not a
 //!   refusal to open. A lineage is applied only to the epoch it names, and
 //!   only after the follower's own history was checked to agree with it.
 //! * **Journals mislabelled before this fix are not rewritten.** Nothing on a
@@ -110,6 +111,10 @@ const LINEAGE_MAGIC: &[u8; 8] = b"VTOPFLN1";
 const LINEAGE_VERSION: u16 = 1;
 const LINEAGE_HEADER_BYTES: usize = 8 + 2 + 8 + 8 + 4;
 const LINEAGE_CHECKSUM_BYTES: usize = 32;
+/// The longest sidecar a lineage of `MAX_ENTRIES` entries encodes to. A
+/// longer file is refused before it is read (#648 review).
+const MAX_LINEAGE_BYTES: u64 =
+    (LINEAGE_HEADER_BYTES + MAX_ENTRIES * ENTRY_BYTES + LINEAGE_CHECKSUM_BYTES) as u64;
 /// Appended to the journal's file name to name its lineage sidecar.
 const LINEAGE_SUFFIX: &str = ".leader";
 /// `(epoch, start_offset)`, both big-endian u64.
@@ -878,8 +883,29 @@ fn read_lineage(env: &Env, path: &Path) -> Option<LeaderLineage> {
             return None;
         }
     }
-    let bytes = match env.storage.read(path) {
-        Ok(bytes) => bytes,
+    // Bounded BEFORE it is read (#648 review), as the journal is: the length
+    // comes off a file a crash or a damaged disk may have left any size, and
+    // reading it whole first would let it exhaust memory while the replica
+    // opens. No lineage this code writes is longer than `MAX_LINEAGE_BYTES`.
+    let read = env.storage.open(path, OpenMode::Read).and_then(|mut file| {
+        let len = file.len()?;
+        if len > MAX_LINEAGE_BYTES {
+            return Ok(Err(len));
+        }
+        let mut bytes = vec![0_u8; len as usize];
+        file.read_exact(&mut bytes)?;
+        Ok(Ok(bytes))
+    });
+    let bytes = match read {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(len)) => {
+            eprintln!(
+                "leader-lineage sidecar {} is {len} bytes, past the {MAX_LINEAGE_BYTES} of the \
+                 largest lineage; following without it, as before #640",
+                path.display()
+            );
+            return None;
+        }
         Err(error) => {
             eprintln!(
                 "leader-lineage sidecar {} could not be read ({error}); following without it",
@@ -2075,5 +2101,43 @@ mod tests {
         j.record_adoption(21, 8).unwrap();
         j.replay_leader_lineage_at_open(12).unwrap();
         assert_eq!(j.entries(), starts(&[(18, 0), (21, 8)]).as_slice());
+    }
+
+    /// #648 review (cubic, P2): the sidecar's length is bounded BEFORE it is
+    /// read, as the journal's is. No lineage this code writes is longer than
+    /// the frame for `MAX_ENTRIES` entries, so a longer file is not one, and
+    /// reading it whole first would let a damaged file exhaust memory while
+    /// the replica opens. A valid frame with junk after it, within the bound,
+    /// is still read: that is a crash between the write and the cut to length.
+    #[test]
+    fn a_sidecar_longer_than_the_largest_frame_is_refused_before_it_is_read() {
+        let dir = TempDir::new().unwrap();
+        let sidecar = lineage_path(&dir.path().join("fencing-epochs"));
+        {
+            let mut j = journal(&dir);
+            j.record(18, 0).unwrap();
+            assert!(j
+                .take_leader_lineage(20, &starts(&[(18, 0), (20, 10)]), 5, 0)
+                .unwrap());
+        }
+        let good = std::fs::read(&sidecar).unwrap();
+        let mut within = good.clone();
+        within.resize(MAX_LINEAGE_BYTES as usize, 0xA5);
+        std::fs::write(&sidecar, &within).unwrap();
+        assert_eq!(
+            journal(&dir).leader_lineage_epoch(),
+            Some(20),
+            "a stale tail within the bound is a crash before the cut to length"
+        );
+        let mut beyond = good;
+        beyond.resize(MAX_LINEAGE_BYTES as usize + 1, 0xA5);
+        std::fs::write(&sidecar, &beyond).unwrap();
+        let j = journal(&dir);
+        assert_eq!(j.leader_lineage_epoch(), None);
+        assert_eq!(
+            j.entries(),
+            starts(&[(18, 0)]).as_slice(),
+            "the journal itself still opens"
+        );
     }
 }

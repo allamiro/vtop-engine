@@ -395,8 +395,10 @@ pub struct ReplicaFenceRequest {
     /// new epoch at its tail, proves nothing. The replica keeps them and
     /// answers with its full offset.
     ///
-    /// A replica whose own history agrees with this one below its tail also
-    /// keeps it as the caller's lineage (#640): should the caller be
+    /// A replica whose retained history agrees with this one below its tail
+    /// (compared on `[base, tail)`) also keeps it as the caller's lineage
+    /// (#640), unless it keeps a dispute at this epoch: then it takes the
+    /// lineage only once that dispute settles. Should the caller be
     /// established, the records it catches the replica up on are filed under
     /// the caller's entries, the epochs that wrote them, not under this
     /// fence's epoch.

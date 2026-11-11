@@ -91,14 +91,20 @@ impl Replica {
 
     /// Open the replica from its directory the way `data_node` does.
     fn open(dir: &Path, id: Uuid) -> (MetaFencingEpoch, Arc<InProcessFollower>) {
-        let meta = MetaFencingEpoch::new(OLD_EPOCH);
+        Self::open_holding(dir, id, OLD_EPOCH)
+    }
+
+    /// Open already holding `held`, as a process does that reads its grant
+    /// before it constructs the replica: no adoption runs.
+    fn open_holding(dir: &Path, id: Uuid, held: u64) -> (MetaFencingEpoch, Arc<InProcessFollower>) {
+        let meta = MetaFencingEpoch::new(held);
         let node = Arc::new(
             InProcessFollower::new(
                 id,
                 segment_at(dir),
                 ProducerEpochJournal::open(dir.join("epochs")).unwrap(),
                 range_identity(),
-                OLD_EPOCH,
+                held,
                 meta.clone(),
                 ClusterCommittedOffset::new(0),
             )
@@ -343,22 +349,7 @@ fn an_in_sync_follower_records_the_epoch_at_its_tail_as_before() {
 fn the_open_replays_the_lineage_over_records_a_crash_left_unfiled() {
     let (r, c) = up_to_the_fence_at_20();
     catch_up_and_write(&r, &c);
-    let journal_path = c.dir.path().join("fencing-epochs");
-    let Replica {
-        dir,
-        id,
-        meta,
-        node,
-    } = c;
-    drop(node);
-    drop(meta);
-    // The crash window on disk: the record at 10 is durable, the journal is
-    // as the fence left it, and the sidecar still names the lineage.
-    let mut journal = FencingEpochJournal::open(&journal_path).unwrap();
-    journal.truncate_to(1).unwrap();
-    assert_eq!(journal.entries(), starts(&[(OLD_EPOCH, 0)]).as_slice());
-    assert_eq!(journal.leader_lineage_epoch(), Some(R_EPOCH));
-    drop(journal);
+    let (dir, id) = crash_in_the_window(c);
     let (meta, node) = Replica::open(dir.path(), id);
     let c = Replica {
         dir,
@@ -383,4 +374,88 @@ fn the_open_replays_the_lineage_over_records_a_crash_left_unfiled() {
     assert_eq!(c.node.epoch_starts(), expected);
     let c = c.reopen();
     assert_eq!(c.node.epoch_starts(), expected, "and it is durable");
+}
+
+/// Kill C and leave its directory in the crash window: the leader's record
+/// at 10 durable, the journal as the fence left it (the follow that records
+/// 19 and 20 at 10 never ran), and the lineage sidecar intact.
+fn crash_in_the_window(c: Replica) -> (TempDir, Uuid) {
+    let Replica {
+        dir,
+        id,
+        meta,
+        node,
+    } = c;
+    drop(node);
+    drop(meta);
+    let mut journal = FencingEpochJournal::open(dir.path().join("fencing-epochs")).unwrap();
+    journal.truncate_to(1).unwrap();
+    assert_eq!(journal.entries(), starts(&[(OLD_EPOCH, 0)]).as_slice());
+    assert_eq!(journal.leader_lineage_epoch(), Some(R_EPOCH));
+    drop(journal);
+    (dir, id)
+}
+
+/// #648 review (cubic, P1): in the crash window, metadata moved on to 21
+/// while C was down, and the first thing C does is adopt it. That adoption
+/// is not under the lineage's epoch, so it never re-derived anything and
+/// recorded 21 at the tail over records still filed under 18. Only the
+/// adoption is checked here, not the open before it.
+#[test]
+fn adopting_a_newer_epoch_after_the_crash_window_keeps_the_leaders_history() {
+    let (r, c) = up_to_the_fence_at_20();
+    catch_up_and_write(&r, &c);
+    let (dir, id) = crash_in_the_window(c);
+    let (meta, node) = Replica::open(dir.path(), id);
+    let c = Replica {
+        dir,
+        id,
+        meta,
+        node,
+    };
+    c.grant(R_EPOCH + 1);
+    let mut expected = r.node.epoch_starts();
+    expected.push(EpochStart {
+        epoch: R_EPOCH + 1,
+        start_offset: R_TAIL + 1,
+    });
+    assert_eq!(
+        c.node.epoch_starts(),
+        expected,
+        "the records at 10 are epoch 20's, as R files them; 21 begins at the tail"
+    );
+}
+
+/// #648 review (cubic, P1): in the crash window, C restarts already holding
+/// the lineage's epoch (no adoption runs), and the leader retransmits the
+/// batch C already holds. That append takes the committed-duplicate path,
+/// which acks without appending and so without following the lineage. The
+/// history must still be the leader's, from the replay at open.
+#[test]
+fn a_committed_duplicate_after_the_crash_window_answers_the_leaders_history() {
+    let (r, c) = up_to_the_fence_at_20();
+    catch_up_and_write(&r, &c);
+    let (dir, id) = crash_in_the_window(c);
+    let (meta, node) = Replica::open_holding(dir.path(), id, R_EPOCH);
+    let c = Replica {
+        dir,
+        id,
+        meta,
+        node,
+    };
+    c.append(R_EPOCH, R_TAIL);
+    assert_eq!(
+        c.node.next_offset(),
+        R_TAIL + 1,
+        "the retransmission was a duplicate"
+    );
+    assert_eq!(c.node.epoch_starts(), r.node.epoch_starts());
+    // And the fence the next candidate sends sees the same.
+    c.meta.set(R_EPOCH + 1);
+    let answer = c.node.fence(R_EPOCH + 1, &r.node.epoch_starts()).unwrap();
+    assert_eq!(
+        clamp_lineage(&answer.epoch_starts, 0, answer.next_offset),
+        clamp_lineage(&r.node.epoch_starts(), 0, answer.next_offset),
+        "the fence answer attributes every record C holds as R does"
+    );
 }
