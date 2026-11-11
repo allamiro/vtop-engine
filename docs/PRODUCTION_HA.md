@@ -664,8 +664,13 @@ saturating the store:
 - or `--sample N [--seed S]`: N batches chosen at random; the seed is printed,
   and the same seed picks the same batches.
 
-Scrub reads are ingress to the scrub's host. The operator egress ceiling of
-#481 is not merged; when it is, it bounds uploads, which the scrub never does.
+Scrub reads are ingress to the scrub's host. The operator ceilings of #481
+bound uploads: `upload.max_egress_bytes_per_second` shapes the bodies of
+`s3_native` object, manifest and part PUTs, and `upload.max_concurrency_ceiling`
+caps the upload concurrency knobs. The scrub uploads nothing, so neither
+applies to it, and its own `--max-bytes-per-sec` and `--concurrency` are what
+bound its reads. A config that sets the egress ceiling is still accepted with
+an `s3_native` backend, as for the engine.
 
 **Schedule.** There is no periodic mode inside the engine: its loop is single
 threaded, housekeeping such as the ledger prune runs on idle cycles, and one
