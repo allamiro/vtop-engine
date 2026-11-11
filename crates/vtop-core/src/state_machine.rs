@@ -15,8 +15,10 @@
 //! that was handed back (`FAILED` / `REPLAY_REQUIRED`) and that its source
 //! has since committed past. It commits nothing - no source progress moves
 //! when a row is retired this way - so it is not a second way into
-//! `SOURCE_COMMITTED`, and no state that holds a verified, uncommitted object
-//! can reach it.
+//! `SOURCE_COMMITTED`. It is entered only from `FAILED` or `REPLAY_REQUIRED`:
+//! a `VERIFIED` row can reach it only by being failed first, which recovery
+//! does only to a row whose stored object no longer verifies (its commit is
+//! otherwise retried, never retired).
 
 use crate::errors::VtopError;
 use serde::{Deserialize, Serialize};
@@ -37,7 +39,8 @@ pub enum BatchState {
     Failed,
     ReplayRequired,
     /// Terminal (#567): a handed-back range (`FAILED` / `REPLAY_REQUIRED`)
-    /// whose source unit has since committed past its end, in the same file.
+    /// whose source unit (a Kafka partition under one consumer group, or one
+    /// file or spool, by identity) has since committed past its end.
     /// A rewind to it would re-read nothing (every adapter clamps a rewind to
     /// its committed point), so recovery retires the row instead of visiting
     /// it on every restart. Not a commit: written without moving any source

@@ -373,7 +373,7 @@ Legal transitions (and **only** these) are permitted:
 
 `SUPERSEDED` retires a batch whose range was handed back to its source (`FAILED` or `REPLAY_REQUIRED`) and which the source has since committed past. An implementation:
 
-- **MAY** move a batch to `SUPERSEDED` only when the committed progress of the batch's source unit (one partition under one consumer group; one file, by identity) is at or past the end of the batch's range. A rewind to such a range re-reads nothing, because a rewind never goes below committed progress (§14).
+- **MAY** move a batch to `SUPERSEDED` only when the committed progress of the batch's source unit (one partition under one consumer group; one file, by identity) is at or past the end of the batch's range, and the implementation's state shows that progress belongs to the same file (or partition) the batch was read from. A rewind to such a range re-reads nothing, because a rewind never goes below committed progress (§14).
 - **MUST NOT** advance any source progress marker in doing so. `SUPERSEDED` is not a commit, and it is not a path to `SOURCE_COMMITTED`: the only predecessor of `SOURCE_COMMITTED` is still `VERIFIED` (§13).
 - **MUST NOT** treat a `SUPERSEDED` batch as evidence that its range was archived. Committed progress having passed a range does not prove that a committed range covers its bytes. A coverage audit **MUST** judge a `SUPERSEDED` range as it judges a `FAILED` one.
 - **MAY** delete `SUPERSEDED` batches under the same retention rules as `SOURCE_COMMITTED` ones. A `SUPERSEDED` batch is never a restart position, so none has to be kept for that.
@@ -418,6 +418,7 @@ A conformant implementation:
 - On recovery, a batch already in `VERIFIED` (object and manifest durably written and verified, but progress not yet committed) **MAY** complete by committing source progress (`VERIFIED → SOURCE_COMMITTED`); its object **MUST NOT** be discarded.
 - On recovery, a batch in any state *before* `VERIFIED` **MUST** be transitioned to `FAILED` and then `REPLAY_REQUIRED`, and re-entered at `BATCHING`; its uncommitted source range **MUST** remain replayable.
 - **MUST NOT** double-commit a source progress marker that was already committed.
+- **MUST NOT** rewind a source unit for replay below its committed progress: everything below it is archived, and a rewind there would only archive it again. A replay of a range that starts below committed progress resumes at committed progress.
 - **MUST** be safe to re-run from the last committed source progress marker without data loss; re-uploaded objects with identical content **SHOULD** be idempotent (same `batch_id` and naming yields the same object key).
 
 A mismatch between persisted state and the contents of object storage (e.g., an object exists but is not verified) **MUST** be resolved by re-verifying or re-uploading before any commit.

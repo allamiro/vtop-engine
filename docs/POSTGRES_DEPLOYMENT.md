@@ -111,8 +111,10 @@ migration job per database; engine replicas should start only after it succeeds.
   Older engines keep running on the widened schema; they never write the
   state. An older engine that READS a superseded row fails closed: its startup
   recovery claim, and `vtopctl status`, stop with `unknown batch state:
-  superseded` rather than misreading it. So once any upgraded engine has run
-  recovery, an older engine sharing the ledger cannot restart. Upgrade every
+  superseded` rather than misreading it. So once an upgraded engine has
+  written a superseded row - which its recovery does to the first stale
+  handed-back row it finds - an older engine sharing the ledger cannot
+  restart. Upgrade every
   engine on a ledger together, or drain the older ones first. Rolling back
   past this release means restoring a ledger backup taken before the upgrade.
 - Changes to the JSON inside ledger rows need no migration step. The content

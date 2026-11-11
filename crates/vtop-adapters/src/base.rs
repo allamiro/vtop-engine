@@ -193,8 +193,9 @@ pub trait SourceAdapter: Send + Sync {
 
     /// The committed point of `marker`'s source unit, in the unit the markers
     /// use (a byte offset; for Kafka the next offset to read, one past the
-    /// last committed), and only when the adapter knows it for THE FILE the
-    /// marker was read from; `None` when it cannot say (#567).
+    /// last committed), and only when the adapter can show it is THE FILE the
+    /// marker was read from (same identity, same content); `None` when it
+    /// cannot show that (#567).
     ///
     /// Everything below it has been committed, and a rewind to `marker`
     /// never lands below it - so a handed-back range that ends at or below it

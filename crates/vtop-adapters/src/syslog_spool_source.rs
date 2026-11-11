@@ -744,28 +744,39 @@ impl SourceAdapter for SyslogSpoolSource {
         Some(i128::from(c.read_byte))
     }
 
-    /// See `FileSource::committed_through`.
+    /// The cursor's committed byte, only when the cursor is PROVEN to describe
+    /// the marker's spool: the same inode, and the same content - equal
+    /// fingerprints, or both matching the first bytes of the spool now at the
+    /// path, which still has that inode. See `FileSource::committed_through`
+    /// (review of #567); a spool marker records no tail.
     fn committed_through(&self, marker: &ProgressMarker) -> Option<i128> {
         let ProgressMarker::SyslogSpool {
             path,
-            inode: marker_inode,
-            content_fingerprint: marker_content,
+            inode: Some(marker_inode),
+            content_fingerprint: Some(marker_content),
             ..
         } = marker
         else {
             return None;
         };
         let c = self.cursors.get(path)?;
-        let seen = c.seen.as_ref();
-        if marker_inode.is_some() && seen.and_then(|seen| seen.inode) != *marker_inode {
+        let seen = c.seen.as_ref()?;
+        if seen.inode != Some(*marker_inode) {
             return None;
         }
-        if seen
-            .and_then(|seen| seen.content.as_ref())
-            .zip(marker_content.as_ref())
-            .is_some_and(|(seen, marker)| seen.same_content(marker) == Some(false))
-        {
-            return None;
+        let seen_content = seen.content.as_ref()?;
+        match seen_content.same_content(marker_content) {
+            Some(true) => {}
+            Some(false) => return None,
+            None => {
+                let (metadata, head) = continuity::probe(Path::new(path))?;
+                if inode_of(&metadata) != Some(*marker_inode)
+                    || !seen_content.matches_head(&head)
+                    || !marker_content.matches_head(&head)
+                {
+                    return None;
+                }
+            }
         }
         Some(i128::from(c.committed_byte))
     }
@@ -794,6 +805,64 @@ fn inode_of(_md: &std::fs::Metadata) -> Option<u64> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// #567 (review): as for `FileSource` - a spool's committed point is
+    /// answered only for a marker proven to be the cursor's spool: the same
+    /// inode and content shown to be the same, settled against the spool at
+    /// the path when the fingerprints are of different lengths.
+    #[cfg(unix)]
+    #[test]
+    fn the_committed_point_is_answered_only_for_a_marker_proven_to_be_the_cursors_spool() {
+        use std::os::unix::fs::MetadataExt;
+        let bytes: Vec<u8> = (0..100u8).map(|i| b'a' + i % 26).collect();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let fp = |b: &[u8]| ContentFingerprint::of(b);
+        let marker =
+            |inode: Option<u64>, content: Option<ContentFingerprint>| ProgressMarker::SyslogSpool {
+                spool_id: "s".into(),
+                path: path.clone(),
+                inode,
+                start_byte: 0,
+                end_byte: 30,
+                received_time_start: None,
+                received_time_end: None,
+                file_size: Some(100),
+                content_fingerprint: content,
+            };
+        let mut s = SyslogSpoolSource::new(vec![path.clone()]);
+        s.seed_committed_from(&path, 40, Some(inode), Some(100), fp(&bytes));
+        assert_eq!(
+            s.committed_through(&marker(Some(inode), fp(&bytes))),
+            Some(40)
+        );
+        assert_eq!(
+            s.committed_through(&marker(Some(inode), fp(&bytes[..50]))),
+            Some(40)
+        );
+        assert_eq!(
+            s.committed_through(&marker(None, fp(&bytes))),
+            None,
+            "no inode"
+        );
+        assert_eq!(
+            s.committed_through(&marker(Some(inode), None)),
+            None,
+            "no content"
+        );
+        assert_eq!(
+            s.committed_through(&marker(Some(inode + 1), fp(&bytes))),
+            None
+        );
+        assert_eq!(
+            s.committed_through(&marker(Some(inode), fp(&[b'z'; 50]))),
+            None,
+            "other content of another length"
+        );
+    }
 
     #[tokio::test]
     async fn reads_spool_and_resumes() {
