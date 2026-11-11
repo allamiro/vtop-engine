@@ -489,3 +489,87 @@ fn a_committed_duplicate_after_the_crash_window_answers_the_leaders_history() {
         "the fence answer attributes every record C holds as R does"
     );
 }
+
+/// Steps for a dispute the new leader's lineage must outlive (#640, with
+/// #635). R holds 5..10 written under 19, a leadership C never followed; C
+/// holds 5..7 written under 18. Metadata grants 20 to C. R keeps 5..10 in
+/// dispute from 5: C proves nothing about them (its record at 5 is older than
+/// R's). C's history says its epoch-20 records begin at its tail, 7, which a
+/// tail adoption at the settlement's cut, 5, would get wrong.
+fn a_dispute_kept_against_c_at_20() -> (Replica, Replica) {
+    let r = Replica::new(0xB1);
+    let c = Replica::new(0xB2);
+    for offset in 0..SHARED {
+        r.append(OLD_EPOCH, offset);
+        c.append(OLD_EPOCH, offset);
+    }
+    for offset in SHARED..7 {
+        c.append(OLD_EPOCH, offset);
+    }
+    r.grant(C_EPOCH);
+    for offset in SHARED..R_TAIL {
+        r.node
+            .apply_append(&ReplicaAppendRequest {
+                producer_id: Uuid::from_u128(0x2000 + u128::from(offset)),
+                ..record(C_EPOCH, offset)
+            })
+            .unwrap();
+    }
+    r.grant(R_EPOCH);
+    c.meta.set(R_EPOCH);
+    c.node.fence_locally(R_EPOCH).unwrap();
+    assert_eq!(
+        c.node.epoch_starts(),
+        starts(&[(OLD_EPOCH, 0), (R_EPOCH, 7)])
+    );
+    let answer = r.node.fence(R_EPOCH, &c.node.epoch_starts()).unwrap();
+    assert_eq!((answer.truncated_records, answer.next_offset), (0, R_TAIL));
+    assert_eq!(
+        r.node.replication_status().1,
+        SHARED,
+        "precondition: R keeps 5..10 in dispute"
+    );
+    (r, c)
+}
+
+/// The leader C catches R up from where R's status ends, then writes its
+/// first epoch-20 record at its tail. The first append settles R's dispute.
+fn c_settles_r(r: &Replica, c: &Replica) {
+    let (_, from) = r.node.replication_status();
+    for offset in from..7 {
+        r.append(R_EPOCH, offset);
+    }
+    c.append(R_EPOCH, 7);
+    r.append(R_EPOCH, 7);
+}
+
+#[test]
+fn a_settled_dispute_files_the_leaders_records_by_its_lineage() {
+    let (r, c) = a_dispute_kept_against_c_at_20();
+    c_settles_r(&r, &c);
+    assert_eq!(r.node.next_offset(), 8);
+    assert_eq!(
+        r.node.epoch_starts(),
+        c.node.epoch_starts(),
+        "R files 5..7 under 18 and 7 on under 20, as C does"
+    );
+}
+
+/// #648 review: the history the fence carried is held, like the dispute,
+/// across a restart between the fence and the settlement (#635 persists the
+/// dispute). In memory only, the restart lost it and the settlement filed
+/// R's tail by the held epoch at the cut, `[(18,0),(20,5)]`, against C's
+/// `[(18,0),(20,7)]`.
+#[test]
+fn a_restart_between_the_fence_and_the_settlement_keeps_the_waiting_lineage() {
+    let (r, c) = a_dispute_kept_against_c_at_20();
+    let r = r.restart(R_EPOCH);
+    assert_eq!(
+        r.node.replication_status().1,
+        SHARED,
+        "precondition: the dispute survived the restart (#635)"
+    );
+    c_settles_r(&r, &c);
+    assert_eq!(r.node.next_offset(), 8);
+    assert_eq!(r.node.epoch_starts(), c.node.epoch_starts());
+}

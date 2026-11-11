@@ -109,11 +109,16 @@ const MAGIC: &[u8; 8] = b"VTOPFNC1";
 const VERSION: u16 = 1;
 const HEADER_BYTES: u64 = 10;
 /// The leader-lineage sidecar (#640): `magic | version u16 | epoch u64 |
-/// anchor u64 | count u32 | count x (epoch u64, start u64) | BLAKE3-32 over
-/// everything before it`, big-endian like the journal.
+/// anchor u64 | state u8 | count u32 | count x (epoch u64, start u64) |
+/// BLAKE3-32 over everything before it`, big-endian like the journal. `state`
+/// is [`LINEAGE_FOLLOWING`] or [`LINEAGE_WAITING_ON_DISPUTE`].
 const LINEAGE_MAGIC: &[u8; 8] = b"VTOPFLN1";
 const LINEAGE_VERSION: u16 = 1;
-const LINEAGE_HEADER_BYTES: usize = 8 + 2 + 8 + 8 + 4;
+const LINEAGE_HEADER_BYTES: usize = 8 + 2 + 8 + 8 + 1 + 4;
+/// The lineage is followed: appends under its epoch are filed by it.
+const LINEAGE_FOLLOWING: u8 = 0;
+/// The fence that carried it kept a dispute; it is taken once that settles.
+const LINEAGE_WAITING_ON_DISPUTE: u8 = 1;
 const LINEAGE_CHECKSUM_BYTES: usize = 32;
 /// The longest sidecar a lineage of `MAX_ENTRIES` entries encodes to. A
 /// longer file is refused before it is read (#648 review).
@@ -168,6 +173,14 @@ struct LeaderLineage {
     /// from `epoch`'s leader. Only ever lowered (a truncation, or records a
     /// crash lost), never raised.
     anchor: u64,
+    /// The fence that carried it kept a dispute at `epoch` (#640, with
+    /// #635): the replica holds records the caller does not, so the vector
+    /// says nothing about who wrote those. Waiting, it is never followed;
+    /// once the dispute settles it is taken afresh at the tail the
+    /// settlement leaves ([`FencingEpochJournal::take_leader_lineage`]), with
+    /// the same agreement check as at a fence. `anchor` means nothing while
+    /// it waits.
+    waiting_on_dispute: bool,
     /// The leader's vector as it sent it with the fence.
     entries: Vec<EpochStart>,
 }
@@ -571,6 +584,7 @@ impl FencingEpochJournal {
         let lineage = LeaderLineage {
             epoch,
             anchor,
+            waiting_on_dispute: false,
             entries: leader.to_vec(),
         };
         if self.lineage.as_ref() != Some(&lineage) {
@@ -578,6 +592,63 @@ impl FencingEpochJournal {
             self.lineage = Some(lineage);
         }
         Ok(true)
+    }
+
+    /// Keep `leader`, the history a fence at `epoch` carried, while that
+    /// fence's kept dispute is pending (#640, with #635). Returns whether it
+    /// was kept: a vector that is not a history, or does not name `epoch`,
+    /// is not (see [`Self::take_leader_lineage`]).
+    ///
+    /// It is persisted, as the dispute is, so a restart between the fence and
+    /// the settlement changes nothing: the settlement then takes it at the
+    /// tail it leaves ([`Self::waiting_leader_lineage`]). It is never
+    /// followed while it waits, so it cannot file the kept records, which are
+    /// this replica's own, under the leader's entries.
+    pub fn hold_leader_lineage_until_settled(
+        &mut self,
+        epoch: u64,
+        leader: &[EpochStart],
+    ) -> BrokerResult<bool> {
+        let usable = !leader.is_empty()
+            && leader.len() <= MAX_ENTRIES
+            && leader.windows(2).all(|pair| {
+                pair[1].epoch > pair[0].epoch && pair[1].start_offset >= pair[0].start_offset
+            })
+            && canonicalize_lineage(leader)
+                .last()
+                .is_some_and(|last| last.epoch == epoch);
+        if !usable {
+            self.drop_leader_lineage(epoch)?;
+            return Ok(false);
+        }
+        let lineage = LeaderLineage {
+            epoch,
+            anchor: 0,
+            waiting_on_dispute: true,
+            entries: leader.to_vec(),
+        };
+        if self.lineage.as_ref() != Some(&lineage) {
+            self.write_lineage(Some(&lineage))?;
+            self.lineage = Some(lineage);
+        }
+        Ok(true)
+    }
+
+    /// The history held for `epoch` while its fence's dispute is pending, if
+    /// any (see [`Self::hold_leader_lineage_until_settled`]).
+    pub fn waiting_leader_lineage(&self, epoch: u64) -> Option<Vec<EpochStart>> {
+        self.lineage
+            .as_ref()
+            .filter(|lineage| lineage.waiting_on_dispute && lineage.epoch == epoch)
+            .map(|lineage| lineage.entries.clone())
+    }
+
+    /// The epoch of a history held while its fence's dispute is pending.
+    pub fn waiting_leader_lineage_epoch(&self) -> Option<u64> {
+        self.lineage
+            .as_ref()
+            .filter(|lineage| lineage.waiting_on_dispute)
+            .map(|lineage| lineage.epoch)
     }
 
     /// Forget a lineage held for `epoch`, durably (#640). A no-op for any
@@ -626,6 +697,9 @@ impl FencingEpochJournal {
         let Some(lineage) = self.lineage.as_mut() else {
             return Ok(false);
         };
+        if lineage.waiting_on_dispute {
+            return Ok(false);
+        }
         lineage.anchor = lineage.anchor.min(tail);
         let epoch = lineage.epoch;
         Ok(matches!(
@@ -656,7 +730,7 @@ impl FencingEpochJournal {
         let Some(lineage) = self.lineage.as_mut() else {
             return Ok(LineageFollow::NotHeld);
         };
-        if lineage.epoch != epoch {
+        if lineage.epoch != epoch || lineage.waiting_on_dispute {
             return Ok(LineageFollow::NotHeld);
         }
         lineage.anchor = lineage.anchor.min(tail);
@@ -869,6 +943,11 @@ fn encode_lineage(lineage: &LeaderLineage) -> Vec<u8> {
     bytes.extend_from_slice(&LINEAGE_VERSION.to_be_bytes());
     bytes.extend_from_slice(&lineage.epoch.to_be_bytes());
     bytes.extend_from_slice(&lineage.anchor.to_be_bytes());
+    bytes.push(if lineage.waiting_on_dispute {
+        LINEAGE_WAITING_ON_DISPUTE
+    } else {
+        LINEAGE_FOLLOWING
+    });
     bytes.extend_from_slice(&(lineage.entries.len() as u32).to_be_bytes());
     for entry in &lineage.entries {
         bytes.extend_from_slice(&entry.epoch.to_be_bytes());
@@ -946,7 +1025,7 @@ fn decode_lineage(bytes: &[u8]) -> Result<LeaderLineage, String> {
     if bytes.len() < LINEAGE_HEADER_BYTES + LINEAGE_CHECKSUM_BYTES {
         return Err(format!("is {} bytes, shorter than its frame", bytes.len()));
     }
-    let count = u32::from_be_bytes(bytes[26..30].try_into().expect("fixed width")) as usize;
+    let count = u32::from_be_bytes(bytes[27..31].try_into().expect("fixed width")) as usize;
     if count > MAX_ENTRIES {
         return Err(format!(
             "names {count} entries, past the bound of {MAX_ENTRIES}"
@@ -975,6 +1054,11 @@ fn decode_lineage(bytes: &[u8]) -> Result<LeaderLineage, String> {
     }
     let epoch = u64::from_be_bytes(bytes[10..18].try_into().expect("fixed width"));
     let anchor = u64::from_be_bytes(bytes[18..26].try_into().expect("fixed width"));
+    let waiting_on_dispute = match bytes[26] {
+        LINEAGE_FOLLOWING => false,
+        LINEAGE_WAITING_ON_DISPUTE => true,
+        state => return Err(format!("names state {state}, which no release writes")),
+    };
     let entries: Vec<EpochStart> = bytes[LINEAGE_HEADER_BYTES..body]
         .as_chunks::<ENTRY_BYTES>()
         .0
@@ -994,6 +1078,7 @@ fn decode_lineage(bytes: &[u8]) -> Result<LeaderLineage, String> {
     Ok(LeaderLineage {
         epoch,
         anchor,
+        waiting_on_dispute,
         entries,
     })
 }
@@ -2001,7 +2086,7 @@ mod tests {
             ("empty", Vec::new()),
         ];
         let mut flipped = good.clone();
-        flipped[30] ^= 0x40;
+        flipped[LINEAGE_HEADER_BYTES + 3] ^= 0x40;
         cases.push(("checksum mismatch", flipped));
         // A newer version under a valid checksum: not this build's to read.
         let mut newer = good.clone();
