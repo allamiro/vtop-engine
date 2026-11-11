@@ -1166,6 +1166,15 @@ impl LocalBroker {
             self.fencing_epoch_history_broken
                 .store(true, Ordering::SeqCst);
         }
+        // The directory may have been a follower's until a role flip, with
+        // a crash between an append it took from a leader and the journal's
+        // re-derivation from that leader's lineage (#640, #648 review). The
+        // replay files those records as the leader did before this broker
+        // reads or extends the history.
+        if journal.replay_leader_lineage_at_open(next_offset).is_err() {
+            self.fencing_epoch_history_broken
+                .store(true, Ordering::SeqCst);
+        }
         if journal.latest().is_none() {
             let epoch = self.held_fencing_epoch.load(Ordering::SeqCst);
             // Epoch 0 is the "no grant yet" sentinel a lease-driven replica

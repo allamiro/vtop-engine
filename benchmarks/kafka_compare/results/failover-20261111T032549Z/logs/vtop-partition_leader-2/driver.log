@@ -1,0 +1,18 @@
+1794370893923896 start total=475000 rate=5000 batch=100 request_timeout_ms=30000
+1794370893937318 attempt=1 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794370893947464 attempt=1 exit=1 acked=0 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794370894057380 attempt=2 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794370894063714 attempt=2 exit=1 acked=0 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794370894172701 attempt=3 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794370894176633 attempt=3 exit=1 acked=0 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794370894285692 attempt=4 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794370894292085 attempt=4 exit=1 acked=0 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794370894401943 attempt=5 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794370894407720 attempt=5 exit=1 acked=0 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794370894520342 attempt=6 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794370894526771 attempt=6 exit=1 acked=0 reason=error: tls vtop-1:9400: tls handshake eof (the peer closed the handshake unanswered, as a plaintext plane does to a TLS client; if that plane is plaintext, dial it with `transport: plaintext`) 
+1794370894637095 attempt=7 produce holder=aaaaaaaa-0000-0000-0000-0000000000a1 epoch=1 addr=vtop-1:9400 first=0
+1794370961842149 attempt=7 exit=3 acked=175200 reason=produce interrupted: no answer to a 100-record batch within 30000 ms 
+1794370961961868 attempt=8 produce holder=aaaaaaaa-0000-0000-0000-0000000000a3 epoch=2 addr=vtop-3:9400 first=175200
+1794370991783119 attempt=8 exit=0 acked=475000 reason=
+1794370991783521 done acked=475000 attempts=8
