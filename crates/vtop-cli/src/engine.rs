@@ -38,6 +38,8 @@ use vtop_state::{connect_state_store_with_deadline, BatchPatch, BatchRecord, Sta
 use vtop_upload::multipart::{self, MultipartFence, MultipartUploadConfig};
 use vtop_upload::{ObjectChecksum, UploadBackend};
 
+use crate::verification_mode::{self, Recheck};
+
 /// How long a batch claim stays exclusive without renewal (#93). Batches
 /// complete in seconds; the lease only has to outlive the slowest healthy
 /// batch by a wide margin so a crashed engine's work transfers reasonably
@@ -1473,6 +1475,7 @@ impl Engine {
                  Do not run replicas against this database (see #66/#93)"
             );
         }
+        verification_mode::announce(&config);
         let mut engine = Self::new_with_state_store(config, streams, state_store).await?;
         engine._instance_locks = locks;
         // Reclaim multipart sessions no source will replay (#482, review):
@@ -1549,12 +1552,15 @@ impl Engine {
                 let fmt = default_format_for(&streams, SourceType::File);
                 adapters.insert(
                     SourceType::File,
-                    Box::new(FileSource::with_mode(
-                        f.paths.clone(),
-                        fmt,
-                        f.delete_after_commit,
-                        f.whole_file,
-                    )),
+                    Box::new(
+                        FileSource::with_mode(
+                            f.paths.clone(),
+                            fmt,
+                            f.delete_after_commit,
+                            f.whole_file,
+                        )
+                        .with_delete_quiet_period(Duration::from_secs(f.delete_quiet_seconds)),
+                    ),
                 );
             }
         }
@@ -2150,16 +2156,16 @@ impl Engine {
     /// manifest, binds it to the ledger, then asks the backend to verify the
     /// stored object content using the manifest's algorithm. HEAD metadata and
     /// uploader-written sidecars are never sufficient for a strong result.
-    async fn storage_still_verified(&self, rec: &BatchRecord) -> bool {
+    async fn storage_still_verified(&self, rec: &BatchRecord) -> Recheck {
         let Some(uri) = rec.object_uri.as_deref() else {
             // A VERIFIED row without an object URI is corrupt bookkeeping;
             // never commit source progress on it.
-            return false;
+            return Recheck::Failed;
         };
         let Some(muri) = rec.manifest_uri.as_deref() else {
             // VERIFIED covers both the object and its manifest. A row that
             // cannot identify the manifest cannot safely advance its source.
-            return false;
+            return Recheck::Failed;
         };
         // A recorded version pins recovery to the immutable manifest this
         // batch actually verified (#135). Overwriting the current key cannot
@@ -2187,14 +2193,14 @@ impl Engine {
                     error = %e,
                     "recovery re-check: manifest download failed"
                 );
-                return false;
+                return Recheck::Failed;
             }
         };
         let manifest: VtopManifest = match serde_json::from_slice(&bytes) {
             Ok(manifest) => manifest,
             Err(e) => {
                 tracing::warn!(muri, error = %e, "recovery re-check: manifest parse failed");
-                return false;
+                return Recheck::Failed;
             }
         };
 
@@ -2214,7 +2220,7 @@ impl Engine {
                 batch_id = %rec.batch_id,
                 "recovery re-check: manifest authentication or ledger binding failed"
             );
-            return false;
+            return Recheck::Failed;
         }
 
         // Bind the manifest back to the durable ledger before trusting it as
@@ -2231,7 +2237,7 @@ impl Engine {
                 batch_id = %rec.batch_id,
                 "recovery re-check: manifest and ledger object metadata disagree"
             );
-            return false;
+            return Recheck::Failed;
         }
 
         let algo = match manifest
@@ -2242,12 +2248,12 @@ impl Engine {
             Ok(algo) => algo,
             Err(e) => {
                 tracing::warn!(batch_id = %rec.batch_id, error = %e, "recovery re-check: unsupported checksum");
-                return false;
+                return Recheck::Failed;
             }
         };
         let expected = if algo.is_enabled() {
             if manifest.object.checksum.is_empty() {
-                return false;
+                return Recheck::Failed;
             }
             Some(ObjectChecksum::new(
                 algo.as_str(),
@@ -2264,14 +2270,17 @@ impl Engine {
             Ok(result) => result,
             Err(e) => {
                 tracing::warn!(uri, error = %e, "recovery re-check: content verification failed");
-                return false;
+                return Recheck::Failed;
             }
         };
         if !result.passed {
             tracing::warn!(uri, reason = %result.message, "recovery re-check: stored content mismatch");
-            return false;
+            return Recheck::Failed;
         }
-        !result.backend_limited || !self.config.upload.require_strong_verification
+        if result.backend_limited {
+            return verification_mode::recheck_size_only(&self.config, rec, &result.message);
+        }
+        Recheck::Strong
     }
 
     /// Recovery scan run at startup. Seeds adapters from committed batches and
@@ -2303,7 +2312,7 @@ impl Engine {
         let mut rewinds = RewindPlan::default();
         // VERIFIED rows that still check out against storage. Their source
         // commits wait until every replay decision is known (see below).
-        let mut verified: Vec<BatchRecord> = Vec::new();
+        let mut verified: Vec<(BatchRecord, Recheck)> = Vec::new();
         for rec in incomplete {
             let action = next_recovery_action(rec.state);
             tracing::info!(batch_id = %rec.batch_id, state = %rec.state, ?action, "recovery_scan");
@@ -2316,7 +2325,8 @@ impl Engine {
                     // verified (#69). Re-check the store before committing;
                     // anything less trusts a stale claim about a system this
                     // process has never observed.
-                    if !self.storage_still_verified(&rec).await {
+                    let recheck = self.storage_still_verified(&rec).await;
+                    if recheck == Recheck::Failed {
                         tracing::warn!(
                             batch_id = %rec.batch_id,
                             object_uri = rec.object_uri.as_deref().unwrap_or(""),
@@ -2382,7 +2392,7 @@ impl Engine {
                         summary.replay_required += 1;
                         continue;
                     }
-                    verified.push(rec);
+                    verified.push((rec, recheck));
                 }
                 RecoveryAction::None => {}
                 _ => {
@@ -2492,7 +2502,7 @@ impl Engine {
         // commits it once the source has caught up. A lower range whose replay
         // decision could not be recorded holds it back too, though nothing
         // rewinds for it (#639).
-        for rec in verified {
+        for (rec, recheck) in verified {
             if rewinds.holds_back(&rec.progress_start) {
                 tracing::warn!(
                     batch_id = %rec.batch_id,
@@ -2502,7 +2512,7 @@ impl Engine {
                 summary.still_pending += 1;
                 continue;
             }
-            self.commit_recovered(&rec, &mut summary).await?;
+            self.commit_recovered(&rec, recheck, &mut summary).await?;
         }
         // Second pass: the commits above moved committed points up, and the
         // first pass's rewinds are not clamped to them. Rewind again so no
@@ -2544,6 +2554,7 @@ impl Engine {
     async fn commit_recovered(
         &mut self,
         rec: &BatchRecord,
+        recheck: Recheck,
         summary: &mut RecoverySummary,
     ) -> Result<(), VtopError> {
         if let Some(adapter) = self.adapters.get_mut(&rec.source_type) {
@@ -2586,6 +2597,10 @@ impl Engine {
                             ])
                             .inc();
                     }
+                    // Counted at the commit, like verified_total above, not
+                    // at the re-check: a held-back row passes the re-check on
+                    // every restart without committing (#629 review).
+                    verification_mode::count_size_only_commit(recheck, rec);
                     summary.committed += 1;
                     tracing::info!(batch_id = %rec.batch_id, "recovered: source_committed");
                 }
@@ -2627,6 +2642,10 @@ impl Engine {
                         c.content_fingerprint,
                         c.tail_fingerprint,
                     );
+                    // A file archived but not yet deleted before the restart
+                    // (#619): re-armed only if it still has the mtime the
+                    // committed batch saw.
+                    fs.arm_delete_from_seed(&c.path, c.observed_mtime.as_deref());
                 }
             }
         }
