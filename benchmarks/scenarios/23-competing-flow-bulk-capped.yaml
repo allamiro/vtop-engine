@@ -1,0 +1,57 @@
+name: competing-flow-bulk-capped
+description: >-
+  The capped half of the egress ceiling's competitor pair (#481): scenario 22
+  with upload.max_egress_bytes_per_second set to 256 KiB/s - about 2.1 Mbit/s
+  of request-body bytes, 21% of the 10 Mbit/s bottleneck - and nothing else
+  changed. The number to read is competitor_goodput_mbps_with beside scenario
+  22's, each against its own solo windows. Per-cycle engine (process-once): the
+  competitor refuses engine_mode run by design, so each cycle's fresh engine
+  starts with a full bucket of R/32. Requires the netem stack, docker compose
+  -f benchmarks/docker-compose.benchmark.yml --profile netem --profile
+  containerized up -d.
+volume: 250
+file_size: small
+format: jsonl
+# Uncompressed, so the bytes a cycle offers the link are the bytes seeded.
+# COMPARABLE, NOT IDENTICAL, between the two runs: each cycle's 250 file sizes
+# are drawn afresh (1-64 KiB), so a cycle offers about 8.4 MB give or take a
+# few percent. The recorded pair seeded 8.333 MB per cycle uncapped and 8.364
+# MB capped (competitor_pair.json). Pinning the draw would change this file
+# after the pair was measured with it, so it is stated rather than changed.
+compression: none
+checksum: sha256
+backend: s3_native
+bucket: "vtop-bench-soak"
+runner_mode: container
+endpoint_url: http://netem:9200
+shaping_driver: netem
+shaping_latency_ms: 100
+shaping_jitter_ms: 0
+shaping_bottleneck_kbps: 10000
+shaping_buffer_bdp: 1.0
+shaping_competitor: "bulk:120"
+# About eight 1 MiB batches per cycle, all in flight at the shipped default
+# width: eight connections against the competitor's one.
+batch_max_records: 100000
+batch_max_bytes: 1048576
+batch_max_age_seconds: 5
+max_concurrent_batches: 8
+# Each cycle re-seeds the original volume, so every cycle offers the same
+# ~8 MB. Uncapped, a cycle is about the time the link takes to drain it beside
+# the competitor (23 s measured); capped at 256 KiB/s it measured about 40 s.
+# The window is 120 s, not 60: the contended window opens a few seconds into
+# the first cycle, so that cycle always straddles its opening and a 60 s window
+# has to wholly contain the SECOND one. Two capped attempts at bulk:60 were
+# refused for exactly that (no engine cycle wholly inside the window; both
+# cycles that overlapped it crossed an edge). Both halves of the pair use the same
+# window, and scenario 18 explains why a whole cycle must fit.
+backlog_multiplier: 1.0
+seed_concurrently: false
+# THE CAP, the one line this file adds to scenario 22. Set below what the
+# uncapped engine took in scenario 22's first lab run (2.77 Mbit/s of committed
+# body bytes over its attributed cycle), so the ceiling binds: 512 KiB/s was
+# planned first and is above that rate, so it would have priced almost nothing.
+upload_max_egress_bytes_per_second: 262144
+duration_seconds: 300
+fault: none
+sys_sample_interval: 2.0
