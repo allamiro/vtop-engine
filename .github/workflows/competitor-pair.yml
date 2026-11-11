@@ -20,6 +20,12 @@ name: competitor pair (netem lab)
 # comparison between the two halves of one job, never an absolute, and it is
 # recorded with the runner image, kernel and CPU it came from.
 #
+# A REFUSED WINDOW IS KEPT RAW. When the harness refuses a competitor window,
+# it writes that run's raw iperf3 reports into results/<run_id>/ before refusing
+# (lib/competitor.py, keep_raw_reports): competitor-iperf3-<phase>-sender.jsonl,
+# -receiver.json and -line-stamps.json. The artifact below carries them, so a
+# refusal can be explained from what both ends of the flow reported (#610).
+#
 # OUT OF THE DEFAULT PATH ON PURPOSE. It runs for about an hour, so it is
 # dispatched by hand, and on a pull request only when this file itself changes.
 on:

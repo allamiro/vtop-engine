@@ -59,13 +59,14 @@ capability.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from . import netem
@@ -160,6 +161,27 @@ STREAM_SYNC_TOLERANCE_SECONDS = 0.25
 # iperf 3.17 (the netshoot:v0.13 build reports itself as "3.16+" and carries it;
 # netshoot:v0.16 is iperf 3.21).
 JSON_STREAM_FLAG = "--json-stream"
+
+# The receiver's own report, carried back to the client after the test (#610).
+# It changes nothing the harness measures: the server's JSON travels in the
+# end-of-test exchange that iperf3 already runs, after every interval and both
+# summaries are fixed, and no number below reads it. It is asked for so a
+# refused window leaves BOTH sides' raw reports behind (see
+# `Contention.keep_raw_reports`). Without it the receiver's side of a coverage
+# refusal is only the one `sum_received.seconds` figure, and a refusal that
+# turns on how the two sides' clocks differ cannot be explained from one of them.
+SERVER_OUTPUT_FLAG = "--get-server-output"
+
+# What a refused window leaves in the run's results directory (#610), per phase:
+# the client's --json-stream exactly as parsed (the SENDER's per-interval view,
+# with the receiver's summary in its `end` event), the server's own report from
+# that end event (the RECEIVER's per-interval view), and the source stamp of
+# each stream line. Diagnostics only: nothing reads them back.
+RAW_REPORT_FILES = {
+    "sender": "competitor-iperf3-{phase}-sender.jsonl",
+    "receiver": "competitor-iperf3-{phase}-receiver.json",
+    "stamps": "competitor-iperf3-{phase}-line-stamps.json",
+}
 
 # The stamper that runs BESIDE iperf3, inside the probe container (review). The
 # host used to stamp each line when it READ it, which dates the line late by its
@@ -457,6 +479,11 @@ class CompetitorSample:
     retransmits: int | None
     congestion: str
     intervals: tuple[CompetitorInterval, ...]
+    # The report as parsed, and the source stamp of each of its lines, kept so
+    # a refusal can leave them behind (#610). Never read by any measurement, and
+    # out of equality and repr so a sample compares and prints as before.
+    raw: str = field(default="", repr=False, compare=False)
+    stamps: tuple[float, ...] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # The invariant every reader downstream leans on, made unforgeable
@@ -560,10 +587,13 @@ class CompetitorSpec:
         reading it, instead of inferring where a window of the right length
         might have sat. No `-b`: a `bulk` competitor is congestion-controlled,
         because a paced flow cannot lose a share it never asked for and its
-        goodput would say nothing about fairness.
+        goodput would say nothing about fairness. `--get-server-output` only
+        carries the receiver's own report back for a refusal to keep (#610); see
+        SERVER_OUTPUT_FLAG.
         """
         return ["iperf3", "-c", self.server, "-p", str(self.port),
-                "-t", str(self.seconds), "-O", str(self.omit), JSON_STREAM_FLAG]
+                "-t", str(self.seconds), "-O", str(self.omit), JSON_STREAM_FLAG,
+                SERVER_OUTPUT_FLAG]
 
     def command_timeout(self) -> float:
         return self.seconds + self.omit + COMMAND_SLACK_SECONDS
@@ -996,7 +1026,7 @@ def parse_report(out: str, spec: CompetitorSpec, phase: str,
         # share depends on it, so a recorded fairness number that did not name
         # it could not be reproduced.
         congestion=str(end.get("sender_tcp_congestion", "") or ""),
-        intervals=intervals)
+        intervals=intervals, raw=out, stamps=arrivals)
 
 
 def measure(spec: CompetitorSpec, run: Runner, phase: str) -> CompetitorSample:
@@ -1027,7 +1057,60 @@ def measure(spec: CompetitorSpec, run: Runner, phase: str) -> CompetitorSample:
             f"(`{shlex.join(spec.argv())}` exited {code}): {out[:400]}. Start the netem "
             "stack — docker compose -f benchmarks/docker-compose.benchmark.yml "
             "--profile netem up -d — and check the middlebox's iperf3 server is up")
-    return parse_report(out, spec, phase, arrivals)
+    try:
+        return parse_report(out, spec, phase, arrivals)
+    except ShapingError as refused:
+        # A report the parser refused never becomes a sample, so the refusal
+        # itself carries it, for `Contention.keep_raw_reports` (#610).
+        refused.competitor_report = (phase, out, arrivals)
+        raise
+
+
+def _phase_slug(phase: str) -> str:
+    return "-".join(phase.lower().split())
+
+
+def write_raw_report(directory: str, phase: str, out: str,
+                     stamps: tuple[float, ...] | None) -> list[str]:
+    """Leave one phase's raw iperf3 reports in `directory` (#610).
+
+    The sender's file is the client's --json-stream exactly as the parser saw
+    it. The receiver's is the server's own report, which `--get-server-output`
+    puts in the stream's `end` event as `server_output_json`; when it is not
+    there, the file says so rather than being left out, so a missing receiver
+    view is a recorded fact and not an absent file. Returns the paths written.
+    """
+    slug = _phase_slug(phase)
+    paths = {kind: os.path.join(directory, name.format(phase=slug))
+             for kind, name in RAW_REPORT_FILES.items()}
+    receiver: Any = {"absent": "the client's end event carried no server_output_json "
+                               "or server_output_text"}
+    for line in out.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("event") == "end":
+            data = event.get("data")
+            if isinstance(data, dict) and "server_output_json" in data:
+                receiver = data["server_output_json"]
+            elif isinstance(data, dict) and "server_output_text" in data:
+                # A server that answered in text rather than JSON: kept as it
+                # came, because it is still the receiver's own interval lines.
+                receiver = {"server_output_text": data["server_output_text"]}
+    os.makedirs(directory, exist_ok=True)
+    with open(paths["sender"], "w") as f:
+        f.write(out + ("\n" if out and not out.endswith("\n") else ""))
+    with open(paths["receiver"], "w") as f:
+        json.dump(receiver, f, indent=1)
+        f.write("\n")
+    with open(paths["stamps"], "w") as f:
+        json.dump({"phase": phase,
+                   "clock": "time.monotonic() beside iperf3 in the probe container, one per "
+                            "non-blank line of the sender file, in order",
+                   "stamps": None if stamps is None else list(stamps)}, f, indent=1)
+        f.write("\n")
+    return list(paths.values())
 
 
 def solo_agreement(before: float, after: float) -> float:
@@ -1092,8 +1175,12 @@ class Contention:
 
     def __init__(self, spec: CompetitorSpec, run: Runner,
                  vtop_bytes: Callable[[], int],
-                 log: Callable[[str], None] = print) -> None:
+                 log: Callable[[str], None] = print,
+                 diagnostics_dir: str | None = None) -> None:
         self.spec = spec
+        # Where a refused window leaves its raw iperf3 reports (#610); None
+        # keeps nothing. See `keep_raw_reports`.
+        self.diagnostics_dir = diagnostics_dir
         self._run = run
         self._vtop_bytes = vtop_bytes
         self._log = log
@@ -1185,7 +1272,43 @@ class Contention:
     def open_alone(self) -> None:
         """The first bracket, on the way into the block: the empty link, on
         the shape the contended window will run on."""
-        self.before = self.measure_alone("alone before")
+        try:
+            self.before = self.measure_alone("alone before")
+        except ShapingError as refused:
+            self.keep_raw_reports(refused)
+            raise
+
+    def keep_raw_reports(self, refused: BaseException | None = None) -> list[str]:
+        """Leave every phase's raw iperf3 reports in the run's results directory
+        (#610): each sample this run holds, and the report a refusal carried
+        when the parser refused it before it became one.
+
+        Called on the way out of a refusal, before it propagates. It changes no
+        measurement and no verdict: the refusal is re-raised exactly as it was,
+        and a failure to write is logged, never raised, so a full disk cannot
+        replace the reason the run stopped with one about a diagnostic file.
+        """
+        if not self.diagnostics_dir:
+            return []
+        reports: list[tuple[str, str, tuple[float, ...] | None]] = []
+        for phase, sample in (("alone before", self.before), ("with VTOP", self.contended),
+                              ("alone after", self.after)):
+            if sample is not None and sample.raw:
+                reports.append((phase, sample.raw, sample.stamps))
+        carried = getattr(refused, "competitor_report", None)
+        if carried is not None:
+            reports.append(carried)
+        written: list[str] = []
+        for phase, out, stamps in reports:
+            try:
+                written += write_raw_report(self.diagnostics_dir, phase, out, stamps)
+            except OSError as exc:
+                self._log(f"[bench] WARNING: could not keep the {phase} competitor's raw "
+                          f"iperf3 report: {exc}")
+        if written:
+            self._log("[bench] kept the competitor's raw iperf3 reports for this refusal: "
+                      + ", ".join(os.path.basename(path) for path in written))
+        return written
 
     # ------------------------------------------------------------ phase two
 
@@ -1324,6 +1447,18 @@ class Contention:
                       f"crossing the middlebox — docker exec {self.spec.container} pkill iperf3")
 
     def close(self) -> None:
+        """Collect the contended window, measure the link alone again, judge.
+
+        A refusal leaves every phase's raw iperf3 reports behind before it
+        propagates (#610); see `keep_raw_reports` and `_close`.
+        """
+        try:
+            self._close()
+        except ShapingError as refused:
+            self.keep_raw_reports(refused)
+            raise
+
+    def _close(self) -> None:
         """Collect the contended window, measure the link alone again, judge.
 
         Called by the block, as its last act inside the shaped region — not by
@@ -1787,7 +1922,8 @@ class Contention:
 @contextmanager
 def contended(spec: CompetitorSpec | None, vtop_bytes: Callable[[], int],
               run: Runner | None = None,
-              log: Callable[[str], None] = print) -> Iterator[Contention | None]:
+              log: Callable[[str], None] = print,
+              diagnostics_dir: str | None = None) -> Iterator[Contention | None]:
     """Bracket the block with the competitor's three phases.
 
     Entered INSIDE the shaped block, so all three windows cross one
@@ -1810,7 +1946,7 @@ def contended(spec: CompetitorSpec | None, vtop_bytes: Callable[[], int],
         yield None
         return
     handle = Contention(spec, run or docker_exec(spec.container, spec.command_timeout()),
-                        vtop_bytes, log)
+                        vtop_bytes, log, diagnostics_dir=diagnostics_dir)
     handle.open_alone()
     try:
         yield handle
