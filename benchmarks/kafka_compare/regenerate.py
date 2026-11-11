@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import shlex
 import subprocess
 import sys
 from collections.abc import Callable, Iterable
@@ -145,16 +146,23 @@ def check_runs_unchanged(runs: Iterable[str], repo: str = REPO) -> None:
     """Refuse when a committed run's files on disk are not HEAD's: report.py reads the run from disk,
     so a staged, unstaged or untracked change inside it would be regenerated as if HEAD said it.
     Raw data is not edited in place; a re-run is a new run directory."""
-    changed = []
+    problems = []
     for run in runs:
         rel = os.path.relpath(run, repo)
+        quoted = shlex.quote(rel)
         # Against HEAD, not the index: a staged edit is as uncommitted as an unstaged one.
-        diff = _git(repo, "diff", "--name-only", "HEAD", "--", rel).split("\n")
-        untracked = _git(repo, "ls-files", "--others", "--exclude-standard", "--", rel).split("\n")
-        changed += [name for name in diff + untracked if name]
-    if changed:
-        raise Refused("a committed run differs from HEAD on disk (commit it, or restore it with "
-                      "`git restore --staged --worktree`): " + ", ".join(sorted(set(changed))))
+        diff = sorted(filter(None, _git(repo, "diff", "--name-only", "HEAD", "--", rel).split("\n")))
+        untracked = sorted(filter(None, _git(repo, "ls-files", "--others", "--exclude-standard", "--",
+                                             rel).split("\n")))
+        # Each hint names the run directory, so it can be pasted as printed.
+        if diff:
+            problems.append(f"{rel}: changed from HEAD: {', '.join(diff)}; commit them, or restore the run "
+                            f"with `git restore --staged --worktree -- {quoted}`")
+        if untracked:
+            problems.append(f"{rel}: untracked: {', '.join(untracked)}; commit them, or delete them "
+                            f"(`git clean -n -- {quoted}` to preview, `git clean -f -- {quoted}` to delete)")
+    if problems:
+        raise Refused("a committed run differs from HEAD on disk: " + " | ".join(problems))
 
 
 def run_report(run_dir: str) -> list[str]:

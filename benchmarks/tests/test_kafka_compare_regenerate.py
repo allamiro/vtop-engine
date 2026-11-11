@@ -6,6 +6,7 @@ while a drift check over them still passed.
 """
 import io
 import os
+import shlex
 import subprocess
 
 import pytest
@@ -180,8 +181,19 @@ def test_refuses_a_deleted_or_added_file_in_a_committed_run(repo):
     put(repo, f"{RUN}/failover.csv")
     with pytest.raises(regenerate.Refused) as caught:
         regenerate.check_runs_unchanged([run], str(repo))
-    assert f"{RUN}/environment.json" in str(caught.value)
-    assert f"{RUN}/failover.csv" in str(caught.value)
+    message = str(caught.value)
+    assert f"{RUN}/environment.json" in message
+    assert f"{RUN}/failover.csv" in message
+    # The hints name the run directory, not a placeholder ...
+    restore = f"git restore --staged --worktree -- {RUN}"
+    clean = f"git clean -f -- {RUN}"
+    assert f"`{restore}`" in message
+    assert f"`git clean -n -- {RUN}`" in message
+    assert f"`{clean}`" in message
+    # ... and, run as printed, they put the run back the way HEAD has it.
+    for command in (restore, clean):
+        subprocess.run(shlex.split(command), cwd=repo, check=True, capture_output=True)
+    regenerate.check_runs_unchanged([run], str(repo))
 
 
 def test_refuses_when_no_run_is_committed(repo):

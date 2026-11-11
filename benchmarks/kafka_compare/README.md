@@ -101,7 +101,9 @@ was drawn with.
 CI's `benchmark charts (regenerate + no drift)` job runs [`regenerate.py`](regenerate.py), which hands every
 committed run under `results/` to `report.py` and fails on any difference in `docs/benchmarks/`. It refuses
 another plotting stack, a font from outside matplotlib, no committed run, a committed run whose files on
-disk differ from `HEAD` (it vouches for what `HEAD` says), two runs writing one file, and committed output
+disk differ from `HEAD` (it vouches for what `HEAD` says; the refusal names the run directory and the
+`git restore --staged --worktree -- <run dir>` and `git clean -n`/`-f -- <run dir>` commands that put it
+back), two runs writing one file, and committed output
 that no run writes. SVG and Markdown must match byte for byte. PNGs must match pixel for
 pixel, not byte for byte: Pillow's macOS and Linux wheels compress identical pixels to different bytes, so a
 PNG whose decoded image is unchanged keeps its committed bytes.
