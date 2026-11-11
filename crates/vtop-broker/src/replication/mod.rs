@@ -27,6 +27,9 @@ pub mod network;
 pub(crate) use network::REPLICA_LIMITS;
 pub mod transfer;
 
+#[cfg(test)]
+mod fence_race_tests;
+
 use crate::{
     storage_producer_id, BrokerError, BrokerResult, MetaFencingEpoch, MetaLeaseState,
     ProducerEpochJournal, SegmentFormat, PROMOTION_MARKER_PRODUCER,
@@ -314,6 +317,19 @@ impl InProcessFollower {
             #[cfg(test)]
             before_dispute_install: Mutex::new(None),
         })
+    }
+
+    /// The test hook between a mark read and a dispute install.
+    #[cfg(test)]
+    fn run_before_dispute_install(&self) {
+        if let Some(hook) = self
+            .before_dispute_install
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            hook();
+        }
     }
 
     pub fn node_id(&self) -> Uuid {
@@ -1049,14 +1065,7 @@ impl InProcessFollower {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let from = self.cluster_committed.get();
         #[cfg(test)]
-        if let Some(hook) = self
-            .before_dispute_install
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-        {
-            hook();
-        }
+        self.run_before_dispute_install();
         if from < state.segment.next_offset() {
             *self
                 .kept_dispute
@@ -1258,6 +1267,8 @@ impl InProcessFollower {
             // gap no leader fills. Without a tail in the caller's history,
             // nothing is kept, which is the answer before #616.
             let mark = self.cluster_committed.get();
+            #[cfg(test)]
+            self.run_before_dispute_install();
             let from = if divergence >= mark {
                 divergence
             } else {
@@ -2082,7 +2093,8 @@ mod tests {
     /// Invariant: no kept dispute ever starts below the mark, and the
     /// leader's next record lands.
     #[test]
-    fn a_mark_landing_while_a_fence_keeps_a_dispute_never_leaves_it_below_the_mark() {
+    fn a_mark_landing_while_an_uncomparable_replica_keeps_a_dispute_never_leaves_it_below_the_mark()
+    {
         let dir = tempfile::tempdir().unwrap();
         let segment = ActiveSegment::create(
             dir.path().join("range.active"),
