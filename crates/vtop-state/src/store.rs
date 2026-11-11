@@ -231,28 +231,33 @@ pub trait StateStore: Send + Sync {
     /// any prune.
     async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError>;
 
-    /// The newest committed batch of EACH FILE (inode) that has lived at
-    /// `path`, computed in the store like [`StateStore::committed_cursors`]:
+    /// The newest committed batch of EACH FILE (inode) that has lived at each
+    /// path, computed in the store like [`StateStore::committed_cursors`]:
     /// newest by `(created_at, batch_id)`, the order the windows were read and
     /// the order pruning keeps the newest row by, so equal timestamps break
-    /// the same way everywhere.
+    /// the same way everywhere. Ordered by path, and within a path newest
+    /// first, so the first row of each path is the one
+    /// [`StateStore::committed_cursors`] answers.
     ///
-    /// Recovery asks this only for a path with a range being re-read from a
-    /// file rotated away from it (#621): a FAILED row stays in the ledger and
-    /// is rewound again at every restart, so the re-read must start above what
-    /// a later batch already archived of that file.
+    /// For a byte-offset source whose failed range can be re-read from a file
+    /// rotated away from its path (#621). That re-read commits under the path
+    /// AFTER the batches of the file now at the path, so the newest row of the
+    /// path is not always the current file's, and the restart seed picks the
+    /// row of the file at the path from these. A FAILED row stays in the
+    /// ledger and is rewound again at every restart, so recovery also starts
+    /// such a re-read above what a later batch already archived of that file.
     ///
     /// Rows that recorded no inode (legacy, or a platform without inodes)
     /// cannot be told apart by file, so they are answered TOGETHER as one
-    /// entry with `inode: None`: the newest of them. No caller may attribute
-    /// that entry to a particular file; recovery ignores it.
+    /// entry per path with `inode: None`: the newest of them. No caller may
+    /// attribute that entry to a particular file.
     ///
     /// History pruning keeps one row per path, so older files' rows can be
-    /// gone; the caller then re-reads, which costs a duplicate, never a skip.
-    async fn committed_cursors_at(
+    /// gone; the caller then falls back to the newest row, or re-reads, which
+    /// costs a duplicate, never a skip.
+    async fn committed_cursors_by_file(
         &self,
         source_type: SourceType,
-        path: &str,
     ) -> Result<Vec<CommittedCursor>, VtopError>;
 
     /// All batches, newest first.

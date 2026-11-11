@@ -572,7 +572,7 @@ yet - and so does a rewind accepted before its file was renamed away with
 nothing created in its place, whose range only a read of the path moves onto
 the rotated list. A FAILED row stays in the ledger and is rewound again at every restart, so
 recovery asks the ledger for the newest committed batch of each file that has
-lived at that path (`StateStore::committed_cursors_at`) and starts the re-read
+lived at that path (`StateStore::committed_cursors_by_file`) and starts the re-read
 above what is already archived of the rotated file - counting only a row whose
 first page, and page below its end, the rotated file still holds. A commit
 in a running engine raises that floor by the same test: a window of a file's
@@ -609,18 +609,24 @@ Limits:
   section (above): a replacement matching both sampled pages, or a change
   confined between them. A range starting at byte 0 has no page below its
   start, so its proof is the inode and the first page alone.
-- **The restart seed can name the rotated file.** Within a pass the re-read
-  comes first - the path is not read until the rotated file's range is - but
-  the current file may already have batches by then: a window of it read in
-  the cycle whose rotation sealed the failed window (the re-read's first read
-  seals it in turn), or batches committed before a restart whose recovery
-  then re-reads the range. The re-read's batch is created after those, and
-  becomes the
-  path's newest committed row (the restart seed is the newest by creation).
-  If the current file gets no new data before the next restart, that restart
-  seeds the cursor from the rotated file and reads the current one from byte
-  0 again - a one-time duplicate, bounded by the current file, never a skip. Likewise, if pruning removes the re-read's rows while the
-  rotated file still exists, the next restart re-reads it.
+- **The restart seed is chosen per file, and needs proof.** A re-read batch
+  is created after the current file's batches - a window of it read in the
+  cycle whose rotation sealed the failed window, or batches committed before
+  a restart whose recovery then re-reads the range - so it becomes the path's
+  newest committed row. Seeded from that row, a restart took the current file
+  for a rotation and archived it again from byte 0 (review of #621). The seed
+  is therefore chosen from the newest committed row of EACH file that has
+  lived at the path (`StateStore::committed_cursors_by_file`): the newest, as
+  before, unless it names a file no longer at the path; then the row of the
+  file that is, when that file is positively identified - the same inode,
+  the first page and the page below the row's end (#620). A current file
+  whose row lacks either fingerprint (written before #578/#620), or whose
+  bytes no longer match them, is not proven, and the newest row stands: the
+  current file is read from byte 0 again, a duplicate bounded by the file,
+  never a skip. So does a current file whose rows pruning removed (pruning
+  keeps the newest row per path, which can be the re-read's). Likewise, if
+  pruning removes the re-read's rows while the rotated file still exists,
+  the next restart re-reads it.
 - Without inodes (non-Unix platforms) nothing can be proven, and the rewind is
   refused as before. Syslog-spool sources are unchanged: a spool rotated away
   is still refused.

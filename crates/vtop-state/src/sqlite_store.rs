@@ -645,14 +645,13 @@ impl StateStore for SqliteStateStore {
         Ok(rows.iter().filter_map(committed_cursor_of).collect())
     }
 
-    async fn committed_cursors_at(
+    async fn committed_cursors_by_file(
         &self,
         source_type: SourceType,
-        path: &str,
     ) -> Result<Vec<CommittedCursor>, VtopError> {
-        // `committed_cursors`, for one path, partitioned by FILE (inode)
-        // instead of by path (#621): the newest committed row of each file
-        // that has lived there.
+        // `committed_cursors`, partitioned by FILE (path and inode) instead of
+        // by path (#621): the newest committed row of each file that has
+        // lived at each path, the path's newest first.
         let rows = sqlx::query(
             "WITH committed AS ( \
                  SELECT json_extract(progress_end_json, '$.path') AS path, \
@@ -665,15 +664,16 @@ impl StateStore for SqliteStateStore {
                         created_at, batch_id \
                  FROM batches WHERE state = ? AND source_type = ? \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ROW_NUMBER() OVER ( \
-                            PARTITION BY inode ORDER BY created_at DESC, batch_id DESC) AS rn \
-                 FROM committed WHERE path = ? \
+                 SELECT path, inode, end_byte, file_size, content, tail, mtime, \
+                        created_at, batch_id, ROW_NUMBER() OVER ( \
+                            PARTITION BY path, inode ORDER BY created_at DESC, batch_id DESC) AS rn \
+                 FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest WHERE rn = 1",
+             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest \
+             WHERE rn = 1 ORDER BY path, created_at DESC, batch_id DESC",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(source_type.as_str())
-        .bind(path)
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;

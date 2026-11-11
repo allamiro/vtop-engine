@@ -145,15 +145,14 @@ impl StateStore for DeadlineStore {
         .await
     }
 
-    async fn committed_cursors_at(
+    async fn committed_cursors_by_file(
         &self,
         source_type: SourceType,
-        path: &str,
     ) -> Result<Vec<CommittedCursor>, VtopError> {
         self.within(
-            "committed_cursors_at",
+            "committed_cursors_by_file",
             self.scan,
-            self.inner.committed_cursors_at(source_type, path),
+            self.inner.committed_cursors_by_file(source_type),
         )
         .await
     }
@@ -298,10 +297,9 @@ mod tests {
         async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
             never!()
         }
-        async fn committed_cursors_at(
+        async fn committed_cursors_by_file(
             &self,
             _: SourceType,
-            _: &str,
         ) -> Result<Vec<CommittedCursor>, VtopError> {
             never!()
         }
@@ -380,8 +378,8 @@ mod tests {
             "committed_kafka_offsets",
         );
         expired(
-            store.committed_cursors_at(SourceType::File, "/a").await,
-            "committed_cursors_at",
+            store.committed_cursors_by_file(SourceType::File).await,
+            "committed_cursors_by_file",
         );
         expired(store.list_batches().await, "list_batches");
         expired(

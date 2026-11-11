@@ -80,7 +80,7 @@ pub async fn run_all(store: &dyn StateStore) {
     committed_cursors_carry_the_newest_rows_content_fingerprint(store).await;
     committed_kafka_offsets_are_the_newest_row_of_each_partition_and_group(store).await;
     claims_respect_live_leases_and_take_over_expired_ones(store).await;
-    committed_cursors_at_answer_each_file_that_lived_at_a_path(store).await;
+    committed_cursors_by_file_answer_each_file_that_lived_at_a_path(store).await;
 }
 
 /// #557: the claim fence. Two handles onto ONE ledger stand for two engines
@@ -689,13 +689,14 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
     );
 }
 
-/// #621: a range re-read from a rotated file must start above what a later
-/// batch already archived of THAT file, which the per-path cursor cannot say
-/// once another file has taken the path. `committed_cursors_at` answers, for
-/// one path, with the newest committed batch of each inode - the newest, not
-/// the furthest, exactly as the per-path cursor (a `copytruncate` keeps the
-/// inode) - and nothing uncommitted, nothing of another path.
-async fn committed_cursors_at_answer_each_file_that_lived_at_a_path(store: &dyn StateStore) {
+/// #621: the restart seed must find the row of the file now at a path, and a
+/// range re-read from a rotated file must start above what a later batch
+/// already archived of THAT file; the per-path cursor can say neither once
+/// another file has taken the path. `committed_cursors_by_file` answers with
+/// the newest committed batch of each (path, inode) - the newest, not the
+/// furthest, exactly as the per-path cursor (a `copytruncate` keeps the inode)
+/// - each path's rows together and newest first, nothing uncommitted.
+async fn committed_cursors_by_file_answer_each_file_that_lived_at_a_path(store: &dyn StateStore) {
     let marker = |path: &str, inode: Option<u64>, end: u64| ProgressMarker::File {
         path: path.into(),
         inode,
@@ -765,13 +766,30 @@ async fn committed_cursors_at_answer_each_file_that_lived_at_a_path(store: &dyn 
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    let mut got = store
-        .committed_cursors_at(SourceType::File, "/at.log")
+    let all = store
+        .committed_cursors_by_file(SourceType::File)
         .await
         .unwrap();
-    got.sort_by_key(|c| c.inode);
-    let want = |inode: Option<u64>, end_byte: u64| CommittedCursor {
-        path: "/at.log".into(),
+    // Each path's rows form ONE run, so a caller can take a path's files
+    // together (the store is shared with other checks, whose rows are here
+    // too).
+    let mut runs: Vec<&str> = Vec::new();
+    for c in &all {
+        if runs.last() != Some(&c.path.as_str()) {
+            assert!(
+                !runs.contains(&c.path.as_str()),
+                "{} appears in two runs: {all:?}",
+                c.path
+            );
+            runs.push(&c.path);
+        }
+    }
+    let got: Vec<_> = all
+        .into_iter()
+        .filter(|c| c.path == "/at.log" || c.path == "/elsewhere.log")
+        .collect();
+    let want = |path: &str, inode: Option<u64>, end_byte: u64| CommittedCursor {
+        path: path.into(),
         inode,
         end_byte,
         observed_size: Some(end_byte * 10),
@@ -783,34 +801,35 @@ async fn committed_cursors_at_answer_each_file_that_lived_at_a_path(store: &dyn 
     assert_eq!(
         got,
         vec![
-            // Rows without an inode cannot be told apart by file: they are
-            // answered together, as the newest of them (see the trait doc).
-            want(None, 25),
-            want(Some(11), 900),
-            // The uncommitted 5000 does not count.
-            want(Some(22), 60),
+            // Newest first within the path, so the first is the one
+            // `committed_cursors` answers for it. Rows without an inode cannot
+            // be told apart by file: they are answered together, as the newest
+            // of them (see the trait doc).
+            want("/at.log", None, 25),
             // The newest row, not the furthest: a copytruncate keeps the inode.
-            want(Some(33), 30),
+            want("/at.log", Some(33), 30),
+            // The uncommitted 5000 does not count.
+            want("/at.log", Some(22), 60),
+            want("/at.log", Some(11), 900),
+            // Another path's file with the same inode is its own file.
+            want("/elsewhere.log", Some(11), 7),
         ]
     );
-    let mut spool = store
-        .committed_cursors_at(SourceType::SyslogSpool, "/at.log")
+    let spool: Vec<_> = store
+        .committed_cursors_by_file(SourceType::SyslogSpool)
         .await
-        .unwrap();
-    spool.sort_by_key(|c| c.inode);
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.path == "/at.log")
+        .collect();
     assert_eq!(
         spool,
         vec![
             // Newest, not furthest; and the uncommitted 9000 does not count.
-            want(Some(41), 50),
-            want(Some(42), 70),
+            want("/at.log", Some(42), 70),
+            want("/at.log", Some(41), 50),
         ]
     );
-    assert!(store
-        .committed_cursors_at(SourceType::SyslogSpool, "/elsewhere.log")
-        .await
-        .unwrap()
-        .is_empty());
 }
 
 /// #558: a restart seeds each file's cursor from the ledger. The ledger's

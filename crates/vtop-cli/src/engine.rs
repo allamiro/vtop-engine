@@ -2583,31 +2583,30 @@ impl Engine {
         else {
             return;
         };
-        for path in files.rotated_replay_paths() {
-            match self
-                .store
-                .committed_cursors_at(SourceType::File, &path)
-                .await
-            {
-                Ok(rows) => {
-                    let archived: Vec<ArchivedEnd> = rows
-                        .into_iter()
-                        .map(|row| ArchivedEnd {
-                            inode: row.inode,
-                            end_byte: row.end_byte,
-                            content: row.content_fingerprint,
-                            tail: row.tail_fingerprint,
-                        })
-                        .collect();
-                    files.raise_rotated_replay_floor(&path, &archived);
-                }
-                Err(e) => tracing::warn!(
-                    path,
+        let paths = files.rotated_replay_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let rows = match self.store.committed_cursors_by_file(SourceType::File).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    paths = ?paths,
                     error = %e,
-                    "recovery could not read what is already archived of a rotated file; its \
-                     failed range is re-read from its start, which may archive part of it again"
-                ),
+                    "recovery could not read what is already archived of rotated files; their \
+                     failed ranges are re-read from their start, which may archive part of them \
+                     again"
+                );
+                return;
             }
+        };
+        for path in paths {
+            let archived: Vec<ArchivedEnd> = rows
+                .iter()
+                .filter(|row| row.path == path)
+                .map(archived_end)
+                .collect();
+            files.raise_rotated_replay_floor(&path, &archived);
         }
     }
 
@@ -2710,21 +2709,34 @@ impl Engine {
         // fingerprint of its first bytes, for a replacement that kept the
         // inode (#578), and of the bytes below the offset, for one that also
         // kept the first page (#620).
-        let file_cursors = self.store.committed_cursors(SourceType::File).await?;
+        //
+        // Per FILE, not per path, for file sources (review of #621): a range
+        // re-read from a rotated file commits under the path after the batches
+        // of the file now there, so the path's newest row can name the rotated
+        // file. The seed is then the row of the file at the path, when that
+        // file is positively identified (`FileSource::seed_choice`); otherwise
+        // the newest row, as before.
+        let file_rows = self
+            .store
+            .committed_cursors_by_file(SourceType::File)
+            .await?;
         let spool_cursors = self
             .store
             .committed_cursors(SourceType::SyslogSpool)
             .await?;
         if let Some(a) = self.adapters.get_mut(&SourceType::File) {
             if let Some(fs) = a.as_any_mut().downcast_mut::<FileSource>() {
-                for c in file_cursors {
+                // The store answers each path's files together, newest first.
+                for files in file_rows.chunk_by(|a, b| a.path == b.path) {
+                    let archived: Vec<ArchivedEnd> = files.iter().map(archived_end).collect();
+                    let c = &files[FileSource::seed_choice(&files[0].path, &archived)];
                     fs.seed_committed_from(
                         &c.path,
                         c.end_byte,
                         c.inode,
                         c.observed_size,
-                        c.content_fingerprint,
-                        c.tail_fingerprint,
+                        c.content_fingerprint.clone(),
+                        c.tail_fingerprint.clone(),
                     );
                     // A file archived but not yet deleted before the restart
                     // (#619): re-armed only if it still has the mtime the
@@ -3519,6 +3531,17 @@ fn source_for_marker(requested: &DiscoveredSource, marker: &ProgressMarker) -> D
             }
         }
         _ => requested.clone(),
+    }
+}
+
+/// What the file adapter needs of a committed row to judge which file it was
+/// read from (#621): its inode, end, first page and the page below its end.
+fn archived_end(row: &vtop_state::CommittedCursor) -> ArchivedEnd {
+    ArchivedEnd {
+        inode: row.inode,
+        end_byte: row.end_byte,
+        content: row.content_fingerprint.clone(),
+        tail: row.tail_fingerprint.clone(),
     }
 }
 
@@ -4685,6 +4708,114 @@ mod tests {
         );
     }
 
+    /// Review of #621 (Codex): a re-read of a rotated file must not become the
+    /// path's restart position. One cycle sees the rotation: the old file's
+    /// buffered window is sealed and fails, and the new file's window commits.
+    /// The old range is then re-read from the rotated file and commits, after
+    /// the new file's batch. The restart seed was the newest committed row of
+    /// the path, by creation, so it named the rotated file. The restart then
+    /// took the new file for a rotation and archived it again from byte 0.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_re_read_of_a_rotated_file_does_not_take_over_the_paths_restart_position() {
+        use std::os::unix::fs::MetadataExt;
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        std::fs::write(&input, "old 1\nold 2\n").unwrap(); // 12 bytes
+        let old_inode = std::fs::metadata(&input).unwrap().ino();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let config = |work: &str| {
+            let mut cfg = file_config(
+                dir.path().join(work).to_str().unwrap(),
+                &url,
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            cfg.batching.max_records = 10_000;
+            cfg.batching.max_bytes = 104_857_600;
+            cfg.batching.max_batch_age_seconds = 3_600;
+            cfg
+        };
+        let new_inode;
+        {
+            let mut first = Engine::new(config("work-1"), StreamsConfig { streams: vec![] })
+                .await
+                .unwrap();
+            let held = first.run_source(SourceType::File, false).await.unwrap();
+            assert!(
+                held.is_empty(),
+                "the old file's window is buffered, not flushed"
+            );
+
+            std::fs::rename(&input, dir.path().join("app.log.1")).unwrap();
+            std::fs::write(&input, "new 1\nnew 2\nnew 3\n").unwrap(); // 18 bytes
+            new_inode = std::fs::metadata(&input).unwrap().ino();
+
+            // One cycle: the rotation seals the old window, the new file is
+            // read and flushed. The old window's upload is throttled; the new
+            // one's goes through.
+            first.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(1));
+            let rotated = first.run_source(SourceType::File, true).await.unwrap();
+            let failed: Vec<_> = rotated
+                .iter()
+                .filter(|o| o.final_state == BatchState::Failed)
+                .collect();
+            assert_eq!(failed.len(), 1, "the old window fails: {rotated:?}");
+            assert_eq!(
+                committed_file_ranges(&first).await,
+                vec![(Some(new_inode), 0, 18, Some(3))],
+                "and the new file's window commits in the same cycle"
+            );
+            // The old range is re-read from the rotated file and commits
+            // later, under the same path.
+            for _ in 0..3 {
+                first.run_source(SourceType::File, true).await.unwrap();
+            }
+            let mut want = vec![
+                (Some(old_inode), 0, 12, Some(2)),
+                (Some(new_inode), 0, 18, Some(3)),
+            ];
+            want.sort();
+            assert_eq!(committed_file_ranges(&first).await, want);
+        } // the engine stops
+
+        let mut second = Engine::new(config("work-2"), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        second.recover().await.unwrap();
+        for _ in 0..3 {
+            second.run_source(SourceType::File, true).await.unwrap();
+        }
+        let new_batches: Vec<_> = committed_file_ranges(&second)
+            .await
+            .into_iter()
+            .filter(|(inode, ..)| *inode == Some(new_inode))
+            .collect();
+        assert_eq!(
+            new_batches,
+            vec![(Some(new_inode), 0, 18, Some(3))],
+            "the new file resumes at its committed 18 after the restart; it is not \
+             archived again from byte 0"
+        );
+
+        // And it resumes there: a line appended now is archived on its own.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&input)
+            .unwrap()
+            .write_all(b"new 4\n")
+            .unwrap();
+        second.run_source(SourceType::File, true).await.unwrap();
+        assert!(
+            committed_file_ranges(&second)
+                .await
+                .contains(&(Some(new_inode), 18, 24, Some(1))),
+            "the restart position kept: {:?}",
+            committed_file_ranges(&second).await
+        );
+    }
+
     /// `vtop_source_replay_refused_total` for one tenant's file sources, read
     /// back through the registry as a scrape would.
     fn refused_so_far(tenant: &str) -> u64 {
@@ -4900,12 +5031,11 @@ mod tests {
         ) -> Result<Vec<vtop_state::CommittedCursor>, VtopError> {
             self.inner.committed_cursors(source_type).await
         }
-        async fn committed_cursors_at(
+        async fn committed_cursors_by_file(
             &self,
             source_type: SourceType,
-            path: &str,
         ) -> Result<Vec<vtop_state::CommittedCursor>, VtopError> {
-            self.inner.committed_cursors_at(source_type, path).await
+            self.inner.committed_cursors_by_file(source_type).await
         }
         async fn committed_kafka_offsets(
             &self,

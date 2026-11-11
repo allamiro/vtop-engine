@@ -608,13 +608,12 @@ impl StateStore for PgStateStore {
         Ok(rows.iter().filter_map(committed_cursor_of).collect())
     }
 
-    async fn committed_cursors_at(
+    async fn committed_cursors_by_file(
         &self,
         source_type: SourceType,
-        path: &str,
     ) -> Result<Vec<CommittedCursor>, VtopError> {
-        // See the SQLite implementation (#621): `committed_cursors` for one
-        // path, partitioned by inode instead of by path.
+        // See the SQLite implementation (#621): `committed_cursors`,
+        // partitioned by path and inode instead of by path.
         let rows = sqlx::query(
             "WITH committed AS ( \
                  SELECT progress_end_json::jsonb ->> 'path' AS path, \
@@ -627,15 +626,16 @@ impl StateStore for PgStateStore {
                         created_at, batch_id \
                  FROM batches WHERE state = $1 AND source_type = $2 \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ROW_NUMBER() OVER ( \
-                            PARTITION BY inode ORDER BY created_at DESC, batch_id DESC) AS rn \
-                 FROM committed WHERE path = $3 \
+                 SELECT path, inode, end_byte, file_size, content, tail, mtime, \
+                        created_at, batch_id, ROW_NUMBER() OVER ( \
+                            PARTITION BY path, inode ORDER BY created_at DESC, batch_id DESC) AS rn \
+                 FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest WHERE rn = 1",
+             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest \
+             WHERE rn = 1 ORDER BY path, created_at DESC, batch_id DESC",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(source_type.as_str())
-        .bind(path)
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;

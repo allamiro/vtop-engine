@@ -479,6 +479,52 @@ impl FileSource {
         }
     }
 
+    /// Which of `path`'s committed files - the newest committed range of each
+    /// file that has lived there, newest first - the restart seed is taken
+    /// from (review of #621). An index into `newest_first`.
+    ///
+    /// Normally the newest, as it always was: the window read last. But a
+    /// range re-read from a file rotated away from the path commits under the
+    /// path AFTER the batches of the file now there, so the newest row can
+    /// name the rotated file. Seeded from it, the restart took the current
+    /// file for a rotation and archived it again from byte 0. So when the
+    /// newest row's file is not the one at the path, the seed is the row of the
+    /// file that is - but only on POSITIVE identity: the same inode, the first
+    /// page its marker fingerprinted, and the page ending at its end (#620).
+    /// A row without both fingerprints (legacy), or a file that does not match
+    /// them, proves nothing, and the newest row stands: that costs a re-read
+    /// of the current file, never a skip.
+    pub fn seed_choice(path: &str, newest_first: &[ArchivedEnd]) -> usize {
+        let Some(newest) = newest_first.first() else {
+            return 0;
+        };
+        let Some(current_inode) = std::fs::metadata(path).ok().and_then(|md| inode_of(&md)) else {
+            return 0;
+        };
+        if newest.inode.is_none() || newest.inode == Some(current_inode) {
+            return 0;
+        }
+        newest_first
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, row)| {
+                let (Some(content), Some(tail)) = (row.content.as_ref(), row.tail.as_ref()) else {
+                    return false;
+                };
+                if row.inode != Some(current_inode) {
+                    return false;
+                }
+                let (inode, len, head, at_tail) =
+                    Self::probe_with_tail(Path::new(path), row.end_byte, Some(tail));
+                inode == Some(current_inode)
+                    && len >= row.end_byte
+                    && content.matches_head(&head)
+                    && tail.matches_bytes(&at_tail)
+            })
+            .map_or(0, |(i, _)| i)
+    }
+
     /// Re-arm the deferred delete of a file the engine had fully archived but
     /// not yet deleted before a restart (#619), from the seed just given to
     /// [`Self::seed_committed_from`] and the mtime the same committed batch
@@ -5003,6 +5049,83 @@ mod tests {
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
         let err = fs.replay_from_marker(&start).await.unwrap_err().to_string();
         assert!(err.contains("identity changed"), "{err}");
+    }
+
+    /// Review of #621: the restart seed is the newest committed row of the
+    /// path, unless that row names a file no longer at the path (a re-read of
+    /// a rotated file commits after the current file's batches). Then it is
+    /// the current file's row - only on positive identity: the same inode,
+    /// the first page and the page below its end. Anything less keeps the
+    /// newest row, which costs a re-read of the current file, never a skip.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_restart_seed_is_the_file_at_the_path_only_when_it_is_proven() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "new 1\nnew 2\n").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let read = read_one(&mut fs, &path).await;
+        let ProgressMarker::File {
+            content_fingerprint,
+            tail_fingerprint,
+            ..
+        } = &read[0].progress_end
+        else {
+            panic!("a file marker");
+        };
+        let current = ArchivedEnd {
+            inode: Some(inode),
+            end_byte: 12,
+            content: content_fingerprint.clone(),
+            tail: tail_fingerprint.clone(),
+        };
+        assert!(current.content.is_some() && current.tail.is_some());
+        let rotated = ArchivedEnd {
+            inode: Some(inode + 1_000_000),
+            end_byte: 30,
+            content: ContentFingerprint::of(b"old"),
+            tail: ContentFingerprint::of_tail(b"old"),
+        };
+
+        assert_eq!(
+            FileSource::seed_choice(&path, &[current.clone(), rotated.clone()]),
+            0,
+            "the newest row is the file at the path: as before"
+        );
+        assert_eq!(
+            FileSource::seed_choice(&path, &[rotated.clone(), current.clone()]),
+            1,
+            "the newest row is a rotated file's re-read: the file at the path is proven"
+        );
+        let legacy = ArchivedEnd {
+            tail: None,
+            ..current.clone()
+        };
+        assert_eq!(
+            FileSource::seed_choice(&path, &[rotated.clone(), legacy]),
+            0,
+            "a row without the page below its end proves nothing"
+        );
+        // Rewritten in place below the first page: the same inode and first
+        // bytes, other bytes below the end.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"new 1\nNEW 2\n")
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        let short_head = ArchivedEnd {
+            content: ContentFingerprint::of(b"new 1\n"),
+            ..current.clone()
+        };
+        assert_eq!(
+            FileSource::seed_choice(&path, &[rotated, short_head]),
+            0,
+            "a file whose bytes below the end changed is not the row's file"
+        );
     }
 
     /// #621 with `delete_after_commit` (#619): a delete can find the path's
