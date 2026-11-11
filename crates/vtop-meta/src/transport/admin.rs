@@ -95,6 +95,16 @@ pub trait AdminHandler: Send + Sync {
             "this admin handler does not serve replica set reads".to_owned(),
         ))
     }
+    /// Linearizable read of the cluster's feature level and what each node
+    /// reported it runs (#634). Defaulted to a refusal, as the others are.
+    async fn read_cluster_versions(
+        &self,
+        _request: crate::transport::wire::AdminReadClusterVersionsRequest,
+    ) -> TransportResult<crate::transport::wire::AdminReadClusterVersionsResponse> {
+        Err(TransportError::Protocol(
+            "this admin handler does not serve cluster version reads".to_owned(),
+        ))
+    }
 }
 
 /// Admin server, with or without TLS.
@@ -319,6 +329,16 @@ fn predates_replica_set_read() -> String {
     TransportError::UnexpectedKind(KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ).to_string()
 }
 
+/// Whether `error` is a metadata node refusing the cluster-versions read
+/// because it predates it (#634): its dispatcher's unknown-kind refusal.
+pub fn predates_cluster_versions_read(error: &TransportError) -> bool {
+    matches!(error, TransportError::Protocol(message)
+        if *message == TransportError::UnexpectedKind(
+            crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ
+        )
+        .to_string())
+}
+
 /// Whether metadata refused a promotion report BECAUSE it carries lineage
 /// verdicts (#577), so the same report without them is the one to send.
 ///
@@ -356,6 +376,35 @@ pub fn refuses_lineage_verdicts(error: &TransportError) -> bool {
     let undecodable = crate::wire::CodecError::UnknownTag {
         what: "promotion outcome",
         tag: 3,
+    }
+    .to_string();
+    message.starts_with(gate_prefix) || message.contains(&undecodable)
+}
+
+/// Whether metadata refused a data node's version report (#634) because the
+/// tier is not yet at the level that records it, so the node should simply
+/// ask again later.
+///
+/// Two releases refuse it, each in its own words, both before anything is
+/// replicated: one with feature levels below
+/// [`crate::command::NODE_VERSION_REPORTS_FEATURE_LEVEL`], with the gate's
+/// `FeatureNotEnabled`; and one that cannot decode the command kind at all.
+pub fn refuses_version_report(error: &TransportError) -> bool {
+    let TransportError::Protocol(message) = error else {
+        return false;
+    };
+    let gate = crate::raft::ConsensusError::FeatureNotEnabled {
+        needed: crate::command::NODE_VERSION_REPORTS_FEATURE_LEVEL,
+        enabled: 0,
+    }
+    .to_string();
+    let gate_prefix = gate
+        .split(" and the cluster runs at")
+        .next()
+        .unwrap_or(&gate);
+    let undecodable = crate::wire::CodecError::UnknownTag {
+        what: "command kind",
+        tag: 38,
     }
     .to_string();
     message.starts_with(gate_prefix) || message.contains(&undecodable)
@@ -457,6 +506,19 @@ async fn dispatch_admin(
             let response = handler.read_range_replica_set(request).await?;
             Ok(VtpmFrame {
                 kind: KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP,
+                payload: response.encode()?,
+            })
+        }
+        crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ => {
+            let request =
+                crate::transport::wire::AdminReadClusterVersionsRequest::decode(&frame.payload)?;
+            // A read, like the others: what each node runs is for anybody
+            // entitled to look at the cluster, and a data node polls the
+            // level with its own identity.
+            authorize(authorizer.authorize_read(identity))?;
+            let response = handler.read_cluster_versions(request).await?;
+            Ok(VtpmFrame {
+                kind: crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP,
                 payload: response.encode()?,
             })
         }
@@ -857,6 +919,38 @@ impl AdminClient {
             KIND_ADMIN_READ_GROUP_CURSOR_RESP => {
                 Ok(AdminReadGroupCursorResponse::decode(&frame.payload)?)
             }
+            KIND_ADMIN_ERROR => {
+                let error = AdminError::decode(&frame.payload)?;
+                Err(TransportError::Protocol(error.message))
+            }
+            other => Err(TransportError::UnexpectedKind(other)),
+        }
+    }
+
+    /// Linearizable read of the cluster's feature level and, with
+    /// `include_nodes`, every registered node and what it reported it runs
+    /// (#634).
+    ///
+    /// A metadata node that predates the read refuses its kind; that arrives
+    /// as an error [`predates_cluster_versions_read`] recognizes. Nothing
+    /// here reads it as "no reports": a caller that judges a raise on this
+    /// must refuse to judge, and one that only wants the level keeps the one
+    /// it had.
+    pub async fn read_cluster_versions(
+        &self,
+        include_nodes: bool,
+    ) -> TransportResult<crate::transport::wire::AdminReadClusterVersionsResponse> {
+        let frame = self
+            .round_trip(VtpmFrame {
+                kind: crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ,
+                payload: crate::transport::wire::AdminReadClusterVersionsRequest { include_nodes }
+                    .encode(),
+            })
+            .await?;
+        match frame.kind {
+            crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP => Ok(
+                crate::transport::wire::AdminReadClusterVersionsResponse::decode(&frame.payload)?,
+            ),
             KIND_ADMIN_ERROR => {
                 let error = AdminError::decode(&frame.payload)?;
                 Err(TransportError::Protocol(error.message))
@@ -1519,6 +1613,12 @@ mod tests {
     /// error and leave every range unleadable mid-upgrade.
     #[test]
     fn an_older_servers_refusal_of_the_replica_set_read_is_recognized() {
+        assert!(predates_cluster_versions_read(&TransportError::Protocol(
+            "unexpected response kind 29".to_owned()
+        )));
+        assert!(!predates_cluster_versions_read(&TransportError::Protocol(
+            "unexpected response kind 27".to_owned()
+        )));
         assert_eq!(predates_replica_set_read(), "unexpected response kind 27");
     }
 
@@ -1793,6 +1893,37 @@ mod tests {
             TransportError::UnexpectedKind(99),
         ] {
             assert!(!refuses_lineage_verdicts(&other), "{other}");
+        }
+    }
+
+    /// #634: a data node upgraded ahead of its metadata tier keeps asking to
+    /// report, and recognizes both ways a tier says "not yet" - the gate on
+    /// a tier with levels, the codec on one that cannot decode the kind -
+    /// and nothing else.
+    #[test]
+    fn a_refusal_of_a_version_report_is_recognized_and_nothing_else_is() {
+        let gate = crate::raft::ConsensusError::FeatureNotEnabled {
+            needed: crate::command::NODE_VERSION_REPORTS_FEATURE_LEVEL,
+            enabled: 6,
+        }
+        .to_string();
+        assert!(refuses_version_report(&TransportError::Protocol(gate)));
+        assert!(refuses_version_report(&TransportError::Protocol(
+            "unknown command kind tag 38".to_owned()
+        )));
+        for other in [
+            TransportError::Protocol(
+                crate::raft::ConsensusError::FeatureNotEnabled {
+                    needed: crate::command::LINEAGE_VERDICTS_FEATURE_LEVEL,
+                    enabled: 5,
+                }
+                .to_string(),
+            ),
+            TransportError::Protocol("unknown command kind tag 37".to_owned()),
+            TransportError::Protocol("record not found".to_owned()),
+            TransportError::Closed,
+        ] {
+            assert!(!refuses_version_report(&other), "{other}");
         }
     }
 

@@ -380,6 +380,8 @@ pub struct SegmentTransferClient {
     /// arbitrarily large, and the failure this bounds is a peer that stops
     /// answering, which any single exchange detects.
     request_timeout: Duration,
+    /// How each pull opens its session (#634).
+    version: super::version::ReplicaVersionPolicy,
 }
 
 impl SegmentTransferClient {
@@ -387,12 +389,35 @@ impl SegmentTransferClient {
         Ok(Self {
             connector: build_client_connector(material)?,
             request_timeout: Duration::from_secs(5),
+            version: super::version::ReplicaVersionPolicy::default(),
         })
     }
 
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
+    }
+
+    /// Open each session with this node's identity and finalized level
+    /// (#634); see [`super::network::ReplicaStatusClient::with_version_policy`].
+    pub fn with_version_policy(mut self, version: super::version::ReplicaVersionPolicy) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// The version exchange every session opens with (#634), bounded like
+    /// any other round trip.
+    async fn open<S>(&self, stream: &mut S) -> BrokerResult<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        timeout(
+            self.request_timeout,
+            super::version::open_session(stream, &self.version),
+        )
+        .await
+        .map_err(|_| crate::BrokerError::Timeout("replica version hello"))??;
+        Ok(())
     }
 
     /// Ask the leader to seal its active tail, so the sealed prefix reaches
@@ -434,6 +459,7 @@ impl SegmentTransferClient {
         .await
         .map_err(|_| crate::BrokerError::Timeout("seal tail connect"))??;
         assert_peer_uuid(peer_certs_client(&stream), expected_node)?;
+        self.open(&mut stream).await?;
         let mut request_id = 1_u64;
         match self
             .round_trip(
@@ -510,6 +536,7 @@ impl SegmentTransferClient {
         .await
         .map_err(|_| crate::BrokerError::Timeout("segment listing connect"))??;
         assert_peer_uuid(peer_certs_client(&stream), expected_node)?;
+        self.open(&mut stream).await?;
         let mut request_id = 1_u64;
         match self
             .round_trip(
@@ -565,6 +592,7 @@ impl SegmentTransferClient {
         .await
         .map_err(|_| crate::BrokerError::Timeout("segment transfer connect"))??;
         assert_peer_uuid(peer_certs_client(&stream), expected_node)?;
+        self.open(&mut stream).await?;
 
         let mut request_id = 1_u64;
         let listing = match self

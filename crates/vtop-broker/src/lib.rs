@@ -167,6 +167,13 @@ pub enum BrokerError {
     /// sides, see `vtop_meta::transport::cross_mode_refusal`.
     #[error("{0}")]
     CrossMode(String),
+    /// A replica peer this node will not run a session with, or one that
+    /// will not run one with this node (#634): the version handshake found
+    /// it below the cluster's finalized feature level, or found no protocol
+    /// in common. Its own variant because the remedy is an upgrade, not a
+    /// retry or a configuration change.
+    #[error("replica version: {0}")]
+    ReplicaVersion(String),
     #[error("segment storage error: {0}")]
     Segment(#[from] vtop_log::LogError),
 }
