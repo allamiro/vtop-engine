@@ -27,6 +27,9 @@ pub mod network;
 pub(crate) use network::REPLICA_LIMITS;
 pub mod transfer;
 
+#[cfg(test)]
+mod fence_race_tests;
+
 use crate::{
     storage_producer_id, BrokerError, BrokerResult, MetaFencingEpoch, MetaLeaseState,
     ProducerEpochJournal, SegmentFormat, PROMOTION_MARKER_PRODUCER,
@@ -207,7 +210,18 @@ pub struct InProcessFollower {
     /// caught up with (#640): the fast path that keeps a follower in steady
     /// state from taking the journal lock on every append.
     lineage_following: AtomicBool,
+    /// Runs between reading the high-water mark and installing a dispute
+    /// from it, so a unit test can land a concurrent mark exactly there.
+    #[cfg(test)]
+    before_dispute_install: Mutex<Option<TestHook>>,
+    /// Runs in `observe_hwm` after its settle and before its advance, so a
+    /// unit test can tell when a mark has passed its settle.
+    #[cfg(test)]
+    after_mark_settle: Mutex<Option<TestHook>>,
 }
+
+#[cfg(test)]
+type TestHook = Arc<dyn Fn() + Send + Sync>;
 
 /// A suffix a fence found in dispute and kept (#611), because the fencing
 /// caller could not prove that no quorum had acknowledged it.
@@ -331,7 +345,24 @@ impl InProcessFollower {
             hold_fsync: AtomicBool::new(false),
             kept_dispute: Mutex::new(None),
             lineage_following: AtomicBool::new(false),
+            #[cfg(test)]
+            before_dispute_install: Mutex::new(None),
+            #[cfg(test)]
+            after_mark_settle: Mutex::new(None),
         })
+    }
+
+    /// Run a test hook. Cloned out of its slot first, so the slot's lock is
+    /// not held while the hook runs and a hook may touch its own slot.
+    #[cfg(test)]
+    fn run_test_hook(slot: &Mutex<Option<TestHook>>) {
+        let hook = slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub fn node_id(&self) -> Uuid {
@@ -1400,6 +1431,16 @@ impl InProcessFollower {
         epoch: u64,
         leader_epoch_starts: &[crate::fencing_epochs::EpochStart],
     ) -> Result<FenceOutcome, (ErrorCode, String)> {
+        // The whole fence is one critical section with every append and every
+        // high-water mark (#649 review, cubic 4532895325): both hold the meta
+        // lock from their checks through their effect. Without it a mark
+        // could land between this replica reading its own mark and keeping a
+        // dispute from it, after the mark's settle had seen no dispute, and
+        // leave the dispute below the mark, where no settle may truncate and
+        // every later append is refused (the #616 wedge). Lock order is meta,
+        // then state, then the dispute and the journal, as on the append
+        // path; nothing below takes the meta lock again.
+        let meta = self.meta_fencing_epoch.lock();
         let held = self.held_fencing_epoch();
         if epoch < held {
             return Err((
@@ -1407,7 +1448,7 @@ impl InProcessFollower {
                 format!("fence request at epoch {epoch} is below this replica's held epoch {held}"),
             ));
         }
-        let granted = self.meta_fencing_epoch.lock().fencing_epoch;
+        let granted = meta.fencing_epoch;
         if epoch > granted {
             return Err((
                 ErrorCode::Fenced,
@@ -1425,7 +1466,7 @@ impl InProcessFollower {
         // sees an empty vector, compares as Unknown, and truncates nothing —
         // on this fence and every later one, and in the `epoch_starts` this
         // fence returns to the caller.
-        self.adopt_fencing_epoch(epoch);
+        self.adopt_fencing_epoch_locked(epoch);
 
         // Reconcile WHILE STOPPED. This is the only moment it is sound: the
         // replica has just been fenced, so nothing can append between the
@@ -1453,10 +1494,10 @@ impl InProcessFollower {
         // the tail it sent. Taken now, while the log is stopped, so the
         // records it later catches this replica up on are filed under the
         // epochs that wrote them rather than under this fence's.
-        {
-            let _meta = self.meta_fencing_epoch.lock();
-            self.take_leader_lineage_locked(epoch, leader_epoch_starts);
-        }
+        // Under the meta lock this fence holds throughout (#660), the lock
+        // `take_leader_lineage_locked` expects; taking it again here would
+        // deadlock.
+        self.take_leader_lineage_locked(epoch, leader_epoch_starts);
 
         // Offsets and history read together, under the state lock, so the pair
         // describes one instant of one log.
@@ -1467,13 +1508,15 @@ impl InProcessFollower {
         let local_committed_offset = state.segment.committed_offset();
         let next_offset = state.segment.next_offset();
         drop(state);
-        Ok(FenceOutcome {
+        let outcome = FenceOutcome {
             fencing_epoch: self.held_fencing_epoch(),
             local_committed_offset,
             next_offset,
             epoch_starts: self.epoch_starts(),
             truncated_records,
-        })
+        };
+        drop(meta);
+        Ok(outcome)
     }
 
     /// Discard anything written under a leadership `leader_epoch_starts` does
@@ -1707,6 +1750,8 @@ impl InProcessFollower {
             // gap no leader fills. Without a tail in the caller's history,
             // nothing is kept, which is the answer before #616.
             let mark = self.cluster_committed.get();
+            #[cfg(test)]
+            Self::run_test_hook(&self.before_dispute_install);
             let (from, bounded_by) = if divergence >= mark {
                 (divergence, 0)
             } else {
@@ -2351,6 +2396,8 @@ impl InProcessFollower {
         // kept records as committed and put them below a mark no truncation
         // may cross, wedging the replica.
         self.settle_kept_dispute(update.fencing_epoch, update.committed_high_watermark)?;
+        #[cfg(test)]
+        Self::run_test_hook(&self.after_mark_settle);
         // Never advertise above local durability.
         let local = self.local_committed_offset();
         let visible = update.committed_high_watermark.min(local);
