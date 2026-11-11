@@ -218,6 +218,20 @@ impl SqliteStateStore {
                 }
             }
         }
+        // A row is born only as batching (#625), in the database too, so a
+        // write that skips save_batch_state cannot create one born verified.
+        // A trigger, not a CHECK: an existing table gains it without a
+        // rebuild. Run apart from SCHEMA, whose split on ';' would cut the
+        // trigger body. Every release inserts only batching, so an older
+        // binary opening this file is unaffected.
+        sqlx::raw_sql(
+            "CREATE TRIGGER IF NOT EXISTS trg_batches_insert_as_batching \
+             BEFORE INSERT ON batches WHEN NEW.state <> 'batching' \
+             BEGIN SELECT RAISE(ABORT, 'a batch must be inserted as batching'); END",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         Ok(())
     }
 
@@ -270,6 +284,7 @@ impl StateStore for SqliteStateStore {
     /// created once. A duplicate id must fail loudly rather than silently
     /// overwrite an existing — possibly already-committed — row.
     async fn save_batch_state(&self, rec: &BatchRecord) -> Result<(), VtopError> {
+        crate::store::require_batching_insert(rec)?;
         let ps = serde_json::to_string(&rec.progress_start)?;
         let pe = serde_json::to_string(&rec.progress_end)?;
         sqlx::query(
@@ -548,14 +563,15 @@ impl StateStore for SqliteStateStore {
                         CAST(json_extract(progress_end_json, '$.end_byte') AS INTEGER) AS end_byte, \
                         CAST(json_extract(progress_end_json, '$.file_size') AS INTEGER) AS file_size, \
                         CAST(progress_end_json -> '$.content_fingerprint' AS TEXT) AS content, \
+                        CAST(progress_end_json -> '$.tail_fingerprint' AS TEXT) AS tail, \
                         created_at, batch_id \
                  FROM batches WHERE state = ? AND source_type = ? \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, ROW_NUMBER() OVER ( \
+                 SELECT path, inode, end_byte, file_size, content, tail, ROW_NUMBER() OVER ( \
                             PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size, content FROM latest WHERE rn = 1",
+             SELECT path, inode, end_byte, file_size, content, tail FROM latest WHERE rn = 1",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(source_type.as_str())
@@ -570,12 +586,14 @@ impl StateStore for SqliteStateStore {
                 let end: Option<i64> = r.get("end_byte");
                 let size: Option<i64> = r.get("file_size");
                 let content: Option<String> = r.get("content");
+                let tail: Option<String> = r.get("tail");
                 Some(CommittedCursor {
                     path: path?,
                     inode: inode.and_then(|i| i.parse().ok()),
                     end_byte: end?.max(0) as u64,
                     observed_size: size.map(|s| s.max(0) as u64),
                     content_fingerprint: content.as_deref().and_then(parse_content_fingerprint),
+                    tail_fingerprint: tail.as_deref().and_then(parse_content_fingerprint),
                 })
             })
             .collect())
@@ -868,6 +886,35 @@ mod tests {
             .unwrap();
         // Reopening is idempotent: the column is added once.
         SqliteStateStore::connect(&url).await.unwrap();
+    }
+
+    /// #625, in the database: a write that skips `save_batch_state` (a tool
+    /// with its own connection, a future import) still cannot create a row in
+    /// any state but BATCHING.
+    #[tokio::test]
+    async fn sqlite_refuses_a_direct_insert_in_any_state_but_batching() {
+        let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
+        let insert = |id: &'static str, state: &'static str| {
+            sqlx::query(
+                "INSERT INTO batches (batch_id, tenant, source_type, source_name, format, \
+                 state, progress_start_json, progress_end_json, created_at, updated_at) \
+                 VALUES (?, 'default', 'kafka', 'app', 'cef', ?, '{}', '{}', 't', 't')",
+            )
+            .bind(id)
+            .bind(state)
+            .execute(&store.pool)
+        };
+        for state in ["verified", "source_committed", "sealed"] {
+            let err = insert("direct-refused", state)
+                .await
+                .expect_err("a direct insert in a later state must be refused");
+            assert!(
+                err.to_string().contains("must be inserted as batching"),
+                "expected the trigger's message for {state}, got: {err}"
+            );
+        }
+        assert!(store.get_batch("direct-refused").await.unwrap().is_none());
+        insert("direct-batching", "batching").await.unwrap();
     }
 
     // The SQLite backend must pass the same behavioural contract every backend

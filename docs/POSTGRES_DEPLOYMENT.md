@@ -81,8 +81,9 @@ reference keeps credentials out of config serialization and command arguments.
 
 ## Failure behavior
 
-If the table, required columns, or invariant trigger are absent, engine startup
-fails with instructions to run `vtopctl migrate`. It does not try to repair the
+If the table, required columns, or invariant trigger are absent, or the
+trigger is disabled or its function lacks a current schema version marker,
+engine startup fails with instructions to run `vtopctl migrate`. It does not try to repair the
 schema. If the runtime role lacks `USAGE` or `SELECT`, startup reports the
 missing runtime access. Migration failures remain fatal to the deployment step.
 
@@ -103,5 +104,47 @@ migration job per database; engine replicas should start only after it succeeds.
   fingerprint added to file and spool markers (#578) is such a change: no
   DDL, older rows keep being read and judged as before. See the ledger format
   note in [`ARCHITECTURE.md`](ARCHITECTURE.md) §7.2.
+- The invariant trigger also refuses an `INSERT` in any state but `batching`
+  (#625). Re-running `vtopctl migrate` replaces the trigger function in
+  place. Every release inserts only `batching`, so an older engine on the
+  upgraded schema is unaffected.
+- Schema version marker. The first non-empty line of the trigger function's
+  body (`prosrc`) is the SQL comment `-- vtop-state-schema 2`, written on the
+  line right after `$fn$`. Engine startup reads only that line: it requires
+  the trigger to be enabled and its function body to open with a marker of
+  at least the version the engine was built for (2 since #625), not just a
+  trigger with that name. A missing or unparseable marker, or one on any
+  later line, counts as an old schema.
+  An engine from this release therefore refuses to start, with instructions
+  to run `vtopctl migrate`, until the migration has run, so run it before
+  rolling out the engines, as above. The marker is part of the body, so
+  whatever installs a body also sets its marker. If an older release's
+  `vtopctl migrate` is run against an upgraded database, its
+  `CREATE OR REPLACE` installs the older, unmarked body, and this release's
+  engines refuse to start until this release's migration runs again.
+  **Any future change to the trigger or its function must bump this
+  marker** in the migration together with `MIN_SCHEMA_VERSION` in
+  `pg_store.rs`.
+- Restoring the ledger from a backup. Stop every engine first, and **always
+  finish with `vtopctl migrate`**. A schema restored from an older archive
+  (`pg_restore`, or `--schema-only`) carries that release's trigger
+  function, and the migration's `CREATE OR REPLACE` installs the current one
+  and re-creates the trigger enabled. A data-only restore into a migrated
+  schema (`pg_restore --data-only`) is refused by the trigger, as it already
+  was for `source_committed` rows. Restore the data in one of two ways:
+  - `pg_restore --data-only --disable-triggers`. This issues
+    `ALTER TABLE batches DISABLE TRIGGER ALL`, which only the table's owner
+    (the migration identity) or a superuser may run; the runtime role is
+    refused with `must be owner of table batches`. The pg_restore
+    documentation says to run it as a superuser, and a superuser is required
+    once the table has foreign-key triggers, which `batches` does not.
+  - Without superuser: once the schema exists (`vtopctl migrate`, or
+    `pg_restore --schema-only` followed by `vtopctl migrate`), have the
+    owner run `ALTER TABLE batches DISABLE TRIGGER trg_commit_after_verify`,
+    then restore with `--data-only`.
+
+  Then run `vtopctl migrate` before any engine starts. Startup refuses a
+  disabled trigger, and a function restored from an older archive, which
+  has no current marker.
 - Test grants after role changes: runtime must be able to read/write ledger
   rows but must fail `CREATE TABLE`, `ALTER TABLE`, `DELETE`, and `TRUNCATE`.

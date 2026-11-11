@@ -42,6 +42,28 @@ use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 /// operators apply the same artifact outside the engine if desired.
 const MIGRATION: &str = include_str!("../migrations/postgres/0001_state_store.sql");
 
+/// The first non-empty line of the invariant trigger's function body is
+/// `-- vtop-state-schema N` (the body starts with the newline after `$fn$`,
+/// hence "non-empty"). Startup requires at least this N. 2 is the first
+/// body that refuses an insert in any state but batching (#625); a schema from
+/// before it carries no marker. The marker lives in the body, not in a
+/// `COMMENT ON FUNCTION`, because `CREATE OR REPLACE` replaces the body but
+/// keeps a comment: an older release's migrate would leave its older body
+/// under the newer comment.
+const SCHEMA_MARKER_PREFIX: &str = "-- vtop-state-schema ";
+const MIN_SCHEMA_VERSION: u32 = 2;
+
+/// Whether the trigger function's body opens with a schema version this
+/// engine accepts. A marker anywhere but the first non-empty line, or a
+/// missing or unparseable one, is an old schema.
+fn schema_marker_is_current(function_body: Option<&str>) -> bool {
+    function_body
+        .and_then(|body| body.lines().map(str::trim).find(|line| !line.is_empty()))
+        .and_then(|line| line.strip_prefix(SCHEMA_MARKER_PREFIX))
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .is_some_and(|v| v >= MIN_SCHEMA_VERSION)
+}
+
 /// Retry budget for transient serialization failures (SQLSTATE 40001). One
 /// retry per attempt with a small backoff; a single-node Postgres essentially
 /// never hits this, a distributed store occasionally does.
@@ -256,19 +278,24 @@ impl PgStateStore {
         .await
         .map_err(map_schema_check)?;
 
-        let trigger_present: bool = sqlx::query_scalar(
-            "SELECT EXISTS ( \
-                SELECT 1 FROM pg_catalog.pg_trigger t \
-                JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
-                WHERE c.oid = 'batches'::regclass \
-                  AND t.tgname = 'trg_commit_after_verify' \
-                  AND NOT t.tgisinternal \
-             )",
+        // The trigger must be enabled and call a function whose body carries a
+        // current schema marker, not merely exist by name: a schema restored
+        // from an older archive, never re-migrated, or re-migrated by an older
+        // release keeps the name with an older body, and a restore that
+        // disabled the trigger may never have enabled it again.
+        let body: Option<String> = sqlx::query_scalar(
+            "SELECT p.prosrc \
+             FROM pg_catalog.pg_trigger t \
+             JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid \
+             WHERE t.tgrelid = 'batches'::regclass \
+               AND t.tgname = 'trg_commit_after_verify' \
+               AND NOT t.tgisinternal \
+               AND t.tgenabled IN ('O', 'A')",
         )
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(map_schema_check)?;
-        if !trigger_present {
+        if !schema_marker_is_current(body.as_deref()) {
             return Err(schema_migration_required());
         }
         Ok(())
@@ -302,6 +329,7 @@ impl PgStateStore {
 #[async_trait]
 impl StateStore for PgStateStore {
     async fn save_batch_state(&self, rec: &BatchRecord) -> Result<(), VtopError> {
+        crate::store::require_batching_insert(rec)?;
         let ps = serde_json::to_string(&rec.progress_start)?;
         let pe = serde_json::to_string(&rec.progress_end)?;
         // Plain INSERT: a duplicate batch_id must fail on the primary key, never
@@ -535,14 +563,15 @@ impl StateStore for PgStateStore {
                         (progress_end_json::jsonb ->> 'end_byte')::bigint AS end_byte, \
                         (progress_end_json::jsonb ->> 'file_size')::bigint AS file_size, \
                         progress_end_json::jsonb ->> 'content_fingerprint' AS content, \
+                        progress_end_json::jsonb ->> 'tail_fingerprint' AS tail, \
                         created_at, batch_id \
                  FROM batches WHERE state = $1 AND source_type = $2 \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, ROW_NUMBER() OVER ( \
+                 SELECT path, inode, end_byte, file_size, content, tail, ROW_NUMBER() OVER ( \
                             PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size, content FROM latest WHERE rn = 1",
+             SELECT path, inode, end_byte, file_size, content, tail FROM latest WHERE rn = 1",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(source_type.as_str())
@@ -557,12 +586,16 @@ impl StateStore for PgStateStore {
                 let end: Option<i64> = r.get("end_byte");
                 let size: Option<i64> = r.get("file_size");
                 let content: Option<String> = r.get("content");
+                let tail: Option<String> = r.get("tail");
                 Some(CommittedCursor {
                     path: path?,
                     inode: inode.and_then(|i| i.parse().ok()),
                     end_byte: end?.max(0) as u64,
                     observed_size: size.map(|s| s.max(0) as u64),
                     content_fingerprint: content
+                        .as_deref()
+                        .and_then(crate::models::parse_content_fingerprint),
+                    tail_fingerprint: tail
                         .as_deref()
                         .and_then(crate::models::parse_content_fingerprint),
                 })
@@ -758,6 +791,38 @@ mod security_tests {
 
     fn options(url: &str) -> PgConnectOptions {
         PgConnectOptions::from_str(url).unwrap()
+    }
+
+    #[test]
+    fn only_a_current_schema_marker_passes_startup() {
+        let body = |marker: &str| format!("\n{marker}\nBEGIN\n    RETURN NEW;\nEND;\n");
+        for refused in [
+            "",
+            "-- vtop-state-schema",
+            "-- vtop-state-schema x",
+            "-- vtop-state-schema 1",
+            "vtop-state-schema 2",
+            "-- must be inserted as batching",
+        ] {
+            assert!(
+                !schema_marker_is_current(Some(&body(refused))),
+                "{refused:?}"
+            );
+        }
+        assert!(!schema_marker_is_current(None));
+        // Only the first non-empty line counts.
+        assert!(!schema_marker_is_current(Some(
+            "\nBEGIN\n-- vtop-state-schema 2\n    RETURN NEW;\nEND;\n"
+        )));
+        assert!(!schema_marker_is_current(Some(
+            "\n-- an earlier comment\n-- vtop-state-schema 2\nBEGIN\nEND;\n"
+        )));
+        assert!(schema_marker_is_current(Some(&body(
+            "-- vtop-state-schema 2"
+        ))));
+        assert!(schema_marker_is_current(Some(&body(
+            "    -- vtop-state-schema 3"
+        ))));
     }
 
     #[test]
