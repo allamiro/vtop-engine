@@ -757,11 +757,90 @@ def _write_csv(path: str, rows: list[dict], cols: list[str]) -> None:
         w.writerows(rows)
 
 
+# The conditions each profile's rows carry in the document's linted table
+# (scripts/check-egress-claims.sh): RTT, loss rate, loss model, bottleneck
+# rate, buffer depth.
+PROFILE_CONDITIONS = {
+    "lan": ("< 1 ms (no delay qdisc)", "0%", "none", "none (unshaped)", "n/a (no qdisc)"),
+    "wan100": ("100 ms", "0%", "none", "10 Mbit/s (tbf)", "1 BDP (125 KB)"),
+    "wan100-loss1": ("100 ms", "1%", "gemodel (bursty, mean burst 2 packets), upload only",
+                     "10 Mbit/s (tbf)", "1 BDP (125 KB)"),
+    "wan100-policed": ("100 ms", "0% configured", "policer-induced",
+                       "10 Mbit/s policer, 5000 B bucket", "none (policer, no queue)"),
+}
+HARDWARE = "Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared)"
+TRANSPORT = "tcp_tls (s3_native; plain HTTP to the lab MinIO)"
+MEASUREMENT_HEADER = [
+    "Hardware", "RTT", "Loss rate", "Loss model", "Bottleneck rate", "Buffer depth",
+    "Competitor state", "Transport", "Bottleneck", "Date", "Configuration", "Runs",
+    "Goodput, Mbit/s: median (min-max)", "Of link reference", "object_upload p95",
+    "Verify mean", "CPU-s per GiB", "Competitor with / without VTOP, Mbit/s",
+]
+
+
+def _config_text(row: dict) -> str:
+    if row["config"] == "default":
+        text = "default (8 in flight, 8 MiB parts, 4 parts in flight)"
+    else:
+        text = (f"max_concurrency {row['c']}, parts_in_flight {row['pif']}, "
+                f"5 MiB parts")
+    if row["phase"] == "confirm":
+        text += ", confirmation runs"
+    if row["phase"] == "contended":
+        text += ", scenario 18 workload"
+    return text
+
+
+def measurement_rows(points: list[dict], dates: dict[tuple, str]) -> list[str]:
+    """The document's Measurements table rows, one per point, generated so a
+    number in the doc is the number in points.csv."""
+    order = {"lan": 0, "wan100": 1, "wan100-loss1": 2, "wan100-policed": 3}
+    phase_order = {"grid": 0, "confirm": 1, "contended": 2}
+
+    def key(r):
+        cfg = (999, 0) if r["config"] == "default" else (int(r["c"]), int(r["pif"]))
+        return (phase_order[r["phase"]], order[r["profile"]], cfg)
+
+    lines = ["| " + " | ".join(MEASUREMENT_HEADER) + " |",
+             "|" + "|".join("---" for _ in MEASUREMENT_HEADER) + "|"]
+    for r in sorted(points, key=key):
+        rtt, loss, model, rate, buf = PROFILE_CONDITIONS[r["profile"]]
+        contended = r["phase"] == "contended"
+        good = ("no object committed" if r["goodput_mbps_median"] == ""
+                else f"{_f(r['goodput_mbps_median']):.2f} ({_f(r['goodput_mbps_min']):.2f}-"
+                     f"{_f(r['goodput_mbps_max']):.2f})")
+        frac = "" if r["fraction_median"] == "" else f"{_f(r['fraction_median']):.3f}"
+        p95 = ("" if r["object_upload_p95_ms_pooled"] == ""
+               else f"{_f(r['object_upload_p95_ms_pooled']) / 1000:.1f} s")
+        ver = "" if r["verify_mean_ms"] == "" else f"{_f(r['verify_mean_ms']) / 1000:.2f} s"
+        cpu = ("" if r["cpu_seconds_per_gib_median"] == ""
+               else f"{_f(r['cpu_seconds_per_gib_median']):.1f}")
+        comp = (f"{_f(r['competitor_goodput_mbps_with']):.2f} / "
+                f"{_f(r['competitor_goodput_mbps_without']):.2f}" if contended else "")
+        cells = [HARDWARE, rtt, loss, model, rate, buf,
+                 "bulk TCP flow (iperf3), same queue" if contended else "none",
+                 TRANSPORT, r["bottleneck"], dates[(r["profile"], r["config"], r["phase"])],
+                 _config_text(r), r["runs"], good, frac or "n/a", p95 or "n/a", ver or "n/a",
+                 cpu or "n/a", comp or "n/a"]
+        if int(_f(r["objects_failed"])):
+            cells[12] += f"; {r['objects_failed']} object(s) failed"
+        lines.append("| " + " | ".join(str(c) for c in cells) + " |")
+    return lines
+
+
 def cmd_report(args) -> int:
     runs = _read_csv(os.path.join(args.data, "runs.csv"))
     objects = _read_csv(os.path.join(args.data, "objects.csv"))
     points = aggregate_points(runs, objects)
     _write_csv(os.path.join(args.data, "points.csv"), points, POINT_COLUMNS)
+    dates: dict[tuple, str] = {}
+    for r in runs:
+        k = (r["profile"], r["config"], r["phase"])
+        lo, hi = dates.get(k, (r["date_utc"], r["date_utc"]))
+        dates[k] = (min(lo, r["date_utc"]), max(hi, r["date_utc"]))
+    date_text = {k: lo if lo == hi else f"{lo} to {hi}" for k, (lo, hi) in dates.items()}
+    with open(os.path.join(args.data, "measurements_table.md"), "w", encoding="utf-8") as fh:
+        fh.write("\n".join(measurement_rows(points, date_text)) + "\n")
     gate = evaluate_gate(runs, objects)
     with open(os.path.join(args.data, "gate.json"), "w", encoding="utf-8") as fh:
         json.dump(gate, fh, indent=2, sort_keys=True)

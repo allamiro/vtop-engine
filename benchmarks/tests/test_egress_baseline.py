@@ -6,6 +6,7 @@ with, the best-tuned selection and its tie rule, the two thresholds, the noise
 rule, and the charts being a pure function of the data.
 """
 import os
+import subprocess
 import sys
 
 import pytest
@@ -246,3 +247,26 @@ def test_a_contended_row_is_scenario_18_with_only_the_width_replaced(tmp_path):
         assert sc.get(key) == original.get(key), key
     default = _load(tmp_path, eb.contended_yaml(base, None, None, "contended"))
     assert default.get("max_concurrent_batches") == 8 and not default.get("transports")
+
+
+def test_the_generated_measurement_rows_pass_the_documents_claims_lint(tmp_path):
+    point = {"profile": "wan100-policed", "config": "default", "phase": "grid", "c": "",
+             "pif": "", "runs": "2", "goodput_mbps_median": "", "goodput_mbps_min": "nan",
+             "goodput_mbps_max": "nan", "fraction_median": "", "object_upload_p95_ms_pooled": "",
+             "verify_mean_ms": "", "cpu_seconds_per_gib_median": "", "objects_failed": "16",
+             "competitor_goodput_mbps_with": "", "competitor_goodput_mbps_without": "",
+             "bottleneck": "link (per-flow window)"}
+    contended = dict(point, profile="wan100", config="c8-p1", c="8", pif="1",
+                     phase="contended", goodput_mbps_median="3.1", goodput_mbps_min="3.0",
+                     goodput_mbps_max="3.2", fraction_median="0.33", objects_failed="0",
+                     competitor_goodput_mbps_with="4.7", competitor_goodput_mbps_without="9.5")
+    rows = eb.measurement_rows([point, contended],
+                               {("wan100-policed", "default", "grid"): "2026-11-10",
+                                ("wan100", "c8-p1", "contended"): "2026-11-11"})
+    doc = tmp_path / "doc.md"
+    doc.write_text("# t\n\n## Measurements\n\n" + "\n".join(rows) + "\n\n## After\n",
+                   encoding="utf-8")
+    lint = os.path.join(os.path.dirname(eb.HERE), "scripts", "check-egress-claims.sh")
+    proc = subprocess.run(["bash", lint, str(doc)], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    assert "16 object(s) failed" in rows[2] and "4.70 / 9.50" in rows[3]
