@@ -36,7 +36,7 @@ pub(crate) fn announce(config: &VtopConfig, streams: &StreamsConfig) {
         method = verification_method(backend, algorithm).as_str(),
         "default verification settings (sources no stream matches)"
     );
-    for stream in &streams.streams {
+    for stream in streams.applied() {
         let algorithm = effective_algorithm(config, Some(stream));
         tracing::info!(
             stream = %stream.source_name,

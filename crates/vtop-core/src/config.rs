@@ -1463,7 +1463,7 @@ pub struct StreamConfig {
     /// Override the global checksum for this stream. The strong-verification
     /// floor stays global and cannot be lowered by a stream.
     #[serde(default)]
-    pub checksum: Option<ChecksumConfig>,
+    pub checksum: Option<StreamChecksumConfig>,
     /// Keys this entry set in `streams.yaml` (#670), filled in by
     /// [`StreamsConfig::from_path`] / [`StreamsConfig::from_yaml_str`]. Key
     /// names only; never serialized.
@@ -1479,6 +1479,17 @@ pub struct StreamConfig {
     pub s3_source_name: Option<String>,
     #[serde(default)]
     pub retention_class: Option<String>,
+}
+
+/// A stream's own `checksum` block (#669). The shape mirrors the global
+/// [`ChecksumConfig`], but `algorithm` is required and no other key is
+/// accepted: an empty block or a misspelled key would otherwise read as an
+/// explicit sha256 override of the global algorithm (#480: a misspelled
+/// knob fails loudly). Omit the block, or set it to null, to inherit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamChecksumConfig {
+    pub algorithm: ChecksumAlgorithm,
 }
 
 /// Resolve the algorithm at the point a new batch is written. Recovery and
@@ -1504,9 +1515,10 @@ impl StreamsConfig {
     /// explicit per-stream `checksum.algorithm: none` while
     /// `upload.require_strong_verification` is on is refused here, naming the
     /// stream. A stream that merely inherits the global algorithm is judged
-    /// exactly as before this setting existed.
+    /// exactly as before this setting existed. Only applied entries are
+    /// judged ([`StreamsConfig::applied`]): a shadowed one never runs.
     pub fn validate(&self, config: &VtopConfig) -> Result<(), VtopError> {
-        for stream in &self.streams {
+        for stream in self.applied() {
             let lowers_floor = stream
                 .checksum
                 .as_ref()
@@ -1522,13 +1534,13 @@ impl StreamsConfig {
     }
 
     /// Global warnings with stream overrides accounted for, followed by each
-    /// explicit stream opt-out. Existing configurations keep their old text.
+    /// applied stream's explicit opt-out. Existing configurations keep their
+    /// old text.
     pub fn warnings(&self, config: &VtopConfig) -> Vec<String> {
         let mut warnings = config.warnings();
         if !config.checksum.algorithm.is_enabled()
             && self
-                .streams
-                .iter()
+                .applied()
                 .any(|stream| effective_algorithm(config, Some(stream)).is_enabled())
         {
             for warning in &mut warnings {
@@ -1538,12 +1550,20 @@ impl StreamsConfig {
                 );
             }
         }
-        warnings.extend(self.streams.iter()
-            .filter(|stream| stream.checksum.is_some() && !effective_algorithm(config, Some(stream)).is_enabled())
-            .map(|stream| format!(
-                "stream {:?}: checksum.algorithm is none, so EVERY batch of this stream is verified by size alone; same-size corruption is not detected",
-                stream.source_name
-            )));
+        warnings.extend(
+            self.applied()
+                .filter(|stream| {
+                    stream.checksum.is_some()
+                        && !effective_algorithm(config, Some(stream)).is_enabled()
+                })
+                .map(|stream| {
+                    format!(
+                        "stream {:?}: checksum.algorithm is none, so EVERY batch of this \
+                         stream is verified by size alone; same-size corruption is not detected",
+                        stream.source_name
+                    )
+                }),
+        );
         warnings
     }
 
@@ -1567,6 +1587,16 @@ impl StreamsConfig {
     }
 
     /// Find the stream definition that matches a discovered source name.
+    /// The entries the engine applies: the first per `source_name`, as
+    /// [`StreamsConfig::lookup`] resolves them. A later entry with the same
+    /// name is shadowed and never used (#670 lists it as shadowed).
+    pub fn applied(&self) -> impl Iterator<Item = &StreamConfig> {
+        let mut seen = std::collections::HashSet::new();
+        self.streams
+            .iter()
+            .filter(move |s| seen.insert(s.source_name.as_str()))
+    }
+
     pub fn lookup(&self, source_name: &str) -> Option<&StreamConfig> {
         self.streams.iter().find(|s| s.source_name == source_name)
     }
@@ -1678,6 +1708,82 @@ streams:
             !warnings.iter().any(|w| w.contains("\"inherits\"")),
             "{warnings:?}"
         );
+    }
+
+    /// #669 review: a stream's `checksum` must name its algorithm. An empty
+    /// block or a misspelled key used to deserialize to sha256 and override
+    /// the global algorithm as if the operator had chosen it (#480: a
+    /// misspelled knob fails loudly).
+    #[test]
+    fn a_stream_checksum_block_must_name_a_known_algorithm() {
+        for block in [
+            "{}",
+            "{algoritm: blake3}",
+            "{algorithm: blake3, read_back: true}",
+        ] {
+            let yaml = format!(
+                "streams:\n  - {{source_name: a, source_type: file, format: raw, checksum: {block}}}\n"
+            );
+            assert!(
+                StreamsConfig::from_yaml_str(&yaml).is_err(),
+                "checksum: {block} must be refused, not read as an override"
+            );
+        }
+        let ok = StreamsConfig::from_yaml_str(
+            "streams:\n  - {source_name: a, source_type: file, format: raw, checksum: {algorithm: blake3}}\n  - {source_name: b, source_type: file, format: raw, checksum: null}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ok.streams[0].checksum.as_ref().map(|c| c.algorithm),
+            Some(ChecksumAlgorithm::Blake3)
+        );
+        assert!(ok.streams[1].checksum.is_none(), "null inherits");
+    }
+
+    /// #669 review: the engine applies only the first entry per
+    /// `source_name` ([`StreamsConfig::lookup`]), so a shadowed later entry
+    /// must neither refuse the config nor produce a warning about a stream
+    /// that in fact runs with the first entry's algorithm.
+    #[test]
+    fn a_shadowed_stream_entry_neither_warns_nor_refuses() {
+        let mut cfg: VtopConfig = serde_yaml::from_str(
+            r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources: {}
+upload:
+  bucket: telemetry-data
+"#,
+        )
+        .unwrap();
+        let streams = StreamsConfig::from_yaml_str(
+            "streams:\n  - {source_name: a, source_type: file, format: raw}\n  - {source_name: a, source_type: kafka, format: raw, checksum: {algorithm: none}}\n",
+        )
+        .unwrap();
+        assert_eq!(streams.applied().count(), 1);
+        assert!(streams.applied().next().unwrap().checksum.is_none());
+        streams.validate(&cfg).unwrap();
+        cfg.upload.require_strong_verification = false;
+        let warnings = streams.warnings(&cfg);
+        assert!(
+            !warnings.iter().any(|w| w.contains("stream \"a\"")),
+            "{warnings:?}"
+        );
+    }
+
+    /// The shipped examples load and pass the cross-file check together, so
+    /// the per-stream keys they document stay valid (#669 review).
+    #[test]
+    fn the_example_streams_file_validates_against_the_example_config() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
+        let cfg = VtopConfig::from_path(Path::new(&format!("{dir}/config.yaml"))).unwrap();
+        let streams = StreamsConfig::from_path(Path::new(&format!("{dir}/streams.yaml"))).unwrap();
+        streams.validate(&cfg).unwrap();
+        assert!(streams.streams.iter().any(|s| s.checksum.is_some()));
     }
 
     #[test]

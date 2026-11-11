@@ -266,8 +266,10 @@ is not rate-limited: it replaces that batch's INFO `verification_passed`
 line, so it is no more frequent than the batch log itself.
 
 **Per-stream checksum selection (#669).** An entry in `streams.yaml` may set
-`checksum: { algorithm: sha256 }`, `blake3`, or `none`. An omitted checksum
-inherits `config.yaml`'s algorithm. The global
+`checksum: { algorithm: sha256 }`, `blake3`, or `none`. An omitted (or null)
+checksum inherits `config.yaml`'s algorithm; a block without `algorithm`, or
+with any other key, is refused at load rather than read as an override. Only
+the first entry per `source_name` applies, as everywhere in `streams.yaml`. The global
 `upload.require_strong_verification` floor applies to every stream: a stream
 that sets `none` is rejected at config load when the floor is on, and warns by
 stream name when it is off. The runtime floor still refuses any size-only

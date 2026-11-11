@@ -21,7 +21,7 @@ streams:
     format: cef
     tenant: default
     checksum:
-      algorithm: sha256             # native S3: service checksum; no body read-back
+      algorithm: sha256             # native S3: service checksum; read-back only without one (multipart)
     s3_source_name: security
     retention_class: standard
 
