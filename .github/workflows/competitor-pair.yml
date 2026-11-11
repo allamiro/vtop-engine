@@ -1,0 +1,329 @@
+name: competitor pair (netem lab)
+
+# The egress ceiling's competitor pair (#481, #610) on a GitHub-hosted runner.
+#
+# WHY HERE. The netem middlebox shapes the upload on an `ifb` device, and Docker
+# Desktop's linuxkit kernel has no ifb driver, so the pair cannot run on the
+# Mac the rest of #481 was measured on. A hosted ubuntu runner is a full VM
+# with a stock Ubuntu kernel, where `modprobe ifb` loads the driver. The first
+# step proves that before anything is built, so a runner image that drops the
+# module fails in seconds, naming it, instead of an hour later as a lab error.
+#
+# WHAT IT RUNS. Scenarios 22 (uncapped) and 23 (capped at 256 KiB/s) exactly as
+# committed: 10 Mbit/s tbf at 1.0 BDP, 100 ms round trip, no jitter, no loss,
+# iperf3 bulk:120 alone / beside VTOP / alone again, per-cycle engine. The pair
+# is repeated (input `repetitions`, default 3) with the order alternated per
+# repetition, so a drift in the runner over the hour lands on both halves.
+#
+# WHAT IT IS NOT. A shared CI runner is a noisy host: other tenants share the
+# physical machine, and nothing here can see them. A number from this job is a
+# comparison between the two halves of one job, never an absolute, and it is
+# recorded with the runner image, kernel and CPU it came from.
+#
+# OUT OF THE DEFAULT PATH ON PURPOSE. It runs for about an hour, so it is
+# dispatched by hand, and on a pull request only when this file itself changes.
+on:
+  workflow_dispatch:
+    inputs:
+      repetitions:
+        description: "How many uncapped/capped pairs to run (each pair is about 20 minutes)"
+        required: false
+        default: "3"
+  pull_request:
+    paths:
+      - ".github/workflows/competitor-pair.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: competitor-pair-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pair:
+    name: competitor pair (ifb + netem, uncapped vs capped)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      REPETITIONS: ${{ inputs.repetitions || '3' }}
+      COMPOSE_FILE: benchmarks/docker-compose.benchmark.yml
+      # The binary BOTH the runner's preflight hashes and the engine container
+      # mounts. Absolute, so the two cannot resolve it differently.
+      VTOPCTL_BIN: ${{ github.workspace }}/target/release/vtopctl
+    steps:
+      # FIRST, before anything costs minutes: the kernel must provide every
+      # module the middlebox's tc program uses (lib/netem.py tc_program): ifb
+      # for the upload direction, netem and tbf for the shape, the ingress
+      # qdisc, the u32 classifier and the mirred redirect. If a stock load
+      # fails, the runner's linux-modules-extra package for the running kernel
+      # is tried once. Then an ifb device is created inside a fresh network
+      # namespace, which is where the middlebox container creates its own.
+      - name: The kernel provides ifb and the qdiscs the middlebox installs
+        run: |
+          set -euo pipefail
+          env_dir="${RUNNER_TEMP}/pair/environment"
+          mkdir -p "${env_dir}"
+          mods=(ifb sch_netem sch_tbf sch_ingress cls_u32 act_mirred)
+          uname -r | tee "${env_dir}/kernel_release.txt"
+          if ! sudo modprobe -a "${mods[@]}" 2> "${env_dir}/modprobe_first_try.txt"; then
+            cat "${env_dir}/modprobe_first_try.txt"
+            echo "stock modprobe failed; trying linux-modules-extra-$(uname -r)"
+            sudo apt-get update -q
+            sudo apt-get install -y -q "linux-modules-extra-$(uname -r)"
+            sudo modprobe -a "${mods[@]}"
+            echo "linux-modules-extra-$(uname -r)" > "${env_dir}/modules_from_extra_package.txt"
+          fi
+          for m in "${mods[@]}"; do
+            printf '%s\t%s\n' "${m}" "$(modinfo -F filename "${m}" 2>/dev/null || echo unknown)"
+          done | tee "${env_dir}/modules.tsv"
+          sudo ip netns add ifbprobe
+          sudo ip -n ifbprobe link add ifb0 type ifb
+          sudo ip -n ifbprobe link set ifb0 up
+          sudo ip -n ifbprobe -d link show ifb0 | tee "${env_dir}/ifb_probe.txt"
+          sudo ip netns del ifbprobe
+          echo "ifb: created and brought up inside a network namespace"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: competitor-pair-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # --no-default-features, as environment.json records for the Lima runs:
+      # the only default feature is the Kafka source adapter, which links
+      # libsasl2, and the lab's engine image (ubuntu:26.04) does not ship it.
+      # The file source, the batching pipeline and the s3_native upload path
+      # measured here do not depend on that feature.
+      - name: Build vtopctl
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --no-default-features --bin vtopctl
+          ls -l "${VTOPCTL_BIN}"
+          ldd "${VTOPCTL_BIN}" || true
+
+      - name: Build the lab's MinIO image
+        run: docker compose build minio
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the harness's optional dependencies
+        run: pip install --disable-pip-version-check -r benchmarks/requirements.txt
+
+      # The engine service runs as the building user's uid (compose's
+      # VTOP_BENCH_UID, default 1000), and the hosted runner's user is not
+      # 1000: it must be able to execute the 0700 binary cargo wrote and to
+      # write the run root the runner creates.
+      - name: Bring up the netem lab
+        run: |
+          set -euo pipefail
+          {
+            echo "VTOP_BENCH_UID=$(id -u)"
+            echo "VTOP_BENCH_GID=$(id -g)"
+          } >> "${GITHUB_ENV}"
+          VTOP_BENCH_UID="$(id -u)"
+          VTOP_BENCH_GID="$(id -g)"
+          export VTOP_BENCH_UID VTOP_BENCH_GID
+          docker compose --profile netem --profile containerized up -d
+          for _ in $(seq 1 60); do
+            if docker compose logs minio-init 2>/dev/null | grep -q "benchmark buckets ready"; then
+              break
+            fi
+            sleep 2
+          done
+          docker compose logs minio-init | tail -n 5
+          docker compose --profile netem --profile containerized ps
+
+      # Every run's own output is kept, refused or not: a refused run is part
+      # of the record (#610's acceptance: no refused runs left unexplained).
+      - name: Run the pair
+        id: pair
+        run: |
+          set -uo pipefail
+          out="${RUNNER_TEMP}/pair"
+          mkdir -p "${out}/results" "${out}/logs"
+          printf 'order\trepetition\tscenario\texit_code\trun_id\n' > "${out}/runs.tsv"
+          order=0
+          failed=0
+          for rep in $(seq 1 "${REPETITIONS}"); do
+            if (( rep % 2 )); then halves="22 23"; else halves="23 22"; fi
+            for n in ${halves}; do
+              scenario="$(ls benchmarks/scenarios/"${n}"-competing-flow-bulk-*.yaml)"
+              order=$((order + 1))
+              log="${out}/logs/${order}-scenario-${n}.log"
+              echo "::group::repetition ${rep}, scenario ${n} (${scenario})"
+              python3 benchmarks/run_benchmark.py "${scenario}" --results-dir "${out}/results" 2>&1 | tee "${log}"
+              code="${PIPESTATUS[0]}"
+              echo "::endgroup::"
+              run_id="$(sed -n 's/.*run_id=\([^ ]*\).*/\1/p' "${log}" | head -n 1)"
+              printf '%s\t%s\t%s\t%s\t%s\n' "${order}" "${rep}" "${n}" "${code}" "${run_id}" >> "${out}/runs.tsv"
+              if [ "${code}" != "0" ]; then failed=$((failed + 1)); fi
+            done
+          done
+          cat "${out}/runs.tsv"
+          echo "failed=${failed}" >> "${GITHUB_OUTPUT}"
+
+      - name: Record the environment
+        if: always()
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TESTED_SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          env_dir="${RUNNER_TEMP}/pair/environment"
+          mkdir -p "${env_dir}"
+          lscpu > "${env_dir}/lscpu.txt" 2>&1
+          grep MemTotal /proc/meminfo > "${env_dir}/meminfo.txt"
+          cat /etc/os-release > "${env_dir}/os-release.txt"
+          systemd-detect-virt > "${env_dir}/virt.txt" 2>&1 || true
+          docker version --format '{{.Server.Version}}' > "${env_dir}/docker_server.txt" 2>&1
+          docker compose version --short > "${env_dir}/compose.txt" 2>&1
+          docker exec vtop-bench-netem iperf3 --version > "${env_dir}/iperf3.txt" 2>&1 || true
+          docker exec vtop-bench-netem tc -V > "${env_dir}/tc.txt" 2>&1 || true
+          docker inspect --format '{{.Name}} {{.Config.Image}} {{.Image}}' \
+            vtop-bench-minio vtop-bench-engine vtop-bench-netem vtop-bench-netem-probe \
+            > "${env_dir}/containers.txt" 2>&1 || true
+          rustc -V > "${env_dir}/rustc.txt" 2>&1
+          sha256sum "${VTOPCTL_BIN}" > "${env_dir}/vtopctl.sha256" 2>&1
+          ldd "${VTOPCTL_BIN}" > "${env_dir}/vtopctl.ldd" 2>&1 || true
+          python3 --version > "${env_dir}/python.txt" 2>&1
+          python3 - "${env_dir}" <<'PY'
+          import json, os, sys
+          d = sys.argv[1]
+          def read(name):
+              p = os.path.join(d, name)
+              return open(p).read().strip() if os.path.exists(p) else None
+          def lscpu(field):
+              for line in (read("lscpu.txt") or "").splitlines():
+                  k, _, v = line.partition(":")
+                  if k.strip() == field:
+                      return v.strip()
+              return None
+          rec = {
+              "workflow_run": os.environ["RUN_URL"],
+              "head_sha": os.environ["HEAD_SHA"],
+              "tested_sha": os.environ["TESTED_SHA"],
+              "runner": {
+                  "environment": os.environ.get("RUNNER_ENVIRONMENT"),
+                  "name": os.environ.get("RUNNER_NAME"),
+                  "image_os": os.environ.get("ImageOS"),
+                  "image_version": os.environ.get("ImageVersion"),
+                  "os_release": dict(
+                      line.split("=", 1) for line in (read("os-release.txt") or "").splitlines() if "=" in line
+                  ).get("PRETTY_NAME", "").strip('"'),
+                  "kernel": read("kernel_release.txt"),
+                  "virtualization": read("virt.txt"),
+                  "cpu_model": lscpu("Model name"),
+                  "cpus": lscpu("CPU(s)"),
+                  "memory": read("meminfo.txt"),
+              },
+              "ifb": {
+                  "modules": read("modules.tsv"),
+                  "from_extra_package": read("modules_from_extra_package.txt"),
+                  "probe": read("ifb_probe.txt"),
+              },
+              "docker_server": read("docker_server.txt"),
+              "compose": read("compose.txt"),
+              "lab_containers": read("containers.txt"),
+              "iperf3": read("iperf3.txt"),
+              "tc": read("tc.txt"),
+              "rustc": read("rustc.txt"),
+              "vtopctl_build": "cargo build --release --locked --no-default-features --bin vtopctl, on the runner",
+              "vtopctl_sha256": (read("vtopctl.sha256") or "").split(" ")[0],
+              "vtopctl_ldd": read("vtopctl.ldd"),
+              "python": read("python.txt"),
+          }
+          with open(os.path.join(d, "environment.json"), "w") as f:
+              json.dump(rec, f, indent=2)
+              f.write("\n")
+          print(json.dumps(rec["runner"], indent=2))
+          PY
+
+      # One row per run from each run's own summary.json, so the step summary
+      # and the artifact carry the numbers without anyone typing them.
+      - name: Tabulate the runs
+        if: always()
+        run: |
+          set -uo pipefail
+          python3 - "${RUNNER_TEMP}/pair" <<'PY' | tee -a "${GITHUB_STEP_SUMMARY}"
+          import csv, json, os, sys
+          out = sys.argv[1]
+          rows = []
+          runs = os.path.join(out, "runs.tsv")
+          if not os.path.exists(runs):
+              print("no runs.tsv: the pair never started")
+              sys.exit(0)
+          for r in csv.DictReader(open(runs), delimiter="\t"):
+              s_path = os.path.join(out, "results", r["run_id"], "summary.json")
+              s = json.load(open(s_path)) if r["run_id"] and os.path.exists(s_path) else {}
+              c = s.get("competitor") or {}
+              rows.append({
+                  "order": r["order"], "repetition": r["repetition"], "scenario": r["scenario"],
+                  "exit_code": r["exit_code"], "run_id": r["run_id"],
+                  "cap_bytes_per_second": s.get("upload_max_egress_bytes_per_second", ""),
+                  "emulator_validation_mbps": s.get("emulator_validation_mbps", ""),
+                  "alone_before_mbps": (c.get("alone_before") or {}).get("goodput_mbps", ""),
+                  "alone_after_mbps": (c.get("alone_after") or {}).get("goodput_mbps", ""),
+                  "competitor_goodput_mbps_without": s.get("competitor_goodput_mbps_without", ""),
+                  "competitor_goodput_mbps_with": s.get("competitor_goodput_mbps_with", ""),
+                  "share_of_solo_pct": c.get("share_of_solo_pct", ""),
+                  "solo_disagreement_pct": c.get("solo_disagreement_pct", ""),
+                  "competitor_goodput_mbps_over_vtop_window": s.get("competitor_goodput_mbps_over_vtop_window", ""),
+                  "vtop_goodput_mbps_with": s.get("vtop_goodput_mbps_with", ""),
+                  "competitor_jain_index": s.get("competitor_jain_index", ""),
+                  "vtop_attributed_cycles": c.get("vtop_attributed_cycles", ""),
+                  "vtop_window_seconds": c.get("vtop_window_seconds", ""),
+                  "sync_spread_seconds": c.get("competitor_window_sync_spread_seconds", ""),
+                  "final_line_delay_seconds": c.get("competitor_window_final_line_delay_seconds", ""),
+                  "successful_batches": s.get("successful_batches", ""),
+                  "failed_batches": s.get("failed_batches", ""),
+              })
+          with open(os.path.join(out, "pair_runs.csv"), "w", newline="") as f:
+              w = csv.DictWriter(f, fieldnames=list(rows[0]) if rows else ["order"])
+              w.writeheader()
+              w.writerows(rows)
+          cols = ["order", "scenario", "exit_code", "cap_bytes_per_second", "competitor_goodput_mbps_without",
+                  "competitor_goodput_mbps_with", "share_of_solo_pct", "vtop_goodput_mbps_with",
+                  "competitor_jain_index", "vtop_attributed_cycles"]
+          print("### Competitor pair runs\n")
+          print("| " + " | ".join(cols) + " |")
+          print("|" + "---|" * len(cols))
+          for r in rows:
+              print("| " + " | ".join(str(r[k]) for k in cols) + " |")
+          PY
+
+      - name: Lab logs and teardown
+        if: always()
+        run: |
+          docker compose --profile netem --profile containerized logs --no-color \
+            > "${RUNNER_TEMP}/pair/logs/compose.log" 2>&1 || true
+          docker compose --profile netem --profile containerized down -v || true
+
+      - name: Upload the raw runs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: competitor-pair-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pair
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Every run completed
+        env:
+          FAILED: ${{ steps.pair.outputs.failed }}
+        run: |
+          if [ "${FAILED}" != "0" ]; then
+            echo "::error::${FAILED} run(s) exited nonzero; see runs.tsv and logs/ in the artifact"
+            exit 1
+          fi
