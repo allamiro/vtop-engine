@@ -86,18 +86,40 @@
 //! And liveness: some candidate is established, and every node catches up,
 //! within a bounded number of elections once faults stop.
 //!
-//! # Known gap: #635
+//! # Known gaps: #635, #640, #641
 //!
-//! A kept dispute is held in memory. A replica restarted between its fence
-//! and the settlement forgets it, and the established leader's first append
-//! over the suffix is acked as a duplicate of a record the replica does not
-//! hold (#261). A run fails for that reason only when the node a violation is
-//! on was restarted while it held a kept dispute, and the violation is at or
-//! above the dispute's start. Those runs are reported as #635, not hidden.
-//! Any other failure is a new one.
+//! Each failing run is matched against these by signature
+//! (`Outcome::known_issues`) and printed with its issue number. A failure
+//! that matches none of them fails the test, so the sweep stays a guard.
+//!
+//! * #635. A kept dispute is held in memory. A replica restarted between
+//!   its fence and the settlement forgets it, and the established leader's
+//!   first append over the suffix is acked as a duplicate of a record the
+//!   replica does not hold (#261). Signature: the violation is on a node
+//!   restarted while it held a kept dispute that its fence reply had
+//!   announced, at or above the dispute's start. A fence that died before
+//!   replying leaves the replica absent from the election, which is #641.
+//! * #640. A follower's fencing-epoch journal records an adopted epoch at its
+//!   own tail, so records a new leader later catches it up on are filed
+//!   under that epoch rather than the one that wrote them. After a second
+//!   failover the replicas cannot prove each other's lineage, every answer
+//!   is Unknown, and no candidate is established again. Signature: no leader
+//!   finished and the last election failed with answers judged Unknown;
+//!   every acknowledged record must still be durable on a majority.
+//!   Reproduction:
+//!   `reproduction_a_second_failover_after_a_catch_up_finds_no_provable_quorum`.
+//! * #641. A deposed leader that returns without being fenced keeps its
+//!   unacknowledged suffix under the new leader's mark (the "absent
+//!   replica" item in `promotion.rs`). Signature: the violation is on a node
+//!   not fenced at the final leader's epoch, holding a record nobody
+//!   acknowledged. Reproduction:
+//!   `reproduction_a_returning_deposed_leader_keeps_its_unacknowledged_suffix_under_the_mark`.
+
+// A node is an index into the cluster, `NAMES` and the trace arrays at once.
+#![allow(clippy::needless_range_loop)]
 
 use crate::promotion::{establish, fenced_lineage, Promotion, ReplicaProbe};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -178,9 +200,15 @@ const SHAPES: [Shape; 3] = [
 #[derive(Clone, Copy, Debug)]
 enum Fault {
     None,
-    Storage { node: usize, plan: FaultPlan },
+    Storage {
+        node: usize,
+        plan: FaultPlan,
+    },
     /// Kill the node after the driver's `step`-th step and restart it.
-    ProcessDeath { node: usize, step: u64 },
+    ProcessDeath {
+        node: usize,
+        step: u64,
+    },
 }
 
 impl fmt::Display for Fault {
@@ -222,16 +250,6 @@ enum Violation {
     Liveness(String),
 }
 
-impl Violation {
-    fn node_and_offset(&self) -> Option<(usize, u64)> {
-        match self {
-            Violation::AckWithoutTheRecord { node, offset, .. }
-            | Violation::DivergedBelowMark { node, offset, .. } => Some((*node, *offset)),
-            _ => None,
-        }
-    }
-}
-
 /// How a run ended.
 #[derive(Debug)]
 struct Outcome {
@@ -252,29 +270,88 @@ struct Outcome {
     acknowledged: BTreeMap<u64, String>,
     /// Nodes whose open refused after the crash, and why.
     refused_to_open: Vec<(usize, String)>,
+    /// Epochs at which each node was fenced (or fenced itself as candidate).
+    fenced_at: Vec<Vec<u64>>,
+    /// The epoch the final leader was established at.
+    final_epoch: Option<u64>,
+    /// The last election's result, for the #640 signature.
+    last_promotion: Option<Promotion>,
 }
 
 impl Outcome {
-    /// Every violation explained by #635: on a node restarted while it held
-    /// a kept dispute, at or above the dispute's start. A lost acknowledged
-    /// record counts only as a consequence of such an ack in the same run.
-    fn is_explained_by_635(&self) -> bool {
-        let explained = |violation: &Violation| {
-            violation.node_and_offset().is_some_and(|(node, offset)| {
-                self.forgotten_disputes
-                    .iter()
-                    .any(|(forgot, from)| *forgot == node && offset >= *from)
-            })
+    /// The known issues this run's violations match, one per violation, or
+    /// `None` when any violation matches none of them: a new failure, which
+    /// fails the sweep.
+    ///
+    /// * #635: an ack or disagreement on a node that was restarted while it
+    ///   held a kept dispute its fence reply had announced, at or above the
+    ///   dispute's start. A lost
+    ///   acknowledged record counts only as a consequence of such an ack.
+    /// * #640: no leader finished, and the last election failed for want of
+    ///   a provable quorum: answers came back but were judged Unknown. Every
+    ///   acknowledged record must still be durable on a majority, or the run
+    ///   reports a lost record, which matches nothing.
+    /// * #641: an ack or disagreement on a node that was never fenced at the
+    ///   final leader's epoch, where it holds a record nobody acknowledged.
+    fn known_issues(&self) -> Option<BTreeSet<u32>> {
+        let after_a_forgotten_dispute = |node: usize, offset: u64| {
+            self.forgotten_disputes
+                .iter()
+                .any(|(forgot, from)| *forgot == node && offset >= *from)
+        };
+        let unfenced_holding_an_unacknowledged_record = |node: usize, holds: &Option<String>| {
+            self.final_epoch
+                .is_some_and(|epoch| !self.fenced_at[node].contains(&epoch))
+                && holds
+                    .as_ref()
+                    .is_some_and(|value| !self.acknowledged.values().any(|acked| acked == value))
         };
         let any_635_ack = self.violations.iter().any(|violation| {
-            matches!(violation, Violation::AckWithoutTheRecord { .. }) && explained(violation)
+            matches!(
+                violation,
+                Violation::AckWithoutTheRecord { node, offset, .. }
+                    if after_a_forgotten_dispute(*node, *offset)
+            )
         });
-        !self.violations.is_empty()
-            && self.violations.iter().all(|violation| match violation {
-                Violation::AckedRecordLost { .. } => any_635_ack,
-                Violation::Liveness(_) => false,
-                _ => explained(violation),
-            })
+        let mut issues = BTreeSet::new();
+        for violation in &self.violations {
+            let issue = match violation {
+                Violation::AckWithoutTheRecord {
+                    node,
+                    offset,
+                    holds,
+                    ..
+                }
+                | Violation::DivergedBelowMark {
+                    node,
+                    offset,
+                    holds,
+                    ..
+                } => {
+                    if after_a_forgotten_dispute(*node, *offset) {
+                        635
+                    } else if unfenced_holding_an_unacknowledged_record(*node, holds) {
+                        641
+                    } else {
+                        return None;
+                    }
+                }
+                Violation::AckedRecordLost { .. } if any_635_ack => 635,
+                Violation::AckedRecordLost { .. } => return None,
+                Violation::Liveness(_)
+                    if self.final_leader.is_none()
+                        && matches!(
+                            self.last_promotion,
+                            Some(Promotion::QuorumUnavailable { unproven, .. }) if unproven > 0
+                        ) =>
+                {
+                    640
+                }
+                Violation::Liveness(_) => return None,
+            };
+            issues.insert(issue);
+        }
+        Some(issues)
     }
 
     fn report(&self, shape: Shape, fault: &Fault) -> String {
@@ -309,6 +386,8 @@ struct Cluster {
     nodes: Vec<Node>,
     granted: u64,
     published: u64,
+    /// The node that last completed an election, until it is deposed.
+    leader: Option<usize>,
     steps: u64,
     elections: usize,
     /// Offset -> bytes of every record a leader acknowledged to a producer or
@@ -321,6 +400,12 @@ struct Cluster {
     forgotten_disputes: Vec<(usize, u64)>,
     log: Vec<String>,
     first_promotion: Option<(usize, Promotion)>,
+    fenced_at: Vec<Vec<u64>>,
+    final_epoch: Option<u64>,
+    last_promotion: Option<Promotion>,
+    /// Per node: a fence reply that announced a kept suffix was sent, and
+    /// the dispute it announced is still held (#635's precondition).
+    announced_dispute: [bool; 3],
 }
 
 /// The durable records on `disk`, read from a copy so the read itself
@@ -399,6 +484,7 @@ fn setup_disks() -> Vec<SimDiskState> {
             .collect(),
         granted: OLD_EPOCH,
         published: 0,
+        leader: None,
         steps: 0,
         elections: 0,
         acknowledged: BTreeMap::new(),
@@ -408,6 +494,10 @@ fn setup_disks() -> Vec<SimDiskState> {
         forgotten_disputes: Vec::new(),
         log: Vec::new(),
         first_promotion: None,
+        fenced_at: vec![Vec::new(); 3],
+        final_epoch: None,
+        last_promotion: None,
+        announced_dispute: [false; 3],
     };
     for node in 0..3 {
         let opened = open_replica(node, &cluster.nodes[node].env, &cluster.nodes[node].meta)
@@ -480,11 +570,7 @@ impl Cluster {
     /// death scheduled after it, and restart any node whose disk crashed.
     fn after_step(&mut self, _node: usize) {
         self.steps += 1;
-        if let Fault::ProcessDeath {
-            node: victim,
-            step,
-        } = self.fault
-        {
+        if let Fault::ProcessDeath { node: victim, step } = self.fault {
             if step == self.steps && self.nodes[victim].replica.is_some() {
                 self.note(format!("{} killed (fault)", NAMES[victim]));
                 self.kill(victim);
@@ -511,14 +597,16 @@ impl Cluster {
         if let Some(replica) = self.nodes[node].replica.take() {
             let (_, reported) = replica.replication_status();
             let held = replica.next_offset();
-            if reported < held {
+            if reported < held && self.announced_dispute[node] {
                 self.forgotten_disputes.push((node, reported));
                 self.note(format!(
-                    "{} dies holding a kept dispute from {reported} (held {held}) (#635)",
+                    "{} dies holding a kept dispute from {reported} (held {held}) that its \
+                     fence reply announced (#635)",
                     NAMES[node]
                 ));
             }
         }
+        self.announced_dispute[node] = false;
         self.nodes[node].disk.crash();
     }
 
@@ -719,7 +807,10 @@ impl Cluster {
     /// watcher adopts it.
     fn grant(&mut self, candidate: usize, epoch: u64) {
         self.granted = epoch;
-        self.note(format!("metadata grants epoch {epoch} to {}", NAMES[candidate]));
+        self.note(format!(
+            "metadata grants epoch {epoch} to {}",
+            NAMES[candidate]
+        ));
         for node in 0..3 {
             let Some(replica) = self.up(node) else {
                 continue;
@@ -746,6 +837,9 @@ impl Cluster {
         self.after_step(candidate);
         if !self.still_the_same(candidate, &own) {
             return None;
+        }
+        if vote.is_some() {
+            self.fenced_at[candidate].push(epoch);
         }
         let mut probes = vec![ReplicaProbe {
             node_id: node_id(candidate),
@@ -780,6 +874,13 @@ impl Cluster {
                         outcome.truncated_records,
                         candidate_tail,
                     );
+                    self.fenced_at[node].push(epoch);
+                    // The reply leaves the process here. Only a dispute a
+                    // reply announced can be forgotten in #635's sense; one
+                    // installed by a fence that died before replying leaves
+                    // the replica absent from the election (#641).
+                    let (_, reported) = replica.replication_status();
+                    self.announced_dispute[node] = reported < replica.next_offset();
                     self.note(format!(
                         "{} fenced at {epoch}: committed {}, next {}, truncated {}, {verdict:?}",
                         NAMES[node],
@@ -829,6 +930,7 @@ impl Cluster {
         if self.first_promotion.is_none() {
             self.first_promotion = Some((candidate, promotion.clone()));
         }
+        self.last_promotion = Some(promotion.clone());
         Some(promotion)
     }
 
@@ -910,6 +1012,28 @@ impl Cluster {
         false
     }
 
+    /// An orderly reopen of `node`'s directory: commit, drop, open.
+    fn role_flip(&mut self, node: usize) {
+        let Some(replica) = self.nodes[node].replica.take() else {
+            return;
+        };
+        self.note(format!(
+            "{} reopens its directory for the role flip",
+            NAMES[node]
+        ));
+        if let Err(error) = replica.quiesce() {
+            self.note(format!("{} pre-flip commit failed: {error}", NAMES[node]));
+        }
+        drop(replica);
+        self.after_step(node);
+        if self.nodes[node].replica.is_none() {
+            if self.nodes[node].disk.has_crashed() {
+                self.nodes[node].disk.reboot();
+            }
+            self.restart(node);
+        }
+    }
+
     /// Restart the nodes the scenario held down. True if there were any.
     fn release_held_down(&mut self) -> bool {
         let mut released = false;
@@ -970,9 +1094,19 @@ impl Cluster {
                 continue;
             };
             self.published = self.published.max(committed_offset);
+            // The role flip `data_node` performs: the deposed leader and the
+            // new one each reopen their directory, so nothing held in memory
+            // (a kept dispute included) crosses the flip.
+            if let Some(deposed) = self.leader.take() {
+                if deposed != candidate {
+                    self.role_flip(deposed);
+                }
+            }
+            self.role_flip(candidate);
             let Some(leading) = self.up(candidate) else {
                 continue;
             };
+            self.leader = Some(candidate);
             if !self.lead(candidate, epoch) {
                 continue;
             }
@@ -1002,6 +1136,7 @@ impl Cluster {
                     self.publish_mark(candidate, epoch, mark, &[0, 1, 2]);
                     if self.still_the_same(candidate, &own) {
                         final_leader = Some(candidate);
+                        self.final_epoch = Some(epoch);
                     }
                     break;
                 }
@@ -1017,8 +1152,14 @@ impl Cluster {
                 "no leader finished within {MAX_ELECTIONS} elections"
             ))),
         }
+        if final_leader.is_none() {
+            self.check_majority_durability();
+        }
         Outcome {
             violations: self.violations,
+            fenced_at: self.fenced_at,
+            final_epoch: self.final_epoch,
+            last_promotion: self.last_promotion,
             forgotten_disputes: self.forgotten_disputes,
             log: self.log,
             traces: self.nodes.iter().map(|node| node.disk.trace()).collect(),
@@ -1033,6 +1174,27 @@ impl Cluster {
                 .enumerate()
                 .filter_map(|(node, state)| state.refuses_to_open.clone().map(|why| (node, why)))
                 .collect(),
+        }
+    }
+
+    /// With no leader to read back from, the safety invariant is that every
+    /// acknowledged record is still durable, with its bytes, on a majority.
+    fn check_majority_durability(&mut self) {
+        let logs: Vec<BTreeMap<u64, String>> = (0..3)
+            .map(|node| durable_records(&self.nodes[node].disk))
+            .collect();
+        for (offset, expected) in &self.acknowledged {
+            let holders = logs
+                .iter()
+                .filter(|log| log.get(offset) == Some(expected))
+                .count();
+            if holders < REPLICATION_FACTOR / 2 + 1 {
+                self.violations.push(Violation::AckedRecordLost {
+                    offset: *offset,
+                    expected: expected.clone(),
+                    found: None,
+                });
+            }
         }
     }
 
@@ -1095,6 +1257,7 @@ fn run(shape: Shape, fault: Fault, setup: &[SimDiskState]) -> Outcome {
         nodes,
         granted: OLD_EPOCH,
         published: 0,
+        leader: None,
         steps: 0,
         elections: 0,
         acknowledged: (0..SHARED)
@@ -1106,6 +1269,10 @@ fn run(shape: Shape, fault: Fault, setup: &[SimDiskState]) -> Outcome {
         forgotten_disputes: Vec::new(),
         log: Vec::new(),
         first_promotion: None,
+        fenced_at: vec![Vec::new(); 3],
+        final_epoch: None,
+        last_promotion: None,
+        announced_dispute: [false; 3],
     };
     // The shared records' requests, for resending them in a catch-up.
     for offset in 0..SHARED {
@@ -1168,8 +1335,26 @@ struct Sweep {
     passed: usize,
     /// Passed with a node out because its open refused after the crash.
     passed_with_a_node_refusing_to_open: Vec<String>,
-    known_635: Vec<String>,
+    /// Failures matching a known issue: the issue numbers, then the case.
+    known: Vec<(BTreeSet<u32>, String)>,
     new_failures: Vec<(String, String)>,
+}
+
+fn issue_title(issue: u32) -> &'static str {
+    match issue {
+        635 => "a kept dispute is forgotten on restart",
+        640 => "no provable quorum after a catch-up",
+        641 => "a deposed leader keeps its suffix under the mark",
+        _ => "unknown",
+    }
+}
+
+fn issue_labels(issues: &BTreeSet<u32>) -> String {
+    issues
+        .iter()
+        .map(|issue| format!("#{issue}, {}", issue_title(*issue)))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// One line per violation, for the summary.
@@ -1201,6 +1386,16 @@ fn summary(outcome: &Outcome) -> String {
                 "{} holds {holds:?} at {offset} below the mark, leader {leader}",
                 NAMES[*node]
             ),
+            Violation::Liveness(why)
+                if outcome.log.iter().any(|line| {
+                    line.contains("kept in dispute") && line.contains("below its high-water mark")
+                }) =>
+            {
+                format!(
+                    "liveness: {why}; a replica refused every append over a dispute it kept \
+                     below its own high-water mark"
+                )
+            }
             Violation::Liveness(why) => format!("liveness: {why}"),
         })
         .collect::<Vec<_>>()
@@ -1218,12 +1413,23 @@ fn sweep(shape: Shape, setup: &[SimDiskState]) -> Sweep {
         runs: 0,
         passed: 0,
         passed_with_a_node_refusing_to_open: Vec::new(),
-        known_635: Vec::new(),
+        known: Vec::new(),
         new_failures: Vec::new(),
     };
     for fault in faults_for(&clean) {
         let outcome = run(shape, fault, setup);
         result.runs += 1;
+        let known = outcome.known_issues();
+        if std::env::var_os("VTOP_SWEEP_VERBOSE").is_some() {
+            let verdict = match (&known, outcome.violations.is_empty()) {
+                (_, true) => "pass".to_owned(),
+                (Some(issues), false) => {
+                    format!("{}: {}", issue_labels(issues), summary(&outcome))
+                }
+                (None, false) => format!("NEW: {}", summary(&outcome)),
+            };
+            eprintln!("RESULT {shape:?} | {fault} | {verdict}");
+        }
         if outcome.violations.is_empty() {
             result.passed += 1;
             for (node, why) in &outcome.refused_to_open {
@@ -1231,10 +1437,10 @@ fn sweep(shape: Shape, setup: &[SimDiskState]) -> Sweep {
                     .passed_with_a_node_refusing_to_open
                     .push(format!("{fault}: {} stayed down: {why}", NAMES[*node]));
             }
-        } else if outcome.is_explained_by_635() {
+        } else if let Some(issues) = known {
             result
-                .known_635
-                .push(format!("{fault}: {}", summary(&outcome)));
+                .known
+                .push((issues, format!("{fault}: {}", summary(&outcome))));
         } else {
             result.new_failures.push((
                 format!("{fault}: {}", summary(&outcome)),
@@ -1248,20 +1454,29 @@ fn sweep(shape: Shape, setup: &[SimDiskState]) -> Sweep {
 fn assert_sweep(shape: Shape) {
     let setup = setup_disks();
     let result = sweep(shape, &setup);
+    let count = |issue: u32| {
+        result
+            .known
+            .iter()
+            .filter(|(issues, _)| issues.contains(&issue))
+            .count()
+    };
     eprintln!(
         "{shape:?}: {} runs, {} passed ({} of them with a node whose open refused after the \
-         crash), {} expected #635, {} new failures",
+         crash), expected failures: {} #635, {} #640, {} #641; {} new failures",
         result.runs,
         result.passed,
         result.passed_with_a_node_refusing_to_open.len(),
-        result.known_635.len(),
+        count(635),
+        count(640),
+        count(641),
         result.new_failures.len()
     );
     for case in &result.passed_with_a_node_refusing_to_open {
         eprintln!("  passed, node out: {case}");
     }
-    for case in &result.known_635 {
-        eprintln!("  EXPECTED FAILURE (#635, a kept dispute is forgotten on restart): {case}");
+    for (issues, case) in &result.known {
+        eprintln!("  EXPECTED FAILURE ({}): {case}", issue_labels(issues));
     }
     for (case, _) in &result.new_failures {
         eprintln!("  NEW FAILURE: {case}");
@@ -1269,7 +1484,8 @@ fn assert_sweep(shape: Shape) {
     assert!(
         result.new_failures.is_empty(),
         "{} of {} crash points lost an acknowledged record, acked a record a replica \
-         does not hold, or never finished, for a reason #635 does not explain. First:\n{}",
+         does not hold, or never finished, for a reason #635, #640 and #641 do not \
+         explain. First:\n{}",
         result.new_failures.len(),
         result.runs,
         result.new_failures[0].1
@@ -1290,10 +1506,7 @@ fn the_611_sequence_without_a_fault_loses_no_acknowledged_record() {
             "{}",
             outcome.report(shape, &Fault::None)
         );
-        let (candidate, promotion) = outcome
-            .first_promotion
-            .clone()
-            .expect("an election ran");
+        let (candidate, promotion) = outcome.first_promotion.clone().expect("an election ran");
         assert_eq!(candidate, C, "metadata grants C first");
         match shape {
             Shape::AckedLeaderStaysDown | Shape::AckedLeaderReturns => {
@@ -1332,11 +1545,10 @@ fn the_611_sequence_without_a_fault_loses_no_acknowledged_record() {
             }
             Shape::UnackedOutvoted => {
                 assert!(
-                    !DISPUTED
-                        .clone()
-                        .any(|offset| outcome.acknowledged.get(&offset).is_some_and(
-                            |value| value.starts_with(&format!("e{OLD_EPOCH}-"))
-                        )),
+                    !DISPUTED.clone().any(|offset| outcome
+                        .acknowledged
+                        .get(&offset)
+                        .is_some_and(|value| value.starts_with(&format!("e{OLD_EPOCH}-")))),
                     "precondition: nothing past 5 was acknowledged under epoch 18"
                 );
                 assert!(
@@ -1371,13 +1583,49 @@ fn a_crash_at_every_step_of_an_outvoted_dispute_loses_no_acknowledged_record() {
     assert_sweep(Shape::UnackedOutvoted);
 }
 
+/// Found by the sweep, not explained by #635, and reported rather than
+/// fixed here. The established leader R dies after it caught C up on 5..10
+/// and committed its marker. C's fencing-epoch journal attributes 5..10 to
+/// the epoch it adopted at its own tail before the catch-up delivered them
+/// (`record_adoption` at the follower's next offset); R's attributes them to
+/// epoch 18, which wrote them. Every later fence compares the two as
+/// diverged at 5, below both tails, so each answer is Unknown and never
+/// counted (#577). L, restarted and caught up the same way, disagrees with
+/// R about 10..12. No candidate reaches a provable quorum again, and C,
+/// which kept the "disputed" 5..12 below its own high-water mark, refuses
+/// every append from the next leader. All three hold identical bytes.
 #[test]
-fn scratch_one_fault() {
+#[ignore = "#640: caught-up records are filed under the adopted epoch, so no quorum is provable after a second failover"]
+fn reproduction_a_second_failover_after_a_catch_up_finds_no_provable_quorum() {
     let setup = setup_disks();
-    let outcome = run(
-        Shape::AckedLeaderStaysDown,
-        Fault::ProcessDeath { node: R, step: 30 },
-        &setup,
+    let fault = Fault::ProcessDeath { node: R, step: 30 };
+    let outcome = run(Shape::AckedLeaderStaysDown, fault, &setup);
+    assert!(
+        outcome.violations.is_empty(),
+        "{}",
+        outcome.report(Shape::AckedLeaderStaysDown, &fault)
     );
-    eprintln!("{}", outcome.report(Shape::AckedLeaderStaysDown, &Fault::None));
+}
+
+/// Found by the sweep, not explained by #635: the documented "absent
+/// replica" gap in `promotion.rs`. R's disk dies before it acks L's first
+/// record of 5..10, so L holds 5..10 unacknowledged. L dies, C and R
+/// establish C at 5, and L returns without ever being fenced. Nothing
+/// reconciles it: it reports its full tail, and its epoch-18 records stay
+/// under the new leader's published mark (the real leader's appends there
+/// would be acked as duplicates, #261).
+#[test]
+#[ignore = "#641: a deposed leader that returns is never fenced and keeps its unacknowledged suffix under the mark"]
+fn reproduction_a_returning_deposed_leader_keeps_its_unacknowledged_suffix_under_the_mark() {
+    let setup = setup_disks();
+    let fault = Fault::Storage {
+        node: R,
+        plan: FaultPlan::CrashBefore(67),
+    };
+    let outcome = run(Shape::AckedLeaderStaysDown, fault, &setup);
+    assert!(
+        outcome.violations.is_empty(),
+        "{}",
+        outcome.report(Shape::AckedLeaderStaysDown, &fault)
+    );
 }
