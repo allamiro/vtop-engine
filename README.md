@@ -362,7 +362,7 @@ docker compose up -d
 docker compose logs -f vtop-engine
 ```
 
-Or build and run locally:
+Or build and run locally (install the [native prerequisites](#native-prerequisites) first):
 
 ```bash
 cargo build --release
@@ -372,6 +372,53 @@ cargo run -p vtop-cli -- discover --config examples/config.yaml
 ---
 
 ## Build and test
+
+### Native prerequisites
+
+The default build includes the Kafka source. Its `rdkafka` dependency compiles
+librdkafka with SSL and SASL, so it needs a C toolchain, CMake, OpenSSL 3 and
+Cyrus SASL. Without the Kafka source
+(`cargo build -p vtop-cli --no-default-features`), the file, spool and native
+paths need none of these.
+
+**Debian / Ubuntu** (the same packages CI and the release workflow install):
+
+```bash
+sudo apt-get install -y --no-install-recommends \
+  cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+```
+
+**macOS** (Homebrew). `openssl@3` and `cyrus-sasl` are keg-only, so point
+pkg-config at them explicitly:
+
+```bash
+brew install cmake openssl@3 cyrus-sasl
+export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix cyrus-sasl)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+export OPENSSL_DIR="$(brew --prefix openssl@3)"
+```
+
+Add the two `export` lines to `~/.zshrc` to keep them in new terminals.
+
+- **Use OpenSSL 3, not 4.** If Homebrew's default `openssl` is 4.x and these
+  variables are unset, the build links `openssl@4` and fails at the link step,
+  because librdkafka uses APIs that OpenSSL 4 removed. If that happened, set
+  the variables above, then run `cargo clean -p rdkafka-sys` and build again.
+- `ld: warning: ... was built for newer 'macOS' version` lines are harmless.
+  `export MACOSX_DEPLOYMENT_TARGET=11.0` silences them.
+
+**macOS release binaries** load the same two Homebrew libraries at run time.
+Install them before running a downloaded `vtopctl` or `vtop-node`:
+
+```bash
+brew install openssl@3 cyrus-sasl
+```
+
+Without them the binary stops at launch with
+`Library not loaded: .../libsasl2.3.dylib`. Bundling them into the release is
+tracked in #677. The Linux binaries and the container image need nothing
+extra.
+
+### Checks
 
 ```bash
 cargo fmt --all --check
