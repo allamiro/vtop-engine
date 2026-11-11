@@ -1340,17 +1340,12 @@ async fn recovery_commits_a_verified_range_above_a_failed_row_that_a_retry_alrea
     );
 }
 
-
 /// A ledger whose only VERIFIED row, `b-629` over `[7,14)`, can be re-checked
 /// by size alone (checksums disabled, testkit's `require_strong_verification:
 /// false`), with its object and manifest staged in the engine's backend. With
 /// `failed_below`, a FAILED row over `[0,7)` of the same file sits under it,
 /// so recovery must hold `b-629` back (#552).
-async fn size_only_verified_ledger(
-    dir: &Path,
-    tenant: &str,
-    failed_below: bool,
-) -> Engine {
+async fn size_only_verified_ledger(dir: &Path, tenant: &str, failed_below: bool) -> Engine {
     let work = dir.join("work");
     let input = dir.join("in.log");
     std::fs::write(&input, "line-0\nline-1\n").unwrap();

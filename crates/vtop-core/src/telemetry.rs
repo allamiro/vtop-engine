@@ -62,15 +62,19 @@ pub struct Metrics {
     pub verification_failures_total: IntCounterVec,
 
     /// Verified by size/existence only. The default policy refuses to commit;
-    /// this counter records explicit compatibility/lab opt-outs, whether the
-    /// running engine or recovery's storage re-check accepted the result.
+    /// this counter records explicit compatibility/lab opt-outs. It is
+    /// counted where `verified_total` is: when the running engine marks a
+    /// batch VERIFIED on a size-only result, and when recovery commits a
+    /// VERIFIED row whose storage re-check confirmed only size. A row recovery
+    /// re-checks but holds back is not counted.
     pub verification_backend_limited_total: IntCounterVec,
 
     /// Which verification results this engine will commit on, set once at
     /// startup (#629): `mode="size_only"` reads 1 when
     /// `upload.require_strong_verification` is false, `mode="strong"` reads 1
     /// otherwise. The counter above only moves when a batch does; this can be
-    /// alerted on before any traffic.
+    /// alerted on before any traffic. Exported only by `vtopctl run` with
+    /// `VTOP_METRICS_ADDR` set, the one process that builds a registry.
     pub verification_mode: IntGaugeVec,
 
     /// Batches sent back to be re-read from source. Safe by design, but a
@@ -186,7 +190,7 @@ impl Metrics {
         )?;
         let verification_backend_limited_total = cv(
             "verification_backend_limited_total",
-            "Size-only verifications committed under an explicit require_strong_verification=false opt-out, by the running engine or recovery's re-check; each accepts same-size corruption",
+            "Size-only verifications accepted under an explicit require_strong_verification=false opt-out, counted where vtop_verified_total is (the running engine at VERIFIED, recovery at its commit); each accepts same-size corruption",
             labels3(),
         )?;
         let verification_mode = IntGaugeVec::new(

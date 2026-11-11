@@ -248,14 +248,20 @@ algorithm choice and the strength opt-out, each visible in configuration.
 recorded size is committed as verified. With
 `upload.require_strong_verification: false`, an engine started for `run`,
 `process-once` or `replay` logs one WARN at startup naming that consequence
-and the key, and sets `vtop_verification_mode{mode="size_only"}` to 1 (the
-`strong` series reads 0), so an alert can fire before any batch moves.
+and the key. `vtopctl run` with `VTOP_METRICS_ADDR` set, the one process
+that serves metrics, also sets `vtop_verification_mode{mode="size_only"}` to
+1 (the `strong` series reads 0), so an alert can fire before any batch
+moves; the one-shot commands build no registry and export nothing.
 `vtopctl validate --config <file>` prints the same warning and still exits 0;
-there is no strict or production profile for it to refuse in. Every batch
-committed on size alone logs a WARN with its batch id and increments
-`vtop_verification_backend_limited_total` — in the running engine and in
-recovery's storage re-check of a VERIFIED row alike; under the strong
-default, the re-check logs the size-only result it refuses. The per-batch WARN
+there is no strict or production profile for it to refuse in. Every
+size-only verification logs a WARN with its batch id, and
+`vtop_verification_backend_limited_total` counts it where
+`vtop_verified_total` counts verifications: when the running engine marks the
+batch VERIFIED, and when recovery commits a VERIFIED row whose storage
+re-check confirmed only size. A row recovery re-checks but holds back under
+a lower incomplete range is logged, not counted, so a restart does not count
+it again. Under the strong default, the re-check logs the size-only result it
+refuses. The per-batch WARN
 is not rate-limited: it replaces that batch's INFO `verification_passed`
 line, so it is no more frequent than the batch log itself.
 
