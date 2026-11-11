@@ -4,7 +4,7 @@
 //! identity (inode), size, and mtime. Resumes from the last committed byte and
 //! never deletes source files unless explicitly configured, only after the
 //! batch is committed, and only once the file has gone a quiet period without
-//! a write (#619, see [`DeleteCandidate`]).
+//! a write (#619, see `DeleteCandidate`).
 
 use crate::base::{
     AdapterReadReport, DiscoveredSource, ReadResult, SourceAdapter, SourceReadOutcome,
@@ -70,7 +70,8 @@ struct FileCursor {
 ///
 /// The wait is in memory: a restart starts it again, from the seed (see
 /// [`FileSource::arm_delete_from_seed`]). With a zero quiet period the commit
-/// that covers the file deletes it at once.
+/// that covers the file deletes it at once - through the same rename-and-check
+/// ([`DeleteJob::run`]), with no quiet-period protection.
 #[derive(Debug, Clone)]
 struct DeleteCandidate {
     /// The identity the committed range was read from.
@@ -378,8 +379,9 @@ impl FileSource {
 
     /// How long a fully archived file must stay unwritten before
     /// `delete_after_commit` removes it (#619). Zero deletes as soon as a
-    /// commit covers the file, which is safe only when nothing can still be
-    /// writing to it.
+    /// commit covers the file - still through the rename-and-check, but with
+    /// no quiet-period protection, so it is safe only when nothing can still
+    /// hold the file open for writing.
     pub fn with_delete_quiet_period(mut self, quiet: Duration) -> Self {
         self.delete_quiet = quiet;
         self
@@ -471,7 +473,7 @@ impl FileSource {
     ///   the seed carries the tail fingerprint (#620). Then the delete checks
     ///   the page below the committed end as well as the first, which is what
     ///   proves a moved mtime a touch rather than a rewrite (see
-    ///   [`DeleteCandidate::compare`]), so the wait is armed from the file's
+    ///   `DeleteCandidate::compare`), so the wait is armed from the file's
     ///   current mtime, as a touch in process restarts it.
     pub fn arm_delete_from_seed(&mut self, path: &str, archived_mtime: Option<&str>) {
         if !self.delete_after_commit {

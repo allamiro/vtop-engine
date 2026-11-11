@@ -465,8 +465,11 @@ pub struct FileSourceConfig {
     /// `delete_after_commit` deletes it (#619). Timed on the engine's own
     /// clock from the commit that covered the file, so a restart starts the
     /// wait again; the file's mtime is compared, never trusted as a clock. 0
-    /// deletes as soon as a commit covers the file, which loses the lines of
-    /// any writer that still has it open. Default 3600.
+    /// deletes as soon as a commit covers the file - still through the
+    /// rename-and-check, which puts the file back if a write landed before
+    /// the move - but with no quiet-period protection: a writer that still
+    /// has the file open loses every line it writes after the delete.
+    /// Default 3600.
     #[serde(default = "default_delete_quiet_seconds")]
     pub delete_quiet_seconds: u64,
     /// Read each file as a single whole-file record instead of line by line.

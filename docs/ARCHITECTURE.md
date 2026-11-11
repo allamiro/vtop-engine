@@ -387,8 +387,9 @@ What follows from that, in the engine:
   page, length, mtime), and the file is deleted only once it has stayed
   exactly like that for `delete_quiet_seconds` (default 3600), timed on the
   engine's monotonic clock from that commit. With `delete_quiet_seconds: 0`
-  there is no wait: the covering commit deletes the file at once, through
-  the rename-and-check below. The check runs again at the next commit or
+  there is no wait: the covering commit deletes the file at once, still
+  through the rename-and-check below, but with no quiet-period protection
+  for a writer that holds the file open. The check runs again at the next commit or
   read pass. Until then the file is kept and read as usual. Before, the
   engine deleted the path the moment it caught up. Most appenders hold their
   log open with `O_APPEND`, so every later line went into the unlinked
