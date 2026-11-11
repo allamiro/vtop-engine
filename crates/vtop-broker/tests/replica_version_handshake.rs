@@ -525,3 +525,89 @@ fn an_answer_selecting_beyond_the_peers_own_maximum_is_refused() {
         "{refused}"
     );
 }
+
+/// #634 review (Codex on #656): a session is judged when it opens, and the
+/// level can rise while it stays open. A leader that kept replicating to a
+/// follower the new level refuses would let that follower keep counting
+/// toward quorum after the raise - the gate's guarantee must hold for
+/// sessions that already exist. The leader re-judges an open session before
+/// it sends a batch, and stops counting the follower once it falls below.
+#[test]
+fn a_leader_drops_an_open_session_the_raised_level_refuses() {
+    let runtime = Runtime::new().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let old_follower = runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_like_a_release_before_the_handshake(
+            listener,
+            Arc::clone(&seen),
+        ));
+        addr
+    });
+    let level = ClusterFeatureLevel::unknown();
+    level.observe(LEGACY_PEERS_ACCEPTED_THROUGH);
+    let leader = leader_of(&runtime, old_follower, level.clone());
+    assert!(until(Duration::from_secs(5), || leader
+        .follower_connected(FOLLOWER)
+        == Some(true)));
+    assert_eq!(
+        leader.replicate_append_batch(&[append(0)], 1).follower_acks,
+        1
+    );
+
+    // The cluster is finalized past the old follower while its session is
+    // open.
+    level.observe(FINALIZED_PAST_OLD_PEERS);
+    seen.lock().unwrap().clear();
+    assert_eq!(
+        leader.replicate_append_batch(&[append(1)], 2).follower_acks,
+        0,
+        "an open session below the raised level still counted toward quorum"
+    );
+    assert!(
+        seen.lock().unwrap().iter().all(|kind| *kind == "hello"),
+        "an append reached a follower the raised level refuses: {:?}",
+        seen.lock().unwrap()
+    );
+}
+
+/// The serving side of the same rule: an old leader whose session opened
+/// before the raise is refused on its next request, and the session closes.
+#[test]
+fn a_follower_refuses_an_open_session_the_raised_level_refuses() {
+    let runtime = Runtime::new().unwrap();
+    runtime.block_on(async {
+        let level = ClusterFeatureLevel::unknown();
+        let follower = serve_this_build(level.clone()).await;
+        let mut session = TcpStream::connect(follower).await.unwrap();
+        let ask = |request_id| WireFrame {
+            request_id,
+            stream_id: 0,
+            message: Message::ReplicaStatusRequest(ReplicaStatusRequest { range: range() }),
+        };
+        write_frame(&mut session, &ask(1), LIMITS).await.unwrap();
+        let first = read_frame(&mut session, LIMITS).await.unwrap().unwrap();
+        assert!(matches!(first.message, Message::ReplicaStatusResponse(_)));
+
+        level.observe(FINALIZED_PAST_OLD_PEERS);
+        write_frame(&mut session, &ask(2), LIMITS).await.unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut session, LIMITS))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match second.message {
+            Message::Error(ErrorResponse {
+                code: ErrorCode::UnsupportedVersion,
+                message,
+                ..
+            }) => assert!(message.contains("predates"), "{message}"),
+            other => panic!("an open session below the raised level was served: {other:?}"),
+        }
+        let after = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut session, LIMITS))
+            .await
+            .expect("the refused session must close, not hang");
+        assert!(matches!(after, Ok(None)) || after.is_err(), "{after:?}");
+    });
+}

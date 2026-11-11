@@ -222,6 +222,20 @@ where
     Ok(peer)
 }
 
+/// The typed refusal a serving side answers a peer it will not run a
+/// session with: `UnsupportedVersion`, not retryable, saying why.
+pub(crate) fn refusal(request_id: u64, stream_id: u64, why: String) -> WireFrame {
+    WireFrame {
+        request_id,
+        stream_id,
+        message: Message::Error(ErrorResponse {
+            code: ErrorCode::UnsupportedVersion,
+            retryable: false,
+            message: why,
+        }),
+    }
+}
+
 /// What the serving side made of a session's first frame.
 pub(crate) enum Accepted {
     /// A hello, answered: the session continues at this version.
@@ -242,15 +256,7 @@ pub(crate) async fn accept_session<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let refuse = |request_id: u64, stream_id: u64, why: String| WireFrame {
-        request_id,
-        stream_id,
-        message: Message::Error(ErrorResponse {
-            code: ErrorCode::UnsupportedVersion,
-            retryable: false,
-            message: why,
-        }),
-    };
+    let refuse = refusal;
     let level = policy.cluster_level.get();
     let Some(hello) = ReplicaHello::from_message(&first.message) else {
         return match judge_peer(level, PeerVersion::Legacy) {

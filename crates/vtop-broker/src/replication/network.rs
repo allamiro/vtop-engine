@@ -618,9 +618,10 @@ async fn serve_follower_connection(
     // always was - unless the cluster's finalized level has moved past what
     // such a peer can run, and then it is refused by name.
     //
-    // `_session` is the version the session runs at: what a later wire
-    // change (one only a peer at a newer protocol may be sent) branches on.
-    let (mut first, _session) = match read_frame(&mut stream, REPLICA_LIMITS).await {
+    // `session` is the version the session runs at: what a later wire
+    // change (one only a peer at a newer protocol may be sent) branches on,
+    // and what every later frame is judged by.
+    let (mut first, session) = match read_frame(&mut stream, REPLICA_LIMITS).await {
         Ok(Some(frame)) => {
             match super::version::accept_session(&mut stream, frame, &version).await? {
                 super::version::Accepted::Hello(peer) => (None, peer),
@@ -644,6 +645,19 @@ async fn serve_follower_connection(
                 Err(problem) => return Err(problem.into()),
             },
         };
+        // Re-judged on EVERY frame, not only the first (#634 review): the
+        // finalized level can rise while this session is open, and a peer it
+        // leaves behind must stop being served now, not on its next connect.
+        if let Err(why) = super::version::judge_peer(version.cluster_level.get(), session) {
+            write_frame(
+                &mut stream,
+                &super::version::refusal(frame.request_id, frame.stream_id, why.clone()),
+                REPLICA_LIMITS,
+            )
+            .await
+            .map_err(crate::BrokerError::from)?;
+            return Err(crate::BrokerError::ReplicaVersion(why));
+        }
         let response = dispatch_replica_frame(handler.as_ref(), peer_id, frame);
         if let Some(response) = response {
             write_frame(&mut stream, &response, REPLICA_LIMITS)
@@ -1380,16 +1394,18 @@ impl FollowerDriver {
         // typed refusal and is spoken to as before; one the cluster's level
         // has left behind is refused by name, and this driver keeps retrying
         // on its backoff until the follower is upgraded.
-        match tokio::time::timeout_at(
+        let peer = match tokio::time::timeout_at(
             deadline,
             super::version::open_session(&mut stream, &self.flow.version),
         )
         .await
         {
-            Ok(Ok(peer)) => self
-                .channel
-                .protocol
-                .store(peer.protocol(), Ordering::SeqCst),
+            Ok(Ok(peer)) => {
+                self.channel
+                    .protocol
+                    .store(peer.protocol(), Ordering::SeqCst);
+                peer
+            }
             Ok(Err(error)) => {
                 if matches!(error, crate::BrokerError::ReplicaVersion(_)) {
                     warn_rate_limited(
@@ -1403,7 +1419,7 @@ impl FollowerDriver {
                 return SessionOutcome::Disconnected;
             }
             Err(_) => return SessionOutcome::Disconnected,
-        }
+        };
         // Catch-up probe + bounded retransmission. Mark connected only after the
         // optional status exchange succeeds so tests do not observe a false ready.
         let range = retransmission
@@ -1509,7 +1525,8 @@ impl FollowerDriver {
                 else {
                     break;
                 };
-                if !window_allows(inflight.len(), inflight_bytes, bytes, &self.flow) {
+                let refused = !self.still_admitted(peer);
+                if refused || !window_allows(inflight.len(), inflight_bytes, bytes, &self.flow) {
                     pending.push_front(FollowerCmd::Replicate {
                         requests,
                         leader_committed_offset,
@@ -1517,6 +1534,10 @@ impl FollowerDriver {
                         response_tx,
                         catch_up_charged,
                     });
+                    if refused {
+                        requeue_inflight(pending, &mut inflight, retransmission);
+                        return SessionOutcome::Disconnected;
+                    }
                     break;
                 }
                 if let Err(outcome) = self
@@ -1551,6 +1572,13 @@ impl FollowerDriver {
                 }
                 frame = read_frame(&mut stream, REPLICA_LIMITS), if !inflight.is_empty() => {
                     match frame {
+                        // An ack from a peer the level has since left behind
+                        // is not counted (#634 review): the session closes,
+                        // and what it had in flight is sent again elsewhere.
+                        Ok(Some(_)) if !self.still_admitted(peer) => {
+                            requeue_inflight(pending, &mut inflight, retransmission);
+                            return SessionOutcome::Disconnected;
+                        }
                         Ok(Some(frame)) => {
                             if handle_response(
                                 frame,
@@ -1613,6 +1641,20 @@ impl FollowerDriver {
                             response_tx,
                             catch_up_charged,
                         }) => {
+                            // Re-judged before every batch (#634 review): the
+                            // level can rise while a session is open, and a
+                            // peer it leaves behind must stop taking part now,
+                            // not when it next reconnects.
+                            // The batch is missed, as a slow follower's is:
+                            // this peer is refused until it is upgraded.
+                            if !self.still_admitted(peer) {
+                                if catch_up_charged {
+                                    self.budget.release_catch_up(bytes as u64);
+                                }
+                                drop((requests, leader_committed_offset, response_tx));
+                                requeue_inflight(pending, &mut inflight, retransmission);
+                                return SessionOutcome::Disconnected;
+                            }
                             if !window_allows(inflight.len(), inflight_bytes, bytes, &self.flow) {
                                 // Slow follower: miss this ack rather than stall.
                                 // A transferred charge dies with the dropped
@@ -1649,6 +1691,27 @@ impl FollowerDriver {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Whether the peer of an OPEN session may still take part (#634
+    /// review). A session is judged when it opens, but the finalized level
+    /// can rise while it stays open; a peer the new level refuses must stop
+    /// receiving batches and stop counting toward quorum now, or the gate
+    /// would hold only for sessions opened after the raise.
+    fn still_admitted(&self, peer: super::version::PeerVersion) -> bool {
+        match super::version::judge_peer(self.flow.version.cluster_level.get(), peer) {
+            Ok(()) => true,
+            Err(why) => {
+                warn_rate_limited(
+                    "replica-driver",
+                    &format!(
+                        "replica {} at {}: open session closed: {why}",
+                        self.config.node_id, self.config.addr
+                    ),
+                );
+                false
             }
         }
     }
