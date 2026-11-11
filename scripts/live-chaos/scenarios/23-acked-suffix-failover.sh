@@ -6,7 +6,8 @@
 # synchronous network. Three identical candidates over TLS, as scenario 14.
 #
 # The #611 shape, placed with signals rather than luck:
-#   1. the leader L and both followers take a shared prefix;
+#   1. the leader L and both followers take a shared prefix, and both
+#      followers' committed offsets are seen to cover it;
 #   2. one follower, C, is SIGKILLed, so the suffix L produces next is
 #      acknowledged by L and the other follower, R, alone. Killed rather
 #      than frozen: a frozen process still has the leader's appends queued in
@@ -25,7 +26,8 @@
 #
 # Invariants:
 #   * SAFETY (#611): C, which lacks acknowledged records, never leads, and R
-#     takes the range at a newer epoch.
+#     takes the range at an epoch newer than both L's and the one C was
+#     refused at.
 #   * SAFETY: every record acknowledged before the kill is readable,
 #     byte-exact, from whichever candidate ends up serving.
 #   * LIVENESS: some candidate serves quorum produce at a newer epoch within
@@ -40,7 +42,10 @@
 #
 # Knobs: CHAOS_611_SEED picks which follower lags and how far into the
 # suffix the kill lands (logged, so a failure replays exactly);
-# CHAOS_611_SHARED, CHAOS_611_SUFFIX_MAX and CHAOS_611_BATCH size the stream.
+# CHAOS_611_SHARED is the shared prefix (default 200), CHAOS_611_BATCH the
+# produce batch (default 20), and CHAOS_611_SUFFIX_MAX (default 2000, at
+# least one batch) bounds the suffix acknowledged before L dies, chosen in
+# [BATCH, SUFFIX_MAX].
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 # v2: every promotion appends a boundary marker, as in scenario 14.
@@ -55,10 +60,11 @@ SUFFIX_MAX="${CHAOS_611_SUFFIX_MAX:-2000}"
 BATCH="${CHAOS_611_BATCH:-20}"
 require_integer_in_range CHAOS_611_SEED "$SEED" 0 4294967295
 require_integer_in_range CHAOS_611_SHARED "$SHARED" 1 100000000
-require_integer_in_range CHAOS_611_SUFFIX_MAX "$SUFFIX_MAX" 1 100000000
 require_integer_in_range CHAOS_611_BATCH "$BATCH" 1 65536
-# The kill lands after at least one batch of suffix and at most SUFFIX_MAX.
-SUFFIX=$((BATCH + SEED % SUFFIX_MAX))
+# At least one batch: the kill waits for that much suffix to be acknowledged.
+require_integer_in_range CHAOS_611_SUFFIX_MAX "$SUFFIX_MAX" "$BATCH" 100000000
+# How much suffix L and R acknowledge before L dies: in [BATCH, SUFFIX_MAX].
+SUFFIX=$((BATCH + SEED % (SUFFIX_MAX - BATCH + 1)))
 TOTAL=$((SHARED + SUFFIX + 100000))
 log "seed=$SEED shared=$SHARED suffix=$SUFFIX batch=$BATCH"
 
@@ -103,6 +109,14 @@ CLIENT_CFG="$(emit_client_config_at_epoch "$EPOCH")"
 PRODUCER=$!
 echo "$PRODUCER" >> "$WORKDIR/pids"
 await_acked_floor "$ACKED_FILE" "$SHARED"
+# An acknowledgement proves only that SOME majority holds the prefix (#646
+# review). Both followers must hold it before C dies, so that what C lacks is
+# exactly the suffix acknowledged after. The committed offset counts the
+# epoch's boundary marker too, hence the epoch on top of the record count.
+PREFIX="$(cat "$ACKED_FILE")"
+for n in "$C" "$R"; do
+  await_metric_at_least "$(data_metrics_addr $((n + 10)))"     vtop_broker_local_committed_offset $((PREFIX + EPOCH))     "follower $n must hold the $PREFIX-record shared prefix before C is killed"
+done
 kill9_pid "${PIDS[$C]}"
 FROZEN_AT="$(cat "$ACKED_FILE")"
 log "C=$C SIGKILLed with the acknowledged floor at $FROZEN_AT"
@@ -144,7 +158,13 @@ if grep -q "refusing promotion: fewer than a majority" "$C_LOG"; then
 else
   REFUSED=no
 fi
-log "R=$R took the range at epoch $R_EPOCH; C=$C never led (refused by R's answer: $REFUSED)"
+[[ -n "$R_EPOCH" ]] \
+  || fail "R=$R logged a role change without an epoch: $(grep "data_node_role_changed" "$R_LOG" | tail -1)"
+[[ "$R_EPOCH" -gt "$EPOCH" && "$R_EPOCH" -gt "$C_EPOCH" ]] \
+  || fail "R=$R must lead at an epoch newer than the deposed leader's $EPOCH and the refused \
+candidate's $C_EPOCH; it leads at $R_EPOCH"
+log "R=$R took the range at epoch $R_EPOCH (L led at $EPOCH, C was refused at $C_EPOCH); \
+C=$C never led (refused by R's answer: $REFUSED)"
 
 # --- liveness needs a second follower that holds R's tail -------------------
 # C is behind R's tail, and a new leader does not stream a lagging follower
