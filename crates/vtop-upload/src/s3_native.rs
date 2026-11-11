@@ -84,6 +84,10 @@ pub struct S3NativeConfig {
     /// construction in [`S3NativeBackend::new`], naming the field and the
     /// transport — never silently ignored.
     pub tuning: vtop_core::config::EgressTuning,
+    /// The operator's process-wide egress cap (#481). `None` — the default —
+    /// builds no shaper, and every request body goes to the SDK exactly as it
+    /// did before the cap existed.
+    pub max_egress_bytes_per_second: Option<u64>,
     /// Wall-clock limit for one attempt of one request (#556); see
     /// `UploadConfig::request_timeout_seconds`. Must be non-zero.
     pub request_timeout_seconds: u64,
@@ -121,6 +125,16 @@ pub fn request_timeouts(request_timeout_seconds: u64) -> aws_smithy_types::timeo
 
 pub struct S3NativeBackend {
     client: Client,
+    /// Present only when a cap is configured (#481). The PROCESS's shaper
+    /// (`transport::process_egress_shaper`), not this backend's own: every
+    /// object, manifest and part sent by any backend in the process draws on
+    /// the same budget.
+    shaper: Option<Arc<transport::EgressShaper>>,
+    /// Where this process's live egress budget is kept (#481, review). A
+    /// backend built WITHOUT a cap still consults it for every body, so a cap
+    /// another backend in the process has in force binds this one too. Always
+    /// the process-global slot outside tests.
+    process_slot: &'static transport::ShaperSlot,
     /// The bound on reading a response BODY (review of #568). The SDK's
     /// timeouts end when `send()` returns the headers; a body consumed after
     /// that is outside them, and the SDK's stalled-stream protection only
@@ -510,6 +524,32 @@ fn reject_out_of_range_part_size(
     Ok(())
 }
 
+/// The shaper a configured cap needs, or a refusal naming the cap and the
+/// transport when the transport cannot be held under one (#481). `None` in,
+/// `None` out: an unset cap builds nothing, so the default pipeline carries no
+/// shaper at all.
+///
+/// `slot` is where the process's budget lives: always the process-global one
+/// in production (`transport::process_shaper_slot`); a unit test passes its
+/// own, so two tests asking for different caps at once cannot collide in it.
+fn egress_shaper_for(
+    transport: &dyn EgressTransport,
+    cap: Option<u64>,
+    slot: &transport::ShaperSlot,
+) -> Result<Option<Arc<transport::EgressShaper>>, VtopError> {
+    let Some(cap) = cap else {
+        return Ok(None);
+    };
+    if !transport.tuning_support().egress_ceiling {
+        return Err(VtopError::Config(format!(
+            "upload.max_egress_bytes_per_second = {cap} is set, but the {} transport cannot be \
+             held under an egress ceiling; refusing rather than accepting a cap nothing enforces",
+            transport.name()
+        )));
+    }
+    transport::shared_shaper(slot, cap).map(Some)
+}
+
 impl S3NativeBackend {
     /// S3's hard minimum for a non-final multipart part (#482).
     pub const fn part_size_floor() -> u64 {
@@ -544,6 +584,14 @@ impl S3NativeBackend {
             Self::part_size_ceiling(),
             &cfg.tuning,
             &cfg.transport,
+        )?;
+        // The egress cap next (#481): refused here, naming the cap and the
+        // transport, when the resolved transport cannot be held under it —
+        // never accepted and then ignored.
+        let shaper = egress_shaper_for(
+            transport.as_ref(),
+            cfg.max_egress_bytes_per_second,
+            transport::process_shaper_slot(),
         )?;
         if !cfg.verify_tls {
             tracing::warn!(
@@ -599,9 +647,43 @@ impl S3NativeBackend {
 
         Ok(Self {
             client: Client::from_conf(s3_conf),
+            shaper,
+            process_slot: transport::process_shaper_slot(),
             body_deadline: std::time::Duration::from_secs(cfg.request_timeout_seconds)
                 .saturating_mul(OPERATION_ATTEMPTS),
         })
+    }
+
+    /// The egress shaper, when a cap is configured (#481). `None` is the
+    /// shipping default and means no body is wrapped. Exposed so the
+    /// benchmark harness and tests can read the admitted-bytes account
+    /// directly, beside the exported counter.
+    pub fn egress_shaper(&self) -> Option<&Arc<transport::EgressShaper>> {
+        self.shaper.as_ref()
+    }
+
+    /// Every request body that carries object bytes goes through HERE (#481):
+    /// with no cap it is returned untouched — the same value, not a copy — and
+    /// with one it is wrapped so each attempt's bytes pass the shared shaper.
+    /// A new body-carrying request must route through this too, or its bytes
+    /// escape both the cap and the account.
+    ///
+    /// "No cap" means no cap ANYWHERE in the process (review): a backend
+    /// configured without one still takes the process's live budget, looked
+    /// up per body rather than at construction, so a capped backend built
+    /// after this one binds it as well. A cap is the process's ceiling; a
+    /// second, uncapped backend sending at line rate beside it would exceed
+    /// that ceiling and escape its counter. With no cap configured by any
+    /// backend the slot is empty and the body is untouched, as before.
+    fn egress_body(&self, body: ByteStream) -> ByteStream {
+        let shaper = match &self.shaper {
+            Some(own) => Some(Arc::clone(own)),
+            None => transport::live_shaper(self.process_slot),
+        };
+        match shaper {
+            None => body,
+            Some(shaper) => ByteStream::new(transport::shape_body(&shaper, body.into_inner())),
+        }
     }
 
     async fn put(
@@ -622,7 +704,7 @@ impl S3NativeBackend {
             .bucket(&bucket)
             .key(&key)
             .content_type(content_type)
-            .body(body);
+            .body(self.egress_body(body));
 
         if let Some(c) = checksum {
             // Always retain the hex digest as user metadata (any algorithm),
@@ -1136,7 +1218,7 @@ impl UploadBackend for S3NativeBackend {
             .key(&key)
             .upload_id(upload_id)
             .part_number(part_number as i32)
-            .body(ByteStream::from(data))
+            .body(self.egress_body(ByteStream::from(data)))
             .send()
             .await
             .map_err(|e| sdk_failure("upload_part", &format!("{object_uri}#{part_number}"), e))?;
@@ -1246,6 +1328,7 @@ pub fn config_from_upload(upload: &vtop_core::config::UploadConfig) -> S3NativeC
         verify_tls,
         transport,
         tuning,
+        max_egress_bytes_per_second: upload.max_egress_bytes_per_second,
         request_timeout_seconds: upload.request_timeout_seconds,
     }
 }
@@ -1473,6 +1556,7 @@ mod tests {
                 rate_control: false,
                 parallelism: true,
                 redundancy: false,
+                egress_ceiling: true,
             }
         }
     }
@@ -1606,6 +1690,7 @@ mod tests {
                 rate_control: false,
                 parallelism: true,
                 redundancy: false,
+                egress_ceiling: true,
             }
         }
     }
@@ -2709,6 +2794,7 @@ mod tests {
             verify_tls: true,
             transport: "tcp_tls".to_string(),
             tuning: Default::default(),
+            max_egress_bytes_per_second: None,
             request_timeout_seconds: 300,
         };
         let err = match S3NativeBackend::new(&cfg).await {
@@ -2930,5 +3016,477 @@ mod throttle_classification {
         }
         let error = sdk_failure("upload_part", "s3://b/k", response_error(502));
         assert!(!error.is_upload_throttle(), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod egress_ceiling {
+    use super::*;
+    use aws_sdk_s3::config::retry::RetryConfig;
+    use aws_sdk_s3::config::Credentials;
+    use aws_smithy_runtime_api::client::http::{
+        http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector,
+    };
+    use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
+    use aws_smithy_runtime_api::client::result::ConnectorError;
+    use aws_smithy_runtime_api::http::StatusCode;
+    use aws_smithy_types::body::SdkBody;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// A fresh slot for one test's backends, so a budget another test holds
+    /// live in the process-global slot cannot reach them.
+    fn test_slot() -> &'static transport::ShaperSlot {
+        Box::leak(Box::new(Mutex::new(std::sync::Weak::new())))
+    }
+
+    /// The process ceiling binds a backend configured WITHOUT a cap (#481,
+    /// review), in either construction order: while any backend in the
+    /// process holds a live budget, every body an uncapped backend sends
+    /// passes, and is counted by, that budget. With none live - before the
+    /// capped backend exists, and after it is gone - the uncapped backend's
+    /// body is the untouched value it was before the cap existed.
+    #[tokio::test]
+    async fn an_uncapped_backend_shares_the_live_process_budget_in_either_order() {
+        let slot = test_slot();
+        let backend = |shaper: Option<Arc<transport::EgressShaper>>| S3NativeBackend {
+            client: Client::from_conf(
+                aws_sdk_s3::Config::builder()
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .build(),
+            ),
+            shaper,
+            process_slot: slot,
+            body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
+        };
+        let payload = Bytes::from_static(b"bytes the process ceiling must see");
+        let untouched = |b: ByteStream| {
+            format!("{:?}", b.into_inner())
+                == format!("{:?}", ByteStream::from(payload.clone()).into_inner())
+        };
+
+        // Built first, while no cap is live anywhere: today's body.
+        let early = backend(None);
+        assert!(untouched(
+            early.egress_body(ByteStream::from(payload.clone()))
+        ));
+
+        // A capped backend arrives; it registers the process's budget.
+        let shaper = transport::EgressShaper::new(1024 * 1024).unwrap();
+        *slot.lock().unwrap() = Arc::downgrade(&shaper);
+        let capped = backend(Some(Arc::clone(&shaper)));
+        drop(shaper);
+        let late = backend(None);
+
+        for (who, uncapped) in [("built before the cap", &early), ("built after it", &late)] {
+            let live = Arc::clone(capped.egress_shaper().unwrap());
+            let before = live.admitted_bytes();
+            let body = uncapped.egress_body(ByteStream::from(payload.clone()));
+            assert_eq!(body.collect().await.unwrap().into_bytes(), payload);
+            assert_eq!(
+                live.admitted_bytes() - before,
+                payload.len() as u64,
+                "[{who}] an uncapped backend beside a capped one must send through the \
+                 process's budget, not around it"
+            );
+        }
+
+        // The capped backend is gone and with it the only budget: back to today.
+        drop(capped);
+        assert!(untouched(
+            early.egress_body(ByteStream::from(payload.clone()))
+        ));
+        assert!(untouched(
+            late.egress_body(ByteStream::from(payload.clone()))
+        ));
+    }
+
+    /// A transport that declares it cannot be held under a ceiling.
+    struct Unpaceable;
+    impl EgressTransport for Unpaceable {
+        fn name(&self) -> &str {
+            "unpaceable_test"
+        }
+        fn install(
+            &self,
+            builder: aws_sdk_s3::config::Builder,
+        ) -> Result<aws_sdk_s3::config::Builder, VtopError> {
+            Ok(builder)
+        }
+        fn permits_scheme(&self, scheme: &str) -> bool {
+            scheme == "https"
+        }
+        fn tuning_support(&self) -> transport::TuningSupport {
+            transport::TuningSupport {
+                rate_control: false,
+                parallelism: true,
+                redundancy: false,
+                egress_ceiling: false,
+            }
+        }
+    }
+
+    #[test]
+    fn every_registered_transport_honours_a_cap_or_refuses_it_naming_the_cap_and_itself() {
+        // Table over the LIVE registry (#481), plus one transport that cannot
+        // be paced, so the refusal arm is exercised rather than merely present.
+        let registry = TransportRegistry::with_builtins();
+        let mut rows: Vec<Box<dyn EgressTransport>> = registry
+            .names()
+            .iter()
+            .map(|name| registry.resolve(name).unwrap())
+            .collect();
+        rows.push(Box::new(Unpaceable));
+        let cap = 8 * 1024 * 1024;
+        for transport in rows {
+            let name = transport.name().to_owned();
+            // A slot of the test's own (review): the process-global one is
+            // reserved for the constructor test, which holds a 4 MiB/s budget
+            // there while it runs; asking it for 8 MiB/s in parallel would be
+            // refused as a conflicting cap and fail one of the two at random.
+            let verdict = egress_shaper_for(transport.as_ref(), Some(cap), test_slot());
+            if transport.tuning_support().egress_ceiling {
+                let shaper = verdict
+                    .unwrap_or_else(|e| panic!("[{name}] declares it honours the cap: {e}"))
+                    .unwrap_or_else(|| panic!("[{name}] a configured cap must build a shaper"));
+                assert_eq!(shaper.rate_bytes_per_second(), cap);
+            } else {
+                let msg = verdict
+                    .expect_err("a transport that cannot be paced must refuse the cap")
+                    .to_string();
+                assert!(
+                    msg.contains("max_egress_bytes_per_second = 8388608") && msg.contains(&name),
+                    "[{name}] the refusal names the cap and the transport: {msg}"
+                );
+            }
+            assert!(
+                egress_shaper_for(transport.as_ref(), None, test_slot())
+                    .unwrap()
+                    .is_none(),
+                "[{name}] no cap, no shaper — for every transport"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_constructor_builds_a_shaper_only_when_a_cap_is_configured() {
+        // Through the real constructor, both ways (#481): the default builds no
+        // shaper at all, which is what "no shaper in the path" rests on.
+        let build = |cap| S3NativeConfig {
+            region: "us-east-1".into(),
+            endpoint_url: Some("https://127.0.0.1:9".into()),
+            force_path_style: true,
+            verify_tls: true,
+            transport: "tcp_tls".into(),
+            tuning: Default::default(),
+            max_egress_bytes_per_second: cap,
+            request_timeout_seconds: 300,
+        };
+        let unset = S3NativeBackend::new(&build(None)).await.unwrap();
+        assert!(
+            unset.egress_shaper().is_none(),
+            "an unset cap must leave the shipping pipeline without a shaper"
+        );
+        let capped = S3NativeBackend::new(&build(Some(4 * 1024 * 1024)))
+            .await
+            .unwrap();
+        assert_eq!(
+            capped.egress_shaper().map(|s| s.rate_bytes_per_second()),
+            Some(4 * 1024 * 1024)
+        );
+        // One budget per PROCESS (review): a second backend built with the
+        // cap gets the very same shaper, and one built with a different cap
+        // while it is live is refused naming both. This is the only test that
+        // builds a capped backend through the process-global slot, so no other
+        // test can hold a conflicting budget while it runs.
+        let second = S3NativeBackend::new(&build(Some(4 * 1024 * 1024)))
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(
+                capped.egress_shaper().unwrap(),
+                second.egress_shaper().unwrap()
+            ),
+            "two backends in one process must draw on one egress budget"
+        );
+        let msg = match S3NativeBackend::new(&build(Some(1024 * 1024))).await {
+            Ok(_) => panic!("a different cap while one is in force must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("1048576") && msg.contains("4194304"),
+            "the refusal names both caps: {msg}"
+        );
+        // And the backend built WITHOUT a cap, BEFORE the capped ones (review):
+        // through the real constructor it shares their budget per body, so a
+        // library caller mixing the two cannot exceed the process ceiling.
+        let payload = Bytes::from_static(b"an uncapped backend beside a capped one");
+        let shaper = Arc::clone(capped.egress_shaper().unwrap());
+        let before = shaper.admitted_bytes();
+        let body = unset.egress_body(ByteStream::from(payload.clone()));
+        assert_eq!(body.collect().await.unwrap().into_bytes(), payload);
+        assert_eq!(
+            shaper.admitted_bytes() - before,
+            payload.len() as u64,
+            "the uncapped backend's bytes must pass, and be counted by, the live budget"
+        );
+    }
+
+    #[test]
+    fn an_unset_cap_hands_the_sdk_the_body_it_was_given() {
+        // The default is today's pipeline, asserted rather than assumed (#481):
+        // with no shaper, the body the request carries is the very value the
+        // caller built — same variant, same contents, same retryability — and
+        // with one, it is a different (streaming) body over the same contents.
+        let backend = |shaper| S3NativeBackend {
+            client: Client::from_conf(
+                aws_sdk_s3::Config::builder()
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .build(),
+            ),
+            shaper,
+            process_slot: test_slot(),
+            body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
+        };
+        let payload = Bytes::from_static(b"the pipeline an unset cap must not touch");
+
+        let unshaped = backend(None).egress_body(ByteStream::from(payload.clone()));
+        let today = ByteStream::from(payload.clone());
+        assert_eq!(
+            format!("{:?}", unshaped.into_inner()),
+            format!("{:?}", today.into_inner()),
+            "with no cap the request body must be exactly the one built before the cap existed"
+        );
+
+        let shaper = transport::EgressShaper::new(1024 * 1024).unwrap();
+        let shaped = backend(Some(shaper))
+            .egress_body(ByteStream::from(payload.clone()))
+            .into_inner();
+        assert!(
+            shaped.is_streaming(),
+            "a configured cap must actually put the shaper in the path"
+        );
+        assert_eq!(shaped.bytes(), Some(&payload[..]));
+    }
+
+    /// Everything a request carried that shaping could conceivably change.
+    type Recorded = (Vec<(String, String)>, Vec<u8>);
+
+    #[derive(Debug, Clone, Default)]
+    struct Recorder {
+        seen: Arc<Mutex<Vec<Recorded>>>,
+        fail_first: Arc<AtomicUsize>,
+    }
+
+    impl HttpConnector for Recorder {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let me = self.clone();
+            HttpConnectorFuture::new(async move {
+                let headers = request
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.to_ascii_lowercase(), v.to_owned()))
+                    .collect();
+                // Drained exactly as a real client drains it: frame by frame.
+                let body = ByteStream::new(request.into_body())
+                    .collect()
+                    .await
+                    .map_err(|e| ConnectorError::io(e.into()))?
+                    .into_bytes()
+                    .to_vec();
+                me.seen.lock().unwrap().push((headers, body));
+                // Spend one of the throttled answers if any is left. A
+                // compare-exchange loop because `fetch_update` is deprecated on
+                // current stable and its replacement is newer than the MSRV
+                // (the same reasoning as `MockBackend::take_throttle`).
+                let mut left = me.fail_first.load(Ordering::SeqCst);
+                let throttle = loop {
+                    if left == 0 {
+                        break false;
+                    }
+                    match me.fail_first.compare_exchange_weak(
+                        left,
+                        left - 1,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break true,
+                        Err(observed) => left = observed,
+                    }
+                };
+                let status = if throttle { 503 } else { 200 };
+                let mut response =
+                    HttpResponse::new(StatusCode::try_from(status).unwrap(), SdkBody::empty());
+                response.headers_mut().insert("etag", "\"recorded\"");
+                Ok(response)
+            })
+        }
+    }
+
+    fn recording_backend(
+        recorder: &Recorder,
+        shaper: Option<Arc<transport::EgressShaper>>,
+    ) -> S3NativeBackend {
+        let connector = recorder.clone();
+        let conf = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("AKID", "SECRET", None, None, "test"))
+            .endpoint_url("https://s3.recorded.test")
+            .force_path_style(true)
+            .retry_config(
+                RetryConfig::standard()
+                    .with_max_attempts(3)
+                    .with_initial_backoff(std::time::Duration::from_millis(1)),
+            )
+            .http_client(http_client_fn(move |_, _| {
+                SharedHttpConnector::new(connector.clone())
+            }))
+            .build();
+        S3NativeBackend {
+            client: Client::from_conf(conf),
+            shaper,
+            process_slot: test_slot(),
+            body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
+        }
+    }
+
+    /// The headers that carry length, encoding, payload hash and checksums —
+    /// every one computed from the body, and none of them time-dependent.
+    const BODY_DERIVED_HEADERS: &[&str] = &[
+        "content-length",
+        "content-encoding",
+        "content-type",
+        "transfer-encoding",
+        "x-amz-content-sha256",
+        "x-amz-decoded-content-length",
+        "x-amz-trailer",
+        "x-amz-checksum-sha256",
+        "x-amz-checksum-crc32",
+        "x-amz-meta-vtop-checksum",
+    ];
+
+    fn body_derived(recorded: &Recorded) -> (Vec<(String, String)>, &[u8]) {
+        let mut headers: Vec<_> = recorded
+            .0
+            .iter()
+            .filter(|(k, _)| BODY_DERIVED_HEADERS.contains(&k.as_str()))
+            .cloned()
+            .collect();
+        headers.sort();
+        (headers, &recorded.1)
+    }
+
+    /// Through the REAL SDK request path (#481): a capped backend sends the
+    /// same body bytes and the same length, payload-hash and checksum headers
+    /// as an uncapped one — for a SHA-256-checked object PUT, an unchecked PUT
+    /// the SDK sends aws-chunked with a CRC trailer, and an in-memory multipart
+    /// part — and a 503 the SDK retries is paid for, and counted, twice.
+    #[tokio::test]
+    async fn a_capped_backend_sends_the_same_request_as_an_uncapped_one_and_counts_every_attempt() {
+        let payload: Vec<u8> = (0..(6 * 1024 * 1024 + 3))
+            .map(|i| (i % 253) as u8)
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batch.bin");
+        std::fs::write(&path, &payload).unwrap();
+        let digest = vtop_core::checksum::sha256_bytes(&payload);
+
+        async fn exercise(backend: &S3NativeBackend, path: &Path, payload: &[u8], digest: &str) {
+            backend
+                .put_object(
+                    path,
+                    "s3://b/object.bin",
+                    Some(ObjectChecksum::new("sha256", digest)),
+                )
+                .await
+                .expect("a checked PUT");
+            backend
+                .put_object(path, "s3://b/unchecked.bin", None)
+                .await
+                .expect("an unchecked PUT");
+            backend
+                .upload_part(
+                    "s3://b/multi.bin",
+                    "upload-1",
+                    1,
+                    Bytes::from(payload.to_vec()),
+                )
+                .await
+                .expect("a part");
+        }
+
+        let plain = Recorder::default();
+        exercise(&recording_backend(&plain, None), &path, &payload, &digest).await;
+        let shaper = transport::EgressShaper::new(256 * 1024 * 1024).unwrap();
+        let capped = Recorder::default();
+        exercise(
+            &recording_backend(&capped, Some(Arc::clone(&shaper))),
+            &path,
+            &payload,
+            &digest,
+        )
+        .await;
+
+        let plain = plain.seen.lock().unwrap().clone();
+        let capped_seen = capped.seen.lock().unwrap().clone();
+        assert_eq!(plain.len(), 3);
+        assert_eq!(capped_seen.len(), 3);
+        for (request, (a, b)) in ["checked put", "unchecked put", "part"]
+            .iter()
+            .zip(plain.iter().zip(capped_seen.iter()))
+        {
+            let (a, b) = (body_derived(a), body_derived(b));
+            assert!(
+                a.0.iter().any(|(k, _)| k == "content-length"),
+                "[{request}] the comparison must include Content-Length to mean anything: {:?}",
+                a.0
+            );
+            assert_eq!(
+                a.0, b.0,
+                "[{request}] a cap must not change the length, payload hash or checksum headers"
+            );
+            assert!(
+                a.1 == b.1,
+                "[{request}] a cap must not change a single byte the store receives"
+            );
+        }
+        let per_request: u64 = capped_seen
+            .iter()
+            .map(|(_, body)| body.len() as u64)
+            .sum::<u64>();
+        // The aws-chunked PUT's wire body carries framing and a trailer; the
+        // account is of PAYLOAD bytes admitted, three payloads' worth.
+        assert!(per_request >= 3 * payload.len() as u64);
+        assert_eq!(
+            shaper.admitted_bytes(),
+            3 * payload.len() as u64,
+            "every payload byte of every request is admitted exactly once"
+        );
+
+        // A throttled first attempt: the SDK re-sends, and the cap and the
+        // account must both see the second send.
+        let throttled = Recorder::default();
+        throttled.fail_first.store(1, Ordering::SeqCst);
+        let before = shaper.admitted_bytes();
+        recording_backend(&throttled, Some(Arc::clone(&shaper)))
+            .upload_part(
+                "s3://b/multi.bin",
+                "upload-1",
+                2,
+                Bytes::from(payload.clone()),
+            )
+            .await
+            .expect("the retry succeeds");
+        assert_eq!(
+            throttled.seen.lock().unwrap().len(),
+            2,
+            "one 503, one retry"
+        );
+        assert_eq!(
+            shaper.admitted_bytes() - before,
+            2 * payload.len() as u64,
+            "a retried part crosses the wire twice and must cross the shaper twice"
+        );
     }
 }

@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib import competitor, engine, engine_run, seed, shaping  # noqa: E402
 from lib.metrics import ResultsWriter, iso_now, new_run_id, percentile  # noqa: E402
-from lib.scenario import load_scenario, reseed_count  # noqa: E402
+from lib.scenario import initial_seed, load_scenario, reseed_count  # noqa: E402
 from lib.sysmon import SystemMonitor  # noqa: E402
 
 STAGES = [
@@ -150,6 +150,11 @@ def main() -> int:
     # and nothing in the numbers would give it away.
     try:
         engine.require_endpoint_through_h3_proxy(sc)
+        # The egress cap's spelling too (#481, review): a non-integer cap is
+        # refused before anything runs, not as a traceback from the config
+        # writer after the shape and the seed have been paid for.
+        engine.egress_cap_of(sc)
+        initial_seed(sc)
     except ValueError as bad:
         print(f"[bench] {bad}", file=sys.stderr)
         return 2
@@ -398,7 +403,15 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
         if files_seen:
             print(f"[bench] seed dir already held {files_seen} file(s); counted "
                   "into the seeded baseline")
-        totals = seed.generate_dataset(seed_dir, sc.format, int(sc.volume), sc.file_size)
+        # EVERY GENERATION GETS A NAMESPACE OF THIS RUN'S OWN (#481, review).
+        # With a pinned initial_seed (and the concurrent rounds' fixed seeds)
+        # file names repeat exactly between runs, so a rerun into the same
+        # --seed-dir would reuse the previous run's paths. The run id's random
+        # tail keeps the bytes reproducible and the names distinct; the
+        # generator refuses, rather than truncates, any path that still exists.
+        run_tag = run_id.rsplit("-", 1)[-1]
+        totals = seed.generate_dataset(seed_dir, sc.format, int(sc.volume), sc.file_size,
+                                       seed=initial_seed(sc), prefix=f"{run_tag}-evt")
         files_seen += totals["files"]
         seeded_bytes += totals["bytes"]
         print(f"[bench] seeded {totals['files']} files ({totals['bytes']} bytes) "
@@ -460,7 +473,7 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
                         # cursor for — silent loss inside the measurement.
                         more = seed.generate_dataset(seed_dir, sc.format, per_round,
                                                      sc.file_size, seed=10_000 + round_no,
-                                                     prefix=f"evt{round_no}")
+                                                     prefix=f"{run_tag}-evt{round_no}")
                         with seed_lock:
                             files_seen += more["files"]
                             seeded_bytes += more["bytes"]
@@ -687,7 +700,8 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
                                          float(sc.get("backlog_multiplier", 0.25)))
                 more = seed.generate_dataset(seed_dir, sc.format,
                                              per_cycle, sc.file_size,
-                                             seed=cycle + 1)
+                                             seed=cycle + 1,
+                                             prefix=f"{run_tag}-cycle{cycle + 1}")
                 files_seen += more["files"]
                 seeded_bytes += more["bytes"]
             else:
@@ -861,6 +875,11 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
         "run_id": run_id, "scenario_name": sc.name, "scenario": sc.values,
         "start_time": start_iso, "end_time": iso_now(),
         "duration_seconds": duration_s,
+        # end_time - start_time is NOT duration_seconds on a contended run
+        # (review): the competitor's closing solo window and collection tail
+        # are excluded from the duration (above) but fall between the two
+        # timestamps. Recorded so the gap is in the record, not inferred.
+        "harness_close_seconds": round(harness_close_seconds, 3),
         "total_input_files": files_seen, "total_input_bytes": in_bytes,
         "total_output_objects": out_objects, "total_output_bytes": out_bytes,
         "successful_files": success, "failed_files": failed,
@@ -941,6 +960,11 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
         # is what is recorded, and the runner has already refused any run whose
         # endpoint did not match it.
         "h3_proxy": engine.H3_PROXY_SERVICE if sc.get("h3_proxy") else "",
+        # The operator egress ceiling the engine ran under (#481), blank when
+        # unset. Flat on every run for the reason the transport is: the
+        # with/without-cap competitor pair differs in this and nothing else, so
+        # a row that omitted it would show two identical conditions.
+        "upload_max_egress_bytes_per_second": engine.egress_cap_of(sc),
     }
     # The long-lived engine's flat counters (#510), and blanks for the columns
     # only per-cycle outcomes can fill. Absent on a per-cycle run, whose
