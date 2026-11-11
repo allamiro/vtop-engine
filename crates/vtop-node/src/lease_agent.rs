@@ -5865,7 +5865,11 @@ mod tests {
         // The candidate's directory: ten records under 18, written while it
         // was a follower, then reopened as a broker (the role flip).
         let candidate_dir = tempfile::tempdir().unwrap();
-        drop(lineage_replica(candidate_dir.path(), Uuid::from_u128(1), 10));
+        drop(lineage_replica(
+            candidate_dir.path(),
+            Uuid::from_u128(1),
+            10,
+        ));
         let candidate = Arc::new(
             LocalBroker::new(
                 vtop_log::ActiveSegment::recover(candidate_dir.path().join("range.active"))
