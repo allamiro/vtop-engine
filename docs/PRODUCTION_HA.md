@@ -286,8 +286,19 @@ The verification method is the backend's preferred path: native S3 with SHA-256
 uses `store_checksum` when a service whole-object checksum is available, falling
 back to `read_back` otherwise (including multipart objects). Native S3 with
 BLAKE3, localfs, and the command backends use `read_back`; disabled checksums use
-`size_only`. The resolved upload width is the configured ceiling after active
-transport tuning, before the adaptive controller reacts to live throttles.
+`size_only`. An `upload.backend` that names no registered backend reports
+`unknown`: validate accepts the name, but the engine refuses it at startup.
+A batch whose compressed object exceeds `upload.multipart_threshold_bytes` is
+uploaded multipart and therefore read back even under `store_checksum`.
+
+The engine applies the first `streams.yaml` entry for each `source_name`. A
+later entry with the same name is listed under `shadowed_streams` (and as a
+`WARNING` line in text) instead of being printed as if it were in effect. A key
+written with no value or `~` counts as set: a string setting then takes that
+literal text.
+
+The resolved upload width is the configured ceiling after active transport
+tuning, before the adaptive controller reacts to live throttles.
 Without `--print-effective`, validate's existing output and exit codes are
 unchanged.
 

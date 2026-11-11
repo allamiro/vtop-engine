@@ -116,3 +116,23 @@ fn effective_output_never_resolves_or_prints_secret_references() {
         }
     }
 }
+
+#[test]
+fn a_shadowed_stream_is_named_in_both_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    config(dir.path());
+    std::fs::write(dir.path().join("streams.yaml"), "streams:\n- {source_name: app, source_type: file, format: raw, tenant: a}\n- {source_name: app, source_type: file, format: raw, tenant: b}\n").unwrap();
+    let text = String::from_utf8(run(dir.path(), false, true).stdout).unwrap();
+    assert!(
+        text.contains("WARNING: streams[1] repeats source_name app;"),
+        "{text}"
+    );
+    assert_eq!(text.matches("stream app:").count(), 1, "{text}");
+    let json: serde_json::Value =
+        serde_json::from_slice(&run(dir.path(), true, true).stdout).unwrap();
+    assert_eq!(
+        json["effective"]["shadowed_streams"],
+        serde_json::json!([{"index": 1, "source_name": "app"}])
+    );
+    assert_eq!(json["effective"]["streams"].as_array().unwrap().len(), 1);
+}
