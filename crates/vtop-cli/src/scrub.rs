@@ -942,6 +942,22 @@ impl ScrubReport {
             "When a scrub last finished checking every committed batch (0: never)",
             pass.to_string(),
         );
+        // What the findings alert reads (review of #652). The counter cannot
+        // carry it: a counter whose first sample already holds the finding
+        // (the first run found damage) shows no `increase()`, and the clean
+        // slices of the rest of the pass leave it flat. A timestamp is
+        // alertable from its first sample, and stays set across those slices.
+        let finding = if self.findings.is_empty() {
+            carried.last_finding
+        } else {
+            now_unix
+        };
+        gauge(
+            &mut out,
+            "vtop_scrub_last_finding_timestamp_seconds",
+            "When a scrub run last found a missing, mismatched, unauthenticated or unreadable batch (0: never)",
+            finding.to_string(),
+        );
         out
     }
 }
@@ -952,6 +968,7 @@ struct Carried {
     counts: BTreeMap<String, u64>,
     last_success: i64,
     last_pass_complete: i64,
+    last_finding: i64,
 }
 
 impl Carried {
@@ -974,6 +991,10 @@ impl Carried {
                 line.strip_prefix("vtop_scrub_last_pass_complete_timestamp_seconds ")
             {
                 carried.last_pass_complete = value.trim().parse().unwrap_or(0);
+            } else if let Some(value) =
+                line.strip_prefix("vtop_scrub_last_finding_timestamp_seconds ")
+            {
+                carried.last_finding = value.trim().parse().unwrap_or(0);
             }
         }
         carried
@@ -1150,6 +1171,39 @@ mod tests {
         assert!(with.lines().iter().any(|line| line.contains(&warning)));
         let json = serde_json::to_value(&with).unwrap();
         assert_eq!(json["warnings"][0], warning.as_str());
+    }
+
+    /// Damage found by the very FIRST run must be alertable (review of #652).
+    /// The counter is born in that run's file already holding the finding,
+    /// so `increase()` has no earlier sample to compare it to and sees
+    /// nothing; and the clean slices that follow leave it flat for the rest
+    /// of the pass. A timestamp of the last run with findings, carried
+    /// forward, is alertable from its first sample on.
+    #[test]
+    fn the_last_finding_time_is_set_by_the_first_run_and_carried_by_clean_ones() {
+        let gauge = "vtop_scrub_last_finding_timestamp_seconds";
+        let first = report(&[(ScrubResult::Mismatched, 1)], 1, false).prometheus_text(None, 1000);
+        assert!(first.contains(&format!("{gauge} 1000\n")), "{first}");
+        assert!(
+            first.contains(&format!("# TYPE {gauge} gauge\n")),
+            "{first}"
+        );
+
+        let clean = report(&[(ScrubResult::Ok, 9)], 0, false).prometheus_text(Some(&first), 2000);
+        assert!(
+            clean.contains(&format!("{gauge} 1000\n")),
+            "a clean slice keeps the last finding's time: {clean}"
+        );
+
+        let later =
+            report(&[(ScrubResult::Missing, 1)], 1, false).prometheus_text(Some(&clean), 3000);
+        assert!(later.contains(&format!("{gauge} 3000\n")), "{later}");
+
+        let never = report(&[(ScrubResult::Ok, 3)], 0, true).prometheus_text(None, 4000);
+        assert!(
+            never.contains(&format!("{gauge} 0\n")),
+            "0: no run has found anything: {never}"
+        );
     }
 
     #[test]

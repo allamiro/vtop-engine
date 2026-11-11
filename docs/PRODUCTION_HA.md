@@ -657,9 +657,10 @@ saturating the store:
   batch but may check again up to concurrency - 1 batches it had already
   finished. The run that reaches the end completes the pass; the next run
   starts again from the first batch. A finding does not hold the cursor: the
-  run that found it reports it, and the next pass checks it again, which is
-  why the example alert counts findings over a pass window rather than reading
-  the latest run alone. A lock beside the file refuses a second scrub on the
+  run that found it reports it, and the next pass checks it again. That is
+  why the example alert reads `vtop_scrub_last_finding_timestamp_seconds` and
+  fires for a pass window after it, rather than reading the latest run alone.
+  A lock beside the file refuses a second scrub on the
   same cursor (a cron run overlapping the previous one);
 - or `--sample N [--seed S]`: N batches chosen at random; the seed is printed,
   and the same seed picks the same batches.
@@ -1009,7 +1010,8 @@ path needed by the distributed options is already implemented (§6.3).
   (`docker-compose.observability.yml`) and generated dashboards for the
   pipeline, Kafka, and flow views.
 - **Archive scrub metrics** — `vtopctl scrub --metrics-file` (§7.5) writes
-  `vtop_scrub_objects_total{result}` and the last-success and last-pass times
+  `vtop_scrub_objects_total{result}` and the last-success, last-pass and
+  last-finding times
   as a textfile; the [observability README](../observability/README.md#archive-scrub)
   has an example alert rule set.
 

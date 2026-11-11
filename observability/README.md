@@ -201,10 +201,11 @@ lab has no textfile collector, so nothing here charts or alerts on them.
 | Metric | Type | Meaning |
 |---|---|---|
 | `vtop_scrub_objects_total{result}` | counter | Committed batches checked, by `result`: `ok`; `limited` (present at its size, archived with checksums disabled: counted, not a finding); `missing`, `mismatched`, `unauthenticated`, `unreadable` (findings). Every result is written, at zero when nothing had it. Carried forward from the file each run replaces, so it counts across runs. |
-| `vtop_scrub_last_run_findings` | gauge | Findings in the latest run. With a rotating cursor this is one slice's: the next slice can read 0 while damage found earlier in the pass is still there, so alert on the counter (below). |
+| `vtop_scrub_last_run_findings` | gauge | Findings in the latest run. With a rotating cursor this is one slice's: the next slice can read 0 while damage found earlier in the pass is still there, so alert on the timestamp below. |
 | `vtop_scrub_last_run_timestamp_seconds` | gauge | When the latest run finished. |
 | `vtop_scrub_last_success_timestamp_seconds` | gauge | When a run last finished with no findings; 0 if none has. A run with findings leaves it where it was. |
 | `vtop_scrub_last_pass_complete_timestamp_seconds` | gauge | When a scrub last finished checking every committed batch: a run over all of them, or the cursor run that reached the end of a pass. 0 if none has. |
+| `vtop_scrub_last_finding_timestamp_seconds` | gauge | When a run last found a missing, mismatched, unauthenticated or unreadable batch; 0 if none has. A clean run leaves it where it was. This is what the findings alert reads: unlike an `increase()` of the counter, it shows damage the very first run found, since that is already in the counter's first sample. |
 
 `result` is the only label: batch ids and URIs are in the command's report and
 its WARN lines. An example rule set, in Prometheus rule format, for a
@@ -220,23 +221,28 @@ groups:
       # replica or backup, or record the loss. `vtopctl scrub --json` lists
       # each finding with its batch id, URIs and what was found.
       #
-      # Counted over a pass window (8d here), not read from the latest run:
-      # a rotating scrub checks a damaged batch once per pass, so the next
-      # slice is clean while the damage is still there, and an alert on
-      # `vtop_scrub_last_run_findings` would clear an hour after it fired.
-      # The finding is checked again next pass and counted again if it is
-      # still there; after a repair the alert clears one window later.
+      # Fires for a pass window (8d here) after the last run that found
+      # anything. Not `vtop_scrub_last_run_findings`: a rotating scrub checks
+      # a damaged batch once per pass, so the next slice reads 0 while the
+      # damage is still there. Not `increase()` of the result counter either:
+      # the counter is born in the first run's file, so damage that FIRST run
+      # finds is already in the series' first sample and shows no increase,
+      # and the clean slices after it leave the counter flat. The timestamp
+      # is alertable from its first sample. A batch still damaged is found
+      # again next pass and restamps it; after a repair the alert clears one
+      # window after the last finding.
       - alert: VtopArchiveScrubFindings
-        expr: sum(increase(vtop_scrub_objects_total{result=~"missing|mismatched|unauthenticated|unreadable"}[8d])) > 0
+        expr: time() - vtop_scrub_last_finding_timestamp_seconds < 8 * 86400
         labels:
           severity: page
           service: vtop-engine
         annotations:
           summary: "The archive scrub found committed batches damaged or unreadable"
           description: >-
-            {{ $value }} finding(s) in the last eight days of scrub runs (missing,
-            mismatched, unauthenticated or unreadable). The run logs and
-            vtopctl scrub --json list them.
+            A scrub run in the last eight days found a committed batch missing,
+            mismatched, unauthenticated or unreadable. The run logs and
+            vtopctl scrub --json list them; vtop_scrub_objects_total{result}
+            counts them.
       # The scrub stopped running, or has not passed for two days.
       # `last_success` is 0 until a run passes, so a scrub that never passed fires too.
       - alert: VtopArchiveScrubStale

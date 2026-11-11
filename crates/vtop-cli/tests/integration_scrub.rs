@@ -633,6 +633,11 @@ async fn the_command_exits_non_zero_on_findings_and_writes_metrics() {
     );
     let success = metric_value(&text, "vtop_scrub_last_success_timestamp_seconds");
     assert!(success > 0.0, "{text}");
+    assert_eq!(
+        metric_value(&text, "vtop_scrub_last_finding_timestamp_seconds"),
+        0.0,
+        "no run has found anything yet"
+    );
 
     // Damage one object on disk: same size, different bytes.
     let store = dir.path().join("store");
@@ -651,6 +656,11 @@ async fn the_command_exits_non_zero_on_findings_and_writes_metrics() {
         "{text}"
     );
     assert_eq!(metric_value(&text, "vtop_scrub_last_run_findings"), 1.0);
+    assert_eq!(
+        metric_value(&text, "vtop_scrub_last_finding_timestamp_seconds"),
+        metric_value(&text, "vtop_scrub_last_run_timestamp_seconds"),
+        "the run that found damage stamps it: {text}"
+    );
     assert_eq!(
         metric_value(&text, "vtop_scrub_last_success_timestamp_seconds"),
         success,
