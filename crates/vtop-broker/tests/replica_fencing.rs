@@ -1690,3 +1690,124 @@ fn a_dispute_below_the_mark_finds_the_callers_tail_behind_a_newer_epoch() {
          it never had was not kept in dispute"
     );
 }
+
+/// #649 review (cubic P2, 4532766446). A replica whose own history cannot be
+/// compared (no fencing-epoch journal, or a broken one) answers a fence as
+/// Unknown, and the fence used to leave it exactly as it was. A leader's
+/// session fence (#641) then left such a returning deposed leader reporting
+/// its whole tail: the leader pruned the records it had to send there, its
+/// mark put the old-epoch suffix under the committed boundary, and its
+/// appends at those offsets were acked as duplicates over different bytes
+/// (#261).
+///
+/// Invariant: an uncomparable replica keeps everything above its own
+/// high-water mark in dispute, so it reports no more than the mark, and the
+/// leader's first record there discards the suffix and lands. Nothing at or
+/// below the mark is touched.
+#[test]
+fn an_uncomparable_replica_keeps_its_suffix_above_the_mark_in_dispute() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    let segment = ActiveSegment::create(
+        dir.path().join("range.active"),
+        descriptor_for(&range, 0xE1),
+        SegmentConfig::default(),
+    )
+    .unwrap();
+    let meta = MetaFencingEpoch::new(OLD_EPOCH);
+    // No fencing-epoch journal: its history is unknown.
+    let node = Arc::new(
+        InProcessFollower::new(
+            FOLLOWER,
+            segment,
+            ProducerEpochJournal::open(dir.path().join("epochs")).unwrap(),
+            range.clone(),
+            OLD_EPOCH,
+            meta.clone(),
+            ClusterCommittedOffset::new(0),
+        )
+        .unwrap(),
+    );
+    let h = Harness {
+        _dir: dir,
+        range,
+        node,
+        meta,
+    };
+    for offset in 0..5 {
+        append_at(&h, OLD_EPOCH, OLD_LEADER, offset).unwrap();
+    }
+    h.node.cluster_committed().advance_to(5);
+    // The deposed leadership's own suffix, never acknowledged.
+    for offset in 5..10 {
+        h.node
+            .apply_append(&ReplicaAppendRequest {
+                range: h.range.clone(),
+                fencing_epoch: OLD_EPOCH,
+                leader_node_id: OLD_LEADER,
+                expected_base_offset: offset,
+                producer_id: Uuid::from_u128(0xB9),
+                producer_epoch: 1,
+                first_sequence: offset - 5,
+                records: vec![ProduceRecord {
+                    timestamp_millis: 1_000,
+                    key: b"k".to_vec(),
+                    value: format!("stale-{offset}").into_bytes(),
+                }],
+            })
+            .unwrap();
+    }
+    assert!(h.node.epoch_starts().is_empty(), "precondition: no history");
+
+    // It returns under epoch 19 and the leader's session fences it.
+    h.meta.set(NEW_EPOCH);
+    h.node.adopt_fencing_epoch(NEW_EPOCH);
+    let fenced = h
+        .node
+        .fence(
+            NEW_EPOCH,
+            &[
+                EpochStart {
+                    epoch: OLD_EPOCH,
+                    start_offset: 0,
+                },
+                EpochStart {
+                    epoch: NEW_EPOCH,
+                    start_offset: 5,
+                },
+            ],
+        )
+        .expect("fenced");
+    assert_eq!((fenced.truncated_records, fenced.next_offset), (0, 10));
+    assert_eq!(
+        h.node.replication_status(),
+        (5, 5),
+        "an uncomparable replica reported its whole old-epoch suffix as held, so the leader \
+         would prune the records it must send there"
+    );
+
+    let landed = h
+        .node
+        .apply_append(&append_request(
+            &h.range,
+            NEW_EPOCH,
+            Uuid::from_u128(0xA3),
+            5,
+        ))
+        .expect("the leader's record at 5 lands over the kept suffix");
+    assert_eq!(landed.local_committed_offset, 6);
+    assert_eq!(h.node.next_offset(), 6);
+    let served: Vec<String> = h
+        .node
+        .fetch(0, usize::MAX, 64)
+        .unwrap()
+        .records
+        .iter()
+        .map(|fetched| String::from_utf8_lossy(&fetched.record.value).into_owned())
+        .collect();
+    assert_eq!(
+        served,
+        ["v0", "v1", "v2", "v3", "v4"],
+        "the committed prefix was touched"
+    );
+}

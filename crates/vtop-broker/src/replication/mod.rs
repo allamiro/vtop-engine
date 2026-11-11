@@ -1001,6 +1001,43 @@ impl InProcessFollower {
     /// producer, so a caller asking for it is either wrong or reconciling
     /// against a log that is not this range's — and the fence must fail rather
     /// than let promotion proceed believing this replica agreed.
+    /// A caller with a history fenced a replica that has none it can compare
+    /// (no journal, a broken one, or none over records it holds): keep
+    /// everything above this replica's own high-water mark in dispute
+    /// (#649 review, cubic 4532766446).
+    ///
+    /// Untouched, the suffix was reported as held. A returning deposed
+    /// leader in this state then had its reconnect status prune the records
+    /// the new leader had to send there, took the old-epoch suffix under the
+    /// new mark, and acked the leader's appends over it as duplicates of
+    /// different bytes (#261), which is #641 again. Nothing here can tell
+    /// whether the suffix matches the caller's, so it is treated as
+    /// uncertain: the status stops at the mark, so the leader keeps what it
+    /// must send, and the leader's first append or mark past the mark
+    /// discards it and lets the leader's records land. A leader that appends
+    /// under its epoch was established, and an established leader holds
+    /// every acknowledged record, so it re-sends what it holds of the
+    /// suffix. Nothing at or below the mark is ever kept, and nothing is
+    /// discarded here. The history stays unknown; repairing it (`vtopctl
+    /// node repair`) is what makes this replica's answers count again.
+    fn keep_unprovable_suffix(&self, fencing_epoch: u64) {
+        // Installed under the state lock, like every change to the dispute.
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let from = self.cluster_committed.get();
+        if from < state.segment.next_offset() {
+            *self
+                .kept_dispute
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(KeptDispute {
+                epoch: fencing_epoch,
+                from,
+            });
+        }
+    }
+
     fn reconcile_with(
         &self,
         leader_epoch_starts: &[crate::fencing_epochs::EpochStart],
@@ -1043,16 +1080,17 @@ impl InProcessFollower {
             }
         };
         let divergence = match verdict {
-            // Agreed and Unknown are different facts with the same action
-            // HERE: touch nothing. One says there is nothing to discard, the
-            // other says we cannot prove there is. They are NOT the same fact
-            // to the candidate counting this replica's answer, and it tells
-            // them apart from the history this fence returns (#577,
-            // `promotion::fenced_lineage` in vtop-node): an Unknown answer's
-            // offset counts records whatever wrote them, so it is recorded
-            // but never counted toward the quorum.
-            crate::fencing_epochs::Lineage::Agreed | crate::fencing_epochs::Lineage::Unknown => {
-                return Ok(0)
+            // Agreed and Unknown discard nothing. One says there is nothing
+            // to discard, the other says we cannot prove there is. They are
+            // NOT the same fact to the candidate counting this replica's
+            // answer, and it tells them apart from the history this fence
+            // returns (#577, `promotion::fenced_lineage` in vtop-node): an
+            // Unknown answer's offset counts records whatever wrote them, so
+            // it is recorded but never counted toward the quorum.
+            crate::fencing_epochs::Lineage::Agreed => return Ok(0),
+            crate::fencing_epochs::Lineage::Unknown => {
+                self.keep_unprovable_suffix(fencing_epoch);
+                return Ok(0);
             }
             crate::fencing_epochs::Lineage::DivergesAt(offset) => offset,
         };

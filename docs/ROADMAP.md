@@ -249,14 +249,23 @@ reopen quietly.
   before the status read and before any record or mark. A session opened
   before the attachment is dropped before it carries a record or a mark.
   The fence reconciles a deposed leader that missed the election, or a
-  voter that restarted, exactly as it reconciles a voter: histories that
-  agree, or that cannot be compared, leave the log as it is; a suffix the
-  leader provably supersedes is truncated at once; and a suffix it cannot
-  yet prove superseded is kept in dispute and discarded on the leader's
-  first append or mark over it. Either way the replica then catches up, and
-  no longer reports a disputed suffix as held, takes it under the new mark,
-  or acks the leader's records over it. Plaintext planes skip the session
-  fence, since they refuse fences and do not fail over.
+  voter that restarted, exactly as it reconciles a voter. Histories that
+  agree leave the log as it is. A suffix the leader provably supersedes is
+  truncated at once. A suffix in a comparable history that the leader
+  cannot yet prove superseded is kept in dispute, from the divergence (or,
+  below the replica's high-water mark, from past both the mark and the
+  leader's tail). A replica whose own history cannot be compared (no
+  journal, or a broken one) keeps everything above its own high-water mark
+  in dispute (#649 review). A kept dispute caps the replica's status and
+  acks, so the leader keeps the records it must send, and the leader's
+  first append or mark over it discards it; the replica then catches up and
+  never reports a disputed suffix as held, takes it under the new mark, or
+  acks the leader's records over it. Nothing at or below a replica's own
+  mark is touched. An uncomparable history stays uncomparable: its answers
+  never count toward a promotion, and the replica needs `vtopctl node
+  repair` to install one. A leader with no history of its own cannot
+  reconcile anyone; its fences leave every log as it is. Plaintext planes
+  skip the session fence, since they refuse fences and do not fail over.
   **The protection is the fenced replica's, so it holds only on upgraded
   replicas.** There is no wire or feature-level change and the fence frames
   are identical, so nothing tells a candidate which replicas run this
