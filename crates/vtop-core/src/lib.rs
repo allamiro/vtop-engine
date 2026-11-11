@@ -19,6 +19,7 @@ pub mod checksum;
 pub mod compression;
 pub mod config;
 pub mod detect;
+pub mod effective_config;
 pub mod errors;
 pub mod event_time;
 pub mod manifest;

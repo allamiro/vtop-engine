@@ -25,6 +25,7 @@ pub fn file_config(
     backend: &str,
 ) -> VtopConfig {
     VtopConfig {
+        configured_fields: Default::default(),
         engine: EngineConfig {
             name: "vtop-test".into(),
             tenant: "default".into(),

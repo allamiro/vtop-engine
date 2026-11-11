@@ -82,6 +82,10 @@ pub enum Command {
     Validate {
         #[arg(long)]
         config: PathBuf,
+        /// Explain effective per-stream settings and their origin, without
+        /// resolving secrets or contacting any service.
+        #[arg(long)]
+        print_effective: bool,
     },
     /// Apply state-store schema migrations with a deployment identity.
     Migrate {
@@ -267,6 +271,30 @@ fn load(config: &Path) -> Result<(VtopConfig, StreamsConfig), VtopError> {
         StreamsConfig { streams: vec![] }
     };
     Ok((cfg, streams))
+}
+
+/// Render only the dedicated allowlist; never walk the configuration model.
+fn print_effective_block(
+    name: &str,
+    stream: &vtop_core::effective_config::EffectiveStream,
+) -> Result<(), VtopError> {
+    println!("{name}:");
+    let value = serde_json::to_value(stream)?;
+    if let Some(fields) = value.as_object() {
+        for (key, setting) in fields {
+            let value = &setting["value"];
+            // Strings bare, except an empty one, which would otherwise read
+            // as a missing value; anything else as its JSON literal.
+            let rendered = match value.as_str() {
+                Some("") => "\"\"".to_owned(),
+                Some(text) => text.to_owned(),
+                None => value.to_string(),
+            };
+            let origin = setting["origin"].as_str().unwrap_or("built-in default");
+            println!("  {key}: {rendered} ({origin})");
+        }
+    }
+    Ok(())
 }
 
 /// A rate that is a finite number above zero.
@@ -554,13 +582,46 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 )))
             }
         }
-        Command::Validate { config } => {
+        Command::Validate {
+            config,
+            print_effective,
+        } => {
             // `load` parses and validates both files; an error is the
             // non-zero exit. Warnings never fail the check (#629): each is a
             // documented opt-out, and refusing it here would only push
             // operators to skip the check.
-            let (cfg, _streams) = load(config)?;
+            let (cfg, streams) = load(config)?;
             let warnings = cfg.warnings();
+            if *print_effective {
+                let effective =
+                    vtop_core::effective_config::effective_streams(&cfg, Some(&streams));
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"status": "ok", "warnings": warnings, "effective_version": 1, "effective": effective})
+                    );
+                } else {
+                    for warning in &warnings {
+                        println!("WARNING: {warning}");
+                    }
+                    for shadowed in &effective.shadowed {
+                        println!(
+                            "WARNING: streams[{}] repeats source_name {}; the engine applies only \
+                             the first entry with that name, so this one is never used",
+                            shadowed.index, shadowed.source_name
+                        );
+                    }
+                    println!("effective_version: 1");
+                    print_effective_block("default", &effective.default)?;
+                    for stream in &effective.streams {
+                        print_effective_block(
+                            &format!("stream {}", stream.source_name.value),
+                            stream,
+                        )?;
+                    }
+                }
+                return Ok(());
+            }
             if cli.json {
                 println!(
                     "{}",

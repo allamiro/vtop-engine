@@ -1,5 +1,9 @@
 # VTOP Engine configuration (prototype / reference implementation).
 #
+# Explain the static per-stream settings, origins and preferred verification:
+#   vtopctl validate --config examples/config.yaml --print-effective
+# Add --json for effective_version: 1. No service is contacted or secret resolved.
+#
 # Secrets (access keys, passwords) are NEVER placed in this file. They are read
 # from environment variables or mounted secrets. See docs/SECURITY_MODEL.md.
 
