@@ -91,7 +91,7 @@
 //! And liveness: some candidate is established, and every node catches up,
 //! within a bounded number of elections once faults stop.
 //!
-//! # Known gaps: #640
+//! # Known gaps: none open
 //!
 //! Each failing run is matched against these by signature
 //! (`Outcome::known_issues`) and printed with its issue number. A failure
@@ -104,14 +104,14 @@
 //!   hold (#261). The dispute now survives a restart. A violation on a node
 //!   restarted while it held one is a new failure again; the report still
 //!   names such restarts.
-//! * #640. A follower's fencing-epoch journal records an adopted epoch at its
-//!   own tail, so records a new leader later catches it up on are filed
-//!   under that epoch rather than the one that wrote them. After a second
-//!   failover the replicas cannot prove each other's lineage, every answer
-//!   is Unknown, and no candidate is established again. Signature: no leader
-//!   finished and the last election failed with answers judged Unknown;
-//!   every acknowledged record must still be durable on a majority.
-//!   Reproduction:
+//! * #640, fixed and no longer expected. A follower's fencing-epoch journal
+//!   recorded an adopted epoch at its own tail, so records a new leader then
+//!   caught it up on were filed under that epoch rather than the one that
+//!   wrote them. After a second failover the replicas could not prove each
+//!   other's lineage, every answer was Unknown, and no candidate was
+//!   established again. A fenced follower now files them under the leader's
+//!   own entries. A run whose last election fails for want of a provable
+//!   quorum is a new failure again. Guard:
 //!   `reproduction_two_caught_up_replicas_cannot_prove_a_quorum_after_the_leader_is_lost`.
 //!
 //! Fixed and no longer matched: #641, a deposed leader absent from the
@@ -284,7 +284,7 @@ struct Outcome {
     acknowledged: BTreeMap<u64, String>,
     /// Nodes whose open refused after the crash, and why.
     refused_to_open: Vec<(usize, String)>,
-    /// The last election's result, for the #640 signature.
+    /// The last election's result, for the failure report.
     last_promotion: Option<Promotion>,
 }
 
@@ -294,46 +294,31 @@ impl Outcome {
     /// fails the sweep.
     ///
     /// * #635 is fixed (#643) and matched no longer.
-    /// * #640: no leader finished, and the last election failed for want of
-    ///   a provable quorum: answers came back but were judged Unknown. Every
-    ///   acknowledged record must still be durable on a majority, or the run
-    ///   reports a lost record, which matches nothing.
+    /// * #640 is fixed (#648) and matched no longer: a run whose last
+    ///   election failed for want of a provable quorum is a new failure.
+    /// * #641 (a returning deposed leader never fenced) is fixed and matched
+    ///   no longer: a run that shows it is a new failure.
     ///
-    /// #641 (a returning deposed leader never fenced) is fixed and no longer
-    /// matched: a run that shows it fails the sweep.
+    /// With none open, any violation is a new failure. A future issue adds
+    /// its signature here.
     fn known_issues(&self) -> Option<BTreeSet<u32>> {
-        let mut issues = BTreeSet::new();
-        for violation in &self.violations {
-            let issue = match violation {
-                Violation::AckWithoutTheRecord { .. }
-                | Violation::DivergedBelowMark { .. }
-                | Violation::AckedRecordLost { .. }
-                | Violation::AcknowledgedRecordReplaced { .. } => return None,
-                Violation::Liveness(_)
-                    if self.final_leader.is_none()
-                        && matches!(
-                            self.last_promotion,
-                            Some(Promotion::QuorumUnavailable { unproven, .. }) if unproven > 0
-                        ) =>
-                {
-                    640
-                }
-                Violation::Liveness(_) => return None,
-            };
-            issues.insert(issue);
+        if self.violations.is_empty() {
+            Some(BTreeSet::new())
+        } else {
+            None
         }
-        Some(issues)
     }
 
     fn report(&self, shape: Shape, fault: &Fault) -> String {
         format!(
             "shape {shape:?}, {fault}, seed {SEED:#x}\n  violations: {:#?}\n  forgotten \
-             disputes (node, from): {:?}\n  run:\n    {}",
+             disputes (node, from): {:?}\n  last election: {:?}\n  run:\n    {}",
             self.violations,
             self.forgotten_disputes
                 .iter()
                 .map(|(node, from)| (NAMES[*node], *from))
                 .collect::<Vec<_>>(),
+            self.last_promotion,
             self.log.join("\n    ")
         )
     }
@@ -1501,11 +1486,10 @@ struct Sweep {
     new_failures: Vec<(String, String)>,
 }
 
-fn issue_title(issue: u32) -> &'static str {
-    match issue {
-        640 => "no provable quorum after a catch-up",
-        _ => "unknown",
-    }
+/// No issue is open: #635, #640 and #641 are fixed. A future one gets its
+/// number and title here, with a signature in `Outcome::known_issues`.
+fn issue_title(_issue: u32) -> &'static str {
+    "unknown"
 }
 
 fn issue_labels(issues: &BTreeSet<u32>) -> String {
@@ -1618,20 +1602,13 @@ fn sweep(shape: Shape, setup: &[SimDiskState]) -> Sweep {
 fn assert_sweep(shape: Shape) {
     let setup = setup_disks();
     let result = sweep(shape, &setup);
-    let count = |issue: u32| {
-        result
-            .known
-            .iter()
-            .filter(|(issues, _)| issues.contains(&issue))
-            .count()
-    };
     eprintln!(
         "{shape:?}: {} runs, {} passed ({} of them with a node whose open refused after the \
-         crash), expected failures: {} #640; {} new failures",
+         crash), {} matching a known issue (none is open); {} new failures",
         result.runs,
         result.passed,
         result.passed_with_a_node_refusing_to_open.len(),
-        count(640),
+        result.known.len(),
         result.new_failures.len()
     );
     for case in &result.passed_with_a_node_refusing_to_open {
@@ -1646,8 +1623,7 @@ fn assert_sweep(shape: Shape) {
     assert!(
         result.new_failures.is_empty(),
         "{} of {} crash points lost an acknowledged record, acked a record a replica \
-         does not hold, or never finished, for a reason #640 does not explain. \
-         First:\n{}",
+         does not hold, or never finished. First:\n{}",
         result.new_failures.len(),
         result.runs,
         result.new_failures[0].1
@@ -1747,11 +1723,12 @@ fn a_crash_at_every_step_of_an_outvoted_dispute_loses_no_acknowledged_record() {
 
 /// Was the first #640 reproduction; passes since #616's 786fb07 and stays
 /// as a guard. The established leader R dies after it caught C up on 5..10
-/// and committed its marker. C files 5..10 under the epoch it adopted at its
-/// own tail, R under 18, so they still disagree about who wrote them (#640),
-/// but L restarts, agrees with R, and R is established again with L. Before
-/// 786fb07, C kept the "disputed" 5..12 below its own high-water mark and
-/// refused every append from the next leader, so no leader ever finished.
+/// and committed its marker. Before the #640 fix C filed 5..10 under the
+/// epoch it adopted at its own tail and R under 18, so they disagreed about
+/// who wrote them, and only L, restarted and agreeing with R, let R be
+/// established again; C now files them under 18 as R does. Before 786fb07,
+/// C kept the "disputed" 5..12 below its own high-water mark and refused
+/// every append from the next leader, so no leader ever finished.
 #[test]
 fn a_second_failover_after_a_catch_up_still_finishes_with_two_agreeing_replicas() {
     let setup = setup_disks();
@@ -1791,16 +1768,16 @@ fn nth_op(
         .index
 }
 
-/// #640. R leads at 20 after catching C up on 5..10, and L, back before the
-/// election, has caught up too. R's producer-epoch journal entry is torn
-/// as it takes its marker, so R refuses to reopen and stays out (that
-/// journal's designed answer to a torn entry). L and C hold identical
-/// bytes, but each filed the records it caught up on under the epoch it
-/// adopted at its own tail, so each judges the other's answer Unknown and
-/// neither is ever established. The range is unavailable with two healthy
-/// replicas.
+/// #640, the guard. R leads at 20 after catching C up on 5..10, and L, back
+/// before the election, has caught up too. R's producer-epoch journal entry
+/// is torn as it takes its marker (its sixth write there), so R refuses to
+/// reopen and stays out (that journal's designed answer to a torn entry). L
+/// and C hold identical bytes. Before the fix each filed the records it
+/// caught up on under the epoch it adopted at its own tail, so each judged
+/// the other's answer Unknown and neither was ever established: the range
+/// was unavailable with two healthy replicas. Each now files them under the
+/// leader's own entries, so they agree and one of them is established.
 #[test]
-#[ignore = "#640: caught-up records are filed under the adopted epoch, so two healthy replicas cannot prove a quorum"]
 fn reproduction_two_caught_up_replicas_cannot_prove_a_quorum_after_the_leader_is_lost() {
     let setup = setup_disks();
     let op = nth_op(

@@ -1,0 +1,17 @@
+# The exact plotting stack report.py's committed output was generated with (#600).
+# CI's drift check installs this file and regenerate.py refuses any other
+# version of these packages: a different matplotlib moves glyphs and ticks,
+# so a version bump is a deliberate change that regenerates docs/benchmarks/
+# in the same commit. matplotlib renders its own bundled DejaVu Sans (no
+# system font is consulted; regenerate.py checks that too).
+matplotlib==3.10.3
+contourpy==1.3.3
+cycler==0.12.1
+fonttools==4.68.0
+kiwisolver==1.5.1
+numpy==2.4.6
+packaging==26.3
+pillow==13.0.0
+pyparsing==3.3.3
+python-dateutil==4.0.0
+tzdata==2026.6

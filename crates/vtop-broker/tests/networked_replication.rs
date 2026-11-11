@@ -1253,7 +1253,16 @@ fn a_follower_holding_records_without_a_history_gets_no_session() {
     );
     assert!(blind.epoch_starts().is_empty(), "precondition: no history");
 
-    // Its next session is fenced against the leader's history.
+    // A follower with a usable history still gets its session, through the
+    // same fence and the lineage it hands over (#640).
+    assert!(h.replica_set.force_reconnect(FOLLOWER_2));
+    assert!(
+        await_within(Duration::from_secs(5), || {
+            h.replica_set.follower_connected(FOLLOWER_2) == Some(true)
+        }),
+        "a follower with a history was refused its session"
+    );
+    // The one without a history is fenced against the leader's next.
     assert!(h.replica_set.force_reconnect(FOLLOWER_1));
     assert!(
         !await_within(Duration::from_secs(2), || {
