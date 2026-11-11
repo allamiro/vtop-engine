@@ -9,6 +9,21 @@ what each release does **not** yet do.
 
 ---
 
+## Next release — per-stream checksum selection
+
+- **[#669](https://github.com/allamiro/vtop-engine/issues/669)** — choose
+  `checksum.algorithm` per stream, inheriting the global value by default.
+  This is the manual selection step motivated by the paper's cost-aware
+  future work (Eq. 4), recorded in the
+  [implementation plan](https://github.com/allamiro/vtop-engine/issues/669#issuecomment-6806355703).
+  Automatic selection still needs a measured cost model and is future work.
+- **Upgrade note:** older engines silently ignore the new stream key and
+  use the global algorithm. Upgrade all engines before relying on it; keep
+  the global algorithm strong during mixed-version operation. Recovery and
+  scrub continue checking each old batch with its manifest's algorithm.
+  No manifest format or ledger migration is introduced. Downgrade remains
+  unsupported.
+
 ## v0.1.0 — a range that fails over
 
 Metadata leases, a lease agent on the data node, verified promotion, and the

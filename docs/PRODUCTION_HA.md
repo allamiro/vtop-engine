@@ -265,6 +265,73 @@ refuses. The per-batch WARN
 is not rate-limited: it replaces that batch's INFO `verification_passed`
 line, so it is no more frequent than the batch log itself.
 
+**Per-stream checksum selection (#669).** An entry in `streams.yaml` may set
+`checksum: { algorithm: sha256 }`, `blake3`, or `none`. An omitted (or null)
+checksum inherits `config.yaml`'s algorithm; a block without `algorithm`, or
+with any other key, is refused at load rather than read as an override. Only
+the first entry per `source_name` applies, as everywhere in `streams.yaml`. The global
+`upload.require_strong_verification` floor applies to every stream: a stream
+that sets `none` is rejected at config load when the floor is on, and warns by
+stream name when it is off. The runtime floor still refuses any size-only
+backend result. `validate --print-effective` shows each stream's resolved
+`checksum.algorithm` and `verification_method`, with origin `stream` when the
+entry sets its own; at startup the engine logs one INFO
+`stream verification settings` line per stream with its algorithm, origin and
+method.
+
+On native S3, SHA-256 uses a service-computed checksum from HEAD, falling
+back to read-back if no usable whole-object checksum is supplied; BLAKE3
+always reads the stored body back and hashes it. Read-back consumes download traffic
+and hashing work. Local filesystem and command compatibility backends check
+stored content for either enabled algorithm. Choose explicitly for the
+backend and workload; there is no automatic cost-based selection and no
+per-stream `read_back` setting in this release.
+
+**Upgrade note:** engines predating this setting silently ignore a stream's
+`checksum` key and use the global algorithm. Upgrade every engine before
+relying on per-stream settings, retain a strong global algorithm during the
+upgrade, and run the new `validate` afterward. Existing batches retain their
+manifest-recorded algorithm: recovery and scrub use it even after config
+changes. Sharing a ledger does not change that rule. Downgrade remains
+unsupported.
+
+### Explain effective configuration before starting
+
+`vtopctl validate --config <file> --print-effective` prints a `default` block
+for unmatched discovered sources and one block per configured stream. The
+`default` block is also present without `streams.yaml`. Every setting identifies
+its origin: `stream`, `global`, or `built-in default`. This is a static explanation:
+no source, state store or object store is contacted, and secret references are
+not resolved. A stream whose tenant is omitted uses the built-in `default`
+tenant, matching the engine; unmatched sources use `engine.tenant`.
+
+Add `--json` for the versioned shape
+`{"status":"ok","warnings":[],"effective_version":1,"effective":{"default":{},"streams":[]}}`.
+Each setting in a block has `value` and `origin` fields. The explicit allowlist
+covers identity, evidence, placement and batching; it omits secret values and
+references, including the manifest MAC key's environment-variable name. The MAC
+setting reports only `enabled` or `disabled`.
+
+The verification method is the backend's preferred path: native S3 with SHA-256
+uses `store_checksum` when a service whole-object checksum is available, falling
+back to `read_back` otherwise (including multipart objects). Native S3 with
+BLAKE3, localfs, and the command backends use `read_back`; disabled checksums use
+`size_only`. An `upload.backend` that names no registered backend reports
+`unknown`: validate accepts the name, but the engine refuses it at startup.
+A batch whose compressed object exceeds `upload.multipart_threshold_bytes` is
+uploaded multipart and therefore read back even under `store_checksum`.
+
+The engine applies the first `streams.yaml` entry for each `source_name`. A
+later entry with the same name is listed under `shadowed_streams` (and as a
+`WARNING` line in text) instead of being printed as if it were in effect. A key
+written with no value or `~` counts as set: a string setting then takes that
+literal text.
+
+The resolved upload width is the configured ceiling after active transport
+tuning, before the adaptive controller reacts to live throttles.
+Without `--print-effective`, validate's existing output and exit codes are
+unchanged.
+
 **ETag caveat:** S3 multipart ETags are **not** reliable MD5 checksums. The
 authoritative integrity value is VTOP's own **SHA-256/BLAKE3 manifest checksum**,
 never the ETag.
@@ -991,7 +1058,8 @@ path needed by the distributed options is already implemented (§6.3).
 | `batching.max_concurrent_batches` | uploads kept in flight per cycle (default 8); the ceiling when the adaptive width is on |
 | `batching.adaptive_width.enabled` / `min_width` | AIMD upload width (#102): a cycle the store throttled halves the next cycle's width, a clean cycle grows it by one, never below `min_width` (default 1) nor above the ceiling. Off by default; `vtop_upload_width` shows the width in use |
 | `compression.type` / `level` | `gzip` \| `zstd` \| `none` |
-| `checksum.algorithm` | `sha256` \| `blake3` \| disabled |
+| `checksum.algorithm` | global `sha256` \| `blake3` \| `none`; inherited by streams without an override |
+| `streams.yaml`: `streams[].checksum.algorithm` | per-stream override with the same shape; `none` requires the global strong floor to be off, otherwise config load fails naming the stream |
 | `manifest_mac_key_env` | optional env-var name for the 32-byte hex manifest MAC key; the secret is not serialized |
 | `sources.kafka.*` | brokers, group, include/exclude, `enable_auto_commit:false` |
 | `sources.file.*` | paths, `delete_after_commit`, `delete_quiet_seconds`, `whole_file`. `delete_after_commit` is for files nothing writes to any more: whole-file drops, and rotated logs once the writer has reopened its new file. A fully archived file is deleted only after it has stayed unwritten for `delete_quiet_seconds` (default 3600) from the commit that covered it, so the engine catching up on a live log does not delete it out from under a writer that still holds it open (#619). A file whose mtime moves while it waits (a producer stamping a finished drop) restarts the wait when its first page, the page below the committed end (#620) and its length still match, and is kept when the range predates that tail fingerprint. The wait is kept in memory: a restart starts it again, from the newest committed row, and only when that row names the file's inode and first page, its batch read the file to its end, and either the row carries the tail fingerprint or the file still has the mtime that batch recorded; otherwise the file stays until a new commit covers it. `delete_quiet_seconds: 0` deletes immediately at the covering commit, still through the rename-and-check (a write that lands before the move puts the file back), but with no quiet-period protection: a writer that still holds the file open loses every line it writes after the delete. The wait is a heuristic, because no portable check proves that no process holds a file open. A writer that keeps the file open loses lines in two cases: it is silent for longer than the quiet period and then writes again, or its write lands between the delete's final check and the unlink (after the same silence). Do not point the option at a live log. Two directory entries naming one file — a symlink beside its target, two hard links — are **two sources** by ruling (#378): each is archived under its own name, so the file's records are archived twice, and discovery warns once per alias group naming every spelling. Narrow the patterns to one spelling if one source is meant. There is no merge and no knob, because a merge needs a cursor identity that survives an alias being removed and none is safe: keyed by the surviving spelling, `delete_after_commit` removes it and the target is re-read from zero; keyed by inode, a freed inode reused by a new file inherits the old cursor and that file's opening records are skipped. A duplicate costs storage; a merge risks data. |

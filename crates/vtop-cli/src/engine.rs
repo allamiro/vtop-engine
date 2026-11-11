@@ -450,8 +450,11 @@ impl<'a> Pipeline<'a> {
         );
 
         // ---- COMPRESSED -> CHECKSUMMED ----------------------------------
-        // Algorithm is configurable: sha256, blake3, or disabled (None).
-        let algo = self.config.checksum.algorithm;
+        // Algorithm is configurable: sha256, blake3, or disabled (None), per
+        // stream with the global value as the default (#669). This is the
+        // only place a new batch's algorithm is chosen; recovery and scrub
+        // re-verify with the algorithm recorded in each batch's manifest.
+        let algo = vtop_core::config::effective_algorithm(self.config, stream);
         let t = Instant::now();
         let object_checksum = match vtop_core::checksum::digest_file(algo, &compressed.path).await {
             Ok(d) => d,
@@ -1460,6 +1463,7 @@ impl Engine {
         streams: StreamsConfig,
     ) -> Result<Self, VtopError> {
         config.validate()?;
+        streams.validate(&config)?;
         let state_store = config.engine.state_store.resolve()?;
         let locks = acquire_instance_locks(&config, &state_store)?;
         let cleanup = cleanup_work_dir(
@@ -1482,7 +1486,7 @@ impl Engine {
                  Do not run replicas against this database (see #66/#93)"
             );
         }
-        verification_mode::announce(&config);
+        verification_mode::announce(&config, &streams);
         let mut engine = Self::new_with_state_store(config, streams, state_store).await?;
         engine._instance_locks = locks;
         // Reclaim multipart sessions no source will replay (#482, review):
@@ -1511,6 +1515,7 @@ impl Engine {
     /// Anything that mutates goes through [`Engine::new_exclusive`].
     pub async fn new(config: VtopConfig, streams: StreamsConfig) -> Result<Self, VtopError> {
         config.validate()?;
+        streams.validate(&config)?;
         let state_store = config.engine.state_store.resolve()?;
         Self::new_with_state_store(config, streams, state_store).await
     }
@@ -4237,12 +4242,14 @@ mod tests {
     fn a_retention_loss_on_an_overridden_stream_is_charged_to_that_streams_tenant() {
         let streams = StreamsConfig {
             streams: vec![StreamConfig {
+                configured_fields: Default::default(),
                 source_name: "app_events".into(),
                 source_type: SourceType::Kafka,
                 format: vtop_core::types::TelemetryFormat::Raw,
                 tenant: "acme".into(),
                 s3_source_name: None,
                 retention_class: None,
+                checksum: None,
             }],
         };
         assert_eq!(
