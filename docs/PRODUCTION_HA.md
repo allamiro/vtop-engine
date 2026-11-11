@@ -653,6 +653,7 @@ one result:
 | `mismatched` | something is stored, and it is not what was committed (object content or size, the manifest's current key, the ledger's record of the object) | yes |
 | `unauthenticated` | the manifest does not parse, fails its self-hash or MAC, or does not bind to the ledger row | yes |
 | `unreadable` | the store answered with an error other than absence (timeout, throttle, permission); nothing was proven | yes |
+| `unsupported_version` | the manifest is from a newer release than this binary reads (#671): not damaged, but not checked either; upgrade the scrub's binary and run it again | yes |
 
 It exits non-zero on any finding; `--json` prints the report (each finding with
 its batch id, URIs, version and whether its row came from the ledger or a
@@ -1159,6 +1160,8 @@ Short procedures now; expand into a full ops runbook before go-live.
   object is read back once per pass; a non-zero exit lists the batches whose
   object or manifest is missing, mismatched, unauthenticated or unreadable.
   It cannot repair them: restore from a replica or backup, or record the loss.
+  A manifest from a newer release (`unsupported_version`) is a finding too;
+  its remedy is a scrub binary of that release or later.
 - **Upgrade the metadata tier (#554):** roll the voters one at a time, and
   confirm each has CAUGHT UP before the next. The chart's `RollingUpdate`
   replaces one pod at a time, but it waits only for `/readyz`, which on a

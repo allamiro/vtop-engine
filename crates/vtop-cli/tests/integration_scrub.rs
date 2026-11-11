@@ -1124,3 +1124,26 @@ delegate_backend!(
             .await
     }
 );
+
+/// A manifest from a newer release (#671) is its own finding, not
+/// `unauthenticated`: before, a scrub binary older than the archive's writer
+/// reported every such batch as a failed self-hash.
+#[tokio::test]
+async fn a_newer_manifest_is_unsupported_not_unauthenticated() {
+    let a = archive(1).await;
+    let mut rows = a.rows().await;
+    let uri = rows[0].record.manifest_uri.clone().unwrap();
+    a.overwrite(
+        &uri,
+        br#"{"protocol":"VTOP","version":"0.9","future_enum":"unrecognized"}"#,
+        true,
+    )
+    .await;
+    rows[0].record.manifest_version_id = None;
+    let report = a.scrub_rows(rows, &opts()).await;
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(report.findings[0].result.as_str(), "unsupported_version");
+    assert!(report.findings[0]
+        .detail
+        .contains("newer than this build supports"));
+}

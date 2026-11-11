@@ -41,6 +41,9 @@ pub(crate) fn announce(config: &VtopConfig) {
 pub(crate) enum Recheck {
     /// The row must not commit; it is replayed instead.
     Failed,
+    /// The manifest is from a newer release (#671): the row is neither
+    /// committed nor replayed, and waits for an upgraded engine.
+    UnsupportedVersion,
     /// Stored content matched a digest.
     Strong,
     /// Only size and existence were confirmed, and the opt-out allows it.

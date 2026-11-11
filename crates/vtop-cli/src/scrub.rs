@@ -35,7 +35,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 use vtop_core::errors::VtopError;
-use vtop_core::manifest::{ManifestMacKey, VtopManifest, MAX_MANIFEST_BYTES};
+use vtop_core::manifest::{ManifestMacKey, ParsedManifest, MAX_MANIFEST_BYTES};
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::ChecksumAlgorithm;
 use vtop_state::BatchRecord;
@@ -74,16 +74,21 @@ pub enum ScrubResult {
     /// timeout, a throttle, a permission error). Nothing was proven either
     /// way, so it is a finding: a scrub that could not look did not pass.
     Unreadable,
+    /// The manifest is from a newer release than this build reads (#671):
+    /// not damaged, but not checked either, so it is a finding. Upgrade the
+    /// scrub's binary and run it again.
+    UnsupportedVersion,
 }
 
 impl ScrubResult {
-    pub const ALL: [ScrubResult; 6] = [
+    pub const ALL: [ScrubResult; 7] = [
         ScrubResult::Ok,
         ScrubResult::Limited,
         ScrubResult::Missing,
         ScrubResult::Mismatched,
         ScrubResult::Unauthenticated,
         ScrubResult::Unreadable,
+        ScrubResult::UnsupportedVersion,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -94,6 +99,7 @@ impl ScrubResult {
             ScrubResult::Mismatched => "mismatched",
             ScrubResult::Unauthenticated => "unauthenticated",
             ScrubResult::Unreadable => "unreadable",
+            ScrubResult::UnsupportedVersion => "unsupported_version",
         }
     }
 
@@ -236,8 +242,14 @@ async fn check_manifest_and_object(
     bytes: &[u8],
 ) -> BatchCheck {
     let unauthenticated = |why: String| BatchCheck::new(ScrubResult::Unauthenticated, why);
-    let manifest: VtopManifest = match serde_json::from_slice(bytes) {
+    let manifest = match ParsedManifest::from_slice(bytes) {
         Ok(manifest) => manifest,
+        Err(e @ VtopError::UnsupportedManifestVersion { .. }) => {
+            return BatchCheck::new(
+                ScrubResult::UnsupportedVersion,
+                format!("manifest {muri}: {e}"),
+            );
+        }
         Err(e) => return unauthenticated(format!("manifest {muri} does not parse: {e}")),
     };
     if let Err(e) = manifest.verify_authentication(mac_key) {
@@ -1056,7 +1068,7 @@ impl ScrubReport {
         gauge(
             &mut out,
             "vtop_scrub_last_run_findings",
-            "Findings (missing, mismatched, unauthenticated, unreadable) in the latest scrub run",
+            "Findings (missing, mismatched, unauthenticated, unreadable, unsupported_version) in the latest scrub run",
             self.findings.len().to_string(),
         );
         gauge(
@@ -1100,7 +1112,7 @@ impl ScrubReport {
         gauge(
             &mut out,
             "vtop_scrub_last_finding_timestamp_seconds",
-            "When a scrub run last found a missing, mismatched, unauthenticated or unreadable batch (0: never)",
+            "When a scrub run last found a missing, mismatched, unauthenticated, unreadable or unsupported-version batch (0: never)",
             finding.to_string(),
         );
         out

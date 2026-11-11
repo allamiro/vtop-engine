@@ -54,6 +54,15 @@ pub enum VtopError {
     #[error("compression error: {0}")]
     Compression(String),
 
+    /// A manifest from a newer release (#671): not damaged, only not readable
+    /// by this build. Distinct from [`VtopError::Manifest`] (malformed) and
+    /// from the integrity errors, so no reader reports it as tampered.
+    #[error("manifest version {version} is newer than this build supports (maximum {supported})")]
+    UnsupportedManifestVersion {
+        version: String,
+        supported: &'static str,
+    },
+
     #[error("manifest error: {0}")]
     Manifest(String),
 

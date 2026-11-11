@@ -202,12 +202,12 @@ lab has no textfile collector, so nothing here charts or alerts on them.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `vtop_scrub_objects_total{result}` | counter | Committed batches checked, by `result`: `ok`; `limited` (size-only: present at its size, no digest compared, the same result recovery counts in `vtop_verification_backend_limited_total`; counted, not a finding); `missing`, `mismatched`, `unauthenticated`, `unreadable` (findings). Every result is written, at zero when nothing had it. Carried forward from the file each run replaces, so it counts across runs. |
+| `vtop_scrub_objects_total{result}` | counter | Committed batches checked, by `result`: `ok`; `limited` (size-only: present at its size, no digest compared, the same result recovery counts in `vtop_verification_backend_limited_total`; counted, not a finding); `missing`, `mismatched`, `unauthenticated`, `unreadable`, `unsupported_version` (a manifest from a newer release than the scrub's binary reads, #671) (findings). Every result is written, at zero when nothing had it. Carried forward from the file each run replaces, so it counts across runs. |
 | `vtop_scrub_last_run_findings` | gauge | Findings in the latest run. With a rotating cursor this is one slice's: the next slice can read 0 while damage found earlier in the pass is still there, so alert on the timestamp below. |
 | `vtop_scrub_last_run_timestamp_seconds` | gauge | When the latest run finished. |
 | `vtop_scrub_last_success_timestamp_seconds` | gauge | When a run last finished with no findings; 0 if none has. A run with findings leaves it where it was. |
 | `vtop_scrub_last_pass_complete_timestamp_seconds` | gauge | When a scrub last finished checking every committed batch: a run over all of them, or the cursor run that reached the end of a pass. 0 if none has. |
-| `vtop_scrub_last_finding_timestamp_seconds` | gauge | When a run last found a missing, mismatched, unauthenticated or unreadable batch; 0 if none has. A clean run leaves it where it was. This is what the findings alert reads: unlike an `increase()` of the counter, it shows damage the very first run found, since that is already in the counter's first sample. |
+| `vtop_scrub_last_finding_timestamp_seconds` | gauge | When a run last found a missing, mismatched, unauthenticated, unreadable or unsupported-version batch; 0 if none has. A clean run leaves it where it was. This is what the findings alert reads: unlike an `increase()` of the counter, it shows damage the very first run found, since that is already in the counter's first sample. |
 
 `result` is the only label: batch ids and URIs are in the command's report and
 its WARN lines. An example rule set, in Prometheus rule format, for a

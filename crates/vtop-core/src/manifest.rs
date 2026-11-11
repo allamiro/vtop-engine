@@ -127,6 +127,326 @@ pub struct VtopManifest {
     pub created_at: String,
 }
 
+/// The newest manifest version this build reads.
+pub const MAX_READABLE_VERSION: &str = "0.4";
+
+/// How a manifest version is authenticated, decided from its `version` field
+/// before anything else in the document is interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HashScheme {
+    /// 0.1-0.3: the hash and MAC cover `serde_json::to_vec` of the decoded
+    /// struct. Kept exactly, so every archived manifest still verifies.
+    Legacy,
+    /// 0.4: the hash and MAC cover the STORED document, canonicalized, so
+    /// fields this build does not know are authenticated too (#671).
+    Canonical,
+}
+
+/// A manifest read from storage, with the bytes its version's scheme
+/// authenticates. Dereferences to the decoded fields this build knows, which
+/// bind it to the batch and the ledger; for a 0.4 manifest the hash and MAC
+/// also cover the fields it does not know.
+///
+/// Every reader of a stored manifest goes through [`ParsedManifest::from_slice`]
+/// (recovery's re-check, the in-run keyed read-back, `vtopctl scrub` and
+/// `vtopctl verify-manifest`): decoding into [`VtopManifest`] and re-encoding
+/// drops a newer writer's fields, and the recomputed hash then reports a
+/// newer manifest as tampered.
+#[derive(Debug)]
+pub struct ParsedManifest {
+    decoded: VtopManifest,
+    auth_bytes: Vec<u8>,
+}
+
+impl std::ops::Deref for ParsedManifest {
+    type Target = VtopManifest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.decoded
+    }
+}
+
+impl ParsedManifest {
+    /// Parse a stored manifest. `protocol` and `version` are checked first:
+    /// a version newer than [`MAX_READABLE_VERSION`] is
+    /// [`VtopError::UnsupportedManifestVersion`] before any other field is
+    /// decoded or any digest computed, so a newer writer never looks like a
+    /// damaged older one. Anything else wrong is a malformed document
+    /// ([`VtopError::Manifest`] or [`VtopError::Json`]).
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, VtopError> {
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(VtopError::Manifest(format!(
+                "manifest exceeds the {MAX_MANIFEST_BYTES}-byte limit"
+            )));
+        }
+        let header = ManifestHeader::from_slice(bytes)?;
+        match header.scheme()? {
+            HashScheme::Legacy => {
+                // Decoded straight from the bytes, as every earlier reader
+                // did, and hashed by re-encoding the struct: unchanged.
+                let decoded: VtopManifest = serde_json::from_slice(bytes)?;
+                let auth_bytes = decoded.auth_bytes()?;
+                Ok(Self {
+                    decoded,
+                    auth_bytes,
+                })
+            }
+            HashScheme::Canonical => {
+                let StrictJson(value) = serde_json::from_slice(bytes)?;
+                let decoded: VtopManifest = serde_json::from_value(value.clone())?;
+                let auth_bytes = canonical_auth_bytes(value)?;
+                Ok(Self {
+                    decoded,
+                    auth_bytes,
+                })
+            }
+        }
+    }
+
+    pub fn verify_self_hash(&self) -> Result<(), VtopError> {
+        check_self_hash(&self.decoded, &self.auth_bytes)
+    }
+
+    pub fn verify_authentication(&self, mac_key: Option<&ManifestMacKey>) -> Result<(), VtopError> {
+        self.verify_self_hash()?;
+        check_mac(&self.decoded, &self.auth_bytes, mac_key)
+    }
+}
+
+/// The two envelope fields every manifest version carries, read from a
+/// document that must be a JSON object. Anything else in it is ignored here,
+/// so a newer writer's fields cannot fail this.
+struct ManifestHeader {
+    protocol: Option<serde_json::Value>,
+    version: Option<serde_json::Value>,
+}
+
+impl ManifestHeader {
+    fn from_slice(bytes: &[u8]) -> Result<Self, VtopError> {
+        // A map, not a derived struct: serde would accept a positional array.
+        let mut object: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(bytes)?;
+        Ok(Self {
+            protocol: object.remove("protocol"),
+            version: object.remove("version"),
+        })
+    }
+
+    fn scheme(&self) -> Result<HashScheme, VtopError> {
+        if self.protocol.as_ref().and_then(serde_json::Value::as_str) != Some(VTOP_PROTOCOL) {
+            return Err(VtopError::Manifest(format!(
+                "manifest protocol must be {VTOP_PROTOCOL}"
+            )));
+        }
+        let version = self
+            .version
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| VtopError::Manifest("manifest version must be a string".into()))?;
+        version_scheme(version)
+    }
+}
+
+fn version_scheme(version: &str) -> Result<HashScheme, VtopError> {
+    match version {
+        "0.1" | "0.2" | "0.3" => return Ok(HashScheme::Legacy),
+        "0.4" => return Ok(HashScheme::Canonical),
+        _ => {}
+    }
+    // `MAJOR.MINOR`, both all digits. A number too large for u64 is still a
+    // larger number, so it saturates rather than reads as malformed.
+    let numeric = |part: &str| {
+        (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| part.parse::<u64>().unwrap_or(u64::MAX))
+    };
+    let parsed = version
+        .split_once('.')
+        .and_then(|(major, minor)| Some((numeric(major)?, numeric(minor)?)));
+    // Bounded: the field comes from storage and lands in logs.
+    let shown: String = if version.chars().count() > 32 {
+        version.chars().take(32).chain("...".chars()).collect()
+    } else {
+        version.to_string()
+    };
+    match parsed {
+        Some(parsed) if parsed > (0, 4) => Err(VtopError::UnsupportedManifestVersion {
+            version: shown,
+            supported: MAX_READABLE_VERSION,
+        }),
+        _ => Err(VtopError::Manifest(format!(
+            "malformed manifest version {shown:?}"
+        ))),
+    }
+}
+
+/// The 0.4 hash/MAC input: the stored document with `manifest.sha256` set to
+/// `""` (and `manifest.mac` too where the key is present), object keys sorted
+/// at every depth, serialized as compact JSON. Unknown fields are kept.
+fn canonical_auth_bytes(mut value: serde_json::Value) -> Result<Vec<u8>, VtopError> {
+    let metadata = value
+        .get_mut("manifest")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| VtopError::Manifest("manifest metadata must be an object".into()))?;
+    metadata.insert("sha256".into(), serde_json::Value::String(String::new()));
+    if metadata.contains_key("mac") {
+        metadata.insert("mac".into(), serde_json::Value::String(String::new()));
+    }
+    // Sorted explicitly: serde_json's map is sorted only while no crate in
+    // the build enables its `preserve_order` feature.
+    sort_json_keys(&mut value);
+    Ok(serde_json::to_vec(&value)?)
+}
+
+fn sort_json_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for value in map.values_mut() {
+                sort_json_keys(value);
+            }
+            map.sort_keys();
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                sort_json_keys(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A JSON value parsed for the 0.4 canonical form, refusing the two inputs
+/// whose canonical bytes would not pin down what the document says:
+///
+/// - a duplicate object key: `serde_json` keeps the last, other parsers the
+///   first, so two readers could authenticate one document and act on
+///   different values;
+/// - a number that is not an integer in the 64-bit range: it is re-encoded
+///   as an `f64`, so different stored numbers (`0.1` and
+///   `0.10000000000000001`, or two integers above `u64::MAX`) would share
+///   one hash, and an edit between them would pass verification.
+struct StrictJson(serde_json::Value);
+
+impl<'de> Deserialize<'de> for StrictJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(StrictVisitor).map(StrictJson)
+    }
+}
+
+struct StrictVisitor;
+
+impl<'de> serde::de::Visitor<'de> for StrictVisitor {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a JSON value with integer numbers and no duplicate keys")
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Bool(v))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(v.into())
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(v.into())
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        Err(E::custom(format_args!(
+            "a version 0.4 manifest number must be an integer in the 64-bit range, not {v}"
+        )))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(v.to_owned()))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(v))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some(StrictJson(value)) = seq.next_element()? {
+            values.push(value);
+        }
+        Ok(serde_json::Value::Array(values))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(serde::de::Error::custom(format_args!(
+                    "duplicate key {key:?} in a version 0.4 manifest"
+                )));
+            }
+            let StrictJson(value) = map.next_value()?;
+            object.insert(key, value);
+        }
+        Ok(serde_json::Value::Object(object))
+    }
+}
+
+fn check_self_hash(manifest: &VtopManifest, bytes: &[u8]) -> Result<(), VtopError> {
+    let expected = sha256_bytes(bytes);
+    if expected.eq_ignore_ascii_case(&manifest.manifest.sha256) {
+        Ok(())
+    } else {
+        Err(VtopError::ChecksumMismatch {
+            uri: manifest.manifest.uri.clone(),
+            expected,
+            actual: manifest.manifest.sha256.clone(),
+        })
+    }
+}
+
+fn check_mac(
+    manifest: &VtopManifest,
+    bytes: &[u8],
+    mac_key: Option<&ManifestMacKey>,
+) -> Result<(), VtopError> {
+    let Some(key) = mac_key else {
+        return Ok(());
+    };
+    let actual_hex = manifest.manifest.mac.as_deref().ok_or_else(|| {
+        VtopError::Manifest(
+            "manifest MAC is required because manifest_mac_key_env is configured".into(),
+        )
+    })?;
+    let actual = hex::decode(actual_hex)
+        .map_err(|_| VtopError::Manifest("manifest MAC is not valid hex".into()))?;
+    if actual.len() != 32 {
+        return Err(VtopError::Manifest(
+            "manifest MAC must be exactly 32 bytes".into(),
+        ));
+    }
+    let expected = key.authenticate(bytes);
+    // Compare without an early exit so a remote verification path does not
+    // leak how many prefix bytes were correct.
+    let mismatch = expected
+        .as_bytes()
+        .iter()
+        .zip(actual.iter())
+        .fold(0_u8, |acc, (left, right)| acc | (left ^ right));
+    if mismatch == 0 {
+        Ok(())
+    } else {
+        Err(VtopError::Manifest(
+            "manifest MAC verification failed".into(),
+        ))
+    }
+}
+
 /// Inputs needed to assemble a manifest.
 pub struct ManifestBuilder {
     pub batch_id: String,
@@ -234,58 +554,39 @@ impl VtopManifest {
         Ok(sha256_bytes(&self.auth_bytes()?))
     }
 
-    /// Recompute and compare the embedded manifest hash. Used during
-    /// verification of a manifest read back from storage.
+    /// Recompute and compare the embedded manifest hash of a decoded manifest.
+    ///
+    /// Only the legacy scheme (0.1-0.3) can be recomputed from decoded
+    /// fields: a 0.4 manifest's hash covers fields the struct may not hold,
+    /// so it is verified from its stored bytes with [`ParsedManifest`].
     pub fn verify_self_hash(&self) -> Result<(), VtopError> {
-        let expected = self.self_hash()?;
-        if expected.eq_ignore_ascii_case(&self.manifest.sha256) {
-            Ok(())
-        } else {
-            Err(VtopError::ChecksumMismatch {
-                uri: self.manifest.uri.clone(),
-                expected,
-                actual: self.manifest.sha256.clone(),
-            })
-        }
+        self.require_legacy_scheme()?;
+        check_self_hash(self, &self.auth_bytes()?)
     }
 
     /// Verify the reproducible self-hash and, when configured, require a valid
-    /// keyed BLAKE3 authenticator.
+    /// keyed BLAKE3 authenticator. Legacy scheme only, as for
+    /// [`VtopManifest::verify_self_hash`].
     ///
     /// Supplying a key deliberately rejects legacy/unsigned manifests. This is
     /// the migration boundary: operators must verify their backlog before
     /// enabling authentication rather than silently grandfathering it forever.
     pub fn verify_authentication(&self, mac_key: Option<&ManifestMacKey>) -> Result<(), VtopError> {
         self.verify_self_hash()?;
-        let Some(key) = mac_key else {
-            return Ok(());
+        check_mac(self, &self.auth_bytes()?, mac_key)
+    }
+
+    fn require_legacy_scheme(&self) -> Result<(), VtopError> {
+        let header = ManifestHeader {
+            protocol: Some(self.protocol.clone().into()),
+            version: Some(self.version.clone().into()),
         };
-        let actual_hex = self.manifest.mac.as_deref().ok_or_else(|| {
-            VtopError::Manifest(
-                "manifest MAC is required because manifest_mac_key_env is configured".into(),
-            )
-        })?;
-        let actual = hex::decode(actual_hex)
-            .map_err(|_| VtopError::Manifest("manifest MAC is not valid hex".into()))?;
-        if actual.len() != 32 {
-            return Err(VtopError::Manifest(
-                "manifest MAC must be exactly 32 bytes".into(),
-            ));
-        }
-        let expected = key.authenticate(&self.auth_bytes()?);
-        // Compare without an early exit so a remote verification path does not
-        // leak how many prefix bytes were correct.
-        let mismatch = expected
-            .as_bytes()
-            .iter()
-            .zip(actual.iter())
-            .fold(0_u8, |acc, (left, right)| acc | (left ^ right));
-        if mismatch == 0 {
-            Ok(())
-        } else {
-            Err(VtopError::Manifest(
-                "manifest MAC verification failed".into(),
-            ))
+        match header.scheme()? {
+            HashScheme::Legacy => Ok(()),
+            HashScheme::Canonical => Err(VtopError::Manifest(format!(
+                "a version {} manifest is verified from its stored bytes, not from decoded fields",
+                self.version
+            ))),
         }
     }
 

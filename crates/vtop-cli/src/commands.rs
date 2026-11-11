@@ -116,7 +116,8 @@ pub enum Command {
     /// it binds to the ledger row, verify the object's stored content against
     /// the manifest's digest, and check the manifest's current key still
     /// holds the pinned version. Reports missing, mismatched, unauthenticated
-    /// and unreadable batches, and exits non-zero on any. Read-only; it can
+    /// and unreadable batches, and manifests from a newer release
+    /// (unsupported_version), and exits non-zero on any. Read-only; it can
     /// run beside a live engine, bounded by the limits below.
     Scrub {
         #[arg(long)]
@@ -867,8 +868,17 @@ pub async fn verify_manifest_deep(
     let manifest_bytes = backend
         .get_object_bounded(manifest_uri, vtop_core::manifest::MAX_MANIFEST_BYTES)
         .await?;
-    let parsed: vtop_core::manifest::VtopManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| VtopError::Other(format!("manifest {manifest_uri} does not parse: {e}")))?;
+    // The version is checked before anything else: a manifest from a newer
+    // release is reported as that, never as a failed self-hash (#671).
+    let parsed = match vtop_core::manifest::ParsedManifest::from_slice(&manifest_bytes) {
+        Ok(parsed) => parsed,
+        Err(e @ VtopError::UnsupportedManifestVersion { .. }) => return Err(e),
+        Err(e) => {
+            return Err(VtopError::Other(format!(
+                "manifest {manifest_uri} does not parse: {e}"
+            )))
+        }
+    };
     lines.push(format!(
         "manifest        : {} ({} bytes, batch {})",
         manifest_uri,
