@@ -40,11 +40,12 @@ mod wire;
 
 pub use command::{
     lease_skew_bound_ms, AnswerLineage, CommandEnvelope, MetadataCommand, MetadataError,
-    MetadataResponse, NodeState, PromotionOutcome, PromotionRefusal, QuorumAnswer, RangeAssignment,
-    VerificationMethod, BASELINE_FEATURE_LEVEL, LINEAGE_VERDICTS_FEATURE_LEVEL,
-    MAX_ASSIGNED_RANGES, MAX_ERROR_DETAIL_BYTES, MAX_NODE_ADDR_BYTES, MAX_TIER_BACKEND_ID_BYTES,
+    MetadataResponse, NodeState, PromotionAttestation, PromotionOutcome, PromotionRefusal,
+    QuorumAnswer, RangeAssignment, VerificationMethod, BASELINE_FEATURE_LEVEL,
+    LINEAGE_VERDICTS_FEATURE_LEVEL, MAX_ASSIGNED_RANGES, MAX_ATTESTATION_OPERATOR_BYTES,
+    MAX_ERROR_DETAIL_BYTES, MAX_NODE_ADDR_BYTES, MAX_TIER_BACKEND_ID_BYTES,
     MAX_TIER_OBJECT_URI_BYTES, MAX_TIER_VERSION_ID_BYTES, MAX_TRANSITION_QUORUM,
-    SUPPORTED_FEATURE_LEVEL,
+    PROMOTE_UNPROVEN_FEATURE_LEVEL, SUPPORTED_FEATURE_LEVEL,
 };
 pub use keys::{
     validate_group_name, validate_topic_name, MetaKey, MetaNodeId, MAX_GROUP_NAME_BYTES,

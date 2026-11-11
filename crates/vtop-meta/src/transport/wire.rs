@@ -90,6 +90,10 @@ pub const KIND_ADMIN_READ_GROUP_CURSOR_RESP: u16 = 26;
 // configured set against before it promotes.
 pub const KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ: u16 = 27;
 pub const KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP: u16 = 28;
+// A range's live promotion attestation (#636): what a candidate whose quorum
+// cannot prove its lineage checks before it counts an Unknown answer.
+pub const KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ: u16 = 29;
+pub const KIND_ADMIN_READ_PROMOTION_ATTESTATION_RESP: u16 = 30;
 
 /// The most transition records one read returns; a longer chain is paged
 /// with `from_epoch`.
@@ -1206,6 +1210,77 @@ impl AdminReadRangeReplicaSetRequest {
     }
 }
 
+/// Which range's live promotion attestation to read (#636).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminReadPromotionAttestationRequest {
+    pub topic_uuid: Uuid,
+    pub range_uuid: Uuid,
+}
+
+impl AdminReadPromotionAttestationRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_uuid(&mut out, self.topic_uuid);
+        put_uuid(&mut out, self.range_uuid);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let request = Self {
+            topic_uuid: reader.uuid("topic uuid")?,
+            range_uuid: reader.uuid("range uuid")?,
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+}
+
+/// Whether the range exists, its live promotion attestation if an operator
+/// recorded one no promotion has used yet (#636), and the applied index the
+/// read was served at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminReadPromotionAttestationResponse {
+    pub range_found: bool,
+    pub attestation: Option<crate::command::PromotionAttestation>,
+    pub read_at_applied_index: u64,
+}
+
+impl AdminReadPromotionAttestationResponse {
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut out = Vec::new();
+        put_u8(&mut out, u8::from(self.range_found));
+        match &self.attestation {
+            None => put_u8(&mut out, 0),
+            Some(attestation) => {
+                put_u8(&mut out, 1);
+                attestation.encode_into(&mut out)?;
+            }
+        }
+        put_u64(&mut out, self.read_at_applied_index);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let range_found = reader.flag("range found")?;
+        let attestation = if reader.flag("attestation presence")? {
+            Some(crate::command::PromotionAttestation::decode_from(
+                &mut reader,
+            )?)
+        } else {
+            None
+        };
+        let response = Self {
+            range_found,
+            attestation,
+            read_at_applied_index: reader.u64("read-at applied index")?,
+        };
+        reader.finish()?;
+        Ok(response)
+    }
+}
+
 /// A recorded replica set as the admin wire carries it: the state machine's
 /// [`crate::state::RangeReplicaSetRecord`], field for field.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2311,6 +2386,7 @@ mod tests {
                     }],
                     votes: 1,
                     required: 1,
+                    attestation: None,
                 },
                 reported_at_ms: 2_500,
                 reported_apply_index: 12,

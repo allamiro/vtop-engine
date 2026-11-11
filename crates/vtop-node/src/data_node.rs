@@ -1353,6 +1353,12 @@ async fn run_leader(
         let publisher = Arc::new(crate::lease_agent::BrokerLeasePublisher::new(Arc::clone(
             &broker,
         )));
+        // Why promotions are refused, by reason (#636).
+        let refusals = Arc::new(crate::lease_agent::PromotionRefusals::default());
+        observability.register(Box::new(crate::observe::PromotionRefusalCollector::new(
+            Arc::clone(&refusals),
+            broker.range(),
+        )?))?;
         let agent = crate::lease_agent::LeaseAgent::new(
             lease_admin_client(lease)?,
             crate::lease_agent::LeaseAgentConfig {
@@ -1368,7 +1374,8 @@ async fn run_leader(
         )?
         // The standalone case has no probe to carry this node's view, and
         // its transition record still wants the sealed prefix (#240 item 5).
-        .with_local_view(Arc::clone(&broker) as Arc<dyn crate::lease_agent::CandidateLocalView>);
+        .with_local_view(Arc::clone(&broker) as Arc<dyn crate::lease_agent::CandidateLocalView>)
+        .with_refusal_counters(refusals);
         agent_task = Some(tokio::spawn(agent.run(release_lease_rx)));
         // The boundary is published through this epoch's marker, not by the
         // promotion itself (#240, §5.4.2): the driver appends and proves it,
@@ -2054,6 +2061,12 @@ async fn run_candidate(
     // agent out of its pacing sleep or in-flight round, so the hand-back
     // starts now rather than up to a renew interval later.
     let stand_down = Arc::new(crate::lease_agent::StandDownSignal::new());
+    // Why promotions are refused, by reason (#636).
+    let refusals = Arc::new(crate::lease_agent::PromotionRefusals::default());
+    observability.register(Box::new(crate::observe::PromotionRefusalCollector::new(
+        Arc::clone(&refusals),
+        &range,
+    )?))?;
     let agent = crate::lease_agent::LeaseAgent::new(
         lease_admin_client(lease)?,
         crate::lease_agent::LeaseAgentConfig {
@@ -2066,7 +2079,8 @@ async fn run_candidate(
         config.range.range_id,
         Arc::clone(&publisher) as Arc<dyn crate::lease_agent::LeasePublisher>,
         Some(Arc::new(probe) as Arc<dyn crate::lease_agent::QuorumProbe>),
-    )?;
+    )?
+    .with_refusal_counters(refusals);
     // One MORE mark before /readyz goes green, same shape as the static
     // follower: the binds' own mark plus the agent's first completed
     // metadata exchange (review: a candidate that has never reached

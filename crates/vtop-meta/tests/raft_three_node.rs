@@ -1404,6 +1404,7 @@ async fn a_lineage_carrying_report_never_reaches_an_old_level_log() {
         ],
         votes: 1,
         required: 2,
+        attestation: None,
     };
     let last_log = |cluster: &Cluster| {
         cluster
@@ -1479,4 +1480,148 @@ async fn a_lineage_carrying_report_never_reaches_an_old_level_log() {
         "{:?}",
         judged.response
     );
+}
+
+/// #636: below feature level 8 the operator's override cannot enter the log
+/// - neither the attestation nor a report that used one - and the
+/// lineage-unproven refusal reason is held back with them. An older voter
+/// could decode none of the three. At level 8 all three pass the gate.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn the_promotion_override_never_reaches_a_log_below_level_8() {
+    use vtop_meta::{
+        AnswerLineage, Consensus, ConsensusError, OpenraftConsensus, PromotionAttestation,
+        PromotionOutcome, PromotionRefusal, QuorumAnswer, PROMOTE_UNPROVEN_FEATURE_LEVEL,
+    };
+
+    let seed = SEED ^ 0x636;
+    let mut cluster = Cluster::boot(seed).await;
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone());
+    let topic_uuid = Uuid::from_u128(0x20);
+    let range_uuid = Uuid::from_u128(0x21);
+    let attest = |env: CommandEnvelope| MetadataCommand::AttestUnprovenPromotion {
+        env,
+        topic_uuid,
+        range_uuid,
+        replica_node_uuid: Uuid::from_u128(0x10),
+        operator: "oncall".to_owned(),
+    };
+    let report =
+        |env: CommandEnvelope, outcome: PromotionOutcome| MetadataCommand::ReportPromotionOutcome {
+            env,
+            topic_uuid,
+            range_uuid,
+            holder_node_uuid: Uuid::from_u128(0x10),
+            fencing_epoch: 1,
+            outcome,
+        };
+    let attested = PromotionOutcome::Established {
+        boundary_offset: Some(5),
+        sealed_prefix_end: None,
+        quorum: vec![
+            QuorumAnswer {
+                node_uuid: Uuid::from_u128(0x10),
+                offset: 5,
+                lineage: Some(AnswerLineage::Unknown),
+            },
+            QuorumAnswer {
+                node_uuid: Uuid::from_u128(0x11),
+                offset: 5,
+                lineage: Some(AnswerLineage::Unknown),
+            },
+        ],
+        votes: 2,
+        required: 2,
+        attestation: Some(PromotionAttestation {
+            attestation_id: Uuid::from_u128(0x636),
+            replica_node_uuid: Uuid::from_u128(0x10),
+            operator: "oncall".to_owned(),
+            attested_at_ms: 0,
+        }),
+    };
+    let unproven_refusal = PromotionOutcome::Refused {
+        reason: PromotionRefusal::LineageUnproven,
+    };
+    let last_log = |cluster: &Cluster| {
+        cluster
+            .leader()
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0)
+    };
+
+    // Everything below the override's level is enabled, so each refusal is
+    // about the override and nothing else.
+    let below = PROMOTE_UNPROVEN_FEATURE_LEVEL - 1;
+    let env = cluster.envelope();
+    consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: below,
+        })
+        .await
+        .unwrap();
+
+    let commands = |cluster: &mut Cluster| {
+        vec![
+            ("the attestation", attest(cluster.envelope())),
+            (
+                "an attested report",
+                report(cluster.envelope(), attested.clone()),
+            ),
+            (
+                "the lineage-unproven refusal",
+                report(cluster.envelope(), unproven_refusal.clone()),
+            ),
+        ]
+    };
+    for (what, command) in commands(&mut cluster) {
+        let before = last_log(&cluster);
+        match consensus.propose(command).await {
+            Err(error @ ConsensusError::FeatureNotEnabled { needed, enabled }) => {
+                assert_eq!((needed, enabled), (PROMOTE_UNPROVEN_FEATURE_LEVEL, below));
+                // The refusal tells the operator what to do.
+                assert!(
+                    error.to_string().contains("enable-features --level 8"),
+                    "{error}"
+                );
+            }
+            other => panic!("{what} was not refused at level {below} (seed={seed:#x}): {other:?}"),
+        }
+        assert_eq!(last_log(&cluster), before, "{what} reached the log");
+    }
+    // Below the level the refusal goes as it always did.
+    let env = cluster.envelope();
+    let legacy = consensus
+        .propose(report(env, unproven_refusal.without_unproven_refusal()))
+        .await
+        .unwrap();
+    assert!(
+        matches!(legacy.response, MetadataResponse::Rejected(_)),
+        "no such range here, so the state machine judges it: {:?}",
+        legacy.response
+    );
+
+    let env = cluster.envelope();
+    consensus
+        .propose(MetadataCommand::SetFeatureLevel {
+            env,
+            feature_level: PROMOTE_UNPROVEN_FEATURE_LEVEL,
+        })
+        .await
+        .unwrap();
+    for (what, command) in commands(&mut cluster) {
+        let judged = consensus.propose(command).await.unwrap_or_else(|error| {
+            panic!("{what} was refused at level 8 (seed={seed:#x}): {error}")
+        });
+        // No such range here: each is judged by the state machine, which
+        // is what passing the gate means.
+        assert!(
+            matches!(judged.response, MetadataResponse::Rejected(_)),
+            "{what}: {:?}",
+            judged.response
+        );
+    }
 }

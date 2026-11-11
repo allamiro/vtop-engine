@@ -219,7 +219,16 @@ reopen quietly.
   lost on every replica) cannot promote, and repair cannot fix it, since a
   history-less source has nothing to install; and a
   replica whose only dispute is below its retained base (#408) is not
-  counted. The verdicts are recorded with the quorum and the replica-set gate
+  counted. #636 makes that refusal visible as its own reason
+  (`lineage_unproven`: a data-node log field and metric, and at feature
+  level 8 `Refused{LineageUnproven}` in the transition record) and adds the
+  one way out, after restore from backup: `vtopctl node promote-unproven`
+  records an operator's attestation naming the replica whose log becomes
+  canonical. Only that replica, at its next promotion, counts Unknown
+  answers; metadata records the promotion only while the attestation is
+  live and names its holder, and uses it up in the same apply. It is never
+  automatic, and every record the named replica does not hold may be lost
+  (PRODUCTION_HA.md). The verdicts are recorded with the quorum and the replica-set gate
   and `vtopctl meta transitions` count only the proven answers. Recording
   them is a new outcome tag inside the promotion report, so it is gated at
   feature level 6: below it (or against a metadata tier that predates

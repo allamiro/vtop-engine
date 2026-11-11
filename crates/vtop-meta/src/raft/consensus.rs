@@ -17,9 +17,10 @@ use crate::state::MetaValue;
 use crate::transport::admin::AdminHandler;
 use crate::transport::wire::{
     AdminGroupCursorView, AdminLeaseView, AdminRangeReplicaSetView, AdminReadGroupCursorResponse,
-    AdminReadRangeLeaseResponse, AdminReadRangeReplicaSetResponse,
-    AdminReadRangeTransitionsResponse, AdminReadSegmentPlacementResponse, AdminRebalanceIntentView,
-    AdminSegmentView, AdminTransitionView, MAX_TRANSITIONS_PER_READ,
+    AdminReadPromotionAttestationResponse, AdminReadRangeLeaseResponse,
+    AdminReadRangeReplicaSetResponse, AdminReadRangeTransitionsResponse,
+    AdminReadSegmentPlacementResponse, AdminRebalanceIntentView, AdminSegmentView,
+    AdminTransitionView, MAX_TRANSITIONS_PER_READ,
 };
 use crate::transport::wire::{
     AdminMembershipResponse, AdminProposeResponse, AdminStatusResponse, TransportError,
@@ -579,6 +580,56 @@ impl AdminReadRangeReplicaSet for OpenraftConsensus {
     }
 }
 
+/// Linearizable read of a range's live promotion attestation (#636), its
+/// own trait as the other reads are.
+#[async_trait]
+pub trait AdminReadPromotionAttestation: Send + Sync {
+    async fn read_promotion_attestation(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> ConsensusResult<AdminReadPromotionAttestationResponse>;
+}
+
+#[async_trait]
+impl AdminReadPromotionAttestation for OpenraftConsensus {
+    async fn read_promotion_attestation(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> ConsensusResult<AdminReadPromotionAttestationResponse> {
+        let Some(store) = self.store.as_ref() else {
+            return Err(ConsensusError::Message(
+                "this node was built without applied state and cannot serve reads".to_owned(),
+            ));
+        };
+        // Fence FIRST, as every admin read does. A stale copy could still
+        // show an attestation a promotion has already used; metadata would
+        // refuse that promotion's report (the use is checked in apply), but
+        // the candidate should not get that far on a lagging view.
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(classify_read_error)?;
+        store.with_storage(|storage| {
+            let read_at_applied_index = storage.last_applied();
+            let state = storage.state();
+            let range_found = matches!(
+                state.record(&MetaKey::Range {
+                    topic_uuid,
+                    range_uuid,
+                }),
+                Some(MetaValue::Range(_))
+            );
+            Ok(AdminReadPromotionAttestationResponse {
+                range_found,
+                attestation: state.promotion_attestation(topic_uuid, range_uuid).cloned(),
+                read_at_applied_index,
+            })
+        })
+    }
+}
+
 /// Linearizable range-lease read, kept as its own trait so the consensus
 /// façade stays the narrow propose/status interface it was.
 #[async_trait]
@@ -1028,6 +1079,19 @@ impl AdminHandler for OpenraftConsensus {
         request: crate::transport::wire::AdminReadRangeReplicaSetRequest,
     ) -> TransportResult<AdminReadRangeReplicaSetResponse> {
         AdminReadRangeReplicaSet::read_range_replica_set(
+            self,
+            request.topic_uuid,
+            request.range_uuid,
+        )
+        .await
+        .map_err(to_transport_error)
+    }
+
+    async fn read_promotion_attestation(
+        &self,
+        request: crate::transport::wire::AdminReadPromotionAttestationRequest,
+    ) -> TransportResult<AdminReadPromotionAttestationResponse> {
+        AdminReadPromotionAttestation::read_promotion_attestation(
             self,
             request.topic_uuid,
             request.range_uuid,

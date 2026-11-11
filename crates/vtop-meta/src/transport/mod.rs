@@ -29,8 +29,8 @@ pub mod tls;
 pub mod wire;
 
 pub use admin::{
-    refuses_lineage_verdicts, resolve_endpoint, stub_status, AdminCandidate, AdminClient,
-    AdminHandler, AdminServer,
+    refuses_lineage_verdicts, refuses_promote_unproven, resolve_endpoint, stub_status,
+    AdminCandidate, AdminClient, AdminHandler, AdminServer,
 };
 pub use authz::{AdminAuthorizer, AdminIdentity, CommandClass, Refusal};
 pub use maybe_tls::{
@@ -46,16 +46,19 @@ pub use wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
     AdminGroupCursorView, AdminInitRequest, AdminLeaseView, AdminMembershipResponse,
     AdminProposeRequest, AdminProposeResponse, AdminRangeReplicaSetView,
-    AdminReadGroupCursorRequest, AdminReadGroupCursorResponse, AdminReadRangeLeaseRequest,
-    AdminReadRangeLeaseResponse, AdminReadRangeReplicaSetRequest, AdminReadRangeReplicaSetResponse,
-    AdminReadRangeTransitionsRequest, AdminReadRangeTransitionsResponse,
-    AdminReadSegmentPlacementRequest, AdminReadSegmentPlacementResponse, AdminRebalanceIntentView,
-    AdminSegmentView, AdminStatusRequest, AdminStatusResponse, AdminTransitionView,
-    PeerAppendRequest, PeerAppendResponse, PeerInstallRequest, PeerInstallResponse,
-    PeerVoteRequest, PeerVoteResponse, TransportError, TransportResult, VtpmFrame, WireLogId,
-    KIND_ADMIN_ADD_LEARNER_REQ, KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR,
-    KIND_ADMIN_INIT_REQ, KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ,
-    KIND_ADMIN_PROPOSE_RESP, KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+    AdminReadGroupCursorRequest, AdminReadGroupCursorResponse,
+    AdminReadPromotionAttestationRequest, AdminReadPromotionAttestationResponse,
+    AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse, AdminReadRangeReplicaSetRequest,
+    AdminReadRangeReplicaSetResponse, AdminReadRangeTransitionsRequest,
+    AdminReadRangeTransitionsResponse, AdminReadSegmentPlacementRequest,
+    AdminReadSegmentPlacementResponse, AdminRebalanceIntentView, AdminSegmentView,
+    AdminStatusRequest, AdminStatusResponse, AdminTransitionView, PeerAppendRequest,
+    PeerAppendResponse, PeerInstallRequest, PeerInstallResponse, PeerVoteRequest, PeerVoteResponse,
+    TransportError, TransportResult, VtpmFrame, WireLogId, KIND_ADMIN_ADD_LEARNER_REQ,
+    KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR, KIND_ADMIN_INIT_REQ,
+    KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ, KIND_ADMIN_PROPOSE_RESP,
+    KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+    KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ, KIND_ADMIN_READ_PROMOTION_ATTESTATION_RESP,
     KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP,
     KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ, KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP,
     KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ, KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP,

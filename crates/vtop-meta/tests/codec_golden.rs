@@ -42,6 +42,20 @@ const GOLDEN_SET_RANGE_REPLICA_SET_HEX: &str = concat!(
     "0000000000000003",                 // expected generation 3
 );
 
+/// AttestUnprovenPromotion (#636), derived by hand from the layout: kind 38,
+/// the envelope, topic, range, the attested replica, the operator as a
+/// length-prefixed string.
+const GOLDEN_ATTEST_UNPROVEN_PROMOTION_HEX: &str = concat!(
+    "0026",                             // kind 38
+    "00112233445566778899aabbccddee07", // request id
+    "0102030405060708",                 // issued_at_ms
+    "ffeeddccbbaa99887766554433221100", // topic
+    "0f1e2d3c4b5a69788796a5b4c3d2e1f0", // range
+    "bbbbbbbb000000000000000000000031", // attested replica
+    "0003",                             // operator: 3 bytes
+    "6f7073",                           // "ops"
+);
+
 /// ReportPromotionOutcome (kind 30) as every release since v0.5.0 writes it -
 /// derived by hand from the v0.5.0 layout, NOT taken from the encoder under
 /// test, so a change that moved these bytes would fail here rather than agree
@@ -341,6 +355,28 @@ fn set_feature_level_command_matches_golden_vector() {
 }
 
 #[test]
+fn attest_unproven_promotion_command_matches_golden_vector() {
+    let command = MetadataCommand::AttestUnprovenPromotion {
+        env: CommandEnvelope {
+            request_id: Uuid::parse_str("00112233-4455-6677-8899-aabbccddee07").unwrap(),
+            issued_at_ms: 0x0102_0304_0506_0708,
+        },
+        topic_uuid: Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap(),
+        range_uuid: Uuid::parse_str("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0").unwrap(),
+        replica_node_uuid: Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000031").unwrap(),
+        operator: "ops".to_owned(),
+    };
+    let encoded = command.encode().unwrap();
+    assert_eq!(to_hex(&encoded), GOLDEN_ATTEST_UNPROVEN_PROMOTION_HEX);
+    assert_eq!(MetadataCommand::decode(&encoded).unwrap(), command);
+    assert_eq!(
+        command.feature_level(),
+        8,
+        "gated: older voters cannot decode it"
+    );
+}
+
+#[test]
 fn set_range_replica_set_command_matches_golden_vector() {
     let command = MetadataCommand::SetRangeReplicaSet {
         env: CommandEnvelope {
@@ -381,6 +417,7 @@ fn golden_report(request: &str, quorum: Vec<QuorumAnswer>) -> MetadataCommand {
             quorum,
             votes: 2,
             required: 2,
+            attestation: None,
         },
     }
 }
