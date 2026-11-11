@@ -411,12 +411,16 @@ struct PartitionLiveness {
     idle: HashMap<(String, i32), IdleRun>,
     /// When the stall check last asked the broker.
     last_check: Option<Instant>,
-    /// The high watermark at which each partition was last re-assigned for a
-    /// stall. A partition whose re-assign did not help, with no new records
-    /// since, holds records it cannot deliver (a transaction marker at the
-    /// end of the log, for example), not a dead fetcher, and re-assigning it
-    /// again would only restart every fetcher once per interval for nothing.
-    reassigned_at_high: HashMap<(String, i32), i64>,
+    /// The high watermark at which each partition was last recovered from a
+    /// stall, and how many recoveries it has had at that watermark. The first
+    /// re-assigns the partition; the second, when the first did not help and
+    /// no record has arrived since, rebuilds the consumer, which is what a
+    /// restart does (#623: a run of the research benchmark sat at a static
+    /// high watermark until a restart). After `MAX_RECOVERIES_PER_HIGH` the
+    /// partition is left alone until a new record arrives: it holds records
+    /// it cannot deliver (a transaction marker at the end of the log, for
+    /// example), not a dead fetcher.
+    reassigned_at_high: HashMap<(String, i32), (i64, u8)>,
     /// For a partition that has not delivered since an assign at
     /// `Offset::Stored`, where the group answered that nothing is committed
     /// and `auto.offset.reset` is `latest`: where the fetcher would have
@@ -547,19 +551,53 @@ impl PartitionLiveness {
     }
 
     /// The lag of a due partition that is stalled: the broker holds records at
-    /// or past `next`, the offset it would read next, and it was not already
-    /// re-assigned at this high watermark. `None` when `next` is unknown.
+    /// or past `next`, the offset it would read next, and it has not used up
+    /// its recoveries at this high watermark. `None` when `next` is unknown.
     fn stalled_lag(&self, key: &(String, i32), next: Option<i64>, high: i64) -> Option<u64> {
         let next = next.filter(|n| *n >= 0)?;
-        if high <= next || self.reassigned_at_high.get(key) == Some(&high) {
+        if high <= next || self.recoveries_at(key, high) >= MAX_RECOVERIES_PER_HIGH {
             return None;
         }
         Some(high.saturating_sub(next) as u64)
     }
 
-    fn note_reassigned(&mut self, key: &(String, i32), high: i64) {
-        self.reassigned_at_high.insert(key.clone(), high);
+    /// How a stalled partition is recovered this time: a re-assign of it
+    /// first, then, if that did not help at the same high watermark, a new
+    /// consumer.
+    fn recovery(&self, key: &(String, i32), high: i64) -> Recovery {
+        if self.recoveries_at(key, high) == 0 {
+            Recovery::Reassign
+        } else {
+            Recovery::RebuildConsumer
+        }
     }
+
+    fn recoveries_at(&self, key: &(String, i32), high: i64) -> u8 {
+        match self.reassigned_at_high.get(key) {
+            Some(&(at, count)) if at == high => count,
+            _ => 0,
+        }
+    }
+
+    fn note_reassigned(&mut self, key: &(String, i32), high: i64) {
+        let count = self.recoveries_at(key, high).saturating_add(1);
+        self.reassigned_at_high.insert(key.clone(), (high, count));
+    }
+}
+
+/// Recoveries of one partition at one high watermark (#623). See
+/// `PartitionLiveness::reassigned_at_high`.
+const MAX_RECOVERIES_PER_HIGH: u8 = 2;
+
+/// How the stall check recovers a stalled partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recovery {
+    /// Restart its fetcher alone: unassign and assign it again, at its own
+    /// position, leaving every other partition's fetcher (and the offset an
+    /// `Offset::Stored` partition resolved to) as it is.
+    Reassign,
+    /// Drop the consumer and build a new one, as a restart would.
+    RebuildConsumer,
 }
 
 /// The offset a partition would read next, for the stall check (#623): where
@@ -1073,9 +1111,12 @@ impl KafkaSource {
     /// watermarks (earliest) or the offsets at the assign's time (latest).
     ///
     /// A partition is stalled when it would read next below the high
-    /// watermark. A stalled partition is logged and the whole assignment is
-    /// re-assigned on the next pass, which restarts its fetcher; that costs
-    /// every fetcher one restart, and happens at most once per interval.
+    /// watermark. A stalled partition is logged and its fetcher alone is
+    /// restarted (`reassign_stalled`); if that did not help and no record has
+    /// arrived since, the next stall at the same high watermark rebuilds the
+    /// consumer (`rebuild_consumer_after_stall`), and after that the
+    /// partition is left alone until a record arrives. At most once per
+    /// interval.
     /// Never fails the pass: a broker that does not answer leaves things as
     /// they are until the next check.
     fn check_stalled_partitions(&mut self) {
@@ -1154,7 +1195,8 @@ impl KafkaSource {
         }
 
         let now = Instant::now();
-        let mut stalled = false;
+        let mut stalled: Vec<(String, i32)> = Vec::new();
+        let mut rebuild = false;
         for key in &due {
             let Some(&high) = highs.get(key) else {
                 continue;
@@ -1200,9 +1242,13 @@ impl KafkaSource {
                 .get(key)
                 .map(|run| (run.passes, now.saturating_duration_since(run.since)))
                 .unwrap_or_default();
+            let recovery = self.liveness.recovery(key, high);
             self.liveness.note_reassigned(key, high);
             self.stall_reassigns += 1;
-            stalled = true;
+            match recovery {
+                Recovery::Reassign => stalled.push(key.clone()),
+                Recovery::RebuildConsumer => rebuild = true,
+            }
             tracing::warn!(
                 topic = %key.0,
                 partition = key.1,
@@ -1212,13 +1258,133 @@ impl KafkaSource {
                 idle_passes,
                 idle_secs = idle_for.as_secs(),
                 stall_reassigns_total = self.stall_reassigns,
+                recovery = ?recovery,
                 "kafka partition re-assigned after stall: it delivered nothing while the broker \
                  holds records for it, so its fetcher is restarted (#623)"
             );
         }
-        if stalled {
-            self.assigned.clear();
+        if rebuild {
+            self.rebuild_consumer_after_stall();
+        } else if !stalled.is_empty() {
+            self.reassign_stalled(&stalled);
         }
+    }
+
+    /// Restart the fetchers of `stalled` partitions ALONE (review of #644):
+    /// unassign them and assign them again at their own position. A whole
+    /// re-assign would restart every fetcher, and resolve every partition
+    /// still at `Offset::Stored` again - for `latest`, at the NEW end of the
+    /// log, skipping whatever arrived since its first assign. Should the
+    /// consumer refuse the incremental calls, the whole assignment is renewed
+    /// on the next pass instead, as before.
+    fn reassign_stalled(&mut self, stalled: &[(String, i32)]) {
+        let positions: Vec<((String, i32), Offset)> = stalled
+            .iter()
+            .map(|key| {
+                let cursor = self.cursors.get(key);
+                let at = match (
+                    cursor.and_then(|c| c.last_read_offset),
+                    cursor.and_then(|c| c.committed_offset),
+                ) {
+                    (Some(read), _) => Offset::Offset(read + 1),
+                    (None, Some(committed)) => Offset::Offset(committed),
+                    (None, None) => Offset::Stored,
+                };
+                (key.clone(), at)
+            })
+            .collect();
+        let Some(consumer) = self.consumer.as_ref() else {
+            return;
+        };
+        let mut plain = TopicPartitionList::new();
+        let mut at = TopicPartitionList::new();
+        for ((topic, partition), offset) in &positions {
+            plain.add_partition(topic, *partition);
+            if at.add_partition_offset(topic, *partition, *offset).is_err() {
+                self.assigned.clear();
+                return;
+            }
+        }
+        let result = consumer
+            .incremental_unassign(&plain)
+            .and_then(|()| consumer.incremental_assign(&at))
+            .and_then(|()| consumer.resume(&plain));
+        match result {
+            Ok(()) => {
+                for (key, offset) in positions {
+                    self.liveness.idle.remove(&key);
+                    match offset {
+                        Offset::Offset(next) => self.delivered.insert(key, next),
+                        _ => self.delivered.remove(&key),
+                    };
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "kafka could not re-assign the stalled partitions alone; renewing the whole \
+                     assignment instead (#623)"
+                );
+                self.assigned.clear();
+            }
+        }
+    }
+
+    /// Drop the consumer and build a new one on the next pass, as a restart
+    /// would (#623): a re-assign of the stalled partition did not bring it
+    /// back, and no record has arrived since. Every position this process
+    /// holds survives in its cursors. A partition still waiting on
+    /// `Offset::Stored` under `latest`, with nothing committed, is first
+    /// pinned where it started, so the new consumer does not resolve it at
+    /// the new end of the log (review of #644).
+    fn rebuild_consumer_after_stall(&mut self) {
+        let waiting: Vec<(String, i32)> = self
+            .assigned
+            .iter()
+            .filter(|key| {
+                !self.delivered.contains_key(*key)
+                    && self.cursors.get(*key).is_none_or(|c| {
+                        c.last_read_offset.is_none() && c.committed_offset.is_none()
+                    })
+            })
+            .cloned()
+            .collect();
+        if !waiting.is_empty() && resets_to_latest(&self.cfg.auto_offset_reset) {
+            let answers = self.group_committed_answers(&waiting).unwrap_or_default();
+            let unpinned: Vec<(String, i32)> = waiting
+                .into_iter()
+                .filter(|key| matches!(answers.get(key), Some(None)))
+                .collect();
+            if let Some(consumer) = self.consumer.as_ref() {
+                let since = end_start_lookup_time(self.liveness.assigned_at_ms);
+                let highs = list_offsets(consumer, &unpinned, Offset::End);
+                let starts = offsets_at_time(consumer, &unpinned, since).unwrap_or_default();
+                for key in unpinned {
+                    let start = match starts.get(&key) {
+                        Some(Some(start)) => Some(*start),
+                        Some(None) => highs.get(&key).copied(),
+                        None => None,
+                    };
+                    if let Some(start) = start {
+                        self.cursors.entry(key).or_default().committed_offset = Some(start);
+                    }
+                }
+            }
+        }
+        tracing::warn!(
+            "kafka consumer rebuilt after a stall that a re-assign did not clear (#623)"
+        );
+        self.consumer = None;
+        self.assigned.clear();
+        self.delivered.clear();
+        self.paused.clear();
+    }
+
+    /// TEST SEAM (#623): how many stall recoveries this adapter has made, so
+    /// a live test can act in the gap right after one is decided.
+    #[doc(hidden)]
+    pub fn stall_recoveries(&self) -> u64 {
+        self.stall_reassigns
     }
 
     /// TEST SEAM (#623): stop one partition's fetcher on the underlying
@@ -2189,9 +2355,29 @@ mod tests {
         let mut live = PartitionLiveness::default();
         live.on_assign(&assigned);
         live.note_reassigned(&key, 100);
+        live.note_reassigned(&key, 100);
         assert_eq!(live.stalled_lag(&key, Some(40), 100), None);
         live.record_pass(&assigned, |_| true, Instant::now());
         assert_eq!(live.stalled_lag(&key, Some(60), 100), Some(40));
+        assert_eq!(live.recovery(&key, 100), Recovery::Reassign);
+    }
+
+    /// #623, from a run of the research benchmark: a partition sat at a
+    /// static high watermark (the producer had finished) until a restart. A
+    /// re-assign that does not bring it back must not be the last word: the
+    /// second recovery at the same watermark builds a new consumer, as a
+    /// restart does. A new record starts the ladder over.
+    #[test]
+    fn a_stall_a_reassign_did_not_clear_rebuilds_the_consumer() {
+        let key = tp("a", 0);
+        let mut live = PartitionLiveness::default();
+        assert_eq!(live.recovery(&key, 655_147), Recovery::Reassign);
+        live.note_reassigned(&key, 655_147);
+        assert_eq!(live.stalled_lag(&key, Some(77_054), 655_147), Some(578_093));
+        assert_eq!(live.recovery(&key, 655_147), Recovery::RebuildConsumer);
+        live.note_reassigned(&key, 655_147);
+        assert_eq!(live.stalled_lag(&key, Some(77_054), 655_147), None);
+        assert_eq!(live.recovery(&key, 655_148), Recovery::Reassign);
     }
 
     /// Review of #644: a partition assigned at `Offset::Stored` with nothing
@@ -2337,9 +2523,10 @@ mod tests {
 
     /// Stalled means records are waiting: the high watermark is past the
     /// offset the partition would read next. An idle partition that is caught
-    /// up is not stalled, and one whose re-assign did not help is not
-    /// re-assigned again until a new record arrives, so an undeliverable tail
-    /// (a transaction marker) cannot restart every fetcher once per interval.
+    /// up is not stalled. At one high watermark a partition is recovered at
+    /// most twice (a re-assign, then a new consumer); after that it is left
+    /// alone until a new record arrives, so an undeliverable tail (a
+    /// transaction marker) cannot restart fetchers once per interval forever.
     #[test]
     fn a_partition_is_stalled_only_while_records_wait_for_it() {
         let key = tp("a", 0);
@@ -2354,6 +2541,7 @@ mod tests {
         );
         assert_eq!(live.stalled_lag(&key, Some(39), 40), Some(1));
 
+        live.note_reassigned(&key, 40);
         live.note_reassigned(&key, 40);
         assert_eq!(live.stalled_lag(&key, Some(39), 40), None);
         assert_eq!(live.stalled_lag(&key, Some(39), 41), Some(2));
