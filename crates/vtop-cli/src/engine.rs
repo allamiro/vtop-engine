@@ -233,7 +233,10 @@ impl<'a> Pipeline<'a> {
             .and_then(|s| s.s3_source_name.clone())
             .unwrap_or_else(|| source.source_name.clone());
 
-        let batch_id = vtop_core::batch::build_batch_id(&source.source_name, &read.progress_end);
+        // The range the batch's object holds, for its name and its manifest.
+        // The ledger and the adapter commit keep `read.progress_end` as it is.
+        let window = window_marker(&read);
+        let batch_id = vtop_core::batch::build_batch_id(&source.source_name, &window);
         let now = Utc::now().to_rfc3339();
 
         // ---- DISCOVERED -> BATCHING (persisted) -------------------------
@@ -663,7 +666,7 @@ impl<'a> Pipeline<'a> {
             last_timestamp: batch.last_timestamp.clone(),
             // Without the #578 fields: an older verifier would drop them
             // and fail the self-hash (see `ProgressMarker::for_manifest`).
-            source_progress: read.progress_end.for_manifest(),
+            source_progress: window.for_manifest(),
             object_uri: object_uri.clone(),
             object_size: compressed.size_bytes,
             object_checksum_algorithm: algo.as_str().to_string(),
@@ -3265,6 +3268,17 @@ fn buffer_key(source: &DiscoveredSource, marker: &ProgressMarker) -> (SourceType
     }
 }
 
+/// The range a drained window's object holds, for its batch id and manifest
+/// (#622): the first read's start to the last read's end. Each read's end
+/// marker carries that read's own start, so `progress_end` alone named only
+/// the last read, and the manifest of a batch of several reads claimed less
+/// than its object held. `progress_end` itself stays the commit marker and
+/// the ledger's end: the file adapter settles a commit by the exact range of
+/// the read it issued, and a span would match none of them.
+fn window_marker(read: &ReadResult) -> ProgressMarker {
+    ProgressMarker::spanning(&read.progress_start, &read.progress_end)
+}
+
 /// The source a read actually belongs to. Like [`buffer_key`], the marker is
 /// authoritative for Kafka: the buffer's source drives stream lookup (tenant,
 /// format) and batch metadata, so it must name the topic the records came
@@ -4824,6 +4838,297 @@ mod tests {
             committed[0].progress_end, committed[1].progress_end,
             "and the two are different files"
         );
+    }
+
+    /// Records every read the wrapped adapter hands out and every marker the
+    /// engine commits through it, so a test can hold the commit to exactly
+    /// what was read.
+    struct RecordingAdapter {
+        inner: Box<dyn SourceAdapter>,
+        reads: Arc<std::sync::Mutex<Vec<ProgressMarker>>>,
+        commits: Arc<std::sync::Mutex<Vec<ProgressMarker>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SourceAdapter for RecordingAdapter {
+        async fn discover_sources(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
+            self.inner.discover_sources().await
+        }
+        async fn read_batch_candidates(
+            &mut self,
+            source: &DiscoveredSource,
+            max_records: usize,
+            max_bytes: usize,
+            max_wait: Duration,
+        ) -> Result<Vec<ReadResult>, VtopError> {
+            let reads = self
+                .inner
+                .read_batch_candidates(source, max_records, max_bytes, max_wait)
+                .await?;
+            self.reads.lock().unwrap().extend(
+                reads
+                    .iter()
+                    .filter(|r| !r.is_empty())
+                    .map(|r| r.progress_end.clone()),
+            );
+            Ok(reads)
+        }
+        async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            self.commits.lock().unwrap().push(marker.clone());
+            self.inner.commit_progress(marker).await
+        }
+        async fn replay_from_marker(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            self.inner.replay_from_marker(marker).await
+        }
+        fn source_type(&self) -> SourceType {
+            self.inner.source_type()
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self.inner.as_any_mut()
+        }
+    }
+
+    /// #622: a batch buffered from three reads holds bytes `0..total`, and
+    /// its manifest and batch id must say so. They used to carry the LAST
+    /// read's range (`b<l1+l2>-<total>`), so an audit from manifests alone
+    /// saw a hole at `0..l1+l2` and could not place the first records. The
+    /// ledger row and the adapter commit keep the last read's marker: the
+    /// file adapter settles a commit by that read's exact range.
+    #[tokio::test]
+    async fn a_window_of_several_reads_names_its_whole_range_in_its_manifest_and_batch_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        let lines = ["one\n", "two two\n", "three three three\n"];
+        std::fs::write(&input, lines[0]).unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        // Nothing seals on its own: only the forced cycle flushes.
+        cfg.batching.max_records = 10_000;
+        cfg.batching.max_bytes = 104_857_600;
+        cfg.batching.max_batch_age_seconds = 3_600;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let commits = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inner = engine.adapters.remove(&SourceType::File).unwrap();
+        engine.adapters.insert(
+            SourceType::File,
+            Box::new(RecordingAdapter {
+                inner,
+                reads: reads.clone(),
+                commits: commits.clone(),
+            }),
+        );
+
+        let append = |line: &str| {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&input)
+                .unwrap();
+            f.write_all(line.as_bytes()).unwrap();
+        };
+        assert!(engine
+            .run_source(SourceType::File, false)
+            .await
+            .unwrap()
+            .is_empty());
+        append(lines[1]);
+        assert!(engine
+            .run_source(SourceType::File, false)
+            .await
+            .unwrap()
+            .is_empty());
+        append(lines[2]);
+        let done = engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(done.len(), 1, "three reads, one window: {done:?}");
+        assert!(done[0].committed, "{done:?}");
+        assert_eq!(done[0].record_count, 3);
+
+        let total: u64 = lines.iter().map(|l| l.len() as u64).sum();
+        let last_read_start = (lines[0].len() + lines[1].len()) as u64;
+        let reads = reads.lock().unwrap().clone();
+        assert_eq!(reads.len(), 3, "the window was built from three reads");
+
+        let rows = engine.store.list_batches().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        let bytes = engine
+            .backend
+            .get_object(row.manifest_uri.as_deref().unwrap())
+            .await
+            .unwrap();
+        let manifest: VtopManifest = serde_json::from_slice(&bytes).unwrap();
+        manifest.verify_self_hash().unwrap();
+        let ProgressMarker::File {
+            start_byte,
+            end_byte,
+            ..
+        } = &manifest.source_progress
+        else {
+            panic!("a file manifest: {:?}", manifest.source_progress);
+        };
+        assert_eq!(
+            (*start_byte, *end_byte),
+            (0, total),
+            "the manifest names the bytes its object holds, from the first read's \
+             start to the last read's end (the last read alone is {last_read_start}..{total})"
+        );
+        let token = format!("-b0-{total}-");
+        assert!(
+            row.batch_id.contains(&token) && manifest.batch_id == row.batch_id,
+            "the batch id carries the manifest's range {token}: {}",
+            row.batch_id
+        );
+        assert!(
+            row.object_uri.as_deref().unwrap().contains(&row.batch_id),
+            "and so does the object key"
+        );
+
+        // The ledger and the adapter keep the last read's marker, exactly as
+        // the adapter issued it: that is what the file adapter settles a
+        // commit by.
+        let ProgressMarker::File {
+            start_byte: ledger_start,
+            ..
+        } = &row.progress_start
+        else {
+            panic!("file markers");
+        };
+        assert_eq!(*ledger_start, 0, "the ledger's start is the first read's");
+        assert_eq!(
+            row.progress_end, reads[2],
+            "the ledger's end is the last read's marker, unchanged"
+        );
+        assert_eq!(
+            *commits.lock().unwrap(),
+            vec![reads[2].clone()],
+            "the adapter is handed the last read's marker, not the manifest's range"
+        );
+    }
+
+    /// One read of `src` through `adapter`, which yields exactly one unit.
+    async fn read_one(adapter: &mut FileSource, src: &DiscoveredSource) -> ReadResult {
+        let mut reads = adapter
+            .read_batch_candidates(src, 10_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(reads.len(), 1);
+        reads.remove(0)
+    }
+
+    /// #622, the other half: the marker a multi-read window commits is the
+    /// last read's own, so the file adapter finds that read on record and
+    /// settles the commit in process. Were it handed the manifest's range
+    /// (first start..last end), no read would match, the commit would be taken
+    /// for one recovered after a restart, and the read head - already past the
+    /// window, on the next one's bytes - would be pulled back to the window's
+    /// end and those bytes read again.
+    #[tokio::test]
+    async fn the_marker_a_window_commits_is_settled_by_the_file_adapter_in_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        let path = input.to_string_lossy().into_owned();
+        let append = |line: &str| {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&input)
+                .unwrap();
+            f.write_all(line.as_bytes()).unwrap();
+        };
+        let src = DiscoveredSource {
+            source_type: SourceType::File,
+            source_name: path.clone(),
+            format: vtop_core::types::TelemetryFormat::Raw,
+        };
+        let mut adapter = FileSource::new(
+            vec![path.clone()],
+            vtop_core::types::TelemetryFormat::Raw,
+            false,
+        );
+        let mut buf = PendingBuffer::new("t", src.clone(), BatchLimits::default());
+        for line in ["a\n", "bb\n", "ccc\n"] {
+            append(line);
+            buf.append(read_one(&mut adapter, &src).await);
+        }
+        let window = buf.drain().unwrap();
+        let byte_range = |m: &ProgressMarker| match m {
+            ProgressMarker::File {
+                start_byte,
+                end_byte,
+                ..
+            } => (*start_byte, *end_byte),
+            other => panic!("a file marker: {other:?}"),
+        };
+        assert_eq!(byte_range(&window_marker(&window)), (0, 9));
+        assert_eq!(byte_range(&window.progress_end), (5, 9));
+
+        // The next window has started reading before this one commits.
+        append("dddd\n");
+        let ahead = read_one(&mut adapter, &src).await;
+        assert_eq!(byte_range(&ahead.progress_end), (9, 14));
+
+        adapter.commit_progress(&window.progress_end).await.unwrap();
+
+        append("eeeee\n");
+        let after = read_one(&mut adapter, &src).await;
+        assert_eq!(
+            byte_range(&after.progress_end),
+            (14, 20),
+            "the commit settled in process: the read head stayed past the window \
+             and nothing was read twice"
+        );
+    }
+
+    /// #622 for Kafka: a window of three reads of one partition, each marker
+    /// shaped as the Kafka adapter builds it (an end marker carries its own
+    /// read's start). The manifest and batch id span the first read's first
+    /// offset to the last read's last; the commit marker stays the last
+    /// read's.
+    #[test]
+    fn a_kafka_window_of_several_reads_names_its_first_to_last_offset() {
+        let source = DiscoveredSource {
+            source_type: SourceType::Kafka,
+            source_name: "t".into(),
+            format: vtop_core::types::TelemetryFormat::Raw,
+        };
+        let mut buf = PendingBuffer::new("default", source, BatchLimits::default());
+        let mk = |start: i64, end: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition: 3,
+            start_offset: start,
+            end_offset: end,
+            consumer_group: "g".into(),
+        };
+        for (start, end) in [(100, 149), (150, 199), (200, 249)] {
+            buf.append(ReadResult {
+                records: vec![b"r".to_vec()],
+                progress_start: mk(start, start),
+                progress_end: mk(start, end),
+                first_timestamp: None,
+                last_timestamp: None,
+                verbatim: false,
+            });
+        }
+        let drained = buf.drain().unwrap();
+        let window = window_marker(&drained);
+        assert_eq!(
+            window,
+            mk(100, 249),
+            "first read's start to last read's end"
+        );
+        assert_eq!(
+            drained.progress_end,
+            mk(200, 249),
+            "the commit marker is the last read's, unchanged"
+        );
+        let id = vtop_core::batch::build_batch_id("t", &window);
+        assert!(id.contains("-p3-100-249-"), "{id}");
     }
 
     /// #558: the engine restarts after the file was rotated while it was down.
