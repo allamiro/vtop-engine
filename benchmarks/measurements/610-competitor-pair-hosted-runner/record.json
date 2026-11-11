@@ -1,0 +1,23 @@
+{
+ "issue": 610,
+ "status": "refused: no competitor-goodput number was produced. All six halves (three uncapped, three capped) were refused by the runner (exit 2) at the same check, so this directory records an attempt, not a measurement. The with-cap and without-cap pair from #481's Lima VM (benchmarks/measurements/481-egress-ceiling/competitor_pair.json) is still the only measured pair.",
+ "source": {
+  "workflow": ".github/workflows/competitor-pair.yml",
+  "workflow_run": "https://github.com/allamiro/vtop-engine/actions/runs/42940266095",
+  "workflow_commit": "7ed0d44dab9c6ef3f96f31aca8ad15d8ed15b702",
+  "tested_merge_commit": "a68a8ff4ff50370c2014d2ca4142d1e12b102096 (the pull request's merge commit, against feat/481-egress-ceiling as it then stood)",
+  "later_workflow_commit": "6a37be7 only adds a check that the repetitions input is a positive integer and a check that minio-init provisioned the buckets. Neither changes what is measured.",
+  "artifact": "competitor-pair-42940266095-1 (30-day retention). It holds each run's raw CSVs (about 45 MB). They are not committed here, because a refused run's CSVs describe no measured window. The runner's logs, runs.tsv and environment.json are committed."
+ },
+ "date_utc": "2026-11-11",
+ "conditions": "scenarios 22 (uncapped) and 23 (upload_max_egress_bytes_per_second 262144), unchanged from main 7472b64: netem 10000 kbit/s tbf bottleneck at 1.0 BDP, 100 ms round trip, no jitter, no loss; competitor bulk:120 (iperf 3.21) alone / beside VTOP / alone again; per-cycle engine, about 8 MB of uncompressed JSONL per cycle in 1 MiB batches, 8 in flight; s3_native to the lab MinIO through the middlebox; runner_mode container. Three pairs in order 22 23 / 23 22 / 22 23.",
+ "host": "GitHub-hosted runner, image ubuntu26 20261101.186.1 (Ubuntu 26.04.1 LTS), kernel 7.0.0-1019-azure, Hyper-V guest (systemd-detect-virt: microsoft), 4 vCPU AMD EPYC 9V74, 16 GiB. Docker 29.4.2, compose 5.1.3. Full record in environment.json.",
+ "noise": "A shared CI runner is a noisy host. Other tenants share the physical machine and nothing in the job can see them. A number from it would be a comparison between the two halves of one job, not an absolute, and it would have to be read with that spread. None was produced this time.",
+ "ifb": "Available from the runner image's stock modules: modprobe ifb sch_netem sch_tbf sch_ingress cls_u32 act_mirred succeeded on the first try (linux-modules-extra was not needed). An ifb device was created and brought up inside a fresh network namespace, and the middlebox then shaped every run: emulator calibration read 9.571-9.575 Mbit/s against the configured 10.0, and every solo window before VTOP read 9.564 Mbit/s over 120.166-120.169 s.",
+ "refusal": {
+  "check": "benchmarks/lib/competitor.py competitor_bytes_over(): the competing flow's per-interval stream must cover the receiver's whole measured window, or the receiver's total cannot be spread across the span VTOP is measured over.",
+  "observed": "In every contended window the stream was missing the window's first 0.100-0.169 s (refused_runs.json, contended_stream_hole_seconds). In each run the hole equals the receiver's measured window minus 120 s, to within 1 ms (measured windows 120.100-120.169 s). So the stream covered exactly the 120.000 s requested, and the receiver's sum_received.seconds was 0.10-0.17 s longer.",
+  "not_yet_explained": "Why the same iperf3 build (netshoot v0.16, iperf 3.21, the same image digest as the Lima runs) gave a stream on #481's Lima VM (Ubuntu 24.04, kernel 6.8) that covered the receiver's window: those runs passed this check with contended windows of 120.142 s (capped) and 120.105 s (uncapped), each with 120 measured intervals. The runner keeps no copy of iperf3's raw report on a refusal, so this artifact cannot show where the two streams differ: a short final interval, the first post-ramp interval's length, or the receiver's clock. Explaining it needs the raw --json-stream report from a refused window, which is a harness change and not part of this record.",
+  "why_not_filled_in": "The check is the harness's own guard against overstating fairness, so it is not weakened to get a number. A hole at the window's start leaves those bytes out of the proportion, and the competitor's share of VTOP's span would be overstated by about the hole's share of the window, roughly 0.1%. That is small, but the check exists precisely so that such a gap is refused rather than estimated."
+ }
+}

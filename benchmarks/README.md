@@ -891,6 +891,18 @@ kernel. The runner must then run on that VM's kernel too, for example in a
 container with the docker socket mounted, or the competitor's stamps are read
 against another kernel's clock.
 
+A GitHub-hosted runner also has `ifb` (#610). `.github/workflows/competitor-pair.yml`
+runs scenarios 22 and 23 there. It is dispatched by hand and takes about an hour,
+so it is not part of the default CI path. The runner is a shared, noisy host, so
+any pair it produces is a comparison between the two halves of one job, not an
+absolute. Its first attempt is recorded in
+[`measurements/610-competitor-pair-hosted-runner/`](measurements/610-competitor-pair-hosted-runner/).
+It produced no number: ubuntu26 image, kernel 7.0.0-1019-azure, ifb from the
+stock modules, calibration 9.571–9.575 Mbit/s. All six contended windows were
+refused because the competitor's stream was missing the window's first
+0.100–0.169 s. That is the receiver's window minus the 120 s requested, a
+difference the Lima runs did not show. The cause is not yet explained (`record.json`).
+
 **Recorded** in [`measurements/481-egress-ceiling/`](measurements/481-egress-ceiling/)
 (local `results/` are never committed, so that directory is the record:
 `environment.json` names the machine, the binary and the noise).
