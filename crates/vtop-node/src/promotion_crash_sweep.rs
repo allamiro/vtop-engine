@@ -1078,9 +1078,13 @@ impl Cluster {
     }
 
     /// An orderly reopen of `node`'s directory: commit, drop, open.
-    fn role_flip(&mut self, node: usize) {
+    /// True when the node came out of the flip still holding the role: the
+    /// same process reopened its directory. A death or crash during the flip
+    /// restarts it as a follower, and leadership then needs a new election
+    /// (#646 review).
+    fn role_flip(&mut self, node: usize) -> bool {
         let Some(replica) = self.up(node) else {
-            return;
+            return false;
         };
         self.note(format!(
             "{} reopens its directory for the role flip",
@@ -1092,13 +1096,20 @@ impl Cluster {
         // The step is counted while the process still holds its replica, so
         // a death scheduled here fires (#646 review: taken first, the
         // replica was already gone and the kill was skipped). A death or a
-        // crash restarts the node from its directory, which is the flip.
+        // crash restarts the node from its directory as a follower: the
+        // process that won the election is gone, and with it the role.
         self.after_step(node);
-        if self.still_the_same(node, &replica) {
-            self.nodes[node].replica = None;
-            drop(replica);
-            self.restart(node);
+        if !self.still_the_same(node, &replica) {
+            self.note(format!(
+                "{} died during the role flip; its leadership died with it",
+                NAMES[node]
+            ));
+            return false;
         }
+        self.nodes[node].replica = None;
+        drop(replica);
+        self.restart(node);
+        self.nodes[node].replica.is_some()
     }
 
     /// Restart the nodes the scenario held down. True if there were any.
@@ -1169,7 +1180,9 @@ impl Cluster {
                     self.role_flip(deposed);
                 }
             }
-            self.role_flip(candidate);
+            if !self.role_flip(candidate) {
+                continue;
+            }
             let Some(leading) = self.up(candidate) else {
                 continue;
             };
