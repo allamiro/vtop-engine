@@ -111,6 +111,16 @@ pub struct Metrics {
     /// this counter, where unbounded detail belongs.
     pub retention_lost_records_total: IntCounterVec,
 
+    /// Ranges handed back for re-reading (a batch that did not reach
+    /// VERIFIED, or an incomplete row at recovery) that the source REFUSED to
+    /// rewind (#621) - for a file, because the file the range was read from
+    /// has left its path and no file proven to be it was found (removed, or
+    /// copied by `copytruncate`). Each is a range missing from the archive;
+    /// recovery counts it again at every restart while the row stays
+    /// incomplete. Labelled by source_type only, like
+    /// `source_read_errors_total`: the path is in the error line beside it.
+    pub source_replay_refused_total: IntCounterVec,
+
     /// Uploads the object store answered with a THROTTLE — HTTP 429 or 503,
     /// or an S3 `SlowDown`/`Throttling` code — after the backend's own
     /// retries were spent (#102). The batch fails and replays like any
@@ -205,6 +215,11 @@ impl Metrics {
             "Records source-side retention removed before the engine read them; any increase is data loss upstream of the archive (see logs for topic/partition)",
             vec!["tenant", "source_type"],
         )?;
+        let source_replay_refused_total = cv(
+            "source_replay_refused_total",
+            "Failed ranges the source could not hand back for re-reading (for a file: it left its path and no file proven to be it was found); each is a range missing from the archive (see logs for the path)",
+            vec!["tenant", "source_type"],
+        )?;
 
         // Buckets span 1ms..~30s: compression is sub-millisecond on small
         // batches while an upload to a slow backend can take seconds. Default
@@ -277,6 +292,7 @@ impl Metrics {
             upload_width,
             source_read_errors_total,
             retention_lost_records_total,
+            source_replay_refused_total,
             upload_throttled_total,
         })
     }

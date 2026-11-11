@@ -169,6 +169,25 @@ fn map_sqlx(e: sqlx::Error) -> VtopError {
     VtopError::State(e.to_string())
 }
 
+/// A `(path, inode, end_byte, file_size, content)` row of a cursor query. The
+/// inode is read as the JSON token and parsed here: `json_extract` turns a u64
+/// above i64::MAX into a lossy REAL, and an unparseable value must read as
+/// "unknown", not as a wrong identity.
+fn committed_cursor_of(r: &sqlx::sqlite::SqliteRow) -> Option<CommittedCursor> {
+    let path: Option<String> = r.get("path");
+    let inode: Option<String> = r.get("inode");
+    let end: Option<i64> = r.get("end_byte");
+    let size: Option<i64> = r.get("file_size");
+    let content: Option<String> = r.get("content");
+    Some(CommittedCursor {
+        path: path?,
+        inode: inode.and_then(|i| i.parse().ok()),
+        end_byte: end?.max(0) as u64,
+        observed_size: size.map(|s| s.max(0) as u64),
+        content_fingerprint: content.as_deref().and_then(parse_content_fingerprint),
+    })
+}
+
 impl SqliteStateStore {
     /// Open (creating if needed) a state store from a connection string such as
     /// `sqlite:///data/vtop-state.db` or `sqlite::memory:`.
@@ -562,23 +581,40 @@ impl StateStore for SqliteStateStore {
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                let path: Option<String> = r.get("path");
-                let inode: Option<String> = r.get("inode");
-                let end: Option<i64> = r.get("end_byte");
-                let size: Option<i64> = r.get("file_size");
-                let content: Option<String> = r.get("content");
-                Some(CommittedCursor {
-                    path: path?,
-                    inode: inode.and_then(|i| i.parse().ok()),
-                    end_byte: end?.max(0) as u64,
-                    observed_size: size.map(|s| s.max(0) as u64),
-                    content_fingerprint: content.as_deref().and_then(parse_content_fingerprint),
-                })
-            })
-            .collect())
+        Ok(rows.iter().filter_map(committed_cursor_of).collect())
+    }
+
+    async fn committed_cursors_at(
+        &self,
+        source_type: SourceType,
+        path: &str,
+    ) -> Result<Vec<CommittedCursor>, VtopError> {
+        // `committed_cursors`, for one path, partitioned by FILE (inode)
+        // instead of by path (#621): the newest committed row of each file
+        // that has lived there.
+        let rows = sqlx::query(
+            "WITH committed AS ( \
+                 SELECT json_extract(progress_end_json, '$.path') AS path, \
+                        CAST(progress_end_json -> '$.inode' AS TEXT) AS inode, \
+                        CAST(json_extract(progress_end_json, '$.end_byte') AS INTEGER) AS end_byte, \
+                        CAST(json_extract(progress_end_json, '$.file_size') AS INTEGER) AS file_size, \
+                        CAST(progress_end_json -> '$.content_fingerprint' AS TEXT) AS content, \
+                        created_at, batch_id \
+                 FROM batches WHERE state = ? AND source_type = ? \
+             ), latest AS ( \
+                 SELECT path, inode, end_byte, file_size, content, ROW_NUMBER() OVER ( \
+                            PARTITION BY inode ORDER BY created_at DESC, batch_id DESC) AS rn \
+                 FROM committed WHERE path = ? \
+             ) \
+             SELECT path, inode, end_byte, file_size, content FROM latest WHERE rn = 1",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(source_type.as_str())
+        .bind(path)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows.iter().filter_map(committed_cursor_of).collect())
     }
 
     async fn list_incomplete_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {

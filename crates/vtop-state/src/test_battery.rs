@@ -79,6 +79,7 @@ pub async fn run_all(store: &dyn StateStore) {
     committed_cursors_carry_the_newest_rows_content_fingerprint(store).await;
     committed_kafka_offsets_are_the_newest_row_of_each_partition_and_group(store).await;
     claims_respect_live_leases_and_take_over_expired_ones(store).await;
+    committed_cursors_at_answer_each_file_that_lived_at_a_path(store).await;
 }
 
 /// #557: the claim fence. Two handles onto ONE ledger stand for two engines
@@ -593,6 +594,78 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
         (got.observed_size, got.content_fingerprint.clone()),
         (Some(51), old)
     );
+}
+
+/// #621: a range re-read from a rotated file must start above what a later
+/// batch already archived of THAT file, which the per-path cursor cannot say
+/// once another file has taken the path. `committed_cursors_at` answers, for
+/// one path, with the newest committed batch of each inode - the newest, not
+/// the furthest, exactly as the per-path cursor (a `copytruncate` keeps the
+/// inode) - and nothing uncommitted, nothing of another path.
+async fn committed_cursors_at_answer_each_file_that_lived_at_a_path(store: &dyn StateStore) {
+    let marker = |path: &str, inode: Option<u64>, end: u64| ProgressMarker::File {
+        path: path.into(),
+        inode,
+        start_byte: 0,
+        end_byte: end,
+        file_size: end * 10,
+        mtime: String::new(),
+        content_fingerprint: None,
+    };
+    let p = BatchPatch::default();
+    for (id, path, inode, end, commit) in [
+        ("at-1", "/at.log", Some(11), 400, true),
+        ("at-2", "/at.log", Some(11), 900, true),
+        ("at-3", "/at.log", Some(22), 20, true),
+        ("at-4", "/at.log", Some(22), 60, true),
+        ("at-5", "/at.log", Some(22), 5_000, false),
+        ("at-6", "/at.log", Some(33), 70, true),
+        ("at-7", "/at.log", Some(33), 30, true),
+        ("at-8", "/at.log", None, 15, true),
+        ("at-9", "/elsewhere.log", Some(11), 7, true),
+    ] {
+        let mut r = sample_record(id);
+        r.source_type = SourceType::File;
+        r.source_name = path.to_string();
+        r.progress_start = marker(path, inode, 0);
+        r.progress_end = marker(path, inode, end);
+        store.save_batch_state(&r).await.unwrap();
+        if commit {
+            for st in LEGAL_WALK {
+                store.update_batch_state(id, st, &p).await.unwrap();
+            }
+        }
+        // Created strictly in this order: "newest" is by creation.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let mut got = store
+        .committed_cursors_at(SourceType::File, "/at.log")
+        .await
+        .unwrap();
+    got.sort_by_key(|c| c.inode);
+    let want = |inode: Option<u64>, end_byte: u64| CommittedCursor {
+        path: "/at.log".into(),
+        inode,
+        end_byte,
+        observed_size: Some(end_byte * 10),
+        content_fingerprint: None,
+    };
+    assert_eq!(
+        got,
+        vec![
+            want(None, 15),
+            want(Some(11), 900),
+            // The uncommitted 5000 does not count.
+            want(Some(22), 60),
+            // The newest row, not the furthest: a copytruncate keeps the inode.
+            want(Some(33), 30),
+        ]
+    );
+    assert!(store
+        .committed_cursors_at(SourceType::SyslogSpool, "/at.log")
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 /// #558: a restart seeds each file's cursor from the ledger. The ledger's

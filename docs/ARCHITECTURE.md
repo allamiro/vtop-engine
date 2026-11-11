@@ -328,7 +328,9 @@ What follows from that, in the engine:
   range's start, or (file sources, whose markers record the length at read
   time) when it is shorter than it was when the range was read. A spool marker
   without an inode keeps the older size-only check, and a spool truncated and
-  regrown past the range's start cannot be told from the original. How the
+  regrown past the range's start cannot be told from the original. A file
+  source then looks for the file the range WAS read from, and re-reads the
+  range from it when it can prove it is that file (#621, below). How the
   engine reports a refused rewind is described in section 13.
 - **Commits are applied in the order the windows were read**, not the order
   their uploads finish. A rotation seals the old file's window and starts a new
@@ -372,7 +374,9 @@ Limits, stated plainly:
   If the rotated name (`app.log.1`) also matches a configured pattern it is
   discovered as its own source, with a fresh cursor, and is archived again from
   byte 0 — a duplicate, never a hole. Archiving the unread tail without the
-  duplicate would need cursors keyed by inode rather than path.
+  duplicate would need cursors keyed by inode rather than path. (A failed
+  range re-read from the rotated file, below, reads on to its end, as a rewind
+  of a file still at its path does: in that case the tail is archived.)
 - `copytruncate` is racy by nature: lines written between the copy and the
   truncate are lost by the rotation tool before the engine can see them. If the
   file also regrows beyond the old read position before the next read, the
@@ -404,6 +408,89 @@ Tracked as #361, which also carries the question of whether the adapter should
 refuse rather than resume when it detects the jump — a refusal is only useful
 if an operator can act on it, and a source that stops archiving because it fell
 behind may be worse than one that archives what remains.
+
+#### A failed range from a file rotated away since it was read (#621)
+
+A batch that fails hands its range back to the source, and the file adapter
+re-reads it from the path. When the file has been rotated in the meantime -
+`app.log` renamed to `app.log.1`, a new `app.log` created - the file at the
+path is not the range's, and the rewind used to be refused: an ERROR, the row
+left FAILED, refused again at every restart, and the range never archived
+unless the rotated name happened to match a source pattern. Worse, a rewind
+that was *accepted* while the file was still at its path, followed by a
+rotation before the re-read, restarted the cursor on the new file and never
+re-read the range at all, with no error.
+
+The adapter (`crates/vtop-adapters/src/rotated.rs`) now reaches the file the
+range was read from, in this order:
+
+1. **A held descriptor.** While a range read from a file is not committed, the
+   adapter keeps a descriptor open on that file. A rotation by rename moves the
+   descriptor to a list of rotated files instead of closing it, and a rename or
+   an unlink does not affect what an open descriptor reads, so this works even
+   when logrotate has already compressed and removed `app.log.1`. It does not
+   survive a restart. A rewind accepted before the rotation is honoured the
+   same way: the rewound range is re-read through the descriptor before the
+   new file is read.
+2. **The rotated-to path.** Across a restart there is no descriptor, so
+   recovery's rewind looks for the file among the entries of the path's own
+   directory and the files the source's patterns match, on the same
+   filesystem, by inode.
+
+Either way nothing is read from a file until it is **proven** to be the one
+the range was read from: the inode the marker recorded, the first page its
+fingerprint covers (#578), and no shorter than when the range was read. The
+descriptor is proven again before every re-read. A marker without an inode or
+a fingerprint proves nothing and is refused as before.
+
+The re-read starts at the range's start and reads on to the end of the rotated
+file, as a rewind of a file still at its path reads on to the path's end. Its
+markers carry the source path and the rotated file's inode, so its commit never
+moves the cursor of the file now at the path, and `delete_after_commit` (which
+judges the file at the path) never deletes the new file or the rotated one. A
+re-read in progress keeps its path a source even if nothing is at the path
+yet. A FAILED row stays in the ledger and is rewound again at every restart, so
+recovery asks the ledger for the newest committed batch of each file that has
+lived at that path (`StateStore::committed_cursors_at`) and starts the re-read
+above what is already archived of the rotated file - counting only a row whose
+fingerprint the rotated file's first bytes match. Without that, a range
+re-read once was archived again at every restart while the rotated file
+existed.
+
+A rewind that still cannot be honoured stays loud: an ERROR naming the path,
+and `vtop_source_replay_refused_total{tenant,source_type}` counts it, so it
+can be alerted on.
+
+Limits:
+
+- **`copytruncate` is not handled.** The copy has a new inode, and a matching
+  fingerprint and length are not proof of identity, so a range read before a
+  `copytruncate` is refused (and counted) unless the copy also matches a
+  configured pattern and is archived as its own source.
+- **A rotated file that is gone** - compressed (`app.log.1.gz` holds other
+  bytes, so it never matches) or removed - can be re-read only through a held
+  descriptor, so only within the process that read it. After a restart its
+  ranges are refused and counted.
+- **The descriptors are bounded.** At most 128 in all (`MAX_HELD_FILES`); past
+  that a file is not held, and a failed range falls back to the search. A
+  descriptor on a rotated file with no re-read in progress is closed one hour
+  after it was last used (`HOLD_FOR`) - it keeps a removed file's disk space
+  allocated until it is closed. A descriptor being re-read through is kept
+  while that re-read is in progress, and is never closed to make room. The
+  search looks at no more than 10,000 entries of the directory.
+- **Identity is the inode and the first page**, with the same blind spots as
+  every other check in this section (above). The tail fingerprint of #620 is
+  meant to join the proof (`rotated::proves`) when it lands.
+- **The restart seed can name the rotated file.** A re-read batch is created
+  after the current file's batches, so it can become the path's newest
+  committed row; if the current file gets no new data before the next
+  restart, that restart seeds the cursor from the rotated file and reads the
+  current one from byte 0 again - a one-time duplicate, bounded by the current
+  file, never a skip. Likewise, if pruning removes the re-read's rows while the
+  rotated file still exists, the next restart re-reads it.
+- Without inodes (non-Unix platforms) nothing can be proven, and the rewind is
+  refused as before. Syslog-spool sources are unchanged: a spool rotated away
+  is still refused.
 
 #### Ledger format note: content fingerprints (#578)
 
@@ -565,7 +652,7 @@ On startup, the `replay` module inspects `vtop-state` and maps each incomplete b
 4. A state/storage mismatch (e.g., an object present but unverified) is resolved by re-verifying or re-uploading **before** any commit.
 5. **The same rule holds while the engine is running.** Adapters advance their read position when they *read*, not when a batch commits, so a batch that fails (or errors before `VERIFIED`) is handed back to its source at the end of the cycle that failed it, not at the next restart. Otherwise the next cycle reads on from the end of the failed range and the first later range to verify commits past it, leaving those bytes unarchived (#552). A cycle in which a batch failed waits before reading again — the idle interval, doubling per consecutive failing cycle up to a minute, plus jitter — because the failed range is now read again and a tight loop would hammer a store that is down.
 
-   Limits, stated rather than implied: a ledger written by a build *before* this change can already contain a committed range above a failed one. Replay does not repair that for file and spool sources — their rewind is clamped to the committed point so a superseded failed row cannot re-archive committed data on every restart — and the ledger cannot say whether the older range was later covered, because committed history may be pruned. Finding such holes is the job of an archive coverage audit (#560), not of recovery. A spool whose identity changed since the batch was read cannot be rewound; that is reported as an error and the range is not re-read — but only for a marker that recorded an inode: a legacy marker without one keeps the old size-only check and can rewind a replacement. The file adapter checks identity on replay the same way: a range whose file now has another inode (rotation, #558), is shorter than when the range was read, or keeps the inode but has different first bytes (a same-inode replacement, #578) is refused rather than re-read. The inode and content checks apply only to a marker that recorded them; a legacy marker keeps the size-only check.
+   Limits, stated rather than implied: a ledger written by a build *before* this change can already contain a committed range above a failed one. Replay does not repair that for file and spool sources — their rewind is clamped to the committed point so a superseded failed row cannot re-archive committed data on every restart — and the ledger cannot say whether the older range was later covered, because committed history may be pruned. Finding such holes is the job of an archive coverage audit (#560), not of recovery. A spool whose identity changed since the batch was read cannot be rewound; that is reported as an error and the range is not re-read — but only for a marker that recorded an inode: a legacy marker without one keeps the old size-only check and can rewind a replacement. The file adapter checks identity on replay the same way: a range whose file now has another inode (rotation, #558), is shorter than when the range was read, or keeps the inode but has different first bytes (a same-inode replacement, #578) is refused rather than re-read - unless the file it was read from can still be reached and is proven to be that file, in which case the range is re-read from it (section 7.2, #621): through a descriptor the adapter kept on it in the same process, or, after a restart, at the name it was renamed to. A range read before a `copytruncate` is still refused - the copy has a new inode, so it cannot be proven to be the file - as is one whose rotated file was compressed or removed before a restart. The inode and content checks apply only to a marker that recorded them; a legacy marker keeps the size-only check. Every refused rewind, in a cycle or in recovery, is counted in `vtop_source_replay_refused_total{tenant,source_type}` as well as logged.
 
 This guarantees: no source progress marker is committed unless its object and manifest are durably stored and verified, and no committed marker is double-committed. Source progress is **never** advanced for unverified data.
 

@@ -214,6 +214,23 @@ pub trait StateStore: Send + Sync {
     /// any prune.
     async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError>;
 
+    /// The newest committed batch of EACH FILE (inode) that has lived at
+    /// `path`, computed in the store like [`StateStore::committed_cursors`].
+    ///
+    /// Recovery asks this only for a path with a range being re-read from a
+    /// file rotated away from it (#621): a FAILED row stays in the ledger and
+    /// is rewound again at every restart, so the re-read must start above what
+    /// a later batch already archived of that file. A legacy row (no inode)
+    /// answers as its own file, `inode: None`.
+    ///
+    /// History pruning keeps one row per path, so older files' rows can be
+    /// gone; the caller then re-reads, which costs a duplicate, never a skip.
+    async fn committed_cursors_at(
+        &self,
+        source_type: SourceType,
+        path: &str,
+    ) -> Result<Vec<CommittedCursor>, VtopError>;
+
     /// All batches, newest first.
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError>;
 

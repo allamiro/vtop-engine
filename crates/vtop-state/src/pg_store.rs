@@ -92,6 +92,25 @@ fn map_sqlx(e: sqlx::Error) -> VtopError {
     VtopError::State(redact_postgres_urls(&e.to_string()))
 }
 
+/// A `(path, inode, end_byte, file_size, content)` row of a cursor query. The
+/// inode is read as text and parsed here so a u64 above i64::MAX stays exact.
+fn committed_cursor_of(r: &sqlx::postgres::PgRow) -> Option<CommittedCursor> {
+    let path: Option<String> = r.get("path");
+    let inode: Option<String> = r.get("inode");
+    let end: Option<i64> = r.get("end_byte");
+    let size: Option<i64> = r.get("file_size");
+    let content: Option<String> = r.get("content");
+    Some(CommittedCursor {
+        path: path?,
+        inode: inode.and_then(|i| i.parse().ok()),
+        end_byte: end?.max(0) as u64,
+        observed_size: size.map(|s| s.max(0) as u64),
+        content_fingerprint: content
+            .as_deref()
+            .and_then(crate::models::parse_content_fingerprint),
+    })
+}
+
 /// Remove complete PostgreSQL URLs from any error before it can reach logs or
 /// CLI output. `connect_with(PgConnectOptions)` means sqlx normally has no URL
 /// string to print, but this is a defense-in-depth boundary for future errors.
@@ -549,25 +568,39 @@ impl StateStore for PgStateStore {
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                let path: Option<String> = r.get("path");
-                let inode: Option<String> = r.get("inode");
-                let end: Option<i64> = r.get("end_byte");
-                let size: Option<i64> = r.get("file_size");
-                let content: Option<String> = r.get("content");
-                Some(CommittedCursor {
-                    path: path?,
-                    inode: inode.and_then(|i| i.parse().ok()),
-                    end_byte: end?.max(0) as u64,
-                    observed_size: size.map(|s| s.max(0) as u64),
-                    content_fingerprint: content
-                        .as_deref()
-                        .and_then(crate::models::parse_content_fingerprint),
-                })
-            })
-            .collect())
+        Ok(rows.iter().filter_map(committed_cursor_of).collect())
+    }
+
+    async fn committed_cursors_at(
+        &self,
+        source_type: SourceType,
+        path: &str,
+    ) -> Result<Vec<CommittedCursor>, VtopError> {
+        // See the SQLite implementation (#621): `committed_cursors` for one
+        // path, partitioned by inode instead of by path.
+        let rows = sqlx::query(
+            "WITH committed AS ( \
+                 SELECT progress_end_json::jsonb ->> 'path' AS path, \
+                        progress_end_json::jsonb ->> 'inode' AS inode, \
+                        (progress_end_json::jsonb ->> 'end_byte')::bigint AS end_byte, \
+                        (progress_end_json::jsonb ->> 'file_size')::bigint AS file_size, \
+                        progress_end_json::jsonb ->> 'content_fingerprint' AS content, \
+                        created_at, batch_id \
+                 FROM batches WHERE state = $1 AND source_type = $2 \
+             ), latest AS ( \
+                 SELECT path, inode, end_byte, file_size, content, ROW_NUMBER() OVER ( \
+                            PARTITION BY inode ORDER BY created_at DESC, batch_id DESC) AS rn \
+                 FROM committed WHERE path = $3 \
+             ) \
+             SELECT path, inode, end_byte, file_size, content FROM latest WHERE rn = 1",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(source_type.as_str())
+        .bind(path)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows.iter().filter_map(committed_cursor_of).collect())
     }
 
     async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
