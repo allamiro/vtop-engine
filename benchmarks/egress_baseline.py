@@ -710,7 +710,7 @@ def svg_small_multiples(points: list[dict], profiles: tuple[str, ...], value: st
     """Line small multiples: x = max_concurrency (log2-spaced), one line per
     parts_in_flight, one panel per profile, one shared y scale. Deterministic:
     no ids, no timestamps, fixed float formatting."""
-    pw, ph, ml, mr, mt, mb, gap = 300, 220, 56, 16, 64, 58, 24
+    pw, ph, ml, mr, mt, mb, gap = 300, 220, 56, 16, 84, 58, 24
     width = ml + len(profiles) * pw + (len(profiles) - 1) * gap + mr
     height = mt + ph + mb + 34
     xs = list(GRID_CONCURRENCY)

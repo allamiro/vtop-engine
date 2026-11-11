@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1020" height="396" viewBox="0 0 1020 396" role="img" aria-label="object_upload p95, 20 MiB objects">
+<style>.bg{fill:#fcfcfb}.t1{fill:#0b0b0b}.t2{fill:#52514e}.grid{stroke:#e4e3df}.axis{stroke:#9b9a95}.ref{stroke:#52514e}.s0{stroke:#2a78d6}.f0{fill:#2a78d6}.s1{stroke:#eb6834}.f1{fill:#eb6834}.s2{stroke:#1baf7a}.f2{fill:#1baf7a}@media (prefers-color-scheme: dark){.bg{fill:#1a1a19}.t1{fill:#f0efec}.t2{fill:#c3c2b7}.grid{stroke:#3a3a37}.axis{stroke:#6f6e69}.ref{stroke:#c3c2b7}.s0{stroke:#3987e5}.f0{fill:#3987e5}.s1{stroke:#d95926}.f1{fill:#d95926}.s2{stroke:#199e70}.f2{fill:#199e70}}text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}</style>
+<rect class="bg" x="0" y="0" width="1020" height="396"/>
+<text class="t1" x="56" y="24" font-size="15" font-weight="600">object_upload p95, 20 MiB objects</text>
+<text class="t2" x="56" y="46" font-size="12">parts_in_flight:</text>
+<line class="s0" x1="156" y1="42" x2="174" y2="42" stroke-width="2"/><circle class="f0" cx="165" cy="42" r="4"/>
+<text class="t2" x="180" y="46" font-size="12">1</text>
+<line class="s1" x1="202" y1="42" x2="220" y2="42" stroke-width="2"/><circle class="f1" cx="211" cy="42" r="4"/>
+<text class="t2" x="226" y="46" font-size="12">2</text>
+<line class="s2" x1="248" y1="42" x2="266" y2="42" stroke-width="2"/><circle class="f2" cx="257" cy="42" r="4"/>
+<text class="t2" x="272" y="46" font-size="12">4</text>
+<text class="t1" x="56" y="78" font-size="12" font-weight="600">100 ms, 10 Mbit/s, 0% loss</text>
+<line class="grid" x1="56" y1="304.0" x2="356" y2="304.0" stroke-width="1"/>
+<text class="t2" x="50" y="308.0" font-size="11" text-anchor="end">0</text>
+<line class="grid" x1="56" y1="249.0" x2="356" y2="249.0" stroke-width="1"/>
+<text class="t2" x="50" y="253.0" font-size="11" text-anchor="end">100</text>
+<line class="grid" x1="56" y1="194.0" x2="356" y2="194.0" stroke-width="1"/>
+<text class="t2" x="50" y="198.0" font-size="11" text-anchor="end">200</text>
+<line class="grid" x1="56" y1="139.0" x2="356" y2="139.0" stroke-width="1"/>
+<text class="t2" x="50" y="143.0" font-size="11" text-anchor="end">300</text>
+<line class="grid" x1="56" y1="84.0" x2="356" y2="84.0" stroke-width="1"/>
+<text class="t2" x="50" y="88.0" font-size="11" text-anchor="end">400</text>
+<line class="axis" x1="56" y1="304" x2="356" y2="304" stroke-width="1"/>
+<text class="t2" x="70.0" y="320" font-size="11" text-anchor="middle">1</text>
+<text class="t2" x="138.0" y="320" font-size="11" text-anchor="middle">2</text>
+<text class="t2" x="206.0" y="320" font-size="11" text-anchor="middle">4</text>
+<text class="t2" x="274.0" y="320" font-size="11" text-anchor="middle">8</text>
+<text class="t2" x="342.0" y="320" font-size="11" text-anchor="middle">16</text>
+<polyline class="s0" points="70.0,293.3 138.0,283.1 206.0,264.6 274.0,225.7 342.0,146.6" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle class="f0" cx="70.0" cy="293.3" r="4"/>
+<circle class="f0" cx="138.0" cy="283.1" r="4"/>
+<circle class="f0" cx="206.0" cy="264.6" r="4"/>
+<circle class="f0" cx="274.0" cy="225.7" r="4"/>
+<circle class="f0" cx="342.0" cy="146.6" r="4"/>
+<polyline class="s1" points="70.0,292.3 138.0,284.2 206.0,264.6 274.0,224.8 342.0,147.0" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle class="f1" cx="70.0" cy="292.3" r="4"/>
+<circle class="f1" cx="138.0" cy="284.2" r="4"/>
+<circle class="f1" cx="206.0" cy="264.6" r="4"/>
+<circle class="f1" cx="274.0" cy="224.8" r="4"/>
+<circle class="f1" cx="342.0" cy="147.0" r="4"/>
+<polyline class="s2" points="70.0,293.1 138.0,283.6 206.0,264.4 274.0,224.6 342.0,141.9" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle class="f2" cx="70.0" cy="293.1" r="4"/>
+<circle class="f2" cx="138.0" cy="283.6" r="4"/>
+<circle class="f2" cx="206.0" cy="264.4" r="4"/>
+<circle class="f2" cx="274.0" cy="224.6" r="4"/>
+<circle class="f2" cx="342.0" cy="141.9" r="4"/>
+<text class="t1" x="380" y="78" font-size="12" font-weight="600">100 ms, 10 Mbit/s, 1% gemodel loss</text>
+<line class="grid" x1="380" y1="304.0" x2="680" y2="304.0" stroke-width="1"/>
+<line class="grid" x1="380" y1="249.0" x2="680" y2="249.0" stroke-width="1"/>
+<line class="grid" x1="380" y1="194.0" x2="680" y2="194.0" stroke-width="1"/>
+<line class="grid" x1="380" y1="139.0" x2="680" y2="139.0" stroke-width="1"/>
+<line class="grid" x1="380" y1="84.0" x2="680" y2="84.0" stroke-width="1"/>
+<line class="axis" x1="380" y1="304" x2="680" y2="304" stroke-width="1"/>
+<text class="t2" x="394.0" y="320" font-size="11" text-anchor="middle">1</text>
+<text class="t2" x="462.0" y="320" font-size="11" text-anchor="middle">2</text>
+<text class="t2" x="530.0" y="320" font-size="11" text-anchor="middle">4</text>
+<text class="t2" x="598.0" y="320" font-size="11" text-anchor="middle">8</text>
+<text class="t2" x="666.0" y="320" font-size="11" text-anchor="middle">16</text>
+<polyline class="s0" points="394.0,262.2 462.0,260.9 530.0,256.6 598.0,222.8 666.0,145.9" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle class="f0" cx="394.0" cy="262.2" r="4"/>
+<circle class="f0" cx="462.0" cy="260.9" r="4"/>
+<circle class="f0" cx="530.0" cy="256.6" r="4"/>
+<circle class="f0" cx="598.0" cy="222.8" r="4"/>
+<circle class="f0" cx="666.0" cy="145.9" r="4"/>
+<polyline class="s1" points="394.0,281.8 462.0,280.0 530.0,263.4 598.0,223.8 666.0,144.4" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle class="f1" cx="394.0" cy="281.8" r="4"/>
+<circle class="f1" cx="462.0" cy="280.0" r="4"/>
+<circle class="f1" cx="530.0" cy="263.4" r="4"/>
+<circle class="f1" cx="598.0" cy="223.8" r="4"/>
+<circle class="f1" cx="666.0" cy="144.4" r="4"/>
+<polyline class="s2" points="394.0,290.6 462.0,281.9 530.0,264.2 598.0,226.3 666.0,144.3" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle class="f2" cx="394.0" cy="290.6" r="4"/>
+<circle class="f2" cx="462.0" cy="281.9" r="4"/>
+<circle class="f2" cx="530.0" cy="264.2" r="4"/>
+<circle class="f2" cx="598.0" cy="226.3" r="4"/>
+<circle class="f2" cx="666.0" cy="144.3" r="4"/>
+<text class="t1" x="704" y="78" font-size="12" font-weight="600">100 ms, 10 Mbit/s policer, no queue</text>
+<line class="grid" x1="704" y1="304.0" x2="1004" y2="304.0" stroke-width="1"/>
+<line class="grid" x1="704" y1="249.0" x2="1004" y2="249.0" stroke-width="1"/>
+<line class="grid" x1="704" y1="194.0" x2="1004" y2="194.0" stroke-width="1"/>
+<line class="grid" x1="704" y1="139.0" x2="1004" y2="139.0" stroke-width="1"/>
+<line class="grid" x1="704" y1="84.0" x2="1004" y2="84.0" stroke-width="1"/>
+<line class="axis" x1="704" y1="304" x2="1004" y2="304" stroke-width="1"/>
+<text class="t2" x="718.0" y="320" font-size="11" text-anchor="middle">1</text>
+<text class="t2" x="786.0" y="320" font-size="11" text-anchor="middle">2</text>
+<text class="t2" x="854.0" y="320" font-size="11" text-anchor="middle">4</text>
+<text class="t2" x="922.0" y="320" font-size="11" text-anchor="middle">8</text>
+<text class="t2" x="990.0" y="320" font-size="11" text-anchor="middle">16</text>
+<polyline class="s0" points="718.0,113.7 990.0,84.0" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle class="f0" cx="718.0" cy="113.7" r="4"/>
+<circle class="f0" cx="990.0" cy="84.0" r="4"/>
+<polyline class="s1" points="854.0,84.0 990.0,84.0" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle class="f1" cx="854.0" cy="84.0" r="4"/>
+<circle class="f1" cx="990.0" cy="84.0" r="4"/>
+<text class="t2" x="530.0" y="344" font-size="12" text-anchor="middle">max_concurrency (objects in flight), median of the grid repetitions</text>
+<text class="t2" x="14" y="194.0" font-size="12" text-anchor="middle" transform="rotate(-90 14 194.0)">seconds</text>
+</svg>

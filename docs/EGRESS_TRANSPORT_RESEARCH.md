@@ -1,11 +1,16 @@
 # Egress transport research
 
+**Not demonstrated here: any result for a datagram transport (none exists in
+this tree), any number taken on a real wide-area link, and any absolute
+throughput. Every figure below compares configurations of this project's own
+TCP path, on an emulated link, inside virtual machines on one shared host.**
+
 The measurement record for the egress-transport milestone (#475): what each
 transport actually does on links that bite, recorded under conditions stated
 completely enough that every number can be re-taken. The lab this document
-reports from is built by the milestone's Phase 1 issues (#476–#478); until
-those land, the table below is a contract with no rows, and that is the
-honest state.
+reports from is built by the milestone's Phase 1 issues (#476–#478). The rows
+below are the tuned-TCP baseline (#483); the only transport measured is TCP,
+because it is the only one there is.
 
 This document is linted (`scripts/check-egress-claims.sh`, run in CI): a
 measurement row missing any required condition fails the build naming the
@@ -21,8 +26,76 @@ competitor state (whether a competing flow shared the link, and what kind);
 the transport under test; what actually limited throughput; and the date.
 A number without its conditions is not a measurement, it is a rumor.
 
-| Hardware | RTT | Loss rate | Loss model | Bottleneck rate | Buffer depth | Competitor state | Transport | Bottleneck | Date |
-|----------|-----|-----------|------------|-----------------|--------------|------------------|-----------|------------|------|
+The rows below are the tuned-TCP baseline sweep (#483). They are generated
+from `benchmarks/measurements/483-tcp-baseline/points.csv` by
+`benchmarks/egress_baseline.py report`, one row per link profile, configuration
+and phase (grid, confirmation, contended), with the repetitions folded into a
+median and range. The goodput is committed object bytes over the engine's
+busy time; "Of link reference" divides it by that run's iperf3 calibration on
+the 100 ms profiles and by the token rate on the policed one; the verify
+column is the read-back alone, kept apart from `object_upload`.
+
+| Hardware | RTT | Loss rate | Loss model | Bottleneck rate | Buffer depth | Competitor state | Transport | Bottleneck | Date | Configuration | Runs | Goodput, Mbit/s: median (min-max) | Of link reference | object_upload p95 | Verify mean | CPU-s per GiB | Competitor with / without VTOP, Mbit/s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 1, parts_in_flight 1, 5 MiB parts | 2 | 525.72 (518.72-532.72) | n/a | 0.3 s | 0.03 s | 7.9 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 1, parts_in_flight 2, 5 MiB parts | 2 | 1028.52 (781.36-1275.68) | n/a | 0.2 s | 0.02 s | 5.9 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 1, parts_in_flight 4, 5 MiB parts | 2 | 1095.85 (977.20-1214.50) | n/a | 0.1 s | 0.02 s | 6.5 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 2, parts_in_flight 1, 5 MiB parts | 2 | 1106.44 (708.83-1504.05) | n/a | 0.3 s | 0.05 s | 6.6 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 2, parts_in_flight 2, 5 MiB parts | 2 | 647.26 (634.90-659.63) | n/a | 0.3 s | 0.10 s | 8.8 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 2, parts_in_flight 4, 5 MiB parts | 2 | 1397.20 (1176.83-1617.57) | n/a | 0.1 s | 0.03 s | 6.8 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 4, parts_in_flight 1, 5 MiB parts | 2 | 1038.97 (884.10-1193.84) | n/a | 0.5 s | 0.11 s | 8.3 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 4, parts_in_flight 2, 5 MiB parts | 2 | 1100.46 (919.61-1281.31) | n/a | 0.4 s | 0.10 s | 7.4 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 4, parts_in_flight 4, 5 MiB parts | 2 | 1303.77 (1031.06-1576.48) | n/a | 0.3 s | 0.09 s | 7.4 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 8, parts_in_flight 1, 5 MiB parts | 2 | 1005.21 (978.17-1032.25) | n/a | 0.6 s | 0.23 s | 8.8 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 8, parts_in_flight 2, 5 MiB parts | 2 | 1614.78 (1512.95-1716.61) | n/a | 0.4 s | 0.12 s | 6.3 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 8, parts_in_flight 4, 5 MiB parts | 2 | 1215.73 (963.00-1468.47) | n/a | 0.7 s | 0.22 s | 7.2 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 16, parts_in_flight 1, 5 MiB parts | 2 | 1248.83 (1040.75-1456.91) | n/a | 0.9 s | 0.28 s | 7.9 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 16, parts_in_flight 2, 5 MiB parts | 2 | 1460.07 (1059.23-1860.90) | n/a | 1.1 s | 0.25 s | 7.2 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | max_concurrency 16, parts_in_flight 4, 5 MiB parts | 2 | 1795.86 (1574.17-2017.55) | n/a | 0.8 s | 0.16 s | 5.9 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | < 1 ms (no delay qdisc) | 0% | none | none (unshaped) | n/a (no qdisc) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | store I/O (no CPU saturated) | 2026-11-10 | default (8 in flight, 8 MiB parts, 4 parts in flight) | 2 | 875.69 (796.01-955.37) | n/a | 0.8 s | 0.35 s | 9.7 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-10 | max_concurrency 1, parts_in_flight 1, 5 MiB parts | 2 | 7.01 (7.00-7.02) | 0.733 | 19.4 s | 4.91 s | 9.4 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-11 | max_concurrency 1, parts_in_flight 2, 5 MiB parts | 2 | 6.64 (6.54-6.74) | 0.702 | 21.3 s | 4.99 s | 15.6 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-10 to 2026-11-11 | max_concurrency 1, parts_in_flight 4, 5 MiB parts | 2 | 6.89 (6.86-6.93) | 0.724 | 19.8 s | 5.02 s | 10.3 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-11 | max_concurrency 2, parts_in_flight 1, 5 MiB parts | 2 | 8.45 (8.35-8.56) | 0.892 | 38.0 s | 5.11 s | 11.3 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-10 to 2026-11-11 | max_concurrency 2, parts_in_flight 2, 5 MiB parts | 2 | 8.15 (8.08-8.21) | 0.857 | 36.1 s | 6.09 s | 16.9 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-10 to 2026-11-11 | max_concurrency 2, parts_in_flight 4, 5 MiB parts | 2 | 8.01 (7.75-8.27) | 0.838 | 37.1 s | 5.54 s | 10.4 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 to 2026-11-11 | max_concurrency 4, parts_in_flight 1, 5 MiB parts | 2 | 9.08 (9.03-9.12) | 0.948 | 71.7 s | 7.11 s | 7.7 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 | max_concurrency 4, parts_in_flight 2, 5 MiB parts | 2 | 8.97 (8.92-9.01) | 0.937 | 71.7 s | 7.54 s | 8.4 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-11 | max_concurrency 4, parts_in_flight 4, 5 MiB parts | 2 | 8.68 (8.64-8.72) | 0.921 | 72.0 s | 5.59 s | 12.3 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 | max_concurrency 8, parts_in_flight 1, 5 MiB parts | 2 | 9.21 (9.18-9.24) | 0.963 | 142.4 s | 8.11 s | 8.4 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-11 | max_concurrency 8, parts_in_flight 2, 5 MiB parts | 2 | 9.11 (9.07-9.15) | 0.952 | 144.0 s | 6.67 s | 14.5 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 to 2026-11-11 | max_concurrency 8, parts_in_flight 4, 5 MiB parts | 2 | 9.07 (9.00-9.14) | 0.948 | 144.3 s | 6.08 s | 13.6 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 to 2026-11-11 | max_concurrency 16, parts_in_flight 1, 5 MiB parts | 2 | 9.31 (9.28-9.34) | 0.973 | 286.2 s | 10.97 s | 15.2 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 to 2026-11-11 | max_concurrency 16, parts_in_flight 2, 5 MiB parts | 2 | 9.32 (9.23-9.41) | 0.974 | 285.5 s | 9.66 s | 14.2 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 | max_concurrency 16, parts_in_flight 4, 5 MiB parts | 2 | 9.34 (9.29-9.38) | 0.975 | 294.7 s | 10.53 s | 11.7 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-10 | max_concurrency 1, parts_in_flight 1, 5 MiB parts | 2 | 2.35 (2.32-2.37) | 0.250 | 76.0 s | 5.64 s | 16.4 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-10 to 2026-11-11 | max_concurrency 1, parts_in_flight 2, 5 MiB parts | 2 | 3.99 (3.91-4.06) | 0.419 | 40.4 s | 5.00 s | 12.9 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-10 | max_concurrency 1, parts_in_flight 4, 5 MiB parts | 2 | 6.09 (5.86-6.33) | 0.637 | 24.3 s | 4.98 s | 10.7 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-11 | max_concurrency 2, parts_in_flight 1, 5 MiB parts | 2 | 4.24 (4.03-4.45) | 0.446 | 78.3 s | 5.03 s | 12.5 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-11 | max_concurrency 2, parts_in_flight 2, 5 MiB parts | 2 | 7.02 (6.90-7.14) | 0.733 | 43.6 s | 4.97 s | 13.6 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-10 to 2026-11-11 | max_concurrency 2, parts_in_flight 4, 5 MiB parts | 2 | 7.90 (7.66-8.14) | 0.823 | 40.1 s | 4.99 s | 13.5 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-10 | max_concurrency 4, parts_in_flight 1, 5 MiB parts | 2 | 7.80 (7.64-7.96) | 0.816 | 86.1 s | 4.96 s | 8.3 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 | max_concurrency 4, parts_in_flight 2, 5 MiB parts | 2 | 8.70 (8.65-8.75) | 0.909 | 73.8 s | 5.34 s | 10.4 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 to 2026-11-11 | max_concurrency 4, parts_in_flight 4, 5 MiB parts | 2 | 8.83 (8.82-8.85) | 0.923 | 72.3 s | 5.94 s | 12.2 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 to 2026-11-11 | max_concurrency 8, parts_in_flight 1, 5 MiB parts | 2 | 8.82 (8.68-8.97) | 0.922 | 147.6 s | 7.22 s | 12.8 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 | max_concurrency 8, parts_in_flight 2, 5 MiB parts | 2 | 9.02 (8.86-9.19) | 0.969 | 145.8 s | 7.10 s | 13.9 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 | max_concurrency 8, parts_in_flight 4, 5 MiB parts | 2 | 9.22 (9.21-9.22) | 0.963 | 141.3 s | 5.87 s | 7.7 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 to 2026-11-11 | max_concurrency 16, parts_in_flight 1, 5 MiB parts | 2 | 9.28 (9.19-9.36) | 1.005 | 287.4 s | 9.13 s | 13.9 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 to 2026-11-11 | max_concurrency 16, parts_in_flight 2, 5 MiB parts | 2 | 9.26 (9.23-9.29) | 0.974 | 290.2 s | 9.89 s | 17.8 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-11 | max_concurrency 16, parts_in_flight 4, 5 MiB parts | 2 | 9.26 (9.25-9.27) | 0.969 | 290.3 s | 9.36 s | 15.3 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% configured | policer-induced | 10 Mbit/s policer, 5000 B bucket | none (policer, no queue) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-11 | max_concurrency 1, parts_in_flight 1, 5 MiB parts | 1 | 0.48 (0.48-0.48) | 0.048 | 346.1 s | 6.58 s | 46.4 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% configured | policer-induced | 10 Mbit/s policer, 5000 B bucket | none (policer, no queue) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-11 | max_concurrency 4, parts_in_flight 2, 5 MiB parts | 1 | 1.53 (1.53-1.53) | 0.153 | 456.0 s | 4.97 s | 24.5 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% configured | policer-induced | 10 Mbit/s policer, 5000 B bucket | none (policer, no queue) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-11 | max_concurrency 16, parts_in_flight 1, 5 MiB parts; 1 of 1 runs overlapped another session's benchmark on the host | 1 | 2.76 (2.76-2.76) | 0.276 | 989.2 s | 4.99 s | 23.7 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% configured | policer-induced | 10 Mbit/s policer, 5000 B bucket | none (policer, no queue) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-10 | max_concurrency 16, parts_in_flight 2, 5 MiB parts | 1 | 2.46 (2.46-2.46); 1 object(s) failed | 0.246 | 1164.1 s | 5.02 s | 17.3 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% configured | policer-induced | 10 Mbit/s policer, 5000 B bucket | none (policer, no queue) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-10 to 2026-11-11 | default (8 in flight, 8 MiB parts, 4 parts in flight); 2 of 3 runs overlapped another session's benchmark on the host | 3 | no object committed; 48 object(s) failed | n/a | n/a | n/a | n/a | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-11 | max_concurrency 8, parts_in_flight 1, 5 MiB parts, confirmation runs; 5 of 5 runs overlapped another session's benchmark on the host | 5 | 9.09 (8.89-9.12) | 0.962 | 147.0 s | 8.98 s | 18.4 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-11 | max_concurrency 16, parts_in_flight 1, 5 MiB parts, confirmation runs; 5 of 5 runs overlapped another session's benchmark on the host | 5 | 9.34 (9.08-9.38) | 0.980 | 296.6 s | 11.07 s | 20.9 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-10 to 2026-11-11 | default (8 in flight, 8 MiB parts, 4 parts in flight), confirmation runs | 5 | 9.19 (9.00-9.25) | 0.960 | 143.0 s | 7.74 s | 11.8 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-11 | max_concurrency 16, parts_in_flight 1, 5 MiB parts, confirmation runs; 5 of 5 runs overlapped another session's benchmark on the host | 5 | 9.34 (9.24-9.35) | 0.976 | 289.5 s | 9.39 s | 12.0 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 1% | gemodel (bursty, mean burst 2 packets), upload only | 10 Mbit/s (tbf) | 1 BDP (125 KB) | none | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (rate) | 2026-11-11 | default (8 in flight, 8 MiB parts, 4 parts in flight), confirmation runs | 5 | 9.04 (8.75-9.14) | 0.967 | 146.1 s | 6.71 s | 11.9 | n/a |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | bulk TCP flow (iperf3), same queue | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-11 | max_concurrency 8, parts_in_flight 1, 5 MiB parts, scenario 18 workload; 1 of 1 runs overlapped another session's benchmark on the host | 1 | 0.56 (0.56-0.56) | 0.059 | 0.3 s | 0.24 s | 2640.6 | 8.25 / 9.41 |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | bulk TCP flow (iperf3), same queue | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-11 | max_concurrency 16, parts_in_flight 1, 5 MiB parts, scenario 18 workload; 1 of 1 runs overlapped another session's benchmark on the host | 1 | 1.24 (1.24-1.24) | 0.129 | 0.3 s | 0.22 s | 1825.8 | 6.89 / 9.37 |
+| Apple M5 Max host; Lima vz VM, 6 vCPU, 8 GiB, Linux 6.8 (host shared) | 100 ms | 0% | none | 10 Mbit/s (tbf) | 1 BDP (125 KB) | bulk TCP flow (iperf3), same queue | tcp_tls (s3_native; plain HTTP to the lab MinIO) | link (per-flow window) | 2026-11-11 | default (8 in flight, 8 MiB parts, 4 parts in flight), scenario 18 workload; 1 of 1 runs overlapped another session's benchmark on the host | 1 | 0.59 (0.59-0.59) | 0.062 | 0.3 s | 0.24 s | 2374.1 | 7.83 / 9.52 |
 
 ## The tuned-TCP baseline, and the gate (#483)
 
@@ -101,6 +174,273 @@ token rate and read as a finding, not as a threshold.
 - **Repetitions.** At least two per grid point; the default and the
   best-tuned configuration re-measured to at least five on each 100 ms
   profile.
+
+### The verdict
+
+**The tuned TCP path closes the gap on both 100 ms profiles. By the gate fixed
+above, the datagram issues (#485, #486, #488) do not open.**
+
+| Gate input | Best-tuned configuration | Confirmation runs | Measured, median (range) | Threshold | Opens |
+|---|---|---|---|---|---|
+| Unused goodput `U`, 100 ms, 10 Mbit/s, 0% loss | `max_concurrency` 8, `parts_in_flight` 1 | 5 | **0.039** (0.008–0.049) | > 0.20 | no |
+| Unused goodput `U`, 100 ms, 10 Mbit/s, 1% `gemodel` | `max_concurrency` 16, `parts_in_flight` 1 | 5 | **0.024** (0.019–0.034) | > 0.20 | no |
+| `object_upload` p95 ratio `R`, 1% over 0% | `max_concurrency` 16, `parts_in_flight` 1 | 5 + 5 (160 objects each) | **0.98** (0.95–1.02 across run pairs) | > 2.0 | no |
+
+Neither threshold falls inside the range of the repetitions that decide it, so
+by the noise rule the verdict is not within noise. The numbers come from
+`benchmarks/measurements/483-tcp-baseline/gate.json`, which
+`egress_baseline.py report` computes from the raw CSVs beside it.
+
+What this does and does not say:
+
+- **It is a statement about goodput and tail latency on these two links,
+  with a backlog of whole 20 MiB objects.** The tuned path closes the gap by
+  running many TCP connections at once — eight objects on the clean link,
+  sixteen on the lossy one. What that costs a flow sharing the link is
+  reported in [The flow beside it](#the-flow-beside-it), and the gate does not
+  weigh it.
+- **The shipped default is already in the same band.** Eight objects in
+  flight with 8 MiB parts reached 0.960 (0.941–0.976) of the link on the clean
+  profile and 0.967 (0.930–0.975) on the lossy one, five runs each. The
+  best-tuned points' confirmation medians are 0.961 and 0.976. On these two
+  links, with this backlog, the sweep found no tuning that moves goodput by
+  more than its own noise; the gap is closed by the width the engine ships
+  with.
+- **The gap is real when few objects are in flight.** One object at a time
+  used 0.733 of the clean link and 0.250 of the lossy one (grid medians), so a
+  deployment whose backlog rarely holds more than one or two objects is in
+  the regime where TCP leaves most of a lossy link unused. How often a real
+  edge site is in that regime is not measured here.
+- **`R` is close to 1 because both profiles are saturated at sixteen in
+  flight**, where an object's upload time is set by sharing the link with
+  fifteen others rather than by loss. At one object in flight the same ratio
+  is 3.9 (76.0 s over 19.4 s, grid p95s). The gate fixed the ratio at the
+  best-tuned configuration and is judged there; the single-flow ratio is
+  derived context, not the gate.
+- **Outside the gate, the policed uplink leaves most of its rate unused** —
+  see below. The gate was fixed on the two queue-backed profiles before any
+  number was read, and it is not moved now that one has been.
+
+### The grid
+
+![VTOP goodput as a fraction of the link reference, per profile](assets/egress-483/fraction_of_link.svg)
+
+![object_upload p95 per profile](assets/egress-483/object_upload_p95.svg)
+
+Fraction of the link reference `C`, median of two runs (minimum–maximum).
+A fraction above 1.0 is possible: `C` is one iperf3 flow measured once before
+the run, and several flows together can deliver slightly more than one did.
+
+100 ms, 10 Mbit/s, 0% loss:
+
+| `max_concurrency` | `parts_in_flight` 1 | `parts_in_flight` 2 | `parts_in_flight` 4 |
+|---|---|---|---|
+| 1 | 0.733 (0.732–0.734) | 0.702 (0.700–0.704) | 0.724 (0.717–0.730) |
+| 2 | 0.892 (0.890–0.894) | 0.857 (0.856–0.858) | 0.838 (0.811–0.864) |
+| 4 | 0.948 (0.943–0.954) | 0.937 (0.932–0.941) | 0.921 (0.912–0.930) |
+| 8 | 0.963 (0.960–0.966) | 0.952 (0.948–0.956) | 0.948 (0.941–0.955) |
+| 16 | 0.973 (0.970–0.976) | 0.974 (0.965–0.983) | 0.975 (0.971–0.980) |
+
+100 ms, 10 Mbit/s, 1% `gemodel` loss:
+
+| `max_concurrency` | `parts_in_flight` 1 | `parts_in_flight` 2 | `parts_in_flight` 4 |
+|---|---|---|---|
+| 1 | 0.250 (0.248–0.253) | 0.419 (0.414–0.424) | 0.637 (0.612–0.662) |
+| 2 | 0.446 (0.421–0.470) | 0.733 (0.721–0.745) | 0.823 (0.800–0.845) |
+| 4 | 0.816 (0.799–0.832) | 0.909 (0.904–0.915) | 0.923 (0.922–0.924) |
+| 8 | 0.922 (0.908–0.937) | 0.969 (0.961–0.978) | 0.963 (0.963–0.964) |
+| 16 | 1.005 (0.996–1.013) | 0.974 (0.966–0.982) | 0.969 (0.968–0.969) |
+
+Clean LAN, goodput in Mbit/s (no link reference; not part of the gate):
+
+| `max_concurrency` | `parts_in_flight` 1 | `parts_in_flight` 2 | `parts_in_flight` 4 |
+|---|---|---|---|
+| 1 | 526 (519–533) | 1029 (781–1276) | 1096 (977–1215) |
+| 2 | 1106 (709–1504) | 647 (635–660) | 1397 (1177–1618) |
+| 4 | 1039 (884–1194) | 1100 (920–1281) | 1304 (1031–1576) |
+| 8 | 1005 (978–1032) | 1615 (1513–1717) | 1216 (963–1468) |
+| 16 | 1249 (1041–1457) | 1460 (1059–1861) | 1796 (1574–2018) |
+
+Read from the grid, not beyond it:
+
+- On the clean 100 ms link, connections are what matter and parts do not:
+  every `parts_in_flight` value above 1 measured at or slightly below
+  `parts_in_flight` 1 at the same width.
+- On the lossy link, parts in flight substitute for objects in flight — at one
+  object, four parts raised the fraction from 0.250 to 0.637 — because each
+  part is its own TCP connection with its own loss response.
+- The clean-LAN numbers spread widely between repetitions (a factor of two at
+  some points) and do not order cleanly; they say the LAN path moves roughly
+  0.5–2 Gbit/s in this VM and not more than that.
+
+### What limited each row, verification, and CPU
+
+The `Bottleneck` column is named by a fixed rule in
+`egress_baseline.py` (`name_bottleneck`), not by eye: a shaped row at 90% of its
+link reference or more is the link's rate; below that it is verification if the
+read-back takes a quarter of a batch's time, and otherwise the link's per-flow
+window — too few TCP flows for the round trip and the loss. A LAN row is CPU
+only if the engine or the store kept 80% of the VM's six vCPUs busy; none did
+(the engine peaked at about 1.2 cores, the store at about 1.0), so every LAN
+row is named the store's I/O path, which this sweep does not separate further.
+
+- **Verification never limited a row.** The verify stage reads each 20 MiB
+  object back. It took 2.5–2.9% of batch time on every profile (median 8.7 s on
+  the clean 100 ms link, 7.0 s on the lossy one, 0.09 s on the LAN; p95
+  13.7 s, 13.0 s and 0.4 s). It is recorded per object in `objects.csv`
+  (`verify_ms`) and per row in the table below, apart from `object_upload`, so
+  no wire figure here absorbs it — and no change of wire would remove it.
+- **CPU never limited a shaped row.** The engine container used at most 0.03
+  cores on the 100 ms profiles. Engine CPU-seconds per GiB committed (from the
+  container's cgroup counter around each run) had a median of 12.8 on the
+  clean 100 ms profile (7.3–24.8), 12.2 on the lossy one (7.5–29.3) and 7.9 on
+  the LAN (4.4–10.9), grid and confirmation runs together. These are not on a pinned core: the VM's vCPUs float over the
+  host's cores, and the hypervisor does not expose pinning.
+
+### The policed uplink: outside the gate, and a finding
+
+A 10 Mbit/s policer with no queue, at 100 ms, with the lab's bucket of
+5000 bytes (`lib/netem.py`: the rate over 250, about 4 ms of line rate). One
+run per configuration except the default:
+
+| Configuration | Runs | Goodput, Mbit/s | Of the 10 Mbit/s token rate | Objects failed |
+|---|---|---|---|---|
+| default (8 in flight, 8 MiB parts, 4 parts in flight) | 3 | none committed | 0 | 48 of 48 |
+| `max_concurrency` 1, `parts_in_flight` 1 | 1 | 0.48 | 0.048 | 0 |
+| `max_concurrency` 4, `parts_in_flight` 2 | 1 | 1.53 | 0.153 | 0 |
+| `max_concurrency` 16, `parts_in_flight` 1 | 1 | 2.76 | 0.276 | 0 |
+| `max_concurrency` 16, `parts_in_flight` 2 | 1 | 2.46 | 0.246 | 1 of 32 |
+
+- **The shipped default committed nothing** in three runs: every one of its 16
+  objects ended `failed` after the cycle had run about half an hour. The
+  per-batch record the harness keeps does not carry the engine's error text,
+  so the cause is not established here; it is consistent with, and not shown
+  to be, the per-request deadline (`upload.request_timeout_seconds`, 300 s) at
+  the share of the policer each of 32 part connections was getting.
+- **The best measured configuration left 72% of the token rate unused.** The
+  policer drops whatever exceeds a 5000-byte bucket and holds nothing, so a
+  loss-based flow on a 100 ms round trip spends most of its time recovering;
+  more connections help only up to the point shown.
+- **What this is not.** It rests on one run per configuration, one bucket
+  depth, and one round trip. A policer with a deeper bucket was not measured,
+  and the result is a property of this one as much as of TCP. Whether kernel
+  pacing or the engine's own egress cap (#481, merged after these runs'
+  engine was built) recovers it is not measured either.
+
+The gate was fixed on the two queue-backed profiles, and this row does not
+change its verdict. It is recorded so that whether a policed-link gate is
+wanted is decided with it in view.
+
+### The flow beside it
+
+The neighbour's cost, from scenario 18's workload (150 small JSONL files per
+cycle, gzip, batches of up to 5000 records, 150 s) on the clean 100 ms link,
+with a plain-TCP bulk flow in the same one-BDP queue (`bulk:60`). One run per
+configuration:
+
+| Configuration | Competitor alone, Mbit/s | Competitor beside VTOP, Mbit/s | VTOP beside it, Mbit/s | Jain's index |
+|---|---|---|---|---|
+| default (8 in flight) | 9.52 | 7.83 | 0.48 | 0.56 |
+| `max_concurrency` 8, `parts_in_flight` 1 | 9.41 | 8.25 | 0.53 | 0.56 |
+| `max_concurrency` 16, `parts_in_flight` 1 | 9.37 | 6.89 | 1.04 | 0.65 |
+
+- On this workload VTOP is round-trip-bound, not link-bound: its batches are
+  small, so most of a cycle is per-batch round trips, and it takes a small
+  share of the link. Sixteen in flight took twice the share of eight and left
+  the neighbour 74% of its solo rate, against 82% and 88% at eight.
+- These rows say what a small-batch engine costs a neighbour. They do not say
+  what the sweep's full-width drain of 20 MiB objects costs one — at sixteen
+  in flight that drain holds sixteen connections against the link for minutes
+  — because no competitor window can contain one of its cycles whole (see the
+  deviations below). The issue that adds a knob is where that has to be
+  measured.
+- The sixteen-in-flight row ran on the harness before #531 merged; the other
+  two after, with its fix to where the competitor's window is placed. 24
+  contended attempts were refused in all — by the window-placement checks
+  before that fix, and by the calibration gate or a hole at the start of the
+  competitor's stream after it — and every refusal is in `sweep_index.csv`.
+  All three rows overlapped the other benchmark on the host.
+
+### Measured and derived
+
+**Measured** (each a column of the committed CSVs, per run or per object):
+committed object bytes; each `process-once` cycle's duration; per-object
+`object_upload`, manifest, verify and checksum milliseconds; the link reference
+`C` (iperf3, per run); engine and store CPU-seconds (cgroup counters, per run);
+the competitor's goodput alone and beside VTOP (iperf3 receiver totals, per
+contended run).
+
+**Derived** (computed by `egress_baseline.py` from the measured columns, so
+re-running `report` reproduces them byte for byte): goodput `G` (bytes × 8 over
+the committing cycles' time); the fraction `G`/`C` and `U`; medians and ranges
+over repetitions; the pooled p95s and `R`; CPU-seconds per GiB; the bottleneck
+name; the best-tuned selection; the gate verdict; the charts.
+
+**Not measured:** the wire itself (headers, retransmissions, manifests —
+`G` counts committed object bytes only, so it understates the wire); a policer
+with a deeper bucket; any backlog shape other than "a full queue of 20 MiB
+objects"; any RTT other than 100 ms and the LAN; anything on a real WAN.
+
+### The lab, and its limits
+
+- **Where it ran.** Four Lima VMs (vz, 6 vCPU, 8 GiB each, Ubuntu 24.04.5,
+  kernel 6.8.0-142, Docker 29.9.3) on one Apple M5 Max (18 cores, 128 GiB),
+  each with its own copy of the lab (`netem` and `containerized` compose
+  profiles), two to four of them measuring at once. The engine was one
+  binary, built from `3564edc` with `--no-default-features` (the lab image
+  lacks the Kafka adapter's `libsasl2`) and copied to every VM (sha256
+  `57f020a6…53600`). The harness was this branch's; the last two contended
+  rows ran after it merged `main` at `7472b64` (#531), for that change's fix to
+  the competitor's window placement — Python only, the engine binary unchanged. The full record is `environment.json` beside the data.
+- **The middlebox ran as `lib/netem.py` builds it.** The VMs' kernel has the
+  `ifb` module, so the upload impairment and bottleneck sit on the `ifb` behind
+  the ingress hook exactly as on a Linux lab host. Docker Desktop's kernel on
+  this Mac has no `ifb`; no egress-shaping substitute was used, and none of
+  these numbers comes from Docker Desktop.
+- **Comparisons, never absolutes.** This is an emulated link on one host:
+  netem's accuracy is bounded by timer granularity and its rate limiter
+  releases traffic in bursts a real link would space out, the middlebox, the
+  engine and the store share a CPU and a clock, and this project has not
+  established netem's accuracy at any rate. No number here may be quoted as
+  what the engine does on a real 10 Mbit/s, 100 ms link. Every shaped run was
+  gated on its own iperf3 calibration within ±10% of 10 Mbit/s; two attempts
+  (8.70 and 8.69 Mbit/s) were refused by that gate and re-run, and the refusals
+  stay in `sweep_index.csv`.
+- **The host was noisy, and that is recorded rather than removed.** Other
+  work ran on the same Mac throughout — Docker Desktop with about ten unrelated
+  containers, other sessions' builds — and was not stopped. Over the sweep
+  the host's one-minute load average had a mean of 18.5 and a maximum of 60 on
+  18 cores, and the CPU was 42% idle on average (`host_noise.csv`, every 30 s,
+  22:44Z to 02:29Z). From 01:06:58Z on 2026-11-11 to past the last run,
+  another session's Kafka/MinIO benchmark ran on the same host
+  (`rq4_presence.csv`); every run whose wall-clock span overlapped it carries
+  that label in `runs.csv` (`host_contention`) and the table rows say how many
+  of their runs did. All 15 tuned confirmation runs, three policed runs and all
+  three contended rows overlapped it; no 100 ms or LAN grid run and none of the
+  default's ten confirmation runs did.
+  The overlapped runs agree with the ones that did not — the clean-link point
+  at eight in flight measured 0.963 in the grid and 0.961 in confirmation —
+  which is expected of rows that are link-bound and use a fiftieth of a core,
+  so they were kept, labelled, and not re-run.
+
+### Deviations from the plan fixed above
+
+- **The policed row is four grid points with one run each, plus the default
+  three times**, not a grid with two repetitions. A policed run of 32 objects
+  took over half an hour; the profile is outside the gate; and the plan never
+  fixed its repetitions.
+- **The clean LAN drains 64 objects per run, not `max(4, 2 ×
+  max_concurrency)`**: two waves of 20 MiB objects finish in well under a
+  second there, and a cycle that short cannot be timed.
+- **The contended rows run scenario 18's workload**, with only the width
+  replaced (`egress_baseline.py`, `contended_yaml`), because a drain of 20 MiB
+  objects is one engine cycle longer than any competitor window, and the
+  competitor's share of VTOP is charged only to cycles its window wholly
+  contains. Scenario 18's objects are below the multipart threshold, so
+  `parts_in_flight` is not exercised in those rows.
+- **The p95 ratio's 0% side was measured as confirmation runs of the 1%
+  profile's best configuration** (sixteen in flight), as the definition above
+  requires, in addition to the 0% profile's own best (eight in flight).
 
 ## Counterparty survey: which S3-compatible endpoints serve HTTP/3 (#484)
 
