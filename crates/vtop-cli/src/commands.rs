@@ -605,6 +605,13 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                     for warning in &warnings {
                         println!("WARNING: {warning}");
                     }
+                    for shadowed in &effective.shadowed {
+                        println!(
+                            "WARNING: streams[{}] repeats source_name {}; the engine applies only \
+                             the first entry with that name, so this one is never used",
+                            shadowed.index, shadowed.source_name
+                        );
+                    }
                     println!("effective_version: 1");
                     print_effective_block("default", &effective.default)?;
                     for stream in &effective.streams {

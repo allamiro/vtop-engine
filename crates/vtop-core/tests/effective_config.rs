@@ -77,3 +77,70 @@ fn resolved_upload_width_origin_names_what_actually_set_it() {
         "a ceiling bounds the width; it does not set it"
     );
 }
+
+/// A key written with no value (`tenant:`) or `~` is still the operator's:
+/// the typed parse reads it as the literal text "" or "~" for a string field,
+/// so its origin must not claim the built-in default.
+#[test]
+fn a_key_set_to_an_empty_or_null_scalar_is_reported_as_set() {
+    let config = VtopConfig::from_yaml_str("engine: {name: test, tenant: ~, state_store: 'sqlite::memory:', work_dir: /unused}\nbatching: {}\ncompression: {}\nsources: {}\nupload: {bucket: b}\n").unwrap();
+    let streams = StreamsConfig::from_yaml_str(
+        "streams:\n- source_name: a\n  source_type: file\n  format: raw\n  tenant:\n",
+    )
+    .unwrap();
+    let effective = serde_json::to_value(effective_streams(&config, Some(&streams))).unwrap();
+    assert_eq!(effective["default"]["tenant"]["value"], "~");
+    assert_eq!(effective["default"]["tenant"]["origin"], "global");
+    assert_eq!(effective["streams"][0]["tenant"]["value"], "");
+    assert_eq!(effective["streams"][0]["tenant"]["origin"], "stream");
+}
+
+/// A root key spelled with dots (`"upload.backend": localfs`) is not the
+/// nested `upload.backend`: the typed parse ignores it, so the explanation
+/// must not claim the operator set that setting.
+#[test]
+fn a_dotted_key_is_not_mistaken_for_the_nested_setting() {
+    let config = VtopConfig::from_yaml_str("engine: {name: test, state_store: 'sqlite::memory:', work_dir: /unused}\nbatching: {}\ncompression: {}\nsources: {}\nupload: {bucket: b}\n\"upload.backend\": localfs\n\"upload.require_strong_verification\": false\n").unwrap();
+    let effective = serde_json::to_value(effective_streams(&config, None)).unwrap();
+    assert_eq!(effective["default"]["upload.backend"]["value"], "s3_native");
+    assert_eq!(
+        effective["default"]["upload.backend"]["origin"],
+        "built-in default"
+    );
+    assert_eq!(
+        effective["default"]["upload.require_strong_verification"]["origin"],
+        "built-in default"
+    );
+    let streams = StreamsConfig::from_yaml_str(
+        "streams:\n- {source_name: a, source_type: file, format: raw}\n\"streams.0.tenant\": x\n",
+    )
+    .unwrap();
+    let effective = serde_json::to_value(effective_streams(&config, Some(&streams))).unwrap();
+    assert_eq!(
+        effective["streams"][0]["tenant"]["origin"],
+        "built-in default"
+    );
+}
+
+/// The engine applies the FIRST stream entry with a given source_name
+/// (`StreamsConfig::lookup`); a later entry with the same name is never used,
+/// so it is listed as shadowed instead of printed as if it were in effect.
+#[test]
+fn a_repeated_source_name_is_shadowed_not_shown_as_effective() {
+    let config = VtopConfig::from_yaml_str("engine: {name: test, state_store: 'sqlite::memory:', work_dir: /unused}\nbatching: {}\ncompression: {}\nsources: {}\nupload: {bucket: b}\n").unwrap();
+    let streams = StreamsConfig::from_yaml_str("streams:\n- {source_name: app, source_type: file, format: raw, tenant: a}\n- {source_name: other, source_type: file, format: raw}\n- {source_name: app, source_type: file, format: raw, tenant: b}\n").unwrap();
+    assert_eq!(streams.lookup("app").unwrap().tenant, "a");
+    let effective = serde_json::to_value(effective_streams(&config, Some(&streams))).unwrap();
+    let names: Vec<_> = effective["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["source_name"]["value"].clone())
+        .collect();
+    assert_eq!(names, ["app", "other"]);
+    assert_eq!(effective["streams"][0]["tenant"]["value"], "a");
+    assert_eq!(
+        effective["shadowed_streams"],
+        serde_json::json!([{"index": 2, "source_name": "app"}])
+    );
+}

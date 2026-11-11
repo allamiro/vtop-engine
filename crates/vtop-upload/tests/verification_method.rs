@@ -154,25 +154,90 @@ fn native_s3_method_matches_verify_object() {
     });
 }
 
+/// The whole table, written out independently of the implementation's match
+/// arms, including a name no backend registers: a typo'd `upload.backend`
+/// passes `validate` and only fails at `build_backend`, so it must not be
+/// explained as strong (or any) evidence.
 #[test]
 fn mapping_covers_every_registered_backend_and_algorithm() {
-    for backend in [
-        "s3_native",
-        "localfs",
-        "awscli",
-        "minio",
-        "s3cmd",
-        "mock",
-        "mock_fail",
-        "mock_limited",
-    ] {
-        for algorithm in ALGORITHMS {
+    use ChecksumAlgorithm::{Blake3, None as Off, Sha256};
+    let table = [
+        (
+            "s3_native",
+            [
+                (Sha256, "store_checksum"),
+                (Blake3, "read_back"),
+                (Off, "size_only"),
+            ],
+        ),
+        (
+            "localfs",
+            [
+                (Sha256, "read_back"),
+                (Blake3, "read_back"),
+                (Off, "size_only"),
+            ],
+        ),
+        (
+            "awscli",
+            [
+                (Sha256, "read_back"),
+                (Blake3, "read_back"),
+                (Off, "size_only"),
+            ],
+        ),
+        (
+            "minio",
+            [
+                (Sha256, "read_back"),
+                (Blake3, "read_back"),
+                (Off, "size_only"),
+            ],
+        ),
+        (
+            "s3cmd",
+            [
+                (Sha256, "read_back"),
+                (Blake3, "read_back"),
+                (Off, "size_only"),
+            ],
+        ),
+        (
+            "mock",
+            [
+                (Sha256, "read_back"),
+                (Blake3, "read_back"),
+                (Off, "size_only"),
+            ],
+        ),
+        (
+            "mock_fail",
+            [
+                (Sha256, "read_back"),
+                (Blake3, "read_back"),
+                (Off, "size_only"),
+            ],
+        ),
+        (
+            "mock_limited",
+            [
+                (Sha256, "size_only"),
+                (Blake3, "size_only"),
+                (Off, "size_only"),
+            ],
+        ),
+        (
+            "s3-native",
+            [(Sha256, "unknown"), (Blake3, "unknown"), (Off, "unknown")],
+        ),
+        (
+            "",
+            [(Sha256, "unknown"), (Blake3, "unknown"), (Off, "unknown")],
+        ),
+    ];
+    for (backend, row) in table {
+        for (algorithm, expected) in row {
             let method = verification_method(backend, algorithm);
-            let expected = match (backend, algorithm) {
-                (_, ChecksumAlgorithm::None) | ("mock_limited", _) => "size_only",
-                ("s3_native", ChecksumAlgorithm::Sha256) => "store_checksum",
-                _ => "read_back",
-            };
             assert_eq!(method.as_str(), expected, "{backend}/{algorithm}");
             assert_eq!(serde_json::to_value(method).unwrap(), expected);
         }

@@ -13,6 +13,10 @@ pub enum VerificationMethod {
     StoreChecksum,
     ReadBack,
     SizeOnly,
+    /// `upload.backend` names no registered backend. `validate` accepts the
+    /// name (only `build_backend` refuses it), so this is reported rather
+    /// than guessed: no batch is ever verified by a backend that cannot start.
+    Unknown,
 }
 impl VerificationMethod {
     pub fn as_str(self) -> &'static str {
@@ -20,6 +24,7 @@ impl VerificationMethod {
             Self::StoreChecksum => "store_checksum",
             Self::ReadBack => "read_back",
             Self::SizeOnly => "size_only",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -28,10 +33,20 @@ impl VerificationMethod {
 /// value model to avoid a core -> upload -> core dependency; vtop-upload exposes
 /// it publicly next to the backends that execute the policy.
 pub fn verification_method(backend: &str, algorithm: ChecksumAlgorithm) -> VerificationMethod {
+    // Every registered name is listed: a new backend must be added here, not
+    // inherit a method it may not implement.
     match (backend, algorithm) {
-        (_, ChecksumAlgorithm::None) | ("mock_limited", _) => VerificationMethod::SizeOnly,
+        (
+            "s3_native" | "localfs" | "awscli" | "minio" | "s3cmd" | "mock" | "mock_fail"
+            | "mock_limited",
+            ChecksumAlgorithm::None,
+        )
+        | ("mock_limited", _) => VerificationMethod::SizeOnly,
         ("s3_native", ChecksumAlgorithm::Sha256) => VerificationMethod::StoreChecksum,
-        _ => VerificationMethod::ReadBack,
+        ("s3_native" | "localfs" | "awscli" | "minio" | "s3cmd" | "mock" | "mock_fail", _) => {
+            VerificationMethod::ReadBack
+        }
+        _ => VerificationMethod::Unknown,
     }
 }
 
@@ -85,13 +100,33 @@ pub struct EffectiveStream {
 #[derive(Debug, Clone, Serialize)]
 pub struct EffectiveStreams {
     pub default: EffectiveStream,
+    /// One block per stream the engine can apply: the first entry for each
+    /// `source_name`, in file order.
     pub streams: Vec<EffectiveStream>,
+    /// Later entries repeating an earlier `source_name`. The engine applies
+    /// only the first (`StreamsConfig::lookup`), so these are never used.
+    #[serde(rename = "shadowed_streams")]
+    pub shadowed: Vec<ShadowedStream>,
 }
 
-/// Every dotted key path a YAML document sets to a non-null value, with
-/// sequence items numbered (`streams.0.tenant`). Presence, not comparison with
-/// the default: an explicit value equal to its default still came from the
-/// operator. Values themselves are never retained.
+/// A `streams.yaml` entry that an earlier entry with the same name hides.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShadowedStream {
+    /// Position in `streams.yaml`, from 0 (as in `streams[2]`).
+    pub index: usize,
+    pub source_name: String,
+}
+
+/// Every dotted key path a YAML document sets, with sequence items numbered
+/// (`streams.0.tenant`). Presence, not comparison with the default: an
+/// explicit value equal to its default still came from the operator, and so
+/// does a key written with no value or `~`, which a string field reads as the
+/// literal text "" or "~". Values themselves are never retained.
+///
+/// A key that itself contains a `.` is skipped with everything under it: no
+/// field has such a name, so the typed parse ignores it, and recording it
+/// would collide with the nested path it spells (`"upload.backend": x` is not
+/// `upload: {backend: x}`).
 ///
 /// Runs only AFTER the typed parse accepted the same text, and never fails on
 /// its own: a document the engine accepts must not be refused, or reworded,
@@ -102,7 +137,7 @@ pub(crate) fn present_keys(text: &str) -> BTreeSet<String> {
     use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
     use std::fmt;
 
-    /// Walks one node; yields whether it was non-null.
+    /// Walks one node, recording the paths of the keys beneath it.
     struct Walk<'a> {
         prefix: String,
         out: &'a mut BTreeSet<String>,
@@ -117,8 +152,8 @@ pub(crate) fn present_keys(text: &str) -> BTreeSet<String> {
         }
     }
     impl<'de> DeserializeSeed<'de> for Walk<'_> {
-        type Value = bool;
-        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
             d.deserialize_any(self)
         }
     }
@@ -136,31 +171,29 @@ pub(crate) fn present_keys(text: &str) -> BTreeSet<String> {
         }
     }
     impl<'de> Visitor<'de> for Walk<'_> {
-        type Value = bool;
+        type Value = ();
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
             f.write_str("any YAML node")
         }
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
             while let Some(Key(key)) = map.next_key()? {
                 match key {
-                    Some(key) => {
+                    Some(key) if !key.contains('.') => {
                         let path = self.child(&key);
-                        let present = map.next_value_seed(Walk {
+                        map.next_value_seed(Walk {
                             prefix: path.clone(),
                             out: &mut *self.out,
                         })?;
-                        if present {
-                            self.out.insert(path);
-                        }
+                        self.out.insert(path);
                     }
-                    None => {
+                    _ => {
                         map.next_value::<IgnoredAny>()?;
                     }
                 }
             }
-            Ok(true)
+            Ok(())
         }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<bool, A::Error> {
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
             let mut index = 0usize;
             while seq
                 .next_element_seed(Walk {
@@ -171,46 +204,47 @@ pub(crate) fn present_keys(text: &str) -> BTreeSet<String> {
             {
                 index += 1;
             }
-            Ok(true)
+            Ok(())
         }
-        fn visit_unit<E>(self) -> Result<bool, E> {
-            Ok(false)
+        // Scalars and nulls end the walk; the key above them is recorded.
+        fn visit_unit<E>(self) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_none<E>(self) -> Result<bool, E> {
-            Ok(false)
+        fn visit_none<E>(self) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
             d.deserialize_any(self)
         }
-        fn visit_bool<E>(self, _: bool) -> Result<bool, E> {
-            Ok(true)
+        fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_i64<E>(self, _: i64) -> Result<bool, E> {
-            Ok(true)
+        fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_u64<E>(self, _: u64) -> Result<bool, E> {
-            Ok(true)
+        fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_i128<E>(self, _: i128) -> Result<bool, E> {
-            Ok(true)
+        fn visit_i128<E>(self, _: i128) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_u128<E>(self, _: u128) -> Result<bool, E> {
-            Ok(true)
+        fn visit_u128<E>(self, _: u128) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_f64<E>(self, _: f64) -> Result<bool, E> {
-            Ok(true)
+        fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_str<E>(self, _: &str) -> Result<bool, E> {
-            Ok(true)
+        fn visit_str<E>(self, _: &str) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_bytes<E>(self, _: &[u8]) -> Result<bool, E> {
-            Ok(true)
+        fn visit_bytes<E>(self, _: &[u8]) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_enum<A: serde::de::EnumAccess<'de>>(self, data: A) -> Result<bool, A::Error> {
-            // A tagged node (`!Tag value`): present; its content is not walked.
+        fn visit_enum<A: serde::de::EnumAccess<'de>>(self, data: A) -> Result<(), A::Error> {
+            // A tagged node (`!Tag value`): its content is not walked.
             let (IgnoredAny, variant) = data.variant::<IgnoredAny>()?;
             serde::de::VariantAccess::newtype_variant::<IgnoredAny>(variant)?;
-            Ok(true)
+            Ok(())
         }
     }
 
@@ -388,10 +422,27 @@ pub fn effective_streams(config: &VtopConfig, streams: Option<&StreamsConfig>) -
             },
         }
     };
+    let mut effective = Vec::new();
+    let mut shadowed = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (index, stream) in streams
+        .map(|s| s.streams.iter())
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        if seen.insert(stream.source_name.as_str()) {
+            effective.push(make(Some(stream)));
+        } else {
+            shadowed.push(ShadowedStream {
+                index,
+                source_name: stream.source_name.clone(),
+            });
+        }
+    }
     EffectiveStreams {
         default: make(None),
-        streams: streams
-            .map(|s| s.streams.iter().map(|s| make(Some(s))).collect())
-            .unwrap_or_default(),
+        streams: effective,
+        shadowed,
     }
 }
