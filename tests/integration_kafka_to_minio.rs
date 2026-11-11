@@ -1187,6 +1187,7 @@ async fn a_partition_started_at_the_end_of_the_log_recovers_without_skipping() {
     let deadline = started + std::time::Duration::from_secs(50);
     let mut victim_read = 0;
     let mut busy_during = 0;
+    let mut victim_reads_at: Vec<(u128, usize)> = Vec::new();
     let mut produced_late = false;
     while victim_read < 15 && std::time::Instant::now() < deadline {
         // Five more after the first stall check could have run.
@@ -1198,6 +1199,9 @@ async fn a_partition_started_at_the_end_of_the_log_recovers_without_skipping() {
         let pass = read_pass(&mut adapter, &sources).await;
         busy_during += pass[0];
         victim_read += pass[1];
+        if pass[1] > 0 {
+            victim_reads_at.push((started.elapsed().as_millis(), pass[1]));
+        }
     }
     // Only the victim stalled: a regression that stopped both partitions
     // must not pass as a recovery (review of #644).
@@ -1209,8 +1213,9 @@ async fn a_partition_started_at_the_end_of_the_log_recovers_without_skipping() {
         victim_read,
         15,
         "records produced while the partition was stalled were skipped or never read \
-         (within {:?})",
-        started.elapsed()
+         (within {:?}; stall recoveries: {}; victim reads (ms, records): {victim_reads_at:?})",
+        started.elapsed(),
+        adapter.stall_recoveries()
     );
 }
 
@@ -1392,7 +1397,12 @@ async fn recovering_one_partition_does_not_move_another_that_started_at_the_end(
         victim_read += pass[1];
         quiet_read += pass[2];
     }
-    assert_eq!(victim_read, 10, "the stalled partition was recovered");
+    assert_eq!(
+        victim_read,
+        10,
+        "the stalled partition was recovered (stall recoveries: {})",
+        adapter.stall_recoveries()
+    );
     assert_eq!(
         quiet_read, 3,
         "recovering another partition skipped records written to one that started at \

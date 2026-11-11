@@ -427,10 +427,11 @@ struct PartitionLiveness {
     /// started, which is the end of the log as it was at the assign (review of
     /// #644). The stall check finds it from record timestamps, from the
     /// assign's own time (`end_start_lookup_time`); when the broker cannot
-    /// say, the high watermark of the first check stands in, which is at or
-    /// above the true start. A stall re-assigns such a partition at this
-    /// offset, never at `Offset::Stored`, which would resolve to the NEW end
-    /// and skip what piled up.
+    /// say, nothing is recorded and the next check asks again (a check's own
+    /// high watermark is not a start: it would give up every record written
+    /// between the assign and that check). A stall re-assigns such a
+    /// partition at this offset, never at `Offset::Stored`, which would
+    /// resolve to the NEW end and skip what piled up.
     end_baseline: HashMap<(String, i32), i64>,
     /// Wall-clock time (ms since the epoch) of the last assign(), for finding
     /// where a partition assigned at the end of the log started.
@@ -465,22 +466,14 @@ impl PartitionLiveness {
     }
 
     /// The offset a due partition would read next: `next` when it is known,
-    /// otherwise the end-of-log baseline. The first check of a partition with
-    /// neither records `high` as the baseline and decides nothing.
-    fn next_or_baseline(
-        &mut self,
-        key: &(String, i32),
-        next: Option<i64>,
-        high: i64,
-    ) -> Option<i64> {
-        if next.is_some() {
-            return next;
-        }
-        if let Some(&baseline) = self.end_baseline.get(key) {
-            return Some(baseline);
-        }
-        self.end_baseline.insert(key.clone(), high);
-        None
+    /// otherwise the end-of-log baseline the start lookup established. With
+    /// neither, nothing is known and nothing is decided: the lookup is tried
+    /// again at the next check. A check never invents a start (#623, the
+    /// flake hunt on #644): taking its own high watermark as one counted every
+    /// record written between the assign and that check as before the start,
+    /// and a dead fetcher's backlog was given up for good.
+    fn next_or_baseline(&self, key: &(String, i32), next: Option<i64>) -> Option<i64> {
+        next.or_else(|| self.end_baseline.get(key).copied())
     }
 
     /// Record one completed pass over `assigned`, the set given to the last
@@ -1290,7 +1283,7 @@ impl KafkaSource {
                 reset_to_earliest,
             );
             let next = if resolved.is_none() && end_measured.contains(key) {
-                self.liveness.next_or_baseline(key, resolved, high)
+                self.liveness.next_or_baseline(key, resolved)
             } else {
                 resolved
             };
@@ -2617,9 +2610,9 @@ mod tests {
 
     /// Review of #644: a partition assigned at `Offset::Stored` with nothing
     /// committed and `auto.offset.reset=latest` starts at the end of the log,
-    /// so there is no offset to measure lag from. The first check records the
-    /// high watermark as its baseline and decides nothing; records past the
-    /// baseline at a later check are records a dead fetcher did not deliver.
+    /// so there is no offset to measure lag from until the start lookup (by
+    /// record time, see `end_start_lookup_time`) establishes one. Records past
+    /// that start are records a dead fetcher did not deliver.
     #[test]
     fn a_partition_started_at_the_end_of_the_log_is_measured_from_a_baseline() {
         let key = tp("a", 0);
@@ -2627,30 +2620,61 @@ mod tests {
         let mut live = PartitionLiveness::default();
         live.on_assign(&assigned);
 
-        let first = live.next_or_baseline(&key, None, 50);
-        assert_eq!(first, None, "the first check only records the baseline");
+        let first = live.next_or_baseline(&key, None);
+        assert_eq!(first, None, "no start until the lookup establishes one");
         assert_eq!(live.stalled_lag(&key, first, 50), None);
-        let quiet = live.next_or_baseline(&key, None, 50);
+        live.note_baseline(&key, 50);
+        let quiet = live.next_or_baseline(&key, None);
         assert_eq!(live.stalled_lag(&key, quiet, 50), None, "nothing new: idle");
-        let later = live.next_or_baseline(&key, None, 57);
+        let later = live.next_or_baseline(&key, None);
         assert_eq!(live.stalled_lag(&key, later, 57), Some(7));
         // A known offset always wins over the baseline.
-        assert_eq!(live.next_or_baseline(&key, Some(40), 57), Some(40));
+        assert_eq!(live.next_or_baseline(&key, Some(40)), Some(40));
 
-        // A start found from record timestamps is used on the FIRST check
-        // and is not overwritten by a later one.
+        // An established start is not overwritten by a later lookup.
         let other = tp("a", 1);
         live.note_baseline(&other, 3);
         live.note_baseline(&other, 9);
-        assert_eq!(live.next_or_baseline(&other, None, 57), Some(3));
+        assert_eq!(live.next_or_baseline(&other, None), Some(3));
         assert_eq!(live.stalled_lag(&other, Some(3), 57), Some(54));
 
         // Delivery and a fresh assign both drop the baseline.
         live.record_pass(&assigned, |_| true, Instant::now());
-        assert_eq!(live.next_or_baseline(&key, None, 60), None);
+        assert_eq!(live.next_or_baseline(&key, None), None);
+        live.note_baseline(&key, 60);
         live.on_assign(&assigned);
-        assert_eq!(live.next_or_baseline(&key, None, 70), None);
-        assert_eq!(live.next_or_baseline(&key, None, 70), Some(70));
+        assert_eq!(live.next_or_baseline(&key, None), None);
+    }
+
+    /// #623, the flake hunt on #644: a partition assigned at the end of the
+    /// log (`latest`, nothing committed) whose fetcher died. When the lookup
+    /// that finds where it started fails (a broker too slow to answer within
+    /// the bound), the check must decide nothing and record nothing. It used
+    /// to fall back to the high watermark of that check as the start, which
+    /// counts every record written between the assign and the check as
+    /// "before the start": those records were never recovered, and with no
+    /// later records the partition was never recovered at all. When a later
+    /// lookup succeeds, every record since the assign is recovered.
+    #[test]
+    fn a_failed_start_lookup_gives_up_no_records() {
+        let key = tp("a", 0);
+        let mut live = PartitionLiveness::default();
+        live.on_assign(std::slice::from_ref(&key));
+
+        // First check: 10 records waiting, the start lookup failed.
+        let next = live.next_or_baseline(&key, None);
+        assert_eq!(live.stalled_lag(&key, next, 10), None, "nothing decided");
+        // Later check: 15 records waiting, the lookup failed again.
+        let next = live.next_or_baseline(&key, None);
+        assert_eq!(live.stalled_lag(&key, next, 15), None, "nothing decided");
+        // The lookup succeeds: the partition started at 0.
+        live.note_baseline(&key, 0);
+        let next = live.next_or_baseline(&key, None);
+        assert_eq!(
+            live.stalled_lag(&key, next, 15),
+            Some(15),
+            "every record since the assign is recovered"
+        );
     }
 
     /// Review of #644: an end-of-log baseline (and the recovery pin it leads
