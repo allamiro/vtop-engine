@@ -2085,6 +2085,10 @@ impl SourceAdapter for FileSource {
     ///   at the path, which still has that inode;
     /// - a marker's tail fingerprint (#620) matches the bytes now below its
     ///   end;
+    /// - the file is no shorter than the cursor's position, the length the
+    ///   cursor saw, or the length the marker's read saw: a truncation since
+    ///   (a rewrite in place that kept the first page) makes the committed
+    ///   byte another generation's (review of #567);
     /// - and the cursor's OWN tail, where it recorded one, matches the bytes
     ///   now below the cursor's position. Without it, a seed taken before an
     ///   in-place rewrite that kept the inode and the first page would lend
@@ -2095,6 +2099,7 @@ impl SourceAdapter for FileSource {
             path,
             inode: Some(marker_inode),
             end_byte,
+            file_size: marker_size,
             content_fingerprint: Some(marker_content),
             tail_fingerprint: marker_tail,
             ..
@@ -2112,23 +2117,34 @@ impl SourceAdapter for FileSource {
         if same == Some(false) {
             return None;
         }
-        if same.is_none() || marker_tail.is_some() {
-            let (current_inode, _, head, below) =
-                Self::probe_with_tail(Path::new(path), *end_byte, marker_tail.as_ref());
-            if current_inode != Some(*marker_inode) {
-                return None;
-            }
-            if same.is_none()
-                && !(seen_content.matches_head(&head) && marker_content.matches_head(&head))
-            {
-                return None;
-            }
-            if marker_tail
-                .as_ref()
-                .is_some_and(|tail| !tail.matches_bytes(&below))
-            {
-                return None;
-            }
+        let (current_inode, current_size, head, below) =
+            Self::probe_with_tail(Path::new(path), *end_byte, marker_tail.as_ref());
+        if current_inode != Some(*marker_inode) {
+            return None;
+        }
+        // An append-only file never gets shorter. One now shorter than the
+        // cursor's position, than the length the cursor saw, or than the
+        // length the marker's read saw has been truncated since - a rewrite
+        // in place that can keep the inode and the first page, so the checks
+        // above cannot see it - and the cursor's committed byte belongs to the
+        // content before it (review of #567, Codex).
+        if current_size < c.committed_byte
+            || current_size < seen.file_size
+            || current_size < *marker_size
+            || current_size < *end_byte
+        {
+            return None;
+        }
+        if same.is_none()
+            && !(seen_content.matches_head(&head) && marker_content.matches_head(&head))
+        {
+            return None;
+        }
+        if marker_tail
+            .as_ref()
+            .is_some_and(|tail| !tail.matches_bytes(&below))
+        {
+            return None;
         }
         if let Some(tail) = seen.tail.as_ref() {
             let (current_inode, _, _, below) =
@@ -2819,6 +2835,52 @@ mod tests {
             .unwrap();
         assert_eq!(reads2.len(), 1);
         assert_eq!(reads2[0].records, vec![b"two".to_vec(), b"three".to_vec()]);
+    }
+
+    /// #567 (review, Codex): a file rewritten in place with the same first
+    /// page but SHORTER agrees with the inode and with fingerprints capped at
+    /// one page, and - with no tail recorded - nothing else compared it, so
+    /// the old content's committed byte was lent to the new content's range.
+    /// The lengths show the truncation: the file is now shorter than the
+    /// cursor's position and than the length the cursor saw.
+    #[cfg(unix)]
+    #[test]
+    fn a_truncated_file_with_the_same_first_page_lends_no_committed_point() {
+        use std::os::unix::fs::MetadataExt;
+        let page: Vec<u8> = (0..4096u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let mut bytes = page.clone();
+        bytes.extend(std::iter::repeat_n(b'n', 5000 - 4096));
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let first_page = ContentFingerprint::of(&page);
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        // The old content was 10000 bytes long and committed through 10000.
+        fs.seed_committed_from(
+            &path,
+            10_000,
+            Some(inode),
+            Some(10_000),
+            first_page.clone(),
+            None,
+        );
+        let replacement = ProgressMarker::File {
+            path: path.clone(),
+            inode: Some(inode),
+            start_byte: 4_000,
+            end_byte: 5_000,
+            file_size: 5_000,
+            mtime: String::new(),
+            content_fingerprint: first_page,
+            tail_fingerprint: None,
+        };
+        assert_eq!(
+            fs.committed_through(&replacement),
+            None,
+            "the old generation's committed offset was lent to a truncated file's range"
+        );
     }
 
     /// #567 (review): recovery retires a handed-back range as SUPERSEDED on
