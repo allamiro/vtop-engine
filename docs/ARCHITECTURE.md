@@ -365,8 +365,11 @@ What follows from that, in the engine:
   that line. A writer that opens the path for each write creates a new file
   once the rename has happened, and that file is read as a new source. A
   delete that fails (the open, the rename or the unlink) keeps the wait's
-  result and is retried on the next pass; only a file that changed starts
-  over.
+  result and is retried on the next pass. A file whose mtime alone moved
+  (same inode, first page and length, as when a producer stamps a finished
+  drop) starts the wait again. A file that is gone, or that changed in any
+  other way, is no longer a candidate until a new commit covers it. The
+  deletes run on the blocking pool, as many at once as the reads.
 - **The wait is in memory, so a restart starts it again.** The seed re-arms
   it with a fresh clock, but only from a row that names the inode and the
   first page, and whose batch saw the file end at the committed offset. A
