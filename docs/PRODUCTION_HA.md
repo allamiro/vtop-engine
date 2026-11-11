@@ -975,6 +975,16 @@ Short procedures now; expand into a full ops runbook before go-live.
      truncate an acknowledged record on any replica, old or new: the
      truncation guard refuses below the mark.
   3. Resume producers once the new leader is serving.
+- **Rolling a data node back past #635:** a replica holding a suffix a fence
+  kept in dispute marks its fencing-epoch journal version 2 until the new
+  leader settles it, usually within one append. A crash between clearing the
+  dispute and lowering the header can leave it at 2 until this release next
+  opens the directory, which lowers it. A release before #635 refuses
+  to start on it with `fencing-epoch journal: unsupported version 2`. That is
+  deliberate: the older release would ack the new leader's records over the
+  disputed ones. Start the newer release again and let the range's leader
+  settle the dispute (the header returns to 1), or replace the replica from
+  scratch. Do not edit the header by hand.
 - **Lineage verdicts on promotion records (#577), feature level 6:** a
   promotion counts a fenced replica's answer only when the candidate could
   prove the replica's epoch history agrees with its own (or the replica

@@ -30,6 +30,7 @@
 pub mod committed_floor;
 pub mod fencing_epochs;
 pub mod group_commit;
+pub mod kept_dispute;
 pub mod memory_budget;
 pub mod replication;
 pub mod retention_stats;
@@ -132,6 +133,12 @@ pub enum BrokerError {
     /// file stay [`BrokerError::Io`], which names the path.
     #[error("committed-floor file: {0}")]
     CommittedFloor(String),
+    /// The kept-dispute record beside the fencing-epoch journal (#635) is in
+    /// a shape this build must not read as "no dispute": written by a newer
+    /// release, or not a record at all. Plain I/O failures stay
+    /// [`BrokerError::Io`].
+    #[error("kept-dispute record: {0}")]
+    KeptDispute(String),
     /// A boundary-marker publication that could not complete (#240): no
     /// replication to convince, a v1 range whose merged producer identity
     /// cannot carry the marker, a fence landing before publication, or a
