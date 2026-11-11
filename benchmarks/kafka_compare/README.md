@@ -31,7 +31,10 @@ python3 benchmarks/kafka_compare/regenerate.py
 Useful knobs: `--sizes 100,1024`, `--reps 3`, `--sat-records 100:3000000,1024:1000000` (records per
 saturation run AND per consume run, per record size), `--fixed-seconds 30` (a fixed-rate run sends rate x this many records),
 `--smoke-records`, `--no-consume`, `--rebuild`, `--run-id` (one path component). Every one is checked
-before any Docker work. A run writes `results/<run-id>/` and never overwrites another.
+before any Docker work. A run writes `results/<run-id>/` and never overwrites another. Unlike
+`benchmarks/results/` (git-ignored by `benchmarks/.gitignore`, whose `results/*` is anchored to that
+directory), `kafka_compare/results/<run-id>/` is committed on purpose: the published reports are generated
+from it, and a reader can check every number against it.
 
 ## What it does
 
@@ -132,11 +135,64 @@ PNG whose decoded image is unchanged keeps its committed bytes.
 | OffsetCommit without a metadata plane | client: `Offset commit failed on partition bench-0 at offset <n>: The message format version on the broker does not support the request`; gateway: `kafka OffsetCommit refused: this gateway has no durable offset store` | `enable.auto.commit=false` for both systems |
 | compressed batches | `UnsupportedCompressionTypeException: batch 0: record batch is compressed (codec 4), which this gateway does not decompress` (zstd) | `compression.type=none` for both systems |
 | gateway on followers | the node refuses `kafka` on any role but leader or standalone | one gateway, on the range's leader |
+| gateway on a candidate (failover, #597) | ``error: `kafka` is configured on a Candidate node: the gateway is served by a leader or standalone only — it holds one broker, and a candidate's changes with the lease (#225)`` | no Kafka client can follow a VTOP failover; `failover.py` measures VTOP through its native client, labelled as such |
 
 Everything the producer and consumer perf tools use was served: the 4.3 JVM client found a common version
 for ApiVersions, Metadata, Produce (idempotent, the client's default, via InitProducerId), Fetch, ListOffsets
 and the classic group protocol, all within the gateway's non-flexible ranges. Advertised listeners worked
 with `kafka.advertised_host`.
+
+## Failover under load (#597)
+
+```bash
+# 3 faults x 5 repetitions x 2 systems, about 75 minutes; one system at a time.
+python3 benchmarks/kafka_compare/failover.py --reps 5
+# Charts and docs/benchmarks/kafka-failover.md (report.py sees failover.csv and hands it on).
+python3 benchmarks/kafka_compare/report.py benchmarks/kafka_compare/results/failover-<stamp>
+```
+
+**The client paths differ, and that is the first finding.** The only VTOP shape that fails over by itself
+is every node a *candidate* (the Helm replicated topology), and a candidate refuses the Kafka gateway (row
+above). A leased leader can carry the gateway, but its followers never take the range over themselves. So the
+Kafka side is driven by the JVM client (`kafka-verifiable-producer.sh`, idempotent, retries at the client
+default) and the VTOP side by its native client (`vtop-node produce` via
+[`vtop/failover-driver.sh`](vtop/failover-driver.sh)); every chart and table says so.
+
+- **Clusters.** Kafka as in phase 1 ([`compose.kafka.yml`](compose.kafka.yml)). VTOP:
+  [`compose.vtop-ha.yml`](compose.vtop-ha.yml), three co-located nodes ([`vtop/ha-node-*.yaml`](vtop/)),
+  each a metadata Raft voter and a candidate replica, TLS on every plane (promotion is refused on a plaintext
+  replica plane; certificates are minted per run with `scripts/live-chaos/gen-certs.sh` and never committed).
+  The CA key is deleted once the leaves are minted, private keys are owner-only (on Docker Desktop; a native
+  Linux daemon needs them readable by the container's uid 10001), and each node mounts only `ca.pem` and its
+  own two key pairs. Kafka's listeners are PLAINTEXT. Both stacks drop every capability and set
+  `no-new-privileges`.
+  Same per-node limits, enforced as in phase 1. Shipped timeouts on both (profile `defaults`).
+- **Per repetition.** Fresh cluster; producer at `--rate` (default 5,000 records/s), `acks=all`; at 35 s the
+  partition leader gets `kill9_leader`, `stop_leader` (`docker stop -t 30`) or `partition_leader`
+  (`docker network disconnect`, reconnected after 30 s); 60 s more load; then the whole partition is read
+  back (Kafka: `kafka-console-consumer.sh`, compared as text; VTOP: `vtop-node verify`, byte-exact, in
+  order). Leaders are observed every 100 ms ([`metadata_probe.py`](metadata_probe.py) for Kafka, the range
+  lease for VTOP).
+- **Output.** `results/failover-<stamp>/failover.csv` (one row per system, fault and repetition: unavailability
+  window, time to new leader, p99 latency before and after measured from the fixed-rate schedule, client
+  errors and retries, acknowledged records lost, duplicates, the read-back verdict), `timeline.csv` (records
+  acknowledged per 100 ms around the fault), `environment.json`, and `logs/` per repetition. A read-back that
+  finds a lost or duplicated acknowledged record keeps the run's raw data under `logs/<rep>/evidence/` and
+  makes `failover.py` exit 1. A repetition whose producer did not acknowledge every record (stopped at the
+  drain deadline, or exited non-zero) is a `failed` row: its gaps and latencies would leave out the unresolved
+  end of the outage. Its read-back verdict is still recorded.
+- **Expected noise in `logs/`.** Every Kafka `consumer.err` holds `ERROR Error processing message, terminating
+  consumer process: ... TimeoutException`: that is how `kafka-console-consumer.sh` ends a read with
+  `--timeout-ms` once no record arrives for 20 s, not a failed read-back. The next line,
+  `Processed a total of N messages`, is the read; the verdict is the `verify` column.
+- **Host contention.** The host is shared and not quieted. `host_noise.csv` samples it every 30 s (load
+  average, CPU idle, Docker containers including `rust:` builds, Lima VMs running), and `environment.json`
+  `host_noise` summarises it for the run and per repetition. The report names the repetitions it affected.
+- **Committed run, and the one it superseded.** `results/failover-20261111T032549Z` is the committed run.
+  It replaced `results/failover-20261110T185855Z`, whose VTOP producer sent a batch when its first record
+  was due and stamped acknowledgements after fsyncing its floor file, so its VTOP 30 s-before p99 was not
+  comparable with Kafka's (#613 review). That run was added in e0c3d35 and is last present, unchanged, in
+  190037b on the #613 branch (`git show 190037b:benchmarks/kafka_compare/results/failover-20261110T185855Z/failover.csv`).
 
 ## Known gaps
 
