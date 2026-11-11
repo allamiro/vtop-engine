@@ -209,11 +209,15 @@ pub struct InProcessFollower {
     /// Runs between reading the high-water mark and installing a dispute
     /// from it, so a unit test can land a concurrent mark exactly there.
     #[cfg(test)]
-    before_dispute_install: Mutex<Option<DisputeInstallHook>>,
+    before_dispute_install: Mutex<Option<TestHook>>,
+    /// Runs in `observe_hwm` after its settle and before its advance, so a
+    /// unit test can tell when a mark has passed its settle.
+    #[cfg(test)]
+    after_mark_settle: Mutex<Option<TestHook>>,
 }
 
 #[cfg(test)]
-type DisputeInstallHook = Box<dyn Fn() + Send + Sync>;
+type TestHook = Arc<dyn Fn() + Send + Sync>;
 
 /// A suffix a fence found in dispute and kept (#611), because the fencing
 /// caller could not prove that no quorum had acknowledged it.
@@ -338,18 +342,20 @@ impl InProcessFollower {
             kept_dispute: Mutex::new(None),
             #[cfg(test)]
             before_dispute_install: Mutex::new(None),
+            #[cfg(test)]
+            after_mark_settle: Mutex::new(None),
         })
     }
 
-    /// The test hook between a mark read and a dispute install.
+    /// Run a test hook. Cloned out of its slot first, so the slot's lock is
+    /// not held while the hook runs and a hook may touch its own slot.
     #[cfg(test)]
-    fn run_before_dispute_install(&self) {
-        if let Some(hook) = self
-            .before_dispute_install
+    fn run_test_hook(slot: &Mutex<Option<TestHook>>) {
+        let hook = slot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-        {
+            .clone();
+        if let Some(hook) = hook {
             hook();
         }
     }
@@ -1497,7 +1503,7 @@ impl InProcessFollower {
             // nothing is kept, which is the answer before #616.
             let mark = self.cluster_committed.get();
             #[cfg(test)]
-            self.run_before_dispute_install();
+            Self::run_test_hook(&self.before_dispute_install);
             let (from, bounded_by) = if divergence >= mark {
                 (divergence, 0)
             } else {
@@ -2130,6 +2136,8 @@ impl InProcessFollower {
         // kept records as committed and put them below a mark no truncation
         // may cross, wedging the replica.
         self.settle_kept_dispute(update.fencing_epoch, update.committed_high_watermark)?;
+        #[cfg(test)]
+        Self::run_test_hook(&self.after_mark_settle);
         // Never advertise above local durability.
         let local = self.local_committed_offset();
         let visible = update.committed_high_watermark.min(local);

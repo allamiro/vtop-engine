@@ -87,6 +87,14 @@ fn follower(dir: &tempfile::TempDir, meta: &MetaFencingEpoch) -> Arc<InProcessFo
 /// 10 in dispute. The hook lands the leader's mark of 11 exactly between the
 /// fence's mark read and that install.
 ///
+/// No timer decides the interleaving (#660 review). The hook starts the mark
+/// on another thread. If this fence does not hold the meta lock there (the
+/// bug), the hook waits until the mark has passed its settle, which saw no
+/// dispute; its advance then waits for the install's state lock and lands
+/// after it. If the fence holds the meta lock (the fix), the mark cannot
+/// even start its settle until the fence is done, and the hook returns at
+/// once.
+///
 /// Invariant: no kept dispute starts below the mark, and the leader's next
 /// record lands.
 #[test]
@@ -105,25 +113,37 @@ fn a_mark_landing_while_a_fence_keeps_a_dispute_never_leaves_it_below_the_mark()
     node.cluster_committed().advance_to(9);
     meta.set(NEWER_EPOCH);
 
+    let (settled, past_settle) = std::sync::mpsc::channel::<()>();
+    let settled = Mutex::new(settled);
+    *node.after_mark_settle.lock().unwrap() = Some(Arc::new(move || {
+        let _ = settled.lock().unwrap().send(());
+    }));
+    let past_settle = Mutex::new(past_settle);
+
     type Marking = std::thread::JoinHandle<Result<(), (ErrorCode, String)>>;
     let marking: Arc<Mutex<Option<Marking>>> = Arc::new(Mutex::new(None));
     {
         let leader_mark = Arc::clone(&node);
         let marking = Arc::clone(&marking);
-        *node.before_dispute_install.lock().unwrap() = Some(Box::new(move || {
-            let (done, finished) = std::sync::mpsc::channel();
+        let meta = meta.clone();
+        *node.before_dispute_install.lock().unwrap() = Some(Arc::new(move || {
             let leader_mark = Arc::clone(&leader_mark);
             *marking.lock().unwrap() = Some(std::thread::spawn(move || {
-                let outcome = leader_mark.observe_hwm(&CommittedHwmUpdate {
+                leader_mark.observe_hwm(&CommittedHwmUpdate {
                     range: range(),
                     fencing_epoch: NEWER_EPOCH,
                     committed_high_watermark: 11,
-                });
-                let _ = done.send(());
-                outcome
+                })
             }));
-            // Give the mark every chance to land before the install.
-            let _ = finished.recv_timeout(Duration::from_millis(300));
+            // A free meta lock means the mark can run its settle now: wait
+            // until it has. A held one (by this fence) means it cannot.
+            if meta.try_snapshot().is_some() {
+                past_settle
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("the leader's mark never passed its settle");
+            }
         }));
     }
     node.fence(
@@ -140,8 +160,9 @@ fn a_mark_landing_while_a_fence_keeps_a_dispute_never_leaves_it_below_the_mark()
         ],
     )
     .expect("fenced");
-    // Drop the hook, and the replica it holds, before judging.
+    // Drop the hooks, and the replica they hold, before judging.
     *node.before_dispute_install.lock().unwrap() = None;
+    *node.after_mark_settle.lock().unwrap() = None;
     let marked = marking
         .lock()
         .unwrap()
@@ -161,4 +182,26 @@ fn a_mark_landing_while_a_fence_keeps_a_dispute_never_leaves_it_below_the_mark()
     let next = node.next_offset();
     node.apply_append(&append(NEWER_EPOCH, next))
         .expect("the leader's next record must land, not be refused below the mark");
+}
+
+/// #660 review (cubic P3). A test hook ran while its slot's lock was held,
+/// so a hook that cleared or replaced its own slot deadlocked. It is now
+/// cloned out of the slot first.
+#[test]
+fn a_test_hook_may_clear_its_own_slot() {
+    let slot: Arc<Mutex<Option<TestHook>>> = Arc::new(Mutex::new(None));
+    let own = Arc::clone(&slot);
+    *slot.lock().unwrap() = Some(Arc::new(move || {
+        *own.lock().unwrap() = None;
+    }));
+    let (done, finished) = std::sync::mpsc::channel();
+    let running = Arc::clone(&slot);
+    std::thread::spawn(move || {
+        InProcessFollower::run_test_hook(&running);
+        let _ = done.send(());
+    });
+    finished
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a hook that cleared its own slot deadlocked");
+    assert!(slot.lock().unwrap().is_none());
 }
