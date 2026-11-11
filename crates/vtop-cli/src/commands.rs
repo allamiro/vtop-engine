@@ -683,22 +683,48 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 },
                 None => None,
             };
+            // Taken before the run moves the cursor: with --metrics-file, a run
+            // counts only once its metrics are published (review of #652).
+            let snapshot = match (cursor_file, metrics_file) {
+                (Some(cursor), Some(_)) => Some(crate::scrub::CursorSnapshot::take(cursor)?),
+                _ => None,
+            };
             let mut report = engine
                 .scrub(crate::scrub::committed_rows(ledger, digested), &opts)
                 .await?;
             report.sources = sources;
             report.warnings.extend(digest_warning);
-            if let Some(path) = metrics_file {
-                crate::coverage::write_textfile(
-                    path,
-                    &report.prometheus_text(previous.as_deref(), chrono::Utc::now().timestamp()),
-                )?;
-            }
+            // The report first, so the findings reach stdout whatever happens
+            // to the metrics file.
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 for line in report.lines() {
                     println!("{line}");
+                }
+            }
+            if let Some(path) = metrics_file {
+                let written = crate::coverage::write_textfile(
+                    path,
+                    &report.prometheus_text(previous.as_deref(), chrono::Utc::now().timestamp()),
+                );
+                if let Err(error) = written {
+                    // Unpublished, the run's findings are in no metric the
+                    // alerts read. Put the cursor back, so the next run checks
+                    // this slice again and publishes what it finds.
+                    let undone = match &snapshot {
+                        Some(snapshot) => match snapshot.restore() {
+                            Ok(()) => "; the cursor was put back, so the next run checks \
+                                       this slice again"
+                                .to_string(),
+                            Err(e) => format!("; the cursor could NOT be put back ({e})"),
+                        },
+                        None => String::new(),
+                    };
+                    return Err(VtopError::Other(format!(
+                        "scrub metrics file {} could not be written ({error}){undone}",
+                        path.display()
+                    )));
                 }
             }
             if report.passed {

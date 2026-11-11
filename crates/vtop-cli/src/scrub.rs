@@ -573,6 +573,63 @@ fn lock_cursor(path: &Path) -> Result<CursorLock, VtopError> {
     }
 }
 
+/// The cursor file as it stood before a run, so the run can be undone if its
+/// results cannot be published (review of #652). The cursor is saved batch by
+/// batch as the run goes, which a killed run needs. A run that finishes but
+/// whose metrics file then fails to write would otherwise have moved the
+/// cursor past findings that reached no metrics. The next runs would check
+/// later slices, and the findings alert would stay silent until the next
+/// pass. Restored, the next run checks the same slice again and publishes
+/// what it finds.
+pub struct CursorSnapshot {
+    path: PathBuf,
+    /// `None`: there was no cursor file, so restoring removes the run's one.
+    bytes: Option<Vec<u8>>,
+}
+
+impl CursorSnapshot {
+    pub fn take(path: &Path) -> Result<Self, VtopError> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            bytes,
+        })
+    }
+
+    /// Put the cursor back, under the cursor lock: a scrub that has started
+    /// since holds it, and is not undone.
+    pub fn restore(&self) -> Result<(), VtopError> {
+        let _lock = lock_cursor(&self.path)?;
+        match &self.bytes {
+            Some(bytes) => {
+                let dir = self
+                    .path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                let name = self
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("scrub.cursor");
+                let tmp = dir.join(format!(".{name}.restore.tmp"));
+                std::fs::write(&tmp, bytes)?;
+                std::fs::rename(&tmp, &self.path)?;
+            }
+            None => match std::fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            },
+        }
+        Ok(())
+    }
+}
+
 // ---- The run ------------------------------------------------------------------
 
 /// A finding, as printed and as exported in JSON.
@@ -1217,6 +1274,22 @@ mod tests {
         std::fs::write(&path, "{ half a cur").unwrap();
         let error = Cursor::load(&path).unwrap_err().to_string();
         assert!(error.contains("delete it"), "{error}");
+    }
+
+    #[test]
+    fn a_cursor_snapshot_puts_back_exactly_what_was_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scrub.cursor");
+        std::fs::write(&path, b"{\"before\":1}").unwrap();
+        let snapshot = CursorSnapshot::take(&path).unwrap();
+        std::fs::write(&path, b"{\"after\":2}").unwrap();
+        snapshot.restore().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"before\":1}");
+
+        // A scrub holding the cursor is not undone under it.
+        let held = lock_cursor(&path).unwrap();
+        assert!(snapshot.restore().is_err());
+        drop(held);
     }
 
     #[test]

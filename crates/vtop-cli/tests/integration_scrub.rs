@@ -710,6 +710,93 @@ async fn an_unreadable_metrics_file_fails_the_run_and_is_left_alone() {
     );
 }
 
+/// A run whose metrics cannot be published does not count (review of #652).
+/// The cursor is saved batch by batch as the run goes. If the metrics file
+/// then fails to write, a finding from that slice used to be in neither
+/// place: not in the metrics, and the cursor had already moved past it, so
+/// the next runs checked later slices and the findings alert stayed silent
+/// until the next pass. The cursor is now put back where the run started, so
+/// the next run checks the same slice again and publishes what it finds.
+#[tokio::test]
+async fn a_finding_whose_metrics_could_not_be_published_is_found_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let inputs = vec![
+        write_input(dir.path(), "a.log", 3),
+        write_input(dir.path(), "b.log", 4),
+        write_input(dir.path(), "c.log", 5),
+    ];
+    let store = dir.path().join("store");
+    let mut cfg = config(dir.path(), &inputs, "localfs");
+    cfg.upload.local_path = Some(store.to_string_lossy().into_owned());
+    let config_path = dir.path().join("config.yaml");
+    std::fs::write(&config_path, serde_yaml::to_string(&cfg).unwrap()).unwrap();
+    let first = {
+        let mut engine = Engine::new(cfg.clone(), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let done = engine.process_once(SourceType::File).await.unwrap();
+        assert!(done.iter().all(|o| o.committed) && done.len() == 3);
+        let mut rows = engine.store.list_batches().await.unwrap();
+        rows.sort_by(|a, b| a.batch_id.cmp(&b.batch_id));
+        rows.remove(0)
+    };
+    // Damage the batch the first slice checks: same size, different bytes.
+    let (bucket, key) = first
+        .object_uri
+        .as_deref()
+        .unwrap()
+        .strip_prefix("s3://")
+        .unwrap()
+        .split_once('/')
+        .unwrap();
+    let object = store.join(bucket).join(key);
+    let len = std::fs::metadata(&object).unwrap().len() as usize;
+    std::fs::write(&object, vec![0u8; len]).unwrap();
+
+    let cursor = dir.path().join("scrub.cursor");
+    let metrics_dir = dir.path().join("textfile");
+    let metrics = metrics_dir.join("scrub.prom");
+    let run = || {
+        let cli = vtop_cli::commands::Cli::try_parse_from([
+            "vtopctl",
+            "scrub",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--cursor-file",
+            cursor.to_str().unwrap(),
+            "--limit",
+            "1",
+            "--metrics-file",
+            metrics.to_str().unwrap(),
+        ])
+        .unwrap();
+        vtop_cli::commands::dispatch(cli)
+    };
+
+    // The metrics directory does not exist: the run finds the damage and
+    // cannot publish it.
+    assert_eq!(run().await, 1);
+    assert!(!metrics.exists());
+    assert!(
+        !cursor.exists(),
+        "the cursor is put back where the run started (no cursor yet)"
+    );
+
+    // Publication repaired: the next slice is the same one, so the finding
+    // is published.
+    std::fs::create_dir_all(&metrics_dir).unwrap();
+    assert_eq!(run().await, 1, "the damaged batch is checked again");
+    let text = std::fs::read_to_string(&metrics).unwrap();
+    assert!(
+        text.contains("vtop_scrub_objects_total{result=\"mismatched\"} 1\n"),
+        "{text}"
+    );
+    assert!(
+        metric_value(&text, "vtop_scrub_last_finding_timestamp_seconds") > 0.0,
+        "the findings alert can see it: {text}"
+    );
+}
+
 fn metric_value(text: &str, name: &str) -> f64 {
     text.lines()
         .find_map(|line| line.strip_prefix(&format!("{name} ")))
