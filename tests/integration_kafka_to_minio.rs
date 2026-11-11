@@ -986,9 +986,21 @@ fn group_offset_if_any(topic: &str, group: &str) -> Option<i64> {
         .unwrap();
     let mut tpl = TopicPartitionList::new();
     tpl.add_partition(topic, 0);
-    let committed = probe
-        .committed_offsets(tpl, std::time::Duration::from_secs(10))
-        .expect("read the group's committed offset");
+    // A broker that has just started may not have a group coordinator yet
+    // (its offsets topic is still being created): ask again rather than fail
+    // a test about the engine on the broker's warm-up.
+    let mut attempts = 0;
+    let committed = loop {
+        match probe.committed_offsets(tpl.clone(), std::time::Duration::from_secs(10)) {
+            Ok(committed) => break committed,
+            Err(e) if attempts < 10 => {
+                attempts += 1;
+                eprintln!("reading the group's committed offset: {e}; retrying");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            Err(e) => panic!("read the group's committed offset: {e}"),
+        }
+    };
     match committed.find_partition(topic, 0).map(|e| e.offset()) {
         Some(rdkafka::Offset::Offset(at)) => Some(at),
         _ => None,

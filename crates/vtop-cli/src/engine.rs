@@ -2847,8 +2847,7 @@ impl Engine {
                 Err(e) => {
                     tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery commit failed");
                     summary.still_pending += 1;
-                    self.unsettled
-                        .push(Unsettled::recovered_commit_failed(&rec));
+                    self.unsettled.push(Unsettled::recovered_commit_failed(rec));
                 }
             }
         } else {
@@ -3601,8 +3600,8 @@ struct Unsettled {
     /// Held back by recovery above a range being read again, rather than
     /// left by a source commit that failed.
     held_back: bool,
-    /// The adapter's committed point for the row when recovery held it back
-    /// - the restart seed. Settling waits for the point to move past it
+    /// The adapter's committed point for the row when recovery held it back:
+    /// the restart seed. Settling waits for the point to move past it
     /// (review of #624).
     committed_at_hold: Option<i128>,
     /// Whether settling it counts its verification too: a row recovery left
