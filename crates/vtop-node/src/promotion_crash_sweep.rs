@@ -107,7 +107,7 @@
 //!   finished and the last election failed with answers judged Unknown;
 //!   every acknowledged record must still be durable on a majority.
 //!   Reproduction:
-//!   `reproduction_a_second_failover_after_a_catch_up_finds_no_provable_quorum`.
+//!   `reproduction_two_caught_up_replicas_cannot_prove_a_quorum_after_the_leader_is_lost`.
 //! * #641. A deposed leader that returns without being fenced keeps its
 //!   unacknowledged suffix under the new leader's mark (the "absent
 //!   replica" item in `promotion.rs`). Signature: the violation is on a node
@@ -1583,20 +1583,15 @@ fn a_crash_at_every_step_of_an_outvoted_dispute_loses_no_acknowledged_record() {
     assert_sweep(Shape::UnackedOutvoted);
 }
 
-/// Found by the sweep, not explained by #635, and reported rather than
-/// fixed here. The established leader R dies after it caught C up on 5..10
-/// and committed its marker. C's fencing-epoch journal attributes 5..10 to
-/// the epoch it adopted at its own tail before the catch-up delivered them
-/// (`record_adoption` at the follower's next offset); R's attributes them to
-/// epoch 18, which wrote them. Every later fence compares the two as
-/// diverged at 5, below both tails, so each answer is Unknown and never
-/// counted (#577). L, restarted and caught up the same way, disagrees with
-/// R about 10..12. No candidate reaches a provable quorum again, and C,
-/// which kept the "disputed" 5..12 below its own high-water mark, refuses
-/// every append from the next leader. All three hold identical bytes.
+/// Was the first #640 reproduction; passes since #616's 786fb07 and stays
+/// as a guard. The established leader R dies after it caught C up on 5..10
+/// and committed its marker. C files 5..10 under the epoch it adopted at its
+/// own tail, R under 18, so they still disagree about who wrote them (#640),
+/// but L restarts, agrees with R, and R is established again with L. Before
+/// 786fb07, C kept the "disputed" 5..12 below its own high-water mark and
+/// refused every append from the next leader, so no leader ever finished.
 #[test]
-#[ignore = "#640: caught-up records are filed under the adopted epoch, so no quorum is provable after a second failover"]
-fn reproduction_a_second_failover_after_a_catch_up_finds_no_provable_quorum() {
+fn a_second_failover_after_a_catch_up_still_finishes_with_two_agreeing_replicas() {
     let setup = setup_disks();
     let fault = Fault::ProcessDeath { node: R, step: 30 };
     let outcome = run(Shape::AckedLeaderStaysDown, fault, &setup);
@@ -1604,6 +1599,33 @@ fn reproduction_a_second_failover_after_a_catch_up_finds_no_provable_quorum() {
         outcome.violations.is_empty(),
         "{}",
         outcome.report(Shape::AckedLeaderStaysDown, &fault)
+    );
+}
+
+/// #640. R leads at 20 after catching C up on 5..10, and L, back before the
+/// election, has caught up too. R's producer-epoch journal entry is torn
+/// as it takes its marker, so R refuses to reopen and stays out (that
+/// journal's designed answer to a torn entry). L and C hold identical
+/// bytes, but each filed the records it caught up on under the epoch it
+/// adopted at its own tail, so each judges the other's answer Unknown and
+/// neither is ever established. The range is unavailable with two healthy
+/// replicas.
+#[test]
+#[ignore = "#640: caught-up records are filed under the adopted epoch, so two healthy replicas cannot prove a quorum"]
+fn reproduction_two_caught_up_replicas_cannot_prove_a_quorum_after_the_leader_is_lost() {
+    let setup = setup_disks();
+    let fault = Fault::Storage {
+        node: R,
+        plan: FaultPlan::CrashDuringWrite {
+            op: 225,
+            byte_cut: 28,
+        },
+    };
+    let outcome = run(Shape::AckedLeaderReturns, fault, &setup);
+    assert!(
+        outcome.violations.is_empty(),
+        "{}",
+        outcome.report(Shape::AckedLeaderReturns, &fault)
     );
 }
 
