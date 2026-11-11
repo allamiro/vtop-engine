@@ -55,6 +55,7 @@ async fn a_store_that_accepts_and_never_answers_fails_the_request_instead_of_han
         transport: "tcp_tls".into(),
         tuning: Default::default(),
         request_timeout_seconds: 1,
+        request_min_bytes_per_second: 4 * 1024,
         max_egress_bytes_per_second: None,
     })
     .await
@@ -156,6 +157,7 @@ async fn a_body_that_drips_after_the_headers_fails_the_read_instead_of_hanging()
         transport: "tcp_tls".into(),
         tuning: Default::default(),
         request_timeout_seconds: 1,
+        request_min_bytes_per_second: 4 * 1024,
         max_egress_bytes_per_second: None,
     })
     .await
@@ -231,6 +233,7 @@ async fn slow_headers_come_out_of_the_bodys_allowance() {
         transport: "tcp_tls".into(),
         tuning: Default::default(),
         request_timeout_seconds: 2,
+        request_min_bytes_per_second: 4 * 1024,
         max_egress_bytes_per_second: None,
     })
     .await

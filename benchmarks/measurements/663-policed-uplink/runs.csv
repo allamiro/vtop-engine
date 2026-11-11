@@ -1,0 +1,12 @@
+tag,run_id,committed,failed,seeded,busy_s,duration_s,goodput_mbps,link_mbps,fraction,upload_p50_s,upload_max_s,harness_rc
+main-c574f6a-policed-r1,tcpb-wan100-policed-default-r1-20261111T024537Z-njmkgf,0,16,16,0,1721.626,0.0,10.0,0.0,,,0
+main937-s24-r1,policed-uplink-default-width-20261111T044621Z-0bf7bn,0,16,16,1811.0,1811.036,0.0,10.0,0.0,,,6
+fix2-s24-r1,policed-uplink-default-width-20261111T033130Z-uhghpt,16,0,16,881.4,881.441,3.045,10.0,0.305,419.5,431.4,0
+fix2-s24-r2,policed-uplink-default-width-20261111T040654Z-ntvuji,16,0,16,869.8,869.782,3.086,10.0,0.309,446.3,462.0,0
+fix2-s24-r3,policed-uplink-default-width-20261111T043157Z-lq61rb,16,0,16,849.5,849.501,3.16,10.0,0.316,421.5,448.9,0
+main937-wan100-r1,tcpb-wan100-default-r1-20261111T035639Z-fudpfq,16,0,16,291.3,291.814,9.216,9.567,0.963,138.0,141.4,0
+fix2-wan100-r1,tcpb-wan100-default-r1-20261111T034627Z-89fjvd,16,0,16,287.5,287.881,9.337,9.566,0.976,131.8,142.4,0
+fix2-wan100-r2,tcpb-wan100-default-r2-20261111T042139Z-fo84o5,16,0,16,290.4,291.834,9.244,9.57,0.966,137.8,141.5,0
+main937-loss1-r1,tcpb-wan100-loss1-default-r1-20261111T040146Z-52j688,16,0,16,293.2,293.858,9.154,9.572,0.956,136.4,147.3,0
+fix2-loss1-r1,tcpb-wan100-loss1-default-r1-20261111T035130Z-c6q2i4,16,0,16,292.6,293.784,9.173,9.571,0.958,138.4,143.2,0
+fix2-loss1-r2,tcpb-wan100-loss1-default-r2-20261111T042646Z-0h5nwx,16,0,16,293.8,295.873,9.138,9.573,0.955,137.2,144.2,0

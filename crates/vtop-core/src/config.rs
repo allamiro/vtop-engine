@@ -525,11 +525,35 @@ pub struct UploadConfig {
     /// answers blocks the engine forever with the process alive and no error:
     /// the AWS SDK's defaults bound connecting but not waiting for a response.
     /// The SDK's own retries still apply, so one request is bounded by three
-    /// of these. An upload part or object body counts: size it for the
-    /// slowest link a part must cross (a 64 MiB part at 1 MiB/s needs about a
-    /// minute). Compatibility backends use `command_timeout_seconds` instead.
+    /// of these. A request that carries an object or part body is allowed
+    /// this PLUS the time its body takes at
+    /// [`request_min_bytes_per_second`](Self::request_min_bytes_per_second)
+    /// (#663), so a slow link stretches the deadline instead of failing every
+    /// body that cannot cross it in a fixed time. Compatibility backends use
+    /// `command_timeout_seconds` instead.
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: u64,
+    /// The slowest rate, in bytes per second, at which ONE request's body may
+    /// cross the link and still be waited for (native S3 backend, #663). A
+    /// request that carries a body (an object, a multipart part, a manifest)
+    /// gets `request_timeout_seconds` plus its size at this rate for each
+    /// attempt: an 8 MiB part at the default 4 KiB/s is allowed 300 + 2048 s.
+    ///
+    /// The fixed per-attempt deadline it replaces for bodies failed every
+    /// object on a policed 10 Mbit/s uplink: the engine's default width puts
+    /// two dozen part uploads on the link at once, each got about 11 KB/s, and
+    /// an 8 MiB part needs about 760 s at that share — so every attempt was
+    /// cut at 300 s, re-sent from its first byte, and cut again. The width
+    /// times the parts in flight divides the link, so this is a per-REQUEST
+    /// rate: at the default 32 requests, 4 KiB/s each is about 1 Mbit/s for
+    /// the whole uplink. Lower it for a slower uplink or a wider
+    /// configuration; a value at or above the link's rate restores the fixed
+    /// deadline. A store that stops reading a body is still caught within
+    /// seconds by the SDK's stalled-upload protection; what this lengthens is
+    /// only how long a store that has read a body may take to answer before
+    /// the attempt is abandoned. Must be > 0.
+    #[serde(default = "default_request_min_bytes_per_second")]
+    pub request_min_bytes_per_second: u64,
     /// Optional named profile / alias for command-based backends.
     #[serde(default)]
     pub profile: Option<String>,
@@ -1013,6 +1037,9 @@ fn default_command_timeout_seconds() -> u64 {
 fn default_request_timeout_seconds() -> u64 {
     300
 }
+fn default_request_min_bytes_per_second() -> u64 {
+    4 * 1024
+}
 fn default_command_max_output_bytes() -> usize {
     1024 * 1024
 }
@@ -1124,6 +1151,15 @@ impl VtopConfig {
         if self.upload.backend == "s3_native" && self.upload.request_timeout_seconds == 0 {
             return Err(VtopError::Config(
                 "upload.request_timeout_seconds must be > 0".into(),
+            ));
+        }
+        // Zero would divide a body by nothing: an attempt with no deadline.
+        if self.upload.backend == "s3_native" && self.upload.request_min_bytes_per_second == 0 {
+            return Err(VtopError::Config(
+                "upload.request_min_bytes_per_second must be > 0: it is the slowest rate a \
+                 request body may cross the link at, and zero would leave a body upload \
+                 with no deadline at all"
+                    .into(),
             ));
         }
         if self.engine.state_store_timeout_seconds == 0 {
@@ -2192,6 +2228,34 @@ upload:
         let other = yaml.replace(
             "  backend: s3_native",
             "  backend: mock\n  request_timeout_seconds: 0",
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&other).unwrap();
+        cfg.validate().unwrap();
+
+        // The body floor (#663): 4 KiB/s unless set, settable, and never zero
+        // on the backend that divides by it.
+        let cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.upload.request_min_bytes_per_second, 4096);
+        let set = yaml.replace(
+            "  backend: s3_native",
+            "  backend: s3_native\n  request_min_bytes_per_second: 1024",
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&set).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.upload.request_min_bytes_per_second, 1024);
+        let zero = yaml.replace(
+            "  backend: s3_native",
+            "  backend: s3_native\n  request_min_bytes_per_second: 0",
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&zero).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("upload.request_min_bytes_per_second") && err.contains("> 0"),
+            "{err}"
+        );
+        let other = yaml.replace(
+            "  backend: s3_native",
+            "  backend: mock\n  request_min_bytes_per_second: 0",
         );
         let cfg: VtopConfig = serde_yaml::from_str(&other).unwrap();
         cfg.validate().unwrap();

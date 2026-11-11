@@ -82,6 +82,31 @@ def measured_nothing(success: int, failed: int, errors: int,
     return success == 0 and failed == 0 and (errors > 0 or files_seeded > 0)
 
 
+def unmet_commit_requirement(scenario, success: int, failed: int,
+                             files_seeded: int) -> str:
+    """Why a run that must commit every object did not, or "" when it did (#663).
+
+    A scenario with `require_all_committed: true` asserts the outcome, not just
+    records it: the policed-uplink regression (scenario 24) exists because the
+    shipped defaults once committed nothing there, and a summary that files
+    zero commits as a measurement would let that come back unnoticed. The run
+    fails it when any batch failed, when nothing committed, or — for
+    whole-file input, where each seeded file is exactly one object — when
+    fewer objects committed than files were seeded. Line-oriented input packs
+    files into batches, so there only the first two can be checked.
+    """
+    if not scenario.get("require_all_committed", False):
+        return ""
+    if failed > 0:
+        return f"{failed} batch(es) failed"
+    if success == 0:
+        return "no object committed"
+    whole_file = scenario.get("whole_file", False) or scenario.get("format") == "binary"
+    if whole_file and success < files_seeded:
+        return f"{success} of {files_seeded} seeded object(s) committed"
+    return ""
+
+
 def uncounted_batches(rc: int, outcomes: list[dict]) -> int:
     """How many things one `process_once` did that its committed bytes cannot
     account for on the wire (#478, review).
@@ -1042,6 +1067,12 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
               f"{files_seen} seeded file(s) ({errors} error(s)); nothing was "
               f"measured. Engine stderr: {stderr_log}", file=sys.stderr)
         return 4
+    unmet = unmet_commit_requirement(sc, success, failed, files_seen)
+    if unmet:
+        print(f"[bench] FAILED: the scenario requires every object to commit, and "
+              f"{unmet}. Summary: {os.path.join(writer.dir, 'summary.md')}",
+              file=sys.stderr)
+        return 6
     return 0
 
 

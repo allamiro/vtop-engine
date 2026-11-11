@@ -595,6 +595,7 @@ own (see its row and [The flow beside the upload](#the-flow-beside-the-upload-47
 | `15-policed-uplink` | a 10 Mbit/s policer, no queue at all | the edge-uplink case with **no queueing-delay signal**: the round trip stays flat while the link shreds bursts, so a delay-based control law degrades silently. The drops are the policer's, so the loss columns read 0 |
 | `16-contended-bottleneck` | four BDP of buffer, no loss | queue depth: what a batch waits behind when the buffer is deep (4 BDP = 400 ms of standing queue at this rate). **Not** fairness or contention — nothing here starts a second flow; `18-competing-flow` is that half |
 | `18-competing-flow` | one BDP of buffer, no loss, **a second flow** | what the upload costs its neighbour (#478): the engine runs at the shipped default of eight concurrent batches while a plain-TCP bulk flow shares the queue. One BDP and no loss, the link of `14-lossy-wan`'s zero-loss control — but **not** its workload: 150 small JSONL files in batches of up to 5000 records, no concurrent seeder, 150 s, because with a sustained backlog and small batches the engine's cycles ran too long for one to fit wholly inside the 60 s window, and a window with no whole cycle is refused. Read it against its own solo windows, not against scenarios 13-16 |
+| `24-policed-uplink-default-width` | `15-policed-uplink`'s policer, no queue at all | the regression for #663, with a workload of its own: sixteen 20 MiB objects (JSONL, `compression: none`, one object per batch) at the **shipped** width and multipart settings, the #483 baseline's shape. Those defaults once committed none of them here, because every part upload's fixed deadline expired at its share of the policed link. `require_all_committed: true` fails the run unless every object commits; read its goodput against the 10 Mbit/s token rate. About fifteen minutes per run |
 
 #### The calibration gate
 
@@ -1096,6 +1097,13 @@ checksum, backend, duration_seconds, fault, sys_sample_interval, bucket,
 endpoint_url, `runner_mode` and `engine_mode` / `engine_scrape_interval_seconds`
 (§3), and the `shaping_*` keys (§7). `run_matrix.py --all`
 automatically picks it up.
+
+`file_size` also takes a whole number of bytes, for a workload of identical
+objects (a line format stops at the first line that reaches it). A scenario
+that sets `require_all_committed: true` asserts its outcome instead of only
+recording it: the run still writes its summary, then exits 6 if any batch
+failed, nothing committed, or — for whole-file input — fewer objects
+committed than files were seeded (#663).
 
 ## Benchmark matrix coverage
 

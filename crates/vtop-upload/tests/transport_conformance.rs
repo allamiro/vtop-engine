@@ -39,6 +39,7 @@ async fn every_registered_transport_holds_the_evidence_rules() {
             tuning: Default::default(),
             max_egress_bytes_per_second: None,
             request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
         })
         .await
         .unwrap_or_else(|e| panic!("[{transport}] backend construction: {e}"));

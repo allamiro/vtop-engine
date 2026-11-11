@@ -76,6 +76,7 @@ pub fn file_config(
             verify_tls: false,
             transport: "tcp_tls".into(),
             request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
             profile: None,
             command_binary: None,
             command_timeout_seconds: 300,

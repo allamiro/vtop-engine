@@ -16,7 +16,9 @@ DEFAULTS: dict[str, Any] = {
     "name": "scenario",
     "description": "",
     "volume": 1000,                 # number of input files
-    "file_size": "small",           # small | medium | large | mixed
+    # small | medium | large | mixed, or a whole number of bytes: every file
+    # that size (a line format stops at the first line that reaches it).
+    "file_size": "small",
     "format": "jsonl",              # jsonl|csv|txt|cef|leef|syslog|mixed|binary
     "batch_max_records": 10000,
     "batch_max_bytes": 104857600,
@@ -46,6 +48,11 @@ DEFAULTS: dict[str, Any] = {
     # Seconds between background seeding rounds, when seeding concurrently.
     "seed_interval_seconds": 1.0,
     "fault": "none",                # none | verify_fail | replay
+    # Assert the outcome instead of only recording it (#663): with true, a run
+    # in which any batch failed, nothing committed, or (for whole-file input)
+    # fewer objects committed than files were seeded exits 6 after writing its
+    # summary. Off by default: most scenarios measure failure as a result.
+    "require_all_committed": False,
     "sys_sample_interval": 1.0,     # seconds between system-metric samples
     "bucket": "telemetry-data",
     "endpoint_url": "",             # for backend=minio
