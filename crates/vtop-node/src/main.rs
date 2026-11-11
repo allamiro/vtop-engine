@@ -14,6 +14,8 @@ mod lease_watcher;
 mod meta_node;
 mod observe;
 mod promotion;
+#[cfg(test)]
+mod promotion_crash_sweep;
 mod tls;
 mod version_report;
 
