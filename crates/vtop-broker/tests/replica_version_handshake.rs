@@ -313,7 +313,7 @@ fn a_new_leader_speaks_the_old_protocol_to_an_old_follower_until_finalized() {
         0
     );
     assert!(
-        !seen.lock().unwrap().contains(&"append"),
+        seen.lock().unwrap().iter().all(|kind| *kind == "hello"),
         "nothing past the hello may reach a refused follower: {:?}",
         seen.lock().unwrap()
     );
@@ -475,6 +475,53 @@ fn peers_that_speak_the_handshake_negotiate_down_and_one_below_the_level_is_refu
         .unwrap_err();
     assert!(
         matches!(&refused, BrokerError::ReplicaVersion(why) if why.contains("implements only")),
+        "{refused}"
+    );
+}
+
+/// #634 review: an answer that selects a protocol above the one the peer
+/// says it implements is not a negotiation either side can keep, however
+/// well it fits this side's own range. The dialer refuses it.
+#[test]
+fn an_answer_selecting_beyond_the_peers_own_maximum_is_refused() {
+    let runtime = Runtime::new().unwrap();
+    let confused = runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    while let Ok(Some(frame)) = read_frame(&mut stream, LIMITS).await {
+                        let reply = WireFrame {
+                            request_id: frame.request_id,
+                            stream_id: frame.stream_id,
+                            message: ReplicaHelloAccept {
+                                node_id: FOLLOWER,
+                                selected_protocol: REPLICA_PROTOCOL_HANDSHAKE,
+                                max_protocol: REPLICA_PROTOCOL_LEGACY,
+                                supported_feature_level: vtop_meta::SUPPORTED_FEATURE_LEVEL,
+                            }
+                            .to_message(),
+                        };
+                        if write_frame(&mut stream, &reply, LIMITS).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    });
+    let refused = runtime
+        .block_on(status_client(ClusterFeatureLevel::unknown()).status(
+            confused,
+            "localhost",
+            FOLLOWER,
+            &range(),
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(&refused, BrokerError::ReplicaVersion(why) if why.contains("selected protocol")),
         "{refused}"
     );
 }

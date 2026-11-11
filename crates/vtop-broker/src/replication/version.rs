@@ -26,7 +26,7 @@
 //! nobody. That keeps static and plaintext ranges working exactly as they
 //! did; the guarantee the handshake adds is enforced by every node that
 //! knows the level, and the metadata gate (`vtopctl meta enable-features`)
-//! refuses to raise it while a live range member reports less.
+//! refuses to raise it while a counted node has not reported it.
 
 use crate::{BrokerError, BrokerResult};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -178,19 +178,18 @@ where
     let peer = match &reply.message {
         message if ReplicaHelloAccept::from_message(message).is_some() => {
             let accept = ReplicaHelloAccept::from_message(message).expect("checked above");
-            // The peer chose; check it chose something both of us speak, so
+            // The peer chose; check it chose something BOTH of us speak - in
+            // this node's offer, and at or below the peer's own maximum - so
             // a confused or hostile answer cannot move this side to a
-            // protocol it never offered.
-            if negotiate_replica_protocol(
-                hello.min_protocol,
-                hello.max_protocol,
-                accept.selected_protocol,
-                accept.selected_protocol,
-            ) != Some(accept.selected_protocol)
+            // protocol one end does not implement (review).
+            let selected = accept.selected_protocol;
+            if !(hello.min_protocol..=hello.max_protocol).contains(&selected)
+                || selected > accept.max_protocol
             {
                 return Err(BrokerError::ReplicaVersion(format!(
-                    "the replica peer selected protocol {}, outside the {}..={} this node offered",
-                    accept.selected_protocol, hello.min_protocol, hello.max_protocol
+                    "the replica peer selected protocol {selected}, outside the {}..={} this \
+                     node offered or above the {} it says it implements",
+                    hello.min_protocol, hello.max_protocol, accept.max_protocol
                 )));
             }
             PeerVersion::Negotiated {

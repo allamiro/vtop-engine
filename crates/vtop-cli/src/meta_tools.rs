@@ -161,9 +161,10 @@ pub enum MetaCommand {
     /// and asking for a level already in force is a no-op. The reply's
     /// generation is the level now in force.
     ///
-    /// A level above 7 is also refused while any live range member reports
-    /// a lower one (#634); the refusal names every such node. See
-    /// `node-versions`.
+    /// A level above 7 is also refused while any counted node - a live range
+    /// member, or any node that has reported, unless marked dead - has not
+    /// reported that level or higher (#634); the refusal names every such
+    /// node. See `node-versions`.
     EnableFeatures {
         #[command(flatten)]
         common: MetaCommonArgs,
@@ -1532,7 +1533,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 }
             }
             match level {
-                Some(level) => judge_feature_raise(level, Ok(read)),
+                Some(level) => judge_node_versions_listing(level, read),
                 None => Ok(()),
             }
         }
@@ -2085,25 +2086,50 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
     }
 }
 
+/// `node-versions --level`'s verdict (#634): the same judgement as a raise,
+/// but with no state machine behind it to judge the nodes past a truncated
+/// list, so a truncated list that names no blocker is inconclusive.
+fn judge_node_versions_listing(
+    level: u32,
+    read: vtop_meta::transport::AdminReadClusterVersionsResponse,
+) -> Result<(), String> {
+    if read.truncated
+        && level > vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL
+        && read.versions.blockers(level).is_empty()
+    {
+        return Err(format!(
+            "feature level {level} cannot be judged: more than {} nodes are registered and the \
+             list stops there; `enable-features` would still be judged by the state machine",
+            vtop_meta::transport::MAX_CLUSTER_VERSION_NODES
+        ));
+    }
+    judge_feature_raise(level, Ok(read))
+}
+
 /// Whether a raise to `level` may be proposed, judged on a cluster-versions
-/// read (#634): `Err` names every live range member that reports less, or
-/// says why the cluster could not be judged. Levels at or below the report
-/// level are not judged on data nodes; the caller only asks above it.
+/// read (#634): `Err` names every counted node that has not reported `level`
+/// or higher, or says why the cluster could not be judged. A level at or
+/// below the report level is never judged on data nodes.
 fn judge_feature_raise(
     level: u32,
     read: Result<vtop_meta::transport::AdminReadClusterVersionsResponse, vtop_meta::TransportError>,
 ) -> Result<(), String> {
     let read = read.map_err(|error| {
         format!(
-            "feature level {level} needs every live range member to report it, and {}",
+            "feature level {level} needs every counted node to report it, and {}",
             cluster_versions_unreadable(&error)
         )
     })?;
+    // A level already in force is the no-op Ack the state machine gives
+    // it; refusing here would be stricter than the raise itself (review).
+    if read.versions.feature_level >= level {
+        return Ok(());
+    }
     let blockers = read.versions.blockers(level);
     if !blockers.is_empty() {
         return Err(vtop_meta::describe_blockers(level, &blockers));
     }
-    if read.truncated {
+    if read.truncated && level > vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL {
         // The rest are judged where nothing can change underneath the
         // decision: the state machine refuses the raise itself.
         eprintln!(
@@ -3396,6 +3422,55 @@ mod tests {
         )
         .unwrap_err();
         assert!(predates.contains("predates version reports"), "{predates}");
+    }
+
+    /// #634 review: a level already in force is a no-op the state machine
+    /// acknowledges, so `enable-features` must not refuse it for a node that
+    /// has since fallen behind (it is the replica plane's to refuse now).
+    #[test]
+    fn a_level_already_in_force_is_not_judged_again() {
+        use vtop_meta::transport::AdminReadClusterVersionsResponse;
+        use vtop_meta::{ClusterVersions, NodeState, NodeVersionEntry};
+        let next = vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL + 1;
+        let read = Ok(AdminReadClusterVersionsResponse {
+            versions: ClusterVersions {
+                feature_level: next,
+                nodes: vec![NodeVersionEntry {
+                    node_uuid: Uuid::from_u128(1),
+                    state: NodeState::Active,
+                    range_member: true,
+                    report: None,
+                }],
+            },
+            truncated: false,
+            read_at_applied_index: 9,
+        });
+        assert_eq!(judge_feature_raise(next, read), Ok(()));
+    }
+
+    /// #634 review: `node-versions --level` has no state machine behind it to
+    /// judge the nodes past a truncated list, so a truncated list with no
+    /// blocker in it is inconclusive, not a pass.
+    #[test]
+    fn a_truncated_listing_cannot_clear_a_raise() {
+        use vtop_meta::transport::AdminReadClusterVersionsResponse;
+        use vtop_meta::ClusterVersions;
+        let next = vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL + 1;
+        let truncated = AdminReadClusterVersionsResponse {
+            versions: ClusterVersions {
+                feature_level: vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL,
+                nodes: Vec::new(),
+            },
+            truncated: true,
+            read_at_applied_index: 9,
+        };
+        let verdict = judge_node_versions_listing(next, truncated.clone()).unwrap_err();
+        assert!(verdict.contains("cannot be judged"), "{verdict}");
+        assert_eq!(
+            judge_node_versions_listing(vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL, truncated),
+            Ok(()),
+            "a level that is never judged on data nodes needs no full list"
+        );
     }
 
     /// #240: a replica's epoch vector is held to the chain — an epoch no

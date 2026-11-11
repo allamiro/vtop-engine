@@ -400,6 +400,13 @@ impl SegmentTransferClient {
 
     /// Open each session with this node's identity and finalized level
     /// (#634); see [`super::network::ReplicaStatusClient::with_version_policy`].
+    ///
+    /// `vtopctl node repair` deliberately keeps the default: an operator's
+    /// tool has no metadata connection to read the level from, and needs
+    /// none to be held to it - the source it pulls from judges the tool's
+    /// hello against the level that node read, and refuses a tool below it.
+    /// What the default skips is the tool refusing a SOURCE below the level,
+    /// and a source below it is one the cluster's own peers already refuse.
     pub fn with_version_policy(mut self, version: super::version::ReplicaVersionPolicy) -> Self {
         self.version = version;
         self

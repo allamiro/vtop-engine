@@ -287,9 +287,9 @@ reopen quietly.
   `(release, max replica protocol, supported feature level)` to metadata (a
   new command kind, feature level 7) from startup until it is recorded, and
   `vtopctl meta node-versions` lists the reports. A raise above level 7 is
-  refused while any live range member reports less: a lease holder, a
-  member of a recorded replica set, or any node that has reported, unless
-  marked dead. The refusal names the nodes. The CLI and the state machine
+  refused while any counted node has not reported that level or higher: a
+  lease holder, a member of a recorded replica set, or any node that has
+  reported, unless marked dead. The refusal names the nodes. The CLI and the state machine
   both judge the raise, so the check and the raise cannot race. The replica session now
   opens with a version exchange carried in the hello frames every older
   peer already decodes. A peer before the handshake answers it with a typed
@@ -301,7 +301,7 @@ reopen quietly.
   as that release will run them. A node is reported once per process, not on
   every renewal, because the renewals share one Raft queue and an unchanged
   report carries nothing. A data node with no metadata configured
-  holds no peer to a level. A follower metadata cannot name, because it
+  holds no peer to a level. A data-node follower that metadata cannot name, because it
   never reported and no recorded replica set lists it, does not hold a raise
   back; after the raise the handshake refuses it if it is behind.
 

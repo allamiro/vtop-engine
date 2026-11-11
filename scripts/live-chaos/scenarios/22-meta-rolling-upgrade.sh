@@ -173,7 +173,7 @@ for n in 1 2; do
   until [[ "$(follower_committed_offset "$n" 2>/dev/null || echo 0)" -ge "$MIXED_RECORDS" ]]; do
     [[ $SECONDS -lt $deadline ]] \
       || fail "follower $n ($([[ $n == 1 ]] && echo previous || echo this) release) stopped at $(follower_committed_offset "$n" 2>/dev/null || echo '?') of $MIXED_RECORDS acknowledged records"
-    sleep 0.2
+    (( deadline - SECONDS > 1 )) && sleep 0.2
   done
 done
 if grep -q "protocol error" "$WORKDIR/logs/data-follower-1.log"; then

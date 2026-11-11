@@ -6076,7 +6076,7 @@ mod tests {
     }
 
     /// #634, the gate: a level above the report level is refused while any
-    /// live range member reports less, the refusal names it, and the same
+    /// counted node has not reported it, the refusal names it, and the same
     /// raise succeeds once it has upgraded. Driven as a build that supports
     /// one level more than this release, because that is the only build
     /// that can ask for a level the gate holds back.
