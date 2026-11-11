@@ -10,7 +10,7 @@
 //! Data nodes now report what they run
 //! ([`crate::MetadataCommand::ReportNodeVersion`]), and a raise above
 //! [`NODE_VERSION_REPORTS_FEATURE_LEVEL`] is refused while any node that
-//! counts reports less. This is the finalize step of the upgrade Kafka
+//! counts has not reported that level or higher. This is the finalize step of the upgrade Kafka
 //! (`metadata.version`), CockroachDB (cluster versions) and etcd use: roll
 //! the binaries, see every node report the new release, then finalize.
 //!
@@ -124,10 +124,15 @@ impl std::fmt::Display for FeatureBlocker {
 /// Why a raise to `level` is refused, naming every node it waits for.
 pub fn describe_blockers(level: u32, blockers: &[FeatureBlocker]) -> String {
     let named: Vec<String> = blockers.iter().map(ToString::to_string).collect();
+    // The remedy FIRST: the state machine's refusal is cut at
+    // `MAX_ERROR_DETAIL_BYTES`, and a long list would cut it off (review).
+    let (count, verb) = match blockers.len() {
+        1 => ("1 node has".to_owned(), "it"),
+        n => (format!("{n} nodes have"), "them"),
+    };
     format!(
-        "feature level {level} needs every live range member to report it, and {} do not: {}. \
-         Upgrade them (or mark a node that will not return dead) and raise again",
-        blockers.len(),
+        "feature level {level} needs every counted node to report it; upgrade {verb} (or mark \
+         a node that will not return dead) and raise again. {count} not: {}",
         named.join(", ")
     )
 }
@@ -185,6 +190,24 @@ mod tests {
             versions.blockers(9).len() == 3,
             "at 9 the level-8 node blocks too"
         );
+    }
+
+    /// #634 review: the state machine cuts its refusal at
+    /// `MAX_ERROR_DETAIL_BYTES`, so what to do comes before the list, and
+    /// survives however many nodes the list names.
+    #[test]
+    fn the_remedy_survives_the_refusal_bound() {
+        let blockers: Vec<FeatureBlocker> = (1..=12)
+            .map(|id| FeatureBlocker {
+                node_uuid: Uuid::from_u128(id),
+                reported: None,
+            })
+            .collect();
+        let why = describe_blockers(8, &blockers);
+        let cut = &why[..crate::command::MAX_ERROR_DETAIL_BYTES.min(why.len())];
+        assert!(cut.contains("raise again"), "{cut}");
+        assert!(why.contains("12 nodes have not"), "{why}");
+        assert!(describe_blockers(8, &blockers[..1]).contains("1 node has not"));
     }
 
     /// Nothing can vouch for a data node before reports exist, so the level

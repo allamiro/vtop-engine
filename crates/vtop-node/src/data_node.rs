@@ -875,15 +875,30 @@ pub async fn serve(
     // finalized for the replica plane to hold peers to (#634). Only where
     // metadata is configured: a static range has nobody to tell, and its
     // replica plane refuses no peer. Spawned after the last startup refusal
-    // and stopped when the role returns, so it never outlives the node.
-    let version_task = match config.lease.as_ref() {
-        Some(lease) => Some(tokio::spawn(crate::version_report::run(
-            lease_admin_client(lease)?,
-            config.node_uuid,
-            crate::version_report::cluster_level_for(config.node_uuid),
-            Duration::from_millis(lease.renew_interval_ms.max(100)),
-            shutdown.clone(),
-        ))),
+    // and held by a guard, so it never outlives the node - not even when
+    // `serve` is dropped at an await (review).
+    //
+    // The level is read ONCE before any listener opens (review): a session
+    // accepted before the first read would be judged against level 0 and
+    // refuse nobody. Bounded by one renewal interval, and not a startup
+    // condition: a node that cannot reach metadata yet keeps 0 until it
+    // can, and until then it cannot do anything a level guards - a lease
+    // follower refuses appends until it knows its epoch, and a fence or a
+    // promotion needs a grant from that same metadata.
+    let _version_task = match config.lease.as_ref() {
+        Some(lease) => {
+            let interval = Duration::from_millis(lease.renew_interval_ms.max(100));
+            let level = crate::version_report::cluster_level_for(config.node_uuid);
+            let admin = lease_admin_client(lease)?;
+            crate::version_report::read_level(&admin, &level, interval).await;
+            Some(Aborting(tokio::spawn(crate::version_report::run(
+                admin,
+                config.node_uuid,
+                level,
+                interval,
+                shutdown.clone(),
+            ))))
+        }
         None => None,
     };
 
@@ -943,9 +958,6 @@ pub async fn serve(
             .await
         }
     };
-    if let Some(task) = version_task {
-        task.abort();
-    }
     served
 }
 

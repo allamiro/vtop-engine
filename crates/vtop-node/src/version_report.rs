@@ -93,6 +93,18 @@ pub async fn report_once(admin: &AdminClient, node_uuid: Uuid) -> Reported {
     }
 }
 
+/// The longest pause, in rounds, between reports metadata refused.
+const MAX_BACKOFF_ROUNDS: u32 = 32;
+
+/// Read the finalized level once, within `budget`, into `level`. A read the
+/// tier cannot serve leaves the level as it was: levels only rise, so the
+/// last one read is a lower bound.
+pub async fn read_level(admin: &AdminClient, level: &ClusterFeatureLevel, budget: Duration) {
+    if let Ok(Ok(read)) = tokio::time::timeout(budget, admin.read_cluster_versions(false)).await {
+        level.observe(read.versions.feature_level);
+    }
+}
+
 /// Report until accepted, and keep `level` current, every `interval` until
 /// `shutdown` fires.
 pub async fn run(
@@ -103,6 +115,13 @@ pub async fn run(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut reported = false;
+    // Rounds to sit out before the next report, and the next such pause. A
+    // refusal by the state machine (an unregistered node, a malformed
+    // report) is a COMMITTED log entry, so it is retried on a doubling pause
+    // rather than every round (review). A tier below the report level
+    // refuses before the log, and that is asked every round.
+    let mut skip_rounds = 0_u32;
+    let mut backoff = 1_u32;
     // Each condition is said once when it starts, not every round: a tier
     // below the report level can stay there for a whole rollout.
     let mut said: Option<&'static str> = None;
@@ -116,7 +135,12 @@ pub async fn run(
         if *shutdown.borrow() {
             return;
         }
-        if !reported {
+        // The level FIRST (review): the replica plane judges peers against
+        // it, and a report that hangs must not leave it unread for a round.
+        read_level(&admin, &level, interval).await;
+        if !reported && skip_rounds > 0 {
+            skip_rounds -= 1;
+        } else if !reported {
             match tokio::time::timeout(interval, report_once(&admin, node_uuid)).await {
                 Ok(Reported::Accepted { feature_level }) => {
                     reported = true;
@@ -136,25 +160,28 @@ pub async fn run(
                         vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL
                     ),
                 ),
-                Ok(Reported::Unregistered) => say(
-                    "unregistered",
-                    format!(
-                        "warning: node {node_uuid} is not registered in metadata, so its \
-                         release report is refused and a feature raise cannot count it; \
-                         register it (vtopctl meta register-node) (#634)"
-                    ),
-                ),
-                Ok(Reported::Failed(why)) => say(
-                    "failed",
-                    format!("warning: node {node_uuid}: version report failed: {why}"),
-                ),
+                Ok(Reported::Unregistered) => {
+                    say(
+                        "unregistered",
+                        format!(
+                            "warning: node {node_uuid} is not registered in metadata, so its \
+                             release report is refused and a feature raise cannot count it; \
+                             register it (vtopctl meta register-node) (#634)"
+                        ),
+                    );
+                    skip_rounds = backoff;
+                    backoff = (backoff * 2).min(MAX_BACKOFF_ROUNDS);
+                }
+                Ok(Reported::Failed(why)) => {
+                    say(
+                        "failed",
+                        format!("warning: node {node_uuid}: version report failed: {why}"),
+                    );
+                    skip_rounds = backoff;
+                    backoff = (backoff * 2).min(MAX_BACKOFF_ROUNDS);
+                }
                 Err(_) => {}
             }
-        }
-        if let Ok(Ok(read)) =
-            tokio::time::timeout(interval, admin.read_cluster_versions(false)).await
-        {
-            level.observe(read.versions.feature_level);
         }
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
@@ -184,7 +211,9 @@ mod tests {
     /// and recording every report it was asked for.
     struct Tier {
         level: AtomicU32,
-        registered: bool,
+        registered: std::sync::atomic::AtomicBool,
+        /// How long a proposal takes to answer.
+        propose_delay: Duration,
         reports: std::sync::Mutex<Vec<MetadataCommand>>,
     }
 
@@ -199,6 +228,7 @@ mod tests {
         }
         async fn propose(&self, command: MetadataCommand) -> TransportResult<AdminProposeResponse> {
             self.reports.lock().unwrap().push(command.clone());
+            tokio::time::sleep(self.propose_delay).await;
             let level = self.level.load(Ordering::SeqCst);
             if command.feature_level() > level {
                 return Err(TransportError::Protocol(
@@ -211,7 +241,7 @@ mod tests {
             }
             Ok(AdminProposeResponse {
                 log_id: vtop_meta::WireLogId { term: 1, index: 1 },
-                response: if self.registered {
+                response: if self.registered.load(Ordering::SeqCst) {
                     MetadataResponse::Ack {
                         generation: u64::from(level),
                     }
@@ -301,7 +331,8 @@ mod tests {
     async fn a_data_node_reports_once_the_tier_can_record_it_and_then_stops() {
         let tier = Arc::new(Tier {
             level: AtomicU32::new(vtop_meta::LINEAGE_VERDICTS_FEATURE_LEVEL),
-            registered: true,
+            registered: true.into(),
+            propose_delay: Duration::ZERO,
             reports: Default::default(),
         });
         let (client, serving) = serve(Arc::clone(&tier)).await;
@@ -380,7 +411,8 @@ mod tests {
     async fn an_unregistered_node_is_told_so() {
         let tier = Arc::new(Tier {
             level: AtomicU32::new(vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL),
-            registered: false,
+            registered: false.into(),
+            propose_delay: Duration::ZERO,
             reports: Default::default(),
         });
         let (client, serving) = serve(Arc::clone(&tier)).await;
@@ -388,6 +420,80 @@ mod tests {
             report_once(&client, Uuid::from_u128(0x634)).await,
             Reported::Unregistered
         );
+        serving.abort();
+    }
+
+    /// #634 review: the level must be read before anything else the loop
+    /// does. It used to come after the report, so a report that hung kept
+    /// the replica plane judging peers against an unread level (0, refusing
+    /// nobody) for a whole round.
+    #[tokio::test]
+    async fn the_level_is_read_before_a_report_that_hangs() {
+        let tier = Arc::new(Tier {
+            level: AtomicU32::new(vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL),
+            registered: true.into(),
+            propose_delay: Duration::from_secs(30),
+            reports: Default::default(),
+        });
+        let (client, serving) = serve(Arc::clone(&tier)).await;
+        let level = ClusterFeatureLevel::unknown();
+        let (_stop, shutdown) = tokio::sync::watch::channel(false);
+        let reporter = tokio::spawn(run(
+            client,
+            Uuid::from_u128(0x634),
+            level.clone(),
+            Duration::from_secs(5),
+            shutdown,
+        ));
+        assert!(
+            until(Duration::from_secs(1), || level.get()
+                == vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL)
+            .await,
+            "the level was not read while a report hung"
+        );
+        reporter.abort();
+        serving.abort();
+    }
+
+    /// #634 review: a refusal by the state machine is a COMMITTED log entry,
+    /// so an unregistered node retrying at the renewal cadence wrote one per
+    /// round, forever. It backs off, and still reports once registered.
+    #[tokio::test]
+    async fn an_unregistered_node_backs_off_and_reports_once_registered() {
+        let tier = Arc::new(Tier {
+            level: AtomicU32::new(vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL),
+            registered: false.into(),
+            propose_delay: Duration::ZERO,
+            reports: Default::default(),
+        });
+        let (client, serving) = serve(Arc::clone(&tier)).await;
+        let (_stop, shutdown) = tokio::sync::watch::channel(false);
+        let reporter = tokio::spawn(run(
+            client,
+            Uuid::from_u128(0x634),
+            ClusterFeatureLevel::unknown(),
+            Duration::from_millis(20),
+            shutdown,
+        ));
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let refused = tier.reports.lock().unwrap().len();
+        assert!(
+            (1..=8).contains(&refused),
+            "{refused} refused reports in 600 ms at a 20 ms cadence: each one is a log entry"
+        );
+        tier.registered.store(true, Ordering::SeqCst);
+        let before = refused;
+        assert!(
+            until(Duration::from_secs(5), || tier
+                .reports
+                .lock()
+                .unwrap()
+                .len()
+                > before)
+            .await,
+            "a node registered later must still report"
+        );
+        reporter.abort();
         serving.abort();
     }
 }

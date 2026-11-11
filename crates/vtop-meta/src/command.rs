@@ -150,7 +150,7 @@ pub const LINEAGE_VERDICTS_FEATURE_LEVEL: u32 = 6;
 /// nodes cannot report before this level is in force - the report is a
 /// command an older voter cannot decode, so it is held back like any other -
 /// so nothing could vouch for them when it is raised. Every level ABOVE this
-/// one is refused while a live range member reports less than it (see
+/// one is refused while a counted node has not reported it or higher (see
 /// [`crate::versions::ClusterVersions::blockers`]), and this level changes
 /// nothing on the replica plane, so raising it cannot cut a peer off.
 pub const NODE_VERSION_REPORTS_FEATURE_LEVEL: u32 = 7;
@@ -1398,8 +1398,10 @@ pub enum MetadataCommand {
     /// until metadata accepts it; replaces the node's previous report.
     ///
     /// What a raise of the feature level is judged against: a level above
-    /// [`NODE_VERSION_REPORTS_FEATURE_LEVEL`] is refused while any live
-    /// range member reports less (or has never reported). A report is a
+    /// [`NODE_VERSION_REPORTS_FEATURE_LEVEL`] is refused while any counted
+    /// node has not reported that level or higher - a live range member, or
+    /// any node that has reported, unless marked dead (see
+    /// [`crate::versions::NodeVersionEntry::counted`]). A report is a
     /// fact about one node, so it is node-scoped: only that node's identity
     /// may send it, and only a registered node's is accepted (a node that
     /// never reports can then still be marked dead, which is how an operator
@@ -2334,7 +2336,16 @@ impl MetadataCommand {
             COMMAND_KIND_REPORT_NODE_VERSION => Ok(MetadataCommand::ReportNodeVersion {
                 env: decode_envelope(reader)?,
                 node_uuid: reader.uuid("node uuid")?,
-                release: reader.bounded_str(MAX_RELEASE_BYTES, "release")?,
+                release: {
+                    let release = reader.bounded_str(MAX_RELEASE_BYTES, "release")?;
+                    if release.is_empty() {
+                        return Err(CodecError::InvalidValue {
+                            what: "release",
+                            reason: "must not be empty",
+                        });
+                    }
+                    release
+                },
                 max_replica_protocol: reader.u16("max replica protocol")?,
                 supported_feature_level: reader.u32("supported feature level")?,
             }),
@@ -4022,6 +4033,34 @@ mod tests {
             seen.len(),
             usize::from(highest),
             "every kind 1..={highest} must be in every_command, or this check is blind to it"
+        );
+    }
+
+    /// #634 review: a version report's release is 1..=MAX_RELEASE_BYTES, and
+    /// the codec enforces both ends, as it does a node address - so an empty
+    /// one is refused at the admin endpoint and never reaches a log. Safe to
+    /// enforce at decode only because the kind is new in this release: no
+    /// log written before it can hold one.
+    #[test]
+    fn a_version_report_with_an_empty_release_does_not_decode() {
+        let empty = MetadataCommand::ReportNodeVersion {
+            env: envelope(38),
+            node_uuid: Uuid::from_u128(10),
+            release: String::new(),
+            max_replica_protocol: 2,
+            supported_feature_level: SUPPORTED_FEATURE_LEVEL,
+        };
+        let encoded = empty.encode().unwrap();
+        assert!(
+            matches!(
+                MetadataCommand::decode(&encoded),
+                Err(CodecError::InvalidValue {
+                    what: "release",
+                    ..
+                })
+            ),
+            "{:?}",
+            MetadataCommand::decode(&encoded)
         );
     }
 

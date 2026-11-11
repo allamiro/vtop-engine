@@ -973,12 +973,13 @@ Short procedures now; expand into a full ops runbook before go-live.
   2. **Verify that every node reports the new release:** `vtopctl meta
      node-versions --config meta-admin.yaml --level N` lists each
      registered node with what it reported, and exits non-zero naming every
-     live range member that reports less than N. A live range member is a
-     lease holder, a member of a recorded replica set, or any node that has
-     reported, unless it is marked dead. "never reported" means the node
+     counted node that has not reported N or higher (including one that
+     never reported). A counted node is a live range member (a lease holder
+     or a member of a recorded replica set) or any node that has reported,
+     unless it is marked dead. "never reported" means the node
      runs a release before #634, has no `lease` block, or is not registered.
   3. **Finalize:** `vtopctl meta enable-features --level N`. It is refused,
-     naming the nodes, while any live range member reports less than N. The
+     naming the nodes, while any counted node has not reported N or higher. The
      metadata state machine applies the same check, so a node that joins
      between the check and the raise is caught too. After the raise, every
      data node that has read the level refuses a replica peer below it on

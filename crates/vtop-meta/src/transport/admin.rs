@@ -1040,23 +1040,66 @@ impl AdminClient {
         &self,
         include_nodes: bool,
     ) -> TransportResult<crate::transport::wire::AdminReadClusterVersionsResponse> {
-        let frame = self
-            .round_trip(VtpmFrame {
-                kind: crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ,
-                payload: crate::transport::wire::AdminReadClusterVersionsRequest { include_nodes }
-                    .encode(),
-            })
-            .await?;
-        match frame.kind {
+        use std::sync::atomic::Ordering;
+        let request = VtpmFrame {
+            kind: crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ,
+            payload: crate::transport::wire::AdminReadClusterVersionsRequest { include_nodes }
+                .encode(),
+        };
+        let decode = |frame: VtpmFrame| match frame.kind {
             crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP => Ok(
                 crate::transport::wire::AdminReadClusterVersionsResponse::decode(&frame.payload)?,
             ),
-            KIND_ADMIN_ERROR => {
-                let error = AdminError::decode(&frame.payload)?;
-                Err(TransportError::Protocol(error.message))
-            }
+            KIND_ADMIN_ERROR => Err(TransportError::Protocol(
+                AdminError::decode(&frame.payload)?.message,
+            )),
             other => Err(TransportError::UnexpectedKind(other)),
+        };
+        let (first, frame) = self.round_trip_indexed(request.clone()).await?;
+        let refusal = decode(frame);
+        // A node that predates the read refuses it with a plain error, not a
+        // redirect, so the walk above stops at it - an older learner or a
+        // stale endpoint listed first would fail the read the leader can
+        // serve (review). Ask every other member before believing it.
+        if !matches!(&refusal, Err(error) if predates_cluster_versions_read(error)) {
+            return refusal;
         }
+        let candidates = self.candidates.len();
+        let mut asked = vec![false; candidates];
+        asked[first] = true;
+        let mut next = (0..candidates).find(|index| !asked[*index]);
+        while let Some(index) = next {
+            asked[index] = true;
+            if let Ok(frame) = self.attempt(index, &request).await {
+                match redirect_of(&frame) {
+                    Some(hint) => {
+                        let named = hint
+                            .leader
+                            .and_then(|leader| self.index_of(leader))
+                            .filter(|named| !asked[*named]);
+                        if named.is_some() {
+                            next = named;
+                            continue;
+                        }
+                    }
+                    None => {
+                        let answer = decode(frame);
+                        if !matches!(&answer, Err(error) if predates_cluster_versions_read(error)) {
+                            if answer.is_ok() {
+                                // Prefer the member that could answer, not
+                                // the one that refused.
+                                self.preferred.store(index, Ordering::Relaxed);
+                                self.answered(index);
+                            }
+                            return answer;
+                        }
+                    }
+                }
+            }
+            next = (0..candidates).find(|index| !asked[*index]);
+        }
+        // Every member that answered predates the read.
+        refusal
     }
 
     /// Linearizable read of a range's recorded replica set (#553).
@@ -2129,6 +2172,74 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// A node answering every frame with one fixed reply.
+    async fn answering(reply: VtpmFrame) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    while let Ok(_request) = read_frame(&mut stream).await {
+                        if write_frame(&mut stream, &reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// #634 review: a node that predates the cluster-versions read refuses
+    /// its kind with an ordinary error frame, not a redirect, and the read
+    /// used to take that as the answer - so an older learner or stale
+    /// endpoint listed first failed the read while the leader could serve
+    /// it, and became the preferred endpoint besides. The read now moves
+    /// past such a refusal; only when every node refuses is it reported as
+    /// predating.
+    #[tokio::test]
+    async fn a_cluster_versions_read_walks_past_a_node_that_predates_it() {
+        let predating = answering(VtpmFrame {
+            kind: KIND_ADMIN_ERROR,
+            payload: AdminError {
+                message: TransportError::UnexpectedKind(
+                    crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ,
+                )
+                .to_string(),
+                not_leader: None,
+            }
+            .encode()
+            .unwrap(),
+        })
+        .await;
+        let current = answering(VtpmFrame {
+            kind: crate::transport::wire::KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP,
+            payload: crate::transport::wire::AdminReadClusterVersionsResponse {
+                versions: crate::versions::ClusterVersions {
+                    feature_level: 7,
+                    nodes: Vec::new(),
+                },
+                truncated: false,
+                read_at_applied_index: 3,
+            }
+            .encode()
+            .unwrap(),
+        })
+        .await;
+
+        let client = candidates(&[(1, predating), (2, current)]);
+        let read = client.read_cluster_versions(false).await.unwrap();
+        assert_eq!(read.versions.feature_level, 7);
+        // Asked again, it still reaches the node that can answer.
+        let again = client.read_cluster_versions(false).await.unwrap();
+        assert_eq!(again.read_at_applied_index, 3);
+
+        let only_old = candidates(&[(1, predating)]);
+        let error = only_old.read_cluster_versions(false).await.unwrap_err();
+        assert!(predates_cluster_versions_read(&error), "{error}");
     }
 
     fn candidates(endpoints: &[(u64, SocketAddr)]) -> AdminClient {
