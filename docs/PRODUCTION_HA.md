@@ -313,14 +313,21 @@ secret reference so credentials never enter serializable config.
 
 ### 6.4 Backend-switching policy (NOT "no migration ever")
 The state store is a replay ledger, **but the file/syslog byte cursor lives only in
-it** (rebuilt from `SOURCE_COMMITTED` rows by `seed_committed_offsets`). Kafka
-offsets live in the broker. Therefore:
+it** (rebuilt from `SOURCE_COMMITTED` rows by `seed_committed_offsets`). The Kafka
+resume position is the ledger's too, but only when the store holds a committed
+batch for the partition AND the broker reports a committed offset for the
+consumer group on it (#614; ARCHITECTURE §7.1). Otherwise - a fresh store, no
+committed batch yet, no group offset, or a broker that cannot be asked at
+startup - the partition resumes at `Offset::Stored`: the group's committed
+offset, or `auto.offset.reset` when there is none. Therefore:
 
 ```text
 Backend switching policy:
 - Dev/test:                a fresh state store is acceptable.
 - Production, Kafka-only:   may be safe AFTER engine DRAIN + offset verification
-                           (offsets are broker-side, so resume is safe).
+                           (a fresh store resumes from the group's committed
+                           offset, so verify it equals the old ledger's
+                           position for every partition before switching).
 - Production, file/syslog:  REQUIRES cursor migration OR a controlled drain,
                            else files reprocess from byte 0 (duplicates) and
                            spool position is lost.
@@ -332,9 +339,12 @@ Backend switching policy:
 import into the new store (or accept Kafka reprocessing for Kafka-only) → validate →
 keep the old store until validation passes (rollback path).
 
-**Why no row migration for the *Kafka* path:** resume position is broker-side
-committed offsets, so a fresh store does not lose Kafka progress (it
-re-discovers). This is the *only* path where "no migration" holds.
+**Why no row migration for the *Kafka* path:** a store with no committed
+batch for a partition resumes it from the broker-side committed offset, so a
+fresh store does not lose Kafka progress (it re-discovers). This is the *only*
+path where "no migration" holds. Once the store has committed a batch for the
+partition and the group has a committed offset for it, the ledger decides where
+it resumes, not the group's offset (#614).
 
 ### 6.5 Database schema & constraints (defense in depth) **[IMPLEMENTED — with one gap]**
 
@@ -519,6 +529,24 @@ for spools, no size): they are judged as before - files by size, spools per
 inode only - and a fingerprint is compared only with one of the same length,
 so they never split a unit. See the ledger format note in
 [`ARCHITECTURE.md`](ARCHITECTURE.md) §7.2.
+
+The audit reads ranges from the ledger, never from manifests, and the ledger
+has always recorded a batch's first read's start. A reconciliation built from
+manifests alone must know their version (#622): from `0.3` a manifest's
+`source_progress` runs from the batch's first read's start to its last read's
+end, and the `batch_id` carries the same range - when both reads name the same
+unit (topic, partition and group; path, spool and inode). A batch whose reads
+name two units (one that spans a rotation; the engine seals at the
+discontinuity, so this is not expected) keeps the last read's range in its
+manifest and id, and its start is only in the ledger's `progress_start`; treat
+it as a `0.2` manifest below, and the audit reports the stretch as unproven,
+as it does any rotation-spanning window. A manifest of `0.2` or earlier
+(and its batch id) carries the LAST read's start, so for a batch built from
+several reads it claims less than the object holds and shows a false hole
+below it. For those, take the start from the ledger row with the manifest's
+`batch_id` (its `progress_start`), or from the prune digest that replaced the
+row; the end is right in both. See
+[`VTOP_PROTOCOL_DRAFT.md`](VTOP_PROTOCOL_DRAFT.md) §11.2.
 
 ---
 
@@ -968,16 +996,46 @@ Short procedures now; expand into a full ops runbook before go-live.
   this candidate could prove" only when the proven answers fall short of
   that majority - for example when the reachable replicas include ones with
   records but no epoch history (a log that predates its journal, a journal
-  restarted empty). Repair those replicas (`vtopctl node repair` installs the source's
-  history) rather than lowering anything. Recording the verdicts needs
+  restarted empty). Repair those replicas from a replica that HAS epoch
+  history (`vtopctl node repair` installs the source's history), rather than
+  lowering anything. Three costs to plan for (#612):
+  - **A range that holds records but where no replica has epoch history
+    cannot promote, and repair cannot fix it.** That means logs whose
+    records predate their epoch journal on every replica, or journals lost
+    on every replica. A repair whose source has no history installs none,
+    and warns when it transferred records (a repair that moved none leaves
+    a replica that disputes nothing). Every candidate holding records is Unknown to itself and
+    stands aside, and a candidate holding none stands aside for them, so
+    the range goes unled. (A fresh, empty range is not affected: a
+    candidate at 0 disputes nothing and promotes.) The transition record shows
+    `Refused{QuorumUnavailable}`, the same as an ordinary missing quorum;
+    the data node's warning names the lineage cause. There is no
+    in-product remedy yet.
+  - **A replica whose only dispute with the candidate is below its retained
+    base is not counted.** The replica itself finds the retained records in
+    agreement (#408), but the candidate cannot see its base, so the answer
+    is Unknown. With one replica of three down, that replica is needed for
+    the majority, and promotion waits until it is repaired or the other
+    replica returns.
+  - **A candidate holding no records stands aside** only when a replica
+    holding records answers Unknown to it (a wiped disk at epoch 0, for
+    example). The replica with history wins the range instead. Facing
+    replicas that hold nothing either, it promotes as before.
+
+  Recording the verdicts needs
   `vtopctl meta enable-features --level 6` once every metadata voter runs
   this release; until then promotions are recorded without them (and
   without the uncounted answers). Upgrade every data node and the `vtopctl`
   you audit with BEFORE raising the level: an older one cannot decode a
   verdict-carrying transition record, so its published-floor read fails
   closed (the node will not promote) and its `meta transitions` errors.
-  Records written before the raise carry no verdicts and are judged as they
-  always were.
+  Records written without verdicts are judged as they always were, with
+  every answer in them counted by offset. That includes records written
+  before the raise. It also includes records written after it by a data
+  node still on an older release: that node does not judge lineage, so its
+  records count answers this release would mark Unknown. Nothing enforces
+  the upgrade order, so raise the level only after every data node runs this
+  release.
 - **Change a range's replica set (#553):** a range's quorum is counted over
   the set metadata records for it (`vtopctl meta replica-set --config
   meta-admin.yaml --topic-uuid T --range-uuid R`; every `vtopctl meta`
