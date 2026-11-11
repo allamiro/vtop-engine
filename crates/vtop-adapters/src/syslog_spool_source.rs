@@ -21,8 +21,8 @@ use vtop_core::types::{ContentFingerprint, ProgressMarker, SourceType, Telemetry
 struct SpoolCursor {
     read_byte: u64,
     committed_byte: u64,
-    /// See `FileCursor::committed_confirmed` (#624).
-    committed_confirmed: bool,
+    /// See `FileCursor::confirmed_for` (#624).
+    confirmed_for: Option<continuity::ConfirmedFile>,
     /// What the spool looked like when this cursor last caught up with it.
     ///
     /// Kept so a cycle can decide NOT to open the file at all (#101). `None`
@@ -78,7 +78,7 @@ impl SyslogSpoolSource {
     pub fn seed_committed(&mut self, path: &str, committed_byte: u64) {
         let c = self.cursors.entry(path.to_string()).or_default();
         c.committed_byte = committed_byte;
-        c.committed_confirmed = false;
+        c.confirmed_for = None;
         c.read_byte = committed_byte;
     }
 
@@ -123,7 +123,7 @@ impl SyslogSpoolSource {
                 "{why}; the read of the new content then failed"
             );
             cursor.committed_byte = 0;
-            cursor.committed_confirmed = false;
+            cursor.confirmed_for = None;
             cursor.read_byte = 0;
             cursor.generations.discontinuity();
             cursor.seen = Some(seen);
@@ -148,7 +148,7 @@ impl SyslogSpoolSource {
         if let Some(why) = discontinuity {
             tracing::warn!(path, previous_read_byte = cursor.read_byte, "{why}");
             cursor.committed_byte = 0;
-            cursor.committed_confirmed = false;
+            cursor.confirmed_for = None;
             cursor.generations.discontinuity();
         }
         cursor.generations.issue(start, end);
@@ -625,7 +625,11 @@ impl SourceAdapter for SyslogSpoolSource {
             let c = self.cursors.entry(path.clone()).or_default();
             // Superseded by a commit this process confirmed (#624; see
             // `FileSource::commit_progress`).
-            if c.committed_confirmed && c.committed_byte >= *end_byte {
+            if c.committed_byte >= *end_byte
+                && c.confirmed_for
+                    .as_ref()
+                    .is_some_and(|file| file.is(*marker_inode, marker_content.as_ref()))
+            {
                 tracing::info!(
                     path,
                     end_byte,
@@ -636,7 +640,7 @@ impl SourceAdapter for SyslogSpoolSource {
                 return Ok(());
             }
             c.committed_byte = *end_byte;
-            c.committed_confirmed = true;
+            c.confirmed_for = continuity::ConfirmedFile::of(*marker_inode, marker_content.as_ref());
             // See `FileSource::commit_progress`: a recovered commit below the
             // seeded head restarts the head there; and, whatever its end, the
             // cursor adopts the identity the batch saw - the seed may be of

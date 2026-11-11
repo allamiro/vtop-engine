@@ -781,3 +781,34 @@ mod tests {
         );
     }
 }
+
+/// The file a committed point was confirmed for (#624): the inode and content
+/// of the marker whose commit, checked against the file at the path, set it.
+/// A legacy marker without an inode confirms nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedFile {
+    pub inode: u64,
+    pub content: Option<ContentFingerprint>,
+}
+
+impl ConfirmedFile {
+    pub fn of(inode: Option<u64>, content: Option<&ContentFingerprint>) -> Option<Self> {
+        inode.map(|inode| Self {
+            inode,
+            content: content.cloned(),
+        })
+    }
+
+    /// Whether a marker naming `inode` and `content` is of this file: the
+    /// same inode, and content not proven different (review of #624). The
+    /// marker is also checked against the file at the path before this is
+    /// asked, so a match here describes the file both commits were of.
+    pub fn is(&self, inode: Option<u64>, content: Option<&ContentFingerprint>) -> bool {
+        inode == Some(self.inode)
+            && !self
+                .content
+                .as_ref()
+                .zip(content)
+                .is_some_and(|(mine, theirs)| mine.same_content(theirs) == Some(false))
+    }
+}

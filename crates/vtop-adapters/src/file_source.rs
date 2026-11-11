@@ -24,13 +24,14 @@ struct FileCursor {
     read_byte: u64,
     /// Highest byte durably committed to object storage.
     committed_byte: u64,
-    /// Whether `committed_byte` was set by a commit this process checked
-    /// against the file now at the path (#624), not by the restart seed. Only
-    /// such a point may supersede a later, lower commit: the seed can be the
-    /// newest committed row of a PREVIOUS generation of the file (a
-    /// copytruncate), and a commit below it must still move the cursor down
-    /// to the new content (review of #564).
-    committed_confirmed: bool,
+    /// The file a commit this process checked against the file at the path
+    /// set `committed_byte` for (#624) - `None` for the restart seed, or after
+    /// a discontinuity. Only such a point may supersede a later, lower
+    /// commit, and only one of the SAME file (review of #624): the seed can be
+    /// the newest committed row of a PREVIOUS generation (a copytruncate),
+    /// and a commit below it must still move the cursor down to the new
+    /// content (review of #564).
+    confirmed_for: Option<crate::continuity::ConfirmedFile>,
     /// What the file looked like when this cursor last caught up with it.
     ///
     /// Kept so a cycle can decide NOT to open the file at all (#100). `None`
@@ -93,7 +94,7 @@ impl FileSource {
     pub fn seed_committed(&mut self, path: &str, committed_byte: u64) {
         let c = self.cursors.entry(path.to_string()).or_default();
         c.committed_byte = committed_byte;
-        c.committed_confirmed = false;
+        c.confirmed_for = None;
         c.read_byte = committed_byte;
     }
 
@@ -300,7 +301,7 @@ impl FileSource {
         if let Some(why) = discontinuity {
             tracing::warn!(path, previous_read_byte = cursor.read_byte, "{why}");
             cursor.committed_byte = 0;
-            cursor.committed_confirmed = false;
+            cursor.confirmed_for = None;
             cursor.generations.discontinuity();
         }
         cursor.generations.issue(start, end);
@@ -333,7 +334,7 @@ impl FileSource {
                 "{why}; the read of the new content then failed"
             );
             cursor.committed_byte = 0;
-            cursor.committed_confirmed = false;
+            cursor.confirmed_for = None;
             cursor.read_byte = 0;
             cursor.generations.discontinuity();
             cursor.seen = Some(opened);
@@ -1195,10 +1196,15 @@ impl SourceAdapter for FileSource {
             // the Kafka adapter reports for a range below its frontier, so the
             // row is recorded SOURCE_COMMITTED: it is VERIFIED, and its source
             // has committed through its end. Only a point this process
-            // confirmed: the seed can be a previous generation's (see
-            // `committed_confirmed`). Nothing is deleted for it either; the
-            // newer commit already decided that.
-            if c.committed_confirmed && c.committed_byte >= *end_byte {
+            // confirmed, for this marker's file: the seed can be a previous
+            // generation's, and a point confirmed for another file says
+            // nothing about this range (see `confirmed_for`). Nothing is
+            // deleted for it either; the newer commit already decided that.
+            if c.committed_byte >= *end_byte
+                && c.confirmed_for
+                    .as_ref()
+                    .is_some_and(|file| file.is(*marker_inode, marker_content.as_ref()))
+            {
                 tracing::info!(
                     path,
                     end_byte,
@@ -1209,7 +1215,8 @@ impl SourceAdapter for FileSource {
                 return Ok(());
             }
             c.committed_byte = *end_byte;
-            c.committed_confirmed = true;
+            c.confirmed_for =
+                crate::continuity::ConfirmedFile::of(*marker_inode, marker_content.as_ref());
             // A commit with no in-process record is recovery after a restart.
             let recovered = generation == continuity::Settled::Unknown;
             if c.read_byte < *end_byte {
@@ -2160,6 +2167,36 @@ mod tests {
         } else {
             panic!("expected file marker");
         }
+    }
+
+    #[tokio::test]
+    async fn a_commit_is_skipped_only_below_a_point_confirmed_for_its_own_file() {
+        // #624 (review): the skip is bound to the file whose commit confirmed
+        // the committed point, not to the number alone. A point confirmed for
+        // another file - a previous one at this path, say - says nothing
+        // about this marker's range, which commits as before.
+        let f = write_log(&["one", "two"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let read = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap()
+            .remove(0);
+        fs.commit_progress(&read.progress_end).await.unwrap();
+        let end = fs.committed_through(&read.progress_end).unwrap();
+        // The point is now another file's, and higher.
+        {
+            let c = fs.cursors.get_mut(&path).unwrap();
+            c.committed_byte = 1_000;
+            let other = c.confirmed_for.as_mut().expect("the commit confirmed it");
+            other.inode += 1;
+        }
+        fs.commit_progress(&read.progress_end).await.unwrap();
+        assert_eq!(
+            fs.cursors[&path].committed_byte as i128, end,
+            "a commit of this file was skipped below another file's committed point"
+        );
     }
 
     #[tokio::test]

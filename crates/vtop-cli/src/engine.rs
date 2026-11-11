@@ -1788,9 +1788,11 @@ impl Engine {
             }
         };
         if row.held_back
-            && !adapter
-                .committed_through(&rec.progress_end)
-                .is_some_and(|committed| committed >= end_position(&rec.progress_end))
+            && !held_row_may_settle(
+                adapter.committed_through(&rec.progress_end),
+                row.committed_at_hold,
+                end_position(&rec.progress_end),
+            )
         {
             return false;
         }
@@ -1806,11 +1808,12 @@ impl Engine {
                         rec.source_type.as_str(),
                         rec.format.extension(),
                     ];
-                    // A row recovery held back was verified by the process
-                    // that crashed; count it here, as `commit_recovered` does,
-                    // so commits_total never exceeds verified_total. A failed
-                    // commit's verification was counted by the pipeline.
-                    if row.held_back {
+                    // A row recovery left (held back, or its commit failed)
+                    // was verified by the process that crashed; count it
+                    // here, as `commit_recovered` does, so commits_total never
+                    // exceeds verified_total. A pipeline row's verification
+                    // was counted by the pipeline (review of #624).
+                    if row.count_verified {
                         mx.verified_total.with_label_values(&l).inc();
                         mx.batches_total
                             .with_label_values(&[l[0], l[1], l[2], BatchState::Verified.as_str()])
@@ -2700,7 +2703,11 @@ impl Engine {
                      it stays VERIFIED until the lower range has been re-read"
                 );
                 summary.still_pending += 1;
-                self.unsettled.push(Unsettled::held_back(&rec));
+                let at_hold = self
+                    .adapters
+                    .get(&rec.source_type)
+                    .and_then(|adapter| adapter.committed_through(&rec.progress_end));
+                self.unsettled.push(Unsettled::held_back(&rec, at_hold));
                 continue;
             }
             self.commit_recovered(&rec, &mut summary).await?;
@@ -2841,7 +2848,7 @@ impl Engine {
                     tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery commit failed");
                     summary.still_pending += 1;
                     self.unsettled
-                        .push(Unsettled::commit_failed(&rec.batch_id, &rec.source_type));
+                        .push(Unsettled::recovered_commit_failed(&rec));
                 }
             }
         } else {
@@ -3594,24 +3601,60 @@ struct Unsettled {
     /// Held back by recovery above a range being read again, rather than
     /// left by a source commit that failed.
     held_back: bool,
+    /// The adapter's committed point for the row when recovery held it back
+    /// - the restart seed. Settling waits for the point to move past it
+    /// (review of #624).
+    committed_at_hold: Option<i128>,
+    /// Whether settling it counts its verification too: a row recovery left
+    /// was verified by the process that crashed, and this one has not counted
+    /// it; a pipeline row's verification is counted already.
+    count_verified: bool,
 }
 
 impl Unsettled {
-    fn held_back(rec: &BatchRecord) -> Self {
+    fn held_back(rec: &BatchRecord, committed_at_hold: Option<i128>) -> Self {
         Self {
             batch_id: rec.batch_id.clone(),
             source_type: rec.source_type.clone(),
             held_back: true,
+            committed_at_hold,
+            count_verified: true,
         }
     }
 
+    /// Recovery re-checked the row and its source commit failed.
+    fn recovered_commit_failed(rec: &BatchRecord) -> Self {
+        Self {
+            batch_id: rec.batch_id.clone(),
+            source_type: rec.source_type.clone(),
+            held_back: false,
+            committed_at_hold: None,
+            count_verified: true,
+        }
+    }
+
+    /// The pipeline verified the row in this process and its commit failed.
     fn commit_failed(batch_id: &str, source_type: &SourceType) -> Self {
         Self {
             batch_id: batch_id.to_owned(),
             source_type: source_type.clone(),
             held_back: false,
+            committed_at_hold: None,
+            count_verified: false,
         }
     }
+}
+
+/// Whether a VERIFIED row recovery held back may settle now (#624): its
+/// source's committed point is at or past the row's end, AND has moved up
+/// since the hold. At the hold that point is the restart seed; recovery holds
+/// the row back because a range below it is to be read again - or is held
+/// with no rewind at all (#639) - and the seed alone says nothing about
+/// whether that has happened (review of #624). Only a point this process
+/// moved does. A point that went down (a rotation restarted the cursor) is
+/// not that either.
+fn held_row_may_settle(committed: Option<i128>, at_hold: Option<i128>, end: i128) -> bool {
+    committed.is_some_and(|now| now >= end && at_hold.is_none_or(|held| now > held))
 }
 
 /// One past where a range ends within its unit, in the unit
@@ -5131,6 +5174,115 @@ mod tests {
         fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
             self.0.as_any_mut()
         }
+    }
+
+    /// #624 (review): a held-back row settles only on a committed point this
+    /// process has moved since it held the row back, and only one at or past
+    /// the row's end. The point at the hold is the restart seed - and when a
+    /// held range (#639) lies below it, the seed alone is no evidence the
+    /// re-read has passed anything.
+    #[test]
+    fn a_held_back_row_settles_only_once_the_committed_point_has_moved_past_it() {
+        // Nothing known, or below the end: wait.
+        assert!(!held_row_may_settle(None, None, 20));
+        assert!(!held_row_may_settle(Some(15), Some(10), 20));
+        // At or past the end, having moved since the hold: settle.
+        assert!(held_row_may_settle(Some(20), Some(10), 20));
+        assert!(held_row_may_settle(Some(40), None, 20));
+        // At or past the end only because the seed already was: wait.
+        assert!(!held_row_may_settle(Some(30), Some(30), 20));
+        // A committed point that went DOWN since (a rotation restarted the
+        // cursor) is not progress either.
+        assert!(!held_row_may_settle(Some(25), Some(30), 20));
+    }
+
+    /// #624 (review): a VERIFIED row whose source commit failed during
+    /// recovery was verified by the process that crashed, so this process
+    /// has not counted it. Settling it later counts the verification with
+    /// the commit, as `commit_recovered` does - or commits_total runs ahead
+    /// of verified_total, the one alarm that must not cry wolf.
+    #[tokio::test]
+    async fn settling_a_row_whose_recovered_commit_failed_counts_its_verification() {
+        let tenant = "settle-counts-624";
+        let counter = |family: &str| -> u64 {
+            let mx = telemetry::init().unwrap();
+            mx.registry
+                .gather()
+                .iter()
+                .filter(|f| f.name().ends_with(family))
+                .flat_map(|f| f.get_metric().iter())
+                .filter(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "tenant" && l.value() == tenant)
+                })
+                .map(|m| m.get_counter().get_value() as u64)
+                .sum()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\n").unwrap();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let backend = Arc::new(vtop_upload::MockBackend::new());
+        let engine = |work: &str| {
+            let mut cfg = file_config(
+                dir.path().join(work).to_str().unwrap(),
+                &url,
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            cfg.engine.tenant = tenant.into();
+            let backend = backend.clone();
+            async move {
+                let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+                    .await
+                    .unwrap();
+                engine.backend = backend;
+                engine
+            }
+        };
+        let fail_commits = |engine: &mut Engine, failures: usize| {
+            let inner = engine.adapters.remove(&SourceType::File).unwrap();
+            engine.adapters.insert(
+                SourceType::File,
+                Box::new(FailingCommits { inner, failures }),
+            );
+        };
+
+        // A process verifies the batch, cannot commit it, and crashes.
+        let mut first = engine("work-1").await;
+        fail_commits(&mut first, usize::MAX);
+        let outcomes = first.process_once(SourceType::File).await.unwrap();
+        assert!(!outcomes[0].committed, "{outcomes:?}");
+        drop(first);
+
+        // The restart re-checks it, and its commit fails once more.
+        let mut second = engine("work-2").await;
+        fail_commits(&mut second, 1);
+        let verified_before = counter("verified_total");
+        let commits_before = counter("commits_total");
+        let summary = second.recover().await.unwrap();
+        assert_eq!(
+            (summary.committed, summary.still_pending),
+            (0, 1),
+            "{summary:?}"
+        );
+        // A later pass settles it.
+        second.process_once(SourceType::File).await.unwrap();
+        let rows = second.store.list_batches().await.unwrap();
+        assert!(
+            rows.iter().all(|r| r.state == BatchState::SourceCommitted),
+            "{rows:?}"
+        );
+        // Every commit this process made is matched by a verification it
+        // counted - the re-read's batch and the settled row alike.
+        let commits = counter("commits_total") - commits_before;
+        assert!(commits >= 1, "nothing was committed");
+        assert_eq!(
+            counter("verified_total") - verified_before,
+            commits,
+            "commits_total ran ahead of verified_total: the settled row's verification was not counted"
+        );
     }
 
     /// Delegates to the real adapter, but its next `failures` source commits

@@ -133,7 +133,7 @@ The engine drives each batch stage-by-stage; each stage advances the batch to a 
 | 8 | **Verify** | Both stored object and manifest are verified against expected checksums/metadata. | `VERIFIED` |
 | 9 | **Commit** | Only after verification, the source marker is committed via the adapter. | `SOURCE_COMMITTED` |
 
-If any stage fails, the batch transitions to `FAILED`, then `REPLAY_REQUIRED`, and its range is handed back to the source at the end of the cycle, whether or not those writes land (§13, item 5). If verification fails, `commit_progress(...)` is never called. If the commit itself fails after verification, the batch stays `VERIFIED` (not lost). The running engine retries the commit after each later pass of that source, and recovery retries it after a restart (#624, §13 item 1).
+If any stage fails, the batch transitions to `FAILED`, then `REPLAY_REQUIRED`, and its range is handed back to the source at the end of the cycle, whether or not those writes land (§13, item 5). If verification fails, `commit_progress(...)` is never called. If the commit itself fails after verification, the batch stays `VERIFIED` (not lost). The running engine retries the commit after each later pass of the same source type, and recovery retries it after a restart (#624, §13 item 1).
 
 ### 5.1 State machine
 
