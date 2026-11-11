@@ -738,7 +738,11 @@ def test_an_archiver_that_raises_keeps_every_volume(tmp_path, monkeypatch, raise
         failover.run_rep(ctx, "vtop", "kill9_leader", 1)
     assert downs == []  # no `down -v` over volumes nobody archived
     assert len(ctx["kept_volumes"]) == 3 and all("not archived yet" in v for v in ctx["kept_volumes"])
-    assert "status" in _csv_text(ctx).splitlines()[0]  # the row is still written
+    # The row is still written: the header the helper wrote, plus run_rep's one row.
+    with open(ctx["csv"], newline="") as handle:
+        rows = list(__import__("csv").DictReader(handle))
+    assert [(r["system"], r["fault"], r["repetition"], r["status"]) for r in rows] == \
+        [("vtop", "kill9_leader", "1", "failed")]
 
 
 def test_an_interrupt_while_archiving_keeps_every_volume(tmp_path, monkeypatch):
