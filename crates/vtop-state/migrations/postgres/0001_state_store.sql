@@ -75,7 +75,19 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
 -- committed without ever having been verified. Every engine release inserts
 -- only batching, so an older binary on an upgraded database is unaffected.
 -- CREATE OR REPLACE means re-running `vtopctl migrate` installs the new body.
+--
+-- Schema version marker: the first line of the body. Engine startup
+-- (PgStateStore::check_schema) refuses a trigger function whose body lacks
+-- a marker of at least MIN_SCHEMA_VERSION, so a schema restored from an older
+-- archive, never re-migrated, or re-migrated by an older release (whose
+-- CREATE OR REPLACE installs its own, unmarked or lower-marked body) is
+-- reported as needing `vtopctl migrate`. It is in the body, not a COMMENT ON
+-- FUNCTION, because CREATE OR REPLACE keeps a comment. Version 2 is the first
+-- with the #625 insert check; bodies before it carry no marker. ANY change to
+-- the trigger or its function MUST bump this number and MIN_SCHEMA_VERSION
+-- together.
 CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$
+-- vtop-state-schema 2
 BEGIN
     IF NEW.state = 'source_committed' THEN
         IF TG_OP = 'INSERT' THEN
@@ -97,13 +109,5 @@ $fn$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS trg_commit_after_verify ON batches;
 CREATE TRIGGER trg_commit_after_verify BEFORE INSERT OR UPDATE ON batches
     FOR EACH ROW EXECUTE FUNCTION vtop_enforce_commit_after_verify();
-
--- Schema version marker. Engine startup (PgStateStore::check_schema) refuses
--- a trigger function without at least MIN_SCHEMA_VERSION here, so a schema
--- restored from an older archive, or never re-migrated, is reported as
--- needing `vtopctl migrate`. Version 2 is the first with the #625 insert
--- check; schemas before it carry no marker. ANY change to the trigger or its
--- function MUST bump this number and MIN_SCHEMA_VERSION together.
-COMMENT ON FUNCTION vtop_enforce_commit_after_verify() IS 'vtop-state-schema 2';
 
 COMMIT;

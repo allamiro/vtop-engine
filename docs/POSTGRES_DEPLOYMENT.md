@@ -108,18 +108,21 @@ migration job per database; engine replicas should start only after it succeeds.
   (#625). Re-running `vtopctl migrate` replaces the trigger function in
   place. Every release inserts only `batching`, so an older engine on the
   upgraded schema is unaffected.
-- Schema version marker. The migration sets
-  `COMMENT ON FUNCTION vtop_enforce_commit_after_verify() IS 'vtop-state-schema 2'`.
-  Engine startup requires the trigger to be enabled and its function to carry
-  a marker of at least the version the engine was built for (2 since #625),
-  not just a trigger with that name. A missing or unparseable marker counts
-  as an old schema. An engine from this release therefore refuses to start,
-  with instructions to run `vtopctl migrate`, until the migration has run, so
-  run it before rolling out the engines, as above. **Any future change to the
-  trigger or its function must bump this marker** in the migration together
-  with `MIN_SCHEMA_VERSION` in `pg_store.rs`. Do not run an older release's
-  `vtopctl migrate` against an upgraded database: `CREATE OR REPLACE`
-  installs the older function body but keeps the newer marker.
+- Schema version marker. The first line of the trigger function's body is
+  the SQL comment `-- vtop-state-schema 2`. Engine startup requires the
+  trigger to be enabled and its function body to carry a marker of at least
+  the version the engine was built for (2 since #625), not just a trigger
+  with that name. A missing or unparseable marker counts as an old schema.
+  An engine from this release therefore refuses to start, with instructions
+  to run `vtopctl migrate`, until the migration has run, so run it before
+  rolling out the engines, as above. The marker is part of the body, so
+  whatever installs a body also sets its marker. If an older release's
+  `vtopctl migrate` is run against an upgraded database, its
+  `CREATE OR REPLACE` installs the older, unmarked body, and this release's
+  engines refuse to start until this release's migration runs again.
+  **Any future change to the trigger or its function must bump this
+  marker** in the migration together with `MIN_SCHEMA_VERSION` in
+  `pg_store.rs`.
 - Restoring the ledger from a backup. Stop every engine first, and **always
   finish with `vtopctl migrate`**. A schema restored from an older archive
   (`pg_restore`, or `--schema-only`) carries that release's trigger

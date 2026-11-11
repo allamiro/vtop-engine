@@ -42,19 +42,25 @@ use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 /// operators apply the same artifact outside the engine if desired.
 const MIGRATION: &str = include_str!("../migrations/postgres/0001_state_store.sql");
 
-/// The migration marks the invariant trigger's function with
-/// `COMMENT ... IS 'vtop-state-schema N'`. Startup requires at least this N.
-/// 2 is the first body that refuses an insert in any state but batching
-/// (#625); a schema from before it carries no marker.
-const SCHEMA_MARKER_PREFIX: &str = "vtop-state-schema ";
+/// The invariant trigger's function body carries a line
+/// `-- vtop-state-schema N`. Startup requires at least this N. 2 is the first
+/// body that refuses an insert in any state but batching (#625); a schema from
+/// before it carries no marker. The marker lives in the body, not in a
+/// `COMMENT ON FUNCTION`, because `CREATE OR REPLACE` replaces the body but
+/// keeps a comment: an older release's migrate would leave its older body
+/// under the newer comment.
+const SCHEMA_MARKER_PREFIX: &str = "-- vtop-state-schema ";
 const MIN_SCHEMA_VERSION: u32 = 2;
 
-/// Whether the trigger function's comment names a schema version this
-/// engine accepts. A missing or unparseable marker is an old schema.
-fn schema_marker_is_current(comment: Option<&str>) -> bool {
-    comment
-        .and_then(|c| c.strip_prefix(SCHEMA_MARKER_PREFIX))
-        .and_then(|v| v.parse::<u32>().ok())
+/// Whether the trigger function's body names a schema version this engine
+/// accepts. A missing or unparseable marker is an old schema.
+fn schema_marker_is_current(function_body: Option<&str>) -> bool {
+    function_body
+        .and_then(|body| {
+            body.lines()
+                .find_map(|line| line.trim().strip_prefix(SCHEMA_MARKER_PREFIX))
+        })
+        .and_then(|v| v.trim().parse::<u32>().ok())
         .is_some_and(|v| v >= MIN_SCHEMA_VERSION)
 }
 
@@ -266,14 +272,15 @@ impl PgStateStore {
         .await
         .map_err(map_schema_check)?;
 
-        // The trigger must be enabled and call a function the migration marked
-        // with a current schema version, not merely exist by name: a schema
-        // restored from an older archive, or never re-migrated, keeps the name
-        // with the body from before #625, and a restore that disabled the
-        // trigger may never have enabled it again.
-        let marker: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT pg_catalog.obj_description(t.tgfoid, 'pg_proc') \
+        // The trigger must be enabled and call a function whose body carries a
+        // current schema marker, not merely exist by name: a schema restored
+        // from an older archive, never re-migrated, or re-migrated by an older
+        // release keeps the name with an older body, and a restore that
+        // disabled the trigger may never have enabled it again.
+        let body: Option<String> = sqlx::query_scalar(
+            "SELECT p.prosrc \
              FROM pg_catalog.pg_trigger t \
+             JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid \
              WHERE t.tgrelid = 'batches'::regclass \
                AND t.tgname = 'trg_commit_after_verify' \
                AND NOT t.tgisinternal \
@@ -282,7 +289,7 @@ impl PgStateStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(map_schema_check)?;
-        if !schema_marker_is_current(marker.flatten().as_deref()) {
+        if !schema_marker_is_current(body.as_deref()) {
             return Err(schema_migration_required());
         }
         Ok(())
@@ -736,18 +743,27 @@ mod security_tests {
 
     #[test]
     fn only_a_current_schema_marker_passes_startup() {
-        for comment in [
-            None,
-            Some(""),
-            Some("vtop-state-schema"),
-            Some("vtop-state-schema x"),
-            Some("vtop-state-schema 1"),
-            Some("must be inserted as batching"),
+        let body = |marker: &str| format!("\n{marker}\nBEGIN\n    RETURN NEW;\nEND;\n");
+        for refused in [
+            "",
+            "-- vtop-state-schema",
+            "-- vtop-state-schema x",
+            "-- vtop-state-schema 1",
+            "vtop-state-schema 2",
+            "-- must be inserted as batching",
         ] {
-            assert!(!schema_marker_is_current(comment), "{comment:?}");
+            assert!(
+                !schema_marker_is_current(Some(&body(refused))),
+                "{refused:?}"
+            );
         }
-        assert!(schema_marker_is_current(Some("vtop-state-schema 2")));
-        assert!(schema_marker_is_current(Some("vtop-state-schema 3")));
+        assert!(!schema_marker_is_current(None));
+        assert!(schema_marker_is_current(Some(&body(
+            "-- vtop-state-schema 2"
+        ))));
+        assert!(schema_marker_is_current(Some(&body(
+            "    -- vtop-state-schema 3"
+        ))));
     }
 
     #[test]
