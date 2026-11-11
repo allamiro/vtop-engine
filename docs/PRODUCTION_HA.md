@@ -265,6 +265,32 @@ refuses. The per-batch WARN
 is not rate-limited: it replaces that batch's INFO `verification_passed`
 line, so it is no more frequent than the batch log itself.
 
+### Explain effective configuration before starting
+
+`vtopctl validate --config <file> --print-effective` prints a `default` block
+for unmatched discovered sources and one block per configured stream. The
+`default` block is also present without `streams.yaml`. Every setting identifies
+its origin: `stream`, `global`, or `built-in default`. This is a static explanation:
+no source, state store or object store is contacted, and secret references are
+not resolved. A stream whose tenant is omitted uses the built-in `default`
+tenant, matching the engine; unmatched sources use `engine.tenant`.
+
+Add `--json` for the versioned shape
+`{"status":"ok","warnings":[],"effective_version":1,"effective":{"default":{},"streams":[]}}`.
+Each setting in a block has `value` and `origin` fields. The explicit allowlist
+covers identity, evidence, placement and batching; it omits secret values and
+references, including the manifest MAC key's environment-variable name. The MAC
+setting reports only `enabled` or `disabled`.
+
+The verification method is the backend's preferred path: native S3 with SHA-256
+uses `store_checksum` when a service whole-object checksum is available, falling
+back to `read_back` otherwise (including multipart objects). Native S3 with
+BLAKE3, localfs, and the command backends use `read_back`; disabled checksums use
+`size_only`. The resolved upload width is the configured ceiling after active
+transport tuning, before the adaptive controller reacts to live throttles.
+Without `--print-effective`, validate's existing output and exit codes are
+unchanged.
+
 **ETag caveat:** S3 multipart ETags are **not** reliable MD5 checksums. The
 authoritative integrity value is VTOP's own **SHA-256/BLAKE3 manifest checksum**,
 never the ETag.

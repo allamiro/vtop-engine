@@ -16,6 +16,8 @@ pub mod multipart;
 pub mod s3_native;
 pub mod s3cmd_backend;
 
+pub use vtop_core::effective_config::{verification_method, VerificationMethod};
+
 pub use base::{is_throttle_code, is_throttle_status, looks_throttled, THROTTLE_ERROR_CODES};
 pub use base::{
     ObjectChecksum, ObjectHead, StoredManifest, StoredObject, UploadBackend, UploadedPart,

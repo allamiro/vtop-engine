@@ -4158,6 +4158,7 @@ mod tests {
     fn a_retention_loss_on_an_overridden_stream_is_charged_to_that_streams_tenant() {
         let streams = StreamsConfig {
             streams: vec![StreamConfig {
+                configured_fields: Default::default(),
                 source_name: "app_events".into(),
                 source_type: SourceType::Kafka,
                 format: vtop_core::types::TelemetryFormat::Raw,
