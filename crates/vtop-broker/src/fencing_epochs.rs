@@ -519,10 +519,9 @@ impl FencingEpochJournal {
         // the records the replica takes from here on come from the leader of
         // the epoch it holds, and below the cut it agreed with that leader
         // already. Lowering is always safe; only raising could re-attribute
-        // records some other leadership wrote.
-        if let Some(lineage) = self.lineage.as_mut() {
-            lineage.anchor = lineage.anchor.min(offset);
-        }
+        // records some other leadership wrote. Durable first (#648 review):
+        // the records written from the cut on will be, too.
+        self.lower_lineage_anchor(offset)?;
         let keep = self
             .entries
             .iter()
@@ -767,13 +766,12 @@ impl FencingEpochJournal {
     /// records under whatever the journal said. Never past an entry of a
     /// later epoch, so it cannot re-file records another leader sent.
     pub fn follow_held_leader_lineage(&mut self, tail: u64) -> BrokerResult<bool> {
-        let Some(lineage) = self.lineage.as_mut() else {
+        let Some(lineage) = self.lineage.as_ref() else {
             return Ok(false);
         };
         if lineage.waiting_on_dispute {
             return Ok(false);
         }
-        lineage.anchor = lineage.anchor.min(tail);
         let epoch = lineage.epoch;
         Ok(matches!(
             self.follow_leader_lineage(epoch, tail)?,
@@ -800,13 +798,16 @@ impl FencingEpochJournal {
     /// the next call (the restart's adoption of `epoch`, or its next append)
     /// completes.
     pub fn follow_leader_lineage(&mut self, epoch: u64, tail: u64) -> BrokerResult<LineageFollow> {
-        let Some(lineage) = self.lineage.as_mut() else {
+        let Some(lineage) = self.lineage.as_ref() else {
             return Ok(LineageFollow::NotHeld);
         };
         if lineage.epoch != epoch || lineage.waiting_on_dispute {
             return Ok(LineageFollow::NotHeld);
         }
-        lineage.anchor = lineage.anchor.min(tail);
+        self.lower_lineage_anchor(tail)?;
+        let Some(lineage) = self.lineage.as_ref() else {
+            return Ok(LineageFollow::NotHeld);
+        };
         let anchor = lineage.anchor;
         let leader = lineage.entries.clone();
         let complete = leader.last().is_none_or(|last| last.start_offset <= tail);
@@ -976,34 +977,64 @@ impl FencingEpochJournal {
         }
     }
 
+    /// Lower the followed lineage's anchor to `to`, durably (#648 review).
+    /// A no-op when it is already at or below `to`, or when the lineage
+    /// waits on a dispute (its anchor means nothing until it is taken).
+    ///
+    /// Durable before it returns, and every caller lowers it before records
+    /// past it can become durable: recovery at open, before anything is
+    /// appended; truncation, before the records written from the cut. Kept
+    /// in memory only, a crash after such a record reloaded the old, higher
+    /// anchor, the re-derivation began at the new tail, and the leader's
+    /// entries between the two were filed under the epoch below them.
+    fn lower_lineage_anchor(&mut self, to: u64) -> BrokerResult<()> {
+        let Some(lineage) = self.lineage.as_ref() else {
+            return Ok(());
+        };
+        if lineage.waiting_on_dispute || lineage.anchor <= to {
+            return Ok(());
+        }
+        let lowered = LeaderLineage {
+            anchor: to,
+            ..lineage.clone()
+        };
+        self.write_lineage(Some(&lowered))?;
+        self.lineage = Some(lowered);
+        Ok(())
+    }
+
+    /// Replace the lineage sidecar with `lineage`, or with nothing,
+    /// atomically (#648 review): written in full to `<sidecar>.rewrite`,
+    /// fsynced, renamed over the sidecar, and the directory fsynced, so a
+    /// crash at any point leaves the old record or the new one. An
+    /// overwrite in place could tear and lose the record whole, and the
+    /// lineage is now relied on across crashes (the anchor, a waiting
+    /// history), not only as a best effort.
     fn write_lineage(&mut self, lineage: Option<&LeaderLineage>) -> BrokerResult<()> {
         let path = lineage_path(&self.path);
         let bytes = lineage.map(encode_lineage).unwrap_or_default();
-        let existed = self
-            .env
-            .storage
-            .exists(&path)
-            .map_err(|source| Self::io(&path, source))?;
-        if !existed && bytes.is_empty() {
+        if bytes.is_empty()
+            && !self
+                .env
+                .storage
+                .exists(&path)
+                .map_err(|source| Self::io(&path, source))?
+        {
             return Ok(());
         }
-        let mut file = self
-            .env
+        let scratch = rewrite_path(&path);
+        self.env
             .storage
-            .open(&path, OpenMode::CreateAppend)
+            .open(&scratch, OpenMode::CreateAppend)
+            .and_then(|mut file| {
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+                file.write_all(&bytes)?;
+                file.sync_data()
+            })
+            .and_then(|()| self.env.storage.rename(&scratch, &path))
             .map_err(|source| Self::io(&path, source))?;
-        // Written whole at offset zero and then cut to length. A crash part
-        // way leaves a frame whose checksum fails, which reads as "no
-        // lineage": the attribution used before #640, never a misread one.
-        file.seek(SeekFrom::Start(0))
-            .and_then(|_| file.write_all(&bytes))
-            .and_then(|()| file.set_len(bytes.len() as u64))
-            .and_then(|()| file.sync_data())
-            .map_err(|source| Self::io(&path, source))?;
-        if !existed {
-            Self::sync_parent(&self.env, &path)?;
-        }
-        Ok(())
+        Self::sync_parent(&self.env, &path)
     }
 
     pub fn entries(&self) -> &[EpochStart] {
@@ -2646,6 +2677,94 @@ mod tests {
             if acked {
                 assert_eq!(read, new, "{plan:?}: an acked rewrite was lost");
             }
+        }
+    }
+
+    /// #648 review (Codex 4534018595): an anchor lowered by recovery must be
+    /// durable before a record past it can be. The lineage of 20 is
+    /// `[(18,0),(19,4),(20,8)]`, anchored at 6. A crash loses records 3..6,
+    /// so the open finds tail 3, drops the journal's `(19,4)` with them, and
+    /// lowers the anchor to 3. Records 3..5 are then appended durably and the
+    /// node crashes before following. Lowered in memory only, the anchor
+    /// reloaded as 6, came down only to the new tail 5, and the re-derivation
+    /// began 19 at 5: offset 4 stayed epoch 18's. A crash anywhere in the
+    /// first recovery must not change that answer either.
+    #[test]
+    fn a_lowered_anchor_survives_the_next_crash() {
+        use vtop_log::sim::{FaultPlan, SimStorage, TraceKind};
+        const PATH: &str = "/node/fencing-epochs";
+        let leader = starts(&[(18, 0), (19, 4), (20, 8)]);
+        let open_sim = |env: &Env| FencingEpochJournal::open_in(env, PathBuf::from(PATH));
+        // The journal as a replica that followed the lineage to 6 left it.
+        let base = {
+            let sim = SimStorage::new();
+            sim.create_dir_all(Path::new("/node"));
+            let mut j = open_sim(&sim.env(1)).unwrap();
+            j.record(18, 0).unwrap();
+            j.record(19, 4).unwrap();
+            assert!(j.take_leader_lineage(20, &leader, 6, 0).unwrap());
+            j.follow_leader_lineage(20, 6).unwrap();
+            assert_eq!(j.entries(), starts(&[(18, 0), (19, 4)]).as_slice());
+            sim.snapshot()
+        };
+        // An open over a log whose tail is `tail`, as the follower's attach
+        // runs it: drop entries past the tail, then replay the lineage.
+        let recover = |env: &Env, tail: u64| -> BrokerResult<FencingEpochJournal> {
+            let mut j = open_sim(env)?;
+            j.truncate_to(tail + 1)?;
+            j.replay_leader_lineage_at_open(tail)?;
+            Ok(j)
+        };
+        let clean = SimStorage::new();
+        clean.restore(&base);
+        let opened = clean.op_count();
+        drop(recover(&clean.env(1), 3).unwrap());
+        let total = clean.op_count();
+        let mut plans: Vec<FaultPlan> = vec![FaultPlan::None];
+        plans.extend((opened..total).map(FaultPlan::CrashBefore));
+        for entry in clean
+            .trace()
+            .into_iter()
+            .filter(|entry| entry.kind == TraceKind::HandleWrite && entry.index >= opened)
+        {
+            for cut in 0..=entry.len as usize {
+                plans.push(FaultPlan::CrashDuringWrite {
+                    op: entry.index,
+                    byte_cut: cut,
+                });
+            }
+        }
+        for plan in plans {
+            let sim = SimStorage::new();
+            sim.restore(&base);
+            let env = sim.env(1);
+            // First crash: records 3..6 are gone. The recovery may itself be
+            // cut short by `plan`; the node then restarts and recovers again.
+            sim.set_fault(plan);
+            let first = recover(&env, 3);
+            if sim.has_crashed() || first.is_err() {
+                drop(first);
+                sim.reboot();
+                drop(recover(&env, 3).expect("the restarted recovery"));
+            } else {
+                drop(first);
+            }
+            // Records 3..5 become durable under 20; the node dies before it
+            // follows the lineage over them.
+            sim.crash();
+            sim.reboot();
+            let j = recover(&env, 5).unwrap_or_else(|error| panic!("{plan:?}: {error}"));
+            assert_eq!(
+                j.epoch_owning(4),
+                Some(19),
+                "{plan:?}: offset 4 must stay epoch 19's, as the leader files it: {:?}",
+                j.entries()
+            );
+            assert_eq!(
+                j.entries(),
+                starts(&[(18, 0), (19, 4)]).as_slice(),
+                "{plan:?}"
+            );
         }
     }
 }
