@@ -281,6 +281,40 @@ reopen quietly.
   the directory, which lowers it. A crash sweep
   (`kept_dispute_crash_sweep.rs`) cuts the fence and the settlement at every
   storage operation and every byte of every write.
+- **#640** - a follower filed the records a new leader caught it up on under
+  the wrong epoch. It recorded an epoch it adopted at its own tail, so when
+  it was behind, the records the new leader then sent it were filed under the
+  new epoch, while the leader filed the same bytes under the epoch that wrote
+  them. The two histories diverged below both tails, every later fence answer
+  between them was Unknown (#577), and after a second failover no candidate
+  could be established, though no acknowledged record was lost. The fence
+  that installs a leader already carries that leader's history; a fenced
+  follower whose own history agrees with it below its tail now keeps it (in a
+  `fencing-epochs.leader` sidecar, so a restart keeps it too) and files every
+  record that leader sends under the leader's entries. After a catch-up its
+  vector equals the leader's for the caught-up range (after a partial
+  catch-up, only that far). A crash between an append and that filing is
+  repaired when the replica next opens, before it answers anything, provided
+  the `fencing-epochs.leader` sidecar survived intact; a missing or torn
+  sidecar reads as "no lineage" and repairs nothing, leaving those records
+  filed as before #640 (an Unknown answer later, never a counted one). A
+  follower that kept a dispute (#611) holds the fence's history in the same
+  sidecar, as #635 holds the dispute, and takes it only once the dispute
+  settles, at the tail the settlement leaves; a newer fence or the node's
+  own candidate fence drops it, as they retire the dispute. A follower the
+  fence did not reach adopts at its tail as before.
+  **Compatibility:** the lineage changes nothing in the journal's own format
+  (its header gate is #635's), so an older binary that may open it reads it
+  as its own and simply resumes adopting at its tail. The sidecar is
+  a name older binaries never open, and this release reads a missing, torn or
+  newer-version sidecar as "no lineage", the old behaviour. **Journals
+  mislabelled by an earlier release are not rewritten**: nothing on a replica
+  tells a record it was caught up on under an epoch from one that epoch's
+  leader wrote, so such a replica's answer stays Unknown against a correctly
+  labelled history (and is never counted) until it is repaired with `vtopctl
+  node repair` from a replica whose history is right (#315). No wire or
+  feature-level change: an older follower keeps mislabelling until upgraded,
+  which costs elections availability, never an acknowledged record.
 
 One observation rode along without becoming a fix: scenario 09 once left a
 promotion unacquired within its deadline (#318). The flake has not recurred —
