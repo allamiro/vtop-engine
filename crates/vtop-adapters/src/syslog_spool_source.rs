@@ -744,6 +744,32 @@ impl SourceAdapter for SyslogSpoolSource {
         Some(i128::from(c.read_byte))
     }
 
+    /// See `FileSource::committed_through`.
+    fn committed_through(&self, marker: &ProgressMarker) -> Option<i128> {
+        let ProgressMarker::SyslogSpool {
+            path,
+            inode: marker_inode,
+            content_fingerprint: marker_content,
+            ..
+        } = marker
+        else {
+            return None;
+        };
+        let c = self.cursors.get(path)?;
+        let seen = c.seen.as_ref();
+        if marker_inode.is_some() && seen.and_then(|seen| seen.inode) != *marker_inode {
+            return None;
+        }
+        if seen
+            .and_then(|seen| seen.content.as_ref())
+            .zip(marker_content.as_ref())
+            .is_some_and(|(seen, marker)| seen.same_content(marker) == Some(false))
+        {
+            return None;
+        }
+        Some(i128::from(c.committed_byte))
+    }
+
     fn source_type(&self) -> SourceType {
         SourceType::SyslogSpool
     }

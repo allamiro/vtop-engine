@@ -1417,6 +1417,36 @@ impl SourceAdapter for FileSource {
         Some(i128::from(c.read_byte))
     }
 
+    /// The cursor's committed byte, when the cursor describes the marker's
+    /// file: the inode it last saw (or the restart seed's) is the marker's,
+    /// and its content is not proven to be another file's. A marker with no
+    /// inode (a legacy row) cannot be told apart from any file at its path,
+    /// and is answered for the one there, as `read_position` does.
+    fn committed_through(&self, marker: &ProgressMarker) -> Option<i128> {
+        let ProgressMarker::File {
+            path,
+            inode: marker_inode,
+            content_fingerprint: marker_content,
+            ..
+        } = marker
+        else {
+            return None;
+        };
+        let c = self.cursors.get(path)?;
+        let seen = c.seen.as_ref();
+        if marker_inode.is_some() && seen.and_then(|seen| seen.inode) != *marker_inode {
+            return None;
+        }
+        if seen
+            .and_then(|seen| seen.content.as_ref())
+            .zip(marker_content.as_ref())
+            .is_some_and(|(seen, marker)| seen.same_content(marker) == Some(false))
+        {
+            return None;
+        }
+        Some(i128::from(c.committed_byte))
+    }
+
     fn source_type(&self) -> SourceType {
         SourceType::File
     }
@@ -2096,6 +2126,44 @@ mod tests {
             .unwrap();
         assert_eq!(reads2.len(), 1);
         assert_eq!(reads2[0].records, vec![b"two".to_vec(), b"three".to_vec()]);
+    }
+
+    /// #567: the committed point is answered only for the file the cursor
+    /// describes - the restart seed's, here - and is the committed byte, not
+    /// the read head. A marker of another inode, or of content proven to be
+    /// another file's, gets no answer: that file's committed point is unknown.
+    #[test]
+    fn the_committed_point_is_answered_only_for_the_cursors_file() {
+        let path = "/logs/committed-through.log".to_string();
+        let page = |byte: u8| ContentFingerprint::of(&[byte; 64]).unwrap();
+        let marker =
+            |inode: Option<u64>, content: Option<ContentFingerprint>| ProgressMarker::File {
+                path: path.clone(),
+                inode,
+                start_byte: 0,
+                end_byte: 10,
+                file_size: 64,
+                mtime: String::new(),
+                content_fingerprint: content,
+                tail_fingerprint: None,
+            };
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        assert_eq!(fs.committed_through(&marker(Some(7), None)), None);
+        fs.seed_committed_from(&path, 40, Some(7), Some(64), Some(page(b'a')), None);
+        fs.cursors.get_mut(&path).unwrap().read_byte = 55;
+        assert_eq!(fs.committed_through(&marker(Some(7), None)), Some(40));
+        assert_eq!(
+            fs.committed_through(&marker(Some(7), Some(page(b'a')))),
+            Some(40)
+        );
+        assert_eq!(fs.committed_through(&marker(Some(8), None)), None);
+        assert_eq!(
+            fs.committed_through(&marker(Some(7), Some(page(b'b')))),
+            None,
+            "a replacement at the same inode"
+        );
+        // A legacy marker names no inode: it is answered for the file there.
+        assert_eq!(fs.committed_through(&marker(None, None)), Some(40));
     }
 
     /// The batch rewind returns one result per marker, in order, and one that

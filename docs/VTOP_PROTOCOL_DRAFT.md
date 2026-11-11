@@ -338,7 +338,7 @@ DISCOVERED → BATCHING → SEALED → COMPRESSED → CHECKSUMMED →
 OBJECT_UPLOADED → MANIFEST_UPLOADED → VERIFIED → SOURCE_COMMITTED
 ```
 
-plus the failure/recovery states `FAILED` and `REPLAY_REQUIRED` (`REPLAY_REQUIRED` is not terminal — it re-enters at `BATCHING`).
+plus the failure/recovery states `FAILED` and `REPLAY_REQUIRED` (`REPLAY_REQUIRED` is not terminal — it re-enters at `BATCHING`), and the terminal state `SUPERSEDED`.
 
 Legal transitions (and **only** these) are permitted:
 
@@ -355,6 +355,8 @@ Legal transitions (and **only** these) are permitted:
 | ANY_STATE | FAILED |
 | FAILED | REPLAY_REQUIRED |
 | REPLAY_REQUIRED | BATCHING |
+| FAILED | SUPERSEDED |
+| REPLAY_REQUIRED | SUPERSEDED |
 
 ```
                  +--------------------------------------------------+
@@ -363,8 +365,18 @@ Legal transitions (and **only** these) are permitted:
  OBJECT_UPLOADED -> MANIFEST_UPLOADED -> VERIFIED -> SOURCE_COMMITTED|
         |  |  |  |  |  |  |  |                                      |
         +--+--+--+--+--+--+--+--> FAILED -> REPLAY_REQUIRED --------+
-                                   (from ANY_STATE)
+                                   (from ANY_STATE)  |        |
+                                                     +--------+--> SUPERSEDED
 ```
+
+`SOURCE_COMMITTED` and `SUPERSEDED` are the terminal states: no transition leaves either, not even to `FAILED`. "Any state" in `ANY_STATE → FAILED` means any non-terminal state.
+
+`SUPERSEDED` retires a batch whose range was handed back to its source (`FAILED` or `REPLAY_REQUIRED`) and which the source has since committed past. An implementation:
+
+- **MAY** move a batch to `SUPERSEDED` only when the committed progress of the batch's source unit (one partition under one consumer group; one file, by identity) is at or past the end of the batch's range. A rewind to such a range re-reads nothing, because a rewind never goes below committed progress (§14).
+- **MUST NOT** advance any source progress marker in doing so. `SUPERSEDED` is not a commit, and it is not a path to `SOURCE_COMMITTED`: the only predecessor of `SOURCE_COMMITTED` is still `VERIFIED` (§13).
+- **MUST NOT** treat a `SUPERSEDED` batch as evidence that its range was archived. Committed progress having passed a range does not prove that a committed range covers its bytes. A coverage audit **MUST** judge a `SUPERSEDED` range as it judges a `FAILED` one.
+- **MAY** delete `SUPERSEDED` batches under the same retention rules as `SOURCE_COMMITTED` ones. A `SUPERSEDED` batch is never a restart position, so none has to be kept for that.
 
 A conformant implementation **MUST** persist state transitions durably so that recovery after a crash is possible (§14).
 
@@ -401,7 +413,8 @@ A conformant implementation **MUST NOT** commit source progress in any other ord
 A conformant implementation:
 
 - **MUST** persist batch state durably such that, after a crash, every batch can be classified as committed or not-yet-committed.
-- **MUST** treat any batch that did not reach `SOURCE_COMMITTED` as eligible for recovery.
+- **MUST** treat any batch that did not reach a terminal state (`SOURCE_COMMITTED` or `SUPERSEDED`) as eligible for recovery.
+- On recovery, a batch whose range its source has already committed past (§12) **MAY** be moved to `SUPERSEDED` instead of being replayed, via `FAILED` if it is in neither `FAILED` nor `REPLAY_REQUIRED`. A `VERIFIED` batch is not eligible: its commit is retried as below.
 - On recovery, a batch already in `VERIFIED` (object and manifest durably written and verified, but progress not yet committed) **MAY** complete by committing source progress (`VERIFIED → SOURCE_COMMITTED`); its object **MUST NOT** be discarded.
 - On recovery, a batch in any state *before* `VERIFIED` **MUST** be transitioned to `FAILED` and then `REPLAY_REQUIRED`, and re-entered at `BATCHING`; its uncommitted source range **MUST** remain replayable.
 - **MUST NOT** double-commit a source progress marker that was already committed.

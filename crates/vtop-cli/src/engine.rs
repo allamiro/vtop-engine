@@ -2348,6 +2348,46 @@ impl Engine {
                     verified.push(rec);
                 }
                 RecoveryAction::None => {}
+                _ if self.committed_past(&rec) => {
+                    // Its source has committed past it (#567): a rewind would
+                    // land at or above its end and read nothing again, so
+                    // the row is retired instead of being marked for replay
+                    // again. Before SUPERSEDED existed it was claimed,
+                    // rewritten twice and re-planned at every restart, and
+                    // retention, which deletes only terminal rows, kept it.
+                    // A failed write rewinds nothing: there is nothing below
+                    // the committed point to read, and the next recovery
+                    // decides again.
+                    match self.retire_superseded(&rec).await {
+                        Ok(()) => {
+                            summary.superseded += 1;
+                            if let Some(mx) = telemetry::metrics() {
+                                mx.batches_total
+                                    .with_label_values(&[
+                                        rec.tenant.as_str(),
+                                        rec.source_type.as_str(),
+                                        rec.format.extension(),
+                                        BatchState::Superseded.as_str(),
+                                    ])
+                                    .inc();
+                            }
+                            tracing::info!(
+                                batch_id = %rec.batch_id,
+                                state = %rec.state,
+                                "recovered: SUPERSEDED (its source has committed past it; nothing to re-read)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                batch_id = %rec.batch_id,
+                                error = %e,
+                                "recovery: could not retire a range its source has committed past; \
+                                 it stays as it is, and nothing below the committed point is re-read"
+                            );
+                            summary.still_pending += 1;
+                        }
+                    }
+                }
                 _ => {
                     // Any other incomplete state has no durable, replayable
                     // object we can finish from in this prototype: mark for
@@ -2493,6 +2533,53 @@ impl Engine {
             }
         }
         Ok(summary)
+    }
+
+    /// Whether `rec`'s source has committed past the end of its range, in the
+    /// same file (#567): the adapter's committed point for the unit - at
+    /// startup, the ledger's newest committed row, which retention never
+    /// prunes - is at or above where the range ends. A rewind to the range
+    /// would then land at that point and re-read none of it.
+    ///
+    /// A range whose start and end name different units (a window across a
+    /// rotation) is not judged: no one committed point describes both files.
+    /// Nor is one whose adapter cannot say, which keeps the replay path.
+    fn committed_past(&self, rec: &BatchRecord) -> bool {
+        let (start, end) = (&rec.progress_start, &rec.progress_end);
+        if unit_key(start) != unit_key(end) {
+            return false;
+        }
+        let Some(adapter) = self.adapters.get(&start.source_type()) else {
+            return false;
+        };
+        let range_end = end_position(end);
+        [start, end].into_iter().all(|marker| {
+            adapter
+                .committed_through(marker)
+                .is_some_and(|committed| committed >= range_end)
+        })
+    }
+
+    /// Retire a range its source has committed past (#567): SUPERSEDED, the
+    /// terminal state no claim or recovery visits again. Legal only from a
+    /// handed-back range, so a row a crashed engine left in flight is
+    /// recorded as FAILED first. Neither write moves any source progress.
+    async fn retire_superseded(&self, rec: &BatchRecord) -> Result<(), VtopError> {
+        if !matches!(rec.state, BatchState::Failed | BatchState::ReplayRequired) {
+            self.store
+                .mark_failed(
+                    &rec.batch_id,
+                    "recovered: superseded (its source committed past it)",
+                )
+                .await?;
+        }
+        self.store
+            .update_batch_state(
+                &rec.batch_id,
+                BatchState::Superseded,
+                &BatchPatch::default(),
+            )
+            .await
     }
 
     /// Commit the source progress of a VERIFIED batch that was just re-checked
@@ -3260,6 +3347,18 @@ fn unit_key(marker: &ProgressMarker) -> String {
     }
 }
 
+/// One past where a range ends within its unit, in the unit
+/// `SourceAdapter::committed_through` answers in: a byte offset, or for
+/// Kafka the offset after the last one read (`end_offset` is inclusive).
+fn end_position(marker: &ProgressMarker) -> i128 {
+    match marker {
+        ProgressMarker::Kafka { end_offset, .. } => i128::from(*end_offset) + 1,
+        ProgressMarker::File { end_byte, .. } | ProgressMarker::SyslogSpool { end_byte, .. } => {
+            i128::from(*end_byte)
+        }
+    }
+}
+
 /// Where a range begins within its unit.
 fn start_position(marker: &ProgressMarker) -> i128 {
     match marker {
@@ -3411,6 +3510,9 @@ pub struct RecoverySummary {
     pub committed: usize,
     pub replay_required: usize,
     pub still_pending: usize,
+    /// Handed-back ranges whose source had already committed past them,
+    /// retired as SUPERSEDED instead of rewound (#567).
+    pub superseded: usize,
 }
 
 #[cfg(test)]
@@ -4587,8 +4689,10 @@ mod tests {
     /// #627, end to end: the FAILED write of a batch that failed after its
     /// object landed fails too. The range is handed back anyway, so the cost
     /// is the one object the failed attempt left in the store, never a gap;
-    /// and the stale row the restart then finds re-reads nothing, because
-    /// recovery clamps its rewind to the committed point.
+    /// and the stale row the restart then finds re-reads nothing: its source
+    /// has committed past it, so recovery retires it as SUPERSEDED (#567)
+    /// instead of planning a rewind the committed point would clamp to
+    /// nothing.
     #[tokio::test]
     async fn a_failed_failed_write_costs_one_duplicate_object_and_no_gap() {
         let _serial = THROTTLE_TESTS.lock().await;
@@ -4633,20 +4737,24 @@ mod tests {
         );
         drop(engine);
 
-        // The restart finds the stale row, records the replay decision, and
-        // its rewind lands on the committed point: nothing is read again.
+        // The restart finds the stale row below the committed point and
+        // retires it: nothing is read again.
         let mut restarted = Engine::new(cfg, StreamsConfig { streams: vec![] })
             .await
             .unwrap();
         let summary = restarted.recover().await.unwrap();
-        assert_eq!(summary.replay_required, 1);
+        assert_eq!(
+            (summary.superseded, summary.replay_required),
+            (1, 0),
+            "{summary:?}"
+        );
         let row = restarted
             .store
             .get_batch(&stale.batch_id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.state, BatchState::ReplayRequired);
+        assert_eq!(row.state, BatchState::Superseded);
         let after = restarted.run_source(SourceType::File, true).await.unwrap();
         assert!(after.is_empty(), "nothing is re-archived: {after:?}");
         assert_eq!(archived_ranges(&restarted).await, vec![(0, len)]);
@@ -4691,8 +4799,9 @@ mod tests {
     /// engine followed recovery's rule and withheld the rewind when FAILED
     /// could not be written, the range it had already read past would be
     /// lost for good. The next cycle reads on, a later batch commits past the
-    /// range, and the restart that marks the row for replay clamps its rewind
-    /// to that commit.
+    /// range, and at the restart its rewind would be clamped to that commit -
+    /// so recovery retires the row as SUPERSEDED (#567). That is no cover
+    /// for the loss: the coverage audit still names the row in the hole.
     #[tokio::test]
     async fn withholding_the_rewind_on_an_unrecorded_failure_would_lose_the_range() {
         let _serial = THROTTLE_TESTS.lock().await;
@@ -4735,16 +4844,39 @@ mod tests {
             .await
             .unwrap();
         let summary = restarted.recover().await.unwrap();
-        assert_eq!(summary.replay_required, 1, "recovery records the decision");
-        let after = restarted.run_source(SourceType::File, true).await.unwrap();
-        assert!(
-            after.is_empty(),
-            "but its rewind is clamped to the committed point: {after:?}"
+        assert_eq!(
+            (summary.superseded, summary.replay_required),
+            (1, 0),
+            "the source committed past the range: nothing could re-read it ({summary:?})"
         );
+        let after = restarted.run_source(SourceType::File, true).await.unwrap();
+        assert!(after.is_empty(), "nothing is read again: {after:?}");
         assert_eq!(
             archived_ranges(&restarted).await,
             vec![(line_1, len)],
             "line 1 is never archived"
+        );
+        let rows = restarted.store.list_batches().await.unwrap();
+        let retired: Vec<String> = rows
+            .iter()
+            .filter(|row| row.state == BatchState::Superseded)
+            .map(|row| row.batch_id.clone())
+            .collect();
+        let holes: Vec<_> = crate::coverage::audit(rows)
+            .into_iter()
+            .flat_map(|report| report.failed_holes)
+            .collect();
+        assert_eq!(
+            holes
+                .iter()
+                .map(|hole| (hole.start, hole.end))
+                .collect::<Vec<_>>(),
+            vec![(0, line_1)],
+            "the audit still reports the lost range: {holes:?}"
+        );
+        assert_eq!(
+            holes[0].failed_batches, retired,
+            "and names the retired row"
         );
     }
 

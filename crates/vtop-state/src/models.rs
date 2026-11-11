@@ -42,9 +42,10 @@ pub struct BatchRecord {
 }
 
 impl BatchRecord {
-    /// Whether this record still holds uncommitted source progress.
+    /// Whether this record still holds uncommitted source progress: it is in
+    /// neither terminal state (SOURCE_COMMITTED, or SUPERSEDED, #567).
     pub fn is_incomplete(&self) -> bool {
-        !matches!(self.state, BatchState::SourceCommitted)
+        !self.state.is_terminal()
     }
 }
 

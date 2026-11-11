@@ -387,8 +387,11 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             }
             let summary = engine.recover().await?;
             println!(
-                "recovery complete: committed={} replay_required={} still_pending={}",
-                summary.committed, summary.replay_required, summary.still_pending
+                "recovery complete: committed={} replay_required={} superseded={} still_pending={}",
+                summary.committed,
+                summary.replay_required,
+                summary.superseded,
+                summary.still_pending
             );
             Ok(())
         }
@@ -781,8 +784,11 @@ fn describe_recovery(state: BatchState) -> &'static str {
     use vtop_core::replay::{next_recovery_action, RecoveryAction};
     match next_recovery_action(state) {
         RecoveryAction::RetrySourceCommit => "retry the source commit",
-        RecoveryAction::None => "do nothing (already committed)",
-        _ => "mark REPLAY_REQUIRED (source progress preserved)",
+        RecoveryAction::None => "do nothing (committed, or superseded by a later commit)",
+        _ => {
+            "mark REPLAY_REQUIRED (source progress preserved), or SUPERSEDED if its source \
+             has already committed past it"
+        }
     }
 }
 

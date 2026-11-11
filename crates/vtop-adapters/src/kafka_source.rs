@@ -1540,6 +1540,27 @@ impl SourceAdapter for KafkaSource {
             .map(i128::from)
     }
 
+    /// The known frontier (`known_committed`): the ledger's newest committed
+    /// row for this partition and group, or what this process committed
+    /// since. Never a rewind's landing, and never the broker's group offset,
+    /// which an engine whose claim moved on can still write (#614). Another
+    /// group's range is not answered: this group's frontier says nothing
+    /// about it.
+    fn committed_through(&self, marker: &ProgressMarker) -> Option<i128> {
+        let ProgressMarker::Kafka {
+            topic, partition, ..
+        } = marker
+        else {
+            return None;
+        };
+        if self.foreign_group(marker).is_some() {
+            return None;
+        }
+        self.known_committed
+            .get(&(topic.clone(), *partition))
+            .map(|&frontier| i128::from(frontier))
+    }
+
     fn source_type(&self) -> SourceType {
         SourceType::Kafka
     }
@@ -1648,6 +1669,31 @@ mod tests {
             !src.cursors.contains_key(&("t".to_string(), 0)),
             "a superseded commit must not move where the partition resumes"
         );
+    }
+
+    /// #567: the committed point recovery retires a handed-back range against
+    /// is the known frontier - the ledger's, or this process's own commits -
+    /// never where a rewind landed, and never another consumer group's.
+    #[tokio::test]
+    async fn the_committed_point_is_the_known_frontier_and_only_this_groups() {
+        let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
+        let range = |group: &str| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition: 0,
+            start_offset: 0,
+            end_offset: 9,
+            consumer_group: group.into(),
+        };
+        assert_eq!(src.committed_through(&range("vtop-engine")), None);
+        // A rewind's landing is not a commit.
+        src.cursors
+            .entry(("t".into(), 0))
+            .or_default()
+            .committed_offset = Some(50);
+        assert_eq!(src.committed_through(&range("vtop-engine")), None);
+        src.known_committed.insert(("t".into(), 0), 20);
+        assert_eq!(src.committed_through(&range("vtop-engine")), Some(20));
+        assert_eq!(src.committed_through(&range("vtop-engine-old")), None);
     }
 
     /// #614, #563: the ledger's rows of another consumer group never seed this

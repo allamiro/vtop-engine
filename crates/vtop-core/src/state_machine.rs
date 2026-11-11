@@ -10,6 +10,13 @@
 //! offset) MUST NOT be committed until the batch reaches
 //! [`BatchState::Verified`]. The only legal predecessor of
 //! [`BatchState::SourceCommitted`] is [`BatchState::Verified`].
+//!
+//! [`BatchState::Superseded`] (#567) is the other terminal state: a range
+//! that was handed back (`FAILED` / `REPLAY_REQUIRED`) and that its source
+//! has since committed past. It commits nothing - no source progress moves
+//! when a row is retired this way - so it is not a second way into
+//! `SOURCE_COMMITTED`, and no state that holds a verified, uncommitted object
+//! can reach it.
 
 use crate::errors::VtopError;
 use serde::{Deserialize, Serialize};
@@ -29,6 +36,14 @@ pub enum BatchState {
     SourceCommitted,
     Failed,
     ReplayRequired,
+    /// Terminal (#567): a handed-back range (`FAILED` / `REPLAY_REQUIRED`)
+    /// whose source unit has since committed past its end, in the same file.
+    /// A rewind to it would re-read nothing (every adapter clamps a rewind to
+    /// its committed point), so recovery retires the row instead of visiting
+    /// it on every restart. Not a commit: written without moving any source
+    /// progress, and the coverage audit still names the row in a hole if no
+    /// committed range covers its bytes.
+    Superseded,
 }
 
 impl BatchState {
@@ -46,6 +61,7 @@ impl BatchState {
             BatchState::SourceCommitted => "source_committed",
             BatchState::Failed => "failed",
             BatchState::ReplayRequired => "replay_required",
+            BatchState::Superseded => "superseded",
         }
     }
 
@@ -57,6 +73,14 @@ impl BatchState {
     /// Whether this is a terminal success state.
     pub fn is_committed(&self) -> bool {
         matches!(self, BatchState::SourceCommitted)
+    }
+
+    /// Whether no transition leaves this state: `SOURCE_COMMITTED`, or
+    /// `SUPERSEDED` (#567). A terminal row is never recovery work - it is
+    /// neither claimed nor listed as incomplete - and history retention may
+    /// delete it.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, BatchState::SourceCommitted | BatchState::Superseded)
     }
 }
 
@@ -75,6 +99,7 @@ impl std::str::FromStr for BatchState {
             "source_committed" => BatchState::SourceCommitted,
             "failed" => BatchState::Failed,
             "replay_required" => BatchState::ReplayRequired,
+            "superseded" => BatchState::Superseded,
             other => return Err(VtopError::Other(format!("unknown batch state: {other}"))),
         })
     }
@@ -101,12 +126,17 @@ impl std::fmt::Display for BatchState {
 /// ANY_STATE         -> FAILED
 /// FAILED            -> REPLAY_REQUIRED
 /// REPLAY_REQUIRED   -> BATCHING
+/// FAILED            -> SUPERSEDED
+/// REPLAY_REQUIRED   -> SUPERSEDED
 /// ```
+///
+/// `SOURCE_COMMITTED` and `SUPERSEDED` are terminal: nothing leaves them, not
+/// even `FAILED`.
 pub fn can_transition(from: BatchState, to: BatchState) -> bool {
     use BatchState::*;
 
-    // Any non-terminal-committed state may fail.
-    if to == Failed && from != SourceCommitted {
+    // Any non-terminal state may fail.
+    if to == Failed && !from.is_terminal() {
         return true;
     }
 
@@ -127,6 +157,8 @@ pub fn can_transition(from: BatchState, to: BatchState) -> bool {
             | (Verified, SourceCommitted)
             | (Failed, ReplayRequired)
             | (ReplayRequired, Batching)
+            | (Failed, Superseded)
+            | (ReplayRequired, Superseded)
     )
 }
 
@@ -257,11 +289,48 @@ mod tests {
         assert!(!can_transition(SourceCommitted, Failed));
     }
 
+    /// #567: SUPERSEDED retires a handed-back range, and only that. From a
+    /// state that holds a verified, uncommitted object (or any in-flight
+    /// one) it would discard work that recovery must still decide; out of it
+    /// nothing may move, or a retired row would come back as recovery work.
+    #[test]
+    fn only_a_handed_back_range_is_superseded_and_it_stays_so() {
+        for from in ALL_STATES {
+            assert_eq!(
+                can_transition(from, Superseded),
+                matches!(from, Failed | ReplayRequired),
+                "{from:?} -> SUPERSEDED"
+            );
+            assert!(
+                !can_transition(Superseded, from),
+                "SUPERSEDED -> {from:?} must be refused"
+            );
+        }
+        assert!(
+            matches!(
+                transition(Superseded, SourceCommitted),
+                Err(VtopError::CommitBeforeVerified { actual: Superseded })
+            ),
+            "a superseded row is not a way into SOURCE_COMMITTED"
+        );
+    }
+
+    #[test]
+    fn only_committed_and_superseded_are_terminal() {
+        for s in ALL_STATES {
+            assert_eq!(
+                s.is_terminal(),
+                matches!(s, SourceCommitted | Superseded),
+                "{s:?}"
+            );
+        }
+    }
+
     // The tests below kill surviving mutants reported by cargo-mutants (issue
     // #103): as_str, Display, is_committable, and is_committed were exercised
     // but their return values were never pinned.
 
-    const ALL_STATES: [BatchState; 11] = [
+    const ALL_STATES: [BatchState; 12] = [
         Discovered,
         Batching,
         Sealed,
@@ -273,6 +342,7 @@ mod tests {
         SourceCommitted,
         Failed,
         ReplayRequired,
+        Superseded,
     ];
 
     #[test]
@@ -286,6 +356,8 @@ mod tests {
         // states so a rename can't slip through the roundtrip.
         assert_eq!(Verified.as_str(), "verified");
         assert_eq!(SourceCommitted.as_str(), "source_committed");
+        // The ledger, the Postgres CHECK and older readers all key on this.
+        assert_eq!(Superseded.as_str(), "superseded");
     }
 
     #[test]

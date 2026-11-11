@@ -100,7 +100,8 @@ impl ClaimFence {
     /// then be refused (review of #569).
     pub(crate) fn wrote(&self, batch_id: &str, to: BatchState, generation: i64) {
         match to {
-            BatchState::SourceCommitted | BatchState::ReplayRequired => {
+            // SUPERSEDED (#567) is terminal: nothing more is written to it.
+            BatchState::SourceCommitted | BatchState::ReplayRequired | BatchState::Superseded => {
                 self.release(batch_id, generation)
             }
             BatchState::Failed => self.park(batch_id, generation),

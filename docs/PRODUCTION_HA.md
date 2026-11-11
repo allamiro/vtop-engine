@@ -406,7 +406,7 @@ CREATE TABLE batches (
   CONSTRAINT state_enum CHECK (state IN (
     'DISCOVERED','BATCHING','SEALED','COMPRESSED','CHECKSUMMED',
     'OBJECT_UPLOADED','MANIFEST_UPLOADED','VERIFIED','SOURCE_COMMITTED',
-    'FAILED','REPLAY_REQUIRED')),
+    'FAILED','REPLAY_REQUIRED','SUPERSEDED')),
 
   -- THE INVARIANT (two equivalent guards, keep both):
   CONSTRAINT commit_needs_verify_state CHECK (
@@ -442,6 +442,8 @@ instances never recover the same batch. Required before fleet mode.
 ### 6.6 Ledger retention / pruning **[IMPLEMENTED — incremental delete, #128]**
 ```text
 - keep ACTIVE, FAILED, REPLAY_REQUIRED, and recent SOURCE_COMMITTED rows hot;
+- delete old SUPERSEDED rows (#567: handed-back ranges the source has since
+  committed past) on age alone - none is ever a restart cursor;
 - delete old SOURCE_COMMITTED rows incrementally, always retaining the
   per-path NEWEST committed row (by `(created_at, batch_id)`) so recovery cursor seeding
   is unchanged - the newest, not the highest end_byte, which after a
@@ -457,7 +459,8 @@ only: the PostgreSQL runtime identity is deliberately denied DELETE, so the
 engine refuses the setting there and pruning runs as a scheduled `vtopctl
 prune-ledger --older-than-days N` under a maintenance identity (see
 [`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md)).
-Rows in any non-committed state are never touched.
+Rows in any other state (in flight, VERIFIED, FAILED, REPLAY_REQUIRED) are
+never touched.
 
 **Pruning keeps an anchor (#560).** Every prune pass, the engine's and
 `vtopctl prune-ledger`'s alike, lists its CANDIDATE rows, writes them to a

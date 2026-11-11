@@ -81,8 +81,9 @@ reference keeps credentials out of config serialization and command arguments.
 
 ## Failure behavior
 
-If the table, required columns, or invariant trigger are absent, engine startup
-fails with instructions to run `vtopctl migrate`. It does not try to repair the
+If the table, required columns, or invariant trigger are absent, or the
+`state_enum` CHECK does not admit every state the engine writes (`superseded`
+since #567), engine startup fails with instructions to run `vtopctl migrate`. It does not try to repair the
 schema. If the runtime role lacks `USAGE` or `SELECT`, startup reports the
 missing runtime access. Migration failures remain fatal to the deployment step.
 
@@ -99,6 +100,19 @@ migration job per database; engine replicas should start only after it succeeds.
 - A runtime rollback may use the upgraded backward-compatible schema. Do not
   drop columns or the invariant trigger while any VTOP process can access the
   database.
+- **`superseded` (#567) needs the migration.** The release that adds the
+  terminal `SUPERSEDED` state widens the `state_enum` CHECK. `vtopctl
+  migrate` replaces the constraint in place, only if it lacks the state. The
+  replacement validates every row while it holds the table's lock, and a
+  later re-run does nothing. Engines of that release refuse to start on a
+  schema without it.
+  Older engines keep running on the widened schema; they never write the
+  state. An older engine that READS a superseded row fails closed: its startup
+  recovery claim, and `vtopctl status`, stop with `unknown batch state:
+  superseded` rather than misreading it. So once any upgraded engine has run
+  recovery, an older engine sharing the ledger cannot restart. Upgrade every
+  engine on a ledger together, or drain the older ones first. Rolling back
+  past this release means restoring a ledger backup taken before the upgrade.
 - Changes to the JSON inside ledger rows need no migration step. The content
   fingerprint added to file and spool markers (#578) is such a change: no
   DDL, older rows keep being read and judged as before. See the ledger format

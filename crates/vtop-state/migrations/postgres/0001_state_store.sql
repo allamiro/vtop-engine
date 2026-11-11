@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS batches (
     CONSTRAINT state_enum CHECK (state IN (
         'discovered','batching','sealed','compressed','checksummed',
         'object_uploaded','manifest_uploaded','verified','source_committed',
-        'failed','replay_required'))
+        'failed','replay_required','superseded'))
 );
 
 -- Upgrade databases created before ownership leases and object sizes shipped.
@@ -41,6 +41,37 @@ ALTER TABLE batches ADD COLUMN IF NOT EXISTS manifest_version_id TEXT;
 -- stalled old engine can still overwrite a new claimant: drain every older
 -- engine before relying on it.
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS claim_gen BIGINT NOT NULL DEFAULT 0;
+
+-- SUPERSEDED (#567): the terminal state of a handed-back range its source has
+-- since committed past. A table created before it carries the CHECK above
+-- without it, and CREATE TABLE IF NOT EXISTS does not touch an existing
+-- table, so the constraint is replaced - only when it lacks the state, so a
+-- re-run of migrate neither rescans the table nor takes its lock again.
+-- Engine startup refuses a CHECK without 'superseded' (PgStateStore::
+-- check_schema), so engines of this release need this migration first.
+--
+-- Older engines keep working on the widened CHECK: they never write the
+-- state. One that READS a superseded row fails closed - its recovery claim
+-- and `vtopctl status` stop with "unknown batch state: superseded" - so once
+-- an engine of this release has run, an older engine on the same ledger
+-- refuses to start rather than misreading the row. Drain older engines first.
+DO $sup$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_constraint
+        WHERE conrelid = 'batches'::regclass
+          AND conname = 'state_enum'
+          AND contype = 'c'
+          AND pg_catalog.pg_get_constraintdef(oid) LIKE '%''superseded''%'
+    ) THEN
+        ALTER TABLE batches DROP CONSTRAINT IF EXISTS state_enum;
+        ALTER TABLE batches ADD CONSTRAINT state_enum CHECK (state IN (
+            'discovered','batching','sealed','compressed','checksummed',
+            'object_uploaded','manifest_uploaded','verified','source_committed',
+            'failed','replay_required','superseded'));
+    END IF;
+END
+$sup$;
 
 CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
 CREATE INDEX IF NOT EXISTS idx_batches_source ON batches(source_type, source_name);
