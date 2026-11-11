@@ -148,13 +148,15 @@ impl RotatedFile {
     }
 
     /// Hand the range from `start` back: the next re-read starts there - never
-    /// below what is committed from this file, and never forward of a re-read
-    /// already behind it.
+    /// forward of a re-read already behind it, and never below what is
+    /// committed from this file, as a rewind of a file still at its path
+    /// never goes below its committed point (review of #621: a re-read left
+    /// behind a commit that landed after it re-archived that commit's bytes).
     pub fn rewind(&mut self, start: u64) {
-        let from = start.max(self.held.committed);
         let read_byte = self
             .replay
-            .map_or(from, |replay| replay.read_byte.min(from));
+            .map_or(start, |replay| replay.read_byte.min(start))
+            .max(self.held.committed);
         self.replay = Some(Replay {
             read_byte,
             drained: false,
@@ -162,10 +164,11 @@ impl RotatedFile {
         self.held.touched = Instant::now();
     }
 
-    /// Raise what is known to be committed from this file (recovery, from the
-    /// ledger): a re-read never starts below it.
+    /// Raise what is known to be committed from this file - a commit of a
+    /// range of it, or what recovery learns from the ledger: a re-read never
+    /// starts below it.
     pub fn raise_floor(&mut self, end: u64) {
-        self.held.committed = self.held.committed.max(end);
+        self.held.committed_to(end);
         if let Some(replay) = self.replay.as_mut() {
             replay.read_byte = replay.read_byte.max(self.held.committed);
         }

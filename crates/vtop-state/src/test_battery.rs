@@ -622,6 +622,7 @@ async fn committed_cursors_at_answer_each_file_that_lived_at_a_path(store: &dyn 
         ("at-6", "/at.log", Some(33), 70, true),
         ("at-7", "/at.log", Some(33), 30, true),
         ("at-8", "/at.log", None, 15, true),
+        ("at-8b", "/at.log", None, 25, true),
         ("at-9", "/elsewhere.log", Some(11), 7, true),
     ] {
         let mut r = sample_record(id);
@@ -636,6 +637,38 @@ async fn committed_cursors_at_answer_each_file_that_lived_at_a_path(store: &dyn 
             }
         }
         // Created strictly in this order: "newest" is by creation.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // Spool rows at the SAME path: answered for SyslogSpool alone, per inode,
+    // and never mixed into the File answer.
+    let spool_marker = |inode: u64, end: u64| ProgressMarker::SyslogSpool {
+        spool_id: "s".into(),
+        path: "/at.log".into(),
+        inode: Some(inode),
+        start_byte: 0,
+        end_byte: end,
+        received_time_start: None,
+        received_time_end: None,
+        file_size: Some(end * 10),
+        content_fingerprint: None,
+    };
+    for (id, inode, end, commit) in [
+        ("at-s1", 41, 100, true),
+        ("at-s2", 41, 50, true),
+        ("at-s3", 42, 70, true),
+        ("at-s4", 42, 9_000, false),
+    ] {
+        let mut r = sample_record(id);
+        r.source_type = SourceType::SyslogSpool;
+        r.source_name = "/at.log".to_string();
+        r.progress_start = spool_marker(inode, 0);
+        r.progress_end = spool_marker(inode, end);
+        store.save_batch_state(&r).await.unwrap();
+        if commit {
+            for st in LEGAL_WALK {
+                store.update_batch_state(id, st, &p).await.unwrap();
+            }
+        }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     let mut got = store
@@ -653,7 +686,9 @@ async fn committed_cursors_at_answer_each_file_that_lived_at_a_path(store: &dyn 
     assert_eq!(
         got,
         vec![
-            want(None, 15),
+            // Rows without an inode cannot be told apart by file: they are
+            // answered together, as the newest of them (see the trait doc).
+            want(None, 25),
             want(Some(11), 900),
             // The uncommitted 5000 does not count.
             want(Some(22), 60),
@@ -661,8 +696,21 @@ async fn committed_cursors_at_answer_each_file_that_lived_at_a_path(store: &dyn 
             want(Some(33), 30),
         ]
     );
-    assert!(store
+    let mut spool = store
         .committed_cursors_at(SourceType::SyslogSpool, "/at.log")
+        .await
+        .unwrap();
+    spool.sort_by_key(|c| c.inode);
+    assert_eq!(
+        spool,
+        vec![
+            // Newest, not furthest; and the uncommitted 9000 does not count.
+            want(Some(41), 50),
+            want(Some(42), 70),
+        ]
+    );
+    assert!(store
+        .committed_cursors_at(SourceType::SyslogSpool, "/elsewhere.log")
         .await
         .unwrap()
         .is_empty());

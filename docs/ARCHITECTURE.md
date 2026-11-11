@@ -444,14 +444,20 @@ descriptor is proven again before every re-read, against the same first page
 and the longest the file has been seen to be: a rotated file truncated above
 its first page keeps its fingerprint, and reading on would archive a
 shortened prefix as the range (or nothing, and call the re-read done). Such a
-re-read is refused. A marker without an inode or a fingerprint proves nothing
-and is refused as before.
+re-read is refused. For rotated-file recovery, a marker without an inode or a
+fingerprint cannot prove the old file and is refused as before (its rewind of
+the file at its own path keeps the inode-and-length check described above).
 
 The re-read starts at the range's start and reads on to the end of the rotated
-file, as a rewind of a file still at its path reads on to the path's end. Its
-markers carry the source path and the rotated file's inode, so its commit never
-moves the cursor of the file now at the path, and `delete_after_commit` (which
-judges the file at the path) never deletes the new file or the rotated one. A
+file, as a rewind of a file still at its path reads on to the path's end. A
+rewind of it never goes below what is committed from that file, as a rewind of
+a file at its path never goes below its committed point. Its markers carry the
+source path and the rotated file's inode. Wherever the identity checks tell the
+rotated file from the file now at the path - another inode, or other first
+bytes - its commit does not move the current file's cursor, and
+`delete_after_commit` (which judges the file at the path) deletes neither file.
+A replacement those checks cannot tell apart (the blind spots below) is the
+exception. A
 re-read in progress keeps its path a source even if nothing is at the path
 yet - and so does a rewind accepted before its file was renamed away with
 nothing created in its place, whose range only a read of the path moves onto
@@ -489,12 +495,17 @@ Limits:
 - **Identity is the inode and the first page**, with the same blind spots as
   every other check in this section (above). The tail fingerprint of #620 is
   meant to join the proof (`rotated::proves`) when it lands.
-- **The restart seed can name the rotated file.** A re-read batch is created
-  after the current file's batches, so it can become the path's newest
-  committed row; if the current file gets no new data before the next
-  restart, that restart seeds the cursor from the rotated file and reads the
-  current one from byte 0 again - a one-time duplicate, bounded by the current
-  file, never a skip. Likewise, if pruning removes the re-read's rows while the
+- **The restart seed can name the rotated file.** Within a pass the re-read
+  comes first - the path is not read until the rotated file's range is - but
+  the current file may already have batches by then: a window of it read in
+  the cycle whose rotation sealed the failed window (the re-read's first read
+  seals it in turn), or batches committed before a restart whose recovery
+  then re-reads the range. The re-read's batch is created after those, and
+  becomes the
+  path's newest committed row (the restart seed is the newest by creation).
+  If the current file gets no new data before the next restart, that restart
+  seeds the cursor from the rotated file and reads the current one from byte
+  0 again - a one-time duplicate, bounded by the current file, never a skip. Likewise, if pruning removes the re-read's rows while the
   rotated file still exists, the next restart re-reads it.
 - Without inodes (non-Unix platforms) nothing can be proven, and the rewind is
   refused as before. Syslog-spool sources are unchanged: a spool rotated away

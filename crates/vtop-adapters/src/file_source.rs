@@ -501,7 +501,7 @@ impl FileSource {
             .iter_mut()
             .filter(|rotated| rotated.path == path && rotated.held.inode == inode)
         {
-            rotated.held.committed_to(end);
+            rotated.raise_floor(end);
         }
         self.rotated.retain(|rotated| {
             let done = rotated.path == path && rotated.held.inode == inode && rotated.resolved();
@@ -768,6 +768,13 @@ impl FileSource {
                 continue;
             };
             let len = rotated.held.file.metadata().map_or(0, |md| md.len());
+            // A row without a fingerprint (written before #578) is not used.
+            // It cannot be what a re-read wrote - every re-read row carries a
+            // fingerprint, and only a fingerprinted marker is re-read from a
+            // rotated file at all - so it predates the failed range and ends
+            // at or below its start, where it raises nothing. Trusting inode
+            // and length alone would let a file that reused the inode raise
+            // the floor and skip bytes; ignoring it costs a re-read at most.
             let floor = archived
                 .iter()
                 .filter(|row| row.inode == Some(rotated.held.inode) && row.end_byte <= len)
@@ -3983,6 +3990,44 @@ mod tests {
         fs.commit_progress(&again[0].progress_end).await.unwrap();
         let next = read_all_one(&mut fs, &path).await;
         assert_eq!(lines(&next), ["new 1", "new 2", "new 3"]);
+    }
+
+    /// Review of #621: a rewind of a rotated file's re-read never goes below
+    /// what is committed from that file, as a rewind of a file at its path
+    /// never goes below its committed point. Recovery rewinds, then commits a
+    /// VERIFIED row of the same file that starts where the pending range does
+    /// (the object that replaced a stale row for the same bytes), then rewinds
+    /// again. Kept at the first rewind's position, the second re-read the
+    /// bytes that commit had just archived.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotated_re_read_is_never_rewound_below_what_is_committed_of_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "old 1\nold 2\n").unwrap(); // 12 bytes
+        let (start, end) = {
+            let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+            let read = read_one(&mut fs, &path).await;
+            (read[0].progress_start.clone(), read[0].progress_end.clone())
+        };
+        std::fs::rename(&path, format!("{path}.1")).unwrap();
+        std::fs::write(&path, "new 1\n").unwrap();
+
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        fs.replay_from_marker(&start).await.unwrap();
+        // The VERIFIED row for the same bytes commits during recovery.
+        fs.commit_progress(&end).await.unwrap();
+        fs.replay_from_marker(&start).await.unwrap();
+        assert_eq!(fs.read_position(&start), Some(12), "landed at the commit");
+
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            for read in read_all_one(&mut fs, &path).await {
+                got.extend(lines(std::slice::from_ref(&read)));
+                fs.commit_progress(&read.progress_end).await.unwrap();
+            }
+        }
+        assert_eq!(got, ["new 1"], "the committed bytes are not archived again");
     }
 
     /// Recovery rewinds every range twice (once to learn where it lands, once

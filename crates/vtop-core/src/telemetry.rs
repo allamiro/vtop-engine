@@ -113,12 +113,14 @@ pub struct Metrics {
 
     /// Ranges handed back for re-reading (a batch that did not reach
     /// VERIFIED, or an incomplete row at recovery) that the source REFUSED to
-    /// rewind (#621) - for a file, because the file the range was read from
-    /// has left its path and no file proven to be it was found (removed, or
-    /// copied by `copytruncate`). Each is a range missing from the archive;
-    /// recovery counts it again at every restart while the row stays
-    /// incomplete. Labelled by source_type only, like
-    /// `source_read_errors_total`: the path is in the error line beside it.
+    /// rewind, or whose re-read it then had to refuse (#621). For a file, the
+    /// file the range was read from cannot be proven reachable: truncated or
+    /// replaced in place, or rotated away and then removed, compressed, copied
+    /// by `copytruncate`, or truncated before its re-read. Each is a range
+    /// missing from the archive; recovery counts it again at every restart
+    /// while the row stays incomplete. Labelled by tenant and source_type,
+    /// like `source_read_errors_total`, never by path: the path is in the
+    /// error line beside it.
     pub source_replay_refused_total: IntCounterVec,
 
     /// Uploads the object store answered with a THROTTLE — HTTP 429 or 503,
