@@ -108,6 +108,19 @@ migration job per database; engine replicas should start only after it succeeds.
   place. Every release inserts only `batching`, so an older engine on the
   upgraded schema is unaffected. A data-only restore into a migrated schema
   (`pg_restore --data-only`) is refused by this trigger, as it already was
-  for `source_committed` rows; restore with `--disable-triggers`.
+  for `source_committed` rows. Stop every engine first, and restore in one
+  of two ways:
+  - `pg_restore --data-only --disable-triggers`. This issues
+    `ALTER TABLE batches DISABLE TRIGGER ALL`, which only the table's owner
+    (the migration identity) or a superuser may run; the runtime role is
+    refused with `must be owner of table batches`. The pg_restore
+    documentation says to run it as a superuser, and a superuser is required
+    once the table has foreign-key triggers, which `batches` does not.
+  - Without superuser: once the schema exists (`vtopctl migrate`, or
+    `pg_restore --schema-only`), have the owner run
+    `ALTER TABLE batches DISABLE TRIGGER trg_commit_after_verify`, restore
+    with `--data-only`, then `ALTER TABLE batches ENABLE TRIGGER
+    trg_commit_after_verify` before any engine starts. Engine startup checks
+    that the trigger exists, not that it is enabled.
 - Test grants after role changes: runtime must be able to read/write ledger
   rows but must fail `CREATE TABLE`, `ALTER TABLE`, `DELETE`, and `TRUNCATE`.

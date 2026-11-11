@@ -154,8 +154,9 @@ pub(crate) fn require_batching_insert(rec: &BatchRecord) -> Result<(), VtopError
 #[async_trait]
 pub trait StateStore: Send + Sync {
     /// Insert a batch when it first enters the store. A duplicate `batch_id`
-    /// MUST fail rather than overwrite an existing — possibly committed — row,
-    /// and so MUST a record in any state but BATCHING (#625).
+    /// MUST fail rather than overwrite an existing — possibly committed — row.
+    /// A record in any state other than BATCHING MUST likewise be refused,
+    /// before any SQL runs (#625).
     async fn save_batch_state(&self, rec: &BatchRecord) -> Result<(), VtopError>;
 
     /// Validate and persist a state transition. The transition MUST be checked
