@@ -2246,7 +2246,7 @@ impl Engine {
     /// resolves incomplete batches without ever advancing source progress for
     /// unverified data.
     pub async fn recover(&mut self) -> Result<RecoverySummary, VtopError> {
-        // Seed file/syslog committed offsets from previously committed batches.
+        // Seed file/syslog/Kafka committed positions from the ledger.
         self.seed_committed_offsets().await?;
 
         // CLAIM, not list (#93): only batches this engine owns, never owned, or
@@ -2557,8 +2557,6 @@ impl Engine {
         // The per-path cursor is computed IN THE STORE. This runs at every
         // startup and the ledger grows without bound, so materialising every
         // row here made recovery memory scale with history (#77).
-        // (Kafka needs no seeding: it resumes from the broker-side committed
-        // offset.)
         //
         // Each cursor names the inode its offset was read from, so a file
         // that was rotated while the engine was down is started at byte 0
@@ -2595,6 +2593,29 @@ impl Engine {
                     );
                 }
             }
+        }
+        // Kafka resumes from the LEDGER, not from the consumer group's
+        // committed offset on the broker (#614). That offset is committed
+        // before the fenced ledger write, with no group generation Kafka could
+        // check, so an engine that lost its claim on a batch can still move it
+        // - backwards, re-reading what is archived, or forwards, past a range
+        // that failed its re-check. Seeded before the claim below, so the
+        // recovery rewinds are clamped to the ledger's frontier too.
+        #[cfg(feature = "kafka")]
+        if let Some(k) = self
+            .adapters
+            .get_mut(&SourceType::Kafka)
+            .and_then(|a| a.as_any_mut().downcast_mut::<KafkaSource>())
+        {
+            let committed = self.store.committed_kafka_offsets().await?;
+            k.seed_committed_from_ledger(committed.iter().map(|c| {
+                (
+                    c.topic.as_str(),
+                    c.partition,
+                    c.consumer_group.as_str(),
+                    c.end_offset,
+                )
+            }));
         }
         Ok(())
     }
