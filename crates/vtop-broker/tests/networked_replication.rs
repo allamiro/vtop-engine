@@ -927,11 +927,18 @@ fn a_follower_reconnecting_with_a_kept_suffix_still_receives_the_new_leaders_rec
     for sequence in 0..5 {
         let _ = produce_ok(&h.leader, h.range.clone(), sequence);
     }
+    // BOTH followers, not just the quorum's: the epoch changes next, and a
+    // record still owed to follower 2 would be retransmitted under the old
+    // epoch, which it refuses once it has adopted the new one. The
+    // new leader's records would then never line up with its log.
     assert!(
         await_within(Duration::from_secs(5), || {
-            disputed.local_committed_offset() == 5
+            disputed.local_committed_offset() == 5 && h.followers[1].local_committed_offset() == 5
         }),
-        "precondition: follower 1 holds the committed prefix"
+        "precondition: both followers hold the committed prefix (follower 1 at {}, \
+         follower 2 at {})",
+        disputed.local_committed_offset(),
+        h.followers[1].local_committed_offset()
     );
     // The deposed leadership wrote 5..10 to follower 1 alone.
     for offset in 5..10 {
@@ -1067,11 +1074,18 @@ fn a_deposed_leader_absent_from_the_election_discards_its_unacknowledged_suffix_
     for sequence in 0..5 {
         let _ = produce_ok(&h.leader, h.range.clone(), sequence);
     }
+    // BOTH followers, not just the quorum's: the epoch changes next, and a
+    // record still owed to follower 2 would be retransmitted under the old
+    // epoch, which it refuses once it has adopted the new one. The
+    // new leader's records would then never line up with its log.
     assert!(
         await_within(Duration::from_secs(5), || {
-            deposed.local_committed_offset() == 5
+            deposed.local_committed_offset() == 5 && h.followers[1].local_committed_offset() == 5
         }),
-        "precondition: follower 1 holds the committed prefix"
+        "precondition: both followers hold the committed prefix (follower 1 at {}, \
+         follower 2 at {})",
+        deposed.local_committed_offset(),
+        h.followers[1].local_committed_offset()
     );
     // The deposed leadership's own suffix: on follower 1 alone, durable,
     // never acknowledged.
