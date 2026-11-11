@@ -1139,32 +1139,80 @@ fn a_fence_never_keeps_a_dispute_below_the_replicas_high_water_mark() {
     assert_eq!(ack.local_committed_offset, 12);
 }
 
-/// The same shape with the mark at 9, so 9..11 are not known committed.
-/// Only that stretch is kept in dispute, not the committed 5..9. It is the
-/// stretch the crash sweep caught being acked over when the fence refused
-/// instead (a refused fence still adopts the epoch and leaves the replica
-/// unreconciled). The next leader's first append over it discards it,
-/// which the guard can always do, because it starts at the mark.
+/// #616 review (codex P2). The same shape with the mark at 9, and the caller
+/// holding records through 11. When it is established, its FIRST append is
+/// its promotion marker at 11, its own tail. Records below that tail it can
+/// only re-send from a retransmission buffer that starts at 11, so a settle
+/// that discarded 9..11 here stranded this replica at 9: the marker failed
+/// its base-offset check, and nothing could restore 9 and 10. Below the mark
+/// the divergence says nothing about records (#640), so the fence keeps in
+/// dispute only what lies above the caller's own tail. Here that is nothing,
+/// and the marker lands on the untouched log, as it did before #616.
 #[test]
-fn a_dispute_below_the_mark_is_kept_only_from_the_mark() {
+fn a_dispute_below_the_mark_never_discards_what_the_caller_holds() {
     let h = caught_up_under_its_own_epoch(9);
     assert_eq!(fence_from_the_epoch_19_leader(&h), Ok(0));
     assert_eq!(
         h.node.replication_status(),
-        (9, 9),
-        "kept from the mark, not from 5"
+        (11, 11),
+        "a dispute was kept over records the caller holds"
     );
-    let ack = h
+    let marker = h
         .node
         .apply_append(&append_request(
             &h.range,
             NEWER_EPOCH,
             Uuid::from_u128(0xAA),
-            9,
+            11,
         ))
-        .expect("the next leader's append over the kept stretch lands");
-    assert_eq!(ack.local_committed_offset, 10);
-    assert_eq!(h.node.next_offset(), 10);
+        .expect("the new leader's marker at its own tail must land");
+    assert_eq!(marker.local_committed_offset, 12);
+    assert_eq!(
+        h.node.next_offset(),
+        12,
+        "nothing below the caller's tail was discarded"
+    );
+}
+
+/// The same shape, fenced by a caller whose own tail is 10: it never
+/// received this replica's record at 10. That record is kept in dispute,
+/// and only that record. The caller's marker at 10 discards it and lands.
+#[test]
+fn a_dispute_below_the_mark_keeps_only_what_the_caller_lacks() {
+    let h = caught_up_under_its_own_epoch(9);
+    let fenced = h
+        .node
+        .fence(
+            NEWER_EPOCH,
+            &[
+                EpochStart {
+                    epoch: OLD_EPOCH,
+                    start_offset: 0,
+                },
+                EpochStart {
+                    epoch: NEWER_EPOCH,
+                    start_offset: 10,
+                },
+            ],
+        )
+        .expect("fenced");
+    assert_eq!((fenced.truncated_records, fenced.next_offset), (0, 11));
+    assert_eq!(
+        h.node.replication_status(),
+        (10, 10),
+        "kept from the caller's tail, 10"
+    );
+    let marker = h
+        .node
+        .apply_append(&append_request(
+            &h.range,
+            NEWER_EPOCH,
+            Uuid::from_u128(0xAA),
+            10,
+        ))
+        .expect("the caller's marker at its tail lands over the kept record");
+    assert_eq!(marker.local_committed_offset, 11);
+    assert_eq!(h.node.next_offset(), 11);
 }
 
 /// #616 regression, also found by the promotion crash sweep (its no-fault

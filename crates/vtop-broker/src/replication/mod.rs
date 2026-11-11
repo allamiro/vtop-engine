@@ -1410,15 +1410,16 @@ impl InProcessFollower {
         // settled, because the truncation guard refuses it, so the replica
         // refused every append from then on. A divergence below the mark (a
         // caught-up stretch filed under a different epoch, #640) says nothing
-        // about the committed records. Only the stretch above the mark is
-        // kept in dispute, and if the mark reaches the tail, nothing is.
+        // about the committed records. Then only the records past both the
+        // mark and the caller's own tail are kept in dispute, and if that
+        // reaches this replica's tail, nothing is.
         //
         // Not a refusal, as before #616: a refused fence still adopts the
-        // epoch and leaves the suffix above the mark unreconciled. The sweep
-        // showed that replica then acking the new leader's record over an
-        // unacknowledged one it held (#261). Kept, the suffix is discarded by
-        // the new leader's first append or mark over it, which the guard can
-        // always do, because it starts at or above the mark. The candidate
+        // epoch and leaves the suffix past the caller's tail unreconciled.
+        // The sweep showed that replica then acking the new leader's record
+        // over an unacknowledged one it held (#261). Kept, the suffix is
+        // discarded by the new leader's first append or mark over it, which
+        // the guard can always do, because it starts at or above the mark. The candidate
         // still judges this answer itself: a divergence below both tails is
         // Unknown and never counted.
         if !supersedes {
@@ -1430,7 +1431,22 @@ impl InProcessFollower {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let from = divergence.max(self.cluster_committed.get());
+            // Below the mark, the divergence is no evidence about records
+            // (#640 files identical bytes under different epochs). Keep in
+            // dispute only what the caller provably LACKS, the records past
+            // its own tail (#616 review, codex P2). The caller, once
+            // established, starts appending at that tail, with its marker,
+            // and can re-send nothing below it. A settle that discarded
+            // records below the caller's tail stranded this replica with a
+            // gap no leader fills. Without a tail in the caller's history,
+            // nothing is kept, which is the answer before #616.
+            let mark = self.cluster_committed.get();
+            let from = if divergence >= mark {
+                divergence
+            } else {
+                caller_tail(leader_epoch_starts, fencing_epoch)
+                    .map_or(u64::MAX, |tail| tail.max(mark))
+            };
             if from < state.segment.next_offset() {
                 let mut kept = self
                     .kept_dispute
@@ -2137,6 +2153,18 @@ impl ReplicaSet for InProcessReplicaSet {
             let _ = follower.observe_hwm(update);
         }
     }
+}
+
+/// Where a fencing caller's log ends, when its history says so: the start of
+/// its entry for `fencing_epoch`, the adoption it records at its own tail
+/// before it fences anyone (#611). `None` when the history carries no such
+/// entry. Canonicalized, so an idle adoption at the same offset collapses
+/// into it.
+fn caller_tail(caller: &[crate::fencing_epochs::EpochStart], fencing_epoch: u64) -> Option<u64> {
+    crate::fencing_epochs::canonicalize_lineage(caller)
+        .last()
+        .filter(|entry| entry.epoch == fencing_epoch)
+        .map(|entry| entry.start_offset)
 }
 
 fn check_follower_lease(meta: &MetaLeaseState, held_fencing_epoch: u64) -> Result<(), BrokerError> {
