@@ -71,6 +71,10 @@ pub struct FileSource {
     /// How long a descriptor in `rotated` is kept, unused and with no re-read
     /// in progress.
     hold_for: Duration,
+    /// Paths whose handed-back range a re-read through a rotated file's
+    /// descriptor had to refuse, for the engine to count
+    /// ([`Self::take_refused_rereads`]).
+    refused_rereads: Vec<String>,
 }
 
 /// What recovery knows is already archived of one file at a path (#621): the
@@ -106,6 +110,7 @@ impl FileSource {
             rotated: Vec::new(),
             max_held: rotated::MAX_HELD_FILES,
             hold_for: rotated::HOLD_FOR,
+            refused_rereads: Vec::new(),
         }
     }
 
@@ -407,6 +412,7 @@ impl FileSource {
         if let Some(held) = self.held.get_mut(path) {
             if held.inode == inode && descriptor.is_none() {
                 held.read_end = held.read_end.max(end);
+                held.seen_len(identity.file_size);
                 held.content = content;
                 held.touched = std::time::Instant::now();
                 return;
@@ -427,7 +433,7 @@ impl FileSource {
         let committed = self.cursors.get(path).map_or(0, |c| c.committed_byte);
         self.held.insert(
             path.to_string(),
-            HeldFile::new(file, inode, content, end, committed),
+            HeldFile::new(file, inode, content, end, committed, identity.file_size),
         );
     }
 
@@ -549,6 +555,7 @@ impl FileSource {
                 drained: slice.records.is_empty(),
             });
             rotated.held.read_end = rotated.held.read_end.max(slice.end);
+            rotated.held.seen_len(slice.identity.file_size);
             rotated.held.touched = std::time::Instant::now();
         }
         ReadResult {
@@ -563,8 +570,11 @@ impl FileSource {
 
     /// A re-read of a rotated file failed: the descriptor no longer proves the
     /// file, or the read itself failed. The range will not be re-read in this
-    /// process, so this is loud; a restart looks for the file again.
+    /// process, so this is loud - and handed to the engine to count, as a
+    /// refused rewind is ([`Self::take_refused_rereads`]); a restart looks for
+    /// the file again.
     fn rotated_read_failed(&mut self, path: &str, error: VtopError) -> VtopError {
+        self.refused_rereads.push(path.to_string());
         if let Some(i) = self.replaying(path) {
             let failed = self.rotated.remove(i);
             tracing::error!(
@@ -601,8 +611,12 @@ impl FileSource {
     }
 
     /// Re-read a range through a descriptor on a rotated file. The descriptor
-    /// is proven again first: its first bytes must still be the ones it was
-    /// held for.
+    /// is proven again first, as [`rotated::proves`] proves a file: its first
+    /// bytes must still be the ones it was held for, and it must be no
+    /// shorter than it was seen to be. A truncation above the first page
+    /// keeps the fingerprint, and reading on would archive a shortened prefix
+    /// as the range - or nothing at all, and call the re-read done (review of
+    /// #621).
     async fn read_rotated(
         read: RotatedRead,
         path: &str,
@@ -612,6 +626,14 @@ impl FileSource {
     ) -> Result<SliceRead, VtopError> {
         let mut file = tokio::fs::File::from_std(read.file);
         let mut identity = Self::identity_of(&file.metadata().await?);
+        if identity.file_size < read.min_len || read.start > identity.file_size {
+            return Err(VtopError::Source(format!(
+                "cannot re-read {path} from the file it was rotated to: that file is now {} \
+                 bytes, shorter than the {} it was when its ranges were read (truncated since)",
+                identity.file_size,
+                read.min_len.max(read.start)
+            )));
+        }
         let head = continuity::read_head(&mut file).await?;
         if identity.inode != Some(read.inode) || !read.content.matches_head(&head) {
             return Err(VtopError::Source(format!(
@@ -660,15 +682,18 @@ impl FileSource {
             .iter()
             .position(|rotated| rotated.path == path && rotated.held.inode == inode)
         {
-            if self.rotated[i].held.proves(content, *size_when_read, start) {
+            let held = &mut self.rotated[i].held;
+            if held.proves(content, (*size_when_read).max(held.min_len), start) {
+                held.seen_len(*size_when_read);
                 self.rotated[i].rewind(start);
                 return true;
             }
             self.rotated.remove(i);
         }
         if self.held.get(path).is_some_and(|held| held.inode == inode) {
-            let held = self.held.remove(path).expect("checked above");
-            if held.proves(content, *size_when_read, start) {
+            let mut held = self.held.remove(path).expect("checked above");
+            if held.proves(content, (*size_when_read).max(held.min_len), start) {
+                held.seen_len(*size_when_read);
                 let mut rotated = RotatedFile {
                     path: path.to_string(),
                     held,
@@ -704,7 +729,7 @@ impl FileSource {
         );
         let mut rotated = RotatedFile {
             path: path.to_string(),
-            held: HeldFile::new(file, inode, content.clone(), 0, 0),
+            held: HeldFile::new(file, inode, content.clone(), 0, 0, *size_when_read),
             replay: None,
         };
         rotated.rewind(start);
@@ -761,11 +786,30 @@ impl FileSource {
         }
     }
 
+    /// The source paths whose handed-back range could not be re-read from the
+    /// file it was rotated to since the last call (#621): the file was
+    /// truncated, or no longer starts with the bytes it was held for. The
+    /// engine counts each as a refused rewind; the error alone reached only
+    /// the read-error counter, which does not say a range is missing.
+    pub fn take_refused_rereads(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.refused_rereads)
+    }
+
     #[cfg(test)]
     fn with_hold_limits(mut self, max_held: usize, hold_for: Duration) -> Self {
         self.max_held = max_held;
         self.hold_for = hold_for;
         self
+    }
+
+    /// The descriptor held on the file `path`'s cursor was rewound into: a
+    /// range of it was handed back and has not been read again yet.
+    fn rewound_held(&self, path: &str) -> Option<&HeldFile> {
+        let cursor = self.cursors.get(path)?;
+        let seen_inode = cursor.seen.as_ref().and_then(|seen| seen.inode);
+        self.held
+            .get(path)
+            .filter(|held| cursor.read_byte < held.read_end && seen_inode == Some(held.inode))
     }
 
     /// Snapshot what one file's read needs, so the reads of a pass can run
@@ -779,21 +823,20 @@ impl FileSource {
                 file: rotated.held.file.try_clone().ok()?,
                 inode: rotated.held.inode,
                 content: rotated.held.content.clone(),
+                min_len: rotated.held.min_len,
                 start: rotated.replay?.read_byte,
             })
         });
+        let rewound = self.rewound_held(path).and_then(|held| {
+            Some(RotatedRead {
+                file: held.file.try_clone().ok()?,
+                inode: held.inode,
+                content: held.content.clone(),
+                min_len: held.min_len,
+                start: start.max(held.committed),
+            })
+        });
         let held = self.held.get(path);
-        let seen_inode = seen.as_ref().and_then(|seen| seen.inode);
-        let rewound = held
-            .filter(|held| start < held.read_end && seen_inode == Some(held.inode))
-            .and_then(|held| {
-                Some(RotatedRead {
-                    file: held.file.try_clone().ok()?,
-                    inode: held.inode,
-                    content: held.content.clone(),
-                    start: start.max(held.committed),
-                })
-            });
         ReadJob {
             path: path.to_string(),
             start,
@@ -899,6 +942,7 @@ impl FileSource {
             }
             PassOutcome::Rewound(Err(error)) => {
                 self.held.remove(path);
+                self.refused_rereads.push(path.to_string());
                 tracing::error!(
                     path,
                     error = %error,
@@ -1331,6 +1375,8 @@ struct RotatedRead {
     inode: u64,
     /// The first bytes the file must still start with.
     content: ContentFingerprint,
+    /// How long it must still be: it was seen this long (review of #621).
+    min_len: u64,
     start: u64,
 }
 
@@ -1456,12 +1502,27 @@ impl SourceAdapter for FileSource {
         // A range being re-read from a rotated file is read under its source
         // path (#621), and a path with nothing at it right now - rotated away
         // with no new file created yet - matches no pattern. It stays a source
-        // until its re-read has reached the end of the rotated file.
-        for rotated in self.rotated.iter().filter(|rotated| rotated.replaying()) {
-            if seen.insert(without_dot_components(Path::new(&rotated.path))) {
+        // until its re-read has reached the end of the rotated file. So does a
+        // path whose cursor was rewound into the file it holds a descriptor
+        // on (review of #621): if that file was renamed away with nothing
+        // created in its place, only a read of the path moves the rewound
+        // range onto the rotated list, and no read happens for a path that is
+        // not a source.
+        let replaying = self
+            .rotated
+            .iter()
+            .filter(|rotated| rotated.replaying())
+            .map(|rotated| rotated.path.as_str());
+        let rewound = self
+            .held
+            .keys()
+            .map(String::as_str)
+            .filter(|path| self.rewound_held(path).is_some());
+        for path in replaying.chain(rewound) {
+            if seen.insert(without_dot_components(Path::new(path))) {
                 out.push(DiscoveredSource {
                     source_type: SourceType::File,
-                    source_name: rotated.path.clone(),
+                    source_name: path.to_string(),
                     format: self.format.clone(),
                 });
             }
@@ -3955,6 +4016,114 @@ mod tests {
             }
         }
         assert_eq!(got, ["old 1", "old 2", "new 1"]);
+    }
+
+    /// #621 (review): a rewind accepted while the file was at its path, then
+    /// the file renamed away with NOTHING created at the path. No pattern
+    /// matches the path any more, so discovery dropped it, no read ran, and
+    /// the rewound range sat behind a held descriptor that was never read.
+    /// The path stays a source until the rewound range is re-read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rewound_file_renamed_away_with_nothing_at_its_path_is_still_re_read() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "old 1\nold 2\n").unwrap(); // 12 bytes
+        let old_inode = std::fs::metadata(&path).unwrap().ino();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = read_all_one(&mut fs, &path).await;
+        fs.replay_from_marker(&first[0].progress_start)
+            .await
+            .expect("the file is still at its path: an ordinary rewind");
+        std::fs::rename(&path, format!("{path}.1")).unwrap();
+
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let sources = fs.discover_sources().await.unwrap();
+            let report = fs
+                .read_all_batch_candidates(&sources, 100, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            for outcome in report.outcomes {
+                for read in outcome.result.unwrap() {
+                    if read.is_empty() {
+                        continue;
+                    }
+                    got.push((
+                        file_marker(&read.progress_end),
+                        lines(std::slice::from_ref(&read)),
+                    ));
+                    fs.commit_progress(&read.progress_end).await.unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            got,
+            vec![(
+                (Some(old_inode), 0, 12),
+                vec!["old 1".to_string(), "old 2".to_string()]
+            )],
+            "the rewound range, once, from the file renamed away"
+        );
+        assert!(
+            fs.discover_sources().await.unwrap().is_empty(),
+            "and the path is no longer a source once it is archived"
+        );
+    }
+
+    /// #621 (review): a rotated file truncated after its rewind was accepted
+    /// keeps its first page when the cut is above it, so the fingerprint still
+    /// matches. The re-read then archived a shortened prefix of the range and
+    /// called it done. The descriptor must still be as long as the file was
+    /// when its ranges were read; a shorter one is refused, loudly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotated_file_truncated_after_its_rewind_is_refused_not_read_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let old: String = (0..200)
+            .map(|i| format!("line {i:04} of the old file\n"))
+            .collect();
+        assert!(old.len() > 4096 + 500, "longer than the fingerprinted page");
+        std::fs::write(&path, &old).unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = fs
+            .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(first[0].records.len(), 200);
+
+        let rotated = format!("{path}.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::write(&path, "new 1\n").unwrap();
+        fs.replay_from_marker(&first[0].progress_start)
+            .await
+            .expect("the held descriptor proves the file");
+        // Cut above the first page: the fingerprint still matches.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&rotated)
+            .unwrap()
+            .set_len(4_500)
+            .unwrap();
+
+        let err = fs
+            .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+            .await
+            .expect_err("a shortened rotated file must not be re-read as if it were the range")
+            .to_string();
+        assert!(err.contains("shorter"), "{err}");
+        assert_eq!(
+            fs.take_refused_rereads(),
+            vec![path.clone()],
+            "the refusal is handed to the engine to count"
+        );
+        let next = fs
+            .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(lines(&next), ["new 1"], "the new file is read as before");
     }
 
     /// #621: the descriptors are bounded. Past the limit a file is not held,

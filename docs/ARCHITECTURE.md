@@ -440,8 +440,12 @@ range was read from, in this order:
 Either way nothing is read from a file until it is **proven** to be the one
 the range was read from: the inode the marker recorded, the first page its
 fingerprint covers (#578), and no shorter than when the range was read. The
-descriptor is proven again before every re-read. A marker without an inode or
-a fingerprint proves nothing and is refused as before.
+descriptor is proven again before every re-read, against the same first page
+and the longest the file has been seen to be: a rotated file truncated above
+its first page keeps its fingerprint, and reading on would archive a
+shortened prefix as the range (or nothing, and call the re-read done). Such a
+re-read is refused. A marker without an inode or a fingerprint proves nothing
+and is refused as before.
 
 The re-read starts at the range's start and reads on to the end of the rotated
 file, as a rewind of a file still at its path reads on to the path's end. Its
@@ -449,7 +453,9 @@ markers carry the source path and the rotated file's inode, so its commit never
 moves the cursor of the file now at the path, and `delete_after_commit` (which
 judges the file at the path) never deletes the new file or the rotated one. A
 re-read in progress keeps its path a source even if nothing is at the path
-yet. A FAILED row stays in the ledger and is rewound again at every restart, so
+yet - and so does a rewind accepted before its file was renamed away with
+nothing created in its place, whose range only a read of the path moves onto
+the rotated list. A FAILED row stays in the ledger and is rewound again at every restart, so
 recovery asks the ledger for the newest committed batch of each file that has
 lived at that path (`StateStore::committed_cursors_at`) and starts the re-read
 above what is already archived of the rotated file - counting only a row whose
@@ -459,7 +465,9 @@ existed.
 
 A rewind that still cannot be honoured stays loud: an ERROR naming the path,
 and `vtop_source_replay_refused_total{tenant,source_type}` counts it, so it
-can be alerted on.
+can be alerted on. A re-read refused after the rewind was accepted (the
+rotated file truncated, or no longer starting with its first page) is counted
+there too, not only as a read error.
 
 Limits:
 

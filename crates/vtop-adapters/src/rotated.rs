@@ -63,6 +63,10 @@ pub(crate) struct HeldFile {
     pub read_end: u64,
     /// The highest byte committed from it.
     pub committed: u64,
+    /// The longest it has been seen to be. An append-only file never gets
+    /// shorter, so a re-read through a descriptor now shorter than this would
+    /// read a truncated file as if it were the range (review of #621).
+    pub min_len: u64,
     pub touched: Instant,
 }
 
@@ -73,6 +77,7 @@ impl HeldFile {
         content: ContentFingerprint,
         read_end: u64,
         committed: u64,
+        min_len: u64,
     ) -> Self {
         Self {
             file,
@@ -80,8 +85,14 @@ impl HeldFile {
             content,
             read_end,
             committed,
+            min_len: min_len.max(read_end),
             touched: Instant::now(),
         }
+    }
+
+    /// The file was seen at least `len` bytes long.
+    pub fn seen_len(&mut self, len: u64) {
+        self.min_len = self.min_len.max(len);
     }
 
     /// Whether a range handed out from it is not committed yet.

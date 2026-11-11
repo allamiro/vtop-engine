@@ -1838,6 +1838,16 @@ impl Engine {
                 }
             }
         }
+        // A range handed back to a file rotated away that its re-read then had
+        // to refuse (the rotated file was truncated, or no longer starts with
+        // the bytes it was held for) is missing from the archive just as a
+        // refused rewind is, and is counted the same way (review of #621). The
+        // read error above only says a read failed.
+        if let Some(files) = adapter.as_any_mut().downcast_mut::<FileSource>() {
+            for path in files.take_refused_rereads() {
+                self.count_refused_replay_of(source_type, &path);
+            }
+        }
 
         let read_phase_ms = cycle_started.elapsed().as_millis() as u64;
         // Logged once per cycle per source type. The ratio that matters is
@@ -2503,14 +2513,18 @@ impl Engine {
     /// A source refused to hand a failed range back (#621): counted under the
     /// tenant the range's source is charged to, like a read error.
     fn count_refused_replay(&self, source_type: &SourceType, marker: &ProgressMarker) {
-        let Some(mx) = telemetry::metrics() else {
-            return;
-        };
         let source_name = match marker {
             ProgressMarker::Kafka { topic, .. } => topic.as_str(),
             ProgressMarker::File { path, .. } | ProgressMarker::SyslogSpool { path, .. } => {
                 path.as_str()
             }
+        };
+        self.count_refused_replay_of(source_type, source_name);
+    }
+
+    fn count_refused_replay_of(&self, source_type: &SourceType, source_name: &str) {
+        let Some(mx) = telemetry::metrics() else {
+            return;
         };
         let tenant = tenant_for_source(&self.streams, &self.config.engine.tenant, source_name);
         mx.source_replay_refused_total
@@ -4456,30 +4470,95 @@ mod tests {
         );
     }
 
+    /// `vtop_source_replay_refused_total` for one tenant's file sources, read
+    /// back through the registry as a scrape would.
+    fn refused_so_far(tenant: &str) -> u64 {
+        let mx = telemetry::init().unwrap();
+        mx.registry
+            .gather()
+            .iter()
+            .filter(|f| f.name().ends_with("source_replay_refused_total"))
+            .flat_map(|f| f.get_metric().iter())
+            .find(|m| {
+                let labels = m.get_label();
+                labels
+                    .iter()
+                    .any(|l| l.name() == "tenant" && l.value() == tenant)
+                    && labels
+                        .iter()
+                        .any(|l| l.name() == "source_type" && l.value() == "file")
+            })
+            .map_or(0, |m| m.get_counter().get_value() as u64)
+    }
+
+    /// #621 (review): the batch fails, its range is handed back, the file is
+    /// rotated away - and the rotated file is then truncated above its first
+    /// page, so its fingerprint still matches. The re-read through the held
+    /// descriptor archived the shortened prefix as though it were the range.
+    /// It is refused instead, and counted like any refused rewind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotated_file_truncated_before_its_re_read_is_refused_and_counted() {
+        use std::os::unix::fs::MetadataExt;
+        let _serial = THROTTLE_TESTS.lock().await;
+        let tenant = "truncated-621";
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        let old: String = (0..200)
+            .map(|i| format!("line {i:04} of the old file\n"))
+            .collect();
+        std::fs::write(&input, &old).unwrap();
+        let old_inode = std::fs::metadata(&input).unwrap().ino();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 3_600;
+        cfg.engine.tenant = tenant.into();
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        engine.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(1));
+        let first = engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(first[0].final_state, BatchState::Failed);
+
+        let rotated = dir.path().join("app.log.1");
+        std::fs::rename(&input, &rotated).unwrap();
+        std::fs::write(&input, "new 1\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&rotated)
+            .unwrap()
+            .set_len(4_500)
+            .unwrap();
+
+        let before = refused_so_far(tenant);
+        for _ in 0..3 {
+            engine.run_source(SourceType::File, true).await.unwrap();
+        }
+        assert_eq!(
+            refused_so_far(tenant) - before,
+            1,
+            "the refused re-read is counted under the engine's tenant"
+        );
+        let committed = committed_file_ranges(&engine).await;
+        assert!(
+            committed
+                .iter()
+                .all(|(inode, ..)| *inode != Some(old_inode)),
+            "nothing of the shortened file is archived as the range: {committed:?}"
+        );
+        assert_eq!(committed.len(), 1, "the new file is: {committed:?}");
+    }
+
     /// #621: when the rotated file is gone (compressed and removed while the
     /// engine was down), the range cannot be re-read. That stays loud - and is
     /// counted, not only logged, so it can be alerted on.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_range_whose_file_is_gone_is_refused_and_counted() {
-        fn refused_so_far(tenant: &str) -> u64 {
-            let mx = telemetry::init().unwrap();
-            mx.registry
-                .gather()
-                .iter()
-                .filter(|f| f.name().ends_with("source_replay_refused_total"))
-                .flat_map(|f| f.get_metric().iter())
-                .find(|m| {
-                    let labels = m.get_label();
-                    labels
-                        .iter()
-                        .any(|l| l.name() == "tenant" && l.value() == tenant)
-                        && labels
-                            .iter()
-                            .any(|l| l.name() == "source_type" && l.value() == "file")
-                })
-                .map_or(0, |m| m.get_counter().get_value() as u64)
-        }
         let _serial = THROTTLE_TESTS.lock().await;
         let tenant = "refused-621";
         let dir = tempfile::tempdir().unwrap();
