@@ -18,8 +18,9 @@ use vtop_broker::fencing_epochs::{EpochStart, FencingEpochJournal};
 use vtop_broker::group_commit::GroupCommitConfig;
 use vtop_broker::memory_budget::{MemoryBudgetConfig, MemoryBudgetPool};
 use vtop_broker::replication::{
-    ClusterCommittedOffset, FlowControlConfig, InProcessFollower, NetworkFollowerConfig,
-    NetworkedReplicaSet, ReplicaPeerHandler, ReplicaPeerServer, ReplicaSet, ReplicaTlsMaterial,
+    ClusterCommittedOffset, FlowControlConfig, InProcessFollower, LeaderLineage,
+    NetworkFollowerConfig, NetworkedReplicaSet, ReplicaPeerHandler, ReplicaPeerServer, ReplicaSet,
+    ReplicaTlsMaterial,
 };
 use vtop_broker::{LocalBroker, MetaFencingEpoch, ProducerEpochJournal};
 use vtop_log::{ActiveSegment, KeyRange, RangeLineage, SegmentConfig, SegmentDescriptor};
@@ -143,13 +144,28 @@ impl ReplicaPeerHandler for SlowFollower {
     fn status(&self, range: &RangeIdentity) -> Result<ReplicaStatusResponse, (ErrorCode, String)> {
         self.inner.status(range)
     }
+
+    fn fence(
+        &self,
+        range: &RangeIdentity,
+        fencing_epoch: u64,
+        leader_epoch_starts: &[EpochStart],
+    ) -> Result<vtop_protocol::ReplicaFenceResponse, (ErrorCode, String)> {
+        ReplicaPeerHandler::fence(
+            self.inner.as_ref(),
+            range,
+            fencing_epoch,
+            leader_epoch_starts,
+        )
+    }
 }
 
 /// Follower 1 behind a gate: while `down`, it refuses appends and
 /// high-water marks as an overloaded replica would, but still answers the
 /// reconnect status probe (#616 review). That pins the order a real
 /// reconnect produces: the status probe prunes the leader's buffer BEFORE
-/// the replica sees the new leader's mark.
+/// the replica sees the new leader's mark. It refuses the session fence
+/// while down too (#641): a replica that is down is fenced by nobody.
 struct GatedFollower {
     inner: Arc<InProcessFollower>,
     down: Arc<AtomicBool>,
@@ -192,6 +208,21 @@ impl ReplicaPeerHandler for GatedFollower {
 
     fn status(&self, range: &RangeIdentity) -> Result<ReplicaStatusResponse, (ErrorCode, String)> {
         self.inner.status(range)
+    }
+
+    fn fence(
+        &self,
+        range: &RangeIdentity,
+        fencing_epoch: u64,
+        leader_epoch_starts: &[EpochStart],
+    ) -> Result<vtop_protocol::ReplicaFenceResponse, (ErrorCode, String)> {
+        self.refuse()?;
+        ReplicaPeerHandler::fence(
+            self.inner.as_ref(),
+            range,
+            fencing_epoch,
+            leader_epoch_starts,
+        )
     }
 }
 
@@ -406,6 +437,25 @@ fn harness_with_gate(
     if let Some(config) = group_commit {
         leader = leader.with_group_commit(config).unwrap();
     }
+    // As `data_node` wires a leader (#641): every follower session opens
+    // with this leader's fence. The sessions opened above carried none, so
+    // they are dropped and come back fenced before anything is produced.
+    let leader = Arc::new(leader);
+    assert!(
+        replica_set.reconcile_followers_against(
+            Arc::downgrade(&leader) as std::sync::Weak<dyn LeaderLineage>
+        )
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let ready = [FOLLOWER_1, FOLLOWER_2]
+            .iter()
+            .all(|node| replica_set.follower_connected(*node) == Some(true));
+        if ready {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     NetworkHarness {
         _dirs: dirs,
@@ -413,7 +463,7 @@ fn harness_with_gate(
         _server_abort: server_abort,
         range,
         meta,
-        leader: Arc::new(leader),
+        leader,
         followers,
         replica_set,
         cluster_committed,
@@ -948,5 +998,144 @@ fn a_follower_reconnecting_with_a_kept_suffix_still_receives_the_new_leaders_rec
          {} record(s) (committed {}), the leader 7",
         disputed.next_offset(),
         disputed.local_committed_offset()
+    );
+}
+
+/// The records `follower` serves from `from`, as values: only what its own
+/// high-water mark admits.
+fn served_values(follower: &InProcessFollower, from: u64) -> Vec<String> {
+    follower
+        .fetch(from, usize::MAX, 64)
+        .map(|batch| {
+            batch
+                .records
+                .iter()
+                .map(|fetched| String::from_utf8_lossy(&fetched.record.value).into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// #641. A deposed leader that was absent from the election that replaced
+/// it was never fenced by it. Follower 1 plays it: it holds epoch-18 records
+/// at 5..10 that no other replica has, so none was acknowledged. It is down
+/// while the leader takes epoch 19 and commits its own records at 5 and 6 on
+/// itself and follower 2, then it comes back having adopted epoch 19 from
+/// metadata, as a lease watcher does, and nothing else.
+///
+/// Before the fix, its reconnect status reported its whole tail (10), so
+/// the leader dropped the records it had buffered for it, the leader's mark
+/// put its own epoch-18 records under the committed mark, and the leader's
+/// appends at those offsets were acked as duplicates over different bytes
+/// (#261). It served "deposed-5.." where every other replica had "v5..".
+///
+/// Invariant: once back, the follower serves exactly the leader's bytes
+/// below the mark. Its session opens with the leader's fence, which keeps
+/// 5..10 in dispute (the leader's history alone cannot prove the suffix
+/// unacknowledged), caps its status at 5, and discards the suffix on the
+/// leader's first mark or record over it. The ordinary retransmission path
+/// then catches it up.
+#[test]
+fn a_deposed_leader_absent_from_the_election_discards_its_unacknowledged_suffix_and_catches_up() {
+    let flow = FlowControlConfig {
+        reconnect_backoff: Duration::from_millis(20),
+        ack_timeout: Duration::from_millis(500),
+        ..FlowControlConfig::default()
+    };
+    let down = Arc::new(AtomicBool::new(false));
+    let h = harness_with_gate(
+        flow,
+        None,
+        None,
+        None,
+        FollowerAddressing::Resolved,
+        Some(Arc::clone(&down)),
+    );
+    // Every replica keeps its epoch history, as a data node does; each
+    // journal is seeded at epoch 18 from offset 0 over an empty log.
+    let journals = tempfile::tempdir().unwrap();
+    h.leader.set_fencing_epoch_journal(
+        FencingEpochJournal::open(journals.path().join("leader")).unwrap(),
+    );
+    for (index, follower) in h.followers.iter().enumerate() {
+        follower.set_fencing_epoch_journal(
+            FencingEpochJournal::open(journals.path().join(format!("follower-{index}"))).unwrap(),
+        );
+    }
+    let deposed = Arc::clone(&h.followers[0]);
+
+    for sequence in 0..5 {
+        let _ = produce_ok(&h.leader, h.range.clone(), sequence);
+    }
+    assert!(
+        await_within(Duration::from_secs(5), || {
+            deposed.local_committed_offset() == 5
+        }),
+        "precondition: follower 1 holds the committed prefix"
+    );
+    // The deposed leadership's own suffix: on follower 1 alone, durable,
+    // never acknowledged.
+    for offset in 5..10 {
+        deposed
+            .apply_append(&ReplicaAppendRequest {
+                range: h.range.clone(),
+                fencing_epoch: FENCING_EPOCH,
+                leader_node_id: FOLLOWER_1,
+                expected_base_offset: offset,
+                producer_id: Uuid::from_u128(0xB2),
+                producer_epoch: 1,
+                first_sequence: offset - 5,
+                records: vec![ProduceRecord {
+                    timestamp_millis: 1_000,
+                    key: b"k".to_vec(),
+                    value: format!("deposed-{offset}").into_bytes(),
+                }],
+            })
+            .unwrap();
+    }
+
+    // Follower 1 is down for the election. The leader and follower 2 take
+    // epoch 19 with the leader's tail at 5; follower 1 is never fenced.
+    down.store(true, Ordering::SeqCst);
+    let epoch = FENCING_EPOCH + 1;
+    h.meta.set(epoch);
+    h.leader.adopt_fencing_epoch(epoch);
+    h.followers[1].adopt_fencing_epoch(epoch);
+    produce_at(&h.leader, h.range.clone(), epoch, 5);
+    produce_at(&h.leader, h.range.clone(), epoch, 6);
+    assert!(
+        await_within(Duration::from_secs(5), || h.cluster_committed.get() == 7),
+        "the leader committed 5 and 6 on the majority without follower 1"
+    );
+    assert!(
+        await_within(Duration::from_secs(5), || {
+            served_values(&h.followers[1], 5) == ["v5", "v6"]
+        }),
+        "precondition: follower 2 serves the leader's records"
+    );
+
+    // It returns: its watcher adopts the granted epoch, and that is all.
+    deposed.adopt_fencing_epoch(epoch);
+    assert_eq!(
+        deposed.next_offset(),
+        10,
+        "precondition: the suffix is still held"
+    );
+    down.store(false, Ordering::SeqCst);
+    produce_at(&h.leader, h.range.clone(), epoch, 7);
+
+    let expected = ["v5", "v6", "v7"];
+    let caught_up = await_within(Duration::from_secs(10), || {
+        deposed.local_committed_offset() == 8 && served_values(&deposed, 5) == expected
+    });
+    assert!(
+        caught_up,
+        "the returning replica must discard its unacknowledged epoch-18 suffix and hold the \
+         leader's records: it serves {:?} from offset 5 (holds {} record(s), committed {}, \
+         mark {}), the leader {expected:?}",
+        served_values(&deposed, 5),
+        deposed.next_offset(),
+        deposed.local_committed_offset(),
+        deposed.cluster_committed().get()
     );
 }

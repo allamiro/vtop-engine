@@ -236,6 +236,15 @@ reopen quietly.
   instead of acking a record it does not hold (#261) or exposing the kept
   records as committed. That memory does not survive a restart, which leaves
   it in the same position as a replica that was absent from the fence.
+  Neither is left unreconciled any more (#641): every leader-to-follower
+  session opens with the probe's own fence frame, at the leader's epoch and
+  with its history, before the status read and before any record or mark. A
+  deposed leader that missed the election, or a voter that restarted, keeps
+  its old-epoch suffix in dispute there and discards it on the leader's
+  first append or mark over it, then catches up. It no longer reports that
+  suffix as held, takes it under the new mark, or acks the leader's records
+  over it. Plaintext planes skip the session fence, since they refuse fences
+  and do not fail over.
   **The protection is the fenced replica's, so it holds only on upgraded
   replicas.** There is no wire or feature-level change and the fence frames
   are identical, so nothing tells a candidate which replicas run this

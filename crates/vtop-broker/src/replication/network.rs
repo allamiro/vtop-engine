@@ -132,6 +132,53 @@ pub async fn address_now(host: &str, within: Duration) -> Option<SocketAddr> {
     }
 }
 
+/// What a leader's follower sessions reconcile against (#641): the range, the
+/// epoch this leader holds, and which epoch wrote each stretch of its log,
+/// read at the moment a session opens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaderLineageSnapshot {
+    pub range: RangeIdentity,
+    pub fencing_epoch: u64,
+    pub epoch_starts: Vec<crate::fencing_epochs::EpochStart>,
+}
+
+/// The leader a [`NetworkedReplicaSet`] replicates for, as its follower
+/// sessions need to see it (#641). See
+/// [`NetworkedReplicaSet::reconcile_followers_against`].
+pub trait LeaderLineage: Send + Sync {
+    /// `None` while this leader holds no live grant at the epoch it would
+    /// fence at. May block briefly; the driver calls it off the runtime.
+    fn leader_lineage(&self) -> Option<LeaderLineageSnapshot>;
+}
+
+impl LeaderLineage for crate::LocalBroker {
+    fn leader_lineage(&self) -> Option<LeaderLineageSnapshot> {
+        // Only an epoch this broker serves, judged as produce judges it. A
+        // session fence at someone else's epoch would install a dispute that
+        // the real leader of that epoch then settles with its ordinary
+        // appends, discarding records it holds and may have acknowledged.
+        // A candidate's broker is built before it adopts its grant, holding
+        // the configured epoch; this keeps its sessions waiting until then.
+        let fencing_epoch = {
+            let meta = self.meta_fencing_epoch().lock();
+            let held = self.held_fencing_epoch();
+            if held == 0 || !meta.lease_active || meta.fencing_epoch != held {
+                return None;
+            }
+            held
+        };
+        // The epoch before the history. An adoption between the two reads
+        // puts a newer epoch in the history than the one fenced at, and the
+        // follower then treats that entry as this leader's own tail adoption:
+        // it keeps a disputed suffix rather than discarding it, the safe side.
+        Some(LeaderLineageSnapshot {
+            range: self.range().clone(),
+            fencing_epoch,
+            epoch_starts: self.epoch_starts(),
+        })
+    }
+}
+
 /// Apply surface hosted by a follower peer server.
 pub trait ReplicaPeerHandler: Send + Sync {
     fn node_id(&self) -> Uuid;
@@ -778,7 +825,15 @@ pub struct NetworkedReplicaSet {
     followers: Vec<Arc<FollowerChannel>>,
     flow: FlowControlConfig,
     _shutdown: Vec<mpsc::Sender<()>>,
+    /// The leader every follower session reconciles against (#641); unset
+    /// until [`Self::reconcile_followers_against`]. Shared with the drivers.
+    lineage: LineageCell,
 }
+
+/// Where a driver finds the leader it reconciles followers against (#641).
+/// Weak: the leader's broker holds this replica set, so a strong reference
+/// back would keep both alive forever.
+type LineageCell = Arc<std::sync::OnceLock<std::sync::Weak<dyn LeaderLineage>>>;
 
 enum RuntimeBinding {
     Owned(Runtime),
@@ -920,6 +975,7 @@ impl NetworkedReplicaSet {
             None => None,
         };
         let handle = runtime.handle();
+        let lineage: LineageCell = Arc::new(std::sync::OnceLock::new());
         let mut channels = Vec::with_capacity(followers.len());
         let mut shutdown = Vec::with_capacity(followers.len());
         for config in followers {
@@ -954,6 +1010,7 @@ impl NetworkedReplicaSet {
                 cmd_rx,
                 hwm_rx,
                 stop_rx,
+                lineage: Arc::clone(&lineage),
             };
             handle.spawn(driver.run());
             channels.push(channel);
@@ -964,7 +1021,52 @@ impl NetworkedReplicaSet {
             followers: channels,
             flow,
             _shutdown: shutdown,
+            lineage,
         })
+    }
+
+    /// Reconcile every follower against `leader` before it takes anything
+    /// from this replica set (#641). Returns false if a leader was already
+    /// attached; the first one stays.
+    ///
+    /// A replica that was absent from the election that made this leader
+    /// was never fenced by it. A deposed leader is the usual case: it comes
+    /// back holding records it wrote under its old epoch, some of them never
+    /// acknowledged, at offsets the new leader has since written. Nothing
+    /// told it those records lost. Its reconnect status then counted them as
+    /// held, the new leader's high-water mark put them under the committed
+    /// mark, and its appends at those offsets were acked as duplicates over
+    /// different bytes (#261).
+    ///
+    /// So every session opens with the same fence a promotion probe sends:
+    /// this leader's epoch and its epoch history, before the status probe
+    /// and before any record or high-water mark. The follower runs the
+    /// fence's reconciliation against it. A suffix this leader provably
+    /// supersedes is discarded there. One it cannot yet prove is kept as a
+    /// dispute (#611), which caps the status the leader prunes its buffer by
+    /// and is discarded by this leader's first append or mark over it. That
+    /// first write is the proof: only an established leader writes under its
+    /// epoch. Nothing at or below the follower's own high-water mark is ever
+    /// touched; the fence refuses instead.
+    ///
+    /// Sessions opened before this call carried no fence. Each is dropped
+    /// before it carries a record or a mark, so the next one opens fenced.
+    ///
+    /// Plaintext sessions skip the fence: a plaintext replica refuses it,
+    /// since it truncates against the caller's word and needs an identified
+    /// caller. A plaintext plane does not fail over (`refuse_plaintext_promotion`
+    /// in vtop-node), so it has no deposed leader to reconcile.
+    pub fn reconcile_followers_against(&self, leader: std::sync::Weak<dyn LeaderLineage>) -> bool {
+        if self.lineage.set(leader).is_err() {
+            return false;
+        }
+        for follower in &self.followers {
+            follower.connected.store(false, Ordering::SeqCst);
+            // Best effort: a full queue still reaches the session's own check
+            // before its next write.
+            let _ = follower.cmd_tx.try_send(FollowerCmd::DropConnection);
+        }
+        true
     }
 
     pub fn follower_durable_offset(&self, node_id: Uuid) -> Option<u64> {
@@ -1175,6 +1277,17 @@ struct FollowerDriver {
     cmd_rx: mpsc::Receiver<FollowerCmd>,
     hwm_rx: watch::Receiver<Option<CommittedHwmUpdate>>,
     stop_rx: mpsc::Receiver<()>,
+    lineage: LineageCell,
+}
+
+/// How a session opened, as far as reconciliation goes (#641).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionFence {
+    /// No leader was attached, or the plane is plaintext: nothing to
+    /// reconcile against.
+    NotRequired,
+    /// The follower was fenced at this leader's epoch and history.
+    Reconciled,
 }
 
 impl FollowerDriver {
@@ -1236,6 +1349,122 @@ impl FollowerDriver {
         if let Some(addr) = address_now(&host, self.flow.connect_timeout / 2).await {
             self.config.addr = addr;
         }
+    }
+
+    /// True when this session opened without a fence but a leader has been
+    /// attached since (#641). It must end before it writes a record or a
+    /// mark, so the next session opens fenced.
+    fn session_predates_lineage(&self, fence: SessionFence) -> bool {
+        fence == SessionFence::NotRequired
+            && self.connector.is_some()
+            && self.lineage.get().is_some()
+    }
+
+    /// Open the session with the fence a promotion probe sends (#641; see
+    /// [`NetworkedReplicaSet::reconcile_followers_against`]): this leader's
+    /// epoch and history, so the follower reconciles its log against this
+    /// leader before it reports a status, takes a mark, or acks a record.
+    ///
+    /// Returns the range the fence named, for the status probe. Any refusal
+    /// ends the session; the driver retries after its backoff. A follower
+    /// whose metadata view has not reached this leader's grant refuses until
+    /// it has, and it would refuse this leader's appends until then anyway.
+    async fn fence_session(
+        &self,
+        stream: &mut MaybeTls<TcpStream>,
+        next_request_id: &mut u64,
+    ) -> Result<(SessionFence, Option<RangeIdentity>), SessionOutcome> {
+        // Plaintext: see `reconcile_followers_against`.
+        if self.connector.is_none() {
+            return Ok((SessionFence::NotRequired, None));
+        }
+        let Some(cell) = self.lineage.get() else {
+            return Ok((SessionFence::NotRequired, None));
+        };
+        // The leader is gone: this replica set is being torn down.
+        let Some(leader) = cell.upgrade() else {
+            return Err(SessionOutcome::Disconnected);
+        };
+        // Off the runtime: the broker reads its lease view under the lock
+        // its produce path holds through an fsync, and a stalled disk must
+        // not park a runtime worker.
+        let lineage = match timeout(
+            self.flow.connect_timeout,
+            tokio::task::spawn_blocking(move || leader.leader_lineage()),
+        )
+        .await
+        {
+            Ok(Ok(Some(lineage))) => lineage,
+            // No live grant (yet, or any more): nothing to replicate under.
+            _ => return Err(SessionOutcome::Disconnected),
+        };
+        let request_id = *next_request_id;
+        *next_request_id = next_request_id.wrapping_add(1);
+        let frame = WireFrame {
+            request_id,
+            stream_id: 0,
+            message: Message::ReplicaFenceRequest(vtop_protocol::ReplicaFenceRequest {
+                range: lineage.range.clone(),
+                fencing_epoch: lineage.fencing_epoch,
+                leader_epoch_starts: lineage
+                    .epoch_starts
+                    .iter()
+                    .map(|entry| vtop_protocol::ReplicaEpochStart {
+                        epoch: entry.epoch,
+                        start_offset: entry.start_offset,
+                    })
+                    .collect(),
+            }),
+        };
+        if write_frame(stream, &frame, REPLICA_LIMITS).await.is_err() {
+            return Err(SessionOutcome::Disconnected);
+        }
+        let reply = match timeout(
+            self.flow.connect_timeout,
+            read_frame(stream, REPLICA_LIMITS),
+        )
+        .await
+        {
+            Ok(Ok(Some(frame))) => frame,
+            _ => return Err(SessionOutcome::Disconnected),
+        };
+        if reply.request_id != request_id {
+            return Err(SessionOutcome::Disconnected);
+        }
+        let refusal = match reply.message {
+            // Exactly this leader's epoch, as the promotion probe requires: a
+            // higher one means a newer grant overtook this leader.
+            Message::ReplicaFenceResponse(response)
+                if response.fencing_epoch == lineage.fencing_epoch =>
+            {
+                if response.truncated_records > 0 {
+                    eprintln!(
+                        "replica {}: discarded {} record(s) from offset {} that this leader \
+                         (epoch {}) supersedes, before the session carried anything (#641)",
+                        self.config.node_id,
+                        response.truncated_records,
+                        response.next_offset,
+                        lineage.fencing_epoch
+                    );
+                }
+                return Ok((SessionFence::Reconciled, Some(lineage.range)));
+            }
+            Message::ReplicaFenceResponse(response) => format!(
+                "it answered at epoch {} rather than this leader's {}",
+                response.fencing_epoch, lineage.fencing_epoch
+            ),
+            Message::Error(error) => format!("{:?} {}", error.code, error.message),
+            other => format!("unexpected reply {other:?}"),
+        };
+        warn_rate_limited(
+            "replica-driver",
+            &format!(
+                "replica {} at {}: the session fence at epoch {} was refused ({refusal}); no \
+                 record or mark is sent until it reconciles against this leader (#641)",
+                self.config.node_id, self.config.addr, lineage.fencing_epoch
+            ),
+        );
+        Err(SessionOutcome::Disconnected)
     }
 
     async fn connect_and_session(
@@ -1308,19 +1537,29 @@ impl FollowerDriver {
             }
             None => MaybeTls::Plain(tcp),
         };
+        // Reconcile before anything else (#641): the status probe below
+        // prunes the retransmission buffer by what the follower reports, and
+        // it must report a log already judged against this leader.
+        let (session_fence, fenced_range) =
+            match self.fence_session(&mut stream, next_request_id).await {
+                Ok(fenced) => fenced,
+                Err(outcome) => return outcome,
+            };
         // Catch-up probe + bounded retransmission. Mark connected only after the
         // optional status exchange succeeds so tests do not observe a false ready.
-        let range = retransmission
-            .front()
-            .and_then(|batch| batch.requests.first().map(|r| r.range.clone()))
-            .or_else(|| {
-                pending.iter().find_map(|cmd| match cmd {
-                    FollowerCmd::Replicate { requests, .. } => {
-                        requests.first().map(|r| r.range.clone())
-                    }
-                    _ => None,
+        let range = fenced_range.or_else(|| {
+            retransmission
+                .front()
+                .and_then(|batch| batch.requests.first().map(|r| r.range.clone()))
+                .or_else(|| {
+                    pending.iter().find_map(|cmd| match cmd {
+                        FollowerCmd::Replicate { requests, .. } => {
+                            requests.first().map(|r| r.range.clone())
+                        }
+                        _ => None,
+                    })
                 })
-            });
+        });
         if let Some(range) = range {
             let request_id = *next_request_id;
             *next_request_id = next_request_id.wrapping_add(1);
@@ -1369,6 +1608,9 @@ impl FollowerDriver {
                 _ => return SessionOutcome::Disconnected,
             }
         }
+        if self.session_predates_lineage(session_fence) {
+            return SessionOutcome::Disconnected;
+        }
         self.channel.connected.store(true, Ordering::SeqCst);
 
         // Re-send the current mark on every fresh session. `changed()` only
@@ -1384,6 +1626,9 @@ impl FollowerDriver {
             guard.clone()
         };
         if let Some(update) = current_hwm {
+            if self.session_predates_lineage(session_fence) {
+                return SessionOutcome::Disconnected;
+            }
             let frame = WireFrame {
                 request_id: 0,
                 stream_id: 0,
@@ -1401,6 +1646,12 @@ impl FollowerDriver {
         let mut inflight_bytes = 0usize;
 
         loop {
+            // A leader attached after this session opened unfenced (#641):
+            // end it before it writes anything, so the next one is fenced.
+            if self.session_predates_lineage(session_fence) {
+                requeue_inflight(pending, &mut inflight, retransmission);
+                return SessionOutcome::Disconnected;
+            }
             // Drain pending catch-up / deferred replicates while the window allows.
             while can_send(&inflight, inflight_bytes, &self.flow) {
                 let Some(FollowerCmd::Replicate {
@@ -1489,6 +1740,12 @@ impl FollowerDriver {
                         guard.clone()
                     };
                     if let Some(update) = update {
+                        // The mark stays in the cell; the next session,
+                        // fenced, sends it first thing (#641).
+                        if self.session_predates_lineage(session_fence) {
+                            requeue_inflight(pending, &mut inflight, retransmission);
+                            return SessionOutcome::Disconnected;
+                        }
                         let frame = WireFrame {
                             request_id: 0,
                             stream_id: 0,
@@ -1517,6 +1774,18 @@ impl FollowerDriver {
                             response_tx,
                             catch_up_charged,
                         }) => {
+                            // Kept for the next, fenced session (#641).
+                            if self.session_predates_lineage(session_fence) {
+                                pending.push_front(FollowerCmd::Replicate {
+                                    requests,
+                                    leader_committed_offset,
+                                    bytes,
+                                    response_tx,
+                                    catch_up_charged,
+                                });
+                                requeue_inflight(pending, &mut inflight, retransmission);
+                                return SessionOutcome::Disconnected;
+                            }
                             if !window_allows(inflight.len(), inflight_bytes, bytes, &self.flow) {
                                 // Slow follower: miss this ack rather than stall.
                                 // A transferred charge dies with the dropped

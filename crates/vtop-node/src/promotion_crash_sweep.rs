@@ -38,6 +38,11 @@
 //!   `lease_agent` tests over a real replica-plane server. Metadata is a
 //!   counter that grants the next epoch to the next candidate. The new
 //!   leader's boundary marker is an ordinary record from its own producer.
+//!   A leader's session with a follower opens with the fence
+//!   `NetworkedReplicaSet` sends (#641): the leader's epoch and history,
+//!   before the status read, any record, or any mark. A session lasts while
+//!   both the follower's process and the leader's epoch do; a restarted
+//!   follower gets a new one.
 //!
 //! # The sequence (the #611 issue body)
 //!
@@ -86,7 +91,7 @@
 //! And liveness: some candidate is established, and every node catches up,
 //! within a bounded number of elections once faults stop.
 //!
-//! # Known gaps: #635, #640, #641
+//! # Known gaps: #635, #640
 //!
 //! Each failing run is matched against these by signature
 //! (`Outcome::known_issues`) and printed with its issue number. A failure
@@ -97,8 +102,7 @@
 //!   first append over the suffix is acked as a duplicate of a record the
 //!   replica does not hold (#261). Signature: the violation is on a node
 //!   restarted while it held a kept dispute that its fence reply had
-//!   announced, at or above the dispute's start. A fence that died before
-//!   replying leaves the replica absent from the election, which is #641.
+//!   announced, at or above the dispute's start.
 //! * #640. A follower's fencing-epoch journal records an adopted epoch at its
 //!   own tail, so records a new leader later catches it up on are filed
 //!   under that epoch rather than the one that wrote them. After a second
@@ -108,12 +112,13 @@
 //!   every acknowledged record must still be durable on a majority.
 //!   Reproduction:
 //!   `reproduction_two_caught_up_replicas_cannot_prove_a_quorum_after_the_leader_is_lost`.
-//! * #641. A deposed leader that returns without being fenced keeps its
-//!   unacknowledged suffix under the new leader's mark (the "absent
-//!   replica" item in `promotion.rs`). Signature: the violation is on a node
-//!   not fenced at the final leader's epoch, holding a record nobody
-//!   acknowledged. Reproduction:
-//!   `reproduction_a_returning_deposed_leader_keeps_its_unacknowledged_suffix_under_the_mark`.
+//!
+//! Fixed and no longer matched: #641, a deposed leader absent from the
+//! election that replaced it, which came back unfenced and kept its
+//! unacknowledged suffix under the new leader's mark. Every session now opens
+//! with a fence, so such a run fails the sweep. Reproduction, kept as a
+//! guard:
+//! `reproduction_a_returning_deposed_leader_keeps_its_unacknowledged_suffix_under_the_mark`.
 
 // A node is an index into the cluster, `NAMES` and the trace arrays at once.
 #![allow(clippy::needless_range_loop)]
@@ -270,10 +275,6 @@ struct Outcome {
     acknowledged: BTreeMap<u64, String>,
     /// Nodes whose open refused after the crash, and why.
     refused_to_open: Vec<(usize, String)>,
-    /// Epochs at which each node was fenced (or fenced itself as candidate).
-    fenced_at: Vec<Vec<u64>>,
-    /// The epoch the final leader was established at.
-    final_epoch: Option<u64>,
     /// The last election's result, for the #640 signature.
     last_promotion: Option<Promotion>,
 }
@@ -291,20 +292,14 @@ impl Outcome {
     ///   a provable quorum: answers came back but were judged Unknown. Every
     ///   acknowledged record must still be durable on a majority, or the run
     ///   reports a lost record, which matches nothing.
-    /// * #641: an ack or disagreement on a node that was never fenced at the
-    ///   final leader's epoch, where it holds a record nobody acknowledged.
+    ///
+    /// #641 (a returning deposed leader never fenced) is fixed and no longer
+    /// matched: a run that shows it fails the sweep.
     fn known_issues(&self) -> Option<BTreeSet<u32>> {
         let after_a_forgotten_dispute = |node: usize, offset: u64| {
             self.forgotten_disputes
                 .iter()
                 .any(|(forgot, from)| *forgot == node && offset >= *from)
-        };
-        let unfenced_holding_an_unacknowledged_record = |node: usize, holds: &Option<String>| {
-            self.final_epoch
-                .is_some_and(|epoch| !self.fenced_at[node].contains(&epoch))
-                && holds
-                    .as_ref()
-                    .is_some_and(|value| !self.acknowledged.values().any(|acked| acked == value))
         };
         let any_635_ack = self.violations.iter().any(|violation| {
             matches!(
@@ -316,22 +311,10 @@ impl Outcome {
         let mut issues = BTreeSet::new();
         for violation in &self.violations {
             let issue = match violation {
-                Violation::AckWithoutTheRecord {
-                    node,
-                    offset,
-                    holds,
-                    ..
-                }
-                | Violation::DivergedBelowMark {
-                    node,
-                    offset,
-                    holds,
-                    ..
-                } => {
+                Violation::AckWithoutTheRecord { node, offset, .. }
+                | Violation::DivergedBelowMark { node, offset, .. } => {
                     if after_a_forgotten_dispute(*node, *offset) {
                         635
-                    } else if unfenced_holding_an_unacknowledged_record(*node, holds) {
-                        641
                     } else {
                         return None;
                     }
@@ -400,12 +383,22 @@ struct Cluster {
     forgotten_disputes: Vec<(usize, u64)>,
     log: Vec<String>,
     first_promotion: Option<(usize, Promotion)>,
-    fenced_at: Vec<Vec<u64>>,
-    final_epoch: Option<u64>,
     last_promotion: Option<Promotion>,
     /// Per node: a fence reply that announced a kept suffix was sent, and
     /// the dispute it announced is still held (#635's precondition).
     announced_dispute: [bool; 3],
+    /// Per follower: the leader, epoch and replica process of its current
+    /// session (#641). A session opens with a fence, so a follower whose
+    /// process or leader changed is fenced before it is sent anything.
+    sessions: [Option<Session>; 3],
+}
+
+/// One leader-to-follower session, as `NetworkedReplicaSet` holds it.
+#[derive(Clone)]
+struct Session {
+    leader: usize,
+    epoch: u64,
+    follower: Arc<InProcessFollower>,
 }
 
 /// The durable records on `disk`, read from a copy so the read itself
@@ -494,16 +487,16 @@ fn setup_disks() -> Vec<SimDiskState> {
         forgotten_disputes: Vec::new(),
         log: Vec::new(),
         first_promotion: None,
-        fenced_at: vec![Vec::new(); 3],
-        final_epoch: None,
         last_promotion: None,
         announced_dispute: [false; 3],
+        sessions: [None, None, None],
     };
     for node in 0..3 {
         let opened = open_replica(node, &cluster.nodes[node].env, &cluster.nodes[node].meta)
             .expect("a fresh replica opens");
         cluster.nodes[node].replica = Some(opened);
     }
+    cluster.open_setup_sessions();
     for offset in 0..SHARED {
         let request = cluster.new_record(format!("e{OLD_EPOCH}-o{offset}"), OLD_EPOCH, L, offset);
         assert!(
@@ -669,9 +662,87 @@ impl Cluster {
         )));
     }
 
-    /// Send `request` to follower `node`. True when it acked; an ack is
-    /// checked against the bytes the follower durably holds.
+    /// The sessions L held with R and C at epoch 18 before the sweep began.
+    fn open_setup_sessions(&mut self) {
+        for follower in [R, C] {
+            self.sessions[follower] = self.up(follower).map(|replica| Session {
+                leader: L,
+                epoch: OLD_EPOCH,
+                follower: replica,
+            });
+        }
+    }
+
+    /// Whether `leader` holds a live session with `follower` at `epoch`.
+    fn has_session(&self, leader: usize, epoch: u64, follower: usize) -> bool {
+        let Some(replica) = self.nodes[follower].replica.as_ref() else {
+            return false;
+        };
+        self.sessions[follower].as_ref().is_some_and(|session| {
+            session.leader == leader
+                && session.epoch == epoch
+                && Arc::ptr_eq(&session.follower, replica)
+        })
+    }
+
+    /// Make sure `leader` has a session with `follower` at `epoch`, opening
+    /// one with the fence `NetworkedReplicaSet` sends (#641) if the follower
+    /// restarted or the leader changed since the last. False when the
+    /// follower is down or refused the fence: nothing is sent to it.
+    fn session(&mut self, leader: usize, epoch: u64, follower: usize) -> bool {
+        let Some(replica) = self.up(follower) else {
+            return false;
+        };
+        if self.has_session(leader, epoch, follower) {
+            return true;
+        }
+        self.sessions[follower] = None;
+        let Some(own) = self.up(leader) else {
+            return false;
+        };
+        let history = own.epoch_starts();
+        let answer = replica.fence(epoch, &history);
+        let dead = self.nodes[follower].disk.has_crashed();
+        let opened = match answer {
+            Ok(outcome) if !dead && outcome.fencing_epoch == epoch => {
+                let (_, reported) = replica.replication_status();
+                self.announced_dispute[follower] = reported < replica.next_offset();
+                self.note(format!(
+                    "{} opens a session with {} at {epoch}: next {}, reports {reported}, \
+                     truncated {}",
+                    NAMES[leader], NAMES[follower], outcome.next_offset, outcome.truncated_records
+                ));
+                true
+            }
+            Ok(_) => false,
+            Err((code, reason)) => {
+                self.note(format!(
+                    "{} refused {}'s session fence at {epoch}: {code:?} {reason}",
+                    NAMES[follower], NAMES[leader]
+                ));
+                false
+            }
+        };
+        self.after_step(follower);
+        if opened && self.still_the_same(follower, &replica) {
+            self.sessions[follower] = Some(Session {
+                leader,
+                epoch,
+                follower: replica,
+            });
+            return true;
+        }
+        false
+    }
+
+    /// Send `request` to follower `node` over the request's leader's
+    /// session. True when it acked; an ack is checked against the bytes the
+    /// follower durably holds.
     fn send(&mut self, node: usize, request: &ReplicaAppendRequest) -> bool {
+        let leader = (request.leader_node_id.as_u128() - 1) as usize;
+        if !self.session(leader, request.fencing_epoch, node) {
+            return false;
+        }
         let Some(replica) = self.up(node) else {
             return false;
         };
@@ -764,6 +835,11 @@ impl Cluster {
             }
         }
         for node in to {
+            // A mark reaches a follower only over a session (#641).
+            let fresh = *node != leader && !self.has_session(leader, epoch, *node);
+            if *node != leader && !self.session(leader, epoch, *node) {
+                continue;
+            }
             let Some(replica) = self.up(*node) else {
                 continue;
             };
@@ -778,6 +854,12 @@ impl Cluster {
                 ));
             }
             self.after_step(*node);
+            // A session the mark opened goes on as the driver's does: it
+            // sends the mark first, then retransmits from where the
+            // follower's status said it ends.
+            if fresh {
+                self.catch_up(leader, epoch, *node);
+            }
         }
     }
 
@@ -838,9 +920,6 @@ impl Cluster {
         if !self.still_the_same(candidate, &own) {
             return None;
         }
-        if vote.is_some() {
-            self.fenced_at[candidate].push(epoch);
-        }
         let mut probes = vec![ReplicaProbe {
             node_id: node_id(candidate),
             local_committed_offset: vote,
@@ -874,11 +953,11 @@ impl Cluster {
                         outcome.truncated_records,
                         candidate_tail,
                     );
-                    self.fenced_at[node].push(epoch);
                     // The reply leaves the process here. Only a dispute a
                     // reply announced can be forgotten in #635's sense; one
                     // installed by a fence that died before replying leaves
-                    // the replica absent from the election (#641).
+                    // the replica absent from the election, and the next
+                    // leader's session fences it (#641).
                     let (_, reported) = replica.replication_status();
                     self.announced_dispute[node] = reported < replica.next_offset();
                     self.note(format!(
@@ -939,6 +1018,9 @@ impl Cluster {
     fn catch_up(&mut self, leader: usize, epoch: u64, follower: usize) -> bool {
         if self.nodes[follower].refuses_to_open.is_some() {
             return true;
+        }
+        if !self.session(leader, epoch, follower) {
+            return false;
         }
         let Some(replica) = self.up(follower) else {
             return false;
@@ -1136,7 +1218,6 @@ impl Cluster {
                     self.publish_mark(candidate, epoch, mark, &[0, 1, 2]);
                     if self.still_the_same(candidate, &own) {
                         final_leader = Some(candidate);
-                        self.final_epoch = Some(epoch);
                     }
                     break;
                 }
@@ -1157,8 +1238,6 @@ impl Cluster {
         }
         Outcome {
             violations: self.violations,
-            fenced_at: self.fenced_at,
-            final_epoch: self.final_epoch,
             last_promotion: self.last_promotion,
             forgotten_disputes: self.forgotten_disputes,
             log: self.log,
@@ -1269,10 +1348,9 @@ fn run(shape: Shape, fault: Fault, setup: &[SimDiskState]) -> Outcome {
         forgotten_disputes: Vec::new(),
         log: Vec::new(),
         first_promotion: None,
-        fenced_at: vec![Vec::new(); 3],
-        final_epoch: None,
         last_promotion: None,
         announced_dispute: [false; 3],
+        sessions: [None, None, None],
     };
     // The shared records' requests, for resending them in a catch-up.
     for offset in 0..SHARED {
@@ -1285,6 +1363,7 @@ fn run(shape: Shape, fault: Fault, setup: &[SimDiskState]) -> Outcome {
         cluster.nodes[node].replica = Some(opened);
         first_op[node] = cluster.nodes[node].disk.op_count();
     }
+    cluster.open_setup_sessions();
     if let Fault::Storage { node, plan } = fault {
         cluster.nodes[node].disk.set_fault(plan);
     }
@@ -1344,7 +1423,6 @@ fn issue_title(issue: u32) -> &'static str {
     match issue {
         635 => "a kept dispute is forgotten on restart",
         640 => "no provable quorum after a catch-up",
-        641 => "a deposed leader keeps its suffix under the mark",
         _ => "unknown",
     }
 }
@@ -1463,13 +1541,12 @@ fn assert_sweep(shape: Shape) {
     };
     eprintln!(
         "{shape:?}: {} runs, {} passed ({} of them with a node whose open refused after the \
-         crash), expected failures: {} #635, {} #640, {} #641; {} new failures",
+         crash), expected failures: {} #635, {} #640; {} new failures",
         result.runs,
         result.passed,
         result.passed_with_a_node_refusing_to_open.len(),
         count(635),
         count(640),
-        count(641),
         result.new_failures.len()
     );
     for case in &result.passed_with_a_node_refusing_to_open {
@@ -1484,8 +1561,8 @@ fn assert_sweep(shape: Shape) {
     assert!(
         result.new_failures.is_empty(),
         "{} of {} crash points lost an acknowledged record, acked a record a replica \
-         does not hold, or never finished, for a reason #635, #640 and #641 do not \
-         explain. First:\n{}",
+         does not hold, or never finished, for a reason #635 and #640 do not explain. \
+         First:\n{}",
         result.new_failures.len(),
         result.runs,
         result.new_failures[0].1
@@ -1629,15 +1706,15 @@ fn reproduction_two_caught_up_replicas_cannot_prove_a_quorum_after_the_leader_is
     );
 }
 
-/// Found by the sweep, not explained by #635: the documented "absent
-/// replica" gap in `promotion.rs`. R's disk dies before it acks L's first
-/// record of 5..10, so L holds 5..10 unacknowledged. L dies, C and R
-/// establish C at 5, and L returns without ever being fenced. Nothing
-/// reconciles it: it reports its full tail, and its epoch-18 records stay
-/// under the new leader's published mark (the real leader's appends there
-/// would be acked as duplicates, #261).
+/// #641, found by the sweep: the "absent replica" gap `promotion.rs` listed.
+/// R's disk dies before it acks L's first record of 5..10, so L holds 5..10
+/// unacknowledged. L dies, C and R establish C at 5, and L returns without
+/// having been fenced by that election. It used to report its full tail and
+/// keep its epoch-18 records under the new leader's published mark (the
+/// leader's appends there would be acked as duplicates, #261). C's session
+/// with L now opens with C's fence: L keeps 5..10 in dispute, reports 5, and
+/// discards them on C's first record there, then catches up.
 #[test]
-#[ignore = "#641: a deposed leader that returns is never fenced and keeps its unacknowledged suffix under the mark"]
 fn reproduction_a_returning_deposed_leader_keeps_its_unacknowledged_suffix_under_the_mark() {
     let setup = setup_disks();
     let fault = Fault::Storage {

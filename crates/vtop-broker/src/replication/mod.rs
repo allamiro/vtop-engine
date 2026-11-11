@@ -44,8 +44,9 @@ pub use fault::{
     FaultInjectingReplicaSet, FollowerNetworkFault, NetworkFaultPlan, PendingDeliveryStats,
 };
 pub use network::{
-    address_now, FlowControlConfig, NetworkFollowerConfig, NetworkedReplicaSet, ReplicaPeerHandler,
-    ReplicaPeerServer, ReplicaStatusClient, ReplicaTlsMaterial,
+    address_now, FlowControlConfig, LeaderLineage, LeaderLineageSnapshot, NetworkFollowerConfig,
+    NetworkedReplicaSet, ReplicaPeerHandler, ReplicaPeerServer, ReplicaStatusClient,
+    ReplicaTlsMaterial,
 };
 pub use transfer::{LeaderSegmentTransferHandler, SegmentTransferClient, TransferredPrefix};
 
@@ -221,8 +222,10 @@ pub struct InProcessFollower {
 /// leader keeps the records it must send there.
 ///
 /// In memory only. A replica restarted with a kept suffix is in the same
-/// position as one that was absent from the fence: nothing reconciled it,
-/// and the catch-up path's #261 gap applies to it until the next fence.
+/// position as one that was absent from the fence, and both are fenced
+/// again by the leader's next session with them (#641,
+/// [`NetworkedReplicaSet::reconcile_followers_against`]), before it sends
+/// them a status read, a record or a mark.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct KeptDispute {
     epoch: u64,

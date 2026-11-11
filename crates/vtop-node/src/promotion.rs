@@ -62,13 +62,20 @@
 //! divergence and truncate down to the candidate first. See the comment above
 //! the vote restriction in [`establish`].
 //!
-//! **Open: an absent replica is not truncated by an election.** A replica
-//! that was not fenced and holds uncommitted records above the established
-//! boundary keeps them. This code correctly refuses to *expose* them, but
-//! if that replica later wins the lease they resurface, and the catch-up
-//! path can ack the new leader's records over them as duplicates (#261). A
-//! replica that WAS fenced and outvoted discards them on the new leader's
-//! first append over them (#611), unless it restarted in between.
+//! **Closed (#641): a replica absent from the election is fenced when it
+//! returns.** An election fences only the replicas it reaches, so a deposed
+//! leader that was down came back holding records it wrote under its old
+//! epoch, some never acknowledged, at offsets the new leader had since
+//! written. Its reconnect status counted them, the new leader's mark put them
+//! under the committed boundary, and its appends there were acked as
+//! duplicates over different bytes (#261). Now every leader-to-follower
+//! session opens with the same fence the probe sends, at the leader's epoch
+//! and with its history (`NetworkedReplicaSet::reconcile_followers_against`),
+//! before the status read and before any record or mark. The returning
+//! replica keeps the suffix in dispute exactly as an outvoted voter does
+//! (#611) and discards it on the leader's first append or mark over it. A
+//! fenced voter that restarted before that is fenced again by its next
+//! session. Plaintext planes skip the session fence; they do not fail over.
 //!
 //! **Closed, from Raft §5.4.2 (#240):** a new leader must not commit entries
 //! from a previous term by counting replicas. The boundary this module
@@ -470,8 +477,9 @@ pub fn establish(
     // A kept suffix whose holder is outvoted is provably unacknowledged once
     // the candidate is established. The replica discards it on the new
     // leader's first append over it, not as an ack of a record it does not
-    // hold (#261). It remembers that in memory only: across a restart it is
-    // the same gap as a replica absent from the fence. The
+    // hold (#261). It remembers that in memory only, but a restarted replica
+    // and one absent from the fence alike are fenced by the leader's next
+    // session with them (#641). The
     // truncation-below-HWM guard stays as the last resort for histories
     // that predate the restriction, seeded across restarts from the
     // follower's persisted `committed-floor`.
