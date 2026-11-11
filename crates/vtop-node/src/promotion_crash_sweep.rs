@@ -1706,6 +1706,33 @@ fn reproduction_two_caught_up_replicas_cannot_prove_a_quorum_after_the_leader_is
     );
 }
 
+/// The index of `node`'s `ordinal`-th (from 1) `kind` operation on `file`
+/// in the clean run of `shape`. Reproductions name a crash point this way,
+/// not by bare index, so a change that adds a storage operation elsewhere
+/// (#640 added the lineage sidecar's probe at open) moves the index without
+/// moving the crash.
+fn nth_op(
+    shape: Shape,
+    setup: &[SimDiskState],
+    node: usize,
+    kind: TraceKind,
+    file: &str,
+    ordinal: usize,
+) -> u64 {
+    let clean = run(shape, Fault::None, setup);
+    clean.traces[node]
+        .iter()
+        .filter(|entry| entry.kind == kind && entry.path == Path::new(file))
+        .nth(ordinal - 1)
+        .unwrap_or_else(|| {
+            panic!(
+                "the clean {shape:?} run has no {kind:?} #{ordinal} on {}'s {file}",
+                NAMES[node]
+            )
+        })
+        .index
+}
+
 /// #641, found by the sweep: the "absent replica" gap `promotion.rs` listed.
 /// R's disk dies before it acks L's first record of 5..10, so L holds 5..10
 /// unacknowledged. L dies, C and R establish C at 5, and L returns without
@@ -1717,9 +1744,20 @@ fn reproduction_two_caught_up_replicas_cannot_prove_a_quorum_after_the_leader_is
 #[test]
 fn reproduction_a_returning_deposed_leader_keeps_its_unacknowledged_suffix_under_the_mark() {
     let setup = setup_disks();
+    // R's second length probe of its producer-epoch journal (op 67 when the
+    // sweep found it), named by kind, file and ordinal so a storage
+    // operation added elsewhere cannot move the crash.
+    let op = nth_op(
+        Shape::AckedLeaderStaysDown,
+        &setup,
+        R,
+        TraceKind::HandleLen,
+        PRODUCER_EPOCHS,
+        2,
+    );
     let fault = Fault::Storage {
         node: R,
-        plan: FaultPlan::CrashBefore(67),
+        plan: FaultPlan::CrashBefore(op),
     };
     let outcome = run(Shape::AckedLeaderStaysDown, fault, &setup);
     assert!(
