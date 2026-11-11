@@ -1258,7 +1258,7 @@ async fn an_idle_partition_started_at_the_end_is_not_rewound_onto_older_records(
 /// read nothing for over ten minutes, with no error, no seek and no rewind,
 /// while the broker held 578,093 unread records. A restart read them.
 ///
-/// After two passes the partition has delivered, so it is assigned at a
+/// Once the partition has delivered, it is assigned at a
 /// concrete offset, and nothing in v0.7.0 ever re-assigns such a partition:
 /// the only retry was for a partition still waiting on `Offset::Stored`.
 /// Why its fetcher stopped is not in that log; stopping it behind the
@@ -1277,11 +1277,13 @@ async fn a_single_partition_that_stops_right_after_its_first_commit_is_read_agai
     // a fresh assign: the partition stays assigned, as it did in that run.
     let budget = 256 << 20;
 
-    // Two productive passes, as the first batch was read.
+    // Read until the partition has delivered, so it is held at a concrete
+    // offset as in that run, then commit what was read. How many passes that
+    // takes, or how much of the backlog they drain, does not matter (review
+    // of #644): records are produced after the stop, so some always wait.
     let mut last_end = -1;
-    let mut productive = 0;
     let warmup = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while productive < 2 {
+    while last_end < 0 {
         assert!(
             std::time::Instant::now() < warmup,
             "precondition: the backlog is read"
@@ -1296,9 +1298,6 @@ async fn a_single_partition_that_stops_right_after_its_first_commit_is_read_agai
             .await;
         let Ok(report) = report else { continue };
         let reads = report.outcomes[0].result.as_ref().expect("source ok");
-        if reads.iter().any(|r| !r.records.is_empty()) {
-            productive += 1;
-        }
         for read in reads {
             if let ProgressMarker::Kafka { end_offset, .. } = &read.progress_end {
                 last_end = last_end.max(*end_offset);
