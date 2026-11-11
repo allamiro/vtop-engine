@@ -203,6 +203,15 @@ pub struct InProcessFollower {
     /// Records a fence disputed but KEPT (#611): the epoch of that fence and
     /// the first offset in dispute. See [`KeptDispute`].
     kept_dispute: Mutex<Option<KeptDispute>>,
+    /// The fencing caller's history from a fence that KEPT a dispute (#640):
+    /// the epoch and the vector. Taken as the leader lineage once the
+    /// dispute settles under that epoch, when every record from its start
+    /// on comes from that epoch's leader. In memory, like the dispute.
+    pending_lineage: Mutex<Option<(u64, Vec<crate::fencing_epochs::EpochStart>)>>,
+    /// Whether the journal holds a leader lineage the appends have not yet
+    /// caught up with (#640): the fast path that keeps a follower in steady
+    /// state from taking the journal lock on every append.
+    lineage_following: AtomicBool,
 }
 
 /// A suffix a fence found in dispute and kept (#611), because the fencing
@@ -301,6 +310,8 @@ impl InProcessFollower {
             online: AtomicBool::new(true),
             hold_fsync: AtomicBool::new(false),
             kept_dispute: Mutex::new(None),
+            pending_lineage: Mutex::new(None),
+            lineage_following: AtomicBool::new(false),
         })
     }
 
@@ -351,20 +362,142 @@ impl InProcessFollower {
         // leader: `fetch_max` is what admits appends under the new epoch, so
         // recording after it can name a start above the first record that
         // epoch actually accepted.
+        //
+        // A replica holding the lineage of `epoch`'s leader (#640) files its
+        // tail by that lineage instead: the leader's own entries, which may
+        // begin above this tail. Only one without it records the epoch at
+        // its tail, which is right exactly when the tail is the leader's.
         if epoch > self.held_fencing_epoch.load(Ordering::SeqCst) {
             let next_offset = self.next_offset();
-            let mut guard = self
-                .fencing_epoch_journal
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(journal) = guard.as_mut() {
-                if journal.record_adoption(epoch, next_offset).is_err() {
-                    self.fencing_epoch_history_broken
-                        .store(true, Ordering::SeqCst);
+            if !self.follow_leader_lineage(epoch, next_offset) {
+                let mut guard = self
+                    .fencing_epoch_journal
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(journal) = guard.as_mut() {
+                    if journal.record_adoption(epoch, next_offset).is_err() {
+                        self.fencing_epoch_history_broken
+                            .store(true, Ordering::SeqCst);
+                    }
                 }
             }
         }
         self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch
+    }
+
+    /// File this replica's records through `tail` under the lineage of
+    /// `epoch`'s leader, if it holds one (#640). Returns whether it did; a
+    /// journal that fails here is marked broken and also counts as done,
+    /// since nothing more may be recorded in it.
+    fn follow_leader_lineage(&self, epoch: u64, tail: u64) -> bool {
+        let mut guard = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(journal) = guard.as_mut() else {
+            return false;
+        };
+        match journal.follow_leader_lineage(epoch, tail) {
+            Ok(crate::fencing_epochs::LineageFollow::NotHeld) => {
+                self.lineage_following.store(false, Ordering::SeqCst);
+                false
+            }
+            Ok(crate::fencing_epochs::LineageFollow::Following { complete }) => {
+                self.lineage_following.store(!complete, Ordering::SeqCst);
+                true
+            }
+            Err(_) => {
+                self.fencing_epoch_history_broken
+                    .store(true, Ordering::SeqCst);
+                true
+            }
+        }
+    }
+
+    /// After a successful append under `epoch` that left the log at `tail`:
+    /// keep filing records under the leader's lineage while it has entries
+    /// the appends have not reached (#640). A single atomic load otherwise.
+    fn follow_leader_lineage_after_append(&self, epoch: u64, tail: u64) {
+        if self.lineage_following.load(Ordering::SeqCst) {
+            self.follow_leader_lineage(epoch, tail);
+        }
+    }
+
+    /// Take the fencing caller's history as the lineage of `epoch`'s leader
+    /// (#640), or set it aside while a dispute is kept for `epoch`. Called
+    /// with the meta lock held, which every append holds too, so the tail
+    /// read here is the one the lineage is anchored at.
+    ///
+    /// A kept dispute means this replica holds records the caller does not
+    /// share. The lineage says who wrote the records the leader sends, not
+    /// those, so it waits for the dispute to settle (see
+    /// [`Self::settle_kept_dispute`]), and any lineage held for `epoch` is
+    /// dropped durably meanwhile: a restart forgets the dispute (#635), and
+    /// must not then file the kept records under the leader's entries.
+    fn take_leader_lineage_locked(
+        &self,
+        epoch: u64,
+        leader: &[crate::fencing_epochs::EpochStart],
+    ) {
+        if self.held_fencing_epoch() != epoch {
+            // A newer grant overtook the fence; its own fence brings its own
+            // history.
+            return;
+        }
+        let (tail, base, disputed) = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let disputed = self
+                .kept_dispute
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some_and(|dispute| dispute.epoch == epoch);
+            (
+                state.segment.next_offset(),
+                state.segment.base_offset(),
+                disputed,
+            )
+        };
+        *self
+            .pending_lineage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            disputed.then(|| (epoch, leader.to_vec()));
+        let mut guard = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(journal) = guard.as_mut() else {
+            return;
+        };
+        if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+            return;
+        }
+        let outcome = if disputed {
+            journal.drop_leader_lineage(epoch).map(|()| None)
+        } else {
+            journal
+                .take_leader_lineage(epoch, leader, tail, base)
+                .and_then(|taken| {
+                    if taken {
+                        journal.follow_leader_lineage(epoch, tail).map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                })
+        };
+        match outcome {
+            Ok(Some(crate::fencing_epochs::LineageFollow::Following { complete })) => {
+                self.lineage_following.store(!complete, Ordering::SeqCst);
+            }
+            Ok(_) => {}
+            Err(_) => {
+                self.fencing_epoch_history_broken
+                    .store(true, Ordering::SeqCst);
+            }
+        }
     }
 
     /// Bound this replica's disk in bytes; `None` disables retention (#290).
@@ -459,6 +592,13 @@ impl InProcessFollower {
             self.fencing_epoch_history_broken
                 .store(true, Ordering::SeqCst);
         }
+        // A lineage reloaded from its sidecar (#640) resumes where the log
+        // opened: records a crash lost are re-sent by the same leader.
+        journal.settle_leader_lineage_at_open(next_offset);
+        self.lineage_following.store(
+            journal.leader_lineage_epoch().is_some(),
+            Ordering::SeqCst,
+        );
         *self
             .fencing_epoch_journal
             .lock()
@@ -652,8 +792,19 @@ impl InProcessFollower {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(journal) = guard.as_mut() {
+            // With the held epoch's leader lineage (#640), the cut is filed
+            // by the leader's entries, not by the held epoch at the cut.
+            let held = self.held_fencing_epoch.load(Ordering::SeqCst);
             let repaired = journal.truncate_to(offset).and_then(|_| {
-                journal.record_held_epoch_at(self.held_fencing_epoch.load(Ordering::SeqCst), offset)
+                match journal.follow_leader_lineage(held, offset)? {
+                    crate::fencing_epochs::LineageFollow::NotHeld => {
+                        journal.record_held_epoch_at(held, offset)
+                    }
+                    crate::fencing_epochs::LineageFollow::Following { complete } => {
+                        self.lineage_following.store(!complete, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }
             });
             if repaired.is_err() {
                 self.fencing_epoch_history_broken
@@ -718,6 +869,17 @@ impl InProcessFollower {
                      never acknowledged (#611)",
                     self.node_id, outcome.records_removed, dispute.from
                 );
+                // Every record from the dispute's start on now comes from
+                // this epoch's leader, so the history its fence carried is
+                // the lineage to file them by (#640).
+                let pending = self
+                    .pending_lineage
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                if let Some((_, leader)) = pending.filter(|(held, _)| *held == epoch) {
+                    self.take_leader_lineage_locked(epoch, &leader);
+                }
                 Ok(())
             }
             Err(BrokerError::TruncationBelowAcknowledged {
@@ -938,6 +1100,16 @@ impl InProcessFollower {
         // disputed suffix that is kept is remembered, so the leader's first
         // append over it discards it then (see `KeptDispute`).
         let truncated_records = self.reconcile_with(leader_epoch_starts, epoch)?;
+
+        // The caller's history is the lineage of this epoch's leader, should
+        // it be established (#640): a leader writes under its epoch only from
+        // the tail it sent. Taken now, while the log is stopped, so the
+        // records it later catches this replica up on are filed under the
+        // epochs that wrote them rather than under this fence's.
+        {
+            let _meta = self.meta_fencing_epoch.lock();
+            self.take_leader_lineage_locked(epoch, leader_epoch_starts);
+        }
 
         // Offsets and history read together, under the state lock, so the pair
         // describes one instant of one log.
@@ -1527,7 +1699,9 @@ impl InProcessFollower {
                 let response = ReplicaAppendResponse {
                     local_committed_offset: self.ack_through(state.segment.committed_offset()),
                 };
+                let tail = state.segment.next_offset();
                 drop(state);
+                self.follow_leader_lineage_after_append(request.fencing_epoch, tail);
                 if barrier {
                     self.persist_committed_floor();
                 }
@@ -1709,14 +1883,23 @@ impl InProcessFollower {
                 ));
             }
         }
+        // Every member was checked against the held epoch above, so the
+        // group is one leader's, and so is the lineage it is filed under
+        // (#640).
+        let epoch = requests[0].fencing_epoch;
         if self.hold_fsync.load(Ordering::SeqCst) {
-            return Ok(ReplicaAppendResponse {
+            let response = ReplicaAppendResponse {
                 local_committed_offset: self.ack_through(state.segment.committed_offset()),
-            });
+            };
+            let tail = state.segment.next_offset();
+            drop(state);
+            self.follow_leader_lineage_after_append(epoch, tail);
+            return Ok(response);
         }
         match state.segment.commit() {
             Ok(local_committed_offset) => {
                 let local_committed_offset = self.ack_through(local_committed_offset);
+                let tail = state.segment.next_offset();
                 // One pass per batch, after the commit, and never under an
                 // fsync hold — the hold path returned above (#290). The floor
                 // persist rides the same barrier (#240) but AFTER the state
@@ -1725,6 +1908,7 @@ impl InProcessFollower {
                 // would serialize every other lock user behind it.
                 self.run_retention(&mut state.segment);
                 drop(state);
+                self.follow_leader_lineage_after_append(epoch, tail);
                 self.persist_committed_floor();
                 Ok(ReplicaAppendResponse {
                     local_committed_offset,

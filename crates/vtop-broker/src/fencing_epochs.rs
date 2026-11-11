@@ -31,19 +31,87 @@
 //! at precisely the moment the answer matters, so entries are appended and
 //! fsynced before the epoch they describe is used.
 //!
+//! # Whose epoch a follower's records carry (#640)
+//!
+//! An entry names the epoch that WROTE the records from its start, which on
+//! a leader is the epoch it adopted at its own tail: a leader writes under an
+//! epoch only from where its log stood when it took it. A follower that
+//! adopts the same epoch at ITS tail is right only when that tail is the
+//! leader's. When it is behind, the records the new leader then catches it up
+//! on were written under older epochs, and an adoption entry at the
+//! follower's tail filed them under the new one. Two replicas holding the
+//! same bytes then disagreed about who wrote them, below both their tails,
+//! and since #577 such an answer is Unknown and never counted: after one more
+//! failover no candidate could be established.
+//!
+//! So an entry AT a follower's tail is provisional. It owns no record, and
+//! the fence that installs a leader also hands the follower that leader's
+//! history: the candidate's vector, which IS the leader's, since a leader
+//! writes under its epoch only from the tail it sent. When the follower's own
+//! history agrees with it below the follower's tail, the follower keeps it as
+//! its LEADER LINEAGE ([`FencingEpochJournal::take_leader_lineage`]) and
+//! files every record that leader sends it under the leader's own entries
+//! ([`FencingEpochJournal::follow_leader_lineage`]), dropping its provisional
+//! ones. After a catch-up its vector equals the leader's for the caught-up
+//! range. A follower with no lineage for the epoch it appends under (one the
+//! fence did not reach, or one whose history disagreed) keeps the tail
+//! adoption: the pre-#640 behaviour, which costs a later election an Unknown
+//! answer, never a wrong one.
+//!
+//! The lineage is persisted beside the journal in `<journal>.leader`, so a
+//! restart between the fence and the catch-up does not lose it. That file is
+//! a separate sidecar and the journal's own format is unchanged (see
+//! "Compatibility" below).
+//!
+//! # Compatibility (#640)
+//!
+//! * **The journal format is unchanged** (`VTOPFNC1`, version 1). Re-deriving
+//!   a follower's entries truncates and appends exactly as truncation and
+//!   adoption always have, and keeps the invariants every reader checks:
+//!   epochs strictly increase, starts never decrease, nothing starts past the
+//!   log's tail. An older binary reads a journal written here as it reads its
+//!   own, and simply goes back to adopting at its tail.
+//! * **The sidecar is new, and only this code reads it.** An older binary does
+//!   not know the name, and range discovery ignores names it does not
+//!   recognise, so it is never misread. This code reads it with its own magic,
+//!   version and BLAKE3 checksum; a missing, torn, foreign or newer-version
+//!   sidecar reads as "no lineage", which is the pre-#640 behaviour, not a
+//!   refusal to open. A lineage is applied only to the epoch it names, and
+//!   only after the follower's own history was checked to agree with it.
+//! * **Journals mislabelled before this fix are not rewritten.** Nothing on a
+//!   replica can tell a record it was caught up on under epoch `e` from one
+//!   `e`'s leader wrote: both are a stretch filed under `e`. So an existing
+//!   mislabel stays, and a candidate comparing it with a correctly labelled
+//!   history finds a divergence below both tails and judges that answer
+//!   Unknown, which #577/#607 never counts. That is the behaviour such a
+//!   replica already has; it is repaired the way any unprovable replica is
+//!   (`vtopctl node repair` from a replica whose history is right, #315), or
+//!   by a truncation that cuts below the mislabel. Replicas mislabelled the
+//!   SAME way (each caught up from the same leader at the same offset) still
+//!   agree with each other.
+//!
 //! # Determinism
 //!
 //! Pure over its inputs: encoding, recovery, and lookup are byte-deterministic
 //! and depend on nothing but the file. Only the surrounding I/O is not.
 
 use crate::{BrokerError, BrokerResult};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use vtop_log::env::{Env, OpenMode, StorageFile};
 
 const MAGIC: &[u8; 8] = b"VTOPFNC1";
 const VERSION: u16 = 1;
 const HEADER_BYTES: u64 = 10;
+/// The leader-lineage sidecar (#640): `magic | version u16 | epoch u64 |
+/// anchor u64 | count u32 | count x (epoch u64, start u64) | BLAKE3-32 over
+/// everything before it`, big-endian like the journal.
+const LINEAGE_MAGIC: &[u8; 8] = b"VTOPFLN1";
+const LINEAGE_VERSION: u16 = 1;
+const LINEAGE_HEADER_BYTES: usize = 8 + 2 + 8 + 8 + 4;
+const LINEAGE_CHECKSUM_BYTES: usize = 32;
+/// Appended to the journal's file name to name its lineage sidecar.
+const LINEAGE_SUFFIX: &str = ".leader";
 /// `(epoch, start_offset)`, both big-endian u64.
 const ENTRY_BYTES: usize = 16;
 /// A range would need this many leadership changes to reach the bound; far
@@ -81,11 +149,40 @@ pub struct EpochStart {
     pub start_offset: u64,
 }
 
+/// The history of the leader this replica follows under `epoch` (#640): see
+/// the module docs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LeaderLineage {
+    epoch: u64,
+    /// This replica's tail when it took the lineage. Below it, its own
+    /// history agreed with `entries`; from it, every record it holds came
+    /// from `epoch`'s leader. Only ever lowered (a truncation, or records a
+    /// crash lost), never raised.
+    anchor: u64,
+    /// The leader's vector as it sent it with the fence.
+    entries: Vec<EpochStart>,
+}
+
+/// What [`FencingEpochJournal::follow_leader_lineage`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineageFollow {
+    /// No lineage for that epoch: attribute the way adoption always has.
+    NotHeld,
+    /// The records through the tail are filed under the leader's entries.
+    /// `complete` once the tail has reached the leader's last entry, after
+    /// which further appends under the epoch change nothing.
+    Following { complete: bool },
+}
+
 /// Durable `(epoch → start offset)` vector for one range replica.
 pub struct FencingEpochJournal {
+    env: Env,
     path: PathBuf,
     file: Box<dyn StorageFile>,
     entries: Vec<EpochStart>,
+    /// See [`LeaderLineage`]; `None` when there is none, or its sidecar did
+    /// not read back.
+    lineage: Option<LeaderLineage>,
     /// Set once a write or fsync fails. The file may hold a partial record
     /// from that attempt, and appending after it would land the next entry at
     /// a misaligned offset — so no further append is allowed until the journal
@@ -115,10 +212,13 @@ impl FencingEpochJournal {
             // whole history with it, putting this replica back to "unknown"
             // after a crash — the one moment the vector exists for.
             Self::sync_parent(env, &path)?;
+            let lineage = read_lineage(env, &lineage_path(&path));
             return Ok(Self {
+                env: env.clone(),
                 path,
                 file,
                 entries: Vec::new(),
+                lineage,
                 poisoned: false,
             });
         }
@@ -193,10 +293,13 @@ impl FencingEpochJournal {
         }
         file.seek(SeekFrom::End(0))
             .map_err(|source| Self::io(&path, source))?;
+        let lineage = read_lineage(env, &lineage_path(&path));
         Ok(Self {
+            env: env.clone(),
             path,
             file,
             entries,
+            lineage,
             poisoned: false,
         })
     }
@@ -334,12 +437,26 @@ impl FencingEpochJournal {
                     .to_owned(),
             ));
         }
+        // A leader lineage anchored above the cut now starts at it (#640):
+        // the records the replica takes from here on come from the leader of
+        // the epoch it holds, and below the cut it agreed with that leader
+        // already. Lowering is always safe; only raising could re-attribute
+        // records some other leadership wrote.
+        if let Some(lineage) = self.lineage.as_mut() {
+            lineage.anchor = lineage.anchor.min(offset);
+        }
         let keep = self
             .entries
             .iter()
             .take_while(|entry| entry.start_offset < offset)
             .count();
-        let dropped = self.entries.len() - keep;
+        self.truncate_entries(keep)
+    }
+
+    /// Shorten the vector to its first `keep` entries, durably. The shared
+    /// body of [`Self::truncate_to`] and the lineage re-derivation.
+    fn truncate_entries(&mut self, keep: usize) -> BrokerResult<usize> {
+        let dropped = self.entries.len().saturating_sub(keep);
         if dropped == 0 {
             return Ok(0);
         }
@@ -380,6 +497,216 @@ impl FencingEpochJournal {
             return Ok(());
         }
         self.record(epoch, offset)
+    }
+
+    /// Take `leader` as the history of the leader this replica follows under
+    /// `epoch`, from `anchor` (this replica's tail) on (#640; see the module
+    /// docs). Returns whether it was taken.
+    ///
+    /// `leader` is the vector the fence for `epoch` carried. It is taken only
+    /// when it agrees with this replica's own history about every record the
+    /// replica retains below `anchor`, compared on the retained window
+    /// `[base, anchor)` exactly as reconciliation compares it
+    /// ([`clamp_lineage`]). A replica with records the leader attributes
+    /// otherwise, or a history either side cannot vouch for, keeps
+    /// attributing the old way: the lineage tells it who wrote the records
+    /// the leader SENDS it, and is no evidence about the ones it already has.
+    ///
+    /// Persisted before anything is re-derived from it, so a crash after this
+    /// call finds the lineage again at the next open. A replica that cannot
+    /// persist it does not take it. The caller re-derives with
+    /// [`Self::follow_leader_lineage`].
+    pub fn take_leader_lineage(
+        &mut self,
+        epoch: u64,
+        leader: &[EpochStart],
+        anchor: u64,
+        base: u64,
+    ) -> BrokerResult<bool> {
+        if self.poisoned {
+            return Err(Self::corrupt(
+                "a previous append failed; this journal may hold a partial record and must be \
+                 reopened before it is written again"
+                    .to_owned(),
+            ));
+        }
+        // The leader's vector must be one this file could hold: the same
+        // bound and the same ordering `open` enforces. Anything else is not
+        // a history and is ignored, never half-applied.
+        let well_formed = !leader.is_empty()
+            && leader.len() <= MAX_ENTRIES
+            && leader.windows(2).all(|pair| {
+                pair[1].epoch > pair[0].epoch && pair[1].start_offset >= pair[0].start_offset
+            });
+        let vouches_for_anchor = leader.iter().any(|entry| entry.start_offset <= anchor);
+        let agrees_below = anchor <= base || {
+            let mine = clamp_lineage(&self.entries, base, anchor);
+            let theirs = clamp_lineage(leader, base, anchor);
+            !mine.is_empty() && mine == theirs
+        };
+        if !(well_formed && vouches_for_anchor && agrees_below) {
+            self.drop_leader_lineage(epoch)?;
+            return Ok(false);
+        }
+        let lineage = LeaderLineage {
+            epoch,
+            anchor,
+            entries: leader.to_vec(),
+        };
+        if self.lineage.as_ref() != Some(&lineage) {
+            self.write_lineage(Some(&lineage))?;
+            self.lineage = Some(lineage);
+        }
+        Ok(true)
+    }
+
+    /// Forget a lineage held for `epoch`, durably (#640). A no-op for any
+    /// other epoch's: a lineage applies only to the epoch it names, so an
+    /// older one left on disk is never used again.
+    ///
+    /// Durable on purpose. A fence that keeps a disputed suffix at `epoch`
+    /// must not leave behind a lineage for `epoch` that a restart would
+    /// reload: the kept records are this replica's own, and filing them
+    /// under the leader's entries would make them look like the leader's.
+    pub fn drop_leader_lineage(&mut self, epoch: u64) -> BrokerResult<()> {
+        if self.lineage.as_ref().is_some_and(|held| held.epoch == epoch) {
+            self.write_lineage(None)?;
+            self.lineage = None;
+        }
+        Ok(())
+    }
+
+    /// The epoch whose leader's lineage this replica holds, if any.
+    pub fn leader_lineage_epoch(&self) -> Option<u64> {
+        self.lineage.as_ref().map(|lineage| lineage.epoch)
+    }
+
+    /// Lower the lineage's anchor to the log's tail as the log opened (#640).
+    ///
+    /// A crash can lose records the replica held when it took the lineage.
+    /// The records it takes from the new tail on still come from the same
+    /// leader, and below it the histories still agree, so the anchor moves
+    /// down with the tail. In memory only: every open recomputes it.
+    pub fn settle_leader_lineage_at_open(&mut self, tail: u64) {
+        if let Some(lineage) = self.lineage.as_mut() {
+            lineage.anchor = lineage.anchor.min(tail);
+        }
+    }
+
+    /// File this replica's records from the lineage's anchor through `tail`
+    /// under the entries of `epoch`'s leader (#640), replacing whatever the
+    /// replica recorded there itself. Called after each append under
+    /// `epoch`, and at adoption of `epoch` instead of recording it at the
+    /// tail.
+    ///
+    /// The result is this replica's own entries below the anchor, then every
+    /// entry of the leader's starting from the anchor through `tail`. An
+    /// entry exactly AT `tail` is kept, as an adoption at the tail always
+    /// was: it names where an epoch begins and owns no record yet. Nothing
+    /// past `tail` is written, so the journal never claims records it does
+    /// not hold.
+    ///
+    /// Only entries at or above the anchor are rewritten, and those own
+    /// records that came from `epoch`'s leader, or nothing at all. A crash
+    /// between the truncation and the appends leaves a shorter vector, which
+    /// the next call (the restart's adoption of `epoch`, or its next append)
+    /// completes.
+    pub fn follow_leader_lineage(&mut self, epoch: u64, tail: u64) -> BrokerResult<LineageFollow> {
+        let Some(lineage) = self.lineage.as_mut() else {
+            return Ok(LineageFollow::NotHeld);
+        };
+        if lineage.epoch != epoch {
+            return Ok(LineageFollow::NotHeld);
+        }
+        lineage.anchor = lineage.anchor.min(tail);
+        let anchor = lineage.anchor;
+        let leader = lineage.entries.clone();
+        let complete = leader.last().is_none_or(|last| last.start_offset <= tail);
+        let keep = self
+            .entries
+            .iter()
+            .take_while(|entry| entry.start_offset < anchor)
+            .count();
+        let mut target: Vec<EpochStart> = self.entries[..keep].to_vec();
+        // Who owns the anchor itself. With the histories agreeing below the
+        // anchor (checked when the lineage was taken), the leader's owner of
+        // the record before it is this replica's last kept entry, so either
+        // that same epoch carries on or the leader has an entry exactly at
+        // the anchor, which the loop below adds. The one other shape is an
+        // anchor at the retained base whose owner began in records both
+        // sides reclaimed: it is anchored at the base, as `clamp_lineage`
+        // anchors it.
+        if let Some(owner) = leader
+            .iter()
+            .rev()
+            .find(|entry| entry.start_offset <= anchor)
+            .filter(|owner| owner.start_offset < anchor)
+        {
+            match target.last() {
+                Some(last) if last.epoch == owner.epoch => {}
+                Some(last) if last.epoch > owner.epoch => {
+                    // Not the history it was checked against. Stop following
+                    // rather than write a vector that goes backwards.
+                    self.lineage = None;
+                    return Ok(LineageFollow::NotHeld);
+                }
+                _ => target.push(EpochStart {
+                    epoch: owner.epoch,
+                    start_offset: anchor,
+                }),
+            }
+        }
+        for entry in leader
+            .iter()
+            .filter(|entry| entry.start_offset >= anchor && entry.start_offset <= tail)
+        {
+            if target.last().is_none_or(|last| entry.epoch > last.epoch) {
+                target.push(*entry);
+            }
+        }
+        if target != self.entries {
+            let common = self
+                .entries
+                .iter()
+                .zip(&target)
+                .take_while(|(have, want)| have == want)
+                .count();
+            self.truncate_entries(common)?;
+            for entry in &target[common..] {
+                self.record(entry.epoch, entry.start_offset)?;
+            }
+        }
+        Ok(LineageFollow::Following { complete })
+    }
+
+    fn write_lineage(&mut self, lineage: Option<&LeaderLineage>) -> BrokerResult<()> {
+        let path = lineage_path(&self.path);
+        let bytes = lineage.map(encode_lineage).unwrap_or_default();
+        let existed = self
+            .env
+            .storage
+            .exists(&path)
+            .map_err(|source| Self::io(&path, source))?;
+        if !existed && bytes.is_empty() {
+            return Ok(());
+        }
+        let mut file = self
+            .env
+            .storage
+            .open(&path, OpenMode::CreateAppend)
+            .map_err(|source| Self::io(&path, source))?;
+        // Written whole at offset zero and then cut to length. A crash part
+        // way leaves a frame whose checksum fails, which reads as "no
+        // lineage": the attribution used before #640, never a misread one.
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.write_all(&bytes))
+            .and_then(|()| file.set_len(bytes.len() as u64))
+            .and_then(|()| file.sync_data())
+            .map_err(|source| Self::io(&path, source))?;
+        if !existed {
+            Self::sync_parent(&self.env, &path)?;
+        }
+        Ok(())
     }
 
     pub fn entries(&self) -> &[EpochStart] {
@@ -461,6 +788,130 @@ impl FencingEpochJournal {
     fn corrupt(message: String) -> BrokerError {
         BrokerError::EpochJournalCorrupt(format!("fencing-epoch journal: {message}"))
     }
+}
+
+/// Where the lineage sidecar of the journal at `path` lives.
+fn lineage_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(LINEAGE_SUFFIX);
+    path.with_file_name(name)
+}
+
+fn encode_lineage(lineage: &LeaderLineage) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(
+        LINEAGE_HEADER_BYTES + lineage.entries.len() * ENTRY_BYTES + LINEAGE_CHECKSUM_BYTES,
+    );
+    bytes.extend_from_slice(LINEAGE_MAGIC);
+    bytes.extend_from_slice(&LINEAGE_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&lineage.epoch.to_be_bytes());
+    bytes.extend_from_slice(&lineage.anchor.to_be_bytes());
+    bytes.extend_from_slice(&(lineage.entries.len() as u32).to_be_bytes());
+    for entry in &lineage.entries {
+        bytes.extend_from_slice(&entry.epoch.to_be_bytes());
+        bytes.extend_from_slice(&entry.start_offset.to_be_bytes());
+    }
+    let checksum = blake3::hash(&bytes);
+    bytes.extend_from_slice(checksum.as_bytes());
+    bytes
+}
+
+/// The lineage the sidecar at `path` holds. Every shape it cannot trust
+/// (absent, empty, torn, checksum-mismatched, foreign magic, a version this
+/// build does not know, an entry count past the bound, a vector that does
+/// not advance) is "no lineage", reported unless it is a clean absence.
+/// That is the attribution this replica used before #640: losing the sidecar
+/// can cost a later election an Unknown answer, and misreading it is the only
+/// direction that could do worse.
+fn read_lineage(env: &Env, path: &Path) -> Option<LeaderLineage> {
+    match env.storage.exists(path) {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(error) => {
+            eprintln!(
+                "leader-lineage sidecar {} could not be probed ({error}); following without it",
+                path.display()
+            );
+            return None;
+        }
+    }
+    let bytes = match env.storage.read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "leader-lineage sidecar {} could not be read ({error}); following without it",
+                path.display()
+            );
+            return None;
+        }
+    };
+    if bytes.is_empty() {
+        return None;
+    }
+    let decoded = decode_lineage(&bytes);
+    if let Err(reason) = &decoded {
+        eprintln!(
+            "leader-lineage sidecar {} {reason}; following without it, as before #640",
+            path.display()
+        );
+    }
+    decoded.ok()
+}
+
+fn decode_lineage(bytes: &[u8]) -> Result<LeaderLineage, String> {
+    if bytes.len() < LINEAGE_HEADER_BYTES + LINEAGE_CHECKSUM_BYTES {
+        return Err(format!("is {} bytes, shorter than its frame", bytes.len()));
+    }
+    let count = u32::from_be_bytes(bytes[26..30].try_into().expect("fixed width")) as usize;
+    if count > MAX_ENTRIES {
+        return Err(format!(
+            "names {count} entries, past the bound of {MAX_ENTRIES}"
+        ));
+    }
+    let body = LINEAGE_HEADER_BYTES + count * ENTRY_BYTES;
+    let Some(checksum) = bytes.get(body..body + LINEAGE_CHECKSUM_BYTES) else {
+        return Err(format!(
+            "is {} bytes, shorter than the {count} entries it names",
+            bytes.len()
+        ));
+    };
+    // Checked before the magic and version are believed: a torn frame can
+    // carry any bytes there.
+    if blake3::hash(&bytes[..body]).as_bytes() != checksum {
+        return Err("fails its checksum (a torn write)".to_owned());
+    }
+    if &bytes[0..8] != LINEAGE_MAGIC {
+        return Err("has a foreign magic".to_owned());
+    }
+    let version = u16::from_be_bytes([bytes[8], bytes[9]]);
+    if version != LINEAGE_VERSION {
+        return Err(format!(
+            "is version {version}, which this build does not know (it reads {LINEAGE_VERSION})"
+        ));
+    }
+    let epoch = u64::from_be_bytes(bytes[10..18].try_into().expect("fixed width"));
+    let anchor = u64::from_be_bytes(bytes[18..26].try_into().expect("fixed width"));
+    let entries: Vec<EpochStart> = bytes[LINEAGE_HEADER_BYTES..body]
+        .chunks_exact(ENTRY_BYTES)
+        .map(|entry| EpochStart {
+            epoch: u64::from_be_bytes(entry[0..8].try_into().expect("fixed width")),
+            start_offset: u64::from_be_bytes(entry[8..16].try_into().expect("fixed width")),
+        })
+        .collect();
+    if entries.is_empty()
+        || !entries.windows(2).all(|pair| {
+            pair[1].epoch > pair[0].epoch && pair[1].start_offset >= pair[0].start_offset
+        })
+    {
+        return Err("holds a vector that does not advance".to_owned());
+    }
+    Ok(LeaderLineage {
+        epoch,
+        anchor,
+        entries,
+    })
 }
 
 /// [`FencingEpochJournal::compare_lineage`] over two vectors neither of which
@@ -1351,5 +1802,192 @@ mod tests {
             assert!(j.latest().is_none());
         }
         assert!(journal(&dir).latest().is_none());
+    }
+
+    /// The #640 shape at the journal level: C adopted 19 and 20 at its tail
+    /// (5), while the leader R files 5..10 under 18 and begins 19 and 20 at
+    /// 10. Following R's lineage, C ends with R's vector exactly.
+    #[test]
+    fn a_follower_files_caught_up_records_under_the_leaders_entries() {
+        let dir = TempDir::new().unwrap();
+        let leader = starts(&[(18, 0), (19, 10), (20, 10)]);
+        let mut j = journal(&dir);
+        j.record(18, 0).unwrap();
+        j.record_adoption(19, 5).unwrap();
+        j.record_adoption(20, 5).unwrap();
+        assert!(j.take_leader_lineage(20, &leader, 5, 0).unwrap());
+        assert_eq!(
+            j.follow_leader_lineage(20, 5).unwrap(),
+            LineageFollow::Following { complete: false }
+        );
+        assert_eq!(
+            j.entries(),
+            starts(&[(18, 0)]).as_slice(),
+            "the provisional adoptions at the tail are gone: the leader says 18 owns 5"
+        );
+        for tail in 6..10 {
+            j.follow_leader_lineage(20, tail).unwrap();
+            assert_eq!(j.entries(), starts(&[(18, 0)]).as_slice());
+        }
+        assert_eq!(
+            j.follow_leader_lineage(20, 11).unwrap(),
+            LineageFollow::Following { complete: true }
+        );
+        assert_eq!(j.entries(), leader.as_slice());
+        drop(j);
+        assert_eq!(
+            journal(&dir).entries(),
+            leader.as_slice(),
+            "durable, and still the plain v1 journal any reader of it expects"
+        );
+    }
+
+    /// A lineage names one epoch. Appends or adoptions under any other epoch
+    /// attribute the old way.
+    #[test]
+    fn a_lineage_applies_only_to_the_epoch_it_names() {
+        let dir = TempDir::new().unwrap();
+        let mut j = journal(&dir);
+        j.record(18, 0).unwrap();
+        assert!(j
+            .take_leader_lineage(20, &starts(&[(18, 0), (20, 10)]), 5, 0)
+            .unwrap());
+        assert_eq!(
+            j.follow_leader_lineage(21, 7).unwrap(),
+            LineageFollow::NotHeld
+        );
+        assert_eq!(j.entries(), starts(&[(18, 0)]).as_slice());
+    }
+
+    /// The lineage is evidence about the records the leader sends, never
+    /// about the ones this replica already holds: a leader that files those
+    /// otherwise is not followed, and a lineage held for that epoch is
+    /// dropped durably.
+    #[test]
+    fn a_leader_that_disagrees_below_the_tail_is_not_followed() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut j = journal(&dir);
+            j.record(18, 0).unwrap();
+            assert!(j
+                .take_leader_lineage(20, &starts(&[(18, 0), (20, 10)]), 5, 0)
+                .unwrap());
+            // Epoch 19 wrote at 3 on the leader; this replica holds 18 there.
+            assert!(!j
+                .take_leader_lineage(20, &starts(&[(18, 0), (19, 3), (20, 10)]), 5, 0)
+                .unwrap());
+            assert_eq!(j.leader_lineage_epoch(), None);
+            // Nor one that cannot vouch for this replica's tail, nor none.
+            assert!(!j.take_leader_lineage(20, &starts(&[(19, 6)]), 5, 0).unwrap());
+            assert!(!j.take_leader_lineage(20, &[], 5, 0).unwrap());
+        }
+        assert_eq!(journal(&dir).leader_lineage_epoch(), None);
+    }
+
+    /// The sidecar survives a reopen, and every shape of it that cannot be
+    /// trusted reads as "no lineage", never as an error that keeps the
+    /// replica from opening: that is the attribution used before #640.
+    #[test]
+    fn the_lineage_survives_reopen_and_an_untrusted_sidecar_reads_as_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fencing-epochs");
+        let sidecar = lineage_path(&path);
+        assert_eq!(sidecar, dir.path().join("fencing-epochs.leader"));
+        {
+            let mut j = journal(&dir);
+            j.record(18, 0).unwrap();
+            assert!(j
+                .take_leader_lineage(20, &starts(&[(18, 0), (19, 10), (20, 10)]), 5, 0)
+                .unwrap());
+        }
+        let mut j = journal(&dir);
+        assert_eq!(j.leader_lineage_epoch(), Some(20));
+        j.follow_leader_lineage(20, 10).unwrap();
+        assert_eq!(
+            j.entries(),
+            starts(&[(18, 0), (19, 10), (20, 10)]).as_slice()
+        );
+        drop(j);
+
+        let good = std::fs::read(&sidecar).unwrap();
+        let mut cases: Vec<(&str, Vec<u8>)> = vec![
+            ("torn", good[..good.len() - 7].to_vec()),
+            ("empty", Vec::new()),
+        ];
+        let mut flipped = good.clone();
+        flipped[30] ^= 0x40;
+        cases.push(("checksum mismatch", flipped));
+        // A newer version under a valid checksum: not this build's to read.
+        let mut newer = good.clone();
+        newer[8..10].copy_from_slice(&(LINEAGE_VERSION + 1).to_be_bytes());
+        let body = newer.len() - LINEAGE_CHECKSUM_BYTES;
+        let checksum = *blake3::hash(&newer[..body]).as_bytes();
+        newer[body..].copy_from_slice(&checksum);
+        cases.push(("newer version", newer));
+        for (what, bytes) in cases {
+            std::fs::write(&sidecar, &bytes).unwrap();
+            let j = journal(&dir);
+            assert_eq!(j.leader_lineage_epoch(), None, "{what}");
+            assert_eq!(
+                j.entries(),
+                starts(&[(18, 0), (19, 10), (20, 10)]).as_slice(),
+                "{what}: the journal itself is untouched"
+            );
+        }
+    }
+
+    /// A journal written while following is the same v1 file an older
+    /// binary reads: the header it checks, then whole 16-byte entries that
+    /// advance. The sidecar is a separate name that binary never opens.
+    #[test]
+    fn a_journal_written_while_following_is_still_a_v1_journal() {
+        let dir = TempDir::new().unwrap();
+        let mut j = journal(&dir);
+        j.record(18, 0).unwrap();
+        j.record_adoption(20, 5).unwrap();
+        assert!(j
+            .take_leader_lineage(20, &starts(&[(18, 0), (19, 10), (20, 10)]), 5, 0)
+            .unwrap());
+        j.follow_leader_lineage(20, 12).unwrap();
+        drop(j);
+        let bytes = std::fs::read(dir.path().join("fencing-epochs")).unwrap();
+        assert_eq!(&bytes[0..8], MAGIC);
+        assert_eq!(u16::from_be_bytes([bytes[8], bytes[9]]), 1);
+        let body = &bytes[HEADER_BYTES as usize..];
+        assert_eq!(
+            body.len(),
+            3 * ENTRY_BYTES,
+            "no torn or stale bytes after the rewrite"
+        );
+        let decoded: Vec<(u64, u64)> = body
+            .chunks_exact(ENTRY_BYTES)
+            .map(|entry| {
+                (
+                    u64::from_be_bytes(entry[0..8].try_into().unwrap()),
+                    u64::from_be_bytes(entry[8..16].try_into().unwrap()),
+                )
+            })
+            .collect();
+        assert_eq!(decoded, vec![(18, 0), (19, 10), (20, 10)]);
+    }
+
+    /// A truncation below the anchor lowers it: the records written from the
+    /// cut on come from the same leader.
+    #[test]
+    fn a_truncation_below_the_anchor_follows_from_the_cut() {
+        let dir = TempDir::new().unwrap();
+        let mut j = journal(&dir);
+        j.record(18, 0).unwrap();
+        // The leader says 20 began at 4, below this replica's tail of 6: the
+        // two disagree about 4..6, so it is not taken.
+        assert!(!j
+            .take_leader_lineage(20, &starts(&[(18, 0), (20, 4)]), 6, 0)
+            .unwrap());
+        assert!(j
+            .take_leader_lineage(20, &starts(&[(18, 0), (20, 8)]), 6, 0)
+            .unwrap());
+        j.truncate_to(4).unwrap();
+        j.follow_leader_lineage(20, 9).unwrap();
+        assert_eq!(j.entries(), starts(&[(18, 0), (20, 8)]).as_slice());
     }
 }
