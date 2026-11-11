@@ -4344,6 +4344,11 @@ mod tests {
         ) -> Result<Vec<vtop_state::CommittedCursor>, VtopError> {
             self.inner.committed_cursors(source_type).await
         }
+        async fn committed_kafka_offsets(
+            &self,
+        ) -> Result<Vec<vtop_state::CommittedKafkaOffset>, VtopError> {
+            self.inner.committed_kafka_offsets().await
+        }
         async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
             self.inner.list_batches().await
         }
