@@ -47,8 +47,9 @@ pub use fault::{
     FaultInjectingReplicaSet, FollowerNetworkFault, NetworkFaultPlan, PendingDeliveryStats,
 };
 pub use network::{
-    address_now, FlowControlConfig, NetworkFollowerConfig, NetworkedReplicaSet, ReplicaPeerHandler,
-    ReplicaPeerServer, ReplicaStatusClient, ReplicaTlsMaterial,
+    address_now, FlowControlConfig, LeaderLineage, LeaderLineageSnapshot, NetworkFollowerConfig,
+    NetworkedReplicaSet, ReplicaPeerHandler, ReplicaPeerServer, ReplicaStatusClient,
+    ReplicaTlsMaterial,
 };
 pub use transfer::{LeaderSegmentTransferHandler, SegmentTransferClient, TransferredPrefix};
 
@@ -1601,14 +1602,19 @@ impl InProcessFollower {
             }
         };
         let divergence = match verdict {
-            // Agreed and Unknown are different facts with the same action
-            // HERE: touch nothing. One says there is nothing to discard, the
-            // other says we cannot prove there is. They are NOT the same fact
-            // to the candidate counting this replica's answer, and it tells
-            // them apart from the history this fence returns (#577,
-            // `promotion::fenced_lineage` in vtop-node): an Unknown answer's
-            // offset counts records whatever wrote them, so it is recorded
-            // but never counted toward the quorum.
+            // Agreed and Unknown discard nothing. One says there is nothing
+            // to discard, the other says we cannot prove there is. They are
+            // NOT the same fact to the candidate counting this replica's
+            // answer, and it tells them apart from the history this fence
+            // returns (#577, `promotion::fenced_lineage` in vtop-node): an
+            // Unknown answer's offset counts records whatever wrote them, so
+            // it is recorded but never counted toward the quorum.
+            //
+            // A replica that holds records but whose own history cannot be
+            // compared is left exactly as it is here. A leader's session
+            // refuses it instead (#649 review): it cannot tell which of its
+            // records match, so it sends it nothing and takes no ack from it
+            // until it is repaired. See `NetworkedReplicaSet`'s session fence.
             crate::fencing_epochs::Lineage::Agreed | crate::fencing_epochs::Lineage::Unknown => {
                 return Ok(0)
             }
@@ -2484,12 +2490,19 @@ impl ReplicaSet for InProcessReplicaSet {
 /// Where a fencing caller's log ends, when its history says so: the start of
 /// its entry for `fencing_epoch`, the adoption it records at its own tail
 /// before it fences anyone (#611). `None` when the history carries no such
-/// entry. Canonicalized, so an idle adoption at the same offset collapses
-/// into it.
+/// entry.
+///
+/// Found wherever it sits, not only in last place (#649 review): a leader's
+/// session fence (#641) reads its epoch before its history, so an epoch it
+/// adopted in between can follow the entry. Read from the raw vector, not
+/// the canonical one, which would fold the entry into a newer epoch adopted
+/// idle at the same offset. An epoch starts once on any one replica, so
+/// there is at most one such entry.
 fn caller_tail(caller: &[crate::fencing_epochs::EpochStart], fencing_epoch: u64) -> Option<u64> {
-    crate::fencing_epochs::canonicalize_lineage(caller)
-        .last()
-        .filter(|entry| entry.epoch == fencing_epoch)
+    caller
+        .iter()
+        .rev()
+        .find(|entry| entry.epoch == fencing_epoch)
         .map(|entry| entry.start_offset)
 }
 

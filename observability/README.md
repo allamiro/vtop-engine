@@ -80,6 +80,7 @@ GET /readyz    readiness
 | `vtop_inflight_batches` | gauge | Accumulated but not sealed |
 | `vtop_source_read_errors_total` | counter | An unhealthy source, which is otherwise invisible |
 | `vtop_retention_lost_records_total{tenant,source_type}` | counter | Records the broker's retention removed before the engine read them — **never archived; any increase is an incident** (#98, #454). Charted on the engine dashboard's retention-loss row; the one provisioned alert fires on it. See [retention loss](#retention-loss). |
+| `vtop_source_replay_refused_total{tenant,source_type}` | counter | A failed range its source could not hand back for re-reading, so it is **missing from the archive** (#621). For a file, that is a range whose file cannot be proven reachable: truncated or replaced in place, or rotated away and then removed, compressed, copied by `copytruncate`, or truncated before its re-read. Primed at zero like the read-error counter; recovery counts it again at every restart while the row stays incomplete. The path is in the ERROR line beside it. |
 | `vtop_upload_throttled_total{stage}` | counter | The store asking for less concurrency, not more retries (#102) |
 | `vtop_upload_width` | gauge | Uploads in flight this cycle: the configured width, or the adaptive controller's (#102) |
 

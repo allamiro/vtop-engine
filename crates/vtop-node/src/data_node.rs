@@ -1286,6 +1286,15 @@ async fn run_leader(
         )
         .map_err(|error| error.to_string())?,
     );
+    // Every follower session opens reconciled against this leader's history
+    // (#641), so a deposed leader that missed the election discards what it
+    // wrote under its old epoch before it acks anything. After the journal:
+    // the history is what the session fence carries.
+    if let Some(replicas) = &observed_replicas {
+        replicas
+            .reconcile_followers_against(Arc::downgrade(&broker)
+                as std::sync::Weak<dyn vtop_broker::replication::LeaderLineage>);
+    }
     if let Some(retention) = &config.retention {
         broker.set_retention(Some(vtop_log::RetentionPolicy {
             max_total_bytes: retention.max_total_bytes,
@@ -2990,6 +2999,12 @@ async fn build_leader_phase(
             config.data_dir.join("fencing-epochs"),
         )
         .map_err(|error| error.to_string())?,
+    );
+    // As in `run_leader` (#641): sessions open reconciled against this
+    // leader. Until the supervisor adopts the granted epoch the broker holds
+    // none, and its sessions wait for it rather than fence at nothing.
+    replicas.reconcile_followers_against(
+        Arc::downgrade(&broker) as std::sync::Weak<dyn vtop_broker::replication::LeaderLineage>
     );
     if let Some(retention) = &config.retention {
         broker.set_retention(Some(vtop_log::RetentionPolicy {

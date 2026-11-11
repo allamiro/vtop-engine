@@ -175,6 +175,30 @@ fn map_sqlx(e: sqlx::Error) -> VtopError {
     VtopError::State(e.to_string())
 }
 
+/// A `(path, inode, end_byte, file_size, content, tail)` row of a cursor
+/// query. The inode is read as the JSON token and parsed here: `json_extract`
+/// turns a u64 above i64::MAX into a lossy REAL, and an unparseable value must
+/// read as "unknown", not as a wrong identity. So must a malformed stored
+/// fingerprint (#620).
+fn committed_cursor_of(r: &sqlx::sqlite::SqliteRow) -> Option<CommittedCursor> {
+    let path: Option<String> = r.get("path");
+    let inode: Option<String> = r.get("inode");
+    let end: Option<i64> = r.get("end_byte");
+    let size: Option<i64> = r.get("file_size");
+    let content: Option<String> = r.get("content");
+    let mtime: Option<String> = r.get("mtime");
+    let tail: Option<String> = r.get("tail");
+    Some(CommittedCursor {
+        path: path?,
+        inode: inode.and_then(|i| i.parse().ok()),
+        end_byte: end?.max(0) as u64,
+        observed_size: size.map(|s| s.max(0) as u64),
+        content_fingerprint: content.as_deref().and_then(parse_content_fingerprint),
+        observed_mtime: mtime.filter(|m| !m.is_empty()),
+        tail_fingerprint: tail.as_deref().and_then(parse_content_fingerprint),
+    })
+}
+
 impl SqliteStateStore {
     /// Open (creating if needed) a state store from a connection string such as
     /// `sqlite:///data/vtop-state.db` or `sqlite::memory:`.
@@ -500,6 +524,26 @@ impl StateStore for SqliteStateStore {
             .await
     }
 
+    async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError> {
+        let Some(held) = self.fence.held(batch_id) else {
+            return Ok(false);
+        };
+        let lease_until = crate::store::normalize_rfc3339_utc("lease_until", lease_until)?;
+        // Conditional on the generation held: a claim by another engine bumps
+        // it, and this write then matches nothing (#624, #557).
+        let renewed = sqlx::query(
+            "UPDATE batches SET lease_expires_at = ? WHERE batch_id = ? AND claim_gen = ?",
+        )
+        .bind(lease_until)
+        .bind(batch_id)
+        .bind(held)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        Ok(renewed == 1)
+    }
+
     async fn claim_incomplete_batches(
         &self,
         owner: &str,
@@ -624,27 +668,42 @@ impl StateStore for SqliteStateStore {
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                let path: Option<String> = r.get("path");
-                let inode: Option<String> = r.get("inode");
-                let end: Option<i64> = r.get("end_byte");
-                let size: Option<i64> = r.get("file_size");
-                let content: Option<String> = r.get("content");
-                let mtime: Option<String> = r.get("mtime");
-                let tail: Option<String> = r.get("tail");
-                Some(CommittedCursor {
-                    path: path?,
-                    inode: inode.and_then(|i| i.parse().ok()),
-                    end_byte: end?.max(0) as u64,
-                    observed_size: size.map(|s| s.max(0) as u64),
-                    content_fingerprint: content.as_deref().and_then(parse_content_fingerprint),
-                    observed_mtime: mtime.filter(|m| !m.is_empty()),
-                    tail_fingerprint: tail.as_deref().and_then(parse_content_fingerprint),
-                })
-            })
-            .collect())
+        Ok(rows.iter().filter_map(committed_cursor_of).collect())
+    }
+
+    async fn committed_cursors_by_file(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<CommittedCursor>, VtopError> {
+        // `committed_cursors`, partitioned by FILE (path and inode) instead of
+        // by path (#621): the newest committed row of each file that has
+        // lived at each path, the path's newest first.
+        let rows = sqlx::query(
+            "WITH committed AS ( \
+                 SELECT json_extract(progress_end_json, '$.path') AS path, \
+                        CAST(progress_end_json -> '$.inode' AS TEXT) AS inode, \
+                        CAST(json_extract(progress_end_json, '$.end_byte') AS INTEGER) AS end_byte, \
+                        CAST(json_extract(progress_end_json, '$.file_size') AS INTEGER) AS file_size, \
+                        CAST(progress_end_json -> '$.content_fingerprint' AS TEXT) AS content, \
+                        CAST(progress_end_json -> '$.tail_fingerprint' AS TEXT) AS tail, \
+                        json_extract(progress_end_json, '$.mtime') AS mtime, \
+                        created_at, batch_id \
+                 FROM batches WHERE state = ? AND source_type = ? \
+             ), latest AS ( \
+                 SELECT path, inode, end_byte, file_size, content, tail, mtime, \
+                        created_at, batch_id, ROW_NUMBER() OVER ( \
+                            PARTITION BY path, inode ORDER BY created_at DESC, batch_id DESC) AS rn \
+                 FROM committed \
+             ) \
+             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest \
+             WHERE rn = 1 ORDER BY path, created_at DESC, batch_id DESC",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(source_type.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows.iter().filter_map(committed_cursor_of).collect())
     }
 
     async fn list_incomplete_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {

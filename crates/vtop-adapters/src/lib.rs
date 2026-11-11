@@ -9,6 +9,7 @@ pub mod continuity;
 pub mod file_source;
 #[cfg(feature = "kafka")]
 pub mod kafka_source;
+mod rotated;
 pub mod syslog_spool_source;
 
 pub use base::{DiscoveredSource, ReadResult, SourceAdapter};

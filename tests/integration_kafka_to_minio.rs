@@ -1543,3 +1543,373 @@ async fn recovering_one_partition_does_not_move_another_that_started_at_the_end(
          the end of the log"
     );
 }
+
+// ---- #624: VERIFIED rows the running engine settles without a restart ------
+
+/// The group's committed offset for partition 0 of `topic`, or `None` while
+/// it has none.
+fn group_offset_if_any(topic: &str, group: &str) -> Option<i64> {
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use rdkafka::topic_partition_list::TopicPartitionList;
+
+    let probe: BaseConsumer = build_client_config(&kafka_cfg(&bootstrap(), group))
+        .unwrap()
+        .create()
+        .unwrap();
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition(topic, 0);
+    // A broker that has just started may not have a group coordinator yet
+    // (its offsets topic is still being created): ask again rather than fail
+    // a test about the engine on the broker's warm-up.
+    let mut attempts = 0;
+    let committed = loop {
+        match probe.committed_offsets(tpl.clone(), std::time::Duration::from_secs(10)) {
+            Ok(committed) => break committed,
+            Err(e) if attempts < 10 => {
+                attempts += 1;
+                eprintln!("reading the group's committed offset: {e}; retrying");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            Err(e) => panic!("read the group's committed offset: {e}"),
+        }
+    };
+    match committed.find_partition(topic, 0).map(|e| e.offset()) {
+        Some(rdkafka::Offset::Offset(at)) => Some(at),
+        _ => None,
+    }
+}
+
+/// Every group offset seen, in order: the test fails if one is lower than
+/// the one before it.
+#[derive(Default)]
+struct OffsetWatch(Vec<i64>);
+
+impl OffsetWatch {
+    fn look(&mut self, topic: &str, group: &str) {
+        if let Some(at) = group_offset_if_any(topic, group) {
+            if let Some(&last) = self.0.last() {
+                assert!(
+                    at >= last,
+                    "the group's committed offset moved BACKWARDS: {:?} then {at}",
+                    self.0
+                );
+            }
+            self.0.push(at);
+        }
+    }
+}
+
+/// The Kafka adapter, but its next `failures` source commits fail - a group
+/// coordinator that is unavailable, say.
+struct FailingCommits {
+    inner: Box<dyn vtop_adapters::SourceAdapter>,
+    failures: usize,
+}
+
+#[async_trait::async_trait]
+impl vtop_adapters::SourceAdapter for FailingCommits {
+    async fn discover_sources(
+        &self,
+    ) -> Result<Vec<vtop_adapters::DiscoveredSource>, vtop_core::errors::VtopError> {
+        self.inner.discover_sources().await
+    }
+    async fn read_batch_candidates(
+        &mut self,
+        source: &vtop_adapters::DiscoveredSource,
+        max_records: usize,
+        max_bytes: usize,
+        max_wait: std::time::Duration,
+    ) -> Result<Vec<vtop_adapters::ReadResult>, vtop_core::errors::VtopError> {
+        self.inner
+            .read_batch_candidates(source, max_records, max_bytes, max_wait)
+            .await
+    }
+    async fn read_all_batch_candidates(
+        &mut self,
+        sources: &[vtop_adapters::DiscoveredSource],
+        max_records: usize,
+        max_bytes: usize,
+        max_wait: std::time::Duration,
+    ) -> Result<vtop_adapters::base::AdapterReadReport, vtop_core::errors::VtopError> {
+        self.inner
+            .read_all_batch_candidates(sources, max_records, max_bytes, max_wait)
+            .await
+    }
+    async fn commit_progress(
+        &mut self,
+        marker: &ProgressMarker,
+    ) -> Result<(), vtop_core::errors::VtopError> {
+        if self.failures > 0 {
+            self.failures -= 1;
+            return Err(vtop_core::errors::VtopError::Source(
+                "kafka commit: coordinator not available".into(),
+            ));
+        }
+        self.inner.commit_progress(marker).await
+    }
+    async fn replay_from_marker(
+        &mut self,
+        marker: &ProgressMarker,
+    ) -> Result<(), vtop_core::errors::VtopError> {
+        self.inner.replay_from_marker(marker).await
+    }
+    async fn replay_from_markers(
+        &mut self,
+        markers: &[ProgressMarker],
+    ) -> Vec<Result<(), vtop_core::errors::VtopError>> {
+        self.inner.replay_from_markers(markers).await
+    }
+    fn read_position(&self, marker: &ProgressMarker) -> Option<i128> {
+        self.inner.read_position(marker)
+    }
+    fn committed_through(&self, marker: &ProgressMarker) -> Option<i128> {
+        self.inner.committed_through(marker)
+    }
+    fn source_type(&self) -> vtop_core::types::SourceType {
+        self.inner.source_type()
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self.inner.as_any_mut()
+    }
+}
+
+/// #624: a batch whose Kafka commit failed after VERIFIED stayed VERIFIED for
+/// as long as the engine ran; the next restart committed it, after later
+/// batches had committed past it. Now a later pass retries it: superseded by
+/// then, it is recorded SOURCE_COMMITTED without being sent, and the group's
+/// offset never moves backwards.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_failed_kafka_commit_is_retried_by_a_later_pass_and_never_moves_the_group_back() {
+    use vtop_core::state_machine::BatchState;
+    use vtop_core::types::SourceType;
+
+    let (topic, _cleanup) = fresh_topic("commit_retry", 20).await;
+    let group = unique_group("commit-retry");
+    let dir = tempfile::tempdir().unwrap();
+    let db = format!("sqlite://{}", dir.path().join("state.db").display());
+    let mut engine = engine_on(&db, &dir.path().join("work"), &topic, &group).await;
+    engine.recover().await.expect("recovery");
+    let inner = engine.adapters.remove(&SourceType::Kafka).unwrap();
+    engine.adapters.insert(
+        SourceType::Kafka,
+        Box::new(FailingCommits { inner, failures: 1 }),
+    );
+    let mut watch = OffsetWatch::default();
+
+    // The first batch verifies, and its commit fails.
+    let mut stuck = None;
+    for _ in 0..15 {
+        let outcomes = engine
+            .process_once(SourceType::Kafka)
+            .await
+            .expect("a pass");
+        watch.look(&topic, &group);
+        if let Some(o) = outcomes.into_iter().find(|o| !o.committed) {
+            stuck = Some(o.batch_id);
+            break;
+        }
+    }
+    let stuck = stuck.expect("a batch whose commit failed");
+    assert_eq!(
+        engine.store.get_batch(&stuck).await.unwrap().unwrap().state,
+        BatchState::Verified
+    );
+    assert_eq!(
+        group_offset_if_any(&topic, &group),
+        None,
+        "nothing committed yet"
+    );
+
+    // More records arrive; a later batch commits past the stuck one, and the
+    // pass retries the stuck one.
+    produce(&topic, 10);
+    for _ in 0..15 {
+        engine
+            .process_once(SourceType::Kafka)
+            .await
+            .expect("a pass");
+        watch.look(&topic, &group);
+        if engine.store.get_batch(&stuck).await.unwrap().unwrap().state
+            == BatchState::SourceCommitted
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        engine.store.get_batch(&stuck).await.unwrap().unwrap().state,
+        BatchState::SourceCommitted,
+        "the batch whose commit failed is committed without a restart"
+    );
+    assert_eq!(
+        watch.0.last(),
+        Some(&30),
+        "the group's offset ends after the last record, never back at 20: {:?}",
+        watch.0
+    );
+}
+
+/// #624: recovery holds a VERIFIED range back while a lower range of its
+/// partition is read again, and nothing in the running loop looked at it
+/// again: it stayed VERIFIED until the next restart. Now the pass whose
+/// re-read commits past it settles it - SOURCE_COMMITTED, not sent to Kafka,
+/// and the group's offset never moves backwards.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_held_back_kafka_range_is_settled_without_a_restart_and_never_moves_the_group_back() {
+    use vtop_core::manifest::ManifestBuilder;
+    use vtop_core::state_machine::BatchState;
+    use vtop_core::types::{CompressionType, SourceType};
+    use vtop_state::StateStore;
+
+    let (topic, _cleanup) = fresh_topic("held_back", 40).await;
+    let group = unique_group("held-back");
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let db = format!("sqlite://{}", dir.path().join("state.db").display());
+
+    // [0, 9] was handed back for replay; [10, 19] is VERIFIED, with an object
+    // and a manifest the re-check will find intact.
+    let marker = kafka_marker(&topic, &group, 10, 19);
+    let object_uri = "s3://telemetry-data/x/b-10-19.raw.gz";
+    let manifest_uri = "s3://telemetry-data/x/b-10-19.manifest.json";
+    let object_bytes = b"archived-bytes";
+    let object_digest = vtop_core::checksum::sha256_bytes(object_bytes);
+    let manifest = ManifestBuilder {
+        batch_id: "b-10-19".into(),
+        tenant: "default".into(),
+        source_type: SourceType::Kafka,
+        source_name: topic.clone(),
+        format: TelemetryFormat::Raw,
+        compression: CompressionType::None,
+        record_count: 10,
+        first_timestamp: None,
+        last_timestamp: None,
+        source_progress: marker.clone(),
+        object_uri: object_uri.into(),
+        object_size: object_bytes.len() as u64,
+        object_checksum_algorithm: "sha256".into(),
+        object_checksum: object_digest.clone(),
+        manifest_uri: manifest_uri.into(),
+        path_template: "test".into(),
+        resolved_prefix: "x".into(),
+        upload_backend: "mock".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    }
+    .build()
+    .unwrap();
+    let manifest_path = manifest.write_to_file(&work).unwrap();
+    {
+        let store = vtop_state::SqliteStateStore::connect(&db).await.unwrap();
+        ledger_batch(&store, "b-0-9", &topic, &group, (0, 9), false).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .save_batch_state(&vtop_state::BatchRecord {
+                batch_id: "b-10-19".into(),
+                tenant: "default".into(),
+                source_type: SourceType::Kafka,
+                source_name: topic.clone(),
+                format: TelemetryFormat::Raw,
+                state: BatchState::Batching,
+                progress_start: kafka_marker(&topic, &group, 10, 10),
+                progress_end: marker,
+                object_uri: Some(object_uri.into()),
+                manifest_uri: Some(manifest_uri.into()),
+                object_sha256: Some(object_digest.clone()),
+                manifest_sha256: Some(manifest.manifest.sha256.clone()),
+                manifest_version_id: None,
+                object_size_bytes: Some(object_bytes.len() as i64),
+                record_count: Some(10),
+                error_message: None,
+                owner: None,
+                lease_expires_at: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        for st in [
+            BatchState::Sealed,
+            BatchState::Compressed,
+            BatchState::Checksummed,
+            BatchState::ObjectUploaded,
+            BatchState::ManifestUploaded,
+            BatchState::Verified,
+        ] {
+            store
+                .update_batch_state("b-10-19", st, &vtop_state::BatchPatch::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    let mut engine = engine_on(&db, &work, &topic, &group).await;
+    let staged = dir.path().join("staged-object");
+    std::fs::write(&staged, object_bytes).unwrap();
+    engine
+        .backend
+        .put_object(
+            &staged,
+            object_uri,
+            Some(vtop_upload::ObjectChecksum::new("sha256", &object_digest)),
+        )
+        .await
+        .unwrap();
+    engine
+        .backend
+        .put_manifest(
+            &manifest_path,
+            manifest_uri,
+            Some(vtop_upload::ObjectChecksum::new(
+                "sha256",
+                &manifest.manifest.sha256,
+            )),
+        )
+        .await
+        .unwrap();
+    let summary = engine.recover().await.expect("recovery");
+    assert_eq!(
+        (summary.committed, summary.still_pending),
+        (0, 1),
+        "the VERIFIED range is held back above the range being re-read: {summary:?}"
+    );
+    let mut watch = OffsetWatch::default();
+    watch.look(&topic, &group);
+
+    for _ in 0..15 {
+        engine
+            .process_once(SourceType::Kafka)
+            .await
+            .expect("a read pass");
+        watch.look(&topic, &group);
+        if engine
+            .store
+            .get_batch("b-10-19")
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+            == BatchState::SourceCommitted
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        engine
+            .store
+            .get_batch("b-10-19")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        BatchState::SourceCommitted,
+        "the held-back range is settled without a restart"
+    );
+    assert_eq!(
+        watch.0.last(),
+        Some(&40),
+        "the group's offset ends after the last record, never back at 20: {:?}",
+        watch.0
+    );
+}
