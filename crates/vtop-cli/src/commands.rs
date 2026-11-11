@@ -120,7 +120,8 @@ pub enum Command {
     /// it binds to the ledger row, verify the object's stored content against
     /// the manifest's digest, and check the manifest's current key still
     /// holds the pinned version. Reports missing, mismatched, unauthenticated
-    /// and unreadable batches, and exits non-zero on any. Read-only; it can
+    /// and unreadable batches, and manifests from a newer release
+    /// (unsupported_version), and exits non-zero on any. Read-only; it can
     /// run beside a live engine, bounded by the limits below.
     Scrub {
         #[arg(long)]
@@ -929,13 +930,26 @@ pub async fn verify_manifest_deep(
     let manifest_bytes = backend
         .get_object_bounded(manifest_uri, vtop_core::manifest::MAX_MANIFEST_BYTES)
         .await?;
-    let parsed: vtop_core::manifest::VtopManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| VtopError::Other(format!("manifest {manifest_uri} does not parse: {e}")))?;
+    // The version is checked before anything else: a manifest from a newer
+    // release is reported as that, never as a failed self-hash (#671).
+    let parsed = match vtop_core::manifest::ParsedManifest::from_slice(&manifest_bytes) {
+        Ok(parsed) => parsed,
+        // Standalone, with no ledger to bind the bytes to, the claim is all
+        // there is: reported as a claim this build cannot authenticate.
+        Err(e @ VtopError::UnsupportedManifestVersion { .. }) => {
+            return Err(e.at_manifest_uri(manifest_uri))
+        }
+        Err(e) => {
+            return Err(VtopError::Other(format!(
+                "manifest {manifest_uri} does not parse: {e}"
+            )))
+        }
+    };
     lines.push(format!(
         "manifest        : {} ({} bytes, batch {})",
         manifest_uri,
         manifest_bytes.len(),
-        parsed.batch_id
+        parsed.fields().batch_id
     ));
 
     // 2. Self-hash: is the manifest itself intact?
@@ -955,7 +969,7 @@ pub async fn verify_manifest_deep(
     // key, retain legacy behavior but do not claim an unverified MAC is valid.
     let authentication_ok = parsed.verify_authentication(manifest_mac_key).is_ok();
     failed |= !authentication_ok;
-    let authentication_status = match (manifest_mac_key, parsed.manifest.mac.as_deref()) {
+    let authentication_status = match (manifest_mac_key, parsed.fields().manifest.mac.as_deref()) {
         (Some(_), _) if authentication_ok => "OK (keyed BLAKE3)".to_string(),
         (Some(_), _) => "FAILED (MAC missing or invalid)".to_string(),
         (None, Some(_)) => "PRESENT (not checked: no key configured)".to_string(),
@@ -964,14 +978,14 @@ pub async fn verify_manifest_deep(
     lines.push(format!("authentication  : {authentication_status}"));
 
     // 3. The stored object's actual content.
-    let object_bytes = backend.get_object(&parsed.object.uri).await?;
-    let size_ok = object_bytes.len() as u64 == parsed.object.size_bytes;
+    let object_bytes = backend.get_object(&parsed.fields().object.uri).await?;
+    let size_ok = object_bytes.len() as u64 == parsed.fields().object.size_bytes;
     failed |= !size_ok;
     lines.push(format!(
         "object size     : {} ({} bytes stored, {} expected)",
         if size_ok { "OK" } else { "FAILED" },
         object_bytes.len(),
-        parsed.object.size_bytes
+        parsed.fields().object.size_bytes
     ));
 
     // LIMITED is reserved for an EXPLICIT `none` algorithm (the operator chose
@@ -980,6 +994,7 @@ pub async fn verify_manifest_deep(
     // algorithm with no recorded digest — is a hard failure: reporting it as
     // "limited" would hand a PASSED verdict to a same-sized replacement.
     let algo = parsed
+        .fields()
         .object
         .checksum_algorithm
         .parse::<ChecksumAlgorithm>();
@@ -992,21 +1007,25 @@ pub async fn verify_manifest_deep(
             failed = true;
             format!("FAILED (cannot verify content: {e})")
         }
-        (Ok(_), Some(actual)) if parsed.object.checksum.is_empty() => {
+        (Ok(_), Some(actual)) if parsed.fields().object.checksum.is_empty() => {
             failed = true;
             format!(
                 "FAILED (algorithm declared but no digest recorded; content hashes to {actual})"
             )
         }
         (Ok(_), Some(actual)) => {
-            let ok = actual.eq_ignore_ascii_case(&parsed.object.checksum);
+            let ok = actual.eq_ignore_ascii_case(&parsed.fields().object.checksum);
             failed |= !ok;
             if ok {
-                format!("OK ({} {})", parsed.object.checksum_algorithm, actual)
+                format!(
+                    "OK ({} {})",
+                    parsed.fields().object.checksum_algorithm,
+                    actual
+                )
             } else {
                 format!(
                     "FAILED (stored content hashes to {actual}, manifest says {})",
-                    parsed.object.checksum
+                    parsed.fields().object.checksum
                 )
             }
         }
@@ -1015,7 +1034,7 @@ pub async fn verify_manifest_deep(
     lines.push(format!("object content  : {checksum_status}"));
 
     // 4. Ledger reconciliation.
-    let row = store.get_batch(&parsed.batch_id).await?;
+    let row = store.get_batch(&parsed.fields().batch_id).await?;
     let ledger_status = match &row {
         None => "ABSENT (not a failure: manifest may belong to another engine's store)".to_string(),
         Some(r) => {
@@ -1047,8 +1066,8 @@ pub async fn verify_manifest_deep(
 
     let json = serde_json::json!({
         "manifest": manifest_uri,
-        "batch_id": parsed.batch_id,
-        "object_uri": parsed.object.uri,
+        "batch_id": parsed.fields().batch_id,
+        "object_uri": parsed.fields().object.uri,
         "self_hash_ok": self_hash_ok,
         "manifest_authentication": authentication_status,
         "manifest_authentication_required": manifest_mac_key.is_some(),

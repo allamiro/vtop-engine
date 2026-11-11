@@ -297,6 +297,93 @@ it. When `manifest.mac` is required by local policy, changing any bound field
 without the secret key fails authentication. A shared-key MAC does not provide
 public verifiability or non-repudiation.
 
+**Reading a manifest: version first (#671).** A reader checks `protocol`
+(`"VTOP"`) and `version` before it decodes any other field or computes any
+digest, and picks the hash scheme from the version:
+
+| `version` | Self-hash and MAC input |
+|---|---|
+| `0.1`, `0.2`, `0.3` | Legacy: the manifest decoded into the fields that release knows, both embedded values blanked, re-serialized as compact JSON in struct order. Unchanged, so every archived manifest verifies as before. A field that release does not know is dropped before hashing. |
+| `0.4` | Canonical: the **stored** document, with `manifest.sha256` set to `""` and `manifest.mac` set to `""` where that key is present (an absent MAC stays absent), object keys sorted at every depth, serialized as compact JSON. Fields the reader does not know stay in, so they are authenticated too. |
+| anything newer | Reported as a manifest that **claims a version this build cannot authenticate**, never as corrupt or tampered, and acted on only when its bytes are proven to be the writer's (below). |
+
+The `0.4` canonical form is sorted-key compact JSON as `serde_json` writes it:
+array order and every value are significant, strings are re-escaped minimally,
+and an integer is written in decimal. It is not full RFC 8785 (JCS). Some
+inputs are refused as malformed, because their canonical bytes would not pin
+down what the document says:
+
+- a **duplicate key** in any object, since parsers disagree on which one wins;
+- a **number that is not an integer** in the signed or unsigned 64-bit range:
+  a fraction, an exponent, or an integer beyond that range. It would be
+  re-encoded as a float, so different stored numbers could share one hash;
+- **`-0`**. It is not the integer `0`, and two stored forms would share one
+  canonical form.
+
+A `0.4` writer stays within these rules. The reader release writes no `0.4`
+manifest; it only reads them. In every version, a second `protocol` or
+`version` key at the top level is malformed.
+
+**Version grammar.** A version is dotted digits, `MAJOR.MINOR` or
+`MAJOR.MINOR.PATCH`, each part with no leading zero (`0` itself is fine). A
+missing PATCH compares as `0`. Versions above the newest the reader knows
+(`0.4` here), such as `0.5`, `0.4.1` or `1.0.0`, are **newer**. Anything else
+is a **malformed** document: a missing `protocol` or `version`, a version that
+is not a string, `00.5`, `0.4a`, an empty string, or a well-formed version
+that is not newer and not one this reader knows (`0.0`, `0.4.0`, `0.3.1`).
+The error type carries the difference.
+
+**A newer version is a claim, not a fact.** The version is read before
+anything is authenticated, so a storage tamperer can write `"version": "0.9"`
+over a manifest. A reader acts on the claim only when the bytes are proven to
+be what the batch's writer stored. Both of these must hold:
+
+- they are the row's **pinned** immutable manifest version, which an
+  overwrite of the key cannot change;
+- they carry the batch id and the self-hash the ledger recorded.
+
+Otherwise the manifest is unauthenticated, exactly as before (see
+SECURITY_MODEL.md §8.2). The readers:
+
+- **Recovery's re-check of a VERIFIED row** (`storage_still_verified`):
+  - **A proven newer manifest** leaves the row VERIFIED, neither committed nor
+    marked for replay. It is logged as an error and counted in
+    `vtop_recovery_unsupported_manifest_total`, and an upgraded engine
+    commits it later.
+  - **Holding back:** like any uncommitted range, it holds back a VERIFIED
+    range of the same source unit above it.
+  - **Retiring:** once the unit has committed past it (proven as for any
+    range retired under #567), it is retired as SUPERSEDED. That makes no
+    source commit, and stops the row being claimed and downloaded at every
+    restart.
+  - **An unproven newer manifest** is unauthenticated: FAILED, then
+    REPLAY_REQUIRED.
+  - **Rows that never reached VERIFIED** are not re-checked. Such a row is
+    re-read whatever its manifest says, as before.
+  - **Duplicates:** the engine's next read of that source still starts at the
+    committed point, below a held newer range, so its bytes are archived again
+    (a duplicate, never a gap), as for any range recovery leaves uncommitted.
+- **The in-run keyed read-back** of the manifest this engine just stored
+  verifies it from the stored bytes by the same rules.
+- **`vtopctl scrub`** reports a proven newer manifest as `unsupported_version`,
+  and an unproven one as `unauthenticated`. Both are findings, because neither
+  was checked. For `unsupported_version`, upgrade the scrub's binary and run
+  it again.
+- **`vtopctl verify-manifest`** has no ledger to bind the bytes to. It fails
+  with "manifest URI claims version X, which this build cannot authenticate".
+
+**Upgrade order.** The reader release (release A in #671) reads `0.1`-`0.4`
+and **still writes `0.3`**, so engines before and after it can share a ledger
+and an archive during a rolling upgrade: everything written is a format both
+read. A later release that writes `0.4` needs every engine, scrub, auditor and
+other manifest consumer on the reader release or later first: an earlier
+reader re-encodes a `0.4` manifest without the fields it does not know, gets a
+different hash, reports it as tampered, and recovery replays the batch. The
+plan in #671 is for that release to keep `0.3` as its default and write `0.4`
+only when configured to. The manifest is not part of the native protocol or
+the Raft log, so the cluster upgrade procedure is unchanged. Downgrade remains
+unsupported.
+
 **`source_progress` spans the whole batch (version `0.3`, #622).** A batch is
 often built from several reads of one source unit. Its `source_progress` names
 the unit (and, for a file, the identity the last read saw) with the FIRST
@@ -495,6 +582,10 @@ The stored **manifest** **MUST** also be verified before commit. The self-hash
 **MUST** be reproducible. When manifest authentication is configured, the
 stored bytes **MUST** contain a valid keyed MAC; a missing MAC **MUST NOT**
 silently downgrade verification.
+
+A reader **MUST** check `protocol` and `version` before verifying, select the
+hash scheme from the version, and report a version newer than it supports as
+such, never as a failed self-hash or MAC (§11.2, "Reading a manifest").
 
 ---
 

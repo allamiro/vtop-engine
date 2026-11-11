@@ -422,6 +422,40 @@ complementary.
   Rows written before this feature (no recorded version) are verified the
   same legacy way.
 
+### 8.2 A manifest that claims a newer version (#671)
+
+A reader checks a manifest's `version` before it authenticates anything,
+so it can tell a newer writer's manifest from a damaged one. The version is
+read from bytes nothing has authenticated yet, so it is only a **claim**: a
+storage tamperer can overwrite a manifest with `{"protocol": "VTOP",
+"version": "0.9"}`. Acted on unchecked, that claim would turn an integrity
+finding into "upgrade the binary". Worse, recovery would hold the batch
+VERIFIED for good, when it should replay it. So the claim counts only for
+bytes proven to be what the batch's writer stored:
+
+- The bytes **MUST** be the row's pinned, immutable `manifest_version_id`
+  (§8.1). An overwrite of the key cannot change a pinned version.
+- They **MUST** carry the batch id and the self-hash the ledger recorded.
+  On its own that binds nothing, because the self-hash was computed by a
+  scheme this build cannot reproduce and a tamperer can copy it into a
+  forgery. What it adds is that the pinned version is this batch's.
+
+When both hold, recovery leaves the row VERIFIED and pending. It counts the
+row in `vtop_recovery_unsupported_manifest_total`, and retires it as
+SUPERSEDED once its source has committed past it. The scrub reports
+`unsupported_version`.
+
+When either fails (no pin, or a pin that does not carry the ledger's
+binding), the manifest is **unauthenticated**, exactly as before #671:
+recovery marks the row FAILED and then REPLAY_REQUIRED, and the scrub reports
+`unauthenticated`. A deployment without object versions therefore replays a
+genuine newer-release batch rather than trusting it. That costs duplicates,
+never a gap.
+
+`vtopctl verify-manifest`, run standalone with no ledger to bind the bytes
+to, reports that the manifest at that URI claims a version this build cannot
+authenticate. It never reports it as intact.
+
 ## 9. Resource exhaustion controls
 
 Resource exhaustion controls are part of the security boundary:

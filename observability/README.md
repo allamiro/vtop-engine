@@ -72,6 +72,7 @@ GET /readyz    readiness
 | `vtop_verification_backend_limited_total` | counter | Size-only verification acceptances under `upload.require_strong_verification: false`, counted where `vtop_verified_total` counts verifications: when the running engine marks a batch VERIFIED on a size-only result, and when recovery commits a VERIFIED row whose storage re-check confirmed only size (a row recovery holds back under a lower incomplete range is logged, not counted). Each is also a WARN with its batch id, and each **accepts same-size corruption** (#629) |
 | `vtop_verification_mode{tenant,mode}` | gauge | Set once at startup: `mode="size_only"` is 1 when `upload.require_strong_verification` is false, `mode="strong"` is 1 otherwise. Alert on `vtop_verification_mode{mode="size_only"} == 1` to catch a lab setting left in production before any batch moves. Exported by `vtopctl run` only, like every series here; the one-shot `process-once` and `replay` serve no endpoint and log the startup WARN instead (#629) |
 | `vtop_replay_required_total` | counter | Work being repeated |
+| `vtop_recovery_unsupported_manifest_total` | counter | VERIFIED batches whose manifest recovery found to be from a newer release than the engine reads (#671), proven to be the writer's pinned version. They are left VERIFIED (or retired SUPERSEDED once their source has committed past them), never replayed. Non-zero means an engine is older than a writer sharing its ledger, which the upgrade order rules out: upgrade that engine |
 | `vtop_failed_total` | counter | Batches that hit FAILED |
 | `vtop_records_total`, `vtop_bytes_in_total`, `vtop_bytes_out_total` | counters | Volume; rates via `rate()` |
 | `vtop_stage_duration_seconds{stage}` | histogram | Per-stage latency, p95-able |
@@ -202,12 +203,12 @@ lab has no textfile collector, so nothing here charts or alerts on them.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `vtop_scrub_objects_total{result}` | counter | Committed batches checked, by `result`: `ok`; `limited` (size-only: present at its size, no digest compared, the same result recovery counts in `vtop_verification_backend_limited_total`; counted, not a finding); `missing`, `mismatched`, `unauthenticated`, `unreadable` (findings). Every result is written, at zero when nothing had it. Carried forward from the file each run replaces, so it counts across runs. |
+| `vtop_scrub_objects_total{result}` | counter | Committed batches checked, by `result`: `ok`; `limited` (size-only: present at its size, no digest compared, the same result recovery counts in `vtop_verification_backend_limited_total`; counted, not a finding); `missing`, `mismatched`, `unauthenticated`, `unreadable`, `unsupported_version` (a manifest from a newer release than the scrub's binary reads, #671) (findings). Every result is written, at zero when nothing had it. Carried forward from the file each run replaces, so it counts across runs. |
 | `vtop_scrub_last_run_findings` | gauge | Findings in the latest run. With a rotating cursor this is one slice's: the next slice can read 0 while damage found earlier in the pass is still there, so alert on the timestamp below. |
 | `vtop_scrub_last_run_timestamp_seconds` | gauge | When the latest run finished. |
 | `vtop_scrub_last_success_timestamp_seconds` | gauge | When a run last finished with no findings; 0 if none has. A run with findings leaves it where it was. |
 | `vtop_scrub_last_pass_complete_timestamp_seconds` | gauge | When a scrub last finished checking every committed batch: a run over all of them, or the cursor run that reached the end of a pass. 0 if none has. |
-| `vtop_scrub_last_finding_timestamp_seconds` | gauge | When a run last found a missing, mismatched, unauthenticated or unreadable batch; 0 if none has. A clean run leaves it where it was. This is what the findings alert reads: unlike an `increase()` of the counter, it shows damage the very first run found, since that is already in the counter's first sample. |
+| `vtop_scrub_last_finding_timestamp_seconds` | gauge | When a run last found a missing, mismatched, unauthenticated, unreadable or unsupported-version batch; 0 if none has. A clean run leaves it where it was. This is what the findings alert reads: unlike an `increase()` of the counter, it shows damage the very first run found, since that is already in the counter's first sample. |
 
 `result` is the only label: batch ids and URIs are in the command's report and
 its WARN lines. An example rule set, in Prometheus rule format, for a
@@ -218,10 +219,16 @@ the windows to your schedule):
 groups:
   - name: vtop-archive-scrub
     rules:
-      # Damage to committed data. The source has usually aged out, so the
-      # engine cannot archive it again: restore the object or manifest from a
-      # replica or backup, or record the loss. `vtopctl scrub --json` lists
-      # each finding with its batch id, URIs and what was found.
+      # Damage to committed data, or data this scrub could not verify. It
+      # keeps paging on `unsupported_version` (#671), a manifest from a newer
+      # release than the scrub's binary reads, which is proven to be the
+      # writer's pinned version (otherwise it is `unauthenticated`). Damage
+      # can hide behind a batch nothing has verified, and the remedy (a scrub
+      # binary of that release) is quick. For damage, the source has usually
+      # aged out, so the engine cannot archive it again: restore the object
+      # or manifest from a replica or backup, or record the loss.
+      # `vtopctl scrub --json` lists each finding with its batch id, URIs
+      # and what was found.
       #
       # Fires for a pass window (8d here) after the last run that found
       # anything. Not `vtop_scrub_last_run_findings`: a rotating scrub checks
@@ -239,10 +246,13 @@ groups:
           severity: page
           service: vtop-engine
         annotations:
-          summary: "The archive scrub found committed batches damaged or unreadable"
+          summary: "The archive scrub found committed batches damaged, unreadable or unverifiable"
           description: >-
             A scrub run in the last eight days found a committed batch missing,
-            mismatched, unauthenticated or unreadable. The run logs and
+            mismatched, unauthenticated or unreadable - restore it from a
+            replica or backup, or record the loss - or with a manifest from a
+            newer release than the scrub's binary reads (unsupported_version):
+            run a scrub of that release or later. The run logs and
             vtopctl scrub --json list them; vtop_scrub_objects_total{result}
             counts them.
       # The scrub stopped running, or has not passed for two days.

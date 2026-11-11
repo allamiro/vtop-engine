@@ -27,7 +27,7 @@ use vtop_core::batch::{AdaptiveBatcher, BatchLimits, SealReason, TelemetryBatch}
 use vtop_core::compression::compress_batch;
 use vtop_core::config::{ResolvedStateStore, StreamConfig, StreamsConfig, VtopConfig};
 use vtop_core::errors::VtopError;
-use vtop_core::manifest::{ManifestBuilder, ManifestMacKey, VtopManifest, MAX_MANIFEST_BYTES};
+use vtop_core::manifest::{ManifestBuilder, ManifestMacKey, ParsedManifest, MAX_MANIFEST_BYTES};
 use vtop_core::metrics::BatchMetrics;
 use vtop_core::partitioning::{self, PartitionContext};
 use vtop_core::replay::{next_recovery_action, RecoveryAction};
@@ -872,14 +872,14 @@ impl<'a> Pipeline<'a> {
                 Ok(bytes) => bytes,
                 Err(e) => fail!(format!("stored manifest download failed: {e}")),
             };
-            let stored: VtopManifest = match serde_json::from_slice(&stored_bytes) {
+            let stored = match ParsedManifest::from_slice(&stored_bytes) {
                 Ok(stored) => stored,
                 Err(e) => fail!(format!("stored manifest parse failed: {e}")),
             };
             if stored.verify_authentication(Some(key)).is_err()
-                || stored.batch_id != batch_id
-                || stored.manifest.uri != manifest_uri
-                || stored.object.uri != object_uri
+                || stored.fields().batch_id != batch_id
+                || stored.fields().manifest.uri != manifest_uri
+                || stored.fields().object.uri != object_uri
             {
                 fail!("stored manifest authentication or batch binding failed".to_string());
             }
@@ -2426,6 +2426,28 @@ impl Engine {
         .await;
         match check.result {
             crate::scrub::ScrubResult::Ok => Recheck::Strong,
+            crate::scrub::ScrubResult::UnsupportedVersion => {
+                // Loud: only an engine older than the batch's writer gets
+                // here (the check has proven the bytes are the writer's
+                // pinned version), and the upgrade order says that should not
+                // happen.
+                if let Some(mx) = telemetry::metrics() {
+                    mx.recovery_unsupported_manifest_total
+                        .with_label_values(&[
+                            rec.tenant.as_str(),
+                            rec.source_type.as_str(),
+                            rec.format.extension(),
+                        ])
+                        .inc();
+                }
+                tracing::error!(
+                    batch_id = %rec.batch_id,
+                    detail = %check.detail,
+                    "recovery: a VERIFIED batch's manifest is from a newer release; it stays VERIFIED, \
+                     neither committed nor replayed, until an upgraded engine recovers it - upgrade this engine"
+                );
+                Recheck::UnsupportedVersion
+            }
             crate::scrub::ScrubResult::Limited => {
                 verification_mode::recheck_size_only(&self.config, rec, &check.detail)
             }
@@ -2484,6 +2506,29 @@ impl Engine {
                     // anything less trusts a stale claim about a system this
                     // process has never observed.
                     let recheck = self.storage_still_verified(&rec).await;
+                    if recheck == Recheck::UnsupportedVersion {
+                        // Written by a newer release (#671): not stale, only
+                        // unreadable here. It is neither committed nor marked
+                        // for replay - the row stays VERIFIED for an upgraded
+                        // engine to commit - and nothing is rewound for it.
+                        if self.committed_past(&rec) {
+                            // Its source has committed past it, proven as
+                            // for any range #567 retires: nothing of it can be
+                            // re-read and an upgraded engine's commit would be
+                            // a no-op. Left VERIFIED, it was claimed,
+                            // downloaded and counted pending at every restart
+                            // and never pruned (review of #674). Retiring it
+                            // makes no source commit.
+                            self.retire_unsupported(&rec, &mut summary).await;
+                            continue;
+                        }
+                        // Held (#639) otherwise: its range is not committed,
+                        // so a VERIFIED range of the same unit above it must
+                        // not commit past it.
+                        rewinds.hold(&rec.progress_start);
+                        summary.still_pending += 1;
+                        continue;
+                    }
                     if recheck == Recheck::Failed {
                         tracing::warn!(
                             batch_id = %rec.batch_id,
@@ -2846,6 +2891,40 @@ impl Engine {
                 .committed_through(marker)
                 .is_some_and(|committed| committed >= range_end)
         })
+    }
+
+    /// Retire a VERIFIED row whose manifest is from a newer release and whose
+    /// source has committed past it (#671): SUPERSEDED, as the
+    /// `committed_past` branch of [`Engine::recover`] retires any range. A
+    /// failed write leaves it as it was, pending, and nothing is rewound.
+    async fn retire_unsupported(&self, rec: &BatchRecord, summary: &mut RecoverySummary) {
+        match self.retire_superseded(rec).await {
+            Ok(()) => {
+                summary.superseded += 1;
+                if let Some(mx) = telemetry::metrics() {
+                    mx.batches_total
+                        .with_label_values(&[
+                            rec.tenant.as_str(),
+                            rec.source_type.as_str(),
+                            rec.format.extension(),
+                            BatchState::Superseded.as_str(),
+                        ])
+                        .inc();
+                }
+                tracing::warn!(
+                    batch_id = %rec.batch_id,
+                    "recovered: SUPERSEDED (its manifest is from a newer release and its source has committed past it)"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    batch_id = %rec.batch_id,
+                    error = %e,
+                    "recovery: could not retire a newer-release range its source has committed past; it stays as it is"
+                );
+                summary.still_pending += 1;
+            }
+        }
     }
 
     /// Retire a range its source has committed past (#567): SUPERSEDED, the
@@ -6864,7 +6943,7 @@ mod tests {
             .get_object(row.manifest_uri.as_deref().unwrap())
             .await
             .unwrap();
-        let manifest: VtopManifest = serde_json::from_slice(&bytes).unwrap();
+        let manifest: vtop_core::manifest::VtopManifest = serde_json::from_slice(&bytes).unwrap();
         manifest.verify_self_hash().unwrap();
         let ProgressMarker::File {
             start_byte,
@@ -8088,6 +8167,141 @@ mod tests {
             "{case}: the hold on B is released once A is archived"
         );
         assert_committed_without_a_gap(&case, &fourth, 14).await;
+    }
+
+    /// #671: a VERIFIED range whose manifest is from a newer release stays
+    /// pending - not committed, not replayed - and holds back a VERIFIED range
+    /// above it like any uncommitted range (#639). Once the file has committed
+    /// past it, though (proven as for any range retired by #567), nothing
+    /// below the committed point can be re-read: it holds nothing back, and
+    /// it is retired SUPERSEDED instead of being claimed, downloaded and
+    /// counted pending at every restart (review of #674). No source commit is
+    /// made for it. Each meeting with a newer manifest is counted.
+    #[tokio::test]
+    async fn a_newer_release_range_the_file_committed_past_is_superseded() {
+        use BatchState::*;
+        let tenant = "newer-release-671";
+        let unsupported = || -> u64 {
+            let mx = telemetry::init().unwrap();
+            mx.registry
+                .gather()
+                .iter()
+                .filter(|f| f.name() == "vtop_recovery_unsupported_manifest_total")
+                .flat_map(|f| f.get_metric().iter())
+                .filter(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "tenant" && l.value() == tenant)
+                })
+                .map(|m| m.get_counter().get_value() as u64)
+                .sum()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\n").unwrap(); // A: [0, 7)
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let backend = Arc::new(vtop_upload::MockBackend::new());
+        let engine = |work: &str| {
+            let mut cfg = file_config(
+                dir.path().join(work).to_str().unwrap(),
+                &url,
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            cfg.engine.tenant = tenant.into();
+            cfg.batching.max_batch_age_seconds = 3_600;
+            let backend = backend.clone();
+            async move {
+                let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+                    .await
+                    .unwrap();
+                engine.backend = backend;
+                engine
+            }
+        };
+
+        let mut first = engine("work-1").await;
+        first.process_once(SourceType::File).await.unwrap();
+        let a = row_at(&first, 0).await;
+        assert_eq!(a.state, SourceCommitted);
+        // N: the same bytes, left VERIFIED by a newer release's engine, its
+        // manifest pinned and carrying the self-hash the ledger recorded.
+        let newer_uri = "s3://telemetry-data/newer.manifest.json";
+        let newer_hash = "ab".repeat(32);
+        let staged = dir.path().join("newer-671.json");
+        std::fs::write(
+            &staged,
+            serde_json::to_vec(&serde_json::json!({
+                "protocol": "VTOP",
+                "version": "0.9",
+                "batch_id": "newer-release",
+                "manifest": {"uri": newer_uri, "sha256": newer_hash},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let stored = backend
+            .put_manifest(&staged, newer_uri, None)
+            .await
+            .unwrap();
+        let newer = BatchRecord {
+            batch_id: "newer-release".into(),
+            state: Batching,
+            manifest_uri: Some(newer_uri.into()),
+            manifest_sha256: Some(newer_hash.clone()),
+            manifest_version_id: stored.version_id,
+            owner: None,
+            lease_expires_at: None,
+            ..a.clone()
+        };
+        first.store.save_batch_state(&newer).await.unwrap();
+        for state in [
+            Sealed,
+            Compressed,
+            Checksummed,
+            ObjectUploaded,
+            ManifestUploaded,
+            Verified,
+        ] {
+            first
+                .store
+                .update_batch_state(&newer.batch_id, state, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+        // B: [7, 14), VERIFIED, its commit refused.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&input)
+            .unwrap();
+        writeln!(f, "line 2").unwrap();
+        FaultyLedger::install(&mut first, &[LedgerWrite::To(SourceCommitted)]).await;
+        assert!(
+            first.process_once(SourceType::File).await.is_err(),
+            "B verifies and its commit write fails"
+        );
+        assert_eq!(row_at(&first, 7).await.state, Verified);
+        drop(first);
+
+        let before = unsupported();
+        let mut second = engine("work-2").await;
+        let summary = second.recover().await.unwrap();
+        assert_eq!(
+            row_at(&second, 7).await.state,
+            SourceCommitted,
+            "B is held back by a range its file has committed past: {summary:?}"
+        );
+        let newer = second
+            .store
+            .get_batch("newer-release")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(newer.state, Superseded, "{summary:?}");
+        assert_eq!(summary.superseded, 1, "{summary:?}");
+        assert_eq!(summary.still_pending, 0, "{summary:?}");
+        assert_eq!(summary.replay_required, 0, "{summary:?}");
+        assert_eq!(unsupported() - before, 1, "the newer manifest is counted");
     }
 
     /// #639, `Engine::recover`'s stale-VERIFIED path: FAILED is refused.

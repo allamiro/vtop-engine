@@ -716,6 +716,33 @@ gaps the Kafka comparison found (#596), measure failover and crash
 durability against Kafka (#597, #599), serve split children as Kafka
 partitions (#473), and ship the egress ceiling once measured (#481).
 
+**Manifest format evolution (#671).** The next release's readers check a
+manifest's `version` first, read `0.1`-`0.4`, verify `0.4` over the stored
+document so fields they do not know stay authenticated, and report anything
+newer as newer rather than as tampered: recovery leaves such a batch VERIFIED
+and pending, and `vtopctl scrub` reports `unsupported_version`. Both act on
+that only for the row's pinned manifest version carrying the ledger's
+self-hash; anything else is unauthenticated, as before. It still writes
+`0.3`. A later release adds the `0.4` fields (the verification plan, then
+optional receipts, after #664), opt-in, and only once every engine and
+auditor runs a reader release. Known limitations until then:
+
+- **Readers before the next release cannot read `0.4`.** v0.7.0 and earlier
+  re-encode a manifest without the fields they do not know, so a `0.4`
+  manifest fails their self-hash: recovery replays the batch, the scrub
+  reports it, `verify-manifest` calls it corrupt. Upgrade every reader first.
+- **A pending newer-release range is still re-read.** An engine older than a
+  batch's writer leaves its VERIFIED row alone, but its next read of that
+  source starts at the committed point, below that range, and archives those
+  bytes again: a duplicate, not a gap.
+- **Without object versions, a genuine newer manifest is replayed.** A
+  row with no pinned manifest version cannot prove its manifest is the
+  writer's, so an older engine treats it as unauthenticated and replays it
+  (duplicates), as before #671.
+- **`scripts/upgrade-compat.sh` does not cover manifests.** The old-release
+  coverage is the committed v0.7.0 fixtures in
+  `crates/vtop-core/tests/fixtures/manifests/`.
+
 ---
 
 ## Versioning
