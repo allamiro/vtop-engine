@@ -879,12 +879,101 @@ impl FencingEpochJournal {
                 .zip(&target)
                 .take_while(|(have, want)| have == want)
                 .count();
-            self.truncate_entries(common)?;
-            for entry in &target[common..] {
-                self.record(entry.epoch, entry.start_offset)?;
+            if common == self.entries.len() {
+                // Only additions: each append is durable on its own, and a
+                // crash between two leaves a prefix of the target, which the
+                // next follow (the open's replay at the latest) completes.
+                for entry in &target[common..] {
+                    self.record(entry.epoch, entry.start_offset)?;
+                }
+            } else {
+                // Entries must come out, and some of what follows them may
+                // have to go back in: a later epoch's start kept above the
+                // leader's entries (#648 review). Truncating and re-appending
+                // is two durable steps, and a crash between them lost that
+                // start, filing its records under the lineage's epoch. The
+                // whole new journal replaces the old one in one rename.
+                self.replace_entries(&target)?;
             }
         }
         Ok(LineageFollow::Following { complete })
+    }
+
+    /// Replace the whole vector with `target`, atomically (#648 review):
+    /// written in full to `<journal>.rewrite`, fsynced, renamed over the
+    /// journal, and the directory fsynced, so a crash at any point leaves the
+    /// old journal or the new one, never a mix. The header keeps the version
+    /// it has, so #635's dispute gate is carried over unchanged.
+    ///
+    /// `target` must be a valid vector (epochs strictly increasing, starts
+    /// non-decreasing); its callers build it that way, and it is checked
+    /// before anything is written. A failure poisons the journal: past the
+    /// rename the open handle names the replaced file, and appending through
+    /// it would write nowhere the next open looks.
+    fn replace_entries(&mut self, target: &[EpochStart]) -> BrokerResult<()> {
+        if self.poisoned {
+            return Err(Self::corrupt(
+                "a previous write failed; this journal must be reopened before it is rewritten"
+                    .to_owned(),
+            ));
+        }
+        if target.len() > MAX_ENTRIES
+            || !target.windows(2).all(|pair| {
+                pair[1].epoch > pair[0].epoch && pair[1].start_offset >= pair[0].start_offset
+            })
+        {
+            return Err(Self::corrupt(format!(
+                "refusing to rewrite the journal with a vector that does not advance: \
+                 {target:?}"
+            )));
+        }
+        let version = if self.dispute_gate {
+            VERSION_DISPUTE_PENDING
+        } else {
+            VERSION
+        };
+        let mut bytes = Vec::with_capacity(HEADER_BYTES as usize + target.len() * ENTRY_BYTES);
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&version.to_be_bytes());
+        for entry in target {
+            bytes.extend_from_slice(&entry.epoch.to_be_bytes());
+            bytes.extend_from_slice(&entry.start_offset.to_be_bytes());
+        }
+        let scratch = rewrite_path(&self.path);
+        let replaced = self
+            .env
+            .storage
+            .open(&scratch, OpenMode::CreateAppend)
+            .and_then(|mut file| {
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+                file.write_all(&bytes)?;
+                file.sync_data()
+            })
+            .and_then(|()| self.env.storage.rename(&scratch, &self.path))
+            .map_err(|source| Self::io(&self.path, source))
+            .and_then(|()| Self::sync_parent(&self.env, &self.path))
+            .and_then(|()| {
+                let mut file = self
+                    .env
+                    .storage
+                    .open(&self.path, OpenMode::CreateAppend)
+                    .map_err(|source| Self::io(&self.path, source))?;
+                file.seek(SeekFrom::End(0))
+                    .map_err(|source| Self::io(&self.path, source))?;
+                Ok(file)
+            });
+        match replaced {
+            Ok(file) => {
+                self.file = file;
+                self.entries = target.to_vec();
+                Ok(())
+            }
+            Err(problem) => {
+                self.poisoned = true;
+                Err(problem)
+            }
+        }
     }
 
     fn write_lineage(&mut self, lineage: Option<&LeaderLineage>) -> BrokerResult<()> {
@@ -1060,6 +1149,19 @@ impl FencingEpochJournal {
     fn corrupt(message: String) -> BrokerError {
         BrokerError::EpochJournalCorrupt(format!("fencing-epoch journal: {message}"))
     }
+}
+
+/// Where an atomic rewrite of the journal at `path` is staged before it is
+/// renamed over the journal (#648 review). One fixed name, so a crash before
+/// the rename leaves at most this one file, which the next rewrite truncates
+/// and reuses; range discovery ignores names it does not recognise.
+fn rewrite_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".rewrite");
+    path.with_file_name(name)
 }
 
 /// Where the lineage sidecar of the journal at `path` lives.
@@ -2471,5 +2573,79 @@ mod tests {
             starts(&[(18, 0)]).as_slice(),
             "the journal itself still opens"
         );
+    }
+
+    /// #648 review (Codex 4533824123): re-deriving the journal from a
+    /// lineage can have to insert entries BELOW one it keeps. The replica
+    /// adopted 21 at 12 while it still held records of the lineage of 20,
+    /// whose leader began 20 at 10, so the journal goes from
+    /// `[(18,0),(21,12)]` to `[(18,0),(20,10),(21,12)]`. Truncating and then
+    /// re-appending made that two durable steps, and a crash between them
+    /// left `[(18,0)]`: epoch 21's start was gone, and the next open filed
+    /// 12..14 under 20. Every crash point, before any operation of the
+    /// rewrite and inside every write at every byte, must read back the old
+    /// journal or the new one, and 12 and 13 must stay epoch 21's.
+    #[test]
+    fn a_crash_anywhere_in_a_lineage_rewrite_reads_back_old_or_new() {
+        use vtop_log::sim::{FaultPlan, SimStorage, TraceKind};
+        const PATH: &str = "/node/fencing-epochs";
+        let old = starts(&[(18, 0), (21, 12)]);
+        let new = starts(&[(18, 0), (20, 10), (21, 12)]);
+        let open_sim = |env: &Env| FencingEpochJournal::open_in(env, PathBuf::from(PATH));
+        let base = {
+            let sim = SimStorage::new();
+            sim.create_dir_all(Path::new("/node"));
+            let mut j = open_sim(&sim.env(1)).unwrap();
+            j.record(18, 0).unwrap();
+            assert!(j
+                .take_leader_lineage(20, &starts(&[(18, 0), (20, 10)]), 5, 0)
+                .unwrap());
+            j.record_adoption(21, 12).unwrap();
+            assert_eq!(j.entries(), old.as_slice());
+            sim.snapshot()
+        };
+        let clean = SimStorage::new();
+        clean.restore(&base);
+        let mut j = open_sim(&clean.env(1)).unwrap();
+        let opened = clean.op_count();
+        j.follow_held_leader_lineage(14).unwrap();
+        assert_eq!(j.entries(), new.as_slice(), "precondition: the rewrite");
+        let total = clean.op_count();
+        let mut plans: Vec<FaultPlan> = (opened..total).map(FaultPlan::CrashBefore).collect();
+        for entry in clean
+            .trace()
+            .into_iter()
+            .filter(|entry| entry.kind == TraceKind::HandleWrite && entry.index >= opened)
+        {
+            for cut in 0..=entry.len as usize {
+                plans.push(FaultPlan::CrashDuringWrite {
+                    op: entry.index,
+                    byte_cut: cut,
+                });
+            }
+        }
+        assert!(!plans.is_empty());
+        for plan in plans {
+            let sim = SimStorage::new();
+            sim.restore(&base);
+            let env = sim.env(1);
+            let mut j = open_sim(&env).unwrap();
+            sim.set_fault(plan);
+            let acked = j.follow_held_leader_lineage(14).is_ok();
+            drop(j);
+            sim.reboot();
+            let reopened = open_sim(&env)
+                .unwrap_or_else(|error| panic!("{plan:?}: the journal refused to reopen: {error}"));
+            let read = reopened.entries().to_vec();
+            assert!(
+                read == old || read == new,
+                "{plan:?}: read back {read:?}, neither the old {old:?} nor the new {new:?}"
+            );
+            assert_eq!(reopened.epoch_owning(12), Some(21), "{plan:?}");
+            assert_eq!(reopened.epoch_owning(13), Some(21), "{plan:?}");
+            if acked {
+                assert_eq!(read, new, "{plan:?}: an acked rewrite was lost");
+            }
+        }
     }
 }
