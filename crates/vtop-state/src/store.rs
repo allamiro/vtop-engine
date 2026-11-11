@@ -194,6 +194,21 @@ pub trait StateStore: Send + Sync {
         lease_until: &str,
     ) -> Result<Vec<BatchRecord>, VtopError>;
 
+    /// Extend this process's lease on `batch_id` to `lease_until` (RFC3339),
+    /// if it still holds the claim: `true` when it does (the lease is
+    /// extended), `false` when it holds no claim on the row or another engine
+    /// has claimed it since (nothing is changed) (#624).
+    ///
+    /// ONE conditional write on the claim generation this process holds, so
+    /// it is atomic with any competing claim: whichever lands first wins. A
+    /// caller that is about to move a source for a row it has held a while
+    /// renews first - after a `true`, no other engine can claim the row until
+    /// the new lease runs out, so the move cannot race a new owner's re-read.
+    /// Detecting the lost claim at the ledger write AFTER the move is too
+    /// late: a source commit cannot be undone, and with `delete_after_commit`
+    /// it can delete the file.
+    async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError>;
+
     /// Highest committed `end_byte` per source path for a byte-offset source
     /// type (file / syslog spool), computed IN THE STORE.
     ///

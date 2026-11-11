@@ -1738,9 +1738,11 @@ impl Engine {
     /// it - the pass that produced it committed or gave up on it before
     /// returning. So no in-flight batch, of this engine or another, is ever
     /// touched: `claim_incomplete_batches` would claim this engine's own
-    /// in-flight rows. A row that another engine has claimed since (its lease
-    /// ran out) refuses the ledger write and is dropped here; that engine's
-    /// recovery commits it.
+    /// in-flight rows. A row can outlive its lease, so the claim is renewed -
+    /// fenced, in one write - before the source is touched (review of #624);
+    /// a refused renewal means another engine owns the row now, and it is
+    /// dropped here without moving the source; that engine's recovery
+    /// commits it.
     ///
     /// - A row recovery held back waits until its source has committed past
     ///   its END - by then the re-read below it has archived and committed its
@@ -1795,6 +1797,29 @@ impl Engine {
             )
         {
             return false;
+        }
+        // Renew the claim, fenced, BEFORE the source is touched (review of
+        // #624). The row may have been held for longer than its lease, and an
+        // engine that claimed it since may be about to re-read a range below
+        // it; moving the source now would clamp that re-read, or with
+        // `delete_after_commit` delete the file. A refusal at the ledger write
+        // afterwards comes too late to undo either. After a renewal no other
+        // engine can claim the row until the new lease runs out.
+        let lease_until = (Utc::now() + chrono::Duration::seconds(LEASE_TTL_SECS)).to_rfc3339();
+        match self.store.renew_claim(&rec.batch_id, &lease_until).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    batch_id = %rec.batch_id,
+                    "an uncommitted VERIFIED row is no longer this engine's (another engine claimed it); \
+                     its new owner commits it"
+                );
+                return true;
+            }
+            Err(e) => {
+                tracing::warn!(batch_id = %rec.batch_id, error = %e, "could not renew the claim on an uncommitted VERIFIED row; retried after the next pass");
+                return false;
+            }
         }
         if let Err(e) = adapter.commit_progress(&rec.progress_end).await {
             tracing::warn!(batch_id = %rec.batch_id, error = %e, "source commit still failing; retried after the next pass");
@@ -4831,6 +4856,9 @@ mod tests {
                 .claim_incomplete_batches(owner, now, lease_until)
                 .await
         }
+        async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError> {
+            self.inner.renew_claim(batch_id, lease_until).await
+        }
         async fn max_committed_end_bytes(
             &self,
             source_type: SourceType,
@@ -5281,6 +5309,123 @@ mod tests {
             counter("verified_total") - verified_before,
             commits,
             "commits_total ran ahead of verified_total: the settled row's verification was not counted"
+        );
+    }
+
+    /// Counts the source commits that reach the real adapter.
+    struct CountsCommits {
+        inner: Box<dyn SourceAdapter>,
+        failures: usize,
+        reached: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SourceAdapter for CountsCommits {
+        async fn discover_sources(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
+            self.inner.discover_sources().await
+        }
+        async fn read_batch_candidates(
+            &mut self,
+            source: &DiscoveredSource,
+            max_records: usize,
+            max_bytes: usize,
+            max_wait: Duration,
+        ) -> Result<Vec<ReadResult>, VtopError> {
+            self.inner
+                .read_batch_candidates(source, max_records, max_bytes, max_wait)
+                .await
+        }
+        async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            if self.failures > 0 {
+                self.failures -= 1;
+                return Err(VtopError::Source("source commit refused".into()));
+            }
+            self.reached.fetch_add(1, Ordering::SeqCst);
+            self.inner.commit_progress(marker).await
+        }
+        async fn replay_from_marker(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            self.inner.replay_from_marker(marker).await
+        }
+        fn committed_through(&self, marker: &ProgressMarker) -> Option<i128> {
+            self.inner.committed_through(marker)
+        }
+        fn source_type(&self) -> SourceType {
+            self.inner.source_type()
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self.inner.as_any_mut()
+        }
+    }
+
+    /// #624 (review, P1): a row this process left uncommitted can be claimed
+    /// by another engine once its lease runs out - and that engine may be
+    /// about to re-read a range below it. Settling must not move the source
+    /// for it: a commit moves the committed point, and with
+    /// `delete_after_commit` can delete the file. Detecting the lost claim at
+    /// the ledger write afterwards is too late, so the claim is renewed,
+    /// fenced, BEFORE the source is touched; a refused renewal drops the row.
+    #[tokio::test]
+    async fn a_row_another_engine_has_claimed_is_never_committed_to_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\n").unwrap();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            &url,
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 3_600;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let reached = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inner = engine.adapters.remove(&SourceType::File).unwrap();
+        engine.adapters.insert(
+            SourceType::File,
+            Box::new(CountsCommits {
+                inner,
+                failures: 1,
+                reached: reached.clone(),
+            }),
+        );
+        let first = engine.run_source(SourceType::File, true).await.unwrap();
+        assert!(!first[0].committed, "{first:?}");
+
+        // The lease runs out and another engine claims the row.
+        let other = vtop_state::SqliteStateStore::connect(&url).await.unwrap();
+        let later = Utc::now() + chrono::Duration::days(1);
+        let claimed = other
+            .claim_incomplete_batches(
+                "engine-b",
+                &later.to_rfc3339(),
+                &(later + chrono::Duration::days(1)).to_rfc3339(),
+            )
+            .await
+            .unwrap();
+        assert!(claimed.iter().any(|r| r.batch_id == first[0].batch_id));
+
+        engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            0,
+            "the source was committed for a row another engine has claimed"
+        );
+        assert_eq!(
+            engine
+                .store
+                .get_batch(&first[0].batch_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            BatchState::Verified,
+            "the new owner's row"
+        );
+        assert!(
+            engine.unsettled.is_empty(),
+            "a row claimed away is dropped, not retried for ever"
         );
     }
 

@@ -200,6 +200,75 @@ pub async fn run_fencing_battery(a: &dyn StateStore, b: &dyn StateStore) {
         .await
         .unwrap();
 
+    // 3b. #624 (review): before the running engine moves a source for a row
+    //     it has held a while, it renews its claim - fenced, in one write - so
+    //     the row cannot be claimed away between the check and the move. A
+    //     process that still holds the row extends its lease; one whose claim
+    //     moved on is told so and changes nothing.
+    a.save_batch_state(&batch("fence-renew", "engine-a"))
+        .await
+        .unwrap();
+    a.update_batch_state("fence-renew", BatchState::Sealed, &patch)
+        .await
+        .unwrap();
+    assert!(
+        a.renew_claim("fence-renew", LATER).await.unwrap(),
+        "the creator holds its row and renews the claim"
+    );
+    assert_eq!(
+        a.get_batch("fence-renew")
+            .await
+            .unwrap()
+            .unwrap()
+            .lease_expires_at
+            .as_deref()
+            .map(|at| chrono::DateTime::parse_from_rfc3339(at).unwrap()),
+        Some(chrono::DateTime::parse_from_rfc3339(LATER).unwrap()),
+        "the renewal extends the lease"
+    );
+    // A renewed lease is live: B cannot claim the row before it runs out...
+    let claimed = b
+        .claim_incomplete_batches("engine-b", NOW, LATER)
+        .await
+        .unwrap();
+    assert!(
+        !claimed.iter().any(|r| r.batch_id == "fence-renew"),
+        "a row whose claim was just renewed was claimed away"
+    );
+    // ...and once it has, the old holder's renewal is refused.
+    let after = "2200-01-01T00:00:00+00:00";
+    let claimed = b
+        .claim_incomplete_batches("engine-b", after, "2300-01-01T00:00:00+00:00")
+        .await
+        .unwrap();
+    assert!(claimed.iter().any(|r| r.batch_id == "fence-renew"));
+    let before = b.get_batch("fence-renew").await.unwrap().unwrap();
+    assert!(
+        !a.renew_claim("fence-renew", "2400-01-01T00:00:00+00:00")
+            .await
+            .unwrap(),
+        "a process whose claim moved on renewed it"
+    );
+    assert_eq!(
+        b.get_batch("fence-renew")
+            .await
+            .unwrap()
+            .unwrap()
+            .lease_expires_at,
+        before.lease_expires_at,
+        "a refused renewal changed the new owner's lease"
+    );
+    assert!(
+        b.renew_claim("fence-renew", "2400-01-01T00:00:00+00:00")
+            .await
+            .unwrap(),
+        "the new owner holds it"
+    );
+    assert!(
+        !a.renew_claim("no-such-batch", LATER).await.unwrap(),
+        "nothing is held for a row that does not exist"
+    );
+
     // 4. A committed batch is finished: no claim, no fence.
     a.save_batch_state(&batch("fence-done", "engine-a"))
         .await
