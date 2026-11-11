@@ -37,6 +37,9 @@
 # (its own copy lands first, so a kill can leave one in-flight batch there),
 # nothing fences it and no quorum forms: that is #641. The scenario then
 # exits 77 (SKIP) after the #611 check, saying so; it never reports PASS.
+# Likewise when C comes back holding every acknowledged record (the
+# producer's acknowledged floor trails what the leader has already sent):
+# the #611 shape was not reached, and the scenario says so and exits 77.
 # It also reports whether C's probe was refused by R's answer (the #611
 # path proper) or missed its quorum.
 #
@@ -47,6 +50,41 @@
 # least one batch) bounds the suffix acknowledged before L dies, chosen in
 # [BATCH, SUFFIX_MAX].
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
+
+# METADATA LEADERSHIP MAY MOVE, so everything here follows it. This scenario
+# keeps a loaded host busy (three data nodes, a producer, two kills and a
+# freeze), and two early runs (seeds 604 and 609) saw the metadata leader
+# change mid-scenario. With the library's single `admin_endpoint`, every lease
+# agent then asked the former leader forever ("not the metadata leader; it
+# named node 2") and no candidate could take the range: a harness limit, not
+# the protocol under test. Scenario-local overrides, so the other scenarios'
+# configs stay exactly as they are:
+#   * candidates get `lease.admin_peers` for all three metadata nodes, which
+#     is how a lease agent follows a redirect (#292);
+#   * lease reads try the named node first, then the other two.
+emit_lease_yaml() {
+  local id="$1" cert="${2:-data-1}" m
+  echo "lease:"
+  echo "  admin_endpoint: \"$(meta_host "$id"):$(meta_admin_port "$id")\""
+  echo "  server_name: \"localhost\""
+  echo "  topic_uuid: $TOPIC_UUID"
+  echo "  tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
+  echo "  lease_duration_ms: $LEASE_DURATION_MS"
+  echo "  renew_interval_ms: $LEASE_RENEW_MS"
+  echo "  poll_interval_ms: $LEASE_POLL_MS"
+  echo "  admin_peers:"
+  for m in 1 2 3; do
+    echo "    - { node_id: $m, endpoint: \"$(meta_host "$m"):$(meta_admin_port "$m")\" }"
+  done
+}
+eval "lib_$(declare -f lease_field)"
+lease_field() { # <meta-id> <python expression over `d`>
+  local id="$1" expr="$2" m
+  for m in "$id" 1 2 3; do
+    lib_lease_field "$m" "$expr" && return 0
+  done
+  return 1
+}
 
 # v2: every promotion appends a boundary marker, as in scenario 14.
 export CHAOS_SEGMENT_FORMAT=v2
@@ -135,7 +173,21 @@ them by L and R alone; R=$R frozen"
 
 # --- 4. C is the only candidate that can take the lease ----------------------
 PIDS[C]=$(start_candidate "$C" "$LEADER_ID")
-log "C=$C restarted from its own directory"
+C_NEXT="$(sed -n 's/.*segment_recovered report=.*next_offset: \([0-9]*\).*/\1/p' \
+  "$WORKDIR/logs/data-candidate-$C.log" | tail -1)"
+log "C=$C restarted from its own directory holding ${C_NEXT:-?} records"
+# The acknowledged floor the producer writes trails what the leader has
+# already sent, so C can die holding records acknowledged after it (seed 701
+# did: C came back with all 300). Then C lacks nothing, may legitimately
+# lead, and the #611 shape was not reached: reported, never a PASS. One
+# boundary marker per promoted epoch sits in the log beside the records.
+if [[ -n "$C_NEXT" && "$C_NEXT" -ge $((ACKED + EPOCH)) ]]; then
+  log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_next=$C_NEXT \
+serving=none (shape not reached)"
+  log "SKIP: C came back holding every one of the $ACKED acknowledged records; the #611 \
+shape (C lacking acknowledged records) was not reached"
+  exit 77
+fi
 C_EPOCH="$(await_lease_holder "$LEADER_ID" "$C_UUID" \
   $((LEASE_DURATION_MS / 1000 + ELECTION_TIMEOUT_SECONDS)))"
 # --- 5. R answers C's fence ------------------------------------------------
@@ -184,7 +236,7 @@ if [[ -n "$L_NEXT" && -n "$R_NEXT" && "$L_NEXT" -gt "$R_NEXT" ]]; then
   # them, so R cannot reach a quorum with L, and C is behind (#341). The
   # #611 claim above has been checked; the read-back cannot run without a
   # published mark. Exit 77 is reported as SKIP by run-all.sh, never PASS.
-  log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_epoch=$C_EPOCH \
+  log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_next=${C_NEXT:-?} c_epoch=$C_EPOCH \
 c_refused_by_r=$REFUSED r_epoch=$R_EPOCH r_next=$R_NEXT l_next=$L_NEXT serving=none (#641)"
   log "SKIP: L returned holding $((L_NEXT - R_NEXT)) unacknowledged record(s) past R's tail \
 and is never fenced (#641); no quorum can form until it is"
@@ -222,6 +274,6 @@ CHAOS_MAX_OFFSET_GAPS="$SERVING_EPOCH" \
   "$(candidate_native_addr "$SERVING")" "$ACKED" "$ACKED"
 log "all $ACKED acknowledged records read back byte-exact from candidate $SERVING"
 
-log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_epoch=$C_EPOCH \
+log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_next=${C_NEXT:-?} c_epoch=$C_EPOCH \
 c_refused_by_r=$REFUSED r_epoch=$R_EPOCH r_next=${R_NEXT:-?} l_next=${L_NEXT:-?} \
 serving=$SERVING serving_epoch=$SERVING_EPOCH"
