@@ -272,9 +272,12 @@ impl ReplicaPeerHandler for InProcessFollower {
                 "replica status range identity does not match this follower".to_owned(),
             ));
         }
+        // Capped at a kept dispute's start (#611, #616 review): the leader
+        // prunes its reconnect buffer by this answer.
+        let (local_committed_offset, next_offset) = self.replication_status();
         Ok(ReplicaStatusResponse {
-            local_committed_offset: self.local_committed_offset(),
-            next_offset: self.next_offset(),
+            local_committed_offset,
+            next_offset,
         })
     }
 

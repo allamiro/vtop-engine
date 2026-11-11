@@ -14,6 +14,7 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
+use vtop_broker::fencing_epochs::{EpochStart, FencingEpochJournal};
 use vtop_broker::group_commit::GroupCommitConfig;
 use vtop_broker::memory_budget::{MemoryBudgetConfig, MemoryBudgetPool};
 use vtop_broker::replication::{
@@ -144,6 +145,56 @@ impl ReplicaPeerHandler for SlowFollower {
     }
 }
 
+/// Follower 1 behind a gate: while `down`, it refuses appends and
+/// high-water marks as an overloaded replica would, but still answers the
+/// reconnect status probe (#616 review). That pins the order a real
+/// reconnect produces: the status probe prunes the leader's buffer BEFORE
+/// the replica sees the new leader's mark.
+struct GatedFollower {
+    inner: Arc<InProcessFollower>,
+    down: Arc<AtomicBool>,
+}
+
+impl GatedFollower {
+    fn refuse(&self) -> Result<(), (ErrorCode, String)> {
+        if self.down.load(Ordering::SeqCst) {
+            return Err((ErrorCode::Overloaded, "gated down by the test".to_owned()));
+        }
+        Ok(())
+    }
+}
+
+impl ReplicaPeerHandler for GatedFollower {
+    fn node_id(&self) -> Uuid {
+        self.inner.node_id()
+    }
+
+    fn apply_append(
+        &self,
+        request: &ReplicaAppendRequest,
+    ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+        self.refuse()?;
+        self.inner.apply_append(request)
+    }
+
+    fn apply_append_batch(
+        &self,
+        requests: &[ReplicaAppendRequest],
+    ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+        self.refuse()?;
+        self.inner.apply_append_batch(requests)
+    }
+
+    fn observe_hwm(&self, update: &CommittedHwmUpdate) -> Result<(), (ErrorCode, String)> {
+        self.refuse()?;
+        self.inner.observe_hwm(update)
+    }
+
+    fn status(&self, range: &RangeIdentity) -> Result<ReplicaStatusResponse, (ErrorCode, String)> {
+        self.inner.status(range)
+    }
+}
+
 impl SlowFollower {
     fn block(&self) {
         if self.hold.load(Ordering::SeqCst) {
@@ -210,6 +261,24 @@ fn harness_with(
     memory: Option<Arc<MemoryBudgetPool>>,
     followers_by_name: FollowerAddressing,
 ) -> NetworkHarness {
+    harness_with_gate(
+        flow,
+        group_commit,
+        slow_follower2,
+        memory,
+        followers_by_name,
+        None,
+    )
+}
+
+fn harness_with_gate(
+    flow: FlowControlConfig,
+    group_commit: Option<GroupCommitConfig>,
+    slow_follower2: Option<(Duration, Arc<AtomicBool>)>,
+    memory: Option<Arc<MemoryBudgetPool>>,
+    followers_by_name: FollowerAddressing,
+    gate_follower1: Option<Arc<AtomicBool>>,
+) -> NetworkHarness {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -262,6 +331,11 @@ fn harness_with(
             } else {
                 Arc::clone(&follower) as Arc<dyn ReplicaPeerHandler>
             }
+        } else if let Some(down) = gate_follower1.clone() {
+            Arc::new(GatedFollower {
+                inner: Arc::clone(&follower),
+                down,
+            })
         } else {
             Arc::clone(&follower) as Arc<dyn ReplicaPeerHandler>
         };
@@ -731,5 +805,148 @@ fn a_follower_configured_by_name_is_reached_at_the_address_the_name_holds_now() 
     assert!(
         await_within(Duration::from_secs(5), || h.cluster_committed.get() == 2),
         "a follower configured by name must keep acknowledging across a reconnect"
+    );
+}
+
+/// Produce under `fencing_epoch` (the helpers above pin the harness's
+/// original epoch). A retryable refusal is retried within a deadline: the
+/// quorum wait is short and every test in this file shares the CPU, and a
+/// retry of the same producer sequence is idempotent.
+fn produce_at(broker: &LocalBroker, range: RangeIdentity, epoch: u64, sequence: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let mut frame = produce_frame(
+            range.clone(),
+            sequence,
+            sequence + 1,
+            WireDurability::Quorum,
+        );
+        if let Message::ProduceRequest(request) = &mut frame.message {
+            request.fencing_epoch = epoch;
+        }
+        match broker.handle(Role::Producer, frame).message {
+            Message::ProduceResponse(_) => return,
+            Message::Error(ErrorResponse {
+                retryable: true, ..
+            }) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            other => panic!(
+                "produce at epoch {epoch}, sequence {sequence}, attempt {attempts}: {other:?}"
+            ),
+        }
+    }
+}
+
+/// #616 review (codex P1). An outvoted follower keeps a disputed suffix
+/// through the fence (#611), then reconnects. The reconnect status probe
+/// prunes the leader's retransmission buffer by the offset the follower
+/// reports, and that happens BEFORE the follower sees the new leader's
+/// high-water mark. Reported including the kept suffix, the new leader's
+/// record at the suffix's start counted as already covered and was
+/// dropped. The mark then discarded the suffix, nothing re-sent the
+/// dropped record, and every later append failed its base-offset check:
+/// the follower was stranded at the dispute's start.
+///
+/// Invariant (liveness, after the fault clears): the follower catches up to
+/// the leader's log through the ordinary retransmission path.
+#[test]
+fn a_follower_reconnecting_with_a_kept_suffix_still_receives_the_new_leaders_records() {
+    let flow = FlowControlConfig {
+        reconnect_backoff: Duration::from_millis(20),
+        ack_timeout: Duration::from_millis(500),
+        ..FlowControlConfig::default()
+    };
+    let down = Arc::new(AtomicBool::new(false));
+    let h = harness_with_gate(
+        flow,
+        None,
+        None,
+        None,
+        FollowerAddressing::Resolved,
+        Some(Arc::clone(&down)),
+    );
+    let disputed = Arc::clone(&h.followers[0]);
+    let journal_dir = tempfile::tempdir().unwrap();
+    let mut journal = FencingEpochJournal::open(journal_dir.path().join("fencing-epochs")).unwrap();
+    journal.record(FENCING_EPOCH, 0).unwrap();
+    disputed.set_fencing_epoch_journal(journal);
+
+    for sequence in 0..5 {
+        let _ = produce_ok(&h.leader, h.range.clone(), sequence);
+    }
+    assert!(
+        await_within(Duration::from_secs(5), || {
+            disputed.local_committed_offset() == 5
+        }),
+        "precondition: follower 1 holds the committed prefix"
+    );
+    // The deposed leadership wrote 5..10 to follower 1 alone.
+    for offset in 5..10 {
+        disputed
+            .apply_append(&ReplicaAppendRequest {
+                range: h.range.clone(),
+                fencing_epoch: FENCING_EPOCH,
+                leader_node_id: Uuid::from_u128(0xA0),
+                expected_base_offset: offset,
+                producer_id: Uuid::from_u128(0xB2),
+                producer_epoch: 1,
+                first_sequence: offset - 5,
+                records: vec![ProduceRecord {
+                    timestamp_millis: 1_000,
+                    key: b"k".to_vec(),
+                    value: format!("deposed-{offset}").into_bytes(),
+                }],
+            })
+            .unwrap();
+    }
+
+    // The leader wins the next epoch with its tail at 5; follower 1 keeps
+    // 5..10 through the fence, and follower 2 is the majority's other vote.
+    let epoch = FENCING_EPOCH + 1;
+    h.meta.set(epoch);
+    h.leader.adopt_fencing_epoch(epoch);
+    h.followers[1].adopt_fencing_epoch(epoch);
+    let fenced = disputed
+        .fence(
+            epoch,
+            &[
+                EpochStart {
+                    epoch: FENCING_EPOCH,
+                    start_offset: 0,
+                },
+                EpochStart {
+                    epoch,
+                    start_offset: 5,
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!((fenced.truncated_records, fenced.next_offset), (0, 10));
+
+    // Follower 1 drops off while the new leader commits its record at 5 on
+    // the leader and follower 2. The refused batch sends follower 1's
+    // session through the reconnect status probe.
+    down.store(true, Ordering::SeqCst);
+    produce_at(&h.leader, h.range.clone(), epoch, 5);
+    assert!(
+        await_within(Duration::from_secs(5), || h.cluster_committed.get() == 6),
+        "the leader committed its record at 5 on the majority"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    down.store(false, Ordering::SeqCst);
+    produce_at(&h.leader, h.range.clone(), epoch, 6);
+
+    let caught_up = await_within(Duration::from_secs(5), || {
+        disputed.local_committed_offset() == 7
+    });
+    assert!(
+        caught_up,
+        "follower 1 never caught up after reconnecting with its kept suffix: it holds \
+         {} record(s) (committed {}), the leader 7",
+        disputed.next_offset(),
+        disputed.local_committed_offset()
     );
 }
