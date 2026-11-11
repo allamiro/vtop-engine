@@ -288,6 +288,29 @@ impl FencingEpochJournal {
         self.record(epoch, start_offset)
     }
 
+    /// Make this replica's log the range's history on an operator's word
+    /// (#636): after metadata recorded a promotion made under an attestation
+    /// naming this replica, a journal that is EMPTY over a log with records
+    /// gets `(epoch, 0)` - every record it holds owned by the attested epoch.
+    ///
+    /// The one place a first entry below the tail is written without a
+    /// history to copy, and the exception [`Self::record_adoption`] refuses
+    /// everywhere else: without proof, such an entry is ignorance dressed as
+    /// history. Here it is the operator's statement, recorded in metadata,
+    /// and it is what makes the override recover anything - without it the
+    /// promoted replica still has no history, repair from it installs none,
+    /// and the next failover refuses again with the attestation used up.
+    ///
+    /// A journal that already holds a history is left as it is (`Ok(false)`):
+    /// the override never rewrites a history that exists.
+    pub fn seed_attested_history(&mut self, epoch: u64) -> BrokerResult<bool> {
+        if !self.entries.is_empty() {
+            return Ok(false);
+        }
+        self.record(epoch, 0)?;
+        Ok(true)
+    }
+
     /// Record that `epoch` begins at `start_offset` on this replica.
     ///
     /// Idempotent for an epoch already recorded, so a replica that re-observes
@@ -861,6 +884,42 @@ mod tests {
                 start_offset,
             })
             .collect()
+    }
+
+    /// #636: an attested promotion makes the promoted replica's log the
+    /// range's history. A replica holding records with NO history gets one:
+    /// its whole log owned by the attested epoch from offset 0, durably, so
+    /// it survives a reopen and repair can install it on the others. A
+    /// replica that already has a history keeps it untouched: the override
+    /// never rewrites a history that exists.
+    #[test]
+    fn an_attested_promotion_seeds_a_history_only_where_there_is_none() {
+        let dir = TempDir::new().unwrap();
+        let mut empty = journal(&dir);
+        // What adoption does over a log with records and no history: nothing.
+        empty.record_adoption(7, 500).unwrap();
+        assert!(empty.entries().is_empty());
+        assert!(
+            empty.seed_attested_history(7).unwrap(),
+            "nothing was seeded"
+        );
+        assert_eq!(empty.entries(), starts(&[(7, 0)]).as_slice());
+        // The adoption at the tail that follows is the no-op it should be.
+        empty.record_adoption(7, 500).unwrap();
+        assert_eq!(empty.entries(), starts(&[(7, 0)]).as_slice());
+        drop(empty);
+        assert_eq!(
+            journal(&dir).entries(),
+            starts(&[(7, 0)]).as_slice(),
+            "the seeded history did not survive a reopen"
+        );
+
+        let other = TempDir::new().unwrap();
+        let mut known = journal(&other);
+        known.record(3, 0).unwrap();
+        known.record(5, 40).unwrap();
+        assert!(!known.seed_attested_history(7).unwrap());
+        assert_eq!(known.entries(), starts(&[(3, 0), (5, 40)]).as_slice());
     }
 
     fn header_version(dir: &TempDir) -> u16 {

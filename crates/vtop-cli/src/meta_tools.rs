@@ -3341,7 +3341,14 @@ fn transition_json(view: &AdminTransitionView, record: &TransitionAudit) -> serd
                     // Absent for a record without verdicts (#577), so a
                     // consumer cannot mistake "not recorded" for a verdict.
                     if let Some(lineage) = answer.lineage {
-                        json["lineage"] = serde_json::json!(lineage_word(lineage));
+                        // Counted under an attestation (#636): the same
+                        // label the text listing uses, never "not counted".
+                        json["lineage"] = match lineage {
+                            vtop_meta::AnswerLineage::Unknown if attestation.is_some() => {
+                                serde_json::json!("unknown-counted-attested")
+                            }
+                            _ => serde_json::json!(lineage_word(lineage)),
+                        };
                         json["counted"] =
                             serde_json::json!(answer.counts() || attestation.is_some());
                         if let vtop_meta::AnswerLineage::Reconciled { truncated_records } = lineage {
@@ -3489,6 +3496,10 @@ mod tests {
         let json = transition_json(&views[0], &audit.records[0]);
         assert_eq!(json["outcome"]["attestation"]["operator"], "oncall");
         assert_eq!(json["outcome"]["quorum"][0]["counted"], true);
+        assert_eq!(
+            json["outcome"]["quorum"][0]["lineage"], "unknown-counted-attested",
+            "a counted answer must not be labelled not counted"
+        );
 
         // The same record without its attestation is the #577 shape: the
         // Unknown answers are not counted, and three votes do not recompute.

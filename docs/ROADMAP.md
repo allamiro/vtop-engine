@@ -219,16 +219,21 @@ reopen quietly.
   lost on every replica) cannot promote, and repair cannot fix it, since a
   history-less source has nothing to install; and a
   replica whose only dispute is below its retained base (#408) is not
-  counted. #636 makes that refusal visible as its own reason
-  (`lineage_unproven`: a data-node log field and metric, and at feature
-  level 8 `Refused{LineageUnproven}` in the transition record) and adds the
-  one way out, after restore from backup: `vtopctl node promote-unproven`
-  records an operator's attestation naming the replica whose log becomes
-  canonical. Only that replica, at its next promotion, counts Unknown
-  answers; metadata records the promotion only while the attestation is
-  live and names its holder, and uses it up in the same apply. It is never
-  automatic, and every record the named replica does not hold may be lost
-  (PRODUCTION_HA.md). The verdicts are recorded with the quorum and the replica-set gate
+  counted. In both cases the promotion is refused when the answers whose
+  lineage was proven fall short of a majority of the replica set, however
+  many Unknown answers there are. #636 gives that refusal its own reason,
+  `lineage_unproven` (a data-node log field and metric at once; in the
+  transition record `Refused{LineageUnproven}` from feature level 8, and
+  `Refused{QuorumUnavailable}` as before below it), and adds the one way out
+  after restore from backup, at feature level 8: `vtopctl node
+  promote-unproven` records an operator's attestation naming the replica
+  whose log becomes canonical. Only that replica, at its next promotion,
+  counts Unknown answers; metadata records the promotion only while the
+  attestation is live, names its holder and is for the range's current
+  epoch, and uses it up in the same apply. The promoted replica's whole log
+  then becomes its epoch history, so repair can install it on the others.
+  It is never automatic, and every record the named replica does not hold
+  may be lost (PRODUCTION_HA.md). The verdicts are recorded with the quorum and the replica-set gate
   and `vtopctl meta transitions` count only the proven answers. Recording
   them is a new outcome tag inside the promotion report, so it is gated at
   feature level 6: below it (or against a metadata tier that predates

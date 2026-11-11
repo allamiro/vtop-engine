@@ -1144,11 +1144,24 @@ Short procedures now; expand into a full ops runbook before go-live.
   other replicas hold at the SAME offsets with different content (an
   offset is a count, not an identity, and without epoch history nothing
   tells them apart). Records a producer was told were acknowledged can be
-  among them. After the promotion, the promoted replica has epoch history
-  again: repair every other replica from it (`vtopctl node repair --from
-  <promoted replica>`) so none keeps records the new history does not
-  contain, and expect `vtop_broker_promotions_attested_total` to have moved
-  by one - alert on any increase.
+  among them. Once metadata records the promotion, the promoted replica's
+  whole log becomes its epoch history, under the promotion's epoch, so it can
+  prove its lineage at the next failover. Repair every other replica from it
+  so none keeps records that history does not contain, one stopped replica
+  at a time:
+
+  ```bash
+  # stop the replica's data node first; repair refuses a live range
+  vtopctl node repair --config node-client.yaml \
+    --from <promoted replica> --into <the stopped replica's data dir> \
+    --fencing-epoch <the range's current epoch> --seal-tail
+  # then start the replica again
+  ```
+
+  (`--fencing-epoch` is the epoch metadata granted the promoted replica:
+  `vtopctl meta transitions` shows it as the last `ATTESTED` line.) Expect
+  `vtop_broker_promotions_attested_total` to have moved by one, and alert on
+  any increase.
 
   Needs metadata feature level 8: upgrade every metadata voter and every
   data node, then `vtopctl meta enable-features --level 8`. Level 8 sits

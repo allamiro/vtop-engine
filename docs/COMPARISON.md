@@ -31,7 +31,7 @@ head-on.
 
 | Area | VTOP | Kafka |
 |---|---|---|
-| Leader election safety | Leadership is a metadata **lease**; acquisition mints `fencing_epoch + 1` through a linearizable Raft proposal, so the old leader is fenced **by construction**. There is no unclean-election knob to misconfigure: the only way to promote without proof is an explicit, single-use operator command that is recorded in the transition chain (`vtopctl node promote-unproven`, #636), for a range whose replicas have lost their epoch history. | ISR-based election; `unclean.leader.election.enable` exists and, when enabled (or mis-set), silently trades durability for availability. |
+| Leader election safety | Leadership is a metadata **lease**; acquisition mints `fencing_epoch + 1` through a linearizable Raft proposal, so the old leader is fenced **by construction**. There is no unclean-election knob to misconfigure: the only way to promote without proof is an explicit, single-use operator command that is recorded in the transition chain (`vtopctl node promote-unproven`, #636, metadata feature level 8), for a range whose lineage cannot be proven - for example records that predate the epoch journal, or journals lost, on every replica (see PRODUCTION_HA.md). | ISR-based election; `unclean.leader.election.enable` exists and, when enabled (or mis-set), silently trades durability for availability. |
 | End-to-end verifiability | Content roots per segment; sealed artifacts verified **offline and byte-exactly** (`vtopctl segment verify`); repair, retirement, and tiering commit only after **evidence** (`CommitReplacementProof`, `CommitTierEvidence`) with verifier identity and epoch recorded. These are metadata-log commits — distinct from the archive protocol's *source-progress* commit ([VTOP_PROTOCOL_DRAFT.md §3, §13](VTOP_PROTOCOL_DRAFT.md#13-commit-rule)). On the archive path, verification is graded strong / backend-limited / disabled (§17), with strong the default and non-strong commit requiring explicit opt-out. | Checksums protect against corruption in flight/at rest, but there is no end-to-end, third-party-re-verifiable proof chain for replicas, repairs, or tiered copies. |
 | Source-commit safety (archive path) | The commit rule ([§13](VTOP_PROTOCOL_DRAFT.md#13-commit-rule)): a Kafka offset / file cursor / spool position is never advanced until the object **and** its bound manifest are durably stored and verified; crash recovery is specified (§14) and replay never loses data. | `enable.auto.commit` and consumer-side offset management leave verify-before-commit discipline to each application. |
 | Determinism and test rigor | Pure deterministic metadata state machine (no serde, hand-coded bounded codecs, golden byte vectors); crash sweeps drive the exact production byte paths at every write boundary; mutation testing in CI; deterministic fault harness plus a 15-scenario live-chaos suite (kill -9, disk-full, fsync-EIO, partitions, clock skew, live failover, co-location, admin authorization, replica replacement, restart-free candidate failover). | Strong integration test culture, but replay determinism and byte-exact snapshot equivalence are not design invariants, and crash-point sweeps of the storage engine are not part of CI. |
@@ -88,8 +88,10 @@ Kafka pain points: fixed partitioning, coupled metadata, opaque rebalancing.
   describes strong consistency; VTOP additionally makes the fencing argument
   mechanical: epochs are minted by a linearizable state machine whose golden
   vectors and crash sweeps are in CI. The one unproven path is an explicit,
-  audited, single-use operator command for a range whose replicas have lost
-  their epoch history (#636), never a setting.
+  audited, single-use operator command for a range whose lineage cannot be
+  proven, such as records that predate the epoch journal, or journals lost,
+  on every replica (#636; needs metadata feature level 8, see
+  PRODUCTION_HA.md). It is never a setting.
 - **Auditable size.** A small, deterministic core that one person can read is
   a feature; it is also, honestly, a consequence of being early.
 

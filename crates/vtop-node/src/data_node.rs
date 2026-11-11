@@ -3314,6 +3314,17 @@ impl crate::lease_agent::CandidateLocalView for SwitchingLocalView {
             .and_then(|view| view.local_next_offset())
     }
 
+    fn adopt_attested_history(&self, fencing_epoch: u64) -> Result<bool, String> {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map_or(
+                Err("no role is installed to write the attested history to".to_owned()),
+                |view| view.adopt_attested_history(fencing_epoch),
+            )
+    }
+
     fn fence_for_probe(&self, fencing_epoch: u64) -> Result<u64, String> {
         // NO DELEGATE IS NO VOTE (review, #439). An empty slot is not an
         // empty log: the supervisor clears the old role before installing

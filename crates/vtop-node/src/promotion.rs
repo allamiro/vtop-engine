@@ -236,8 +236,9 @@ pub enum Promotion {
     /// A quorum answered; this is the boundary they can prove.
     Established {
         committed_offset: u64,
-        /// Replicas that answered with a proven lineage - the ones counted -
-        /// for the operator record.
+        /// Replicas that answered and were counted, for the operator
+        /// record: those with a proven lineage - and, under an operator's
+        /// attestation (#636), those whose lineage is Unknown too.
         answered: BTreeMap<Uuid, u64>,
         /// Replicas that answered but whose lineage could not be proven
         /// (#577): recorded, never counted. Empty under an operator's

@@ -1219,6 +1219,34 @@ impl LocalBroker {
         journal.truncate_to(next_offset.saturating_add(1)).is_ok()
     }
 
+    /// Make this replica's log the range's history on an operator's
+    /// attestation (#636): see
+    /// [`crate::fencing_epochs::FencingEpochJournal::seed_attested_history`].
+    /// Call it only once metadata has recorded a promotion of this replica
+    /// made under an attestation naming it.
+    pub fn adopt_attested_history(&self, epoch: u64) -> BrokerResult<bool> {
+        let mut guard = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+            return Err(BrokerError::EpochJournalCorrupt(
+                "this replica's epoch history is broken; an attested history cannot be written \
+                 over it"
+                    .to_owned(),
+            ));
+        }
+        let Some(journal) = guard.as_mut() else {
+            return Err(BrokerError::EpochJournalCorrupt(
+                "no epoch journal is attached to this replica".to_owned(),
+            ));
+        };
+        journal.seed_attested_history(epoch).inspect_err(|_| {
+            self.fencing_epoch_history_broken
+                .store(true, Ordering::SeqCst);
+        })
+    }
+
     /// This replica's epoch history.
     ///
     /// Empty means "no history you may reconcile against" — either none was

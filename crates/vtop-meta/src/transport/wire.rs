@@ -2667,6 +2667,50 @@ mod tests {
         ));
     }
 
+    /// #636: the attestation read round-trips its request and both shapes
+    /// of its answer, and refuses a bad presence flag and trailing bytes.
+    #[test]
+    fn promotion_attestation_read_round_trips() {
+        let request = AdminReadPromotionAttestationRequest {
+            topic_uuid: Uuid::from_u128(0x20),
+            range_uuid: Uuid::from_u128(0x21),
+        };
+        assert_eq!(
+            AdminReadPromotionAttestationRequest::decode(&request.encode()).unwrap(),
+            request
+        );
+        let none = AdminReadPromotionAttestationResponse {
+            range_found: true,
+            attestation: None,
+            read_at_applied_index: 9,
+        };
+        assert_eq!(
+            AdminReadPromotionAttestationResponse::decode(&none.encode().unwrap()).unwrap(),
+            none
+        );
+        let live = AdminReadPromotionAttestationResponse {
+            range_found: true,
+            attestation: Some(crate::command::PromotionAttestation {
+                attestation_id: Uuid::from_u128(0x636),
+                replica_node_uuid: Uuid::from_u128(0x10),
+                operator: "oncall".to_owned(),
+                attested_at_ms: 1_700_000_000_000,
+            }),
+            read_at_applied_index: 10,
+        };
+        let bytes = live.encode().unwrap();
+        assert_eq!(
+            AdminReadPromotionAttestationResponse::decode(&bytes).unwrap(),
+            live
+        );
+        let mut bad_flag = none.encode().unwrap();
+        bad_flag[1] = 7;
+        assert!(AdminReadPromotionAttestationResponse::decode(&bad_flag).is_err());
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(AdminReadPromotionAttestationResponse::decode(&trailing).is_err());
+    }
+
     #[test]
     fn range_replica_set_read_round_trips_and_bounds_its_members() {
         let request = AdminReadRangeReplicaSetRequest {

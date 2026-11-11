@@ -1028,6 +1028,33 @@ impl InProcessFollower {
         kept.map_or(offset, |dispute| offset.min(dispute.from))
     }
 
+    /// Make this replica's log the range's history on an operator's
+    /// attestation (#636), as [`crate::LocalBroker::adopt_attested_history`]
+    /// does: a candidate promotes while it is still this follower, and the
+    /// leader built after it reopens the same journal.
+    pub fn adopt_attested_history(&self, epoch: u64) -> crate::BrokerResult<bool> {
+        let mut guard = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+            return Err(crate::BrokerError::EpochJournalCorrupt(
+                "this replica's epoch history is broken; an attested history cannot be written \
+                 over it"
+                    .to_owned(),
+            ));
+        }
+        let Some(journal) = guard.as_mut() else {
+            return Err(crate::BrokerError::EpochJournalCorrupt(
+                "no epoch journal is attached to this replica".to_owned(),
+            ));
+        };
+        journal.seed_attested_history(epoch).inspect_err(|_| {
+            self.fencing_epoch_history_broken
+                .store(true, Ordering::SeqCst);
+        })
+    }
+
     /// This replica's epoch history; empty means "unknown", never "no changes".
     pub fn epoch_starts(&self) -> Vec<crate::fencing_epochs::EpochStart> {
         // Flag read UNDER the lock; see LocalBroker::epoch_starts.

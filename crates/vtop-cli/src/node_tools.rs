@@ -121,6 +121,10 @@ pub enum NodeCommand {
         /// Required: the statement that records not on --replica may be lost.
         #[arg(long)]
         i_accept_data_loss: bool,
+        /// The attestation's id [default: a new one, printed on stderr]. A
+        /// run that timed out may or may not have been recorded: retry it
+        /// with the SAME --request-id, so metadata answers the first one
+        /// instead of recording a second.
         #[arg(long)]
         request_id: Option<Uuid>,
     },
@@ -619,13 +623,14 @@ async fn run_inner(command: NodeCommand, json: bool) -> Result<i32, String> {
                     .or_else(|| std::env::var("LOGNAME").ok()),
             )?;
             let request_id = request_id.unwrap_or_else(Uuid::new_v4);
-            if !json {
-                eprintln!(
-                    "recording attestation {request_id}: replica {replica}'s log becomes range \
-                     {range}'s history at its next promotion; records it does not hold may be \
-                     lost (operator {operator:?})"
-                );
-            }
+            // On stderr in both modes, so a --json run still learns the id it
+            // must retry with.
+            eprintln!(
+                "recording attestation {request_id}: replica {replica}'s log becomes range \
+                 {range}'s history at its next promotion; records it does not hold may be lost \
+                 (operator {operator:?}). If this run times out, retry with --request-id \
+                 {request_id}"
+            );
             let command = vtop_meta::MetadataCommand::AttestUnprovenPromotion {
                 env: vtop_meta::CommandEnvelope {
                     request_id,

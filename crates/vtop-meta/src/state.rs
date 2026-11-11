@@ -2787,6 +2787,19 @@ impl MetaStateMachine {
                  transition is final"
             )));
         }
+        // Whether this report is about the range's CURRENT epoch (#656
+        // review). A report for an epoch the range has moved past is
+        // evidence about history - still recorded - but it is not the
+        // recovery an attestation was made for: it may neither use one (it
+        // can never serve) nor retire one (it would erase the override the
+        // current recovery needs).
+        let current = matches!(
+            self.record(&MetaKey::Range {
+                topic_uuid,
+                range_uuid,
+            }),
+            Some(MetaValue::Range(range)) if range.fencing_epoch == fencing_epoch
+        );
         let attestation_key = MetaKey::PromotionAttestation {
             topic_uuid,
             range_uuid,
@@ -2805,6 +2818,13 @@ impl MetaStateMachine {
         // exposed, because a boundary is exposed only once its report
         // lands.
         if let Some(used) = outcome.attestation() {
+            if !current {
+                return reject(MetadataError::invalid_transition(format!(
+                    "promotion of epoch {fencing_epoch} counted answers of unproven lineage, but \
+                     the range has moved past that epoch; a superseded promotion may not use an \
+                     attestation"
+                )));
+            }
             if live != Some(used) {
                 return reject(MetadataError::invalid_transition(format!(
                     "promotion of epoch {fencing_epoch} counted answers of unproven lineage \
@@ -2852,7 +2872,7 @@ impl MetaStateMachine {
         // that used it, or one that proved its lineage without it - a range
         // that recovered on its own must not keep an override lying around
         // for some later failure to pick up unasked.
-        if established {
+        if established && current {
             self.records.remove(&attestation_key);
         }
         MetadataResponse::TransitionRecorded { fencing_epoch }
@@ -7131,6 +7151,78 @@ mod tests {
             later,
             unproven_established(500, &quorum, Some(fresh))
         )));
+    }
+
+    /// #656 review: a report for an epoch the range has moved past is
+    /// history, not recovery. Recorded as evidence, it must neither retire an
+    /// attestation recorded for the current recovery nor use one up - an
+    /// attested promotion at a superseded epoch can never serve.
+    #[test]
+    fn a_report_for_a_past_epoch_neither_retires_nor_uses_an_attestation() {
+        let (mut machine, first, topic, range, mut next) = attestable_range();
+        let past = range_of(&machine, topic, range).fencing_epoch;
+        release_and_reacquire(&mut machine, &mut next, first, topic, range);
+        let current = range_of(&machine, topic, range).fencing_epoch;
+        assert!(current > past);
+        assert!(!is_rejected(&attest(
+            &mut machine,
+            next(),
+            400,
+            topic,
+            range,
+            first,
+            "oncall"
+        )));
+        let live = machine
+            .promotion_attestation(topic, range)
+            .cloned()
+            .unwrap();
+
+        // The past epoch's attested report is refused, and uses nothing up.
+        assert!(is_rejected(&report(
+            &mut machine,
+            next(),
+            401,
+            2_000,
+            first,
+            topic,
+            range,
+            past,
+            unproven_established(500, &[(1, 500), (2, 500)], Some(live.clone()))
+        )));
+        assert_eq!(machine.promotion_attestation(topic, range), Some(&live));
+
+        // Its late, ordinary report is recorded, and retires nothing.
+        assert!(!is_rejected(&report(
+            &mut machine,
+            next(),
+            402,
+            2_000,
+            first,
+            topic,
+            range,
+            past,
+            established(500, &[(1, 500), (2, 500)], 2, 2)
+        )));
+        assert_eq!(
+            machine.promotion_attestation(topic, range),
+            Some(&live),
+            "a delayed report for a past epoch erased the current recovery's attestation"
+        );
+
+        // The current epoch still uses it.
+        assert!(!is_rejected(&report(
+            &mut machine,
+            next(),
+            403,
+            3_000,
+            first,
+            topic,
+            range,
+            current,
+            unproven_established(500, &[(1, 500), (2, 500)], Some(live))
+        )));
+        assert!(machine.promotion_attestation(topic, range).is_none());
     }
 
     /// #636: a promotion that PROVED its lineage ends a live attestation's
