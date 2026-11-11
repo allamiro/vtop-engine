@@ -2327,6 +2327,12 @@ impl Engine {
                         // stays VERIFIED and the next recovery re-checks it
                         // again — never rewind on a decision the ledger did
                         // not record (#123 review).
+                        //
+                        // Not rewound, but HELD (#639): its range still has to
+                        // be re-read, so no VERIFIED range of the same file
+                        // above it may commit in this pass. Committing one
+                        // moved the committed point past it, and the next
+                        // recovery's rewind for it was clamped there.
                         if let Err(e) = self
                             .store
                             .mark_failed(
@@ -2336,6 +2342,7 @@ impl Engine {
                             .await
                         {
                             tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist re-check failure");
+                            rewinds.hold(&rec.progress_start);
                             summary.still_pending += 1;
                             continue;
                         }
@@ -2349,6 +2356,7 @@ impl Engine {
                             .await
                         {
                             tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist REPLAY_REQUIRED");
+                            rewinds.hold(&rec.progress_start);
                             summary.still_pending += 1;
                             continue;
                         }
@@ -2392,12 +2400,16 @@ impl Engine {
                     // another engine claimed the batch in between means that
                     // engine re-reads the range now, and rewinding here as
                     // well would ingest it twice (review of #569).
+                    //
+                    // Held, not rewound, as on the stale-VERIFIED path (#639):
+                    // a VERIFIED range above it must not commit past it.
                     if let Err(e) = self
                         .store
                         .mark_failed(&rec.batch_id, "recovered: replay required")
                         .await
                     {
                         tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist the replay decision; not rewinding");
+                        rewinds.hold(&rec.progress_start);
                         summary.still_pending += 1;
                         continue;
                     }
@@ -2411,6 +2423,7 @@ impl Engine {
                         .await
                     {
                         tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist REPLAY_REQUIRED; not rewinding");
+                        rewinds.hold(&rec.progress_start);
                         summary.still_pending += 1;
                         continue;
                     }
@@ -2476,7 +2489,9 @@ impl Engine {
         // follows is clamped to it: the failed range would then be skipped (the
         // file adapters never rewind below their committed point). The row
         // stays VERIFIED, its object stays in the archive, and a later pass
-        // commits it once the source has caught up.
+        // commits it once the source has caught up. A lower range whose replay
+        // decision could not be recorded holds it back too, though nothing
+        // rewinds for it (#639).
         for rec in verified {
             if rewinds.holds_back(&rec.progress_start) {
                 tracing::warn!(
@@ -3054,6 +3069,9 @@ struct RewindPlan {
     /// The lowest pending start per source (a path or a topic-partition), per
     /// inode and content fingerprint, for [`RewindPlan::holds_back`].
     by_source: HashMap<String, Vec<PendingGroup>>,
+    /// The same, for ranges that are HELD and not rewound: their replay
+    /// decision could not be recorded (#639). See [`RewindPlan::hold`].
+    held: HashMap<String, Vec<PendingGroup>>,
     added: u64,
 }
 
@@ -3118,20 +3136,27 @@ impl PendingGroup {
     }
 }
 
+/// Note that a range starting at `start` is still to be read, in the group of
+/// its source, inode and content.
+fn note_pending(groups: &mut HashMap<String, Vec<PendingGroup>>, start: &ProgressMarker) {
+    let position = start_position(start);
+    let groups = groups.entry(source_key(start)).or_default();
+    match groups.iter_mut().find(|group| group.is(start)) {
+        Some(group) => group.lowest = group.lowest.min(position),
+        None => groups.push(PendingGroup {
+            inode: marker_inode(start),
+            content: start.content_fingerprint().cloned(),
+            lowest: position,
+        }),
+    }
+}
+
 impl RewindPlan {
     /// Record that the range starting at `start` is being handed back to its
     /// source. (Only where it starts matters: see [`RewindPlan::holds_back`].)
     fn add(&mut self, start: &ProgressMarker) {
         let position = start_position(start);
-        let groups = self.by_source.entry(source_key(start)).or_default();
-        match groups.iter_mut().find(|group| group.is(start)) {
-            Some(group) => group.lowest = group.lowest.min(position),
-            None => groups.push(PendingGroup {
-                inode: marker_inode(start),
-                content: start.content_fingerprint().cloned(),
-                lowest: position,
-            }),
-        }
+        note_pending(&mut self.by_source, start);
         self.added += 1;
         let content = start.content_fingerprint();
         let generations = self.lowest.entry(unit_key(start)).or_default();
@@ -3156,6 +3181,24 @@ impl RewindPlan {
                 recency: self.added,
             }),
         }
+    }
+
+    /// Record that the range starting at `start` must still be re-read but is
+    /// NOT handed back to its source now: recovery could not record the
+    /// decision to replay it, and never rewinds on a decision the ledger did
+    /// not record (#123). The row stays as it was and the next recovery
+    /// decides it again.
+    ///
+    /// It holds back a VERIFIED range above it all the same (#639). Left out
+    /// of the plan, it let that range commit; the commit moved the unit's
+    /// committed point past it, the next recovery's rewind for it was clamped
+    /// to that point, and the range was never archived.
+    ///
+    /// It produces no rewind ([`RewindPlan::markers`]), and [`RewindPlan::rebase`]
+    /// does not move it: no rewind lands for it, so a landing at its file
+    /// (another range's) says nothing about whether its bytes are archived.
+    fn hold(&mut self, start: &ProgressMarker) {
+        note_pending(&mut self.held, start);
     }
 
     /// Replace each unit's raw start with the position its rewind actually
@@ -3221,13 +3264,15 @@ impl RewindPlan {
     /// #578). "Other" means proven: fingerprints of the same length that
     /// differ. Content that cannot be compared - different lengths, or none -
     /// holds back as before.
+    ///
+    /// A HELD range ([`RewindPlan::hold`]) counts exactly like one being
+    /// re-read, with the same inode and content rules.
     fn holds_back(&self, start: &ProgressMarker) -> bool {
         let from = start_position(start);
         let inode = marker_inode(start);
         let content = start.content_fingerprint();
-        self.by_source
-            .get(&source_key(start))
-            .is_some_and(|groups| {
+        [&self.by_source, &self.held].into_iter().any(|pending| {
+            pending.get(&source_key(start)).is_some_and(|groups| {
                 groups
                     .iter()
                     .filter(|group| {
@@ -3236,6 +3281,7 @@ impl RewindPlan {
                     .filter(|group| !group.proven_other(content))
                     .any(|group| group.lowest < from)
             })
+        })
     }
 
     fn markers(&self) -> Vec<ProgressMarker> {
@@ -6490,6 +6536,548 @@ mod tests {
             engine.last_ledger_prune.is_none(),
             "the ledger prune ran after the stop was already pending; it can take \
              the state-store timeout and push the stop past its grace period"
+        );
+    }
+
+    /// #639: a range whose replay decision recovery could not record is HELD:
+    /// it produces no rewind, survives a rebase, and holds back a VERIFIED
+    /// range above it with the same inode, content and partition rules as a
+    /// range that is being re-read.
+    #[test]
+    fn a_held_range_holds_back_a_verified_range_above_it_without_a_rewind() {
+        let page = |tag: u8| ContentFingerprint::of(&[tag; 5_000]);
+        let file =
+            |inode: u64, start: u64, content: Option<ContentFingerprint>| ProgressMarker::File {
+                path: "/a".into(),
+                inode: Some(inode),
+                start_byte: start,
+                end_byte: start + 100,
+                file_size: 8_192,
+                mtime: String::new(),
+                content_fingerprint: content,
+                tail_fingerprint: None,
+            };
+        let mut plan = RewindPlan::default();
+        plan.hold(&file(1, 0, page(b'A')));
+        assert!(plan.markers().is_empty(), "a held range is not rewound");
+        assert!(plan.holds_back(&file(1, 100, page(b'A'))));
+        assert!(
+            plan.holds_back(&file(1, 100, None)),
+            "content that cannot be compared"
+        );
+        assert!(!plan.holds_back(&file(1, 0, page(b'A'))), "the same start");
+        assert!(!plan.holds_back(&file(2, 100, page(b'A'))), "another inode");
+        assert!(
+            !plan.holds_back(&file(1, 100, page(b'B'))),
+            "content proven to be another file's"
+        );
+        // A rewind of the same file that lands ABOVE the verified range does
+        // not release the hold: it says nothing about the held range's bytes.
+        plan.add(&file(1, 300, page(b'A')));
+        plan.rebase(&HashMap::from([(
+            rewind_key(&file(1, 300, page(b'A'))),
+            300,
+        )]));
+        assert_eq!(plan.markers().len(), 1, "only the added range rewinds");
+        assert!(
+            plan.holds_back(&file(1, 100, page(b'A'))),
+            "the held [0,100) still holds back [100,200) after the rebase"
+        );
+
+        let kafka = |group: &str, partition: i32, start: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition,
+            start_offset: start,
+            end_offset: start + 9,
+            consumer_group: group.into(),
+        };
+        let mut plan = RewindPlan::default();
+        plan.hold(&kafka("g", 0, 10));
+        assert!(plan.markers().is_empty());
+        assert!(plan.holds_back(&kafka("g", 0, 20)));
+        assert!(!plan.holds_back(&kafka("g", 0, 10)), "the same offsets");
+        assert!(!plan.holds_back(&kafka("g", 1, 20)), "another partition");
+        assert!(!plan.holds_back(&kafka("h", 0, 20)), "another group");
+    }
+
+    /// Where a batch starts and ends within its unit: bytes for a file,
+    /// offsets for Kafka (made half-open like bytes, `end_offset + 1`).
+    fn unit_range(row: &BatchRecord) -> (i128, i128) {
+        let end = match &row.progress_end {
+            ProgressMarker::Kafka { end_offset, .. } => i128::from(*end_offset) + 1,
+            ProgressMarker::File { end_byte, .. }
+            | ProgressMarker::SyslogSpool { end_byte, .. } => i128::from(*end_byte),
+        };
+        (start_position(&row.progress_start), end)
+    }
+
+    /// The ledger's row whose range starts at `start`, from the first
+    /// attempt at it (the oldest).
+    async fn row_at(engine: &Engine, start: i128) -> BatchRecord {
+        let mut rows: Vec<_> = engine
+            .store
+            .list_batches()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|b| start_position(&b.progress_start) == start)
+            .collect();
+        rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        rows.into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("the ledger has no row starting at {start}"))
+    }
+
+    /// Asserts the SOURCE_COMMITTED rows cover `[0, len)` with no gap. A
+    /// range archived twice (a VERIFIED row re-read before it committed) is
+    /// a duplicate, which replay allows; a hole is lost data.
+    async fn assert_committed_without_a_gap(case: &str, engine: &Engine, len: i128) {
+        let mut ranges: Vec<(i128, i128)> = engine
+            .store
+            .list_batches()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|b| b.state == BatchState::SourceCommitted)
+            .map(unit_range)
+            .collect();
+        ranges.sort_unstable();
+        let mut covered = 0;
+        for &(start, end) in &ranges {
+            assert!(
+                start <= covered,
+                "{case}: [{covered}, {start}) was never archived; committed ranges: {ranges:?}"
+            );
+            covered = covered.max(end);
+        }
+        assert_eq!(
+            covered, len,
+            "{case}: the committed ranges stop short of the source's end: {ranges:?}"
+        );
+    }
+
+    /// Which of recovery's four replay-decision writes fails for the lower
+    /// range (#639), and what that range was in the ledger.
+    #[derive(Clone, Copy, Debug)]
+    enum LostDecision {
+        /// A VERIFIED row that fails its storage re-check; FAILED is refused.
+        RecheckFailed,
+        /// The same; FAILED lands and REPLAY_REQUIRED is refused.
+        RecheckReplayRequired,
+        /// A row left mid-pipeline (BATCHING); FAILED is refused.
+        DecisionFailed,
+        /// The same; FAILED lands and REPLAY_REQUIRED is refused.
+        DecisionReplayRequired,
+    }
+
+    impl LostDecision {
+        /// The lower row is VERIFIED (and fails its re-check) rather than
+        /// left mid-pipeline.
+        fn lower_verified(self) -> bool {
+            matches!(self, Self::RecheckFailed | Self::RecheckReplayRequired)
+        }
+
+        fn refused(self) -> LedgerWrite {
+            match self {
+                Self::RecheckFailed | Self::DecisionFailed => LedgerWrite::To(BatchState::Failed),
+                Self::RecheckReplayRequired | Self::DecisionReplayRequired => {
+                    LedgerWrite::To(BatchState::ReplayRequired)
+                }
+            }
+        }
+    }
+
+    /// Reads whatever `adapter` has for its first source and drops it: the
+    /// read a process made before it crashed with that range in flight. The
+    /// next read starts after it, as it did for that process.
+    async fn read_and_drop(adapter: &mut dyn SourceAdapter) {
+        let sources = adapter.discover_sources().await.unwrap();
+        let reads = adapter
+            .read_batch_candidates(&sources[0], 10_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(
+            reads.iter().any(|r| !r.records.is_empty()),
+            "the in-flight range is read"
+        );
+    }
+
+    /// The ledger a crash leaves behind (#639): a lower range A of a source
+    /// unit that recovery must replay, and a VERIFIED range B above it. Built
+    /// by a first engine, `first`, whose `source` reads A, then (after
+    /// `grow`) B. A is left VERIFIED or mid-pipeline per `fault`; B is
+    /// VERIFIED, its commit refused.
+    async fn leave_a_lower_range_and_a_verified_one_above_it(
+        first: &mut Engine,
+        source: SourceType,
+        fault: LostDecision,
+        grow: impl FnOnce(),
+    ) {
+        use BatchState::*;
+        use LedgerWrite::To;
+        // A: its pipeline stops before it is committed. A VERIFIED A reads on
+        // past it; a mid-pipeline A is handed back by the running cycle, and
+        // the crashed process's read of it is replayed by hand.
+        let a_stops_at = if fault.lower_verified() {
+            To(SourceCommitted)
+        } else {
+            To(Sealed)
+        };
+        FaultyLedger::install(first, &[a_stops_at, To(SourceCommitted)]).await;
+        assert!(
+            first.process_once(source.clone()).await.is_err(),
+            "A's write fails"
+        );
+        if !fault.lower_verified() {
+            read_and_drop(first.adapters.get_mut(&source).unwrap().as_mut()).await;
+        }
+        grow();
+        assert!(
+            first.process_once(source).await.is_err(),
+            "B verifies and its commit write fails"
+        );
+    }
+
+    /// The four failure paths of [`Engine::recover`] for one file: the lower
+    /// range A's replay decision cannot be recorded, so A is not rewound -
+    /// and the VERIFIED range B above it must not commit either, or the next
+    /// recovery's rewind for A is clamped to B's end and A is never archived.
+    /// Once the store answers again, A is re-read and the archive has no gap.
+    async fn a_lost_replay_decision_holds_back_the_file_range_above_it(fault: LostDecision) {
+        let case = format!("{fault:?}");
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\n").unwrap(); // A: [0, 7)
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let backend = Arc::new(vtop_upload::MockBackend::new());
+        // Each engine is a restart: the same ledger and object store, a fresh
+        // process (and adapter) seeded from the ledger alone.
+        let engine = |work: &str| {
+            let mut cfg = file_config(
+                dir.path().join(work).to_str().unwrap(),
+                &url,
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            cfg.batching.max_batch_age_seconds = 3_600;
+            let backend = backend.clone();
+            async move {
+                let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+                    .await
+                    .unwrap();
+                engine.backend = backend;
+                engine
+            }
+        };
+
+        let mut first = engine("work-1").await;
+        leave_a_lower_range_and_a_verified_one_above_it(
+            &mut first,
+            SourceType::File,
+            fault,
+            || {
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&input)
+                    .unwrap();
+                writeln!(f, "line 2").unwrap(); // B: [7, 14)
+            },
+        )
+        .await;
+        let a = row_at(&first, 0).await;
+        let b = row_at(&first, 7).await;
+        let a_state = if fault.lower_verified() {
+            BatchState::Verified
+        } else {
+            BatchState::Batching
+        };
+        assert_eq!(a.state, a_state, "{case}: A as the crash left it");
+        assert_eq!(unit_range(&b), (7, 14), "{case}");
+        assert_eq!(
+            b.state,
+            BatchState::Verified,
+            "{case}: B as the crash left it"
+        );
+        if fault.lower_verified() {
+            // A's object no longer checks out: recovery must replay A.
+            backend.corrupt(a.object_uri.as_deref().unwrap());
+        }
+        drop(first);
+
+        // Restart 1: A's replay decision cannot be recorded.
+        let mut second = engine("work-2").await;
+        FaultyLedger::install(&mut second, &[fault.refused()]).await;
+        let summary = second.recover().await.unwrap();
+        assert_ne!(
+            row_at(&second, 0).await.state,
+            BatchState::ReplayRequired,
+            "{case}: the refused write kept A's replay decision out of the ledger"
+        );
+        assert_eq!(
+            row_at(&second, 7).await.state,
+            BatchState::Verified,
+            "{case}: B committed while A, below it, was neither rewound nor recorded; \
+             its commit moves the committed point to 14 and A's next rewind is clamped there"
+        );
+        assert_eq!(summary.committed, 0, "{case}: {summary:?}");
+        assert_eq!(
+            summary.still_pending, 2,
+            "{case}: A (no decision) and B (held back): {summary:?}"
+        );
+        drop(second);
+
+        // Restart 2: the store answers. A's decision lands, A is re-read.
+        let mut third = engine("work-3").await;
+        third.recover().await.unwrap();
+        assert_eq!(
+            row_at(&third, 0).await.state,
+            BatchState::ReplayRequired,
+            "{case}: A's replay decision is recorded"
+        );
+        let reread = third.process_once(SourceType::File).await.unwrap();
+        assert!(
+            reread.iter().any(|o| o.committed),
+            "{case}: the re-read commits: {reread:?}"
+        );
+        assert_committed_without_a_gap(&case, &third, 14).await;
+        drop(third);
+
+        // Restart 3: nothing below B is pending any more, so B commits.
+        let mut fourth = engine("work-4").await;
+        fourth.recover().await.unwrap();
+        assert_eq!(
+            row_at(&fourth, 7).await.state,
+            BatchState::SourceCommitted,
+            "{case}: the hold on B is released once A is archived"
+        );
+        assert_committed_without_a_gap(&case, &fourth, 14).await;
+    }
+
+    /// #639, `Engine::recover`'s stale-VERIFIED path: FAILED is refused.
+    #[tokio::test]
+    async fn a_stale_verified_range_whose_failed_write_fails_holds_back_the_range_above_it() {
+        a_lost_replay_decision_holds_back_the_file_range_above_it(LostDecision::RecheckFailed)
+            .await;
+    }
+
+    /// #639, `Engine::recover`'s stale-VERIFIED path: REPLAY_REQUIRED is
+    /// refused.
+    #[tokio::test]
+    async fn a_stale_verified_range_whose_replay_required_write_fails_holds_back_the_range_above_it(
+    ) {
+        a_lost_replay_decision_holds_back_the_file_range_above_it(
+            LostDecision::RecheckReplayRequired,
+        )
+        .await;
+    }
+
+    /// #639, `Engine::recover`'s path for a row left mid-pipeline: FAILED is
+    /// refused.
+    #[tokio::test]
+    async fn an_incomplete_range_whose_failed_write_fails_holds_back_the_range_above_it() {
+        a_lost_replay_decision_holds_back_the_file_range_above_it(LostDecision::DecisionFailed)
+            .await;
+    }
+
+    /// #639, `Engine::recover`'s path for a row left mid-pipeline:
+    /// REPLAY_REQUIRED is refused.
+    #[tokio::test]
+    async fn an_incomplete_range_whose_replay_required_write_fails_holds_back_the_range_above_it() {
+        a_lost_replay_decision_holds_back_the_file_range_above_it(
+            LostDecision::DecisionReplayRequired,
+        )
+        .await;
+    }
+
+    /// One Kafka partition whose resume point is the ledger's, as the real
+    /// adapter's is since #614: seeded from the newest SOURCE_COMMITTED row,
+    /// moved up by each commit, and never rewound below it. The real adapter
+    /// commits to a broker; this one keeps the frontier in memory, which is
+    /// all recovery's decisions depend on.
+    struct LedgerFrontierPartition {
+        /// Offsets `0..log_end` exist; record `n` is `r{n}`.
+        log_end: Arc<std::sync::atomic::AtomicI64>,
+        /// The next offset a read returns.
+        next: i64,
+        /// One past the highest committed offset.
+        committed: i64,
+    }
+
+    impl LedgerFrontierPartition {
+        const TOPIC: &'static str = "t";
+        const GROUP: &'static str = "g";
+
+        /// A fresh process: resumes from the ledger's frontier, or from the
+        /// start of the partition when the ledger has none.
+        async fn seeded(
+            store: &dyn StateStore,
+            log_end: Arc<std::sync::atomic::AtomicI64>,
+        ) -> Self {
+            let committed = store
+                .committed_kafka_offsets()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|c| {
+                    c.topic == Self::TOPIC && c.partition == 0 && c.consumer_group == Self::GROUP
+                })
+                .map(|c| c.end_offset + 1)
+                .max()
+                .unwrap_or(0);
+            Self {
+                log_end,
+                next: committed,
+                committed,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SourceAdapter for LedgerFrontierPartition {
+        async fn discover_sources(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
+            Ok(vec![DiscoveredSource {
+                source_type: SourceType::Kafka,
+                source_name: Self::TOPIC.into(),
+                format: vtop_core::types::TelemetryFormat::Raw,
+            }])
+        }
+        async fn read_batch_candidates(
+            &mut self,
+            _source: &DiscoveredSource,
+            _max_records: usize,
+            _max_bytes: usize,
+            _max_wait: Duration,
+        ) -> Result<Vec<ReadResult>, VtopError> {
+            let end = self.log_end.load(std::sync::atomic::Ordering::SeqCst);
+            if self.next >= end {
+                return Ok(Vec::new());
+            }
+            let marker = |start: i64, end: i64| ProgressMarker::Kafka {
+                topic: Self::TOPIC.into(),
+                partition: 0,
+                start_offset: start,
+                end_offset: end,
+                consumer_group: Self::GROUP.into(),
+            };
+            let read = ReadResult {
+                records: (self.next..end)
+                    .map(|n| format!("r{n}").into_bytes())
+                    .collect(),
+                progress_start: marker(self.next, self.next),
+                progress_end: marker(self.next, end - 1),
+                first_timestamp: None,
+                last_timestamp: None,
+                verbatim: false,
+            };
+            self.next = end;
+            Ok(vec![read])
+        }
+        async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            let ProgressMarker::Kafka { end_offset, .. } = marker else {
+                return Err(VtopError::Source("not a kafka marker".into()));
+            };
+            self.committed = self.committed.max(end_offset + 1);
+            Ok(())
+        }
+        async fn replay_from_marker(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            let ProgressMarker::Kafka { start_offset, .. } = marker else {
+                return Err(VtopError::Source("not a kafka marker".into()));
+            };
+            self.next = (*start_offset).max(self.committed);
+            Ok(())
+        }
+        fn read_position(&self, _marker: &ProgressMarker) -> Option<i128> {
+            Some(i128::from(self.next))
+        }
+        fn source_type(&self) -> SourceType {
+            SourceType::Kafka
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    /// #639 for a Kafka partition, which resumes from the ledger's newest
+    /// committed row since #614: a lower range whose replay decision cannot
+    /// be recorded holds back the VERIFIED range above it, and is re-read
+    /// once the store answers.
+    #[tokio::test]
+    async fn a_kafka_range_whose_replay_decision_is_lost_holds_back_the_range_above_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let backend = Arc::new(vtop_upload::MockBackend::new());
+        let log_end = Arc::new(std::sync::atomic::AtomicI64::new(1)); // A: offset 0
+        let engine = |work: &str| {
+            let cfg = {
+                let mut cfg = file_config(
+                    dir.path().join(work).to_str().unwrap(),
+                    &url,
+                    Vec::new(),
+                    "mock",
+                );
+                cfg.batching.max_batch_age_seconds = 3_600;
+                // The partition below is the only source.
+                cfg.sources.file = None;
+                cfg
+            };
+            let backend = backend.clone();
+            let log_end = log_end.clone();
+            async move {
+                let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+                    .await
+                    .unwrap();
+                engine.backend = backend;
+                let partition =
+                    LedgerFrontierPartition::seeded(engine.store.as_ref(), log_end).await;
+                engine
+                    .adapters
+                    .insert(SourceType::Kafka, Box::new(partition));
+                engine
+            }
+        };
+
+        let mut first = engine("work-1").await;
+        leave_a_lower_range_and_a_verified_one_above_it(
+            &mut first,
+            SourceType::Kafka,
+            LostDecision::DecisionFailed,
+            || log_end.store(2, std::sync::atomic::Ordering::SeqCst), // B: offset 1
+        )
+        .await;
+        assert_eq!(row_at(&first, 0).await.state, BatchState::Batching);
+        let b = row_at(&first, 1).await;
+        assert_eq!(unit_range(&b), (1, 2));
+        assert_eq!(b.state, BatchState::Verified);
+        drop(first);
+
+        let mut second = engine("work-2").await;
+        FaultyLedger::install(&mut second, &[LedgerWrite::To(BatchState::Failed)]).await;
+        let summary = second.recover().await.unwrap();
+        assert_eq!(
+            row_at(&second, 1).await.state,
+            BatchState::Verified,
+            "offset 1 committed while offset 0, below it, was neither rewound nor recorded; \
+             the ledger's frontier moves to 2 and offset 0's next rewind is clamped there"
+        );
+        assert_eq!(summary.committed, 0, "{summary:?}");
+        drop(second);
+
+        let mut third = engine("work-3").await;
+        third.recover().await.unwrap();
+        let reread = third.process_once(SourceType::Kafka).await.unwrap();
+        assert!(
+            reread.iter().any(|o| o.committed),
+            "the re-read commits: {reread:?}"
+        );
+        assert_committed_without_a_gap("kafka", &third, 2).await;
+        drop(third);
+
+        let mut fourth = engine("work-4").await;
+        fourth.recover().await.unwrap();
+        assert_eq!(
+            row_at(&fourth, 1).await.state,
+            BatchState::SourceCommitted,
+            "the hold on offset 1 is released once offset 0 is archived"
         );
     }
 }
