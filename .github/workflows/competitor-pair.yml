@@ -146,13 +146,22 @@ jobs:
 
       # Every run's own output is kept, refused or not: a refused run is part
       # of the record (#610's acceptance: no refused runs left unexplained).
+      #
+      # ERREXIT IS OFF FOR THE LOOP, explicitly. Actions runs a bash step as
+      # `bash -e`, and `set -uo pipefail` does not undo that -e: a half the
+      # runner refused (exit 2) would end the step at its own pipeline, before
+      # PIPESTATUS is read, so it would be missing from runs.tsv and every
+      # later half and repetition would be skipped. With -e off, each half's
+      # exit code is recorded, the loop goes on, and the job is failed at the
+      # end by "Every run completed", after the upload.
       - name: Run the pair
         id: pair
         run: |
           set -uo pipefail
+          set +e
           out="${RUNNER_TEMP}/pair"
-          mkdir -p "${out}/results" "${out}/logs"
-          printf 'order\trepetition\tscenario\texit_code\trun_id\n' > "${out}/runs.tsv"
+          mkdir -p "${out}/results" "${out}/logs" || exit 1
+          printf 'order\trepetition\tscenario\texit_code\trun_id\n' > "${out}/runs.tsv" || exit 1
           order=0
           failed=0
           for rep in $(seq 1 "${REPETITIONS}"); do
@@ -165,7 +174,7 @@ jobs:
               python3 benchmarks/run_benchmark.py "${scenario}" --results-dir "${out}/results" 2>&1 | tee "${log}"
               code="${PIPESTATUS[0]}"
               echo "::endgroup::"
-              run_id="$(sed -n 's/.*run_id=\([^ ]*\).*/\1/p' "${log}" | head -n 1)"
+              run_id="$(sed -n 's/.*run_id=\([^ ]*\).*/\1/p' "${log}" | sed -n 1p)"
               printf '%s\t%s\t%s\t%s\t%s\n' "${order}" "${rep}" "${n}" "${code}" "${run_id}" >> "${out}/runs.tsv"
               if [ "${code}" != "0" ]; then failed=$((failed + 1)); fi
             done
@@ -179,8 +188,12 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           TESTED_SHA: ${{ github.sha }}
+        # Best effort, and -e off for the same reason as the loop: one probe
+        # failing (the lab already down, the binary never built) must not
+        # stop the rest of the record from being written.
         run: |
           set -uo pipefail
+          set +e
           env_dir="${RUNNER_TEMP}/pair/environment"
           mkdir -p "${env_dir}"
           lscpu > "${env_dir}/lscpu.txt" 2>&1
