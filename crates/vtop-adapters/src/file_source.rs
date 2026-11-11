@@ -26,6 +26,14 @@ struct FileCursor {
     read_byte: u64,
     /// Highest byte durably committed to object storage.
     committed_byte: u64,
+    /// The file a commit this process checked against the file at the path
+    /// set `committed_byte` for (#624) - `None` for the restart seed, or after
+    /// a discontinuity. Only such a point may supersede a later, lower
+    /// commit, and only one of the SAME file (review of #624): the seed can be
+    /// the newest committed row of a PREVIOUS generation (a copytruncate),
+    /// and a commit below it must still move the cursor down to the new
+    /// content (review of #564).
+    confirmed_for: Option<crate::continuity::ConfirmedFile>,
     /// What the file looked like when this cursor last caught up with it.
     ///
     /// Kept so a cycle can decide NOT to open the file at all (#100). `None`
@@ -425,6 +433,7 @@ impl FileSource {
     pub fn seed_committed(&mut self, path: &str, committed_byte: u64) {
         let c = self.cursors.entry(path.to_string()).or_default();
         c.committed_byte = committed_byte;
+        c.confirmed_for = None;
         c.read_byte = committed_byte;
     }
 
@@ -863,6 +872,7 @@ impl FileSource {
         if let Some(why) = discontinuity {
             tracing::warn!(path, previous_read_byte = cursor.read_byte, "{why}");
             cursor.committed_byte = 0;
+            cursor.confirmed_for = None;
             cursor.generations.discontinuity();
             cursor.delete_candidate = None;
         }
@@ -901,6 +911,7 @@ impl FileSource {
                 "{why}; the read of the new content then failed"
             );
             cursor.committed_byte = 0;
+            cursor.confirmed_for = None;
             cursor.read_byte = 0;
             cursor.generations.discontinuity();
             cursor.delete_candidate = None;
@@ -2629,7 +2640,50 @@ impl SourceAdapter for FileSource {
             && continuity::tail_is_current(marker_tail.as_ref(), &current_tail);
         if still_current {
             let c = self.cursors.entry(path.clone()).or_default();
+            // A range this process has already committed past, in this file,
+            // is superseded (#624): it is archived, and so is everything up
+            // to the committed point. A VERIFIED range whose commit failed, or
+            // that recovery held back, reaches here after newer ranges have
+            // committed; moving the cursor to its end put the committed point
+            // back and - for a range read before a restart - the read head
+            // too, and everything read since was archived again. Success, as
+            // the Kafka adapter reports for a range below its frontier, so the
+            // row is recorded SOURCE_COMMITTED: it is VERIFIED, and its source
+            // has committed through its end. Only a point this process
+            // confirmed, for this marker's file: the seed can be a previous
+            // generation's, and a point confirmed for another file says
+            // nothing about this range (see `confirmed_for`). Nothing is
+            // deleted for it either; the newer commit already decided that.
+            // Proven, not merely not disproven (review of #659): see
+            // `ConfirmedFile::proves`.
+            let marker_tail_at = continuity::Tail::at(*end_byte, marker_tail.clone());
+            if c.committed_byte >= *end_byte
+                && c.confirmed_for.as_ref().is_some_and(|file| {
+                    file.proves(
+                        Path::new(path),
+                        c.committed_byte,
+                        *marker_inode,
+                        marker_content.as_ref(),
+                        marker_tail_at.as_ref(),
+                        (*marker_file_size).max(*end_byte),
+                    )
+                })
+            {
+                tracing::info!(
+                    path,
+                    end_byte,
+                    committed_byte = c.committed_byte,
+                    "file commit skipped: the range is superseded by a later committed one, and \
+                     committing it would move the cursor back"
+                );
+                return Ok(());
+            }
             c.committed_byte = *end_byte;
+            c.confirmed_for = crate::continuity::ConfirmedFile::of(
+                *marker_inode,
+                marker_content.as_ref(),
+                marker_tail_at,
+            );
             // A commit with no in-process record is recovery after a restart.
             let recovered = generation == continuity::Settled::Unknown;
             if c.read_byte < *end_byte {
@@ -3664,6 +3718,79 @@ mod tests {
             assert_eq!(*end_byte, 6); // "a\nb\nc\n"
         } else {
             panic!("expected file marker");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_commit_is_skipped_only_below_a_point_confirmed_for_its_own_file() {
+        // #624 (review): the skip is bound to the file whose commit confirmed
+        // the committed point, not to the number alone. A point confirmed for
+        // another file - a previous one at this path, say - says nothing
+        // about this marker's range, which commits as before.
+        let f = write_log(&["one", "two"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let read = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap()
+            .remove(0);
+        fs.commit_progress(&read.progress_end).await.unwrap();
+        let end = fs.committed_through(&read.progress_end).unwrap();
+        // The point is now another file's, and higher.
+        {
+            let c = fs.cursors.get_mut(&path).unwrap();
+            c.committed_byte = 1_000;
+            let other = c.confirmed_for.as_mut().expect("the commit confirmed it");
+            other.inode += 1;
+        }
+        fs.commit_progress(&read.progress_end).await.unwrap();
+        assert_eq!(
+            fs.cursors[&path].committed_byte as i128, end,
+            "a commit of this file was skipped below another file's committed point"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_below_this_processs_committed_point_moves_nothing() {
+        // #624: a VERIFIED range whose source commit failed (or was held
+        // back) is committed later, after a newer range of the same file has
+        // committed past it. Moving the cursor to its end would put the
+        // committed point BACK and, for a range with no record of its
+        // generation, the read head too - the newer range read again.
+        let f = write_log(&["one", "two", "three"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = fs
+            .read_batch_candidates(&src(&path), 1, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap()
+            .remove(0);
+        let rest = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap()
+            .remove(0);
+        fs.commit_progress(&first.progress_end).await.unwrap();
+        fs.commit_progress(&rest.progress_end).await.unwrap();
+        let end = fs.committed_through(&rest.progress_end).unwrap();
+        // Late, and twice: once while its generation record is gone (as for
+        // a row from before a restart), once more.
+        for _ in 0..2 {
+            fs.commit_progress(&first.progress_end).await.unwrap();
+            assert_eq!(
+                fs.committed_through(&rest.progress_end),
+                Some(end),
+                "a superseded commit moved the committed point back"
+            );
+            let again = fs
+                .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            assert!(
+                again.iter().all(|r| r.records.is_empty()),
+                "a superseded commit moved the read head back: {again:?}"
+            );
         }
     }
 

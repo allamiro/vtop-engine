@@ -166,6 +166,10 @@ impl StateStore for Recorder {
         )
         .await
     }
+    async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError> {
+        self.write(self.inner.renew_claim(batch_id, lease_until), |_, _| {})
+            .await
+    }
     async fn max_committed_end_bytes(
         &self,
         source_type: SourceType,

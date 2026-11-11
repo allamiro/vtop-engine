@@ -524,6 +524,26 @@ impl StateStore for SqliteStateStore {
             .await
     }
 
+    async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError> {
+        let Some(held) = self.fence.held(batch_id) else {
+            return Ok(false);
+        };
+        let lease_until = crate::store::normalize_rfc3339_utc("lease_until", lease_until)?;
+        // Conditional on the generation held: a claim by another engine bumps
+        // it, and this write then matches nothing (#624, #557).
+        let renewed = sqlx::query(
+            "UPDATE batches SET lease_expires_at = ? WHERE batch_id = ? AND claim_gen = ?",
+        )
+        .bind(lease_until)
+        .bind(batch_id)
+        .bind(held)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        Ok(renewed == 1)
+    }
+
     async fn claim_incomplete_batches(
         &self,
         owner: &str,

@@ -98,6 +98,15 @@ impl StateStore for DeadlineStore {
             .await
     }
 
+    async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError> {
+        self.within(
+            "renew_claim",
+            self.point,
+            self.inner.renew_claim(batch_id, lease_until),
+        )
+        .await
+    }
+
     async fn claim_incomplete_batches(
         &self,
         owner: &str,
@@ -280,6 +289,9 @@ mod tests {
             _: &str,
             _: &str,
         ) -> Result<Vec<BatchRecord>, VtopError> {
+            never!()
+        }
+        async fn renew_claim(&self, _: &str, _: &str) -> Result<bool, VtopError> {
             never!()
         }
         async fn max_committed_end_bytes(
