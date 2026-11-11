@@ -32,7 +32,7 @@ on:
   workflow_dispatch:
     inputs:
       repetitions:
-        description: "How many uncapped/capped pairs to run (each pair is about 20 minutes)"
+        description: "How many uncapped/capped pairs to run, 1-6 (each pair is about 15-18 minutes)"
         required: false
         default: "3"
   pull_request:
@@ -53,18 +53,27 @@ jobs:
     timeout-minutes: 150
     env:
       REPETITIONS: ${{ inputs.repetitions || '3' }}
+      # The most pairs the 150-minute timeout holds; see the first step.
+      MAX_REPETITIONS: "6"
       COMPOSE_FILE: benchmarks/docker-compose.benchmark.yml
       # The binary BOTH the runner's preflight hashes and the engine container
       # mounts. Absolute, so the two cannot resolve it differently.
       VTOPCTL_BIN: ${{ github.workspace }}/target/release/vtopctl
     steps:
       # Before anything costs minutes: the dispatch input must name at least
-      # one pair. 0, an empty value or a non-number would otherwise run the
-      # whole lab and record nothing.
-      - name: The repetitions input is a positive integer
+      # one pair and no more than fit in the job's timeout. 0, an empty value or
+      # a non-number would otherwise run the whole lab and record nothing. Too
+      # many would be killed by the 150-minute timeout partway through. That
+      # would still upload the artifact (the upload step is always()), but the
+      # job would end without a complete set of pairs. The ceiling comes from
+      # run 42940266095: about 7 minutes of setup and about 15 minutes per pair
+      # (17-18 once a half passes and runs its closing solo window), so 6 pairs
+      # is about 115 minutes. The rest of the 150 absorbs a cold cargo cache
+      # and a slow shared runner.
+      - name: The repetitions input is a positive integer the timeout can hold
         run: |
-          if ! [[ "${REPETITIONS}" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::repetitions must be a positive integer, got '${REPETITIONS}'"
+          if ! [[ "${REPETITIONS}" =~ ^[1-9][0-9]*$ ]] || (( REPETITIONS > MAX_REPETITIONS )); then
+            echo "::error::repetitions must be an integer from 1 to ${MAX_REPETITIONS}, got '${REPETITIONS}'"
             exit 1
           fi
 
@@ -171,6 +180,26 @@ jobs:
             exit 1
           fi
           docker compose logs minio-init | tail -n 5
+          # The middlebox's iperf3 server must also be listening before the first
+          # calibration and solo window, or a fast runner refuses the first half
+          # with a connection error. `up -d` returns once the container has
+          # started, not once its command has reached `iperf3 -s -D`. Checked with
+          # `ss` inside the middlebox rather than by connecting to the server: a
+          # bare probe connection would make the iperf3 server handle a test that
+          # never sends its cookie.
+          listening=0
+          for _ in $(seq 1 30); do
+            if [ -n "$(docker exec vtop-bench-netem ss -Hltn 'sport = :5201' 2>/dev/null || true)" ]; then
+              listening=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "${listening}" != "1" ]; then
+            echo "::error::the middlebox's iperf3 server is not listening on 5201 after 30 s"
+            docker compose --profile netem logs netem || true
+            exit 1
+          fi
           docker compose --profile netem --profile containerized ps
 
       # Every run's own output is kept, refused or not: a refused run is part
@@ -190,8 +219,8 @@ jobs:
           # Checked again here, before errexit is turned off. The first step
           # already refused a bad value, but with -e off a `seq` that fails
           # gives an empty loop and a green job that measured nothing.
-          if ! [[ "${REPETITIONS}" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::repetitions must be a positive integer, got '${REPETITIONS}'"
+          if ! [[ "${REPETITIONS}" =~ ^[1-9][0-9]*$ ]] || (( REPETITIONS > MAX_REPETITIONS )); then
+            echo "::error::repetitions must be an integer from 1 to ${MAX_REPETITIONS}, got '${REPETITIONS}'"
             exit 1
           fi
           set +e
