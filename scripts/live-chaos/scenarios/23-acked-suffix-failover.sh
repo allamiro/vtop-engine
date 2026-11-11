@@ -6,7 +6,8 @@
 # synchronous network. Three identical candidates over TLS, as scenario 14.
 #
 # The #611 shape, placed with signals rather than luck:
-#   1. the leader L and both followers take a shared prefix;
+#   1. the leader L and both followers take a shared prefix, and both
+#      followers' committed offsets are seen to cover it;
 #   2. one follower, C, is SIGKILLed, so the suffix L produces next is
 #      acknowledged by L and the other follower, R, alone. Killed rather
 #      than frozen: a frozen process still has the leader's appends queued in
@@ -25,7 +26,8 @@
 #
 # Invariants:
 #   * SAFETY (#611): C, which lacks acknowledged records, never leads, and R
-#     takes the range at a newer epoch.
+#     takes the range at an epoch newer than both L's and the one C was
+#     refused at.
 #   * SAFETY: every record acknowledged before the kill is readable,
 #     byte-exact, from whichever candidate ends up serving.
 #   * LIVENESS: some candidate serves quorum produce at a newer epoch within
@@ -35,13 +37,56 @@
 # (its own copy lands first, so a kill can leave one in-flight batch there),
 # nothing fences it and no quorum forms: that is #641. The scenario then
 # exits 77 (SKIP) after the #611 check, saying so; it never reports PASS.
+# Likewise when C comes back holding every acknowledged record (the
+# producer's acknowledged floor trails what the leader has already sent):
+# the #611 shape was not reached, and the scenario says so and exits 77.
 # It also reports whether C's probe was refused by R's answer (the #611
 # path proper) or missed its quorum.
 #
 # Knobs: CHAOS_611_SEED picks which follower lags and how far into the
 # suffix the kill lands (logged, so a failure replays exactly);
-# CHAOS_611_SHARED, CHAOS_611_SUFFIX_MAX and CHAOS_611_BATCH size the stream.
+# CHAOS_611_SHARED is the shared prefix (default 200), CHAOS_611_BATCH the
+# produce batch (default 20), and CHAOS_611_SUFFIX_MAX (default 2000, at
+# least one batch) bounds the suffix acknowledged before L dies, chosen in
+# [BATCH, SUFFIX_MAX].
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
+
+# METADATA LEADERSHIP MAY MOVE, so everything here follows it. This scenario
+# keeps a loaded host busy (three data nodes, a producer, two kills and a
+# freeze), and two early runs (seeds 604 and 609) saw the metadata leader
+# change mid-scenario. With the library's single `admin_endpoint`, every lease
+# agent then asked the former leader forever ("not the metadata leader; it
+# named node 2") and no candidate could take the range: a harness limit, not
+# the protocol under test. Scenario-local overrides, so the other scenarios'
+# configs stay exactly as they are:
+#   * candidates get `lease.admin_peers` for all three metadata nodes, which
+#     is how a lease agent follows a redirect (#292);
+#   * lease reads try the named node first, then the other two.
+emit_lease_yaml() {
+  local id="$1" cert="${2:-data-1}" m
+  echo "lease:"
+  echo "  admin_endpoint: \"$(meta_host "$id"):$(meta_admin_port "$id")\""
+  echo "  server_name: \"localhost\""
+  echo "  topic_uuid: $TOPIC_UUID"
+  echo "  tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
+  echo "  lease_duration_ms: $LEASE_DURATION_MS"
+  echo "  renew_interval_ms: $LEASE_RENEW_MS"
+  echo "  poll_interval_ms: $LEASE_POLL_MS"
+  echo "  admin_peers:"
+  for m in 1 2 3; do
+    echo "    - { node_id: $m, endpoint: \"$(meta_host "$m"):$(meta_admin_port "$m")\" }"
+  done
+}
+eval "lib_$(declare -f lease_field)"
+lease_field() { # <meta-id> <python expression over `d`>
+  local id="$1" expr="$2" m tried=" "
+  for m in "$id" 1 2 3; do
+    [[ "$tried" == *" $m "* ]] && continue
+    tried+="$m "
+    lib_lease_field "$m" "$expr" && return 0
+  done
+  return 1
+}
 
 # v2: every promotion appends a boundary marker, as in scenario 14.
 export CHAOS_SEGMENT_FORMAT=v2
@@ -55,10 +100,11 @@ SUFFIX_MAX="${CHAOS_611_SUFFIX_MAX:-2000}"
 BATCH="${CHAOS_611_BATCH:-20}"
 require_integer_in_range CHAOS_611_SEED "$SEED" 0 4294967295
 require_integer_in_range CHAOS_611_SHARED "$SHARED" 1 100000000
-require_integer_in_range CHAOS_611_SUFFIX_MAX "$SUFFIX_MAX" 1 100000000
 require_integer_in_range CHAOS_611_BATCH "$BATCH" 1 65536
-# The kill lands after at least one batch of suffix and at most SUFFIX_MAX.
-SUFFIX=$((BATCH + SEED % SUFFIX_MAX))
+# At least one batch: the kill waits for that much suffix to be acknowledged.
+require_integer_in_range CHAOS_611_SUFFIX_MAX "$SUFFIX_MAX" "$BATCH" 100000000
+# How much suffix L and R acknowledge before L dies: in [BATCH, SUFFIX_MAX].
+SUFFIX=$((BATCH + SEED % (SUFFIX_MAX - BATCH + 1)))
 TOTAL=$((SHARED + SUFFIX + 100000))
 log "seed=$SEED shared=$SHARED suffix=$SUFFIX batch=$BATCH"
 
@@ -103,6 +149,30 @@ CLIENT_CFG="$(emit_client_config_at_epoch "$EPOCH")"
 PRODUCER=$!
 echo "$PRODUCER" >> "$WORKDIR/pids"
 await_acked_floor "$ACKED_FILE" "$SHARED"
+# An acknowledgement proves only that SOME majority holds the prefix (#646
+# review). Both followers must hold it before C dies, so that what C lacks is
+# exactly the suffix acknowledged after. The target is the leader's own
+# committed offset, read once the prefix is acknowledged: it covers the
+# prefix and counts exactly the entries the log holds, boundary markers
+# included, where an epoch number would count lease grants (a refused grant
+# mints an epoch and appends nothing).
+PREFIX="$(cat "$ACKED_FILE")"
+L_COMMITTED="$(sample_metric "$(data_metrics_addr $((L + 10)))" \
+  vtop_broker_local_committed_offset)" \
+  || fail "the leader's committed offset could not be read after the $PREFIX-record prefix"
+# The leader commits locally before a quorum acknowledges, so this is never
+# below the acknowledged prefix.
+[[ "$L_COMMITTED" -ge "$PREFIX" ]] \
+  || fail "the leader reports $L_COMMITTED committed entries under $PREFIX acknowledged records"
+for n in "$C" "$R"; do
+  await_metric_at_least "$(data_metrics_addr $((n + 10)))" \
+    vtop_broker_local_committed_offset "$L_COMMITTED" \
+    "follower $n must hold the leader's first $L_COMMITTED entries (the $PREFIX-record \
+shared prefix) before C is killed"
+done
+# Boundary markers in the log so far, for turning C's entry count into a
+# record count below: one per marker the leader published.
+MARKERS="$(grep -c "boundary_marker_published" "$WORKDIR/logs/data-candidate-$L.log" || true)"
 kill9_pid "${PIDS[$C]}"
 FROZEN_AT="$(cat "$ACKED_FILE")"
 log "C=$C SIGKILLed with the acknowledged floor at $FROZEN_AT"
@@ -121,7 +191,23 @@ them by L and R alone; R=$R frozen"
 
 # --- 4. C is the only candidate that can take the lease ----------------------
 PIDS[C]=$(start_candidate "$C" "$LEADER_ID")
-log "C=$C restarted from its own directory"
+C_NEXT="$(sed -n 's/.*segment_recovered report=.*next_offset: \([0-9]*\).*/\1/p' \
+  "$WORKDIR/logs/data-candidate-$C.log" | tail -1)"
+C_RECORDS=""
+[[ -n "$C_NEXT" ]] && C_RECORDS=$((C_NEXT - MARKERS))
+log "C=$C restarted from its own directory holding ${C_NEXT:-?} log entries \
+(${C_RECORDS:-?} records and $MARKERS boundary marker(s))"
+# The acknowledged floor the producer writes trails what the leader has
+# already sent, so C can die holding records acknowledged after it (seed 701
+# did: C came back with all 300). Then C lacks nothing, may legitimately
+# lead, and the #611 shape was not reached: reported, never a PASS.
+if [[ -n "$C_RECORDS" && "$C_RECORDS" -ge "$ACKED" ]]; then
+  log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_records=$C_RECORDS \
+serving=none (shape not reached)"
+  log "SKIP: C came back holding every one of the $ACKED acknowledged records; the #611 \
+shape (C lacking acknowledged records) was not reached"
+  exit 77
+fi
 C_EPOCH="$(await_lease_holder "$LEADER_ID" "$C_UUID" \
   $((LEASE_DURATION_MS / 1000 + ELECTION_TIMEOUT_SECONDS)))"
 # --- 5. R answers C's fence ------------------------------------------------
@@ -144,7 +230,13 @@ if grep -q "refusing promotion: fewer than a majority" "$C_LOG"; then
 else
   REFUSED=no
 fi
-log "R=$R took the range at epoch $R_EPOCH; C=$C never led (refused by R's answer: $REFUSED)"
+[[ -n "$R_EPOCH" ]] \
+  || fail "R=$R logged a role change without an epoch: $(grep "data_node_role_changed" "$R_LOG" | tail -1)"
+[[ "$R_EPOCH" -gt "$EPOCH" && "$R_EPOCH" -gt "$C_EPOCH" ]] \
+  || fail "R=$R must lead at an epoch newer than the deposed leader's $EPOCH and the refused \
+candidate's $C_EPOCH; it leads at $R_EPOCH"
+log "R=$R took the range at epoch $R_EPOCH (L led at $EPOCH, C was refused at $C_EPOCH); \
+C=$C never led (refused by R's answer: $REFUSED)"
 
 # --- liveness needs a second follower that holds R's tail -------------------
 # C is behind R's tail, and a new leader does not stream a lagging follower
@@ -164,7 +256,7 @@ if [[ -n "$L_NEXT" && -n "$R_NEXT" && "$L_NEXT" -gt "$R_NEXT" ]]; then
   # them, so R cannot reach a quorum with L, and C is behind (#341). The
   # #611 claim above has been checked; the read-back cannot run without a
   # published mark. Exit 77 is reported as SKIP by run-all.sh, never PASS.
-  log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_epoch=$C_EPOCH \
+  log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_records=${C_RECORDS:-?} c_epoch=$C_EPOCH \
 c_refused_by_r=$REFUSED r_epoch=$R_EPOCH r_next=$R_NEXT l_next=$L_NEXT serving=none (#641)"
   log "SKIP: L returned holding $((L_NEXT - R_NEXT)) unacknowledged record(s) past R's tail \
 and is never fenced (#641); no quorum can form until it is"
@@ -202,6 +294,6 @@ CHAOS_MAX_OFFSET_GAPS="$SERVING_EPOCH" \
   "$(candidate_native_addr "$SERVING")" "$ACKED" "$ACKED"
 log "all $ACKED acknowledged records read back byte-exact from candidate $SERVING"
 
-log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_epoch=$C_EPOCH \
+log "RESULT seed=$SEED shared=$FROZEN_AT acked=$ACKED c=$C r=$R c_records=${C_RECORDS:-?} c_epoch=$C_EPOCH \
 c_refused_by_r=$REFUSED r_epoch=$R_EPOCH r_next=${R_NEXT:-?} l_next=${L_NEXT:-?} \
 serving=$SERVING serving_epoch=$SERVING_EPOCH"

@@ -241,31 +241,29 @@ reopen quietly.
   that kept such a suffix and was outvoted discards it on the established
   leader's first append or committed high-water mark past its start,
   instead of acking a record it does not hold (#261) or exposing the kept
-  records as committed. That memory does not survive a restart, which leaves
-  it in the same position as a replica that was absent from the fence.
-  Neither is left unreconciled any more (#641): once a leader is attached to
-  its replica set, every session it opens with a follower starts with the
-  probe's own fence frame, at the leader's epoch and with its history,
-  before the status read and before any record or mark. A session opened
-  before the attachment is dropped before it carries a record or a mark.
-  The fence reconciles a deposed leader that missed the election, or a
-  voter that restarted, exactly as it reconciles a voter. Histories that
-  agree leave the log as it is. A suffix the leader provably supersedes is
-  truncated at once. A suffix in a comparable history that the leader
-  cannot yet prove superseded is kept in dispute, from the divergence (or,
-  below the replica's high-water mark, from past both the mark and the
-  leader's tail). A replica that holds records but whose own history cannot
-  be compared (no journal, or a broken one) keeps everything above its own
-  high-water mark in dispute (#649 review). A kept dispute caps the replica's status and
-  acks, so the leader keeps the records it must send, and the leader's
-  first append or mark over it discards it; the replica then catches up and
-  never reports a disputed suffix as held, takes it under the new mark, or
-  acks the leader's records over it. Nothing at or below a replica's own
-  mark is touched. Such a replica stays uncomparable: its answers never
-  count toward a promotion, and it needs `vtopctl node repair` to install a
-  history. An empty replica with no history is not in that position: it
-  holds nothing to dispute, the candidate judges its answer Agreed, and it
-  counts. A leader with no history of its own cannot
+  records as committed. Until it is settled, that dispute caps the replica's
+  acks and reconnect status at its start. A replica absent from the fence,
+  such as a deposed leader that missed the election, is no longer left
+  unreconciled (#641). Once a leader is attached to its replica set, every
+  session it opens with a follower starts with the probe's own fence frame,
+  at the leader's epoch and with its history, before the status read and
+  before any record or mark. A session opened before the attachment is
+  dropped before it carries a record or a mark. The fence reconciles the
+  returning replica exactly as it reconciles a voter. Histories that agree
+  leave the log as it is. A suffix the leader provably supersedes is
+  truncated at once. A suffix the leader cannot yet prove superseded is kept
+  in dispute, from the divergence (or, below the replica's high-water mark,
+  from past both the mark and the leader's tail), and settled as above; the
+  replica then catches up and never reports a disputed suffix as held, takes
+  it under the new mark, or acks the leader's records over it. Nothing at or
+  below a replica's own mark is touched. A replica that holds records but
+  whose own history cannot be compared (no journal, or a broken one) gets no
+  session at all (#649 review): the leader cannot tell which of its records
+  match, so it sends it nothing and takes no ack from it, leaves its log as
+  it is, and reports that it needs `vtopctl node repair`. Its answers never
+  count toward a promotion either. An empty replica with no history is not
+  in that position: it holds nothing to dispute, the candidate judges its
+  answer Agreed, and it counts. A leader with no history of its own cannot
   reconcile anyone; its fences leave every log as it is. Plaintext planes
   skip the session fence, since they refuse fences and do not fail over.
   **The protection is the fenced replica's, so it holds only on upgraded
@@ -278,6 +276,34 @@ reopen quietly.
   keep the rolling upgrade itself from triggering it. An older candidate
   facing an upgraded replica judges the kept answer refused (its offset is
   higher) or Unknown, never a grant.
+- **#635** - the #611 dispute lived in memory only. A replica restarted
+  between the fence reply that kept the suffix and its settlement came back
+  holding the old records with nothing marking them, reported its full log,
+  and acked the new leader's record at the disputed offset as a duplicate of
+  a different one (#261). The dispute (fence epoch, first disputed offset,
+  and, when this replica's history can say, the epoch that owned that
+  offset) is now written beside the fencing-epoch journal, as
+  `fencing-epochs.kept-dispute`, and fsynced before the fence replies. Every
+  retirement, whether by settlement, truncation, a newer fence or the node's
+  own fence as a candidate, clears it durably before anything is acked past
+  it. A restart restores it, so it caps acks and status and is settled
+  exactly as before. A record the log has provably moved past, or one that
+  starts below the replica's committed mark or below the caller's tail its
+  fence bounded it by, is discarded at open, never settled over the new
+  leader's records. A lease adoption of a newer epoch is not such evidence:
+  adoption alone retires nothing. A dispute is retired only by its
+  settlement, a truncation past its start, a newer fence, or the node's own
+  fence as a candidate, and each of these clears the record.
+  The record holds two checksummed frames, so a crash while it changes
+  reads back the old state or the new one, never neither. **Older releases refuse the
+  directory while a dispute may be pending:** the journal's header is
+  version 2 from before the record is written until after it is cleared,
+  and every earlier release opens only version 1, so a downgrade cannot
+  silently serve the suffix. A crash between clearing the record and
+  lowering the header leaves the header at 2 until this release next opens
+  the directory, which lowers it. A crash sweep
+  (`kept_dispute_crash_sweep.rs`) cuts the fence and the settlement at every
+  storage operation and every byte of every write.
 
 One observation rode along without becoming a fix: scenario 09 once left a
 promotion unacquired within its deadline (#318). The flake has not recurred —

@@ -137,6 +137,22 @@ STREAM_JOIN_TOLERANCE_SECONDS = 1e-3
 # any estimate at all. A quarter of the default
 # one-second interval sits two orders of magnitude above the live jitter and
 # well below the smallest buffered block, which is one whole interval.
+#
+# The FINAL interval line is not one of those estimates (#481, found live).
+# iperf3 takes that interval's end when its test timer fires, then exchanges
+# results with the server over the control connection, and prints the line only
+# once the server answers DISPLAY_RESULTS (iperf_client_end -> reporter_callback
+# in iperf 3.21's src/iperf_client_api.c). The control connection crosses the
+# same shaped link, so that one line is late by about two round trips plus
+# whatever the bottleneck queue holds in front of the control messages: 0.206 s
+# on a 100 ms round trip with no queue, 0.62-0.75 s behind a 10 Mbit/s queue,
+# while every other line of the same streams sat within 2.5 ms of the earliest
+# (iperf 3.21, measurements/481-egress-ceiling/stream_placement/). Two capped
+# competitor runs were refused at 0.349 s and 0.285 s, and the uncapped control
+# passed at 0.218 s only because little was queued when it ended. So the final
+# line is left out of the spread and of the placement, and its lateness is
+# recorded as the cost of the end-of-test exchange rather than judged. The
+# tolerance itself is unchanged: the lines it judges are the live ones.
 STREAM_SYNC_TOLERANCE_SECONDS = 0.25
 
 # The flag this module places the contended window with. Named so the refusal
@@ -406,12 +422,18 @@ class CompetitorInterval:
     where this entry puts the window's opening on the run's clock — late only by
     iperf3's own write and one local pipe, and not at all by the relay that
     carries the line to the host. See `Contention.close()`.
+
+    `dates_its_end` is False for the report's FINAL interval alone: iperf3 writes
+    that line only after its end-of-test exchange with the server, so its stamp
+    is late by that exchange and does not say when the interval ended (see
+    STREAM_SYNC_TOLERANCE_SECONDS). Its bytes are as good as any other entry's.
     """
 
     start: float
     end: float
     bytes: int
     emitted_at: float | None = None
+    dates_its_end: bool = True
 
 
 @dataclass(frozen=True)
@@ -683,7 +705,7 @@ def _measured_intervals(report: Any, out: str, spec: CompetitorSpec, phase: str,
             f"{len(arrivals)} arrival stamp(s): the stamps can no longer be paired with the "
             "intervals they date, so the stream cannot be placed on the run's clock. This "
             "is a runner bug")
-    reported: list[tuple[float, float, int, float | None]] = []
+    reported: list[tuple[float, float, int, float | None, bool]] = []
     try:
         for index, entry in enumerate(raw):
             summary = entry["sum"]
@@ -691,7 +713,13 @@ def _measured_intervals(report: Any, out: str, spec: CompetitorSpec, phase: str,
                 continue
             reported.append((float(summary["end"]), float(summary["seconds"]),
                              int(summary["bytes"]),
-                             None if arrivals is None else arrivals[index]))
+                             None if arrivals is None else arrivals[index],
+                             # The report's LAST interval is written after the
+                             # end-of-test exchange, not when it ended (#481).
+                             # By position in the raw stream, so a zero-length
+                             # last entry dropped below takes the mark with it
+                             # instead of moving it onto a line written live.
+                             index != len(raw) - 1))
     except (KeyError, TypeError, ValueError) as exc:
         raise ShapingError(
             f"the {phase} competitor's iperf3 report has an interval this module cannot "
@@ -711,9 +739,9 @@ def _measured_intervals(report: Any, out: str, spec: CompetitorSpec, phase: str,
     # ends where the window ends, and the receiver's summary gives the window's
     # length, so the difference is where the stream's clock puts the window's
     # start — zero on an iperf3 that restarts it, the ramp on one that does not.
-    origin = max(end for end, _seconds, _count, _arrived in reported) - measured_seconds
+    origin = max(entry[0] for entry in reported) - measured_seconds
     stream = []
-    for end, seconds, count, arrived in reported:
+    for end, seconds, count, arrived, live in reported:
         finish = end - origin
         begin = max(0.0, finish - seconds)
         if finish - begin <= 0:
@@ -723,7 +751,7 @@ def _measured_intervals(report: Any, out: str, spec: CompetitorSpec, phase: str,
             # from the receiver's total either way — so dropping it moves the
             # shape by nothing and leaves every remaining span divisible.
             continue
-        stream.append(CompetitorInterval(begin, finish, count, arrived))
+        stream.append(CompetitorInterval(begin, finish, count, arrived, dates_its_end=live))
     if not stream:
         raise ShapingError(
             f"no interval in the {phase} competitor's report has any duration: {out[:400]}. "
@@ -1097,6 +1125,12 @@ class Contention:
         # another: the jitter of the pipe the stream crossed, and the evidence
         # that it was read live rather than buffered.
         self.window_sync_spread_seconds: float = 0.0
+        # How much later than the live lines the report's final line placed the
+        # window: iperf3 writes it after its end-of-test exchange with the
+        # server, across the shaped link, so this is that exchange's cost and is
+        # recorded rather than judged (#481). None when the report had no such
+        # line left to measure.
+        self.window_final_line_delay_seconds: float | None = None
         # The competitor over THAT SAME span, from its own interval stream
         # (review). The index's two inputs have to be rates over one interval,
         # and the flow's whole-window average is not one of them: it is an
@@ -1384,15 +1418,35 @@ class Contention:
                 "clock — only bounded, which lets VTOP's span be paired with the wrong seconds "
                 "of the competing flow. This is a runner bug: the contended window needs a "
                 "runner that stamps each line of the stream as it is written")
-        placements = [slot.emitted_at - slot.end for slot in self.contended.intervals]
+        # ONLY THE LINES WRITTEN AS THEIR INTERVAL ENDED (#481, found live). The
+        # report's final line is written after iperf3's end-of-test exchange
+        # with the server, which crosses the shaped link, so its estimate is
+        # late by two round trips plus the queue — 0.21-0.75s measured, against
+        # 2.5 ms at most for every other line. Judged with the rest, it refused two
+        # capped runs as "buffered" streams whose live lines were all in step.
+        # Its lateness is recorded, not judged: it is the link's cost, not the
+        # pipe's.
+        placements = [slot.emitted_at - slot.end for slot in self.contended.intervals
+                      if slot.dates_its_end]
+        if not placements:
+            raise ShapingError(
+                f"the contended competitor's report has {len(self.contended.intervals)} "
+                "measured interval(s) and none of them was written as it ended: iperf3 writes "
+                "its last line only after the end-of-test exchange, so a stream of one interval "
+                "has nothing that dates the window, and VTOP's span cannot be placed against it. "
+                "The window is too short for its reporting interval")
         synced = min(placements)
         spread = max(placements) - synced
         self.window_sync_spread_seconds = round(spread, 3)
         self.window_setup_seconds = round(max(0.0, synced - earliest), 3)
+        closing = [slot.emitted_at - slot.end - synced for slot in self.contended.intervals
+                   if not slot.dates_its_end]
+        self.window_final_line_delay_seconds = round(max(closing), 3) if closing else None
         if spread > STREAM_SYNC_TOLERANCE_SECONDS:
             raise ShapingError(
                 f"the contended competitor's interval lines place its window's opening "
-                f"{spread:.3f}s apart from one another, beyond the "
+                f"{spread:.3f}s apart from one another (the report's final line, written "
+                "after the end-of-test exchange, left out), beyond the "
                 f"{STREAM_SYNC_TOLERANCE_SECONDS}s a stream read live stays within: the lines "
                 "were buffered somewhere between iperf3 and this process and arrived in "
                 "bursts, so their arrival no longer dates the seconds they report. Placing the "
@@ -1688,14 +1742,19 @@ class Contention:
                 "the window sat"),
             "competitor_window_setup_seconds": self.window_setup_seconds,
             "competitor_window_sync_spread_seconds": self.window_sync_spread_seconds,
+            "competitor_window_final_line_delay_seconds": self.window_final_line_delay_seconds,
             "competitor_window_placed_by": (
-                "the arrival of each interval line of iperf3's --json-stream on the host, less "
-                "where that interval ends on the window's own clock; the earliest such estimate "
-                "is taken, so the placement is late by at most the fastest line's time in the "
-                "pipe. competitor_window_setup_seconds is how much of the unaccounted overhead "
-                "fell before the window opened; competitor_window_sync_spread_seconds is how "
-                "far the per-line estimates disagreed, refused above "
-                f"{STREAM_SYNC_TOLERANCE_SECONDS}s as a stream that was not read live"),
+                "the instant each interval line of iperf3's --json-stream was written, stamped "
+                "beside iperf3 in the probe container, less where that interval ends on the "
+                "window's own clock; the earliest such estimate is taken, so the placement is "
+                "late by at most the fastest line's write. The report's final line is left "
+                "out: iperf3 writes it only after its end-of-test exchange with the server, "
+                "across the shaped link, and competitor_window_final_line_delay_seconds is "
+                "how much later it was. competitor_window_setup_seconds is how much of the "
+                "unaccounted overhead fell before the window opened; "
+                "competitor_window_sync_spread_seconds is how far the other lines' estimates "
+                f"disagreed, refused above {STREAM_SYNC_TOLERANCE_SECONDS}s as a stream that "
+                "was not read live"),
             "vtop_goodput_mbps": self.vtop_mbps,
             "vtop_goodput_is": "committed object bytes; excludes framing, manifests, retries",
             "vtop_window_is": (

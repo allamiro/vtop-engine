@@ -1096,7 +1096,9 @@ impl NetworkedReplicaSet {
     /// and is discarded by this leader's first append or mark over it. That
     /// first write is the proof: only an established leader writes under its
     /// epoch. Nothing at or below the follower's own high-water mark is ever
-    /// touched; the fence refuses instead.
+    /// touched; the fence refuses instead. A follower that holds records
+    /// but has no history to compare gets no session at all (#649 review),
+    /// so it takes nothing and acks nothing until it is repaired.
     ///
     /// Sessions opened before this call carried no fence. Each is dropped
     /// before it carries a record or a mark, so the next one opens fenced.
@@ -1473,6 +1475,31 @@ impl FollowerDriver {
         let refusal = match reply.message {
             // Exactly this leader's epoch, as the promotion probe requires: a
             // higher one means a newer grant overtook this leader.
+            // A replica that holds records but has no history this leader
+            // can compare against (no journal, or a broken one) gets no
+            // session (#649 review). Its fence left it as it was, since
+            // nothing there can tell which of its records match this
+            // leader's. Given a session, it would report all of them as held,
+            // so this leader would prune what it must send, and its mark and
+            // appends would land over records that may differ (#261). Keeping
+            // a dispute from its mark instead would discard records it may
+            // hold validly, which this leader can re-send only while its
+            // bounded buffer still has them. Refused, it keeps its log, takes
+            // nothing, and acks nothing until `vtopctl node repair` installs
+            // a history. A leader with no history of its own compares nothing
+            // and refuses nobody; an empty replica has nothing to dispute.
+            Message::ReplicaFenceResponse(response)
+                if response.fencing_epoch == lineage.fencing_epoch
+                    && !lineage.epoch_starts.is_empty()
+                    && response.epoch_starts.is_empty()
+                    && response.next_offset > 0 =>
+            {
+                format!(
+                    "it holds {} record(s) but has no epoch history this leader can compare; \
+                     it gets no session until `vtopctl node repair` installs one",
+                    response.next_offset
+                )
+            }
             Message::ReplicaFenceResponse(response)
                 if response.fencing_epoch == lineage.fencing_epoch =>
             {

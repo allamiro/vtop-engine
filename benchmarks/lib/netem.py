@@ -712,6 +712,16 @@ def apply(shape: NetemShape, run: Runner) -> str:
     """
     engine_iface = resolve_engine_iface(run)
     code, out = run(["ip", "link", "add", IFB_DEV, "type", "ifb"])
+    if code != 0 and "unknown device type" in out.lower():
+        # Not a claim: the KERNEL has no ifb driver, so this middlebox can never
+        # shape the upload. Reported as "claimed" it sent an operator looking for
+        # a neighbour's leftover ifb that does not exist and cannot (#481: Docker
+        # Desktop's linuxkit kernel is built without CONFIG_IFB).
+        raise ShapingError(
+            f"the netem middlebox {shape.container} cannot create {IFB_DEV} ({out}): the "
+            "Docker host's kernel has no ifb driver (CONFIG_IFB unset; Docker Desktop's "
+            "linuxkit kernel is one such), and the upload is shaped on an ifb device. Run "
+            "the netem lab on a Linux Docker host whose kernel provides ifb")
     if code != 0:
         raise ShapingError(
             f"the netem middlebox {shape.container} is claimed: {IFB_DEV} already exists "

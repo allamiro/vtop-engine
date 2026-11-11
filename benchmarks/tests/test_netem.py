@@ -464,6 +464,27 @@ def test_a_middlebox_that_is_already_shaped_is_refused_not_stacked_on():
         "this run with the last one's link")
 
 
+def test_a_kernel_without_ifb_is_named_as_such_not_as_a_claimed_middlebox():
+    # Docker Desktop's linuxkit kernel (7.0.14 here) is built without
+    # CONFIG_IFB: `ip link add ifb0 type ifb` answers "Unknown device type".
+    # Read as a held claim, that told the operator to delete an ifb0 that did
+    # not exist, and the real cause — no lab on this kernel can shape — was
+    # nowhere in the message.
+    box = ScriptedMiddlebox()
+
+    def no_ifb_driver(argv):
+        if argv[:3] == ["ip", "link", "add"]:
+            box.calls.append(list(argv))
+            return 2, "Error: Unknown device type."
+        return box(argv)
+
+    with pytest.raises(ShapingError, match="no ifb driver") as exc:
+        netem.apply(full_shape(), no_ifb_driver)
+    assert "claimed" not in str(exc.value), str(exc.value)
+    assert box.installed() == [["ip", "link", "add", IFB_DEV, "type", "ifb"]], (
+        "nothing may be installed or deleted on a box that cannot shape at all")
+
+
 def test_every_teardown_command_is_attempted_and_the_ones_that_stayed_are_reported():
     shape = full_shape()
     box = ScriptedMiddlebox(refuse="qdisc del dev enp1s0 root")

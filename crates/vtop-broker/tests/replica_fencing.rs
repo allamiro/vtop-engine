@@ -547,6 +547,525 @@ fn a_high_water_mark_at_a_kept_suffix_start_discards_nothing() {
     assert_eq!(h.node.cluster_committed().get(), 5);
 }
 
+/// The #611 candidate's history: shares epoch 18 from 0, adopted 19 at its
+/// own tail, 5, and never received 5..10.
+fn lacking_candidate_history() -> [EpochStart; 2] {
+    [
+        EpochStart {
+            epoch: OLD_EPOCH,
+            start_offset: 0,
+        },
+        EpochStart {
+            epoch: NEW_EPOCH,
+            start_offset: 5,
+        },
+    ]
+}
+
+/// First life of a replica over `dir`: ten epoch-18 records, the cluster
+/// mark at 5, then fenced at 19 by a candidate that lacks 5..10, which it
+/// keeps (#611). The process then dies without an orderly shutdown: the
+/// fence reply is the last thing it does.
+fn keep_a_dispute_then_die(dir: &TempDir, range: &RangeIdentity) {
+    let segment = ActiveSegment::create(
+        dir.path().join("range.active"),
+        descriptor_for(range, 0xE1),
+        SegmentConfig::default(),
+    )
+    .unwrap();
+    let meta = MetaFencingEpoch::new(OLD_EPOCH);
+    let node = follower_via_the_real_open_path(dir, range, &meta, segment);
+    for offset in 0..10 {
+        node.apply_append(&append_request(range, OLD_EPOCH, OLD_LEADER, offset))
+            .unwrap();
+    }
+    node.observe_hwm(&CommittedHwmUpdate {
+        range: range.clone(),
+        fencing_epoch: OLD_EPOCH,
+        committed_high_watermark: 5,
+    })
+    .unwrap();
+    meta.set(NEW_EPOCH);
+    let fenced = node.fence(NEW_EPOCH, &lacking_candidate_history()).unwrap();
+    assert_eq!(
+        (fenced.truncated_records, fenced.next_offset),
+        (0, 10),
+        "precondition: the fence keeps the suffix the candidate lacks"
+    );
+}
+
+/// The next life over the same directory, through the real open path, with
+/// the lease watcher's adoption of the epoch-19 grant.
+fn restart_under_the_new_epoch(dir: &TempDir, range: &RangeIdentity) -> Arc<InProcessFollower> {
+    let meta = MetaFencingEpoch::new(NEW_EPOCH);
+    let node = follower_via_the_real_open_path(
+        dir,
+        range,
+        &meta,
+        ActiveSegment::recover(dir.path().join("range.active")).unwrap(),
+    );
+    node.adopt_fencing_epoch(NEW_EPOCH);
+    node
+}
+
+/// The kept dispute recorded on disk beside the fencing-epoch journal
+/// (#635), as the next open would read it.
+fn recorded_dispute(dir: &TempDir) -> Option<vtop_broker::kept_dispute::KeptDisputeRecord> {
+    FencingEpochJournal::open(dir.path().join("fencing-epochs"))
+        .unwrap()
+        .kept_dispute()
+}
+
+/// The fencing-epoch journal's header version (#635): 2 while a kept
+/// dispute is recorded beside it, which every older release refuses.
+fn epoch_journal_version(dir: &TempDir) -> u16 {
+    let bytes = std::fs::read(dir.path().join("fencing-epochs")).unwrap();
+    u16::from_be_bytes([bytes[8], bytes[9]])
+}
+
+/// #635. The memory of a kept dispute must survive the replica. Restarted
+/// between its fence reply and the new leader's first append, a replica
+/// that forgot the dispute held the old suffix with nothing marking it, so
+/// it reported its full log and acked the leader's record at 5 as a
+/// duplicate of a different record (#261). Reloaded, the dispute caps the
+/// status at its start and the append replaces the suffix, exactly as
+/// without the restart.
+#[test]
+fn a_kept_suffix_survives_a_restart_and_the_established_leaders_append_still_replaces_it() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    keep_a_dispute_then_die(&dir, &range);
+
+    let node = restart_under_the_new_epoch(&dir, &range);
+    assert_eq!(node.next_offset(), 10, "precondition: the suffix survived");
+    assert_eq!(
+        node.replication_status(),
+        (5, 5),
+        "the restarted replica reported its log past the kept dispute's start; the leader \
+         would prune the records it must send there"
+    );
+    let ack = node
+        .apply_append(&append_request(&range, NEW_EPOCH, Uuid::from_u128(0xA9), 5))
+        .expect("the established leader's append lands once the kept suffix is gone");
+    assert_eq!(ack.local_committed_offset, 6);
+    assert_eq!(
+        node.next_offset(),
+        6,
+        "the append was acked over the old record at 5 instead of replacing it"
+    );
+}
+
+/// #635 through the other settlement: the leader's mark, which a
+/// reconnecting session sends before any append, discards the reloaded
+/// suffix before it is applied and never exposes the old records as
+/// committed.
+#[test]
+fn a_kept_suffix_survives_a_restart_and_a_mark_past_it_still_discards_it_first() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    keep_a_dispute_then_die(&dir, &range);
+
+    let node = restart_under_the_new_epoch(&dir, &range);
+    node.observe_hwm(&CommittedHwmUpdate {
+        range: range.clone(),
+        fencing_epoch: NEW_EPOCH,
+        committed_high_watermark: 7,
+    })
+    .expect("the leader's mark on reconnect");
+    assert!(
+        node.cluster_committed().get() <= 5,
+        "the mark exposed the kept epoch-18 records as committed after a restart: cluster \
+         committed {} over a suffix disputed from 5",
+        node.cluster_committed().get()
+    );
+    assert_eq!(node.next_offset(), 5, "the mark discards the suffix first");
+}
+
+/// #635's compatibility gate. While a dispute is pending the epoch journal
+/// is at version 2, which every older release refuses to open rather than
+/// serve the suffix with no record of the dispute. Settled, it is back at 1,
+/// and a restart neither reloads the dispute nor caps the status.
+#[test]
+fn a_pending_dispute_gates_the_epoch_journal_and_a_settled_one_is_gone_after_a_restart() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    keep_a_dispute_then_die(&dir, &range);
+    assert_eq!(
+        epoch_journal_version(&dir),
+        2,
+        "a pending dispute must refuse older binaries, which would ack over it"
+    );
+
+    {
+        let node = restart_under_the_new_epoch(&dir, &range);
+        node.apply_append(&append_request(&range, NEW_EPOCH, Uuid::from_u128(0xA9), 5))
+            .expect("settles and lands");
+        assert_eq!(node.next_offset(), 6);
+    }
+    assert_eq!(
+        epoch_journal_version(&dir),
+        1,
+        "a settled dispute must not keep older binaries out"
+    );
+
+    let node = restart_under_the_new_epoch(&dir, &range);
+    assert_eq!(
+        node.replication_status(),
+        (6, 6),
+        "a settled dispute came back after a restart"
+    );
+    node.apply_append(&append_request(&range, NEW_EPOCH, Uuid::from_u128(0xA9), 6))
+        .expect("the next append lands");
+    assert_eq!(node.next_offset(), 7);
+}
+
+/// #635 with the #616 review's retirement rule. A fence at a newer epoch
+/// retires an older dispute before it judges and keeps a new one only if it
+/// keeps a suffix again. Here the newer caller agrees with everything the
+/// replica holds, so no dispute survives the fence, and a restart must not
+/// restore the one it retired: the status, the acks and the journal's gate
+/// are all as if no dispute had ever been kept.
+#[test]
+fn a_dispute_a_newer_agreeing_fence_retired_is_not_restored_by_a_restart() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    keep_a_dispute_then_die(&dir, &range);
+
+    // Second life: the dispute is restored, then a fence at 20 by a caller
+    // whose history matches this replica's retires it.
+    {
+        let node = restart_under_the_new_epoch(&dir, &range);
+        assert_eq!(node.replication_status(), (5, 5), "precondition: restored");
+        node.meta_fencing_epoch().set(NEWER_EPOCH);
+        let agreeing = [
+            EpochStart {
+                epoch: OLD_EPOCH,
+                start_offset: 0,
+            },
+            EpochStart {
+                epoch: NEW_EPOCH,
+                start_offset: 10,
+            },
+            EpochStart {
+                epoch: NEWER_EPOCH,
+                start_offset: 10,
+            },
+        ];
+        let fenced = node.fence(NEWER_EPOCH, &agreeing).unwrap();
+        assert_eq!((fenced.truncated_records, fenced.next_offset), (0, 10));
+        assert_eq!(
+            node.replication_status(),
+            (10, 10),
+            "the newer agreeing fence must retire the dispute"
+        );
+    }
+    assert_eq!(
+        epoch_journal_version(&dir),
+        1,
+        "the retirement must reach the disk, gate included"
+    );
+
+    // Third life.
+    let meta = MetaFencingEpoch::new(NEWER_EPOCH);
+    let node = follower_via_the_real_open_path(
+        &dir,
+        &range,
+        &meta,
+        ActiveSegment::recover(dir.path().join("range.active")).unwrap(),
+    );
+    node.adopt_fencing_epoch(NEWER_EPOCH);
+    assert_eq!(
+        node.replication_status(),
+        (10, 10),
+        "a restart restored a dispute a newer fence had retired"
+    );
+    let ack = node
+        .apply_append(&append_request(
+            &range,
+            NEWER_EPOCH,
+            Uuid::from_u128(0xA7),
+            10,
+        ))
+        .expect("the epoch-20 leader's append lands");
+    assert_eq!(
+        ack.local_committed_offset, 11,
+        "the ack was capped by a dispute that no longer exists"
+    );
+    assert_eq!(node.next_offset(), 11, "nothing was truncated");
+}
+
+/// #635 with the #616 regression rule that a candidate fencing ITSELF at a
+/// newer epoch retires a dispute it kept for an older one. The retirement
+/// must reach the disk: a restart must not bring the dispute back to cap
+/// the acks of the log this node now leads with.
+#[test]
+fn a_dispute_a_nodes_own_newer_fence_retired_is_not_restored_by_a_restart() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    keep_a_dispute_then_die(&dir, &range);
+
+    {
+        let node = restart_under_the_new_epoch(&dir, &range);
+        assert_eq!(node.replication_status(), (5, 5), "precondition: restored");
+        node.meta_fencing_epoch().set(NEWER_EPOCH);
+        let vote = node
+            .fence_locally(NEWER_EPOCH)
+            .expect("the candidate's own fence");
+        assert_eq!(vote, 10);
+        assert_eq!(
+            node.replication_status(),
+            (10, 10),
+            "the node's own newer fence must retire the dispute"
+        );
+    }
+    assert_eq!(
+        epoch_journal_version(&dir),
+        1,
+        "the retirement must reach the disk, gate included"
+    );
+    assert_eq!(recorded_dispute(&dir), None, "the record must be cleared");
+
+    let meta = MetaFencingEpoch::new(NEWER_EPOCH);
+    let node = follower_via_the_real_open_path(
+        &dir,
+        &range,
+        &meta,
+        ActiveSegment::recover(dir.path().join("range.active")).unwrap(),
+    );
+    node.adopt_fencing_epoch(NEWER_EPOCH);
+    assert_eq!(
+        node.replication_status(),
+        (10, 10),
+        "a restart restored a dispute the node's own newer fence had retired"
+    );
+}
+
+/// #643 review (cubic P1). Lease adoption of a newer epoch records that
+/// epoch in the journal without judging this replica, and in memory a
+/// dispute survives it, capping acks until a newer FENCE retires it. A
+/// restart must not do more than adoption: a newer epoch in the journal is
+/// not evidence the dispute was retired, and dropping it at open let the
+/// replica ack past the old suffix.
+#[test]
+fn a_dispute_survives_lease_adoption_of_a_newer_epoch_and_a_restart() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    keep_a_dispute_then_die(&dir, &range);
+    {
+        let node = restart_under_the_new_epoch(&dir, &range);
+        node.meta_fencing_epoch().set(NEWER_EPOCH);
+        assert!(node.adopt_fencing_epoch(NEWER_EPOCH), "the lease watcher");
+        assert_eq!(
+            node.replication_status(),
+            (5, 5),
+            "precondition: adoption alone does not retire it"
+        );
+    }
+    let meta = MetaFencingEpoch::new(NEWER_EPOCH);
+    let node = follower_via_the_real_open_path(
+        &dir,
+        &range,
+        &meta,
+        ActiveSegment::recover(dir.path().join("range.active")).unwrap(),
+    );
+    node.adopt_fencing_epoch(NEWER_EPOCH);
+    assert_eq!(
+        node.replication_status(),
+        (5, 5),
+        "a restart after lease adoption dropped a dispute no fence retired"
+    );
+    let ack = node
+        .apply_append(&append_request(
+            &range,
+            NEWER_EPOCH,
+            Uuid::from_u128(0xA7),
+            10,
+        ))
+        .expect("the append itself lands");
+    assert_eq!(
+        ack.local_committed_offset, 5,
+        "the ack passed a dispute that is still held"
+    );
+}
+
+/// #635 with the #616 review's caller-tail rule. Below the mark, a fence
+/// keeps only what lies past the caller's own tail. That dispute, from 10
+/// here, is recorded with the tail that bounded it, survives a restart, and
+/// the caller's marker at its tail still settles it.
+#[test]
+fn a_dispute_kept_from_the_callers_tail_survives_a_restart() {
+    let h = caught_up_under_its_own_epoch(9);
+    let fenced = h
+        .node
+        .fence(
+            NEWER_EPOCH,
+            &[
+                EpochStart {
+                    epoch: OLD_EPOCH,
+                    start_offset: 0,
+                },
+                EpochStart {
+                    epoch: NEWER_EPOCH,
+                    start_offset: 10,
+                },
+            ],
+        )
+        .expect("fenced");
+    assert_eq!((fenced.truncated_records, fenced.next_offset), (0, 11));
+    let Harness {
+        _dir: dir,
+        range,
+        node,
+        ..
+    } = h;
+    drop(node);
+    let recorded = recorded_dispute(&dir).expect("recorded before the fence replied");
+    assert_eq!(
+        (recorded.fence_epoch, recorded.from, recorded.caller_tail),
+        (NEWER_EPOCH, 10, 10)
+    );
+
+    let meta = MetaFencingEpoch::new(NEWER_EPOCH);
+    let node = follower_via_the_real_open_path(
+        &dir,
+        &range,
+        &meta,
+        ActiveSegment::recover(dir.path().join("range.active")).unwrap(),
+    );
+    node.adopt_fencing_epoch(NEWER_EPOCH);
+    assert_eq!(
+        node.replication_status(),
+        (10, 10),
+        "the dispute from the caller's tail was not restored"
+    );
+    let marker = node
+        .apply_append(&append_request(
+            &range,
+            NEWER_EPOCH,
+            Uuid::from_u128(0xAA),
+            10,
+        ))
+        .expect("the caller's marker at its tail lands over the kept record");
+    assert_eq!(marker.local_committed_offset, 11);
+    assert_eq!(node.next_offset(), 11);
+}
+
+/// A dispute bounded by the caller's tail starts at or past it (#616
+/// review), so a stored record whose start is below the tail it records
+/// is not one this rule wrote. Restored, its settlement would discard
+/// records the new leader holds and cannot re-send. It is discarded at
+/// open, durably.
+#[test]
+fn a_dispute_record_below_its_callers_tail_is_discarded_at_open() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    keep_a_dispute_then_die(&dir, &range);
+    {
+        let mut journal = FencingEpochJournal::open(dir.path().join("fencing-epochs")).unwrap();
+        let kept = journal.kept_dispute().expect("the fence recorded it");
+        journal
+            .record_kept_dispute(vtop_broker::kept_dispute::KeptDisputeRecord {
+                caller_tail: kept.from + 2,
+                ..kept
+            })
+            .unwrap();
+    }
+
+    let node = restart_under_the_new_epoch(&dir, &range);
+    assert_eq!(
+        node.replication_status(),
+        (10, 10),
+        "a record below its caller's tail was restored"
+    );
+    drop(node);
+    assert_eq!(
+        recorded_dispute(&dir),
+        None,
+        "the record must be cleared, not left for the next open"
+    );
+    assert_eq!(epoch_journal_version(&dir), 1, "and the gate lowered");
+}
+
+/// A dispute starts at or above the replica's committed mark (#616), so a
+/// stored record whose start is below the mark found at open is not one
+/// this code wrote for the log as it now stands. Restored, its settlement
+/// would be refused by the truncation guard and every later append with it.
+/// It is discarded, durably.
+#[test]
+fn a_dispute_record_below_the_committed_mark_is_discarded_at_open() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    keep_a_dispute_then_die(&dir, &range);
+    // The mark this replica learned moved to 7 after the record was
+    // written: the record from 5 now starts below it.
+    CommittedFloorFile::open(dir.path().join("committed-floor"))
+        .save(7)
+        .unwrap();
+
+    let node = restart_under_the_new_epoch(&dir, &range);
+    assert_eq!(node.cluster_committed().get(), 7, "precondition: the mark");
+    assert_eq!(
+        node.replication_status(),
+        (10, 10),
+        "a record below the committed mark was restored"
+    );
+    assert_eq!(
+        recorded_dispute(&dir),
+        None,
+        "the record must be cleared, not left for the next open"
+    );
+    assert_eq!(epoch_journal_version(&dir), 1, "and the gate lowered");
+}
+
+/// A dispute record the log has moved past is not reloaded (#635). Here the
+/// record is put back after the suffix was settled and the leader appended
+/// past it, which is what a binary that never knew the record would leave
+/// behind. Reloaded, it would truncate the established leader's own records
+/// at its next append. The epoch that owns the dispute's start is no longer
+/// the one that owned it when the fence kept it, and that is enough to tell.
+#[test]
+fn a_dispute_record_the_log_has_moved_past_is_discarded_at_open() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    keep_a_dispute_then_die(&dir, &range);
+    let sidecar = dir.path().join("fencing-epochs.kept-dispute");
+    let stale = std::fs::read(&sidecar).expect("the fence recorded the dispute");
+
+    {
+        let node = restart_under_the_new_epoch(&dir, &range);
+        for offset in 5..7 {
+            node.apply_append(&append_request(
+                &range,
+                NEW_EPOCH,
+                Uuid::from_u128(0xA9),
+                offset,
+            ))
+            .unwrap();
+        }
+        assert_eq!(node.next_offset(), 7);
+    }
+    std::fs::write(&sidecar, &stale).unwrap();
+
+    let node = restart_under_the_new_epoch(&dir, &range);
+    assert_eq!(
+        node.replication_status(),
+        (7, 7),
+        "a stale dispute record capped the status of a settled log"
+    );
+    node.apply_append(&append_request(&range, NEW_EPOCH, Uuid::from_u128(0xA9), 7))
+        .expect("the next append lands");
+    assert_eq!(
+        node.next_offset(),
+        8,
+        "a stale dispute record discarded the established leader's records"
+    );
+    assert_eq!(
+        recorded_dispute(&dir),
+        None,
+        "the stale record is cleared, not left for the next open"
+    );
+}
+
 /// #616 review (cubic P1). A request whose batch end overflows is malformed
 /// and refused; it must be refused BEFORE the kept suffix is discarded, not
 /// after.
@@ -1691,21 +2210,19 @@ fn a_dispute_below_the_mark_finds_the_callers_tail_behind_a_newer_epoch() {
     );
 }
 
-/// #649 review (cubic P2, 4532766446). A replica whose own history cannot be
-/// compared (no fencing-epoch journal, or a broken one) answers a fence as
-/// Unknown, and the fence used to leave it exactly as it was. A leader's
-/// session fence (#641) then left such a returning deposed leader reporting
-/// its whole tail: the leader pruned the records it had to send there, its
-/// mark put the old-epoch suffix under the committed boundary, and its
-/// appends at those offsets were acked as duplicates over different bytes
-/// (#261).
+/// #649 review (cubic 4532766446, codex 4533115499). The follower's half of
+/// the rule for a replica that holds records but has no history to compare
+/// (no fencing-epoch journal, or a broken one). A fence leaves it exactly as
+/// it was, and its reply says it has no history, which is what lets a
+/// leader's session refuse it (`NetworkedReplicaSet`). Nothing here can tell
+/// which of its records match the caller's: keeping a dispute from its mark
+/// would discard records it may hold validly, which the leader can re-send
+/// only while its bounded buffer has them.
 ///
-/// Invariant: an uncomparable replica keeps everything above its own
-/// high-water mark in dispute, so it reports no more than the mark, and the
-/// leader's first record there discards the suffix and lands. Nothing at or
-/// below the mark is touched.
+/// Invariant: the fence truncates nothing, keeps no dispute (the status is
+/// the whole log), and returns an empty history.
 #[test]
-fn an_uncomparable_replica_keeps_its_suffix_above_the_mark_in_dispute() {
+fn an_uncomparable_replica_is_left_as_it_is_and_says_so() {
     let range = range_identity();
     let dir = tempfile::tempdir().unwrap();
     let segment = ActiveSegment::create(
@@ -1779,35 +2296,13 @@ fn an_uncomparable_replica_keeps_its_suffix_above_the_mark_in_dispute() {
         )
         .expect("fenced");
     assert_eq!((fenced.truncated_records, fenced.next_offset), (0, 10));
+    assert!(
+        fenced.epoch_starts.is_empty(),
+        "the reply must say the history is unknown"
+    );
     assert_eq!(
         h.node.replication_status(),
-        (5, 5),
-        "an uncomparable replica reported its whole old-epoch suffix as held, so the leader \
-         would prune the records it must send there"
-    );
-
-    let landed = h
-        .node
-        .apply_append(&append_request(
-            &h.range,
-            NEW_EPOCH,
-            Uuid::from_u128(0xA3),
-            5,
-        ))
-        .expect("the leader's record at 5 lands over the kept suffix");
-    assert_eq!(landed.local_committed_offset, 6);
-    assert_eq!(h.node.next_offset(), 6);
-    let served: Vec<String> = h
-        .node
-        .fetch(0, usize::MAX, 64)
-        .unwrap()
-        .records
-        .iter()
-        .map(|fetched| String::from_utf8_lossy(&fetched.record.value).into_owned())
-        .collect();
-    assert_eq!(
-        served,
-        ["v0", "v1", "v2", "v3", "v4"],
-        "the committed prefix was touched"
+        (10, 10),
+        "the fence kept a dispute over records it cannot judge"
     );
 }

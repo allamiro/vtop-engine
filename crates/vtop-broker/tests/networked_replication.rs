@@ -1213,3 +1213,68 @@ fn a_static_range_at_epoch_zero_still_replicates() {
         h.cluster_committed.get()
     );
 }
+
+/// #649 review (cubic 4532766446, codex 4533115499). A follower that holds
+/// records but has no epoch history the leader can compare (no journal, or
+/// a broken one) cannot be reconciled: nothing can tell which of its records
+/// match the leader's. Given a session it reported all of them as held, so
+/// the leader pruned what it had to send, and its mark and appends landed
+/// over records that may differ (#261). Keeping a dispute from its mark
+/// instead discarded records it may hold validly, and the leader can re-send
+/// them only while its bounded buffer still has them.
+///
+/// Invariant: such a follower gets no session. It takes no record and no
+/// mark, so its log is left as it is, and the range commits on the rest.
+#[test]
+fn a_follower_holding_records_without_a_history_gets_no_session() {
+    let flow = FlowControlConfig {
+        reconnect_backoff: Duration::from_millis(20),
+        ack_timeout: Duration::from_millis(500),
+        ..FlowControlConfig::default()
+    };
+    let h = harness_with(flow, None, None, None, FollowerAddressing::Resolved);
+    // The leader and follower 2 keep a history; follower 1 has none.
+    let journals = tempfile::tempdir().unwrap();
+    h.leader.set_fencing_epoch_journal(
+        FencingEpochJournal::open(journals.path().join("leader")).unwrap(),
+    );
+    h.followers[1].set_fencing_epoch_journal(
+        FencingEpochJournal::open(journals.path().join("follower-2")).unwrap(),
+    );
+    let blind = Arc::clone(&h.followers[0]);
+    for sequence in 0..5 {
+        let _ = produce_ok(&h.leader, h.range.clone(), sequence);
+    }
+    assert!(
+        await_within(Duration::from_secs(5), || {
+            blind.local_committed_offset() == 5 && h.followers[1].local_committed_offset() == 5
+        }),
+        "precondition: both followers hold the committed prefix"
+    );
+    assert!(blind.epoch_starts().is_empty(), "precondition: no history");
+
+    // Its next session is fenced against the leader's history.
+    assert!(h.replica_set.force_reconnect(FOLLOWER_1));
+    assert!(
+        !await_within(Duration::from_secs(2), || {
+            h.replica_set.follower_connected(FOLLOWER_1) == Some(true)
+        }),
+        "a follower with records and no history got a session"
+    );
+    // Its old session may have delivered a mark before it closed; nothing
+    // may reach it from here on.
+    let before = (blind.next_offset(), blind.cluster_committed().get());
+    produce_at(&h.leader, h.range.clone(), FENCING_EPOCH, 5);
+    assert!(
+        await_within(Duration::from_secs(5), || {
+            h.followers[1].local_committed_offset() == 6
+        }),
+        "the range commits on the leader and follower 2"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        (blind.next_offset(), blind.cluster_committed().get()),
+        before,
+        "the follower without a history took a record or a mark"
+    );
+}
