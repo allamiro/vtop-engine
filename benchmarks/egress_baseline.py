@@ -329,7 +329,7 @@ RUN_COLUMNS = [
     "cpu_seconds_per_gib",
     "competitor_goodput_mbps_with", "competitor_goodput_mbps_without",
     "vtop_goodput_mbps_with", "competitor_jain_index",
-    "vm_loadavg_before", "vm_loadavg_after", "exit_code",
+    "vm_loadavg_before", "vm_loadavg_after", "exit_code", "host_contention",
 ]
 OBJECT_COLUMNS = [
     "run_id", "batch_id", "object_bytes", "object_upload_ms", "manifest_upload_ms",
@@ -416,8 +416,38 @@ def summarize_run(meta: dict, summary: dict, cycles: list[dict],
     return row, objects
 
 
+def busy_intervals(samples: list[dict], label: str) -> list[tuple[float, float, str]]:
+    """Intervals during which an outside workload was seen on the host, from a
+    presence sampler's rows (`timestamp_utc`, count). An interval opens at a
+    sample with a nonzero count and closes at the next zero one; still open at
+    the last sample, it is closed there."""
+    rows = sorted((datetime.fromisoformat(r["timestamp_utc"].replace("Z", "+00:00")).timestamp(),
+                   int(_f(r.get("rq4_containers_running")))) for r in samples)
+    out, opened = [], None
+    for ts, n in rows:
+        if n and opened is None:
+            opened = ts
+        elif not n and opened is not None:
+            out.append((opened, ts, label))
+            opened = None
+    if opened is not None and rows:
+        out.append((opened, rows[-1][0], label))
+    return out
+
+
+def contention_label(meta: dict, intervals: list[tuple[float, float, str]]) -> str:
+    """The outside workloads a run's wall-clock span overlapped, if any."""
+    try:
+        start = datetime.fromisoformat(meta["started_utc"]).timestamp()
+    except (KeyError, ValueError):
+        return ""
+    end = start + _f(meta.get("wall_seconds"))
+    return "; ".join(sorted({lab for a, b, lab in intervals if start <= b and end >= a}))
+
+
 def cmd_collect(args) -> int:
     runs, objects, cycles = [], [], []
+    intervals = (busy_intervals(_read_csv(args.busy), args.busy_label) if args.busy else [])
     for results in args.results:
         for meta in _read_csv(os.path.join(results, "sweep_index.csv")):
             if not meta["run_id"]:
@@ -437,6 +467,7 @@ def cmd_collect(args) -> int:
             cyc = _read_csv(os.path.join(rdir, "cycle_metrics.csv"))
             row, objs = summarize_run(meta, summary, cyc,
                                       _read_csv(os.path.join(rdir, "batch_metrics.csv")))
+            row["host_contention"] = contention_label(meta, intervals)
             runs.append(row)
             objects += objs
             cycles += [{k: c.get(k, "") for k in CYCLE_COLUMNS} for c in cyc]
@@ -577,7 +608,7 @@ POINT_COLUMNS = [
     "verify_share_of_batch", "manifest_mean_ms", "cpu_seconds_per_gib_median",
     "engine_cores_busy_median", "store_cores_busy_median", "objects", "objects_failed",
     "competitor_goodput_mbps_with", "competitor_goodput_mbps_without",
-    "vtop_goodput_mbps_with", "competitor_jain_index", "bottleneck",
+    "vtop_goodput_mbps_with", "competitor_jain_index", "host_contended_runs", "bottleneck",
 ]
 
 
@@ -637,6 +668,7 @@ def aggregate_points(runs: list[dict], objects: list[dict]) -> list[dict]:
             "competitor_goodput_mbps_without": med_of("competitor_goodput_mbps_without"),
             "vtop_goodput_mbps_with": med_of("vtop_goodput_mbps_with"),
             "competitor_jain_index": med_of("competitor_jain_index"),
+            "host_contended_runs": sum(1 for r in rs if r.get("host_contention")),
         }
         row["bottleneck"] = name_bottleneck(
             profile, _f(fmed, 0.0), verify_share, _f(ecores, 0.0), _f(scores, 0.0))
@@ -822,6 +854,9 @@ def measurement_rows(points: list[dict], dates: dict[tuple, str]) -> list[str]:
                  TRANSPORT, r["bottleneck"], dates[(r["profile"], r["config"], r["phase"])],
                  _config_text(r), r["runs"], good, frac or "n/a", p95 or "n/a", ver or "n/a",
                  cpu or "n/a", comp or "n/a"]
+        if int(_f(r.get("host_contended_runs"))):
+            cells[10] += (f"; {r['host_contended_runs']} of {r['runs']} runs overlapped another "
+                          "session's benchmark on the host")
         if int(_f(r["objects_failed"])):
             cells[12] += f"; {r['objects_failed']} object(s) failed"
         lines.append("| " + " | ".join(str(c) for c in cells) + " |")
@@ -888,6 +923,9 @@ def main(argv: list[str] | None = None) -> int:
     c = sub.add_parser("collect", help="run directories -> raw CSVs")
     c.add_argument("results", nargs="+")
     c.add_argument("--out", required=True)
+    c.add_argument("--busy", default="",
+                   help="a presence sampler's CSV (timestamp_utc, count) for an outside workload")
+    c.add_argument("--busy-label", default="another benchmark on the host")
     c.set_defaults(func=cmd_collect)
     rp = sub.add_parser("report", help="raw CSVs -> points.csv, gate.json, charts")
     rp.add_argument("--data", required=True)

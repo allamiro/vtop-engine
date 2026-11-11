@@ -270,3 +270,15 @@ def test_the_generated_measurement_rows_pass_the_documents_claims_lint(tmp_path)
     proc = subprocess.run(["bash", lint, str(doc)], capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stderr
     assert "16 object(s) failed" in rows[2] and "4.70 / 9.50" in rows[3]
+
+
+def test_a_run_overlapping_an_outside_workload_is_labelled_not_dropped():
+    samples = [{"timestamp_utc": "2026-11-11T01:00:00Z", "rq4_containers_running": "0"},
+               {"timestamp_utc": "2026-11-11T01:10:00Z", "rq4_containers_running": "3"},
+               {"timestamp_utc": "2026-11-11T01:40:00Z", "rq4_containers_running": "0"}]
+    windows = eb.busy_intervals(samples, "rq4")
+    assert len(windows) == 1
+    before = {"started_utc": "2026-11-11T01:00:00+00:00", "wall_seconds": "300"}
+    across = {"started_utc": "2026-11-11T01:05:00+00:00", "wall_seconds": "600"}
+    after = {"started_utc": "2026-11-11T01:41:00+00:00", "wall_seconds": "60"}
+    assert [eb.contention_label(m, windows) for m in (before, across, after)] == ["", "rq4", ""]
