@@ -655,9 +655,7 @@ KNOWN_GAPS_FIXED = """\
   work.
 - **Latency resolution.** The JVM perf tool reports percentiles in whole milliseconds, from a sample of the
   run's records; sub-millisecond differences are invisible.
-- **End-to-end latency, CPU and write amplification** (#596 metrics 3 and 4) are not measured yet.
-- **No CI drift check yet.** The images are deterministic for a given matplotlib version, but CI does not yet
-  regenerate and compare them (#600 acceptance)."""
+- **End-to-end latency, CPU and write amplification** (#596 metrics 3 and 4) are not measured yet."""
 
 
 # ----------------------------------------------------------------------------- main
