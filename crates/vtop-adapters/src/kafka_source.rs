@@ -417,32 +417,77 @@ struct PartitionLiveness {
     /// end of the log, for example), not a dead fetcher, and re-assigning it
     /// again would only restart every fetcher once per interval for nothing.
     reassigned_at_high: HashMap<(String, i32), i64>,
+    /// For a partition that has not delivered since an assign at
+    /// `Offset::Stored` and whose start is otherwise unknown (no committed
+    /// offset, `auto.offset.reset=latest`): the high watermark the first stall
+    /// check saw. Its start is the end of the log as it was at the assign,
+    /// which is at or below this, so records past it are records the fetcher
+    /// should have delivered (review of #644). Recorded lazily so the assign
+    /// path makes no extra broker call.
+    end_baseline: HashMap<(String, i32), i64>,
 }
 
 impl PartitionLiveness {
-    /// A fresh assign() restarts every fetcher, so every idle run starts over.
+    /// A fresh assign() restarts every fetcher, so every idle run starts over,
+    /// and a partition assigned at the end of the log starts at a new end.
     fn on_assign(&mut self, assignment: &[(String, i32)]) {
         self.idle.clear();
+        self.end_baseline.clear();
         self.reassigned_at_high
             .retain(|key, _| assignment.binary_search(key).is_ok());
     }
 
+    /// The offset a due partition would read next: `next` when it is known,
+    /// otherwise the end-of-log baseline. The first check of a partition with
+    /// neither records `high` as the baseline and decides nothing.
+    fn next_or_baseline(
+        &mut self,
+        key: &(String, i32),
+        next: Option<i64>,
+        high: i64,
+    ) -> Option<i64> {
+        if next.is_some() {
+            return next;
+        }
+        if let Some(&baseline) = self.end_baseline.get(key) {
+            return Some(baseline);
+        }
+        self.end_baseline.insert(key.clone(), high);
+        None
+    }
+
     /// Record one completed pass over `assigned`, the set given to the last
-    /// `on_assign`. A partition progressed if it delivered anything (kept or
-    /// rejected: either way its fetcher is alive) or if its topic filled its
-    /// budget, which leaves a partition crowded out rather than stalled.
+    /// `on_assign`. A partition progressed only if IT delivered something
+    /// (kept or rejected: either way its fetcher is alive). Its topic filling
+    /// its budget is not progress: another partition of the topic can fill it
+    /// on every pass while this one's fetcher is dead (review of #644), and a
+    /// partition that is merely crowded out still has to have records waiting
+    /// before the stall check acts on it.
+    ///
+    /// Delivery also drops the partition's re-assign bookmark and end-of-log
+    /// baseline: a partition that reads again is a new case, and a later
+    /// stall at the same high watermark must still be recovered.
     ///
     /// Runs on every pass, so it allocates only when a partition starts an
     /// idle run.
     fn record_pass(
         &mut self,
         assigned: &[(String, i32)],
-        progressed: impl Fn(&(String, i32)) -> bool,
+        delivered: impl Fn(&(String, i32)) -> bool,
         now: Instant,
     ) {
         for key in assigned {
-            if progressed(key) {
+            if delivered(key) {
+                // Not only when an idle run ends: the stall's own re-assign
+                // clears the idle runs, and the first delivery after it is
+                // the one that must drop the bookmark.
                 self.idle.remove(key);
+                if !self.reassigned_at_high.is_empty() {
+                    self.reassigned_at_high.remove(key);
+                }
+                if !self.end_baseline.is_empty() {
+                    self.end_baseline.remove(key);
+                }
             } else if let Some(run) = self.idle.get_mut(key) {
                 run.passes += 1;
             } else {
@@ -502,8 +547,8 @@ impl PartitionLiveness {
 /// it last delivered up to, or else where `Offset::Stored` resolves - the
 /// group's committed offset, or the low watermark when nothing is committed
 /// and `auto.offset.reset` starts at the beginning. `None` when none of these
-/// is known: a partition that starts at the END of the log has no backlog to
-/// measure until it delivers.
+/// is known (a partition that starts at the END of the log): the stall check
+/// then measures from `PartitionLiveness::next_or_baseline`.
 fn next_read_offset(
     delivered: Option<i64>,
     group_committed: Option<i64>,
@@ -994,6 +1039,7 @@ impl KafkaSource {
                 lows.get(key).copied(),
                 reset_to_earliest,
             );
+            let next = self.liveness.next_or_baseline(key, next, high);
             let Some(lag) = self.liveness.stalled_lag(key, next, high) else {
                 continue;
             };
@@ -1579,7 +1625,7 @@ impl SourceAdapter for KafkaSource {
                 |(topic, p)| {
                     topic_index
                         .get(topic.as_str())
-                        .is_some_and(|&idx| paused[idx] || progressed.contains(&(idx, *p)))
+                        .is_some_and(|&idx| progressed.contains(&(idx, *p)))
                 },
                 Instant::now(),
             );
@@ -1923,6 +1969,73 @@ mod tests {
         assert_eq!(live.stalled_lag(&dead, Some(100), 140), Some(40));
     }
 
+    /// Review of #644: two partitions of ONE topic, one busy enough to fill
+    /// the topic's budget on every pass, the other stopped. The topic being
+    /// full must not count as progress for the stopped partition: it is due
+    /// like any other silent partition (and the lag check then decides).
+    #[test]
+    fn a_stopped_partition_next_to_one_that_fills_the_topic_is_found_stalled() {
+        let assigned = vec![tp("a", 0), tp("a", 1)];
+        let mut live = PartitionLiveness::default();
+        live.on_assign(&assigned);
+        let start = Instant::now();
+        let stopped = tp("a", 1);
+        let passes = (STALL_AFTER.as_millis() / PASS.as_millis()) as u32 + 1;
+        let mut due = Vec::new();
+        for pass in 1..=passes {
+            let now = start + PASS * pass;
+            live.record_pass(&assigned, |key| *key != stopped, now);
+            due.extend(live.due(now));
+        }
+        assert_eq!(due, vec![stopped]);
+    }
+
+    /// Review of #644: the "already re-assigned at this high watermark"
+    /// bookmark is dropped once the partition delivers again, so a later
+    /// stall at the same watermark (a backlog left after a partial read) is
+    /// still recovered.
+    #[test]
+    fn a_partition_that_delivers_again_can_be_recovered_at_the_same_watermark() {
+        let key = tp("a", 0);
+        let assigned = vec![key.clone()];
+        let mut live = PartitionLiveness::default();
+        live.on_assign(&assigned);
+        live.note_reassigned(&key, 100);
+        assert_eq!(live.stalled_lag(&key, Some(40), 100), None);
+        live.record_pass(&assigned, |_| true, Instant::now());
+        assert_eq!(live.stalled_lag(&key, Some(60), 100), Some(40));
+    }
+
+    /// Review of #644: a partition assigned at `Offset::Stored` with nothing
+    /// committed and `auto.offset.reset=latest` starts at the end of the log,
+    /// so there is no offset to measure lag from. The first check records the
+    /// high watermark as its baseline and decides nothing; records past the
+    /// baseline at a later check are records a dead fetcher did not deliver.
+    #[test]
+    fn a_partition_started_at_the_end_of_the_log_is_measured_from_a_baseline() {
+        let key = tp("a", 0);
+        let assigned = vec![key.clone()];
+        let mut live = PartitionLiveness::default();
+        live.on_assign(&assigned);
+
+        let first = live.next_or_baseline(&key, None, 50);
+        assert_eq!(first, None, "the first check only records the baseline");
+        assert_eq!(live.stalled_lag(&key, first, 50), None);
+        let quiet = live.next_or_baseline(&key, None, 50);
+        assert_eq!(live.stalled_lag(&key, quiet, 50), None, "nothing new: idle");
+        let later = live.next_or_baseline(&key, None, 57);
+        assert_eq!(live.stalled_lag(&key, later, 57), Some(7));
+        // A known offset always wins over the baseline.
+        assert_eq!(live.next_or_baseline(&key, Some(40), 57), Some(40));
+
+        // Delivery and a fresh assign both drop the baseline.
+        live.record_pass(&assigned, |_| true, Instant::now());
+        assert_eq!(live.next_or_baseline(&key, None, 60), None);
+        live.on_assign(&assigned);
+        assert_eq!(live.next_or_baseline(&key, None, 70), None);
+        assert_eq!(live.next_or_baseline(&key, None, 70), Some(70));
+    }
+
     #[test]
     fn an_idle_partition_is_not_due_until_both_thresholds_pass() {
         let assigned = vec![tp("a", 0)];
@@ -1956,11 +2069,10 @@ mod tests {
         );
     }
 
-    /// A partition that delivers, or whose topic filled its budget (crowded
-    /// out, not stalled), starts its idle run over. So does every partition
-    /// on a fresh assign(), which restarts every fetcher.
+    /// A partition that delivers starts its idle run over. So does every
+    /// partition on a fresh assign(), which restarts every fetcher.
     #[test]
-    fn delivery_a_full_topic_and_a_fresh_assign_each_start_the_idle_run_over() {
+    fn delivery_and_a_fresh_assign_each_start_the_idle_run_over() {
         let assigned = vec![tp("a", 0)];
         let start = Instant::now();
         let mut live = PartitionLiveness::default();

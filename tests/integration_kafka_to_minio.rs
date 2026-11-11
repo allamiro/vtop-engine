@@ -1090,12 +1090,16 @@ async fn a_partition_that_stops_while_others_deliver_is_reassigned() {
         KafkaSource::new(kafka_cfg(&bootstrap(), &group), TelemetryFormat::Cef).unwrap();
     let sources = vec![kafka_source(&busy), kafka_source(&victim)];
 
+    // Drain all 10 seeded records of each topic first, so every record the
+    // victim delivers after the stall is one produced after it (review of
+    // #644: a seeded record still queued would satisfy the count for the
+    // wrong reason).
     let mut read = vec![0usize; 2];
     let warmup = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while read.contains(&0) {
+    while read.iter().any(|&n| n < 10) {
         assert!(
             std::time::Instant::now() < warmup,
-            "precondition: both topics are read, got {read:?}"
+            "precondition: both topics are drained, got {read:?}"
         );
         for (i, n) in read_pass(&mut adapter, &sources)
             .await
