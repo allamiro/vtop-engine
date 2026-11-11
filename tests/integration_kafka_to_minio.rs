@@ -953,3 +953,459 @@ async fn recovering_an_older_verified_batch_does_not_move_the_group_offset_back(
         starts[0]
     );
 }
+
+// ---------------------------------------------------------------------------
+// #623: a partition that stops being read until the engine restarts.
+// ---------------------------------------------------------------------------
+
+/// Append `n` records to `topic` and wait until the broker has them.
+fn produce(topic: &str, n: usize) {
+    use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+    let producer: BaseProducer = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-producer"))
+        .unwrap()
+        .create()
+        .expect("producer");
+    for i in 0..n {
+        let payload = format!("CEF:0|VTOP|IT|1.0|{i}|Stall|3|src=10.0.0.{}", i % 250);
+        // A large backlog fills the local queue: let it drain and retry.
+        while let Err((e, _)) = producer.send(BaseRecord::<(), str>::to(topic).payload(&payload)) {
+            assert!(
+                matches!(
+                    e,
+                    rdkafka::error::KafkaError::MessageProduction(
+                        rdkafka::types::RDKafkaErrorCode::QueueFull
+                    )
+                ),
+                "enqueue produce: {e}"
+            );
+            producer.poll(std::time::Duration::from_millis(10));
+        }
+    }
+    producer
+        .flush(std::time::Duration::from_secs(10))
+        .expect("flush produce");
+}
+
+fn kafka_source(name: &str) -> DiscoveredSource {
+    DiscoveredSource {
+        source_type: vtop_core::types::SourceType::Kafka,
+        source_name: name.to_string(),
+        format: TelemetryFormat::Cef,
+    }
+}
+
+/// One pass at the engine's default 250ms window; records read per source.
+/// A failed pass reads nothing, as in the engine, which retries next cycle: a
+/// broker whose group coordinator is still being created fails the first
+/// pass that asks it for a committed offset.
+async fn read_pass(adapter: &mut KafkaSource, sources: &[DiscoveredSource]) -> Vec<usize> {
+    let report = match adapter
+        .read_all_batch_candidates(
+            sources,
+            1000,
+            1 << 20,
+            std::time::Duration::from_millis(250),
+        )
+        .await
+    {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("read pass failed (the engine retries it): {e}");
+            return vec![0; sources.len()];
+        }
+    };
+    report
+        .outcomes
+        .iter()
+        .map(|outcome| {
+            outcome
+                .result
+                .as_ref()
+                .expect("per-source result ok")
+                .iter()
+                .map(|r| r.records.len())
+                .sum()
+        })
+        .collect()
+}
+
+/// #623, reproduced: ONE pass that reads nothing, while a partition assigned
+/// at `Offset::Stored` has not delivered yet, stopped the consumer for good.
+///
+/// That pass made the old retry re-assign every partition. The re-assign
+/// restarts every fetcher, and the fetch it starts cannot go out until the
+/// broker answers the long poll already in flight (`fetch.wait.max.ms`,
+/// 500ms), so a 250ms pass read nothing again, and re-assigned again, on every
+/// pass after it. Records kept arriving and none was read until a restart.
+/// The partition at `Stored` here is an empty topic, which is the common case:
+/// it never delivers, so it is "pending" for the life of the process.
+///
+/// Before the fix every pass after the quiet one read 0 of the 5 records
+/// produced before it; a fresh adapter (a restart) read them all.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_pass_that_reads_nothing_does_not_stop_the_consumer_reading() {
+    let (busy, _busy_cleanup) = fresh_topic("stall_busy", 20).await;
+    let (quiet, _quiet_cleanup) = fresh_topic("stall_quiet", 0).await;
+    let group = unique_group("stall-quiet-pass");
+    let mut adapter =
+        KafkaSource::new(kafka_cfg(&bootstrap(), &group), TelemetryFormat::Cef).unwrap();
+    // A concrete position for the busy topic, as recovery or the ledger's
+    // seed gives one; the empty topic resolves at Offset::Stored.
+    adapter
+        .replay_from_marker(&kafka_marker(&busy, &group, 0, 0))
+        .await
+        .expect("rewind");
+    let sources = vec![kafka_source(&busy), kafka_source(&quiet)];
+
+    let mut warm = 0;
+    for _ in 0..3 {
+        produce(&busy, 5);
+        warm += read_pass(&mut adapter, &sources).await[0];
+    }
+    assert!(warm > 0, "precondition: the busy topic is read");
+
+    // The quiet pass: nothing new, nothing read.
+    read_pass(&mut adapter, &sources).await;
+
+    let mut after = Vec::new();
+    for _ in 0..8 {
+        produce(&busy, 5);
+        after.push(read_pass(&mut adapter, &sources).await[0]);
+    }
+    assert!(
+        after.iter().sum::<usize>() >= 30,
+        "the consumer stopped reading after one quiet pass: records read per pass since \
+         {after:?}, of 5 produced before each"
+    );
+}
+
+/// #623, hypothesis 1: one partition stops being read while the others carry
+/// traffic. Sticky assignment never restarts a fetcher on its own, and the
+/// old retry fired only after a pass that read nothing, which never comes
+/// while another partition delivers - so the partition stayed unread until a
+/// restart. The stall check re-assigns it, whatever the others do.
+///
+/// A fetcher that dies is stood in for by pausing the partition on the
+/// consumer behind the adapter's back (the test seam). Before the fix the
+/// victim read nothing for the whole 45s while the busy topic was read on
+/// every pass.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_partition_that_stops_while_others_deliver_is_reassigned() {
+    let (busy, _busy_cleanup) = fresh_topic("stall_others", 10).await;
+    let (victim, _victim_cleanup) = fresh_topic("stall_victim", 10).await;
+    let group = unique_group("stall-one-partition");
+    let mut adapter =
+        KafkaSource::new(kafka_cfg(&bootstrap(), &group), TelemetryFormat::Cef).unwrap();
+    let sources = vec![kafka_source(&busy), kafka_source(&victim)];
+
+    // Drain all 10 seeded records of each topic first, so every record the
+    // victim delivers after the stall is one produced after it (review of
+    // #644: a seeded record still queued would satisfy the count for the
+    // wrong reason).
+    let mut read = vec![0usize; 2];
+    let warmup = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while read.iter().any(|&n| n < 10) {
+        assert!(
+            std::time::Instant::now() < warmup,
+            "precondition: both topics are drained, got {read:?}"
+        );
+        for (i, n) in read_pass(&mut adapter, &sources)
+            .await
+            .into_iter()
+            .enumerate()
+        {
+            read[i] += n;
+        }
+    }
+
+    adapter
+        .stop_fetcher_behind_the_adapter(&victim, 0)
+        .expect("stop the victim's fetcher");
+    produce(&victim, 10);
+
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(45);
+    let mut busy_during = 0;
+    let mut victim_after = 0;
+    while victim_after < 10 && std::time::Instant::now() < deadline {
+        produce(&busy, 2);
+        let pass = read_pass(&mut adapter, &sources).await;
+        busy_during += pass[0];
+        victim_after += pass[1];
+    }
+    assert!(busy_during > 0, "the other topic kept delivering");
+    assert_eq!(
+        victim_after,
+        10,
+        "the stalled partition was not read again within {:?} while the other topic \
+         delivered {busy_during} records",
+        started.elapsed()
+    );
+}
+
+/// Review of #644: with `auto.offset.reset=latest` and nothing committed, a
+/// partition that stalls before its first delivery is assigned at
+/// `Offset::Stored`, which resolves to the END of the log. Recovering it
+/// with another `Stored` assign would start at the new end and skip every
+/// record that piled up while it was stalled. The recovery assigns it at an
+/// explicit offset instead, so all of them are read.
+///
+/// The victim's fetcher is stopped before it delivers anything. Ten records
+/// arrive before the first stall check and five after it; all fifteen must
+/// be read.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_partition_started_at_the_end_of_the_log_recovers_without_skipping() {
+    let (busy, _busy_cleanup) = fresh_topic("stall_latest_busy", 0).await;
+    let (victim, _victim_cleanup) = fresh_topic("stall_latest_victim", 0).await;
+    let group = unique_group("stall-latest");
+    let mut cfg = kafka_cfg(&bootstrap(), &group);
+    cfg.auto_offset_reset = "latest".into();
+    let mut adapter = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
+    let sources = vec![kafka_source(&busy), kafka_source(&victim)];
+
+    // Both partitions resolve to the end of the (empty) log; the busy one
+    // then delivers on every pass.
+    let mut busy_read = 0;
+    let warmup = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while busy_read == 0 {
+        assert!(
+            std::time::Instant::now() < warmup,
+            "precondition: the busy topic is read"
+        );
+        produce(&busy, 2);
+        busy_read += read_pass(&mut adapter, &sources).await[0];
+    }
+    adapter
+        .stop_fetcher_behind_the_adapter(&victim, 0)
+        .expect("stop the victim's fetcher");
+    produce(&victim, 10);
+
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(50);
+    let mut victim_read = 0;
+    let mut busy_during = 0;
+    let mut victim_reads_at: Vec<(u128, usize)> = Vec::new();
+    let mut produced_late = false;
+    while victim_read < 15 && std::time::Instant::now() < deadline {
+        // Five more after the first stall check could have run.
+        if !produced_late && started.elapsed() > std::time::Duration::from_secs(14) {
+            produce(&victim, 5);
+            produced_late = true;
+        }
+        produce(&busy, 2);
+        let pass = read_pass(&mut adapter, &sources).await;
+        busy_during += pass[0];
+        victim_read += pass[1];
+        if pass[1] > 0 {
+            victim_reads_at.push((started.elapsed().as_millis(), pass[1]));
+        }
+    }
+    // Only the victim stalled: a regression that stopped both partitions
+    // must not pass as a recovery (review of #644).
+    assert!(
+        busy_during > 0,
+        "the busy topic stopped delivering after the victim was paused"
+    );
+    assert_eq!(
+        victim_read,
+        15,
+        "records produced while the partition was stalled were skipped or never read \
+         (within {:?}; stall recoveries: {}; victim reads (ms, records): {victim_reads_at:?})",
+        started.elapsed(),
+        adapter.stall_recoveries()
+    );
+}
+
+/// Review of #644: a HEALTHY partition that started at the end of the log
+/// (`latest`, nothing committed) and has had nothing new since is idle, not
+/// stalled - even when records were written shortly before the assign. The
+/// stall check must not mistake those for records the fetcher failed to
+/// deliver and rewind onto them: `latest` skips them on purpose.
+///
+/// Before the fix the start was looked up from 60s before the assign, found
+/// the seeded record, and the partition was rewound and read it.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn an_idle_partition_started_at_the_end_is_not_rewound_onto_older_records() {
+    let (busy, _busy_cleanup) = fresh_topic("stall_latest_idle_busy", 0).await;
+    // Written moments before the assign; latest must skip it.
+    let (idle, _idle_cleanup) = fresh_topic("stall_latest_idle", 1).await;
+    let group = unique_group("stall-latest-idle");
+    let mut cfg = kafka_cfg(&bootstrap(), &group);
+    cfg.auto_offset_reset = "latest".into();
+    let mut adapter = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
+    let sources = vec![kafka_source(&busy), kafka_source(&idle)];
+
+    // Long enough for the idle partition to become due and be checked
+    // (STALL_AFTER plus a check interval), with the busy topic delivering.
+    let started = std::time::Instant::now();
+    let mut busy_read = 0;
+    let mut idle_read = 0;
+    while started.elapsed() < std::time::Duration::from_secs(25) {
+        produce(&busy, 2);
+        let pass = read_pass(&mut adapter, &sources).await;
+        busy_read += pass[0];
+        idle_read += pass[1];
+    }
+    assert!(busy_read > 0, "precondition: the busy topic is read");
+    assert_eq!(
+        idle_read, 0,
+        "a healthy idle partition was rewound onto a record from before its assign"
+    );
+}
+
+/// #623, as a run of the research benchmark hit it on v0.7.0: ONE
+/// partition with a large backlog, a fresh group, 4 MiB passes. The first
+/// batch (two passes) was committed, and from the next pass on every pass
+/// read nothing for over ten minutes, with no error, no seek and no rewind,
+/// while the broker held 578,093 unread records. A restart read them.
+///
+/// Once the partition has delivered, it is assigned at a
+/// concrete offset, and nothing in v0.7.0 ever re-assigns such a partition:
+/// the only retry was for a partition still waiting on `Offset::Stored`.
+/// Why its fetcher stopped is not in that log; stopping it behind the
+/// adapter's back stands in for it here. Before the fix this read nothing
+/// for the whole 45s.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_single_partition_that_stops_right_after_its_first_commit_is_read_again() {
+    let (topic, _cleanup) = fresh_topic("stall_backlog", 0).await;
+    produce(&topic, 600_000);
+    let group = unique_group("stall-backlog");
+    let mut adapter =
+        KafkaSource::new(kafka_cfg(&bootstrap(), &group), TelemetryFormat::Cef).unwrap();
+    let sources = vec![kafka_source(&topic)];
+    // A budget the passes never fill, so no pass rejects a record and forces
+    // a fresh assign: the partition stays assigned, as it did in that run.
+    let budget = 256 << 20;
+
+    // Read until the partition has delivered, so it is held at a concrete
+    // offset as in that run, then commit what was read. How many passes that
+    // takes, or how much of the backlog they drain, does not matter (review
+    // of #644): records are produced after the stop, so some always wait.
+    let mut last_end = -1;
+    let warmup = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while last_end < 0 {
+        assert!(
+            std::time::Instant::now() < warmup,
+            "precondition: the backlog is read"
+        );
+        let report = adapter
+            .read_all_batch_candidates(
+                &sources,
+                1_000_000,
+                budget,
+                std::time::Duration::from_millis(250),
+            )
+            .await;
+        let Ok(report) = report else { continue };
+        let reads = report.outcomes[0].result.as_ref().expect("source ok");
+        for read in reads {
+            if let ProgressMarker::Kafka { end_offset, .. } = &read.progress_end {
+                last_end = last_end.max(*end_offset);
+            }
+        }
+    }
+    adapter
+        .commit_progress(&kafka_marker(&topic, &group, 0, last_end))
+        .await
+        .expect("commit the first batch");
+    adapter
+        .stop_fetcher_behind_the_adapter(&topic, 0)
+        .expect("stop the fetcher");
+    // However much of the backlog the first passes took, records wait.
+    produce(&topic, 1_000);
+
+    let started = std::time::Instant::now();
+    let mut after = 0;
+    while after == 0 && started.elapsed() < std::time::Duration::from_secs(45) {
+        after += read_pass(&mut adapter, &sources).await[0];
+    }
+    assert!(
+        after > 0,
+        "the partition was not read again within {:?} after its first commit, with \
+         {} records waiting",
+        started.elapsed(),
+        601_000 - (last_end + 1)
+    );
+}
+
+/// Review of #644: recovering ONE stalled partition must not move another
+/// partition that started at the end of the log (`latest`, nothing
+/// committed) and has not delivered yet. A whole re-assign resolved that
+/// partition at the end of the log again, so records written to it just
+/// before the recovery were skipped.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn recovering_one_partition_does_not_move_another_that_started_at_the_end() {
+    let (busy, _busy_cleanup) = fresh_topic("stall_iso_busy", 0).await;
+    let (victim, _victim_cleanup) = fresh_topic("stall_iso_victim", 0).await;
+    let (quiet, _quiet_cleanup) = fresh_topic("stall_iso_quiet", 0).await;
+    let group = unique_group("stall-isolated");
+    let mut cfg = kafka_cfg(&bootstrap(), &group);
+    cfg.auto_offset_reset = "latest".into();
+    let mut adapter = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
+    let sources = vec![
+        kafka_source(&busy),
+        kafka_source(&victim),
+        kafka_source(&quiet),
+    ];
+
+    let mut busy_read = 0;
+    let warmup = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while busy_read == 0 {
+        assert!(
+            std::time::Instant::now() < warmup,
+            "precondition: the busy topic is read"
+        );
+        produce(&busy, 2);
+        busy_read += read_pass(&mut adapter, &sources).await[0];
+    }
+    adapter
+        .stop_fetcher_behind_the_adapter(&victim, 0)
+        .expect("stop the victim's fetcher");
+    produce(&victim, 10);
+
+    // Until the stall check decides to recover the victim.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    let mut victim_read = 0;
+    let mut quiet_read = 0;
+    while adapter.stall_recoveries() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "precondition: the stall check recovers the victim"
+        );
+        produce(&busy, 2);
+        let pass = read_pass(&mut adapter, &sources).await;
+        victim_read += pass[1];
+        quiet_read += pass[2];
+    }
+    assert_eq!(
+        quiet_read, 0,
+        "precondition: nothing was written to quiet yet"
+    );
+    // Written in the gap between the decision and the recovery itself.
+    produce(&quiet, 3);
+
+    let settle = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while (victim_read < 10 || quiet_read < 3) && std::time::Instant::now() < settle {
+        produce(&busy, 2);
+        let pass = read_pass(&mut adapter, &sources).await;
+        victim_read += pass[1];
+        quiet_read += pass[2];
+    }
+    assert_eq!(
+        victim_read,
+        10,
+        "the stalled partition was recovered (stall recoveries: {})",
+        adapter.stall_recoveries()
+    );
+    assert_eq!(
+        quiet_read, 3,
+        "recovering another partition skipped records written to one that started at \
+         the end of the log"
+    );
+}

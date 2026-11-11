@@ -79,6 +79,32 @@ enum Command {
         /// Persist the acknowledged floor here after every batch.
         #[arg(long)]
         acked_file: Option<PathBuf>,
+        /// Offer at most this many records per second, averaged from the
+        /// start of this invocation; 0 sends each batch as soon as the last
+        /// is acknowledged. A failover benchmark (#597) needs a fixed offered
+        /// load below saturation, not a closed loop at it.
+        #[arg(long, default_value_t = 0)]
+        rate: u64,
+        /// Anchor `--rate`'s schedule at this wall-clock instant (unix
+        /// micros) instead of this invocation's start: the batch at sequence
+        /// `s` is due at `anchor + s / rate`. A producer restarted after a
+        /// failover with `--first-sequence` then resumes ONE schedule and
+        /// drains the backlog the outage built, as a fixed-rate source
+        /// buffering through the outage would, instead of starting a new,
+        /// later schedule.
+        #[arg(long)]
+        rate_anchor_unix_micros: Option<u64>,
+        /// Append `<unix_micros> <acked_total> <latency_micros>` here for
+        /// every acknowledged batch: the acknowledgement timeline a failover
+        /// is read from, which the floor in `--acked-file` cannot give.
+        #[arg(long)]
+        ack_log: Option<PathBuf>,
+        /// A batch with no answer after this many milliseconds ends the run
+        /// as interrupted (exit 3), as a refused connection does; 0 waits
+        /// forever. Without it a leader cut off by a network partition holds
+        /// the producer on a socket that never answers or closes.
+        #[arg(long, default_value_t = 0)]
+        request_timeout_ms: u64,
     },
     /// Fetch from offset 0 and byte-verify everything below the committed HWM.
     Verify {
@@ -235,6 +261,10 @@ async fn run(cli: Cli) -> Result<i32, String> {
             first_sequence,
             durability,
             acked_file,
+            rate,
+            rate_anchor_unix_micros,
+            ack_log,
+            request_timeout_ms,
         } => {
             let config = client::ClientConfig::load(&client_config)?;
             client::produce(
@@ -247,6 +277,10 @@ async fn run(cli: Cli) -> Result<i32, String> {
                     first_sequence,
                     durability: parse_durability(&durability)?,
                     acked_file,
+                    rate,
+                    rate_anchor_unix_micros,
+                    ack_log,
+                    request_timeout_ms,
                 },
             )
             .await

@@ -10,6 +10,10 @@ Every measured number in them (tables, charts, ratios) comes from the CSV; the
 run's conditions (machine, limits, images, commit, matrix, dates) come from
 environment.json. None is typed here.
 
+A failover run (#597; its directory holds `failover.csv`) is handed to
+failover_report.py, which writes docs/benchmarks/kafka-failover.md under the
+same rules.
+
 Output is deterministic for a given CSV, environment.json and matplotlib
 version: fixed rcParams, a fixed SVG hash salt, and no timestamps or software
 banners in the metadata.
@@ -29,6 +33,7 @@ from kafka_compare import schema, stats  # noqa: E402
 REPO = os.path.dirname(os.path.dirname(HERE))
 DEFAULT_IMG_DIR = os.path.join(REPO, "docs", "benchmarks", "img")
 DEFAULT_DOC = os.path.join(REPO, "docs", "benchmarks", "kafka-comparison.md")
+DEFAULT_FAILOVER_DOC = os.path.join(REPO, "docs", "benchmarks", "kafka-failover.md")
 
 # One colour per system in every chart: categorical slots 1 and 2 of the
 # reference palette, validated for CVD separation (protan dE 24.7) and
@@ -454,7 +459,8 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
         "systems. A run more than 5% short of its offered rate is flagged *not sustained*: the tool's throttle "
         "then becomes a closed loop and its latency understates the real one, so the chart draws such points "
         "hollow and joins no line through them.")
-    add(f"- **Repetition (rule 7).** {reps} repetitions per measurement; the first 20% of each run's records are "
+    add(f"- **Repetition (rule 7).** {reps} repetitions per measurement; the first "
+        f"{percent(env['matrix']['warmup_fraction'])} of each run's records are "
         "warm-up (`--warmup-records`) and excluded, after an unrecorded warm-up run per cell. Tables show the "
         "median with the min-max across repetitions.")
     add("- **Correctness first.** Before any timing, each fresh cluster took "
@@ -537,7 +543,7 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
         add("")
     add("## Reading the results")
     add("")
-    add(READING)
+    add(READING.format(lowest_pct=pcts[0]))
     add("")
     add("## Gateway gaps met (rule 10)")
     add("")
@@ -548,7 +554,7 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
     add("")
     add("## Known gaps in this phase")
     add("")
-    add(KNOWN_GAPS)
+    add(known_gaps(env))
     add("")
     add("## Environment")
     add("")
@@ -588,7 +594,7 @@ isolated by a separate measurement in this phase; they are the explanation the c
    requests) exists in `vtop-broker` but is not wired into the node. The client caps a request at
    `batch.size` (16 KiB by default) whatever the record size, so a ceiling set per request shows up as a
    roughly constant MiB/s across record sizes and a record rate that falls as records grow, which is the shape
-   of VTOP's two cells here.
+   of VTOP's cells here.
 3. **Translation in the gateway.** Every Kafka record batch is decoded, validated (CRC, attributes) and
    re-appended through the native broker, which frames it again for the replica plane; Kafka validates the
    batch and appends it with offsets assigned in place, without taking its records apart. The cost is CPU and
@@ -600,10 +606,10 @@ A separate, unrecorded probe during development showed the VTOP nodes far below 
 saturated, which fits (1) and (2): the produce path is bound by durability round trips, not CPU. Per-node CPU
 and bytes written are not in this run's CSV; recording them is #596's resource metric (phase 2).
 
-**On the latency chart:** where VTOP's saturation is below the lowest offered rate (25% of Kafka's), no VTOP
+**On the latency chart:** where VTOP's saturation is below the lowest offered rate ({lowest_pct}% of Kafka's), no VTOP
 fixed-rate run can be sustained, and the perf tool's throttle degenerates into a closed loop against a full
 producer buffer. Those VTOP latencies are queueing in the client (seconds), not VTOP's service latency at that
-load; they are drawn hollow and must not be read as "VTOP's p99 at 25% load". A fair open-loop VTOP latency
+load; they are drawn hollow and must not be read as "VTOP's p99 at {lowest_pct}% load". A fair open-loop VTOP latency
 curve needs offered rates below VTOP's own saturation, which the issue's Kafka-relative rule does not produce
 here; adding VTOP-relative rates is a phase-2 item.
 
@@ -611,11 +617,38 @@ Nothing here measures what VTOP adds over Kafka on this path (fenced epochs, the
 evidence chain; see [COMPARISON.md](../COMPARISON.md)), and nothing here is a failover, archive or crash
 measurement (#597, #598, #599)."""
 
-KNOWN_GAPS = """\
-- **Matrix size.** Record sizes 100 B and 1 KiB only; 1 partition, 1 producer, no compression, profile
-  `defaults` only. #596's full matrix (10 KiB, 6 partitions, 4 producers, zstd, `fsync-parity`) is not run.
-- **One gateway, one partition.** The gateway runs on the range's leader only; a multi-partition VTOP topic
-  needs one leader per partition and is not exercised here.
+def percent(fraction: float) -> str:
+    return f"{fraction * 100:g}%"
+
+
+def _counted(values: list[int], noun: str) -> str:
+    joined = " and ".join(str(v) for v in values)
+    return f"{joined} {noun}" + ("" if values == [1] else "s")
+
+
+def known_gaps(env: dict[str, Any]) -> str:
+    """The known-gaps list, with the matrix facts read from the run, not typed in."""
+    m = env["matrix"]
+    sizes, partitions, producers = m["record_sizes"], m["partitions"], m["producers"]
+    profile = env["comparable"]["profile"]
+    # #596's full matrix, and which parts of it this run did not cover.
+    full = (("10 KiB", 10240 in sizes), ("6 partitions", 6 in partitions), ("4 producers", 4 in producers),
+            ("zstd", False), ("`fsync-parity`", profile == "fsync-parity"))
+    missing = [name for name, covered in full if not covered]
+    lines = [
+        f"- **Matrix size.** Record sizes {' and '.join(size_label(size) for size in sizes)} only; "
+        f"{_counted(partitions, 'partition')}, {_counted(producers, 'producer')}, no compression, profile\n"
+        f"  `{profile}` only." + (f" #596's full matrix ({', '.join(missing)}) is not run." if missing else ""),
+    ]
+    if max(partitions) == 1:
+        lines.append(
+            "- **One gateway, one partition.** The gateway runs on the range's leader only; a multi-partition VTOP "
+            "topic\n  needs one leader per partition and is not exercised here.")
+    return "\n".join(lines) + "\n" + KNOWN_GAPS_FIXED
+
+
+# The gaps that do not depend on the run's matrix: how the harness is built.
+KNOWN_GAPS_FIXED = """\
 - **No metadata plane.** VTOP runs as a static leader with two followers (live-chaos scenario 17's shape), so
   there is no lease, no failover and no durable consumer-offset store; Kafka runs its full KRaft quorum. Neither
   matters to a steady-state produce/fetch measurement, but the two clusters are not doing identical background
@@ -634,17 +667,20 @@ def build(run_dir: str, img_dir: str, doc_path: str) -> list[str]:
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(doc_path)), exist_ok=True)
     run_id = run.environment["run_id"]
+    m = run.environment["matrix"]
+    shape = f"{_counted(m['partitions'], 'partition')}, {_counted(m['producers'], 'producer')}"
     written = []
     written += throughput_chart(plt, run.rows, run.environment, run_id, "saturation",
                                 "Produce throughput at saturation, VTOP vs Apache Kafka",
-                                "1 partition, 1 producer, acks=all, RF 3 / min ISR 2 (VTOP: write quorum 2 of 3). "
+                                f"{shape}, acks={'/'.join(m['acks'])}, RF 3 / min ISR 2 (VTOP: write quorum 2 of 3). "
                                 "Same JVM client container for both systems.",
                                 "kafka-compare-produce-throughput", img_dir)
     written += latency_chart(plt, run.rows, run.environment, run_id, img_dir)
     if run.environment["matrix"].get("consume"):
         written += throughput_chart(plt, run.rows, run.environment, run_id, "consume",
                                     "Consume throughput, VTOP vs Apache Kafka",
-                                    "1 partition, 1 consumer in a fresh group, offset commits off for both; the tool's "
+                                    f"{_counted(m['partitions'], 'partition')}, 1 consumer in a fresh group, "
+                                    "offset commits off for both; the tool's "
                                     "fetch rate, which excludes the group join. Same JVM client container for both.",
                                     "kafka-compare-consume-throughput", img_dir)
     doc_dir = os.path.dirname(os.path.abspath(doc_path))
@@ -663,10 +699,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("run_dir", help="benchmarks/kafka_compare/results/<run-id>")
     parser.add_argument("--img-dir", default=DEFAULT_IMG_DIR)
-    parser.add_argument("--doc", default=DEFAULT_DOC)
+    parser.add_argument("--doc", default=None, help="default: kafka-comparison.md, or kafka-failover.md for a "
+                                                     "failover run")
     args = parser.parse_args(argv)
     try:
-        written = build(args.run_dir, args.img_dir, args.doc)
+        if os.path.isfile(os.path.join(args.run_dir, "failover.csv")):
+            from kafka_compare import failover_report
+
+            written = failover_report.build(args.run_dir, args.img_dir, args.doc or DEFAULT_FAILOVER_DOC,
+                                            _setup_matplotlib)
+        else:
+            written = build(args.run_dir, args.img_dir, args.doc or DEFAULT_DOC)
     except schema.ReportRefused as exc:
         print(f"report refused: {exc}", file=sys.stderr)
         return 2

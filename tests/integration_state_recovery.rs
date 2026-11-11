@@ -1516,3 +1516,507 @@ async fn recovery_does_not_count_a_size_only_row_it_holds_back() {
         );
     }
 }
+
+// ---- #567: a handed-back range its source has since committed past ----------
+
+/// The inode the file adapter records for `path`, so the ledger rows below
+/// name the file as a running engine would.
+fn inode_of(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(std::fs::metadata(path).unwrap().ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// A file ledger row in BATCHING over `[start, end)` of `path`, created at
+/// `at`, read when the file was 28 bytes long - with the fingerprint of
+/// those bytes, as the file adapter records it (#578): recovery retires a
+/// range only for a marker proven to be the cursor's file.
+fn file_row(id: &str, path: &str, inode: Option<u64>, range: (u64, u64), at: &str) -> BatchRecord {
+    let head = std::fs::read(path).unwrap();
+    let marker = ProgressMarker::File {
+        path: path.into(),
+        inode,
+        start_byte: range.0,
+        end_byte: range.1,
+        file_size: 28,
+        mtime: String::new(),
+        content_fingerprint: vtop_core::types::ContentFingerprint::of(&head[..28]),
+        tail_fingerprint: None,
+    };
+    BatchRecord {
+        batch_id: id.into(),
+        tenant: "default".into(),
+        source_type: SourceType::File,
+        source_name: path.into(),
+        format: TelemetryFormat::Raw,
+        state: BatchState::Batching,
+        progress_start: marker.clone(),
+        progress_end: marker,
+        object_uri: None,
+        manifest_uri: None,
+        object_sha256: None,
+        manifest_sha256: None,
+        manifest_version_id: None,
+        object_size_bytes: None,
+        record_count: Some(2),
+        error_message: None,
+        owner: None,
+        lease_expires_at: None,
+        created_at: at.into(),
+        updated_at: at.into(),
+    }
+}
+
+async fn commit_row(store: &SqliteStateStore, rec: &BatchRecord) {
+    store.save_batch_state(rec).await.unwrap();
+    for st in [
+        BatchState::Sealed,
+        BatchState::Compressed,
+        BatchState::Checksummed,
+        BatchState::ObjectUploaded,
+        BatchState::ManifestUploaded,
+        BatchState::Verified,
+        BatchState::SourceCommitted,
+    ] {
+        store
+            .update_batch_state(&rec.batch_id, st, &BatchPatch::default())
+            .await
+            .unwrap();
+    }
+}
+
+/// A range handed back as an engine leaves it: FAILED, then REPLAY_REQUIRED.
+async fn hand_back_row(store: &SqliteStateStore, rec: &BatchRecord) {
+    store.save_batch_state(rec).await.unwrap();
+    store
+        .mark_failed(&rec.batch_id, "upload failed")
+        .await
+        .unwrap();
+    store
+        .update_batch_state(
+            &rec.batch_id,
+            BatchState::ReplayRequired,
+            &BatchPatch::default(),
+        )
+        .await
+        .unwrap();
+}
+
+/// #567: a REPLAY_REQUIRED row whose bytes a later batch re-archived and
+/// committed never reached a terminal state. Every restart claimed it, wrote
+/// FAILED and REPLAY_REQUIRED over it, counted it as a replay and planned a
+/// rewind that the committed point clamped to nothing; and retention, which
+/// deletes only committed rows, kept it for ever.
+///
+/// Now recovery retires it - SUPERSEDED, one write, once - and so for an
+/// in-flight row a crashed engine left under the same commit. The next
+/// restart does not touch either, nothing is read again, and retention
+/// deletes them with the committed history (after digesting them).
+#[tokio::test]
+async fn a_stale_replay_row_a_later_commit_covers_is_superseded_once_and_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    // Four 7-byte lines, [0,28).
+    std::fs::write(&input, "line-0\nline-1\nline-2\nline-3\n").unwrap();
+    let inode = inode_of(&input);
+    let db = dir.path().join("state.db");
+    let url = format!("sqlite://{}", db.display());
+    let path = input.to_string_lossy().into_owned();
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        // The range that failed and was handed back...
+        hand_back_row(
+            &store,
+            &file_row("b-stale", &path, inode, (0, 14), "2026-01-01T00:00:00Z"),
+        )
+        .await;
+        // ...a range a crashed engine had in flight...
+        let inflight = file_row("b-sealed", &path, inode, (14, 28), "2026-01-01T00:00:01Z");
+        store.save_batch_state(&inflight).await.unwrap();
+        store
+            .update_batch_state("b-sealed", BatchState::Sealed, &BatchPatch::default())
+            .await
+            .unwrap();
+        // ...and the re-read that archived both and committed them, read later.
+        commit_row(
+            &store,
+            &file_row("b-retry", &path, inode, (0, 28), "2026-01-01T00:00:02Z"),
+        )
+        .await;
+    }
+
+    let cfg = file_config(work.to_str().unwrap(), &url, vec![path.clone()], "mock");
+    let streams = || StreamsConfig { streams: vec![] };
+    let mut engine = Engine::new(cfg.clone(), streams()).await.unwrap();
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(
+        (
+            summary.superseded,
+            summary.replay_required,
+            summary.still_pending
+        ),
+        (2, 0, 0),
+        "both rows lie below the committed point: retired, not handed back ({summary:?})"
+    );
+    let mut stamps = Vec::new();
+    for id in ["b-stale", "b-sealed"] {
+        let row = engine.store.get_batch(id).await.unwrap().unwrap();
+        assert_eq!(row.state, BatchState::Superseded, "{id}");
+        stamps.push(row.updated_at);
+    }
+    let outcomes = engine.process_once(SourceType::File).await.unwrap();
+    assert!(
+        outcomes.is_empty(),
+        "[0,28) is committed; nothing is read again: {outcomes:?}"
+    );
+    drop(engine);
+
+    // The next restart leaves them alone: not claimed (a claim rewrites
+    // `updated_at`), not rewritten, not counted.
+    let mut engine = Engine::new(cfg, streams()).await.unwrap();
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(
+        (
+            summary.superseded,
+            summary.replay_required,
+            summary.still_pending
+        ),
+        (0, 0, 0),
+        "a retired row is no recovery work: {summary:?}"
+    );
+    for (id, stamp) in ["b-stale", "b-sealed"].into_iter().zip(&stamps) {
+        let row = engine.store.get_batch(id).await.unwrap().unwrap();
+        assert_eq!(row.state, BatchState::Superseded, "{id}");
+        assert_eq!(&row.updated_at, stamp, "{id} was written again at restart");
+    }
+
+    // Retention deletes them, as it deletes committed history - digested
+    // first - and keeps the committed row the restart cursor is read from.
+    let digests = dir.path().join("digests");
+    let cutoff = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    let (deleted, digest) =
+        vtop_cli::coverage::prune_with_digest(engine.store.as_ref(), &cutoff, 500, &digests)
+            .await
+            .unwrap();
+    assert_eq!(deleted, 2, "both superseded rows are pruned");
+    assert!(digest.is_some(), "and digested before they were deleted");
+    for id in ["b-stale", "b-sealed"] {
+        assert!(engine.store.get_batch(id).await.unwrap().is_none(), "{id}");
+    }
+    assert_eq!(
+        engine
+            .store
+            .get_batch("b-retry")
+            .await
+            .unwrap()
+            .map(|r| r.state),
+        Some(BatchState::SourceCommitted)
+    );
+    // The coverage audit still reads them, from the digest, and finds the
+    // ranges covered.
+    let (digested, files) = vtop_cli::coverage::read_digests(&digests).unwrap();
+    assert_eq!(files, 1);
+    assert!(digested
+        .iter()
+        .all(|row| row.state == BatchState::Superseded));
+    let mut rows = engine.store.list_batches().await.unwrap();
+    rows.extend(digested);
+    for report in vtop_cli::coverage::audit(rows) {
+        assert!(
+            !report.has_findings(),
+            "the ranges are covered by the commit: {report:?}"
+        );
+    }
+}
+
+/// #567: only a row its source has committed past is retired. One above the
+/// committed point is handed back exactly as before - rewound and read again -
+/// and retired at the restart after its range has been committed.
+#[tokio::test]
+async fn a_replay_row_above_the_committed_point_is_still_rewound_and_retired_once_covered() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    std::fs::write(&input, "line-0\nline-1\nline-2\nline-3\n").unwrap();
+    let inode = inode_of(&input);
+    let db = dir.path().join("state.db");
+    let url = format!("sqlite://{}", db.display());
+    let path = input.to_string_lossy().into_owned();
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        commit_row(
+            &store,
+            &file_row("b-first", &path, inode, (0, 14), "2026-01-01T00:00:00Z"),
+        )
+        .await;
+        // Read after the commit, and never archived: [14,28) is lost unless
+        // it is read again.
+        hand_back_row(
+            &store,
+            &file_row("b-lost", &path, inode, (14, 28), "2026-01-01T00:00:01Z"),
+        )
+        .await;
+    }
+
+    let cfg = file_config(work.to_str().unwrap(), &url, vec![path.clone()], "mock");
+    let streams = || StreamsConfig { streams: vec![] };
+    let mut engine = Engine::new(cfg.clone(), streams()).await.unwrap();
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(
+        (summary.superseded, summary.replay_required),
+        (0, 1),
+        "the committed point is below the row's end: it is handed back ({summary:?})"
+    );
+    assert_eq!(
+        engine
+            .store
+            .get_batch("b-lost")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        BatchState::ReplayRequired
+    );
+    let outcomes = engine.process_once(SourceType::File).await.unwrap();
+    assert!(outcomes.iter().all(|o| o.committed), "{outcomes:?}");
+    let reread: Vec<_> = engine
+        .store
+        .list_batches()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|b| b.state == BatchState::SourceCommitted && b.batch_id != "b-first")
+        .collect();
+    assert_eq!(reread.len(), 1, "{reread:?}");
+    let ProgressMarker::File {
+        start_byte,
+        end_byte,
+        ..
+    } = &reread[0].progress_end
+    else {
+        panic!("a file batch carries a file marker");
+    };
+    assert_eq!(
+        (*start_byte, *end_byte),
+        (14, 28),
+        "the handed-back range is read again from its start"
+    );
+    drop(engine);
+
+    // Now a commit covers it, and the next restart retires it.
+    let mut engine = Engine::new(cfg, streams()).await.unwrap();
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(
+        (summary.superseded, summary.replay_required),
+        (1, 0),
+        "{summary:?}"
+    );
+    assert_eq!(
+        engine
+            .store
+            .get_batch("b-lost")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        BatchState::Superseded
+    );
+    let outcomes = engine.process_once(SourceType::File).await.unwrap();
+    assert!(outcomes.is_empty(), "{outcomes:?}");
+}
+
+/// #567 (review): SUPERSEDED is terminal, so a range is retired only when its
+/// marker is proven to be the file the committed point belongs to. A legacy
+/// marker names no inode and cannot be told from another file that lived at
+/// the path - a rotated-away file's failed range, say - so it keeps the
+/// replay path, exactly as before, even under a later commit at the path.
+#[tokio::test]
+async fn a_legacy_marker_without_an_inode_is_never_retired() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    std::fs::write(&input, "line-0\nline-1\nline-2\nline-3\n").unwrap();
+    let inode = inode_of(&input);
+    let db = dir.path().join("state.db");
+    let url = format!("sqlite://{}", db.display());
+    let path = input.to_string_lossy().into_owned();
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        hand_back_row(
+            &store,
+            &file_row("b-legacy", &path, None, (0, 14), "2026-01-01T00:00:00Z"),
+        )
+        .await;
+        commit_row(
+            &store,
+            &file_row("b-retry", &path, inode, (0, 28), "2026-01-01T00:00:02Z"),
+        )
+        .await;
+    }
+    let cfg = file_config(work.to_str().unwrap(), &url, vec![path.clone()], "mock");
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(
+        (summary.superseded, summary.replay_required),
+        (0, 1),
+        "a marker with no inode is not proven to be this file: {summary:?}"
+    );
+    assert_eq!(
+        engine
+            .store
+            .get_batch("b-legacy")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        BatchState::ReplayRequired
+    );
+}
+
+/// #567 with #651: retiring a range as SUPERSEDED verifies nothing and
+/// commits nothing, so it counts neither - not `verified_total`, not
+/// `commits_total`, and not the size-only acceptance counter. Only the
+/// retirement itself is counted, under `batches_total{state="superseded"}`.
+#[tokio::test]
+async fn a_retired_range_counts_no_verification_and_no_commit() {
+    // A tenant no other test uses: the registry is process-wide.
+    let tenant = "tenant-567-retired";
+    let count = |family: &str| -> u64 {
+        let mx = vtop_core::telemetry::init().expect("metrics registry");
+        let l = [tenant, "file", TelemetryFormat::Raw.extension()];
+        match family {
+            "verified" => mx.verified_total.with_label_values(&l).get(),
+            "commits" => mx.commits_total.with_label_values(&l).get(),
+            "size_only" => mx
+                .verification_backend_limited_total
+                .with_label_values(&l)
+                .get(),
+            _ => mx
+                .batches_total
+                .with_label_values(&[l[0], l[1], l[2], "superseded"])
+                .get(),
+        }
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    std::fs::write(&input, "line-0\nline-1\nline-2\nline-3\n").unwrap();
+    let inode = inode_of(&input);
+    let db = dir.path().join("state.db");
+    let url = format!("sqlite://{}", db.display());
+    let path = input.to_string_lossy().into_owned();
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        let mut stale = file_row("b-stale", &path, inode, (0, 14), "2026-01-01T00:00:00Z");
+        stale.tenant = tenant.into();
+        hand_back_row(&store, &stale).await;
+        let mut retry = file_row("b-retry", &path, inode, (0, 28), "2026-01-01T00:00:02Z");
+        retry.tenant = tenant.into();
+        commit_row(&store, &retry).await;
+    }
+    let families = ["verified", "commits", "size_only", "superseded"];
+    let before = families.map(count);
+    let mut cfg = file_config(work.to_str().unwrap(), &url, vec![path.clone()], "mock");
+    cfg.engine.tenant = tenant.into();
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(summary.superseded, 1, "{summary:?}");
+    let after = families.map(count);
+    let delta: Vec<u64> = after
+        .iter()
+        .zip(before.iter())
+        .map(|(a, b)| a - b)
+        .collect();
+    assert_eq!(
+        delta,
+        [0, 0, 0, 1],
+        "(verified, commits, size-only, superseded) counted for a retirement"
+    );
+}
+
+/// #567 (review, Codex): a file rewritten in place, keeping its inode and its
+/// first page but SHORTER, is a new generation, and the newest committed row -
+/// the old content's, committed through byte 10000 - says nothing about it.
+/// A handed-back range of the new content below that offset must keep the
+/// replay path: retired as SUPERSEDED, it would be terminal with no commit
+/// covering its bytes.
+#[tokio::test]
+async fn a_range_of_a_truncated_rewrite_is_not_retired_against_the_old_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    // The new content: the old first page, then a shorter rest, 5000 bytes
+    // of 10-byte lines.
+    let line = |i: usize| format!("line-{:04}\n", i % 10_000);
+    let content: String = (0..500).map(line).collect();
+    assert_eq!(content.len(), 5_000);
+    std::fs::write(&input, &content).unwrap();
+    let inode = inode_of(&input);
+    let first_page = vtop_core::types::ContentFingerprint::of(&content.as_bytes()[..4096]);
+    let url = format!("sqlite://{}", dir.path().join("state.db").display());
+    let path = input.to_string_lossy().into_owned();
+    let marker = |start: u64, end: u64, size: u64| ProgressMarker::File {
+        path: path.clone(),
+        inode,
+        start_byte: start,
+        end_byte: end,
+        file_size: size,
+        mtime: String::new(),
+        content_fingerprint: first_page.clone(),
+        tail_fingerprint: None,
+    };
+    let row = |id: &str, m: ProgressMarker, at: &str| {
+        let mut rec = file_row(id, &path, inode, (0, 0), at);
+        rec.progress_start = m.clone();
+        rec.progress_end = m;
+        rec
+    };
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        // The old content, 10000 bytes, committed through its end...
+        commit_row(
+            &store,
+            &row("b-old", marker(0, 10_000, 10_000), "2026-01-01T00:00:00Z"),
+        )
+        .await;
+        // ...and a range of the new content, read after the rewrite, that
+        // failed: [4000, 5000) of a 5000-byte file.
+        hand_back_row(
+            &store,
+            &row("b-new", marker(4_000, 5_000, 5_000), "2026-01-01T00:00:01Z"),
+        )
+        .await;
+    }
+    let cfg = file_config(work.to_str().unwrap(), &url, vec![path.clone()], "mock");
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(
+        (summary.superseded, summary.replay_required),
+        (0, 1),
+        "the truncated rewrite's range was retired against the old content's offset: {summary:?}"
+    );
+    assert_eq!(
+        engine
+            .store
+            .get_batch("b-new")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        BatchState::ReplayRequired
+    );
+}
