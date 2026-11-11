@@ -133,7 +133,7 @@ The engine drives each batch stage-by-stage; each stage advances the batch to a 
 | 8 | **Verify** | Both stored object and manifest are verified against expected checksums/metadata. | `VERIFIED` |
 | 9 | **Commit** | Only after verification, the source marker is committed via the adapter. | `SOURCE_COMMITTED` |
 
-If any stage fails, the batch transitions to `FAILED` and is later classified for replay (§13). If verification fails, `commit_progress(...)` is never called. If the commit itself fails after verification, the batch stays `VERIFIED` (not lost) and recovery retries the commit.
+If any stage fails, the batch transitions to `FAILED`, then `REPLAY_REQUIRED`, and its range is handed back to the source at the end of the cycle, whether or not those writes land (§13, item 5). If verification fails, `commit_progress(...)` is never called. If the commit itself fails after verification, the batch stays `VERIFIED` (not lost) and recovery retries the commit.
 
 ### 5.1 State machine
 
@@ -237,20 +237,40 @@ records that stopped existing before the engine got to them, and for Kafka that
 is a real and silent condition.
 
 `auto.offset.reset` is passed through to `rdkafka` and defaults to `earliest`
-(`kafka_source.rs`). It reaches that default by two different routes, and both
-end the same way:
+(`kafka_source.rs`). Where a restart resumes a partition is decided first
+(#614):
 
-- **After a restart** — a fresh process has no in-memory cursor, so the
-  partition is assigned at `Offset::Stored` and librdkafka resolves it from the
-  committed offset, or from `auto.offset.reset` when that offset no longer
-  exists.
+- **From the ledger** — when the ledger holds a committed batch for the
+  partition (this topic, partition and consumer group) AND the broker reports
+  a committed offset for the group on that partition. The partition resumes
+  after the last offset of the newest committed batch, newest by
+  `(created_at, batch_id)`, whatever the group's committed offset says: the
+  offset commit carries no group generation, so Kafka accepts it from an
+  engine whose claim on the batch has moved on, and only the ledger's commit
+  is fenced. The group's offset is still committed, for lag monitoring, and a
+  restart moves it up to the ledger's position when it is behind.
+- **From `Offset::Stored`** — every other partition: a fresh store, no
+  committed batch yet, a group with no committed offset for the partition
+  (deleting a topic deletes its group offsets, and the ledger cannot tell a
+  recreated topic from the old one), or a broker that could not be asked for
+  the group's offsets at startup. librdkafka resolves it from the group's
+  committed offset, or from `auto.offset.reset` when there is none. In the
+  last case the ledger is not consulted for that run, and the protection
+  against a stale engine's commit does not apply to it.
+
+When retention has already removed records past that position, `auto.offset.reset`
+applies by two different routes, and both end the same way:
+
+- **After a restart** — the partition is assigned at the position above, which
+  the broker answers out-of-range (or, at `Offset::Stored`, has no committed
+  offset to resolve), and the reset applies.
 - **While still running** — the assignment is sticky and ordinary lag does not
   seek at all; the pass seeks only where the desired offset diverges from what
   librdkafka would deliver next. A consumer that simply falls behind therefore
   keeps fetching forward until the broker answers out-of-range, and the reset
   applies there.
 
-Either way the consumer resumes at the **new** earliest offset. Nothing queries the
+Either way a consumer overtaken by retention resumes at the **new** earliest offset. Nothing queries the
 watermarks, nothing compares the resumed offset against the committed one, and
 no metric fires. The gap between them is data that was never batched, never
 manifested, never verified and never missed.
@@ -338,11 +358,27 @@ What follows from that, in the engine:
   still longer than the committed offset, and the content fingerprint, so a
   replacement at the same inode is caught too. Syslog-spool markers record
   their length and fingerprint since #578; a spool seeded from an older row
-  has the inode and the offset only.
+  has the inode and the offset only. File markers also record, since #620,
+  the fingerprint of the page that ends at their `end_byte`, so the seed
+  catches a rewrite that kept the first page as well (below).
+- **The bytes below the read position are evidence too** (#620). Every file
+  read fingerprints the page (at most 4 KiB) that ends where it stopped,
+  from the bytes it consumed, and the next read - and a seed after a
+  restart - checks that the file still holds those bytes there, through the
+  descriptor it reads from (one extra read of at most a page; two after a
+  rewind moved the position off the page's end). A file rewritten in place
+  with the same first page, or a reused inode whose new file starts like
+  the old one, fails it - and is read from byte 0 - when its bytes in that
+  page differ from the old file's; one that repeats them too is not caught
+  (see the limits below). A late or recovered commit is judged the same way
+  against its range's end, so one whose generation record was evicted (more
+  than 256 ranges issued since) or lost to a restart cannot carry the
+  cursor into rewritten content whose page below that end differs.
 - **Late commits, rewinds and `delete_after_commit` judge content too**
-  (#578): a range whose marker fingerprinted other first bytes than the file
-  at the path now holds does not move the cursor, is not replayed into the
-  new file, and does not delete it. Before, a same-length replacement at the
+  (#578, #620): a range whose marker fingerprinted other first bytes - or
+  other bytes below its end - than the file at the path now holds does not
+  move the cursor, is not replayed into the new file, and does not delete
+  it. Before, a same-length replacement at the
   same inode satisfied every test of `delete_after_commit`
   (`end_byte >= size`) and was deleted unread.
 
@@ -357,25 +393,33 @@ Limits, stated plainly:
   truncate are lost by the rotation tool before the engine can see them. If the
   file also regrows beyond the old read position before the next read, the
   truncation is invisible to the adapter.
-- A file is identified by its **inode number and its first page**. An inode
-  number can be reused: on a *different* filesystem by a replacement that
-  happens to carry it (markers do not record the device), and on the *same*
-  filesystem by the next file created after one is **unlinked**. Since #578
-  such a file is caught by its first bytes, whatever its length. What is
-  still not caught is a replacement whose first page is byte for byte the
-  old file's - a fixed header longer than 4 KiB, or a file restored from a
-  copy - and, for a file under one page, one whose first bytes repeat all of
-  the old, shorter file. Those look like a continuation, as every
-  replacement at a reused inode did before.
+- A file is identified by its **inode number, its first page, and the page
+  below the read position**. An inode number can be reused: on a
+  *different* filesystem by a replacement that happens to carry it (markers
+  do not record the device), and on the *same* filesystem by the next file
+  created after one is **unlinked**. Since #578 such a file is caught by its
+  first bytes, and since #620 by the bytes below the read position, whatever
+  its length. What is still not caught is a replacement that matches BOTH
+  pages byte for byte - the same first 4 KiB and the same 4 KiB below the
+  old position, such as a file restored from a copy of the old one, or a
+  file under one page whose new content repeats all of the old - and a
+  change confined to the bytes BETWEEN the two pages, which only a full
+  re-hash of everything below the position would see. Those look like a
+  continuation.
 - Late commits are judged against the file as it is NOW (another inode, an
-  end beyond its length, or other first bytes than the batch read). A
-  `copytruncate` whose new content starts with the same first page as the
-  old (see above) and regrows past the old end before the late commit lands
-  cannot be told from the original.
+  end beyond its length, other first bytes, or other bytes below the range's
+  end than the batch read). The in-process generation record still orders
+  the discontinuities one process saw; a commit it has no record of (evicted,
+  or after a restart) falls back to these tests, and passes only for content
+  that matches both pages - the case above.
 - **Rows written before #578 carry no fingerprint**, and a cursor seeded from
   one, or a range recovered from one, is judged by inode and length alone,
   exactly as before. The first read after an upgrade that finds the file
-  non-empty takes a fingerprint, and from there the check applies.
+  non-empty takes a fingerprint, and from there the check applies. Rows
+  written before #620 carry no tail fingerprint and are judged exactly as
+  before, by the fields they do carry: inode and length, and the first page
+  for a row written since #578. The first read after the upgrade takes
+  one.
 - History pruning keeps one row per path, so a file untouched for longer than
   the retention window can lose the rows that name its inode. The restart then
   reads it from byte 0 again: duplicates, bounded by the file.
@@ -413,6 +457,32 @@ needs nothing either.
 - An older binary reading a newer ledger ignores the fields (serde skips
   unknown keys) and judges as it always did. Downgrade is still not
   supported (see the roadmap's versioning note); this is what it would do.
+
+#### Ledger format note: tail fingerprints (#620)
+
+The same kind of change, to file markers only, and again no DDL on either
+backend: the restart seed reads the new field out of the stored
+`progress_end_json` as it reads `content_fingerprint`.
+
+- New, optional and omitted when unknown: `tail_fingerprint` on file markers,
+  the same `{"len", "sha256"}` shape, covering the `len` bytes that END at the
+  marker's `end_byte`. Absent for a marker at byte 0 and for a read the stat
+  proved unchanged (it does not open the file).
+- Rows written before it decode with the field absent and are judged exactly
+  as before, by the fields they carry (inode and length, and the first page
+  for a row written since #578). Leaving the field out changes nothing else
+  about a marker: one without it serializes byte for byte as the code before
+  #620 wrote the same marker - and as the code before #578 did only when it
+  carries no `content_fingerprint` either (see the note above).
+- A stored fingerprint no writer could produce - a zero length, a length
+  over 4 KiB, a digest that is not 64 lowercase hex digits, or a value that
+  is not a fingerprint at all - decodes as absent, for `tail_fingerprint`
+  and `content_fingerprint` alike, both in the restart seed and in markers
+  decoded whole (recovery's commits and rewinds). Absent only forgoes a
+  check; a malformed value used to force a re-read, or a large read.
+- The manifest's `source_progress` never carries it, for the reason above.
+  The coverage audit does not use it.
+- An older binary ignores it, as above.
 
 ---
 
@@ -540,12 +610,21 @@ On startup, the `replay` module inspects `vtop-state` and maps each incomplete b
 
    A `VERIFIED` row is committed only after that, and not at all while a range of the same source unit that **starts below it** is about to be re-read: a commit moves the unit's committed point to the end of the committed range, the file adapters clamp a rewind to the committed point, and a `VERIFIED` range archives only its own bytes — so pending bytes below its start would be skipped. Such a row stays `VERIFIED` (its object is in the archive) until a later pass commits it. A `VERIFIED` row that starts where the pending range starts — the object that replaced a stale row for the same bytes — commits normally. A marker with no inode (a legacy row) is compared against every inode at its path.
 
-   **A rewind never goes below what the source has already committed.** The file and spool adapters have always clamped to their committed byte; the Kafka adapter now clamps to the consumer group's committed offset, asked of the broker, so a stale `FAILED` row left behind by a failure that has since been repaired no longer rewinds the group to its start and re-archives everything since on each restart. The stale rows themselves stay in the ledger and are re-visited at every restart (a no-op rewind and a ledger write each); retiring them needs a new durable state and is tracked in #567.
+   **A rewind never goes below what the source has already committed.** The file and spool adapters have always clamped to their committed byte; the Kafka adapter clamps to the ledger's committed frontier for the partition (its newest committed batch, or what the process committed since it started) or, for a partition the ledger does not know, to where an earlier rewind in this process landed. It asks the broker for the consumer group's committed offset only for a partition it has none of these for (#614) — a stale engine's commit can move the group's offset past a range recovery is about to re-read, and clamping to it skipped that range for good. Either way, a stale `FAILED` row left behind by a failure that has since been repaired no longer rewinds the group to its start and re-archives everything since on each restart. The stale rows themselves stay in the ledger and are re-visited at every restart (a no-op rewind and a ledger write each); retiring them needs a new durable state and is tracked in #567.
 3. Replay currently produces a **new** object key: the `batch_id` is derived from wall-clock time plus a random suffix, and the `year/…/hour` path components from the replayed batch's own partition time (§11, `partitioning.time_source`) - under `seal`, the hour the replay was sealed in, so a replay of yesterday's range is filed under today; under `event`, the earliest record time, so a Kafka replay usually lands in the original hour but under a new key. Either way a replayed batch writes a duplicate object (at-least-once, no data loss). Protocol §14/§15.1/§16 specify deterministic naming so that replay is idempotent — this is the open gap tracked as [PRODUCTION_HA.md](PRODUCTION_HA.md) Phase 4.
 4. A state/storage mismatch (e.g., an object present but unverified) is resolved by re-verifying or re-uploading **before** any commit.
-5. **The same rule holds while the engine is running.** Adapters advance their read position when they *read*, not when a batch commits, so a batch that fails (or errors before `VERIFIED`) is handed back to its source at the end of the cycle that failed it, not at the next restart. Otherwise the next cycle reads on from the end of the failed range and the first later range to verify commits past it, leaving those bytes unarchived (#552). A cycle in which a batch failed waits before reading again — the idle interval, doubling per consecutive failing cycle up to a minute, plus jitter — because the failed range is now read again and a tight loop would hammer a store that is down.
+5. **While the engine is running, a failed range is handed back at once, and the hand-back does not wait on the ledger.** Adapters advance their read position when they *read*, not when a batch commits, so a batch that fails (or errors before `VERIFIED`) is handed back to its source at the end of the cycle that failed it, not at the next restart. Otherwise the next cycle reads on from the end of the failed range and the first later range to verify commits past it, leaving those bytes unarchived (#552).
 
-   Limits, stated rather than implied: a ledger written by a build *before* this change can already contain a committed range above a failed one. Replay does not repair that for file and spool sources — their rewind is clamped to the committed point so a superseded failed row cannot re-archive committed data on every restart — and the ledger cannot say whether the older range was later covered, because committed history may be pruned. Finding such holes is the job of an archive coverage audit (#560), not of recovery. A spool whose identity changed since the batch was read cannot be rewound; that is reported as an error and the range is not re-read — but only for a marker that recorded an inode: a legacy marker without one keeps the old size-only check and can rewind a replacement. The file adapter checks identity on replay the same way: a range whose file now has another inode (rotation, #558), is shorter than when the range was read, or keeps the inode but has different first bytes (a same-inode replacement, #578) is refused rather than re-read. The inode and content checks apply only to a marker that recorded them; a legacy marker keeps the size-only check.
+   The ledger records the decision as recovery does — `FAILED`, then `REPLAY_REQUIRED` — but, **unlike recovery (item 2), the rewind is unconditional**: it happens when the `FAILED` write fails, when the `REPLAY_REQUIRED` write fails (the row stays `FAILED`), and after any other error before `VERIFIED`, such as a ledger write that failed mid-pipeline, when the engine cannot even tell whether the ledger holds a row for the batch (#627). The two paths start from different read positions, and that is why one rule does not fit both:
+
+   - At startup the read head is seeded at the committed point, which is at or below every uncommitted range. A rewind withheld there leaves the range ahead of the head.
+   - While running, the head is already past the failed range. A rewind withheld there lets the next cycle read on and a later batch commit past the range; the restart that then marks the stale row for replay clamps its rewind to that commit, and the range is never archived.
+
+   So a rewind on an unrecorded decision costs at most a duplicate, and withholding it costs the data. The duplicate is the object the failed attempt may have left in the store, with no `VERIFIED` row naming it; the range itself is archived once, by the batch that re-reads it. The stale row, if one was written, is visited by the next recovery, which records the replay decision and rewinds — clamped to the committed point, so nothing already archived is read again. The same holds for a write refused by the claim fence (#557): it means another engine claimed the row, and since sources are not divided between engines (two engines on one store are unsupported, [PRODUCTION_HA.md](PRODUCTION_HA.md) §19), this engine cannot know that the claimant will read the same bytes, so it hands its own range back too. A batch that reached `VERIFIED` is never handed back: its object is in the archive, and a failed source commit leaves it `VERIFIED` for recovery to retry (item 1).
+
+   A cycle in which a batch failed waits before reading again — the idle interval, doubling per consecutive failing cycle up to a minute, plus jitter — because the failed range is now read again and a tight loop would hammer a store that is down.
+
+   Limits, stated rather than implied: a ledger written by a build *before* #552 can already contain a committed range above a failed one. Replay does not repair that for file and spool sources — their rewind is clamped to the committed point so a superseded failed row cannot re-archive committed data on every restart — and the ledger cannot say whether the older range was later covered, because committed history may be pruned. Finding such holes is the job of an archive coverage audit (#560), not of recovery. A spool whose identity changed since the batch was read cannot be rewound; that is reported as an error and the range is not re-read — but only for a marker that recorded an inode: a legacy marker without one keeps the old size-only check and can rewind a replacement. The file adapter checks identity on replay the same way: a range whose file now has another inode (rotation, #558), is shorter than when the range was read, or keeps the inode but has different first bytes (a same-inode replacement, #578) is refused rather than re-read. The inode and content checks apply only to a marker that recorded them; a legacy marker keeps the size-only check.
 
 This guarantees: no source progress marker is committed unless its object and manifest are durably stored and verified, and no committed marker is double-committed. Source progress is **never** advanced for unverified data.
 

@@ -83,6 +83,33 @@ pub struct CommittedCursor {
     /// alone. `None` for a row that predates the field, or a file that was
     /// empty when read.
     pub content_fingerprint: Option<ContentFingerprint>,
+    /// The fingerprint of the bytes ending at `end_byte` that the same row's
+    /// marker took (#620): a file rewritten at the same inode while the
+    /// engine was down, with the same first page, is caught by it. `None`
+    /// for a row that predates the field (judged as before), a marker at
+    /// byte 0, and every spool row. Read out of the stored JSON - the
+    /// column already holds it, so no migration.
+    pub tail_fingerprint: Option<ContentFingerprint>,
+}
+
+/// Where the ledger says a Kafka partition resumes, for one consumer group
+/// (#614): the end offset of the NEWEST committed batch read from it.
+///
+/// The group's committed offset on the broker cannot answer this. The adapter
+/// reads with `assign()`, so its commits carry no group generation, and Kafka
+/// accepts one from an engine whose claim has already moved on - backwards or
+/// forwards. The ledger's commit is fenced (#557); this is what it recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedKafkaOffset {
+    pub topic: String,
+    pub partition: i32,
+    pub consumer_group: String,
+    /// The newest committed batch's last offset; the partition resumes at the
+    /// one after it. Newest by `(created_at, batch_id)` - the order the windows
+    /// were read, and the row pruning keeps - not the highest: a topic that
+    /// was deleted and recreated starts its offsets again, and the old topic's
+    /// highest offset would skip the new one's first records.
+    pub end_offset: i64,
 }
 
 /// A `content_fingerprint` read out of a stored marker as JSON text. Anything
@@ -96,14 +123,9 @@ pub struct CommittedCursor {
 /// the comparisons are of hex text, so an uppercase digest would call the
 /// unchanged file a replacement.
 pub(crate) fn parse_content_fingerprint(json: &str) -> Option<ContentFingerprint> {
-    let fingerprint: ContentFingerprint = serde_json::from_str(json).ok()?;
-    let plausible = (1..=ContentFingerprint::MAX_LEN as u64).contains(&fingerprint.len)
-        && fingerprint.sha256.len() == 64
-        && fingerprint
-            .sha256
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
-    plausible.then_some(fingerprint)
+    serde_json::from_str::<ContentFingerprint>(json)
+        .ok()
+        .filter(ContentFingerprint::is_plausible)
 }
 
 /// Patch applied when advancing a batch's state. Fields set to `Some` are

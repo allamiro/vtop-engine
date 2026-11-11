@@ -1,0 +1,63 @@
+# VTOP for the head-to-head comparison (#595, #596): three data nodes from the
+# image docker/Dockerfile builds, one range replicated to all three with a
+# write quorum of 2 of 3, and the Kafka gateway on the range's leader.
+#
+# Fairness rule 1: EXACTLY the per-node limits compose.kafka.yml gives each
+# Kafka broker (2 CPUs, 2 GiB, no swap, a named volume on the same Docker VM
+# disk). run.py records both in environment.json and refuses to start when
+# they differ.
+#
+# VTOP_IMAGE is set by run.py to the image it built from the commit under
+# test (vtop-bench:<sha>), so the recorded commit is the one that ran.
+name: kc-vtop
+
+x-node: &node
+  image: ${VTOP_IMAGE:?set VTOP_IMAGE to the vtop-bench image run.py built}
+  entrypoint: ["vtop-node", "data", "--config", "/etc/vtop/node.yaml"]
+  cpus: 2
+  mem_limit: 2g
+  memswap_limit: 2g
+  ulimits:
+    nofile: { soft: 65536, hard: 65536 }
+  networks: [bench]
+  healthcheck:
+    test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9600/readyz > /dev/null"]
+    interval: 2s
+    timeout: 5s
+    retries: 60
+    start_period: 2s
+
+services:
+  # Followers first: the leader's quorum needs them listening.
+  vtop-2:
+    <<: *node
+    hostname: vtop-2
+    volumes:
+      - "./vtop/follower-1.yaml:/etc/vtop/node.yaml:ro"
+      # Mounted at the image's home (owned by the unprivileged `vtop` user), so
+      # a fresh named volume inherits that ownership.
+      - "vtop-2-data:/home/vtop"
+  vtop-3:
+    <<: *node
+    hostname: vtop-3
+    volumes:
+      - "./vtop/follower-2.yaml:/etc/vtop/node.yaml:ro"
+      - "vtop-3-data:/home/vtop"
+  vtop-1:
+    <<: *node
+    hostname: vtop-1
+    depends_on:
+      vtop-2: { condition: service_healthy }
+      vtop-3: { condition: service_healthy }
+    volumes:
+      - "./vtop/leader.yaml:/etc/vtop/node.yaml:ro"
+      - "vtop-1-data:/home/vtop"
+
+volumes:
+  vtop-1-data:
+  vtop-2-data:
+  vtop-3-data:
+
+networks:
+  bench:
+    name: kc-vtop-bench

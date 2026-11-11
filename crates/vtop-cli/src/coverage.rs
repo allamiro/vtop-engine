@@ -1408,6 +1408,7 @@ mod tests {
             file_size: 1 << 40,
             mtime: String::new(),
             content_fingerprint: None,
+            tail_fingerprint: None,
         }
     }
 
@@ -1429,6 +1430,7 @@ mod tests {
             file_size: size,
             mtime: String::new(),
             content_fingerprint: None,
+            tail_fingerprint: None,
         };
         row(id, state, marker(start), marker(end))
     }
@@ -1539,6 +1541,7 @@ mod tests {
                 file_size: end,
                 mtime: String::new(),
                 content_fingerprint: None,
+                tail_fingerprint: None,
             };
             row(id, Committed, marker(start), marker(start))
         };
@@ -2244,6 +2247,7 @@ mod tests {
                     file_size: size.unwrap_or(0),
                     mtime: String::new(),
                     content_fingerprint: content.clone(),
+                    tail_fingerprint: None,
                 }
             }
         };

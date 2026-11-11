@@ -4165,6 +4165,7 @@ dependencies = [
  "futures",
  "hex",
  "quote",
+ "rustix",
  "serde",
  "serde_json",
  "syn 3.0.9",
