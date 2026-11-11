@@ -50,7 +50,9 @@ const MAX_SNAPSHOT_KEY_BYTES: usize = 256;
 /// reader older than that level can decode at any length. So raising the
 /// bound reaches only records older readers already cannot read, and needs no
 /// level of its own. `the_largest_record_of_every_kind_fits_the_snapshot_
-/// value_bound` pins both halves of that argument.
+/// value_bound` pins both halves of that argument. Records added since are
+/// pinned there too: a data node's version report (#634) is at most 73
+/// bytes, written only at feature level 7.
 const MAX_SNAPSHOT_VALUE_BYTES: usize = 2048;
 const MAX_SNAPSHOT_RESPONSE_BYTES: usize = 1024;
 const MAX_SNAPSHOT_RECORDS: u32 = 1 << 24;
@@ -1275,11 +1277,28 @@ impl MetaValue {
                     recorded_at_epoch,
                 })
             }
-            VALUE_TAG_NODE_VERSION => MetaValue::NodeVersion(NodeVersionRecord {
-                release: reader.bounded_str(MAX_RELEASE_BYTES, "release")?,
-                max_replica_protocol: reader.u16("max replica protocol")?,
-                supported_feature_level: reader.u32("supported feature level")?,
-            }),
+            VALUE_TAG_NODE_VERSION => {
+                let report = NodeVersionRecord {
+                    release: reader.bounded_str(MAX_RELEASE_BYTES, "release")?,
+                    max_replica_protocol: reader.u16("max replica protocol")?,
+                    supported_feature_level: reader.u32("supported feature level")?,
+                };
+                // Apply refuses all three, so a record holding one was not
+                // written by it (#634): refused here, and therefore by
+                // `encode_snapshot` too (#657). Safe because the tag is new
+                // at level 7 - no older log or snapshot holds one.
+                if report.release.is_empty()
+                    || report.max_replica_protocol == 0
+                    || report.supported_feature_level < NODE_VERSION_REPORTS_FEATURE_LEVEL
+                {
+                    return Err(CodecError::InvalidValue {
+                        what: "node version report",
+                        reason: "needs a release, a replica protocol above 0, and a supported \
+                                 level at or above the report level",
+                    });
+                }
+                MetaValue::NodeVersion(report)
+            }
             other => {
                 return Err(CodecError::UnknownTag {
                     what: "record value tag",
@@ -9911,7 +9930,7 @@ mod tests {
     /// Every [`MetaValue`] kind, numbered by an exhaustive match: a new
     /// kind does not compile until it is numbered here, and is then missing
     /// from the largest-record test below until a record is added for it.
-    const META_VALUE_KINDS: usize = 19;
+    const META_VALUE_KINDS: usize = 20;
     fn meta_value_kind(value: &MetaValue) -> usize {
         match value {
             MetaValue::Node(_) => 0,
@@ -9933,6 +9952,7 @@ mod tests {
             MetaValue::LineageTransition(_) => 16,
             MetaValue::ClusterConfig(_) => 17,
             MetaValue::RangeReplicaSet(_) => 18,
+            MetaValue::NodeVersion(_) => 19,
         }
     }
 
@@ -10165,7 +10185,55 @@ mod tests {
                 147,
                 true,
             ),
+            // tag 1 + release (2 + MAX_RELEASE_BYTES 64) + max replica
+            // protocol 2 + supported level 4 (#634). Written only by a
+            // command gated at feature level 7, so no older reader meets it.
+            (
+                MetaValue::NodeVersion(NodeVersionRecord {
+                    release: "r".repeat(MAX_RELEASE_BYTES),
+                    max_replica_protocol: u16::MAX,
+                    supported_feature_level: u32::MAX,
+                }),
+                73,
+                false,
+            ),
         ]
+    }
+
+    /// #634 with #657: a version report apply would refuse - an empty
+    /// release, no replica protocol, a level below the one that lets a node
+    /// report - is a record apply never writes, so the value decoder refuses
+    /// it too, and `encode_snapshot` with it: a snapshot holding one is
+    /// refused where it is written, not on a voter's restart.
+    #[test]
+    fn a_version_report_apply_never_writes_is_refused_by_the_snapshot() {
+        let node_uuid = Uuid::from_u128(7);
+        for (release, protocol, level) in [
+            ("", 2, NODE_VERSION_REPORTS_FEATURE_LEVEL),
+            ("0.8.0", 0, NODE_VERSION_REPORTS_FEATURE_LEVEL),
+            ("0.8.0", 2, NODE_VERSION_REPORTS_FEATURE_LEVEL - 1),
+        ] {
+            let mut machine = MetaStateMachine::new();
+            machine.records.insert(
+                MetaKey::NodeVersion { node_uuid }.encode(),
+                MetaValue::NodeVersion(NodeVersionRecord {
+                    release: release.to_owned(),
+                    max_replica_protocol: protocol,
+                    supported_feature_level: level,
+                }),
+            );
+            let refused = machine.encode_snapshot();
+            assert!(
+                matches!(
+                    refused,
+                    Err(CodecError::InvalidValue {
+                        what: "node version report",
+                        ..
+                    })
+                ),
+                "release {release:?} protocol {protocol} level {level}: {refused:?}"
+            );
+        }
     }
 
     /// #657: no record any command can produce is too large for a snapshot
