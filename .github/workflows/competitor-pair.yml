@@ -52,7 +52,17 @@ jobs:
       # mounts. Absolute, so the two cannot resolve it differently.
       VTOPCTL_BIN: ${{ github.workspace }}/target/release/vtopctl
     steps:
-      # FIRST, before anything costs minutes: the kernel must provide every
+      # Before anything costs minutes: the dispatch input must name at least
+      # one pair. 0, an empty value or a non-number would otherwise run the
+      # whole lab and record nothing.
+      - name: The repetitions input is a positive integer
+        run: |
+          if ! [[ "${REPETITIONS}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::repetitions must be a positive integer, got '${REPETITIONS}'"
+            exit 1
+          fi
+
+      # Next, still before anything costs minutes: the kernel must provide every
       # module the middlebox's tc program uses (lib/netem.py tc_program): ifb
       # for the upload direction, netem and tbf for the shape, the ingress
       # qdisc, the u32 classifier and the mirred redirect. If a stock load
@@ -135,12 +145,25 @@ jobs:
           VTOP_BENCH_GID="$(id -g)"
           export VTOP_BENCH_UID VTOP_BENCH_GID
           docker compose --profile netem --profile containerized up -d
+          # The buckets must exist before the hour-long loop starts, so a
+          # minio-init that never finishes fails the job here and prints its
+          # logs. The log goes into a variable before grep reads it: piping
+          # `docker compose logs` into `grep -q` under pipefail can report a
+          # SIGPIPE as "not found".
+          ready=0
           for _ in $(seq 1 60); do
-            if docker compose logs minio-init 2>/dev/null | grep -q "benchmark buckets ready"; then
+            init_log="$(docker compose logs minio-init 2>&1 || true)"
+            if grep -q "benchmark buckets ready" <<< "${init_log}"; then
+              ready=1
               break
             fi
             sleep 2
           done
+          if [ "${ready}" != "1" ]; then
+            echo "::error::minio-init did not print 'benchmark buckets ready' within 120 s; the benchmark buckets are not provisioned"
+            docker compose logs minio-init || true
+            exit 1
+          fi
           docker compose logs minio-init | tail -n 5
           docker compose --profile netem --profile containerized ps
 
@@ -158,6 +181,13 @@ jobs:
         id: pair
         run: |
           set -uo pipefail
+          # Checked again here, before errexit is turned off. The first step
+          # already refused a bad value, but with -e off a `seq` that fails
+          # gives an empty loop and a green job that measured nothing.
+          if ! [[ "${REPETITIONS}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::repetitions must be a positive integer, got '${REPETITIONS}'"
+            exit 1
+          fi
           set +e
           out="${RUNNER_TEMP}/pair"
           mkdir -p "${out}/results" "${out}/logs" || exit 1
