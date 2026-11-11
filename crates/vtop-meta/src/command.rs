@@ -111,6 +111,7 @@ const COMMAND_KIND_ENSURE_GROUP_MEMBER_COORDINATED: u16 = 34;
 const COMMAND_KIND_SPLIT_RANGE: u16 = 35;
 const COMMAND_KIND_SET_FEATURE_LEVEL: u16 = 36;
 const COMMAND_KIND_SET_RANGE_REPLICA_SET: u16 = 37;
+const COMMAND_KIND_REPORT_NODE_VERSION: u16 = 38;
 
 /// The metadata feature level of a cluster that has never recorded one: the
 /// command set of v0.6.0, the last release before levels existed (#554).
@@ -132,7 +133,7 @@ pub const BASELINE_FEATURE_LEVEL: u32 = 3;
 /// behaviour on the recorded level, so every replica applies the same
 /// thing). `every_kind_newer_than_the_baseline_release_is_gated` catches a
 /// kind that forgets; the other two are on the author.
-pub const SUPPORTED_FEATURE_LEVEL: u32 = 6;
+pub const SUPPORTED_FEATURE_LEVEL: u32 = 7;
 
 /// The level at which a promotion report may carry a lineage verdict on each
 /// quorum answer (#577). Gated by PAYLOAD rather than by kind: the command is
@@ -140,6 +141,23 @@ pub const SUPPORTED_FEATURE_LEVEL: u32 = 6;
 /// is a tag an older voter does not know, so it is held back exactly as a new
 /// kind is (see [`MetadataCommand::feature_level`]).
 pub const LINEAGE_VERDICTS_FEATURE_LEVEL: u32 = 6;
+
+/// The level at which a data node may report its release and what it can run
+/// (#634): [`MetadataCommand::ReportNodeVersion`].
+///
+/// Also the last level whose raise is judged on the metadata tier alone. Data
+/// nodes cannot report before this level is in force - the report is a
+/// command an older voter cannot decode, so it is held back like any other -
+/// so nothing could vouch for them when it is raised. Every level ABOVE this
+/// one is refused while a counted node has not reported it or higher (see
+/// [`crate::versions::ClusterVersions::blockers`]), and this level changes
+/// nothing on the replica plane, so raising it cannot cut a peer off.
+pub const NODE_VERSION_REPORTS_FEATURE_LEVEL: u32 = 7;
+
+/// Bound for the release string a data node reports (#634): a version such
+/// as `0.8.0`, or one with a build suffix. Bounded like every other string a
+/// command carries.
+pub const MAX_RELEASE_BYTES: usize = 64;
 
 /// Why a fenced cursor commit is refused (#457 slice 2b): the commit did not
 /// come from the range's current leaseholder at its current fencing epoch. A
@@ -290,7 +308,7 @@ impl NodeState {
         }
     }
 
-    fn wire_tag(self) -> u8 {
+    pub(crate) fn wire_tag(self) -> u8 {
         match self {
             NodeState::Active => 1,
             NodeState::Draining => 2,
@@ -1196,6 +1214,28 @@ pub enum MetadataCommand {
         members: Vec<Uuid>,
         expected_generation: u64,
     },
+    /// A data node's own account of what it runs (#634): its release, the
+    /// highest replica-plane protocol it speaks, and the highest metadata
+    /// feature level it implements. Sent when the node starts, and repeated
+    /// until metadata accepts it; replaces the node's previous report.
+    ///
+    /// What a raise of the feature level is judged against: a level above
+    /// [`NODE_VERSION_REPORTS_FEATURE_LEVEL`] is refused while any counted
+    /// node has not reported that level or higher - a live range member, or
+    /// any node that has reported, unless marked dead (see
+    /// [`crate::versions::NodeVersionEntry::counted`]). A report is a
+    /// fact about one node, so it is node-scoped: only that node's identity
+    /// may send it, and only a registered node's is accepted (a node that
+    /// never reports can then still be marked dead, which is how an operator
+    /// takes a node that will never return out of the count).
+    ReportNodeVersion {
+        env: CommandEnvelope,
+        node_uuid: Uuid,
+        /// 1..=[`MAX_RELEASE_BYTES`] bytes.
+        release: String,
+        max_replica_protocol: u16,
+        supported_feature_level: u32,
+    },
 }
 
 impl MetadataCommand {
@@ -1222,6 +1262,8 @@ impl MetadataCommand {
             MetadataCommand::SplitRange { .. } | MetadataCommand::SetFeatureLevel { .. } => 4,
             // The recorded replica set (#553).
             MetadataCommand::SetRangeReplicaSet { .. } => 5,
+            // A data node's version report (#634).
+            MetadataCommand::ReportNodeVersion { .. } => NODE_VERSION_REPORTS_FEATURE_LEVEL,
             // Everything v0.4.0 already knew.
             _ => 1,
         }
@@ -1265,7 +1307,8 @@ impl MetadataCommand {
             | MetadataCommand::ConfirmRetentionExpired { env, .. }
             | MetadataCommand::CancelRetention { env, .. }
             | MetadataCommand::SetFeatureLevel { env, .. }
-            | MetadataCommand::SetRangeReplicaSet { env, .. } => env,
+            | MetadataCommand::SetRangeReplicaSet { env, .. }
+            | MetadataCommand::ReportNodeVersion { env, .. } => env,
         }
     }
 
@@ -1424,6 +1467,20 @@ impl MetadataCommand {
                 put_uuid(&mut out, *range_uuid);
                 encode_uuid_list(&mut out, members, MAX_REPLICAS, "replica set members")?;
                 put_u64(&mut out, *expected_generation);
+            }
+            MetadataCommand::ReportNodeVersion {
+                env,
+                node_uuid,
+                release,
+                max_replica_protocol,
+                supported_feature_level,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_REPORT_NODE_VERSION);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *node_uuid);
+                put_bounded_str(&mut out, release, MAX_RELEASE_BYTES, "release")?;
+                put_u16(&mut out, *max_replica_protocol);
+                put_u32(&mut out, *supported_feature_level);
             }
             MetadataCommand::RegisterSealedSegment {
                 env,
@@ -2068,6 +2125,22 @@ impl MetadataCommand {
                 range_uuid: reader.uuid("range uuid")?,
                 members: decode_uuid_list(reader, MAX_REPLICAS, "replica set members")?,
                 expected_generation: reader.u64("expected replica set generation")?,
+            }),
+            COMMAND_KIND_REPORT_NODE_VERSION => Ok(MetadataCommand::ReportNodeVersion {
+                env: decode_envelope(reader)?,
+                node_uuid: reader.uuid("node uuid")?,
+                release: {
+                    let release = reader.bounded_str(MAX_RELEASE_BYTES, "release")?;
+                    if release.is_empty() {
+                        return Err(CodecError::InvalidValue {
+                            what: "release",
+                            reason: "must not be empty",
+                        });
+                    }
+                    release
+                },
+                max_replica_protocol: reader.u16("max replica protocol")?,
+                supported_feature_level: reader.u32("supported feature level")?,
             }),
             COMMAND_KIND_REGISTER_SEALED_SEGMENT => Ok(MetadataCommand::RegisterSealedSegment {
                 env: decode_envelope(reader)?,
@@ -3232,6 +3305,13 @@ mod tests {
                 ],
                 expected_generation: 0,
             },
+            MetadataCommand::ReportNodeVersion {
+                env: envelope(38),
+                node_uuid: Uuid::from_u128(10),
+                release: "0.8.0".to_owned(),
+                max_replica_protocol: 2,
+                supported_feature_level: SUPPORTED_FEATURE_LEVEL,
+            },
             MetadataCommand::AcquireRangeLease {
                 env: envelope(31),
                 topic_uuid: Uuid::from_u128(20),
@@ -3588,6 +3668,34 @@ mod tests {
             seen.len(),
             usize::from(highest),
             "every kind 1..={highest} must be in every_command, or this check is blind to it"
+        );
+    }
+
+    /// #634 review: a version report's release is 1..=MAX_RELEASE_BYTES, and
+    /// the codec enforces both ends, as it does a node address - so an empty
+    /// one is refused at the admin endpoint and never reaches a log. Safe to
+    /// enforce at decode only because the kind is new in this release: no
+    /// log written before it can hold one.
+    #[test]
+    fn a_version_report_with_an_empty_release_does_not_decode() {
+        let empty = MetadataCommand::ReportNodeVersion {
+            env: envelope(38),
+            node_uuid: Uuid::from_u128(10),
+            release: String::new(),
+            max_replica_protocol: 2,
+            supported_feature_level: SUPPORTED_FEATURE_LEVEL,
+        };
+        let encoded = empty.encode().unwrap();
+        assert!(
+            matches!(
+                MetadataCommand::decode(&encoded),
+                Err(CodecError::InvalidValue {
+                    what: "release",
+                    ..
+                })
+            ),
+            "{:?}",
+            MetadataCommand::decode(&encoded)
         );
     }
 

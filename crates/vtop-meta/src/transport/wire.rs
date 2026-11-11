@@ -90,6 +90,16 @@ pub const KIND_ADMIN_READ_GROUP_CURSOR_RESP: u16 = 26;
 // configured set against before it promotes.
 pub const KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ: u16 = 27;
 pub const KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP: u16 = 28;
+// The cluster's feature level and what each node reported it runs (#634):
+// what `vtopctl meta enable-features` judges a raise on, and how a data node
+// learns the level its replica plane must hold peers to.
+pub const KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ: u16 = 29;
+pub const KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP: u16 = 30;
+
+/// The most nodes one cluster-versions read lists (#634). A cluster with more
+/// is told so (`truncated`), and a caller judging a raise on the list must
+/// then refuse to judge: the state machine still judges the raise itself.
+pub const MAX_CLUSTER_VERSION_NODES: usize = 4096;
 
 /// The most transition records one read returns; a longer chain is paged
 /// with `from_epoch`.
@@ -1305,6 +1315,131 @@ impl AdminReadRangeReplicaSetResponse {
     }
 }
 
+/// Read the cluster's feature level, and optionally every node's version
+/// report (#634).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminReadClusterVersionsRequest {
+    /// `false` reads the level alone: what a data node polls, and it costs
+    /// no walk of the records.
+    pub include_nodes: bool,
+}
+
+impl AdminReadClusterVersionsRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_u8(&mut out, u8::from(self.include_nodes));
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let request = Self {
+            include_nodes: reader.flag("include nodes")?,
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+}
+
+/// The level in force, the registered nodes (when asked for) with what each
+/// reported, and the applied index the read was served at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminReadClusterVersionsResponse {
+    pub versions: crate::versions::ClusterVersions,
+    /// More nodes are registered than [`MAX_CLUSTER_VERSION_NODES`]; the
+    /// list holds the first of them in node order.
+    pub truncated: bool,
+    pub read_at_applied_index: u64,
+}
+
+impl AdminReadClusterVersionsResponse {
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let nodes = &self.versions.nodes;
+        if nodes.len() > MAX_CLUSTER_VERSION_NODES {
+            return Err(CodecError::BoundExceeded {
+                what: "cluster version nodes",
+                actual: nodes.len(),
+                maximum: MAX_CLUSTER_VERSION_NODES,
+            });
+        }
+        let mut out = Vec::new();
+        put_u32(&mut out, self.versions.feature_level);
+        put_u8(&mut out, u8::from(self.truncated));
+        put_u64(&mut out, self.read_at_applied_index);
+        put_u16(&mut out, nodes.len() as u16);
+        for node in nodes {
+            put_uuid(&mut out, node.node_uuid);
+            put_u8(&mut out, node.state.wire_tag());
+            put_u8(&mut out, u8::from(node.range_member));
+            match &node.report {
+                None => put_u8(&mut out, 0),
+                Some(report) => {
+                    put_u8(&mut out, 1);
+                    put_bounded_str(
+                        &mut out,
+                        &report.release,
+                        crate::command::MAX_RELEASE_BYTES,
+                        "release",
+                    )?;
+                    put_u16(&mut out, report.max_replica_protocol);
+                    put_u32(&mut out, report.supported_feature_level);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let feature_level = reader.u32("feature level")?;
+        let truncated = reader.flag("truncated")?;
+        let read_at_applied_index = reader.u64("read at applied index")?;
+        let count = usize::from(reader.u16("cluster version node count")?);
+        if count > MAX_CLUSTER_VERSION_NODES {
+            return Err(CodecError::BoundExceeded {
+                what: "cluster version nodes",
+                actual: count,
+                maximum: MAX_CLUSTER_VERSION_NODES,
+            });
+        }
+        let mut nodes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let node_uuid = reader.uuid("node uuid")?;
+            let state = crate::command::NodeState::from_wire(reader.u8("node state")?)?;
+            let range_member = reader.flag("range member")?;
+            let report = match reader.u8("report flag")? {
+                0 => None,
+                1 => Some(crate::versions::NodeVersionRecord {
+                    release: reader.bounded_str(crate::command::MAX_RELEASE_BYTES, "release")?,
+                    max_replica_protocol: reader.u16("max replica protocol")?,
+                    supported_feature_level: reader.u32("supported feature level")?,
+                }),
+                _ => {
+                    return Err(CodecError::InvalidValue {
+                        what: "report flag",
+                        reason: "must be 0 or 1",
+                    })
+                }
+            };
+            nodes.push(crate::versions::NodeVersionEntry {
+                node_uuid,
+                state,
+                range_member,
+                report,
+            });
+        }
+        reader.finish()?;
+        Ok(Self {
+            versions: crate::versions::ClusterVersions {
+                feature_level,
+                nodes,
+            },
+            truncated,
+            read_at_applied_index,
+        })
+    }
+}
+
 /// Which segment to read the placement for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdminReadSegmentPlacementRequest {
@@ -2402,6 +2537,57 @@ mod tests {
         let mut bad = none.encode().unwrap();
         bad[1] = 2;
         assert!(AdminReadGroupCursorResponse::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn cluster_versions_read_round_trips_and_bounds_its_nodes() {
+        let request = AdminReadClusterVersionsRequest {
+            include_nodes: true,
+        };
+        assert_eq!(
+            AdminReadClusterVersionsRequest::decode(&request.encode()).unwrap(),
+            request
+        );
+        let response = AdminReadClusterVersionsResponse {
+            versions: crate::versions::ClusterVersions {
+                feature_level: 7,
+                nodes: vec![
+                    crate::versions::NodeVersionEntry {
+                        node_uuid: Uuid::from_u128(1),
+                        state: crate::command::NodeState::Active,
+                        range_member: true,
+                        report: Some(crate::versions::NodeVersionRecord {
+                            release: "0.8.0".to_owned(),
+                            max_replica_protocol: 2,
+                            supported_feature_level: 7,
+                        }),
+                    },
+                    crate::versions::NodeVersionEntry {
+                        node_uuid: Uuid::from_u128(2),
+                        state: crate::command::NodeState::Dead,
+                        range_member: false,
+                        report: None,
+                    },
+                ],
+            },
+            truncated: false,
+            read_at_applied_index: 42,
+        };
+        assert_eq!(
+            AdminReadClusterVersionsResponse::decode(&response.encode().unwrap()).unwrap(),
+            response
+        );
+        let mut too_many = response.clone();
+        too_many.versions.nodes =
+            vec![response.versions.nodes[1].clone(); MAX_CLUSTER_VERSION_NODES + 1];
+        assert!(too_many.encode().is_err());
+        let mut forged = response.encode().unwrap();
+        // The count sits after level (4), truncated (1) and index (8).
+        forged[13..15].copy_from_slice(&((MAX_CLUSTER_VERSION_NODES + 1) as u16).to_be_bytes());
+        assert!(matches!(
+            AdminReadClusterVersionsResponse::decode(&forged),
+            Err(CodecError::BoundExceeded { .. })
+        ));
     }
 
     #[test]

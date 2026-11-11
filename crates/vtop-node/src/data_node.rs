@@ -620,7 +620,9 @@ fn replica_server(
         PlaneTransport::PlaintextOnAnyInterface => {
             ReplicaPeerServer::plaintext_on_any_interface(config.node_uuid, handler)
         }
-    })
+    }
+    // Dialers are held to the level this node read (#634).
+    .with_cluster_level(crate::version_report::cluster_level_for(config.node_uuid)))
 }
 
 /// A replica-status client dialing the replica plane the way this node
@@ -628,14 +630,16 @@ fn replica_server(
 fn replica_status_client(
     config: &DataNodeConfig,
 ) -> Result<vtop_broker::replication::ReplicaStatusClient, String> {
-    if config.replica_transport.is_tls() {
+    let client = if config.replica_transport.is_tls() {
         vtop_broker::replication::ReplicaStatusClient::new(tls::replica_material(
             config.replica_tls_paths()?,
         )?)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?
     } else {
-        Ok(vtop_broker::replication::ReplicaStatusClient::plaintext())
-    }
+        vtop_broker::replication::ReplicaStatusClient::plaintext()
+    };
+    // A promotion's fence is held to the level this node read (#634).
+    Ok(client.with_version_policy(crate::version_report::version_policy(config.node_uuid)))
 }
 
 /// The leader's replica set, dialing followers the way the plane is served
@@ -645,21 +649,21 @@ fn start_replica_set(
     follower_configs: Vec<NetworkFollowerConfig>,
 ) -> Result<NetworkedReplicaSet, String> {
     let handle = tokio::runtime::Handle::current();
+    // Followers are held to the level this node read (#634).
+    let flow = FlowControlConfig {
+        version: crate::version_report::version_policy(config.node_uuid),
+        ..FlowControlConfig::default()
+    };
     if config.replica_transport.is_tls() {
         NetworkedReplicaSet::start_on_handle_with_memory(
             handle,
             follower_configs,
             tls::replica_material(config.replica_tls_paths()?)?,
-            FlowControlConfig::default(),
+            flow,
             None,
         )
     } else {
-        NetworkedReplicaSet::start_plaintext_on_handle(
-            handle,
-            follower_configs,
-            FlowControlConfig::default(),
-            None,
-        )
+        NetworkedReplicaSet::start_plaintext_on_handle(handle, follower_configs, flow, None)
     }
     .map_err(|error| error.to_string())
 }
@@ -867,7 +871,46 @@ pub async fn serve(
         }
     }
 
-    match config.role {
+    // Tell metadata what this node runs, and read back the level the cluster
+    // finalized for the replica plane to hold peers to (#634). Only where
+    // metadata is configured: a static range has nobody to tell, and its
+    // replica plane refuses no peer. Spawned after the last startup refusal
+    // and held by a guard, so it never outlives the node - not even when
+    // `serve` is dropped at an await (review).
+    //
+    // The level is read ONCE before any listener opens (review): a session
+    // accepted before the first read would be judged against level 0 and
+    // refuse nobody. Bounded by one renewal interval, and not a startup
+    // condition: a node that cannot reach metadata yet keeps 0 until it
+    // can, and until then it cannot do anything a level guards - a lease
+    // follower refuses appends until it knows its epoch, and a fence or a
+    // promotion needs a grant from that same metadata.
+    let _version_task = match config.lease.as_ref() {
+        Some(lease) => {
+            let interval = Duration::from_millis(lease.renew_interval_ms.max(100));
+            // A round's RPC budget is the lease duration, as the lease
+            // watcher's reads have, not the cadence (review): a cadence
+            // under the admin client's per-candidate allowance would cancel
+            // every round before it could pass a stalled endpoint.
+            let budget = Duration::from_millis(lease.lease_duration_ms).max(interval);
+            let level = crate::version_report::cluster_level_for(config.node_uuid);
+            let admin = lease_admin_client(lease)?;
+            // The startup read stays within one interval: it is best effort,
+            // and the loop's first round has the full budget.
+            crate::version_report::read_level(&admin, &level, interval).await;
+            Some(Aborting(tokio::spawn(crate::version_report::run(
+                admin,
+                config.node_uuid,
+                level,
+                interval,
+                budget,
+                shutdown.clone(),
+            ))))
+        }
+        None => None,
+    };
+
+    let served = match config.role {
         DataRole::Follower => {
             run_follower(
                 config,
@@ -922,7 +965,8 @@ pub async fn serve(
             )
             .await
         }
-    }
+    };
+    served
 }
 
 #[allow(clippy::too_many_arguments)]

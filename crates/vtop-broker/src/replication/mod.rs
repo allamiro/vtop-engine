@@ -26,6 +26,7 @@ pub mod fault;
 pub mod network;
 pub(crate) use network::REPLICA_LIMITS;
 pub mod transfer;
+pub mod version;
 
 #[cfg(test)]
 mod fence_race_tests;
@@ -52,6 +53,7 @@ pub use network::{
     ReplicaTlsMaterial,
 };
 pub use transfer::{LeaderSegmentTransferHandler, SegmentTransferClient, TransferredPrefix};
+pub use version::{ClusterFeatureLevel, PeerVersion, ReplicaVersionPolicy};
 
 /// Shared quorum-committed high-water mark for a range.
 ///

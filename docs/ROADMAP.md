@@ -338,6 +338,29 @@ reopen quietly.
   node repair` from a replica whose history is right (#315). No wire or
   feature-level change: an older follower keeps mislabelling until upgraded,
   which costs elections availability, never an acknowledged record.
+- **#634** - a data node's release was invisible to the cluster, so a
+  feature level was raised on the metadata tier's word alone, and the
+  replica plane had no version on the wire. Data nodes now report
+  `(release, max replica protocol, supported feature level)` to metadata (a
+  new command kind, feature level 7) from startup until it is recorded, and
+  `vtopctl meta node-versions` lists the reports. A raise above level 7 is
+  refused while any counted node has not reported that level or higher: a
+  lease holder, a member of a recorded replica set, or any node that has
+  reported, unless marked dead. The refusal names the nodes. The CLI and the state machine
+  both judge the raise, so the check and the raise cannot race. The replica session now
+  opens with a version exchange carried in the hello frames every older
+  peer already decodes. A peer before the handshake answers it with a typed
+  refusal and is spoken to in the old protocol, and both sides use the lower
+  version. A peer below the finalized level is refused on both ends, and
+  one before the handshake is refused once the level is above 7. Limits: no
+  release supports a level above 7 yet, so the gate and the replica-plane
+  refusal have nothing to refuse until one does. They are exercised in tests
+  as that release will run them. A node is reported once per process, not on
+  every renewal, because the renewals share one Raft queue and an unchanged
+  report carries nothing. A data node with no metadata configured
+  holds no peer to a level. A data-node follower that metadata cannot name, because it
+  never reported and no recorded replica set lists it, does not hold a raise
+  back; after the raise the handshake refuses it if it is behind.
 
 One observation rode along without becoming a fix: scenario 09 once left a
 promotion unacquired within its deadline (#318). The flake has not recurred —

@@ -17,6 +17,7 @@ mod promotion;
 #[cfg(test)]
 mod promotion_crash_sweep;
 mod tls;
+mod version_report;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
