@@ -460,6 +460,10 @@ impl PartitionLiveness {
         self.end_baseline.contains_key(key)
     }
 
+    fn baseline(&self, key: &(String, i32)) -> Option<i64> {
+        self.end_baseline.get(key).copied()
+    }
+
     /// The offset a due partition would read next: `next` when it is known,
     /// otherwise the end-of-log baseline. The first check of a partition with
     /// neither records `high` as the baseline and decides nothing.
@@ -1196,7 +1200,7 @@ impl KafkaSource {
 
         let now = Instant::now();
         let mut stalled: Vec<(String, i32)> = Vec::new();
-        let mut rebuild = false;
+        let mut rebuild: Vec<((String, i32), i64)> = Vec::new();
         for key in &due {
             let Some(&high) = highs.get(key) else {
                 continue;
@@ -1243,11 +1247,15 @@ impl KafkaSource {
                 .map(|run| (run.passes, now.saturating_duration_since(run.since)))
                 .unwrap_or_default();
             let recovery = self.liveness.recovery(key, high);
-            self.liveness.note_reassigned(key, high);
-            self.stall_reassigns += 1;
             match recovery {
-                Recovery::Reassign => stalled.push(key.clone()),
-                Recovery::RebuildConsumer => rebuild = true,
+                Recovery::Reassign => {
+                    self.liveness.note_reassigned(key, high);
+                    self.stall_reassigns += 1;
+                    stalled.push(key.clone());
+                }
+                // Counted only once the rebuild happens: a deferred one must
+                // not use up the partition's last recovery at this watermark.
+                Recovery::RebuildConsumer => rebuild.push((key.clone(), high)),
             }
             tracing::warn!(
                 topic = %key.0,
@@ -1263,8 +1271,12 @@ impl KafkaSource {
                  holds records for it, so its fetcher is restarted (#623)"
             );
         }
-        if rebuild {
-            self.rebuild_consumer_after_stall();
+        let rebuilt = !rebuild.is_empty() && self.rebuild_consumer_after_stall();
+        if rebuilt {
+            for (key, high) in &rebuild {
+                self.liveness.note_reassigned(key, *high);
+                self.stall_reassigns += 1;
+            }
         } else if !stalled.is_empty() {
             self.reassign_stalled(&stalled);
         }
@@ -1336,8 +1348,11 @@ impl KafkaSource {
     /// holds survives in its cursors. A partition still waiting on
     /// `Offset::Stored` under `latest`, with nothing committed, is first
     /// pinned where it started, so the new consumer does not resolve it at
-    /// the new end of the log (review of #644).
-    fn rebuild_consumer_after_stall(&mut self) {
+    /// the new end of the log (review of #644). When that start cannot be
+    /// established - the group or the broker does not answer - the rebuild
+    /// waits for a later check and the consumer is kept: a failed lookup is
+    /// not permission to discard the assignment. Returns whether it rebuilt.
+    fn rebuild_consumer_after_stall(&mut self) -> bool {
         let waiting: Vec<(String, i32)> = self
             .assigned
             .iter()
@@ -1350,25 +1365,17 @@ impl KafkaSource {
             .cloned()
             .collect();
         if !waiting.is_empty() && resets_to_latest(&self.cfg.auto_offset_reset) {
-            let answers = self.group_committed_answers(&waiting).unwrap_or_default();
-            let unpinned: Vec<(String, i32)> = waiting
-                .into_iter()
-                .filter(|key| matches!(answers.get(key), Some(None)))
-                .collect();
-            if let Some(consumer) = self.consumer.as_ref() {
-                let since = end_start_lookup_time(self.liveness.assigned_at_ms);
-                let highs = list_offsets(consumer, &unpinned, Offset::End);
-                let starts = offsets_at_time(consumer, &unpinned, since).unwrap_or_default();
-                for key in unpinned {
-                    let start = match starts.get(&key) {
-                        Some(Some(start)) => Some(*start),
-                        Some(None) => highs.get(&key).copied(),
-                        None => None,
-                    };
-                    if let Some(start) = start {
-                        self.cursors.entry(key).or_default().committed_offset = Some(start);
-                    }
-                }
+            let Some(pins) = self.latest_starts(&waiting) else {
+                tracing::warn!(
+                    partitions = waiting.len(),
+                    "kafka consumer rebuild deferred: where a partition assigned at the end of \
+                     the log started could not be established, and a new consumer would skip \
+                     what arrived since; asked again at the next check (#623)"
+                );
+                return false;
+            };
+            for (key, start) in pins {
+                self.cursors.entry(key).or_default().committed_offset = Some(start);
             }
         }
         tracing::warn!(
@@ -1378,6 +1385,52 @@ impl KafkaSource {
         self.assigned.clear();
         self.delivered.clear();
         self.paused.clear();
+        true
+    }
+
+    /// Where each of `waiting` (assigned, `latest`, nothing delivered or held
+    /// in its cursor) started, for pinning before a rebuild (review of #644).
+    /// An end-of-log baseline the stall check already established is used as
+    /// it is; otherwise the group is asked, and for a partition with nothing
+    /// committed, the broker for the first offset since the assign (the end
+    /// of the log when there is none). A partition with a commit needs no pin:
+    /// `Offset::Stored` resolves to that commit. `None` when any start cannot
+    /// be established.
+    fn latest_starts(&mut self, waiting: &[(String, i32)]) -> Option<Vec<((String, i32), i64)>> {
+        let mut pins = Vec::new();
+        let mut unknown = Vec::new();
+        for key in waiting {
+            match self.liveness.baseline(key) {
+                Some(start) => pins.push((key.clone(), start)),
+                None => unknown.push(key.clone()),
+            }
+        }
+        if unknown.is_empty() {
+            return Some(pins);
+        }
+        let answers = self.group_committed_answers(&unknown)?;
+        let mut uncommitted = Vec::new();
+        for key in unknown {
+            match answers.get(&key)? {
+                Some(_committed) => {}
+                None => uncommitted.push(key),
+            }
+        }
+        if uncommitted.is_empty() {
+            return Some(pins);
+        }
+        let consumer = self.consumer.as_ref()?;
+        let since = end_start_lookup_time(self.liveness.assigned_at_ms);
+        let starts = offsets_at_time(consumer, &uncommitted, since)?;
+        let highs = list_offsets(consumer, &uncommitted, Offset::End);
+        for key in uncommitted {
+            let start = match starts.get(&key)? {
+                Some(start) => *start,
+                None => *highs.get(&key)?,
+            };
+            pins.push((key, start));
+        }
+        Some(pins)
     }
 
     /// TEST SEAM (#623): how many stall recoveries this adapter has made, so
@@ -2378,6 +2431,58 @@ mod tests {
         live.note_reassigned(&key, 655_147);
         assert_eq!(live.stalled_lag(&key, Some(77_054), 655_147), None);
         assert_eq!(live.recovery(&key, 655_148), Recovery::Reassign);
+    }
+
+    fn latest_source_assigned_to(keys: &[(String, i32)]) -> KafkaSource {
+        let mut cfg = cfg();
+        cfg.auto_offset_reset = "latest".into();
+        let mut src = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
+        src.assigned = keys.to_vec();
+        src
+    }
+
+    /// Review of #644: a rebuild drops the consumer, and every partition
+    /// still at `Offset::Stored` resolves again on the new one - under
+    /// `latest`, at the NEW end. A partition that has not delivered must be
+    /// pinned where it started first; when that cannot be established (here
+    /// no broker answers), the rebuild waits for a later check instead of
+    /// discarding the assignment and skipping what arrived since.
+    #[test]
+    fn a_rebuild_waits_while_a_latest_start_cannot_be_established() {
+        let waiting = tp("t", 0);
+        let mut src = latest_source_assigned_to(std::slice::from_ref(&waiting));
+        let rebuilt = src.rebuild_consumer_after_stall();
+        assert!(!rebuilt, "the rebuild must wait");
+        assert_eq!(
+            src.assigned,
+            vec![waiting.clone()],
+            "the assignment is kept for a later check"
+        );
+        assert!(
+            src.cursors
+                .get(&waiting)
+                .and_then(|c| c.committed_offset)
+                .is_none(),
+            "nothing is pinned from a lookup that failed"
+        );
+    }
+
+    /// Review of #644: a start the stall check already established (an
+    /// end-of-log baseline, recorded only after the group answered that
+    /// nothing is committed) is used as it is, without asking the broker
+    /// again, and the rebuild goes ahead with the partition pinned there.
+    #[test]
+    fn a_rebuild_pins_a_latest_partition_at_its_established_baseline() {
+        let waiting = tp("t", 0);
+        let mut src = latest_source_assigned_to(std::slice::from_ref(&waiting));
+        src.liveness.note_baseline(&waiting, 42);
+        let rebuilt = src.rebuild_consumer_after_stall();
+        assert!(rebuilt);
+        assert_eq!(
+            src.cursors.get(&waiting).and_then(|c| c.committed_offset),
+            Some(42)
+        );
+        assert!(src.assigned.is_empty() && src.consumer.is_none());
     }
 
     /// Review of #644: a partition assigned at `Offset::Stored` with nothing
