@@ -258,8 +258,12 @@ reopen quietly.
   own fence as a candidate, clears it durably before anything is acked past
   it. A restart restores it, so it caps acks and status and is settled
   exactly as before. A record the log has provably moved past, or one that
-  starts below the replica's committed mark, is discarded at open, never
-  settled over the new leader's records. **Older releases refuse the
+  starts below the replica's committed mark or below the caller's tail its
+  fence bounded it by, is discarded at open, never settled over the new
+  leader's records. A lease adoption of a newer epoch is not such evidence:
+  only a fence retires a dispute, and every retirement clears the record.
+  The record holds two checksummed frames, so a crash while it changes
+  reads back the old state or the new one, never neither. **Older releases refuse the
   directory while a dispute may be pending:** the journal's header is
   version 2 from before the record is written until after it is cleared,
   and every earlier release opens only version 1, so a downgrade cannot

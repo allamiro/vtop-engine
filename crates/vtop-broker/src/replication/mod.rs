@@ -237,6 +237,10 @@ struct KeptDispute {
     /// (0 when this replica's history could not say). Persisted so a reload
     /// can tell a record the log has since moved past (#635).
     suffix_epoch: u64,
+    /// The caller's tail the fence bounded this dispute by, or 0 when it
+    /// did not (#616 review). Persisted so a reload can refuse a record
+    /// that starts below it (#635).
+    caller_tail: u64,
 }
 
 impl KeptDispute {
@@ -245,6 +249,7 @@ impl KeptDispute {
             fence_epoch: self.epoch,
             from: self.from,
             suffix_epoch: self.suffix_epoch,
+            caller_tail: self.caller_tail,
         }
     }
 }
@@ -511,6 +516,13 @@ impl InProcessFollower {
     /// * `from` is below this replica's committed mark. A dispute always
     ///   starts at or above the mark (#616): below it everything is
     ///   committed, and the truncation guard would refuse the settlement;
+    /// * `from` is below the caller's tail the fence bounded it by. A
+    ///   divergence below the mark keeps only what lies past the caller's
+    ///   tail (#616 review), and settling below it would discard records the
+    ///   new leader holds and cannot re-send. (A divergence at or above the
+    ///   mark is not bounded by the caller's tail, and records 0 there: a
+    ///   replica holding a newer leadership's records keeps them from the
+    ///   divergence, which can be below the caller's tail.)
     /// * the epoch owning `from` is no longer the one that owned it then: the
     ///   suffix was replaced, for instance by a binary that never knew the
     ///   record.
@@ -559,6 +571,11 @@ impl InProcessFollower {
             // it is committed, never in dispute, and the truncation guard
             // would refuse to settle it, wedging every later append.
             Some("it starts below this replica's committed mark")
+        } else if record.from < record.caller_tail {
+            // Bounded by the caller's tail (#616 review), a dispute starts
+            // at or past it: below it are records the caller holds and its
+            // first append, at that tail, cannot re-send.
+            Some("it starts below the caller's tail its fence bounded it by")
         } else if history_known
             && journal.epoch_owning(record.from).unwrap_or(0) != record.suffix_epoch
         {
@@ -570,6 +587,7 @@ impl InProcessFollower {
             epoch: record.fence_epoch,
             from: record.from,
             suffix_epoch: record.suffix_epoch,
+            caller_tail: record.caller_tail,
         };
         if let Some(reason) = stale {
             eprintln!(
@@ -1441,11 +1459,11 @@ impl InProcessFollower {
             // gap no leader fills. Without a tail in the caller's history,
             // nothing is kept, which is the answer before #616.
             let mark = self.cluster_committed.get();
-            let from = if divergence >= mark {
-                divergence
+            let (from, bounded_by) = if divergence >= mark {
+                (divergence, 0)
             } else {
                 caller_tail(leader_epoch_starts, fencing_epoch)
-                    .map_or(u64::MAX, |tail| tail.max(mark))
+                    .map_or((u64::MAX, 0), |tail| (tail.max(mark), tail))
             };
             if from < state.segment.next_offset() {
                 let mut kept = self
@@ -1458,6 +1476,7 @@ impl InProcessFollower {
                         epoch: fencing_epoch,
                         from,
                         suffix_epoch: 0,
+                        caller_tail: bounded_by,
                     },
                 )
                 .map_err(|problem| {

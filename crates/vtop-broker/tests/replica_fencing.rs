@@ -888,6 +888,104 @@ fn a_dispute_survives_lease_adoption_of_a_newer_epoch_and_a_restart() {
     );
 }
 
+/// #635 with the #616 review's caller-tail rule. Below the mark, a fence
+/// keeps only what lies past the caller's own tail. That dispute, from 10
+/// here, is recorded with the tail that bounded it, survives a restart, and
+/// the caller's marker at its tail still settles it.
+#[test]
+fn a_dispute_kept_from_the_callers_tail_survives_a_restart() {
+    let h = caught_up_under_its_own_epoch(9);
+    let fenced = h
+        .node
+        .fence(
+            NEWER_EPOCH,
+            &[
+                EpochStart {
+                    epoch: OLD_EPOCH,
+                    start_offset: 0,
+                },
+                EpochStart {
+                    epoch: NEWER_EPOCH,
+                    start_offset: 10,
+                },
+            ],
+        )
+        .expect("fenced");
+    assert_eq!((fenced.truncated_records, fenced.next_offset), (0, 11));
+    let Harness {
+        _dir: dir,
+        range,
+        node,
+        ..
+    } = h;
+    drop(node);
+    let recorded = recorded_dispute(&dir).expect("recorded before the fence replied");
+    assert_eq!(
+        (recorded.fence_epoch, recorded.from, recorded.caller_tail),
+        (NEWER_EPOCH, 10, 10)
+    );
+
+    let meta = MetaFencingEpoch::new(NEWER_EPOCH);
+    let node = follower_via_the_real_open_path(
+        &dir,
+        &range,
+        &meta,
+        ActiveSegment::recover(dir.path().join("range.active")).unwrap(),
+    );
+    node.adopt_fencing_epoch(NEWER_EPOCH);
+    assert_eq!(
+        node.replication_status(),
+        (10, 10),
+        "the dispute from the caller's tail was not restored"
+    );
+    let marker = node
+        .apply_append(&append_request(
+            &range,
+            NEWER_EPOCH,
+            Uuid::from_u128(0xAA),
+            10,
+        ))
+        .expect("the caller's marker at its tail lands over the kept record");
+    assert_eq!(marker.local_committed_offset, 11);
+    assert_eq!(node.next_offset(), 11);
+}
+
+/// A dispute bounded by the caller's tail starts at or past it (#616
+/// review), so a stored record whose start is below the tail it records
+/// is not one this rule wrote. Restored, its settlement would discard
+/// records the new leader holds and cannot re-send. It is discarded at
+/// open, durably.
+#[test]
+fn a_dispute_record_below_its_callers_tail_is_discarded_at_open() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    keep_a_dispute_then_die(&dir, &range);
+    {
+        let mut journal = FencingEpochJournal::open(dir.path().join("fencing-epochs")).unwrap();
+        let kept = journal.kept_dispute().expect("the fence recorded it");
+        journal
+            .record_kept_dispute(vtop_broker::kept_dispute::KeptDisputeRecord {
+                caller_tail: kept.from + 2,
+                ..kept
+            })
+            .unwrap();
+    }
+
+    let node = restart_under_the_new_epoch(&dir, &range);
+    assert_eq!(
+        node.replication_status(),
+        (10, 10),
+        "a record below its caller's tail was restored"
+    );
+    drop(node);
+    assert_eq!(
+        recorded_dispute(&dir),
+        None,
+        "the record must be cleared, not left for the next open"
+    );
+    assert_eq!(epoch_journal_version(&dir), 1, "and the gate lowered");
+}
+
 /// A dispute starts at or above the replica's committed mark (#616), so a
 /// stored record whose start is below the mark found at open is not one
 /// this code wrote for the log as it now stands. Restored, its settlement

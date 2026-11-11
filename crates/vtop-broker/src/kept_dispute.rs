@@ -56,7 +56,7 @@
 //! file longer than two frames is refused, so a format this build cannot
 //! read is never read as "no dispute".
 //!
-//! # Layout (two 75-byte frames; an empty or absent file is "no dispute")
+//! # Layout (two 83-byte frames; an empty or absent file is "no dispute")
 //!
 //! ```text
 //! magic "VTOPKDS1"   8
@@ -67,6 +67,9 @@
 //! from u64           8   the first offset in dispute
 //! suffix_epoch u64   8   when known, the epoch that wrote the record at
 //!                        `from` then; 0 if this replica could not say
+//! caller_tail u64    8   the caller's own tail when the fence bounded the
+//!                        dispute by it (a divergence below the mark); 0
+//!                        when it did not
 //! BLAKE3-32         32   over everything above
 //! ```
 //!
@@ -79,7 +82,7 @@ use vtop_log::env::{Env, OpenMode, StorageFile};
 
 const MAGIC: &[u8; 8] = b"VTOPKDS1";
 const VERSION: u16 = 1;
-const PAYLOAD_BYTES: usize = 8 + 2 + 8 + 1 + 8 + 8 + 8;
+const PAYLOAD_BYTES: usize = 8 + 2 + 8 + 1 + 8 + 8 + 8 + 8;
 const CHECKSUM_BYTES: usize = 32;
 const FRAME_BYTES: usize = PAYLOAD_BYTES + CHECKSUM_BYTES;
 const FILE_BYTES: usize = 2 * FRAME_BYTES;
@@ -97,6 +100,12 @@ pub struct KeptDisputeRecord {
     /// finds a different owner there knows the log moved past the dispute
     /// without this record being cleared (see `InProcessFollower`'s reload).
     pub suffix_epoch: u64,
+    /// The caller's own tail, when the fence bounded the dispute by it: a
+    /// divergence below the replica's mark keeps only what lies past the
+    /// caller's tail (#616 review). 0 when the fence did not bound it so. A
+    /// record whose `from` is below it was not written by this rule and is
+    /// discarded at open.
+    pub caller_tail: u64,
 }
 
 /// The sidecar's path for the journal at `journal_path`.
@@ -306,6 +315,7 @@ fn encode(sequence: u64, record: Option<KeptDisputeRecord>) -> [u8; FRAME_BYTES]
         bytes[19..27].copy_from_slice(&record.fence_epoch.to_be_bytes());
         bytes[27..35].copy_from_slice(&record.from.to_be_bytes());
         bytes[35..43].copy_from_slice(&record.suffix_epoch.to_be_bytes());
+        bytes[43..51].copy_from_slice(&record.caller_tail.to_be_bytes());
     }
     let checksum = blake3::hash(&bytes[..PAYLOAD_BYTES]);
     bytes[PAYLOAD_BYTES..].copy_from_slice(checksum.as_bytes());
@@ -345,6 +355,7 @@ fn decode(frame: &[u8]) -> BrokerResult<Option<(u64, Option<KeptDisputeRecord>)>
         fence_epoch: field(19),
         from: field(27),
         suffix_epoch: field(35),
+        caller_tail: field(43),
     });
     Ok(Some((field(10), record)))
 }
@@ -358,6 +369,7 @@ mod tests {
         fence_epoch: 19,
         from: 5,
         suffix_epoch: 18,
+        caller_tail: 0,
     };
 
     fn open(dir: &TempDir) -> BrokerResult<KeptDisputeFile> {
@@ -377,6 +389,7 @@ mod tests {
             fence_epoch: 20,
             from: 7,
             suffix_epoch: 18,
+            caller_tail: 7,
         };
         let open_sim = |env: &Env| KeptDisputeFile::open_in(env, PathBuf::from(PATH));
         // Disk holding RECORD, durably: the announced state.

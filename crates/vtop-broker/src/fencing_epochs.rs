@@ -879,6 +879,7 @@ mod tests {
             fence_epoch: 19,
             from: 5,
             suffix_epoch: 18,
+            caller_tail: 5,
         };
         {
             let mut journal = journal(&dir);
