@@ -1,6 +1,11 @@
 tag,run_id,committed,failed,seeded,busy_s,duration_s,goodput_mbps,link_mbps,fraction,upload_p50_s,upload_max_s,harness_rc
 main-c574f6a-policed-r1,tcpb-wan100-policed-default-r1-20261111T024537Z-njmkgf,0,16,16,0,1721.626,0.0,10.0,0.0,,,0
 main937-s24-r1,policed-uplink-default-width-20261111T044621Z-0bf7bn,0,16,16,1811.0,1811.036,0.0,10.0,0.0,,,6
+fix2-s24-r4,policed-uplink-default-width-20261111T061010Z-zo2cf5,16,0,16,1382.8,1382.827,1.941,10.0,0.194,692.7,715.0,0
+fix3-s24-r1,policed-uplink-default-width-20261111T051656Z-8v7t4z,16,0,16,1231.5,1231.492,2.18,10.0,0.218,705.3,720.7,0
+fix3-s24-r2,policed-uplink-default-width-20261111T054832Z-uumubr,16,0,16,1245.8,1245.84,2.155,10.0,0.215,672.9,697.8,0
+fix3-wan100-r1,tcpb-wan100-default-r1-20261111T053742Z-whqb5o,16,0,16,289.8,292.001,9.264,9.565,0.969,135.6,141.6,0
+fix3-loss1-r1,tcpb-wan100-loss1-default-r1-20261111T054249Z-xxz76l,16,0,16,291.1,292.04,9.221,9.56,0.965,138.1,144.0,0
 fix2-s24-r1,policed-uplink-default-width-20261111T033130Z-uhghpt,16,0,16,881.4,881.441,3.045,10.0,0.305,419.5,431.4,0
 fix2-s24-r2,policed-uplink-default-width-20261111T040654Z-ntvuji,16,0,16,869.8,869.782,3.086,10.0,0.309,446.3,462.0,0
 fix2-s24-r3,policed-uplink-default-width-20261111T043157Z-lq61rb,16,0,16,849.5,849.501,3.16,10.0,0.316,421.5,448.9,0

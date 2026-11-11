@@ -4,7 +4,7 @@
   "what": "Why the shipped upload defaults committed nothing on a policed 10 Mbit/s uplink at 100 ms (the #483 baseline), and the same workload before and after the fix: scenario 24 (the policed link, 16 x 20 MiB objects, shipped width) and the #483 harness's clean and lossy 100 ms profiles at the default configuration.",
   "host": {
     "machine": "Apple M5 Max, 18 cores, 128 GiB",
-    "noise": "Other work ran on the same Mac throughout and was not stopped: Docker Desktop with unrelated containers, other sessions' VMs and builds, and this change's own cargo builds and tests in Docker Desktop during some runs. None of it is separated from these numbers."
+    "noise": "Other work ran on the same Mac throughout and was not stopped: Docker Desktop with unrelated containers, other sessions' VMs and builds, and this change's own cargo builds and tests in Docker Desktop during some runs. None of it is separated from these numbers. The policed link drifted over the session: the same fix binary measured 0.305-0.316 of the token rate from 03:31Z to 04:46Z (fix2-s24-r1..r3) and 0.194 at 06:10Z (fix2-s24-r4, a control run), and the PR head's binary measured 0.218 and 0.215 in between (fix3-s24-r1, r2). The control shows the drop is the lab's, not the rebase's. Every policed run of the fix committed 16 of 16, the SDK made no retry attempt in any of them whose drain log was kept (all but fix2-s24-r1, whose log a naming collision in the diagnostic harness copy overwrote), and the slowest object (720.7 s) stayed under a third of an 8 MiB part's 2348 s allowance."
   },
   "vm": "Lima vz VM vtop-bench-483a (the #483 lab VM, reused): 6 vCPU, 8 GiB, Ubuntu 24.04.5 LTS, kernel 6.8.0-142-generic (ifb available), Docker 29.9.3. The only containers in it are the lab's.",
   "lab": "benchmarks/docker-compose.benchmark.yml, profiles netem + containerized; vtop-minio:RELEASE.2025-09-07T16-13-09Z, nicolaka/netshoot:v0.16, engine container ubuntu:26.04; runner_mode container, process-once.",
@@ -25,7 +25,7 @@
       "sha256": "2eb8d51c0ebb532c65e67f3b04ace1832077a93e9eaed9386eb09b55e0a582f7"
     },
     "fix_on_b33f69f": {
-      "source": "the PR head: this change rebased on main b33f69f (#652), which landed while the runs above were in progress",
+      "source": "this change rebased on main b33f69f (#652), which landed while the runs above were in progress. The PR head is the same change on 936a9b8; the two commits between (#644 kafka source, #648 replication) are outside this binary's code paths (the Kafka adapter is not built with --no-default-features)",
       "used_for": "the confirmation rows tagged fix3-*",
       "sha256": "c7f17e58efd3dd9f943f2ea6dd3cbcccabfff03735fcb708493eb8bc002df257"
     },
