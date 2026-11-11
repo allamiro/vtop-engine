@@ -37,6 +37,9 @@ prometheus = { version = "0.14", default-features = false }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+# The egress shaper (#481) implements http-body 1.x `Body` to wrap the SDK's
+# request body; already in the tree through the aws-sdk and hyper.
+http-body = "1"
 rdkafka = { version = "0.39", features = ["cmake-build", "ssl", "sasl"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-smithy-runtime-api = "1"

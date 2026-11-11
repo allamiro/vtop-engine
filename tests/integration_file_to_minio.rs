@@ -140,7 +140,7 @@ async fn configured_manifest_key_authenticates_the_stored_manifest() {
     let manifest_uri = row.manifest_uri.unwrap();
     let stored = engine.backend.get_object(&manifest_uri).await.unwrap();
     let manifest: VtopManifest = serde_json::from_slice(&stored).unwrap();
-    assert_eq!(manifest.version, "0.2");
+    assert_eq!(manifest.version, "0.3");
     assert_eq!(manifest.manifest.mac.as_deref().map(str::len), Some(64));
     manifest.verify_authentication(Some(&key)).unwrap();
     assert!(manifest.verify_authentication(Some(&wrong_key)).is_err());

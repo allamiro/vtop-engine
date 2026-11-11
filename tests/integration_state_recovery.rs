@@ -170,6 +170,7 @@ async fn recovery_commits_verified_but_uncommitted_batch() {
         file_size: 28,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     let object_uri = "s3://telemetry-data/x/b-verified.raw.gz";
     let manifest_uri = "s3://telemetry-data/x/b-verified.manifest.json";
@@ -299,6 +300,7 @@ async fn recovery_rejects_same_size_replacement_with_matching_metadata() {
         file_size: 7,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     let (manifest, manifest_path) = write_recovery_manifest(
         &work,
@@ -415,6 +417,7 @@ async fn recovery_rejects_rehashed_manifest_not_bound_to_ledger() {
         file_size: 7,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     let (original_manifest, _) = write_recovery_manifest(
         &work,
@@ -549,6 +552,7 @@ async fn recovery_refuses_to_commit_when_storage_no_longer_verifies() {
         file_size: 14,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     let now = chrono::Utc::now().to_rfc3339();
     let rec = BatchRecord {
@@ -638,6 +642,7 @@ async fn recovery_rejects_unsigned_manifest_after_mac_cutover() {
         file_size: 7,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     let now = chrono::Utc::now().to_rfc3339();
     let unsigned = ManifestBuilder {
@@ -773,6 +778,7 @@ async fn recovery_size_check_rejects_replaced_object_without_checksums() {
         file_size: 7,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
     let object_uri = "s3://telemetry-data/x/b-size.raw.gz";
     let manifest_uri = "s3://telemetry-data/x/b-size.manifest.json";
@@ -931,6 +937,7 @@ async fn recovery_resumes_from_the_lowest_incomplete_range_not_the_last_one_visi
         file_size: 21,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
 
     {
@@ -1025,6 +1032,7 @@ async fn recovery_does_not_commit_a_verified_range_above_a_failed_one() {
         file_size: 28,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
 
     let object_uri = "s3://telemetry-data/x/b-above.raw.gz";
@@ -1191,6 +1199,7 @@ async fn recovery_commits_a_verified_range_above_a_failed_row_that_a_retry_alrea
         file_size: 28,
         mtime: String::new(),
         content_fingerprint: None,
+        tail_fingerprint: None,
     };
 
     let object_uri = "s3://telemetry-data/x/b-above.raw.gz";

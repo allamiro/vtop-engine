@@ -387,9 +387,13 @@ pub struct ReplicaFenceRequest {
     ///
     /// Sent with the fence rather than fetched afterwards because reconciling
     /// is only sound against a log that cannot move. A replica compares this
-    /// with its own vector, and anything above the point where the two provably
-    /// agree was written under a leadership the caller does not share — records
-    /// no quorum ever accepted, which must go before this replica can follow.
+    /// with its own vector and discards the records at and above the offset
+    /// where the two stop agreeing, but only when this history PROVES those records
+    /// were never acknowledged (#611). The caller must hold a record there,
+    /// written under an epoch newer than every record discarded. A caller
+    /// that merely lacks records, including through its own adoption of the
+    /// new epoch at its tail, proves nothing. The replica keeps them and
+    /// answers with its full offset.
     ///
     /// Empty means the caller cannot vouch for its own history, and the replica
     /// must then truncate NOTHING. That is the same "unknown" this project uses

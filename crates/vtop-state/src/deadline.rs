@@ -16,7 +16,7 @@
 //! batch is recorded VERIFIED, and recovery re-reads rows it finds
 //! incomplete. The worst case is a range archived twice, never a lost one.
 
-use crate::models::{BatchPatch, BatchRecord, CommittedCursor};
+use crate::models::{BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset};
 use crate::store::StateStore;
 use async_trait::async_trait;
 use std::future::Future;
@@ -132,6 +132,15 @@ impl StateStore for DeadlineStore {
             "committed_cursors",
             self.scan,
             self.inner.committed_cursors(source_type),
+        )
+        .await
+    }
+
+    async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
+        self.within(
+            "committed_kafka_offsets",
+            self.scan,
+            self.inner.committed_kafka_offsets(),
         )
         .await
     }
@@ -273,6 +282,9 @@ mod tests {
         ) -> Result<Vec<CommittedCursor>, VtopError> {
             never!()
         }
+        async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError> {
+            never!()
+        }
         async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
             never!()
         }
@@ -342,6 +354,10 @@ mod tests {
         expired(
             store.max_committed_end_bytes(SourceType::File).await,
             "max_committed_end_bytes",
+        );
+        expired(
+            store.committed_kafka_offsets().await,
+            "committed_kafka_offsets",
         );
         expired(store.list_batches().await, "list_batches");
         expired(

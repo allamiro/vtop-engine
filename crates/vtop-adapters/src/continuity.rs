@@ -19,6 +19,12 @@
 //!   length both agree with the old file. Its first bytes do not: a read
 //!   fingerprints the file's first page ([`ContentFingerprint`]) and the next
 //!   read checks it.
+//! - **A rewrite that keeps the first page** (#620). A fixed header longer
+//!   than a page, a file restored from a copy, or a reused inode whose new
+//!   file starts like the old one agrees with the first-page fingerprint
+//!   too. The bytes just below the read position do not: a read also
+//!   fingerprints the page that ENDS where it stopped ([`Tail`]), and the
+//!   next read checks the file still holds it there.
 //!
 //! In every case the right move for the NEW content is to read it from byte
 //! zero. What this module decides is only whether a discontinuity happened;
@@ -44,6 +50,10 @@ pub enum Discontinuity {
     /// The same inode, no shorter, but its first `len` bytes are not the ones
     /// the cursor last read (#578).
     Replaced { len: u64 },
+    /// The same inode, no shorter, the same first bytes, but the `len` bytes
+    /// that end at byte `end` are not the ones the cursor last read there
+    /// (#620): rewritten in place, or a reused inode with the same first page.
+    Rewritten { end: u64, len: u64 },
 }
 
 impl std::fmt::Display for Discontinuity {
@@ -67,6 +77,11 @@ impl std::fmt::Display for Discontinuity {
                 "file content replaced at the same inode (its first {len} bytes changed); \
                  the new file is read from byte 0"
             ),
+            Discontinuity::Rewritten { end, len } => write!(
+                f,
+                "file content rewritten at the same inode (the {len} bytes before byte {end} \
+                 changed, though its first page did not); the new file is read from byte 0"
+            ),
         }
     }
 }
@@ -76,11 +91,31 @@ impl std::fmt::Display for Discontinuity {
 /// evidence in its own right, independent of how far the cursor has read.
 /// Nor does it change its first bytes, so `content` - the fingerprint the
 /// last read took, `None` when it knows none - is evidence too (#578).
+///
+/// `tail` is the same evidence for the bytes BELOW the read position (#620):
+/// an append never changes them either.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observed {
     pub inode: Option<u64>,
     pub size: u64,
     pub content: Option<ContentFingerprint>,
+    pub tail: Option<Tail>,
+}
+
+/// The fingerprint of the bytes that end at `end` (#620): what a read saw
+/// just below the position it stopped at. The bytes it covers are
+/// `end - fingerprint.len .. end`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tail {
+    pub end: u64,
+    pub fingerprint: ContentFingerprint,
+}
+
+impl Tail {
+    /// The tail a marker ending at `end` records, if it records one.
+    pub fn at(end: u64, fingerprint: Option<ContentFingerprint>) -> Option<Self> {
+        fingerprint.map(|fingerprint| Self { end, fingerprint })
+    }
 }
 
 /// Decide whether `read_byte` can still be applied to the file now at the
@@ -107,6 +142,9 @@ pub struct Observed {
 /// fingerprint the cursor last took. A cursor with none (a legacy seed, a
 /// file that was empty) cannot prove a replacement this way, exactly as an
 /// unknown inode cannot prove a rotation.
+///
+/// Nor does the first page see a rewrite that keeps it (#620): that is
+/// [`check_tail`], made only when this finds nothing.
 pub fn check(
     last_seen: Option<&Observed>,
     current_inode: Option<u64>,
@@ -140,6 +178,61 @@ pub fn check(
     None
 }
 
+/// The test [`check`] cannot make (#620): a rewrite that kept the first page.
+/// `current_tail` is what the file now holds where the cursor's [`Tail`] was
+/// taken, read through the descriptor the next read uses
+/// ([`read_ending_at`]); a file too short to hold it yields fewer bytes,
+/// which never match. A cursor with no tail (a legacy seed, a read that
+/// ended at byte 0) proves nothing this way.
+///
+/// Separate from [`check`] so the tail is read only once the other tests have
+/// passed: reading it can fail, and a failure must not take a rotation,
+/// truncation or replacement those tests had already found with it (review
+/// of #632).
+pub fn check_tail(last_seen: Option<&Observed>, current_tail: &[u8]) -> Option<Discontinuity> {
+    if let Some(tail) = last_seen.and_then(|seen| seen.tail.as_ref()) {
+        if !tail.fingerprint.matches_bytes(current_tail) {
+            return Some(Discontinuity::Rewritten {
+                end: tail.end,
+                len: tail.fingerprint.len,
+            });
+        }
+    }
+    None
+}
+
+/// Whether a commit's range still ends in the bytes it read (#620): the file
+/// now at the path holds, below the range's `end_byte`, the bytes its
+/// marker fingerprinted there. `current_tail` is what the file holds there
+/// now ([`probe_with_tail`]); a marker with no tail (a legacy row, a range
+/// ending at byte 0) is judged by the other tests alone.
+pub fn tail_is_current(marker_tail: Option<&ContentFingerprint>, current_tail: &[u8]) -> bool {
+    marker_tail.is_none_or(|tail| tail.matches_bytes(current_tail))
+}
+
+/// Up to `len` bytes of an open file that end at byte `end` - fewer when the
+/// file is shorter than `end`, so a fingerprint of `len` bytes cannot match
+/// them. Leaves the descriptor at an arbitrary position; the caller seeks
+/// before reading on.
+pub async fn read_ending_at(
+    file: &mut tokio::fs::File,
+    end: u64,
+    len: u64,
+) -> std::io::Result<Vec<u8>> {
+    let from = end.saturating_sub(len);
+    file.seek(std::io::SeekFrom::Start(from)).await?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(end - from)
+            .unwrap_or(0)
+            .min(ContentFingerprint::MAX_LEN),
+    );
+    (&mut *file)
+        .take(end - from)
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(bytes)
+}
+
 /// The first bytes of an open file, up to [`ContentFingerprint::MAX_LEN`]:
 /// what [`check`] compares and a marker fingerprints. Leaves the descriptor
 /// at an arbitrary position; the caller seeks before reading on.
@@ -157,13 +250,31 @@ pub async fn read_head(file: &mut tokio::fs::File) -> std::io::Result<Vec<u8>> {
 /// descriptor - for judging a commit or a rewind against it. `None` when it
 /// cannot be opened or read.
 pub fn probe(path: &std::path::Path) -> Option<(std::fs::Metadata, Vec<u8>)> {
-    let file = std::fs::File::open(path).ok()?;
+    probe_with_tail(path, None).map(|(metadata, head, _)| (metadata, head))
+}
+
+/// [`probe`], and - through the same descriptor - up to `len` bytes ending at
+/// `end` when `tail` is `Some((end, len))`: what a marker's tail fingerprint
+/// is checked against (#620). Empty when `tail` is `None`.
+pub fn probe_with_tail(
+    path: &std::path::Path,
+    tail: Option<(u64, u64)>,
+) -> Option<(std::fs::Metadata, Vec<u8>, Vec<u8>)> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
     let metadata = file.metadata().ok()?;
     let mut head = Vec::with_capacity(ContentFingerprint::MAX_LEN);
-    file.take(ContentFingerprint::MAX_LEN as u64)
+    (&mut file)
+        .take(ContentFingerprint::MAX_LEN as u64)
         .read_to_end(&mut head)
         .ok()?;
-    Some((metadata, head))
+    let mut bytes = Vec::new();
+    if let Some((end, len)) = tail {
+        let from = end.saturating_sub(len);
+        file.seek(SeekFrom::Start(from)).ok()?;
+        file.take(end - from).read_to_end(&mut bytes).ok()?;
+    }
+    Some((metadata, head, bytes))
 }
 
 /// Whether a commit for a range ending at `end_byte` still describes the file
@@ -210,7 +321,11 @@ pub fn commit_is_current(
 /// range handed out is remembered with the generation it was read in. A commit
 /// is settled against that record: a range from an older generation is stale
 /// however the file looks now. The record is in-process: after a restart there
-/// is none, and `commit_is_current` is the fallback.
+/// is none, and `commit_is_current` with `tail_is_current` is the fallback.
+/// That fallback judges content, not order: since #620 a range whose bytes
+/// below its end are no longer in the file is stale there too, so what the
+/// record alone still catches is a regrowth that repeats the old content in
+/// both the first page and the page below the range's end.
 #[derive(Debug, Clone, Default)]
 pub struct Generations {
     current: u64,
@@ -226,7 +341,7 @@ struct Issued {
 
 /// More than this many uncommitted ranges per file means the engine is not
 /// committing at all; the oldest records are dropped and their commits fall
-/// back to the length test.
+/// back to the identity, length and content tests (see [`Generations`]).
 const MAX_ISSUED: usize = 256;
 
 /// What a commit's range turned out to be.
@@ -313,6 +428,7 @@ mod tests {
             inode,
             size,
             content: None,
+            tail: None,
         })
     }
 
@@ -354,6 +470,7 @@ mod tests {
             inode: Some(7),
             size: head.len() as u64,
             content: ContentFingerprint::of(head),
+            tail: None,
         }
     }
 
@@ -405,6 +522,61 @@ mod tests {
             super::check(Some(&seen_with(b"")), Some(7), 5, b"abcd\n", 0),
             None
         );
+    }
+
+    /// #620: a file rewritten at the same inode with the same first page -
+    /// a fixed header over a page long - or a reused inode whose new file
+    /// starts like the old one. Inode, length and first page all agree with
+    /// the old file; the bytes below the read position do not.
+    #[test]
+    fn a_rewrite_that_keeps_the_first_page_is_told_by_the_bytes_below_the_cursor() {
+        let header = vec![b'#'; ContentFingerprint::MAX_LEN + 500];
+        let old = [&header[..], b"old line one\nold line two\n"].concat();
+        let new = [&header[..], b"NEW line one\nNEW line two\nNEW line three\n"].concat();
+        let end = old.len() as u64;
+        let tail = ContentFingerprint::of_tail(&old).unwrap();
+        let seen = Observed {
+            inode: Some(7),
+            size: end,
+            content: ContentFingerprint::of(&old),
+            tail: Tail::at(end, Some(tail.clone())),
+        };
+        let below = |file: &[u8]| -> Vec<u8> {
+            let end = (end as usize).min(file.len());
+            file[end.saturating_sub(tail.len as usize)..end].to_vec()
+        };
+        let judge = |file: &[u8]| {
+            super::check(
+                Some(&seen),
+                Some(7),
+                file.len() as u64,
+                &file[..ContentFingerprint::MAX_LEN],
+                end,
+            )
+            .or_else(|| check_tail(Some(&seen), &below(file)))
+        };
+        assert_eq!(
+            judge(&new),
+            Some(Discontinuity::Rewritten {
+                end,
+                len: ContentFingerprint::MAX_LEN as u64
+            })
+        );
+        // Appended to, the same file is a continuation.
+        let grown = [&old[..], b"old line three\n"].concat();
+        assert_eq!(judge(&grown), None);
+        // Without a tail it is judged as before #620: a continuation.
+        let legacy = Observed {
+            tail: None,
+            ..seen.clone()
+        };
+        assert_eq!(check_tail(Some(&legacy), b""), None);
+        // And a commit whose range ends at `end` is current for the same
+        // file only.
+        assert!(tail_is_current(Some(&tail), &below(&grown)));
+        assert!(!tail_is_current(Some(&tail), &below(&new)));
+        assert!(!tail_is_current(Some(&tail), b""), "unreadable");
+        assert!(tail_is_current(None, b""), "a legacy marker");
     }
 
     #[test]
