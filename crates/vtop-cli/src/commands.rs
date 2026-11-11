@@ -119,7 +119,8 @@ pub enum Command {
         #[arg(long, default_value_t = crate::scrub::DEFAULT_CONCURRENCY as u32,
               value_parser = clap::value_parser!(u32).range(1..=256))]
         concurrency: u32,
-        /// Start at most this many batches per second (fractions allowed).
+        /// Start at most this many batches per second (fractions allowed, down
+        /// to one a day).
         #[arg(long, value_parser = positive_rate)]
         max_objects_per_sec: Option<f64>,
         /// Read at most this many object bytes per second, by each object's
@@ -260,10 +261,14 @@ fn load(config: &Path) -> Result<(VtopConfig, StreamsConfig), VtopError> {
 }
 
 /// A rate that is a finite number above zero.
+/// An object rate: finite, and at least one a day (a slower rate's interval
+/// would exceed the pacer's one-day cap anyway, so it is refused here rather
+/// than silently raised).
 fn positive_rate(value: &str) -> Result<f64, String> {
+    const MIN: f64 = 1.0 / 86_400.0;
     match value.parse::<f64>() {
-        Ok(rate) if rate.is_finite() && rate > 0.0 => Ok(rate),
-        Ok(_) => Err("must be a number above zero".into()),
+        Ok(rate) if rate.is_finite() && rate >= MIN => Ok(rate),
+        Ok(_) => Err(format!("must be a number of at least {MIN} (one a day)")),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -634,11 +639,17 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             let digest_dir = digest_dir
                 .clone()
                 .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
+            let retention_days = cfg.engine.ledger_retention_days;
             // Read-only construction, as for audit-coverage: a scrub may run
             // beside a live engine.
             let engine = Engine::new(cfg, streams).await?;
             let ledger = engine.store.list_batches().await?;
             let (digested, digest_files) = crate::coverage::read_digests(&digest_dir)?;
+            let digest_warning =
+                crate::scrub::missing_digests_warning(retention_days, &digest_dir, digest_files);
+            if let Some(warning) = &digest_warning {
+                tracing::warn!("{warning}");
+            }
             let sources = crate::scrub::RowSources {
                 ledger_rows: ledger.len(),
                 digest_rows: digested.len(),
@@ -654,16 +665,30 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 sample: sample.map(to_usize),
                 seed: *seed,
             };
-            let mut report = crate::scrub::scrub(
-                engine.backend.as_ref(),
-                engine.manifest_mac_key(),
-                crate::scrub::committed_rows(ledger, digested),
-                &opts,
-            )
-            .await?;
+            // Read BEFORE the scrub, and only an absent file is a first run:
+            // the totals and last-success time carry forward from it, so a
+            // file that exists and cannot be read would otherwise be replaced
+            // with counters reset and a success time of "never" (review).
+            let previous = match metrics_file {
+                Some(path) => match std::fs::read_to_string(path) {
+                    Ok(text) => Some(text),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        return Err(VtopError::Other(format!(
+                            "metrics file {} cannot be read ({e}); the scrub's totals carry \
+                             forward from it",
+                            path.display()
+                        )))
+                    }
+                },
+                None => None,
+            };
+            let mut report = engine
+                .scrub(crate::scrub::committed_rows(ledger, digested), &opts)
+                .await?;
             report.sources = sources;
+            report.warnings.extend(digest_warning);
             if let Some(path) = metrics_file {
-                let previous = std::fs::read_to_string(path).ok();
                 crate::coverage::write_textfile(
                     path,
                     &report.prometheus_text(previous.as_deref(), chrono::Utc::now().timestamp()),
@@ -988,6 +1013,7 @@ mod tests {
             &["--max-objects-per-sec", "0"],
             &["--max-objects-per-sec", "-1"],
             &["--max-objects-per-sec", "NaN"],
+            &["--max-objects-per-sec", "1e-300"],
             &["--max-bytes-per-sec", "0"],
             &["--sample", "5", "--cursor-file", "c"],
             &["--sample", "5", "--limit", "5"],

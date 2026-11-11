@@ -98,14 +98,7 @@ impl Archive {
     }
 
     async fn scrub_rows(&self, rows: Vec<ScrubRow>, opts: &ScrubOptions) -> ScrubReport {
-        scrub::scrub(
-            self.engine.backend.as_ref(),
-            self.engine.manifest_mac_key(),
-            rows,
-            opts,
-        )
-        .await
-        .unwrap()
+        self.engine.scrub(rows, opts).await.unwrap()
     }
 
     /// Store `bytes` at `uri` as the CURRENT object, the way an overwrite or a
@@ -346,7 +339,6 @@ async fn a_manifest_with_a_bad_mac_is_reported_as_unauthenticated() {
     std::env::set_var(&env, "5a".repeat(32));
     let a = archive_with(2, Some(&env)).await;
     std::env::remove_var(&env);
-    assert!(a.engine.manifest_mac_key().is_some());
     assert!(a.scrub(&opts()).await.passed, "signed archive scrubs clean");
 
     let ledger = a.ledger().await;
@@ -663,6 +655,48 @@ async fn the_command_exits_non_zero_on_findings_and_writes_metrics() {
         metric_value(&text, "vtop_scrub_last_success_timestamp_seconds"),
         success,
         "a failed run keeps the last success where it was: {text}"
+    );
+}
+
+/// A metrics file that exists and cannot be read is an error, not a first
+/// run (review of #652): read as absent, it was overwritten with the totals
+/// reset and the last success set to "never". Invalid UTF-8 cannot be read as
+/// text even by root, where a permission bit would not stop the test.
+#[tokio::test]
+async fn an_unreadable_metrics_file_fails_the_run_and_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let inputs = vec![write_input(dir.path(), "a.log", 3)];
+    let mut cfg = config(dir.path(), &inputs, "localfs");
+    cfg.upload.local_path = Some(dir.path().join("store").to_string_lossy().into_owned());
+    let config_path = dir.path().join("config.yaml");
+    std::fs::write(&config_path, serde_yaml::to_string(&cfg).unwrap()).unwrap();
+    {
+        let mut engine = Engine::new(cfg.clone(), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        assert!(engine.process_once(SourceType::File).await.unwrap()[0].committed);
+    }
+    let metrics = dir.path().join("scrub.prom");
+    let garbage = vec![0xff, 0xfe, 0x00, 0x80];
+    std::fs::write(&metrics, &garbage).unwrap();
+    let cli = vtop_cli::commands::Cli::try_parse_from([
+        "vtopctl",
+        "scrub",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--metrics-file",
+        metrics.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(
+        vtop_cli::commands::dispatch(cli).await,
+        1,
+        "an intact archive, but the metrics file cannot be carried forward"
+    );
+    assert_eq!(
+        std::fs::read(&metrics).unwrap(),
+        garbage,
+        "the file the totals live in is not replaced"
     );
 }
 

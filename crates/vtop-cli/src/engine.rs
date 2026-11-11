@@ -1622,8 +1622,33 @@ impl Engine {
 
     /// Key used by read-only manifest verification, if authentication is
     /// required by this process's configuration.
-    pub fn manifest_mac_key(&self) -> Option<&ManifestMacKey> {
+    pub(crate) fn manifest_mac_key(&self) -> Option<&ManifestMacKey> {
         self.manifest_mac_key.as_ref()
+    }
+
+    /// Scrub committed `rows` against this engine's store, authenticating
+    /// manifests with its key (#628). The key stays inside the engine: a
+    /// caller gets the report, never the secret it could forge manifests
+    /// with. The guard below fails to compile if the key accessor is ever
+    /// made public again (review of #652):
+    ///
+    /// ```compile_fail
+    /// fn leak(engine: &vtop_cli::Engine) {
+    ///     let _ = engine.manifest_mac_key();
+    /// }
+    /// ```
+    pub async fn scrub(
+        &self,
+        rows: Vec<crate::scrub::ScrubRow>,
+        opts: &crate::scrub::ScrubOptions,
+    ) -> Result<crate::scrub::ScrubReport, VtopError> {
+        crate::scrub::scrub(
+            self.backend.as_ref(),
+            self.manifest_mac_key.as_ref(),
+            rows,
+            opts,
+        )
+        .await
     }
 
     /// Enumerate all sources across all enabled adapters.

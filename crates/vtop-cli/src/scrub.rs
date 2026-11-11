@@ -428,6 +428,16 @@ impl Default for ScrubOptions {
     }
 }
 
+/// The longest one object's slot can be. `Duration::from_secs_f64` panics on
+/// an interval it cannot hold (a rate of 1e-300 objects/s, or a huge recorded
+/// size at 1 B/s), and `Instant + Duration` panics past the clock's range
+/// (review); a day is past any rate the command accepts.
+pub const MAX_SLOT: Duration = Duration::from_secs(86_400);
+
+fn slot(seconds: f64) -> Duration {
+    Duration::try_from_secs_f64(seconds).map_or(MAX_SLOT, |d| d.min(MAX_SLOT))
+}
+
 /// Spaces object starts so neither rate is exceeded on average: each start
 /// reserves a slot as long as the slower of the two rates says one object of
 /// its size takes, after the previous slot. No burst allowance: a scrub has no
@@ -443,7 +453,7 @@ impl Pacer {
         Self {
             per_object: max_objects_per_sec
                 .filter(|rate| rate.is_finite() && *rate > 0.0)
-                .map(|rate| Duration::from_secs_f64(1.0 / rate)),
+                .map(|rate| slot(1.0 / rate)),
             bytes_per_sec: max_bytes_per_sec.filter(|rate| *rate > 0),
             next: Mutex::new(None),
         }
@@ -454,7 +464,7 @@ impl Pacer {
     pub fn reserve(&self, now: Instant, bytes: u64) -> Instant {
         let by_bytes = self
             .bytes_per_sec
-            .map(|rate| Duration::from_secs_f64(bytes as f64 / rate as f64));
+            .map(|rate| slot(bytes as f64 / rate as f64));
         let cost = self.per_object.max(by_bytes).unwrap_or_default();
         let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let start = next.map_or(now, |at| at.max(now));
@@ -615,6 +625,9 @@ pub struct ScrubReport {
     /// Whether every committed batch has now been checked: a run over all of
     /// them, or the cursor run that finished a pass.
     pub pass_complete: bool,
+    /// Conditions that do not fail the run but limit what it proves, such as
+    /// ledger retention configured with no prune digests found.
+    pub warnings: Vec<String>,
     pub passed: bool,
     /// The batches checked, in order. Not exported: a full scrub of a large
     /// archive would print every id it read.
@@ -778,8 +791,31 @@ pub async fn scrub(
         cursor: progress,
         sample_seed,
         pass_complete,
+        warnings: Vec::new(),
         passed,
         checked_ids,
+    })
+}
+
+/// The warning for a run that cannot see pruned history: ledger retention is
+/// on (`engine.ledger_retention_days`), so rows have been or will be pruned,
+/// and the digest directory holds no digests. Those batches are known only
+/// from the digests, so without them the scrub passes over them without
+/// saying so (review of #652). A warning, not a failure: before the first
+/// prune there is nothing to find. A deployment pruning only with
+/// `vtopctl prune-ledger` sets no retention, and gets no warning.
+pub fn missing_digests_warning(
+    ledger_retention_days: Option<u32>,
+    digest_dir: &Path,
+    digest_files: usize,
+) -> Option<String> {
+    (ledger_retention_days.is_some() && digest_files == 0).then(|| {
+        format!(
+            "engine.ledger_retention_days is set but {} holds no prune digests: batches \
+             pruned from the ledger are not checked; pass --digest-dir where prune-ledger \
+             writes them",
+            digest_dir.display()
+        )
     })
 }
 
@@ -795,6 +831,9 @@ impl ScrubReport {
             self.sources.digest_files,
             self.mode
         )];
+        for warning in &self.warnings {
+            out.push(format!("WARN {warning}"));
+        }
         if let Some(seed) = self.sample_seed {
             out.push(format!(
                 "sample seed {seed} (pass --seed {seed} to repeat it)"
@@ -969,6 +1008,19 @@ mod tests {
         assert_eq!(by_bytes.reserve(later, 0), later);
     }
 
+    /// An interval too long for a `Duration` used to panic before the first
+    /// check (review); it is held to `MAX_SLOT` instead.
+    #[test]
+    fn an_absurd_rate_is_clamped_not_a_panic() {
+        let t0 = Instant::now();
+        let tiny = Pacer::new(Some(1e-300), None);
+        assert_eq!(tiny.reserve(t0, 0), t0);
+        assert_eq!(tiny.reserve(t0, 0), t0 + MAX_SLOT);
+        let huge = Pacer::new(None, Some(1));
+        assert_eq!(huge.reserve(t0, u64::MAX), t0);
+        assert_eq!(huge.reserve(t0, 0), t0 + MAX_SLOT);
+    }
+
     #[test]
     fn an_unbounded_pacer_never_waits() {
         let pacer = Pacer::new(None, None);
@@ -1028,6 +1080,7 @@ mod tests {
             cursor: None,
             sample_seed: None,
             pass_complete,
+            warnings: Vec::new(),
             passed: findings == 0,
             checked_ids: Vec::new(),
         }
@@ -1069,6 +1122,34 @@ mod tests {
             never.contains("vtop_scrub_last_success_timestamp_seconds 0\n"),
             "{never}"
         );
+    }
+
+    /// With ledger retention on, pruned rows are known only from the digests;
+    /// a scrub that found none would pass over them without saying so
+    /// (review of #652). It warns, and the warning is in the report.
+    #[test]
+    fn retention_without_digests_is_warned_about() {
+        let dir = Path::new("/var/lib/vtop/ledger-digests");
+        let warning = missing_digests_warning(Some(30), dir, 0).expect("warned");
+        assert!(
+            warning.contains("/var/lib/vtop/ledger-digests"),
+            "{warning}"
+        );
+        assert!(warning.contains("--digest-dir"), "{warning}");
+        assert!(
+            missing_digests_warning(Some(30), dir, 2).is_none(),
+            "digests found"
+        );
+        assert!(
+            missing_digests_warning(None, dir, 0).is_none(),
+            "no retention configured: nothing is known to be pruned"
+        );
+
+        let mut with = report(&[], 0, true);
+        with.warnings.push(warning.clone());
+        assert!(with.lines().iter().any(|line| line.contains(&warning)));
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["warnings"][0], warning.as_str());
     }
 
     #[test]

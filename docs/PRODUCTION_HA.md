@@ -611,9 +611,12 @@ a deleted pinned version fails closed, never falls back), verify its self-hash
 and, when `manifest_mac_key_env` is set, its MAC, bind it to the ledger row
 (batch id, URIs, the manifest digest and the object's size and digest the
 ledger recorded), then have the backend verify the object's stored content
-against the manifest's digest. Then it reads the manifest's current key and
-requires it to hold the pinned version, because a reader fetching the archive
-by key reads that. Each batch gets one result:
+against the manifest's digest. Then, on a row that pinned a version, it reads
+the manifest's current key and requires it to hold the same bytes as the pinned
+version, because a reader fetching the archive by key reads that. This is a byte
+comparison, not a version-id check: an identical re-upload under a new version
+id passes, and any other content at the current key does not. Each batch gets
+one result:
 
 | Result | Meaning | Finding |
 |---|---|---|
@@ -636,20 +639,28 @@ finding).
 
 **Bounds.** Each batch costs a manifest GET, the object read the backend's
 `verify_object` does (native S3 over SHA-256 uses the service-computed checksum
-when the store kept one, and otherwise reads the body back), and a second
-manifest GET for the current key. To run it beside a live engine against a
-large archive without saturating the store:
+when the store kept one, and otherwise reads the body back), and, on a row that
+pinned a manifest version, a second manifest GET for the current key (a row
+without a pinned version reads the current key once, as its only manifest
+GET). To run it beside a live engine against a large archive without
+saturating the store:
 - `--concurrency N` (default 4) batches at once;
-- `--max-objects-per-sec R` (fractions allowed) and `--max-bytes-per-sec B`
-  (by each object's recorded size) space the starts, whichever is slower;
+- `--max-objects-per-sec R` (fractions allowed, down to one a day) and
+  `--max-bytes-per-sec B` (by each object's recorded size) space the starts,
+  whichever is slower;
 - `--cursor-file F` with `--limit N`: each run resumes after the batch the file
-  names, checks the next N in batch-id order (which is archive order: a batch
-  id starts with its UTC timestamp), and records each as it completes, so a run
-  killed part-way resumes after the last batch it finished. The run that
-  reaches the end completes the pass; the next run starts again from the first
-  batch. A finding does not hold the cursor: the run that found it reports it,
-  and the next pass checks it again. A lock beside the file refuses a second
-  scrub on the same cursor (a cron run overlapping the previous one);
+  names and checks the next N in batch-id order (which is archive order: a
+  batch id starts with its UTC timestamp). Results are taken in that order, and
+  the cursor moves past each batch as its result is taken. With
+  `--concurrency` above 1, a batch that finishes ahead of an earlier one is
+  recorded only once the earlier one is, so a run killed part-way never skips a
+  batch but may check again up to concurrency - 1 batches it had already
+  finished. The run that reaches the end completes the pass; the next run
+  starts again from the first batch. A finding does not hold the cursor: the
+  run that found it reports it, and the next pass checks it again, which is
+  why the example alert counts findings over a pass window rather than reading
+  the latest run alone. A lock beside the file refuses a second scrub on the
+  same cursor (a cron run overlapping the previous one);
 - or `--sample N [--seed S]`: N batches chosen at random; the seed is printed,
   and the same seed picks the same batches.
 
@@ -665,19 +676,37 @@ an identity that can read the state store and the bucket (and nothing more):
 size `--limit` so that hourly runs cover the archive within the pass window,
 e.g. 1,000,000 committed batches once a week is about 6,000 per hourly run.
 
+crontab ends a command at the newline (a trailing `\` does not continue it), so
+keep the options in a script and schedule the script on one line:
+
 ```bash
-# cron: hourly, a slice at a time; a full pass about once a week.
-0 * * * *  vtopctl scrub --config /etc/vtop/config.yaml \
-             --cursor-file /var/lib/vtop/scrub.cursor --limit 6000 \
-             --concurrency 4 --max-bytes-per-sec 20000000 \
-             --metrics-file /var/lib/node_exporter/textfile/vtop_scrub.prom --json \
-             > /var/log/vtop/scrub.json
+#!/bin/sh
+# /usr/local/bin/vtop-scrub: a slice of the archive per run; a full pass about once a week.
+exec vtopctl scrub --config /etc/vtop/config.yaml \
+  --digest-dir /var/lib/vtop/ledger-digests \
+  --cursor-file /var/lib/vtop/scrub.cursor --limit 6000 \
+  --concurrency 4 --max-bytes-per-sec 20000000 \
+  --metrics-file /var/lib/node_exporter/textfile/vtop_scrub.prom --json \
+  > /var/log/vtop/scrub.json
+```
+
+```text
+0 * * * * /usr/local/bin/vtop-scrub
 ```
 
 As a Kubernetes CronJob, give the cursor and the metrics file a persistent
 volume (the counters carry forward from the file each run replaces), set
 `concurrencyPolicy: Forbid`, and mount the config, the bucket credentials and
-the digest directory. With PostgreSQL the job connects like any other client;
+the prune-digest directory, passing it as `--digest-dir`: without the digests a
+scrub checks only the rows still in the ledger and passes over the pruned ones.
+It warns (a WARN log line, and `warnings` in the JSON) when
+`engine.ledger_retention_days` is set and the directory holds no digests, but
+a deployment that prunes only with `vtopctl prune-ledger` sets no retention,
+so there it cannot tell. Run `vtopctl` directly (`command: [vtopctl]`), not through
+the image's entrypoint: `docker/entrypoint.sh` prepends `--config` from
+`VTOP_CONFIG` itself, so a second `--config` in the arguments is refused, and it
+exits unless `/data/work` and `/data/state` are writable, which a read-only
+scrub has no use for. With PostgreSQL the job connects like any other client;
 with SQLite the database file lives on the engine's volume, so run the scrub
 where that volume is mounted (a sidecar running the same schedule, or
 `kubectl exec`). The node exporter's textfile collector is node-local; from a
@@ -703,7 +732,11 @@ spec:
           containers:
             - name: scrub
               image: <the engine image>
+              # vtopctl itself, not the entrypoint (which adds its own --config
+              # and requires writable /data/work and /data/state).
+              command: [vtopctl]
               args: [scrub, --config, /etc/vtop/config.yaml,
+                     --digest-dir, /var/lib/vtop/ledger-digests,
                      --cursor-file, /var/lib/vtop-scrub/scrub.cursor, --limit, "6000",
                      --concurrency, "4", --max-bytes-per-sec, "20000000",
                      --metrics-file, /var/lib/vtop-scrub/vtop_scrub.prom, --json]
@@ -711,10 +744,13 @@ spec:
                 - secretRef: {name: vtop-object-store}   # read access to the bucket
               volumeMounts:
                 - {name: config, mountPath: /etc/vtop, readOnly: true}
+                - {name: ledger-digests, mountPath: /var/lib/vtop/ledger-digests, readOnly: true}
                 - {name: scrub-state, mountPath: /var/lib/vtop-scrub}
           volumes:
             - name: config
               configMap: {name: vtop-engine}
+            - name: ledger-digests   # where prune-ledger writes them (§6.6)
+              persistentVolumeClaim: {claimName: vtop-ledger-digests, readOnly: true}
             - name: scrub-state
               persistentVolumeClaim: {claimName: vtop-scrub}
 ```
