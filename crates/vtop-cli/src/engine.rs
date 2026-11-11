@@ -32,7 +32,7 @@ use vtop_core::partitioning::{self, PartitionContext};
 use vtop_core::replay::{next_recovery_action, RecoveryAction};
 use vtop_core::state_machine::BatchState;
 use vtop_core::telemetry;
-use vtop_core::types::{ChecksumAlgorithm, ContentFingerprint, ProgressMarker, SourceType};
+use vtop_core::types::{ContentFingerprint, ProgressMarker, SourceType};
 use vtop_core::work_dir::cleanup_work_dir;
 use vtop_state::{connect_state_store_with_deadline, BatchPatch, BatchRecord, StateStore};
 use vtop_upload::multipart::{self, MultipartFence, MultipartUploadConfig};
@@ -1622,7 +1622,7 @@ impl Engine {
 
     /// Key used by read-only manifest verification, if authentication is
     /// required by this process's configuration.
-    pub(crate) fn manifest_mac_key(&self) -> Option<&ManifestMacKey> {
+    pub fn manifest_mac_key(&self) -> Option<&ManifestMacKey> {
         self.manifest_mac_key.as_ref()
     }
 
@@ -2122,127 +2122,27 @@ impl Engine {
     /// stored object content using the manifest's algorithm. HEAD metadata and
     /// uploader-written sidecars are never sufficient for a strong result.
     async fn storage_still_verified(&self, rec: &BatchRecord) -> bool {
-        let Some(uri) = rec.object_uri.as_deref() else {
-            // A VERIFIED row without an object URI is corrupt bookkeeping;
-            // never commit source progress on it.
-            return false;
-        };
-        let Some(muri) = rec.manifest_uri.as_deref() else {
-            // VERIFIED covers both the object and its manifest. A row that
-            // cannot identify the manifest cannot safely advance its source.
-            return false;
-        };
-        // A recorded version pins recovery to the immutable manifest this
-        // batch actually verified (#135). Overwriting the current key cannot
-        // roll the batch back to an older validly-authenticated manifest, and
-        // deleting the pinned version fails closed here rather than falling
-        // back to whatever replaced it.
-        let read = match rec.manifest_version_id.as_deref() {
-            Some(version) => {
-                self.backend
-                    .get_manifest_pinned(muri, version, MAX_MANIFEST_BYTES)
-                    .await
-            }
-            None => {
-                self.backend
-                    .get_object_bounded(muri, MAX_MANIFEST_BYTES)
-                    .await
-            }
-        };
-        let bytes = match read {
-            Ok(bytes) => bytes,
-            Err(e) => {
+        // The check itself is shared with `vtopctl scrub` (#628), which runs
+        // it on committed rows, so the two cannot drift apart.
+        let check = crate::scrub::check_stored_batch(
+            self.backend.as_ref(),
+            self.manifest_mac_key.as_ref(),
+            rec,
+        )
+        .await;
+        match check.result {
+            crate::scrub::ScrubResult::Ok => true,
+            crate::scrub::ScrubResult::Limited => !self.config.upload.require_strong_verification,
+            result => {
                 tracing::warn!(
-                    muri,
-                    version_id = rec.manifest_version_id.as_deref().unwrap_or("<current>"),
-                    error = %e,
-                    "recovery re-check: manifest download failed"
+                    batch_id = %rec.batch_id,
+                    result = result.as_str(),
+                    detail = %check.detail,
+                    "recovery re-check: the stored batch does not check out"
                 );
-                return false;
+                false
             }
-        };
-        let manifest: VtopManifest = match serde_json::from_slice(&bytes) {
-            Ok(manifest) => manifest,
-            Err(e) => {
-                tracing::warn!(muri, error = %e, "recovery re-check: manifest parse failed");
-                return false;
-            }
-        };
-
-        let ledger_manifest_hash_matches = rec.manifest_sha256.as_deref().is_some_and(|want| {
-            !want.is_empty() && want.eq_ignore_ascii_case(&manifest.manifest.sha256)
-        });
-        if manifest
-            .verify_authentication(self.manifest_mac_key.as_ref())
-            .is_err()
-            || manifest.batch_id != rec.batch_id
-            || manifest.manifest.uri != muri
-            || manifest.object.uri != uri
-            || !ledger_manifest_hash_matches
-        {
-            tracing::warn!(
-                muri,
-                batch_id = %rec.batch_id,
-                "recovery re-check: manifest authentication or ledger binding failed"
-            );
-            return false;
         }
-
-        // Bind the manifest back to the durable ledger before trusting it as
-        // recovery input. The column retains its historical object_sha256 name
-        // but may contain a BLAKE3 digest.
-        if rec
-            .object_size_bytes
-            .is_some_and(|want| want < 0 || want as u64 != manifest.object.size_bytes)
-            || rec.object_sha256.as_deref().is_some_and(|want| {
-                !want.is_empty() && !want.eq_ignore_ascii_case(&manifest.object.checksum)
-            })
-        {
-            tracing::warn!(
-                batch_id = %rec.batch_id,
-                "recovery re-check: manifest and ledger object metadata disagree"
-            );
-            return false;
-        }
-
-        let algo = match manifest
-            .object
-            .checksum_algorithm
-            .parse::<ChecksumAlgorithm>()
-        {
-            Ok(algo) => algo,
-            Err(e) => {
-                tracing::warn!(batch_id = %rec.batch_id, error = %e, "recovery re-check: unsupported checksum");
-                return false;
-            }
-        };
-        let expected = if algo.is_enabled() {
-            if manifest.object.checksum.is_empty() {
-                return false;
-            }
-            Some(ObjectChecksum::new(
-                algo.as_str(),
-                &manifest.object.checksum,
-            ))
-        } else {
-            None
-        };
-        let result = match self
-            .backend
-            .verify_object(uri, manifest.object.size_bytes, expected)
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::warn!(uri, error = %e, "recovery re-check: content verification failed");
-                return false;
-            }
-        };
-        if !result.passed {
-            tracing::warn!(uri, reason = %result.message, "recovery re-check: stored content mismatch");
-            return false;
-        }
-        !result.backend_limited || !self.config.upload.require_strong_verification
     }
 
     /// Recovery scan run at startup. Seeds adapters from committed batches and

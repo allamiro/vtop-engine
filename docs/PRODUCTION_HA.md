@@ -496,7 +496,7 @@ ranges tile:
 present, and an object must be of the size the ledger recorded (a manifest has
 no recorded size). A committed row that names no object or manifest, and an
 object whose size the store does not report, are findings. Content is
-`verify-manifest`'s job. `--metrics-file`
+`vtopctl scrub`'s job (§7.5), or `verify-manifest`'s for one manifest. `--metrics-file`
 writes the result as a Prometheus text file, with counts by source type and
 never by path, for a node exporter's textfile collector. The command exits
 non-zero on lost data, so it can gate a cron job. Below a unit's first
@@ -592,6 +592,132 @@ the archive layer** and the delivery guarantee may be described that way.
 ### 7.4 ETag caveat (repeat)
 Never treat an S3 ETag as the integrity checksum (multipart ETags aren't MD5). The
 manifest SHA-256/BLAKE3 is the source of truth.
+
+### 7.5 Re-verifying committed objects: `vtopctl scrub` **[IMPLEMENTED, #628]**
+Verification gates the commit; after the commit nothing used to read the object
+again. An object overwritten with same-size bytes, deleted by a lifecycle rule
+or a bucket-policy mistake, or corrupted by the store, and a manifest rewritten
+in place, went unnoticed until someone fetched the data, by when the source has
+usually aged out and the batch cannot be archived again.
+`audit-coverage --check-storage` HEADs each object, which sees presence and
+size only; recovery's storage re-check reads content, but only for VERIFIED
+rows not yet committed, at startup.
+
+`vtopctl scrub --config ...` walks the committed rows of the ledger and of the
+prune digests (§6.6; `--digest-dir` as for `audit-coverage`). For each batch it
+runs recovery's own check (the same function): download the manifest at its
+pinned `manifest_version_id` (the current key only on a row that pinned none;
+a deleted pinned version fails closed, never falls back), verify its self-hash
+and, when `manifest_mac_key_env` is set, its MAC, bind it to the ledger row
+(batch id, URIs, the manifest digest and the object's size and digest the
+ledger recorded), then have the backend verify the object's stored content
+against the manifest's digest. Then it reads the manifest's current key and
+requires it to hold the pinned version, because a reader fetching the archive
+by key reads that. Each batch gets one result:
+
+| Result | Meaning | Finding |
+|---|---|---|
+| `ok` | content matches the authenticated manifest, which matches the ledger | no |
+| `limited` | present at its size; archived with checksums disabled, so content cannot be compared | no |
+| `missing` | the object, the pinned manifest version or the manifest's current key is gone | yes |
+| `mismatched` | something is stored, and it is not what was committed (object content or size, the manifest's current key, the ledger's record of the object) | yes |
+| `unauthenticated` | the manifest does not parse, fails its self-hash or MAC, or does not bind to the ledger row | yes |
+| `unreadable` | the store answered with an error other than absence (timeout, throttle, permission); nothing was proven | yes |
+
+It exits non-zero on any finding; `--json` prints the report (each finding with
+its batch id, URIs, version and whether its row came from the ledger or a
+digest), and `--metrics-file` writes the counts as a Prometheus text file
+([observability README](../observability/README.md#archive-scrub) has the
+metrics and an example alert rule set). It repairs nothing: a finding can only
+alert, and the remedy is a restore from a replica or backup, or recording the
+loss. An S3 backend reports absence as `http 404`; a command backend's words
+for it may not be recognised, which turns `missing` into `unreadable` (still a
+finding).
+
+**Bounds.** Each batch costs a manifest GET, the object read the backend's
+`verify_object` does (native S3 over SHA-256 uses the service-computed checksum
+when the store kept one, and otherwise reads the body back), and a second
+manifest GET for the current key. To run it beside a live engine against a
+large archive without saturating the store:
+- `--concurrency N` (default 4) batches at once;
+- `--max-objects-per-sec R` (fractions allowed) and `--max-bytes-per-sec B`
+  (by each object's recorded size) space the starts, whichever is slower;
+- `--cursor-file F` with `--limit N`: each run resumes after the batch the file
+  names, checks the next N in batch-id order (which is archive order: a batch
+  id starts with its UTC timestamp), and records each as it completes, so a run
+  killed part-way resumes after the last batch it finished. The run that
+  reaches the end completes the pass; the next run starts again from the first
+  batch. A finding does not hold the cursor: the run that found it reports it,
+  and the next pass checks it again. A lock beside the file refuses a second
+  scrub on the same cursor (a cron run overlapping the previous one);
+- or `--sample N [--seed S]`: N batches chosen at random; the seed is printed,
+  and the same seed picks the same batches.
+
+Scrub reads are ingress to the scrub's host. The operator egress ceiling of
+#481 is not merged; when it is, it bounds uploads, which the scrub never does.
+
+**Schedule.** There is no periodic mode inside the engine: its loop is single
+threaded, housekeeping such as the ledger prune runs on idle cycles, and one
+slice of full-object reads would stall archiving for as long as it takes.
+Listing the committed rows also reads the whole ledger, which a separate
+process can afford once per run. Run the command on a schedule instead, under
+an identity that can read the state store and the bucket (and nothing more):
+size `--limit` so that hourly runs cover the archive within the pass window,
+e.g. 1,000,000 committed batches once a week is about 6,000 per hourly run.
+
+```bash
+# cron: hourly, a slice at a time; a full pass about once a week.
+0 * * * *  vtopctl scrub --config /etc/vtop/config.yaml \
+             --cursor-file /var/lib/vtop/scrub.cursor --limit 6000 \
+             --concurrency 4 --max-bytes-per-sec 20000000 \
+             --metrics-file /var/lib/node_exporter/textfile/vtop_scrub.prom --json \
+             > /var/log/vtop/scrub.json
+```
+
+As a Kubernetes CronJob, give the cursor and the metrics file a persistent
+volume (the counters carry forward from the file each run replaces), set
+`concurrencyPolicy: Forbid`, and mount the config, the bucket credentials and
+the digest directory. With PostgreSQL the job connects like any other client;
+with SQLite the database file lives on the engine's volume, so run the scrub
+where that volume is mounted (a sidecar running the same schedule, or
+`kubectl exec`). The node exporter's textfile collector is node-local; from a
+CronJob, push the file to a Pushgateway instead
+(`curl --data-binary @vtop_scrub.prom http://pushgateway:9091/metrics/job/vtop_scrub`),
+or alert on the Job's own failure (`kube_job_status_failed`), which a finding
+causes.
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vtop-scrub
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: scrub
+              image: <the engine image>
+              args: [scrub, --config, /etc/vtop/config.yaml,
+                     --cursor-file, /var/lib/vtop-scrub/scrub.cursor, --limit, "6000",
+                     --concurrency, "4", --max-bytes-per-sec, "20000000",
+                     --metrics-file, /var/lib/vtop-scrub/vtop_scrub.prom, --json]
+              envFrom:
+                - secretRef: {name: vtop-object-store}   # read access to the bucket
+              volumeMounts:
+                - {name: config, mountPath: /etc/vtop, readOnly: true}
+                - {name: scrub-state, mountPath: /var/lib/vtop-scrub}
+          volumes:
+            - name: config
+              configMap: {name: vtop-engine}
+            - name: scrub-state
+              persistentVolumeClaim: {claimName: vtop-scrub}
+```
 
 ---
 
@@ -839,6 +965,10 @@ path needed by the distributed options is already implemented (§6.3).
   Grafana/Loki/Mimir/Tempo/Alloy compose stack
   (`docker-compose.observability.yml`) and generated dashboards for the
   pipeline, Kafka, and flow views.
+- **Archive scrub metrics** — `vtopctl scrub --metrics-file` (§7.5) writes
+  `vtop_scrub_objects_total{result}` and the last-success and last-pass times
+  as a textfile; the [observability README](../observability/README.md#archive-scrub)
+  has an example alert rule set.
 
 **Still needed for production [PROPOSED]:**
 - **Alerting rules** (Alertmanager): verification failures > 0; replay-rate
@@ -938,6 +1068,11 @@ Short procedures now; expand into a full ops runbook before go-live.
 - **Audit archive coverage:** run `vtopctl audit-coverage --config ...
   [--check-storage] [--metrics-file ...]` on a schedule (§6.6); a non-zero
   exit names the source units with lost ranges.
+- **Scrub the archive:** run `vtopctl scrub --config ... --cursor-file ...
+  --limit N [--metrics-file ...]` on a schedule (§7.5) so every committed
+  object is read back once per pass; a non-zero exit lists the batches whose
+  object or manifest is missing, mismatched, unauthenticated or unreadable.
+  It cannot repair them: restore from a replica or backup, or record the loss.
 - **Upgrade the metadata tier (#554):** roll the voters one at a time, and
   confirm each has CAUGHT UP before the next. The chart's `RollingUpdate`
   replaces one pod at a time, but it waits only for `/readyz`, which on a

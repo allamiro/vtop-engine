@@ -101,6 +101,54 @@ pub enum Command {
         #[arg(long)]
         metrics_file: Option<PathBuf>,
     },
+    /// Read committed objects back and verify them again (#628). For each
+    /// committed batch, in the ledger or in a prune digest: download the
+    /// manifest at its pinned version, check its self-hash and MAC and that
+    /// it binds to the ledger row, verify the object's stored content against
+    /// the manifest's digest, and check the manifest's current key still
+    /// holds the pinned version. Reports missing, mismatched, unauthenticated
+    /// and unreadable batches, and exits non-zero on any. Read-only; it can
+    /// run beside a live engine, bounded by the limits below.
+    Scrub {
+        #[arg(long)]
+        config: PathBuf,
+        /// Where prune digests are read from [default: as audit-coverage].
+        #[arg(long)]
+        digest_dir: Option<PathBuf>,
+        /// Batches checked at once.
+        #[arg(long, default_value_t = crate::scrub::DEFAULT_CONCURRENCY as u32,
+              value_parser = clap::value_parser!(u32).range(1..=256))]
+        concurrency: u32,
+        /// Start at most this many batches per second (fractions allowed).
+        #[arg(long, value_parser = positive_rate)]
+        max_objects_per_sec: Option<f64>,
+        /// Read at most this many object bytes per second, by each object's
+        /// recorded size.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        max_bytes_per_sec: Option<u64>,
+        /// Check at most this many batches this run.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        limit: Option<u64>,
+        /// Resume after the batch this file names, and record progress in it
+        /// as each batch completes. With --limit, successive runs walk the
+        /// archive a slice at a time; the run that reaches the end completes
+        /// the pass and the next one starts again from the beginning.
+        #[arg(long, conflicts_with = "sample")]
+        cursor_file: Option<PathBuf>,
+        /// Check this many batches chosen at random instead of walking in
+        /// order.
+        #[arg(long, conflicts_with = "limit",
+              value_parser = clap::value_parser!(u64).range(1..))]
+        sample: Option<u64>,
+        /// The sample's seed (random when not given; printed either way).
+        #[arg(long, requires = "sample")]
+        seed: Option<u64>,
+        /// Also write the results as a Prometheus text file (for a node
+        /// exporter's textfile collector). Totals carry forward from the file
+        /// it replaces.
+        #[arg(long)]
+        metrics_file: Option<PathBuf>,
+    },
     /// Incrementally delete old SOURCE_COMMITTED ledger rows (#128). The
     /// newest committed row per source path always survives, so recovery
     /// cursor seeding is unchanged; rows in any other state are untouched.
@@ -209,6 +257,15 @@ fn load(config: &Path) -> Result<(VtopConfig, StreamsConfig), VtopError> {
         StreamsConfig { streams: vec![] }
     };
     Ok((cfg, streams))
+}
+
+/// A rate that is a finite number above zero.
+fn positive_rate(value: &str) -> Result<f64, String> {
+    match value.parse::<f64>() {
+        Ok(rate) if rate.is_finite() && rate > 0.0 => Ok(rate),
+        Ok(_) => Err("must be a number above zero".into()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn print_receipts(file: &Path, json: bool) -> i32 {
@@ -557,6 +614,77 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 ))
             }
         }
+        Command::Scrub {
+            config,
+            digest_dir,
+            concurrency,
+            max_objects_per_sec,
+            max_bytes_per_sec,
+            limit,
+            cursor_file,
+            sample,
+            seed,
+            metrics_file,
+        } => {
+            let (cfg, streams) = load(config)?;
+            init_tracing(
+                cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
+                cli.json,
+            );
+            let digest_dir = digest_dir
+                .clone()
+                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
+            // Read-only construction, as for audit-coverage: a scrub may run
+            // beside a live engine.
+            let engine = Engine::new(cfg, streams).await?;
+            let ledger = engine.store.list_batches().await?;
+            let (digested, digest_files) = crate::coverage::read_digests(&digest_dir)?;
+            let sources = crate::scrub::RowSources {
+                ledger_rows: ledger.len(),
+                digest_rows: digested.len(),
+                digest_files,
+            };
+            let to_usize = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+            let opts = crate::scrub::ScrubOptions {
+                concurrency: *concurrency as usize,
+                max_objects_per_sec: *max_objects_per_sec,
+                max_bytes_per_sec: *max_bytes_per_sec,
+                limit: limit.map(to_usize),
+                cursor_file: cursor_file.clone(),
+                sample: sample.map(to_usize),
+                seed: *seed,
+            };
+            let mut report = crate::scrub::scrub(
+                engine.backend.as_ref(),
+                engine.manifest_mac_key(),
+                crate::scrub::committed_rows(ledger, digested),
+                &opts,
+            )
+            .await?;
+            report.sources = sources;
+            if let Some(path) = metrics_file {
+                let previous = std::fs::read_to_string(path).ok();
+                crate::coverage::write_textfile(
+                    path,
+                    &report.prometheus_text(previous.as_deref(), chrono::Utc::now().timestamp()),
+                )?;
+            }
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for line in report.lines() {
+                    println!("{line}");
+                }
+            }
+            if report.passed {
+                Ok(())
+            } else {
+                Err(VtopError::Other(format!(
+                    "scrub FAILED: {} finding(s) (see the report above)",
+                    report.findings.len()
+                )))
+            }
+        }
         Command::PruneLedger {
             config,
             digest_dir,
@@ -823,6 +951,49 @@ mod tests {
         match cli.command {
             Command::PruneLedger { limit, .. } => assert_eq!(limit, 500),
             other => panic!("parsed wrong command: {other:?}"),
+        }
+    }
+
+    /// The scrub's bounds are refused at parsing when they could not bound
+    /// anything (zero concurrency would never run a check; a zero or
+    /// negative rate never admits one), and a cursor walk and a random
+    /// sample are different runs, not one.
+    #[test]
+    fn scrub_rejects_bounds_that_bound_nothing_and_conflicting_modes() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["vtopctl", "scrub", "--config", "vtop.yaml"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        match parse(&[]).unwrap().command {
+            Command::Scrub {
+                concurrency,
+                limit,
+                cursor_file,
+                sample,
+                ..
+            } => {
+                assert_eq!(concurrency as usize, crate::scrub::DEFAULT_CONCURRENCY);
+                assert!(limit.is_none() && cursor_file.is_none() && sample.is_none());
+            }
+            other => panic!("parsed wrong command: {other:?}"),
+        }
+        assert!(parse(&["--cursor-file", "c", "--limit", "500"]).is_ok());
+        assert!(parse(&["--sample", "10", "--seed", "7"]).is_ok());
+        assert!(parse(&["--max-objects-per-sec", "0.5"]).is_ok());
+        for bad in [
+            &["--concurrency", "0"][..],
+            &["--limit", "0"],
+            &["--sample", "0"],
+            &["--max-objects-per-sec", "0"],
+            &["--max-objects-per-sec", "-1"],
+            &["--max-objects-per-sec", "NaN"],
+            &["--max-bytes-per-sec", "0"],
+            &["--sample", "5", "--cursor-file", "c"],
+            &["--sample", "5", "--limit", "5"],
+            &["--seed", "7"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} must be refused");
         }
     }
 

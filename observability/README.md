@@ -186,6 +186,75 @@ and a group that retention has already passed pages on the first rule, not the
 second. Groups that commit through the Kafka gateway (#457) are metadata
 cursors and appear here.
 
+### Archive scrub
+
+`vtopctl scrub` (#628) reads committed objects back and verifies them again:
+the manifest at its pinned version, its self-hash and MAC and its binding to
+the ledger row, then the object's stored content against the manifest's
+digest, then that the manifest's current key still holds the pinned version.
+It is a scheduled command, not part of the engine (see
+[`PRODUCTION_HA.md`](../docs/PRODUCTION_HA.md) §7.5), so its metrics are not on
+the engine's `/metrics`: `--metrics-file` writes them as a Prometheus text
+file for a node exporter's textfile collector, like `audit-coverage`'s. The
+lab has no textfile collector, so nothing here charts or alerts on them.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `vtop_scrub_objects_total{result}` | counter | Committed batches checked, by `result`: `ok`; `limited` (present at its size, archived with checksums disabled: counted, not a finding); `missing`, `mismatched`, `unauthenticated`, `unreadable` (findings). Every result is written, at zero when nothing had it. Carried forward from the file each run replaces, so it counts across runs. |
+| `vtop_scrub_last_run_findings` | gauge | Findings in the latest run. |
+| `vtop_scrub_last_run_timestamp_seconds` | gauge | When the latest run finished. |
+| `vtop_scrub_last_success_timestamp_seconds` | gauge | When a run last finished with no findings; 0 if none has. A run with findings leaves it where it was. |
+| `vtop_scrub_last_pass_complete_timestamp_seconds` | gauge | When a scrub last finished checking every committed batch: a run over all of them, or the cursor run that reached the end of a pass. 0 if none has. |
+
+`result` is the only label: batch ids and URIs are in the command's report and
+its WARN lines. An example rule set, in Prometheus rule format, for a
+deployment whose scrub runs hourly and walks the archive once a week (scale
+the windows to your schedule):
+
+```yaml
+groups:
+  - name: vtop-archive-scrub
+    rules:
+      # Damage to committed data. The source has usually aged out, so the
+      # engine cannot archive it again: restore the object or manifest from a
+      # replica or backup, or record the loss. `vtopctl scrub --json` lists
+      # each finding with its batch id, URIs and what was found.
+      - alert: VtopArchiveScrubFindings
+        expr: vtop_scrub_last_run_findings > 0
+        labels:
+          severity: page
+          service: vtop-engine
+        annotations:
+          summary: "The archive scrub found committed batches damaged or unreadable"
+          description: >-
+            {{ $value }} finding(s) in the latest scrub run (missing, mismatched,
+            unauthenticated or unreadable). Run vtopctl scrub --json for the list.
+      # The scrub stopped running, or has not passed for two days.
+      # `last_success` is 0 until a run passes, so a scrub that never passed fires too.
+      - alert: VtopArchiveScrubStale
+        expr: time() - vtop_scrub_last_success_timestamp_seconds > 2 * 86400
+        for: 1h
+        labels:
+          severity: ticket
+          service: vtop-engine
+        annotations:
+          summary: "No archive scrub has passed for two days"
+      # A rotating scrub (--cursor-file with --limit) that has not finished a
+      # pass in eight days: the per-run limit is too small for the archive.
+      - alert: VtopArchiveScrubPassOverdue
+        expr: time() - vtop_scrub_last_pass_complete_timestamp_seconds > 8 * 86400
+        for: 1h
+        labels:
+          severity: ticket
+          service: vtop-engine
+        annotations:
+          summary: "The archive scrub has not checked every committed batch in eight days"
+```
+
+The rules are an example, not provisioned: the lab's rules in
+`grafana/provisioning/alerting/vtop-alerts.yaml` are for metrics the lab
+produces.
+
 ### Design decisions worth knowing
 
 - **Labels are bounded**: `tenant`, `source_type`, `format`, `stage`, `state` —

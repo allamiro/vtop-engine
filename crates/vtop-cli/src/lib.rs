@@ -10,6 +10,7 @@ pub mod engine;
 pub mod meta_tools;
 pub mod metrics_server;
 pub mod node_tools;
+pub mod scrub;
 pub mod segment_tools;
 pub mod testkit;
 pub mod tier_tools;
