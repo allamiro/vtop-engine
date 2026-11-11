@@ -4682,6 +4682,10 @@ mod tests {
             cfg.batching.max_records = 10_000;
             cfg.batching.max_bytes = 104_857_600;
             cfg.batching.max_batch_age_seconds = 3_600;
+            // One upload at a time, in the order the windows were sealed: the
+            // old file's window goes first, so the one throttled put below is
+            // its upload, whatever the pipeline does between puts.
+            cfg.batching.max_concurrent_batches = 1;
             cfg
         };
         let new_inode;
