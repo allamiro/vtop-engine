@@ -708,7 +708,75 @@ in a state replay can explain.
 - **Transactions remain out of scope**, and the v0.6.0 RemoteBridge
   limitations still hold.
 
-## v0.8.0 and beyond
+## v0.8.0 — the engine proves what it archived, and the cluster survives its own failovers
+
+Most of what `main` gathered after v0.7.0 is the same work at two layers:
+find the edge where a claim could outrun its evidence, and close it with a
+test that failed first.
+
+- **Archive engine.**
+  - A range whose source has already committed past it is retired as
+    SUPERSEDED, but only on positive proof of the file's identity (#567).
+  - A VERIFIED row left uncommitted is settled by a later pass, not only at
+    the next restart (#624).
+  - A failed range from a rotated-away file is re-read from that file (#621).
+  - A range whose replay decision can't be recorded holds back the VERIFIED
+    ranges above it (#639).
+  - `delete_after_commit` waits until a file stops being written (#619).
+  - The Kafka source resumes from the ledger (#614), and a stalled partition
+    is re-assigned instead of going silent (#623).
+  - Committed objects can be re-read and checked with `vtopctl scrub` (#628).
+  - Size-only verification is announced at startup, in `validate` and in
+    recovery (#629).
+- **Upload.**
+  - A request body's deadline grows with its size, so a policed uplink
+    commits instead of timing out (#663).
+  - An operator egress ceiling (#481).
+  - Each stream may choose its checksum algorithm, with
+    `require_strong_verification` as a floor (#669).
+  - `vtopctl validate --print-effective` shows what each stream runs with
+    (#670).
+  - The #483 gate kept TCP as the only egress path (#475 is closed).
+- **Manifests (#671, release A).** Readers check the version first and
+  verify `0.4` over the stored document. Writers still write `0.3`.
+- **Cluster plane.**
+  - A follower files caught-up records under the epoch that wrote them (#640).
+  - A returning deposed leader is reconciled at session start (#641).
+  - A fence holds the meta lock through its outcome (#660).
+  - A snapshot never holds a record it can't read back (#657).
+  - Data nodes report their release, and a feature level is finalized only
+    when every node can run it (#634).
+  - The promotion crash sweep runs with no known issue open.
+- **Measured.**
+  - Failover under load against Apache Kafka (#597, partly).
+  - The Kafka comparison's charts are regenerated on CI with no drift (#600).
+
+**Upgrading from v0.7.0.** Downgrade is not supported.
+
+- **Upgrade every engine and data node first, then raise the feature level**
+  with `vtopctl node-versions` and `vtopctl enable-features`. Level 7 is
+  finalized only when every node reports it (#634).
+- **One-way changes:**
+  - Once a SUPERSEDED row is written, the state store carries schema marker
+    3 and v0.7.0 refuses it (#567).
+  - An older binary refuses to start while a kept dispute is pending (#635).
+  - Fencing journal and sidecar rewrites stage through `<file>.rewrite` and
+    a rename (#640).
+- **Older engines silently ignore new keys:**
+  - `upload.request_min_bytes_per_second` (#663);
+  - `upload.max_egress_bytes_per_second` (#481);
+  - a stream's `checksum` block (#669).
+
+  Upgrade every engine before relying on them, and keep the global checksum
+  algorithm strong during a rolling upgrade.
+- **Known open:**
+  - #675: a Kafka stall-recovery test failed once in CI.
+  - #626: replay object keys.
+  - #664: the verification class of recovered commits.
+  - #668: resuming a failed multipart upload.
+  - #671 release B.
+
+## v0.9.0 and beyond
 
 The theme is **the gateway at the speed its durability allows**: wire the
 broker's group commit into the gateway path and close the compatibility
@@ -716,7 +784,7 @@ gaps the Kafka comparison found (#596), measure failover and crash
 durability against Kafka (#597, #599), serve split children as Kafka
 partitions (#473), and ship the egress ceiling once measured (#481).
 
-**Manifest format evolution (#671).** The next release's readers check a
+**Manifest format evolution (#671).** v0.8.0's readers check a
 manifest's `version` first, read `0.1`-`0.4`, verify `0.4` over the stored
 document so fields they do not know stay authenticated, and report anything
 newer as newer rather than as tampered: recovery leaves such a batch VERIFIED
@@ -727,7 +795,7 @@ self-hash; anything else is unauthenticated, as before. It still writes
 optional receipts, after #664), opt-in, and only once every engine and
 auditor runs a reader release. Known limitations until then:
 
-- **Readers before the next release cannot read `0.4`.** v0.7.0 and earlier
+- **Readers before v0.8.0 cannot read `0.4`.** v0.7.0 and earlier
   re-encode a manifest without the fields they do not know, so a `0.4`
   manifest fails their self-hash: recovery replays the batch, the scrub
   reports it, `verify-manifest` calls it corrupt. Upgrade every reader first.
