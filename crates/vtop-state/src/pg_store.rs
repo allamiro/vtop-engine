@@ -43,6 +43,29 @@ use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 /// operators apply the same artifact outside the engine if desired.
 const MIGRATION: &str = include_str!("../migrations/postgres/0001_state_store.sql");
 
+/// The first non-empty line of the invariant trigger's function body is
+/// `-- vtop-state-schema N` (the body starts with the newline after `$fn$`,
+/// hence "non-empty"). Startup requires at least this N. 2 is the first
+/// body that refuses an insert in any state but batching (#625); a schema from
+/// before it carries no marker. 3 is the migration that also admits
+/// `superseded` in the state CHECK (#567). The marker lives in the body, not in a
+/// `COMMENT ON FUNCTION`, because `CREATE OR REPLACE` replaces the body but
+/// keeps a comment: an older release's migrate would leave its older body
+/// under the newer comment.
+const SCHEMA_MARKER_PREFIX: &str = "-- vtop-state-schema ";
+const MIN_SCHEMA_VERSION: u32 = 3;
+
+/// Whether the trigger function's body opens with a schema version this
+/// engine accepts. A marker anywhere but the first non-empty line, or a
+/// missing or unparseable one, is an old schema.
+fn schema_marker_is_current(function_body: Option<&str>) -> bool {
+    function_body
+        .and_then(|body| body.lines().map(str::trim).find(|line| !line.is_empty()))
+        .and_then(|line| line.strip_prefix(SCHEMA_MARKER_PREFIX))
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .is_some_and(|v| v >= MIN_SCHEMA_VERSION)
+}
+
 /// Retry budget for transient serialization failures (SQLSTATE 40001). One
 /// retry per attempt with a small backoff; a single-node Postgres essentially
 /// never hits this, a distributed store occasionally does.
@@ -87,6 +110,13 @@ macro_rules! pg_prune_predicate_sql {
 /// state it can reach. `superseded` arrived with #567; a schema migrated by an
 /// older release refuses it, so startup asks for `vtopctl migrate` instead of
 /// failing the first retirement.
+///
+/// Checked on the constraint itself, not only through the schema marker
+/// (version 3 since #567): the marker describes the function body a
+/// migration installed, and the CHECK is a separate object. A table restored
+/// on its own from an older archive, or a constraint replaced by hand, leaves
+/// a current marker over an old CHECK - and an older release's migrate leaves
+/// the widened CHECK under its older marker. Either half alone is refused.
 const STATE_ADDED_SINCE_FIRST_SCHEMA: &str = "superseded";
 
 /// Handle to the persistent Postgres-compatible state store.
@@ -265,26 +295,31 @@ impl PgStateStore {
         .await
         .map_err(map_schema_check)?;
 
-        let trigger_present: bool = sqlx::query_scalar(
-            "SELECT EXISTS ( \
-                SELECT 1 FROM pg_catalog.pg_trigger t \
-                JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
-                WHERE c.oid = 'batches'::regclass \
-                  AND t.tgname = 'trg_commit_after_verify' \
-                  AND NOT t.tgisinternal \
-             )",
+        // The trigger must be enabled and call a function whose body carries a
+        // current schema marker, not merely exist by name: a schema restored
+        // from an older archive, never re-migrated, or re-migrated by an older
+        // release keeps the name with an older body, and a restore that
+        // disabled the trigger may never have enabled it again.
+        let body: Option<String> = sqlx::query_scalar(
+            "SELECT p.prosrc \
+             FROM pg_catalog.pg_trigger t \
+             JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid \
+             WHERE t.tgrelid = 'batches'::regclass \
+               AND t.tgname = 'trg_commit_after_verify' \
+               AND NOT t.tgisinternal \
+               AND t.tgenabled IN ('O', 'A')",
         )
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(map_schema_check)?;
-        if !trigger_present {
+        if !schema_marker_is_current(body.as_deref()) {
             return Err(schema_migration_required());
         }
 
-        // The state CHECK must admit every state this build writes (#567). A
-        // schema migrated before SUPERSEDED existed refuses it, and the first
-        // retirement would fail at runtime; refuse to start instead, with the
-        // same guidance as any other outdated schema.
+        // The state CHECK must admit every state this build writes (#567),
+        // under a current marker or not: see STATE_ADDED_SINCE_FIRST_SCHEMA.
+        // Without it the first retirement would fail at runtime; refuse to
+        // start instead, with the same guidance as any other outdated schema.
         let admits_every_state: bool = sqlx::query_scalar(
             "SELECT EXISTS ( \
                 SELECT 1 FROM pg_catalog.pg_constraint \
@@ -332,6 +367,7 @@ impl PgStateStore {
 #[async_trait]
 impl StateStore for PgStateStore {
     async fn save_batch_state(&self, rec: &BatchRecord) -> Result<(), VtopError> {
+        crate::store::require_batching_insert(rec)?;
         let ps = serde_json::to_string(&rec.progress_start)?;
         let pe = serde_json::to_string(&rec.progress_end)?;
         // Plain INSERT: a duplicate batch_id must fail on the primary key, never
@@ -801,6 +837,40 @@ mod security_tests {
 
     fn options(url: &str) -> PgConnectOptions {
         PgConnectOptions::from_str(url).unwrap()
+    }
+
+    #[test]
+    fn only_a_current_schema_marker_passes_startup() {
+        let body = |marker: &str| format!("\n{marker}\nBEGIN\n    RETURN NEW;\nEND;\n");
+        for refused in [
+            "",
+            "-- vtop-state-schema",
+            "-- vtop-state-schema x",
+            "-- vtop-state-schema 1",
+            // #625's marker: its schema predates the #567 state CHECK.
+            "-- vtop-state-schema 2",
+            "vtop-state-schema 3",
+            "-- must be inserted as batching",
+        ] {
+            assert!(
+                !schema_marker_is_current(Some(&body(refused))),
+                "{refused:?}"
+            );
+        }
+        assert!(!schema_marker_is_current(None));
+        // Only the first non-empty line counts.
+        assert!(!schema_marker_is_current(Some(
+            "\nBEGIN\n-- vtop-state-schema 3\n    RETURN NEW;\nEND;\n"
+        )));
+        assert!(!schema_marker_is_current(Some(
+            "\n-- an earlier comment\n-- vtop-state-schema 3\nBEGIN\nEND;\n"
+        )));
+        assert!(schema_marker_is_current(Some(&body(
+            "-- vtop-state-schema 3"
+        ))));
+        assert!(schema_marker_is_current(Some(&body(
+            "    -- vtop-state-schema 4"
+        ))));
     }
 
     #[test]

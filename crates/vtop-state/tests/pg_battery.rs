@@ -62,8 +62,8 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         "missing trigger must give migration guidance: {err}"
     );
 
-    // #567: a schema migrated before SUPERSEDED existed (its state CHECK lacks
-    // the state) is not runtime-ready either: the first retirement would fail
+    // #567: a state CHECK without SUPERSEDED is not runtime-ready either, even
+    // under the current schema marker: the first retirement would fail
     // at runtime. `vtopctl migrate` widens the CHECK in place, keeping the
     // rows, and a second run leaves the constraint alone.
     PgStateStore::migrate(&migrator_conn).await.unwrap();
@@ -132,6 +132,113 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         )
         .await
         .unwrap();
+
+    // Nor is a trigger that exists by name but whose function body has no
+    // current schema marker, or one a restore left disabled. The old body is
+    // the trigger function as released before #625 (no marker):
+    // - restored from an old archive: the function dropped and recreated;
+    // - installed by an older release's `vtopctl migrate`: CREATE OR REPLACE
+    //   over the current function. A marker kept in a COMMENT ON FUNCTION
+    //   survived this, which is why the marker lives in the body.
+    macro_rules! pre_625_function {
+        () => {
+            " FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$ \
+             BEGIN \
+                 IF NEW.state = 'source_committed' THEN \
+                     IF TG_OP = 'INSERT' THEN \
+                         RAISE EXCEPTION 'commit before verified: batch % inserted directly as source_committed', NEW.batch_id \
+                             USING ERRCODE = 'check_violation'; \
+                     ELSIF OLD.state <> 'verified' THEN \
+                         RAISE EXCEPTION 'commit before verified: batch % is %', OLD.batch_id, OLD.state \
+                             USING ERRCODE = 'check_violation'; \
+                     END IF; \
+                 END IF; \
+                 RETURN NEW; \
+             END; \
+             $fn$ LANGUAGE plpgsql;"
+        };
+    }
+    for (setup, what) in [
+        (
+            concat!(
+                "DROP FUNCTION vtop_enforce_commit_after_verify() CASCADE; CREATE",
+                pre_625_function!(),
+                " CREATE TRIGGER trg_commit_after_verify BEFORE INSERT OR UPDATE ON batches \
+                     FOR EACH ROW EXECUTE FUNCTION vtop_enforce_commit_after_verify();"
+            ),
+            "a pre-#625 function restored from an old archive",
+        ),
+        (
+            concat!("CREATE OR REPLACE", pre_625_function!()),
+            "a pre-#625 function installed over the current one by an older migrate",
+        ),
+        (
+            "ALTER TABLE batches DISABLE TRIGGER trg_commit_after_verify",
+            "a disabled trigger",
+        ),
+    ] {
+        PgStateStore::migrate(&migrator_conn).await.unwrap();
+        let admin = PgStateStore::connect(&migrator_conn).await.unwrap();
+        admin.execute_raw(setup).await.unwrap();
+        let err = match PgStateStore::connect(&migrator_conn).await {
+            Ok(_) => panic!("runtime connect must reject {what}"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("vtopctl migrate"),
+            "{what} must give migration guidance: {err}"
+        );
+    }
+    // `vtopctl migrate` repairs each: it installs the marked function and
+    // re-creates the trigger enabled.
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    PgStateStore::connect(&migrator_conn)
+        .await
+        .expect("the current schema must pass startup");
+
+    // #567: the other half of the marker/CHECK pair. The release between #625
+    // and #567 installs its marker-2 body with CREATE OR REPLACE and leaves
+    // the state CHECK alone, so a re-run of ITS migrate leaves the widened
+    // CHECK under an older marker. Refused all the same (the reverse, a
+    // current marker over an old CHECK, is refused above).
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    let admin = PgStateStore::connect(&migrator_conn).await.unwrap();
+    admin
+        .execute_raw(
+            "CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$
+-- vtop-state-schema 2
+BEGIN
+    IF NEW.state = 'source_committed' THEN
+        IF TG_OP = 'INSERT' THEN
+            RAISE EXCEPTION 'commit before verified: batch % inserted directly as source_committed', NEW.batch_id
+                USING ERRCODE = 'check_violation';
+        ELSIF OLD.state <> 'verified' THEN
+            RAISE EXCEPTION 'commit before verified: batch % is %', OLD.batch_id, OLD.state
+                USING ERRCODE = 'check_violation';
+        END IF;
+    END IF;
+    IF TG_OP = 'INSERT' AND NEW.state <> 'batching' THEN
+        RAISE EXCEPTION 'batch % must be inserted as batching, not %', NEW.batch_id, NEW.state
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;",
+        )
+        .await
+        .unwrap();
+    let err = match PgStateStore::connect(&migrator_conn).await {
+        Ok(_) => panic!("runtime connect must reject a marker-2 body over the widened CHECK"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("vtopctl migrate"),
+        "a marker-2 body must give migration guidance: {err}"
+    );
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    PgStateStore::connect(&migrator_conn)
+        .await
+        .expect("migrate restores the marker-3 body");
 
     // The deployment identity applies DDL once, then creates a deliberately
     // narrow role. PostgreSQL's default PUBLIC schema privileges are revoked so
@@ -255,5 +362,22 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
     assert!(
         err.to_string().contains("commit before verified"),
         "expected the trigger to reject a born-committed insert, got: {err}"
+    );
+
+    // ---- 5. Nor born in any other state but batching (#625) ----
+    // Born verified, a row could then be committed without ever having been
+    // verified: the UPDATE to source_committed passes the trigger above.
+    let err = store
+        .execute_raw(
+            "INSERT INTO batches \
+             (batch_id, tenant, source_type, source_name, format, state, \
+              progress_start_json, progress_end_json, created_at, updated_at) \
+             VALUES ('born-verified','default','kafka','app','cef','verified','{}','{}','t','t')",
+        )
+        .await
+        .expect_err("inserting a verified row must be rejected");
+    assert!(
+        err.to_string().contains("must be inserted as batching"),
+        "expected the trigger to reject a born-verified insert, got: {err}"
     );
 }
