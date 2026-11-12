@@ -40,7 +40,14 @@ http-body-util = "0.1"
 # The egress shaper (#481) implements http-body 1.x `Body` to wrap the SDK's
 # request body; already in the tree through the aws-sdk and hyper.
 http-body = "1"
-rdkafka = { version = "0.39", features = ["cmake-build", "ssl", "sasl"] }
+# Portable by default (#677). librdkafka is built from source with OpenSSL
+# compiled in (`ssl-vendored`), so a build no longer depends on the host's
+# OpenSSL version (1.1.1 on EL8, 3.x on EL9/10, 4.x on Fedora 45 and Homebrew),
+# and the binaries load no OpenSSL at run time. SASL PLAIN, SCRAM and
+# OAUTHBEARER are built into librdkafka. Only Kerberos (GSSAPI) needs Cyrus
+# SASL, which is the opt-in `kafka-gssapi` feature. Set OPENSSL_NO_VENDOR=1 to
+# link the system OpenSSL instead.
+rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
