@@ -834,7 +834,7 @@ On startup, the `replay` module inspects `vtop-state` and maps each incomplete b
 
    Two writers of one derived key write the same bytes by construction, so the race between the probe and the put changes no content; in a versioned bucket it adds an identical version at worst. The put must still replace the key whole: S3 puts are atomic, and `localfs` copies beside the key and renames onto it, so a crash mid-copy cannot tear an object that a committed row already verified. The probe is the only guard against writing over an object that does not verify; a store-enforced conditional put (`If-None-Match: *`) would close the probe-to-put window as well, and is not used yet.
 
-   **What the operator is told.** Every outcome is one log event with `batch_id`, `source`, `range` and `key` (and `fallback_key`, `reason` where they apply) as fields, and a message that says what happened, what the engine did and what to do:
+   **What the operator is told.** Every outcome is one log event with `batch_id`, `source`, `range` and `key` (and `fallback_key`, `reason` where they apply) as fields, and a message that says what happened, what the engine did and what to do. Every outcome is also counted in `vtop_object_key_decisions_total{decision}`. The two notices a setting repeats on every batch (`object_key_per_attempt`, and `object_key_fallback` for a probe the store refused) are logged at most once a minute per kind, with a `suppressed` count; the counter is never limited:
 
    | `event` | Level | Condition and action |
    |---|---|---|

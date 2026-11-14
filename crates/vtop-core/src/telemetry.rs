@@ -41,6 +41,17 @@ pub const STAGES: [&str; 7] = [
 ];
 
 /// The engine's metric set. Cheap to clone (all fields are `Arc` internally).
+/// The values of `decision` on `vtop_object_key_decisions_total` (#626).
+pub const OBJECT_KEY_DECISIONS: [&str; 7] = [
+    "derived",
+    "reused",
+    "fallback_differs",
+    "fallback_size_only",
+    "fallback_unchecked",
+    "probe_throttled",
+    "per_attempt",
+];
+
 pub struct Metrics {
     pub registry: Registry,
 
@@ -151,6 +162,10 @@ pub struct Metrics {
     /// retrying at the same width is the overload it is complaining about.
     /// `stage` says which upload (`object_upload`, `manifest_upload`).
     pub upload_throttled_total: IntCounterVec,
+    /// How each batch's object key was decided (#626). `decision` is the
+    /// bounded set [`OBJECT_KEY_DECISIONS`]: a rising `fallback_*` or
+    /// `per_attempt` rate means replays are writing second objects.
+    pub object_key_decisions_total: IntCounterVec,
 
     /// Request-body bytes admitted through the egress shaper (#481) — VTOP's
     /// own account of what it handed the wire under
@@ -255,6 +270,11 @@ impl Metrics {
             "Source reads that failed and were skipped for this cycle (see logs for the path)",
             vec!["tenant", "source_type"],
         )?;
+        let object_key_decisions_total = cv(
+            "object_key_decisions_total",
+            "How each batch's object key was decided (#626): derived (uploaded under its content-derived key), reused (the verified object was already stored, no upload), fallback_differs / fallback_size_only / fallback_unchecked (the derived key held something that could not be reused, so the batch was written under its per-attempt key instead of overwriting it), probe_throttled (the batch failed and was handed back), per_attempt (no checksum, or a backend that cannot report an absent key)",
+            vec!["tenant", "source_type", "format", "decision"],
+        )?;
         let upload_throttled_total = cv(
             "upload_throttled_total",
             "Uploads the object store answered with a throttle (HTTP 429/503 or an S3 SlowDown/Throttling code) after the backend's own retries; a sustained rate means the store wants less concurrency, not more retries",
@@ -355,6 +375,7 @@ impl Metrics {
             source_replay_refused_total,
             upload_throttled_total,
             upload_egress_bytes_total,
+            object_key_decisions_total,
         })
     }
 

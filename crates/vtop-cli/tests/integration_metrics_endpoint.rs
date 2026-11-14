@@ -66,6 +66,11 @@ fn populated() -> String {
             .with_label_values(&["default", "kafka", "cef", s])
             .observe(0.01);
     }
+    for d in telemetry::OBJECT_KEY_DECISIONS {
+        m.object_key_decisions_total
+            .with_label_values(&["default", "kafka", "cef", d])
+            .inc_by(0);
+    }
     m.inflight_batches.set(2);
     m.encode().expect("encode must succeed")
 }
@@ -147,7 +152,17 @@ fn unbounded_identifiers_are_never_labels() {
 fn every_exported_label_is_from_a_bounded_set() {
     // "le" is Prometheus's own histogram bucket label. It is bounded by the
     // bucket list defined in telemetry.rs, not free-form, so it is legitimate.
-    const BOUNDED: [&str; 6] = ["tenant", "source_type", "format", "state", "stage", "le"];
+    // "decision" takes the seven values of telemetry::OBJECT_KEY_DECISIONS
+    // (#626).
+    const BOUNDED: [&str; 7] = [
+        "tenant",
+        "source_type",
+        "format",
+        "state",
+        "stage",
+        "le",
+        "decision",
+    ];
     let text = populated();
     let mut seen = std::collections::BTreeSet::new();
     for line in text.lines().filter(|l| !l.starts_with('#')) {
@@ -343,4 +358,17 @@ async fn connection_cap_rejects_excess_and_recovers() {
         body.trim_end().ends_with("200"),
         "endpoint must recover once capacity frees: {body}"
     );
+}
+
+/// #626: how each object key was decided is exported, with `decision` from
+/// its bounded set, so an alert can see replays writing second objects
+/// (`fallback_*`, `per_attempt`) without parsing logs.
+#[test]
+fn object_key_decisions_are_exported_by_bounded_decision() {
+    let text = populated();
+    assert!(text.contains("vtop_object_key_decisions_total"), "{text}");
+    for d in vtop_core::telemetry::OBJECT_KEY_DECISIONS {
+        let label = format!(r#"decision="{d}""#);
+        assert!(text.contains(&label), "missing {label}");
+    }
 }

@@ -152,6 +152,59 @@ pub struct Pipeline<'a> {
     /// CreateBucket calls, and first batches for DIFFERENT buckets must not
     /// wait on each other's network round trip.
     pub provisioned_buckets: ProvisionedBuckets,
+    /// Rate limit for object-key notices that repeat on every batch while a
+    /// setting stays as it is (#626). Owned by [`Engine`] and shared like
+    /// `versioned_buckets`.
+    pub key_notices: Arc<KeyNotices>,
+}
+
+/// Rate limit for the object-key notices a setting repeats on every batch
+/// (#626): no checksum, a backend that cannot report an absent key, a probe
+/// the store refuses. The first is logged at once; later ones at most once a
+/// minute per kind, with how many were suppressed in between. Each decision
+/// is still counted in `vtop_object_key_decisions_total`.
+#[derive(Debug)]
+pub struct KeyNotices {
+    every: Duration,
+    last: std::sync::Mutex<HashMap<&'static str, (Instant, u64)>>,
+}
+
+impl Default for KeyNotices {
+    fn default() -> Self {
+        Self::every(Duration::from_secs(60))
+    }
+}
+
+impl KeyNotices {
+    fn every(every: Duration) -> Self {
+        Self {
+            every,
+            last: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `Some(suppressed since the last one logged)` when a notice of `kind`
+    /// should be logged now, `None` when it is suppressed.
+    fn admit(&self, kind: &'static str) -> Option<u64> {
+        let mut last = self.last.lock().unwrap();
+        let now = Instant::now();
+        match last.get_mut(kind) {
+            None => {
+                last.insert(kind, (now, 0));
+                Some(0)
+            }
+            Some((at, suppressed)) if now.duration_since(*at) >= self.every => {
+                let n = *suppressed;
+                *at = now;
+                *suppressed = 0;
+                Some(n)
+            }
+            Some((_, suppressed)) => {
+                *suppressed += 1;
+                None
+            }
+        }
+    }
 }
 
 impl<'a> Pipeline<'a> {
@@ -632,22 +685,36 @@ impl<'a> Pipeline<'a> {
             format.extension(),
         ];
         // Every outcome is logged for the operator with what happened, what
-        // the engine did and what to do, and the batch id, keys and range as
-        // fields (#626).
+        // the engine did and what to do, with the batch id, keys and range as
+        // fields, and counted by decision (#626). The notices a setting
+        // repeats on every batch are rate-limited; the counter is not.
         let range = window.range_token();
         let source_name = source.source_name.as_str();
+        let decided = |decision: &str| {
+            if let Some(mx) = telemetry::metrics() {
+                mx.object_key_decisions_total
+                    .with_label_values(&[labels[0], labels[1], labels[2], decision])
+                    .inc();
+            }
+        };
         let (object_uri, reused) = match derived_object_uri {
             Err(why) => {
-                tracing::info!(
-                    event = "object_key_per_attempt",
-                    batch_id,
-                    source = source_name,
-                    range,
-                    key = %attempt_object_uri,
-                    reason = %why,
-                    "range {range} of {source_name} is written under its per-attempt key \
-                     {attempt_object_uri}: {why}; a replay of this range will write another object"
-                );
+                decided("per_attempt");
+                if let Some(suppressed) = self.key_notices.admit("per_attempt") {
+                    tracing::info!(
+                        event = "object_key_per_attempt",
+                        batch_id,
+                        source = source_name,
+                        range,
+                        key = %attempt_object_uri,
+                        reason = %why,
+                        suppressed,
+                        "range {range} of {source_name} is written under its per-attempt key \
+                         {attempt_object_uri}, so a replay of it will write another object \
+                         (nothing is lost): {why} ({suppressed} more like this suppressed since \
+                         the last notice)"
+                    );
+                }
                 (attempt_object_uri, false)
             }
             Ok(derived) => match probe_object_key(
@@ -662,6 +729,7 @@ impl<'a> Pipeline<'a> {
             .await
             {
                 Ok(KeyProbe::Free) => {
+                    decided("derived");
                     tracing::info!(
                         event = "object_key_derived",
                         batch_id,
@@ -669,11 +737,13 @@ impl<'a> Pipeline<'a> {
                         range,
                         key = %derived,
                         "no object for range {range} of {source_name} is stored yet; uploading it \
-                         under its derived key {derived}"
+                         under its derived key {derived}, so a replay of the same bytes will reuse \
+                         it; nothing to do"
                     );
                     (derived, false)
                 }
                 Ok(KeyProbe::Holds) => {
+                    decided("reused");
                     tracing::info!(
                         event = "object_key_reused",
                         batch_id,
@@ -681,43 +751,61 @@ impl<'a> Pipeline<'a> {
                         range,
                         key = %derived,
                         "object for range {range} of {source_name} already archived and verified; \
-                         reusing key {derived}, no upload"
+                         reusing key {derived}, no upload; nothing to do"
                     );
                     (derived, true)
                 }
                 Ok(probe) => {
-                    let (what, todo) = match &probe {
+                    let (decision, what, todo) = match &probe {
                         KeyProbe::Differs(_) => (
+                            "fallback_differs",
                             "exists but its bytes differ from this batch",
                             "nothing is lost; run `vtopctl scrub` to see whether a committed \
                              batch names the damaged object",
                         ),
                         KeyProbe::SizeOnly(_) => (
+                            "fallback_size_only",
                             "exists but the backend could confirm only its size",
-                            "use a backend and checksum that verify stored content so a replay \
-                             can reuse it",
+                            "nothing is lost; use a backend and checksum that verify stored \
+                             content so a replay can reuse it",
                         ),
                         _ => (
+                            "fallback_unchecked",
                             "could not be checked",
-                            "check the store's permissions: without list permission S3 answers \
-                             a missing key with 403, not 404",
+                            "nothing is lost; check the store's permissions: without list \
+                             permission S3 answers a missing key with 403, not 404",
                         ),
                     };
-                    let why = probe.reason();
-                    tracing::warn!(
-                        event = "object_key_fallback",
-                        batch_id,
-                        source = source_name,
-                        range,
-                        key = %derived,
-                        fallback_key = %attempt_object_uri,
-                        reason = %why,
-                        "object at {derived} {what} ({why}); writing range {range} of \
-                         {source_name} under {attempt_object_uri} instead of overwriting it; {todo}"
-                    );
+                    decided(decision);
+                    // A refused probe repeats for every batch until the
+                    // permission is fixed; a damaged or size-only object is
+                    // about one key and is always reported.
+                    let suppressed = if decision == "fallback_unchecked" {
+                        self.key_notices.admit(decision)
+                    } else {
+                        Some(0)
+                    };
+                    if let Some(suppressed) = suppressed {
+                        let why = probe.reason();
+                        tracing::warn!(
+                            event = "object_key_fallback",
+                            batch_id,
+                            source = source_name,
+                            range,
+                            key = %derived,
+                            fallback_key = %attempt_object_uri,
+                            reason = %why,
+                            decision,
+                            suppressed,
+                            "object at {derived} {what} ({why}); writing range {range} of \
+                             {source_name} under {attempt_object_uri} instead of overwriting it; \
+                             {todo}"
+                        );
+                    }
                     (attempt_object_uri, false)
                 }
                 Err(e) => {
+                    decided("probe_throttled");
                     tracing::warn!(
                         event = "object_key_probe_throttled",
                         batch_id,
@@ -726,7 +814,8 @@ impl<'a> Pipeline<'a> {
                         key = %derived,
                         error = %e,
                         "the store throttled the check of {derived}; nothing was written, the \
-                         batch fails and range {range} of {source_name} is handed back for retry"
+                         batch fails and range {range} of {source_name} is handed back for retry; \
+                         nothing to do unless it persists, then reduce upload concurrency"
                     );
                     fail!(format!("object key probe of {derived} failed: {e}"))
                 }
@@ -1546,6 +1635,9 @@ pub struct Engine {
     /// Process-wide bucket-provisioning cells (#102); see
     /// [`Pipeline::provisioned_buckets`].
     provisioned_buckets: ProvisionedBuckets,
+    /// Process-wide object-key notice limiter (#626); see
+    /// [`Pipeline::key_notices`].
+    key_notices: Arc<KeyNotices>,
     /// Per-source accumulation buffers, keyed by `(source_type, source_name)`.
     pending: HashMap<(SourceType, String), PendingBuffer>,
     /// Set by a read cycle that returned any records; drives the adaptive
@@ -1849,6 +1941,7 @@ impl Engine {
             attempts: Arc::default(),
             width,
             provisioned_buckets: Arc::default(),
+            key_notices: Arc::default(),
             pending: HashMap::new(),
             cycle_had_data: false,
             cycle_had_failure: false,
@@ -1878,6 +1971,7 @@ impl Engine {
             throttles: Arc::clone(&self.throttles),
             attempts: Arc::clone(&self.attempts),
             provisioned_buckets: Arc::clone(&self.provisioned_buckets),
+            key_notices: Arc::clone(&self.key_notices),
         }
     }
 
@@ -8845,5 +8939,27 @@ mod tests {
         .expect_err("a throttled probe is not an answer");
         assert!(err.is_upload_throttle(), "{err}");
         assert_eq!(throttles.load(Ordering::Relaxed), 1);
+    }
+
+    /// #626: a notice a setting repeats on every batch is logged once, then at
+    /// most once per interval, saying how many were suppressed in between.
+    #[test]
+    fn key_notices_admit_the_first_then_one_per_interval_with_the_suppressed_count() {
+        let notices = KeyNotices::every(Duration::from_millis(50));
+        assert_eq!(notices.admit("per_attempt"), Some(0), "the first is logged");
+        assert_eq!(notices.admit("per_attempt"), None);
+        assert_eq!(notices.admit("per_attempt"), None);
+        assert_eq!(
+            notices.admit("fallback_unchecked"),
+            Some(0),
+            "each kind has its own interval"
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            notices.admit("per_attempt"),
+            Some(2),
+            "the next one reports the two suppressed"
+        );
+        assert_eq!(notices.admit("per_attempt"), None);
     }
 }

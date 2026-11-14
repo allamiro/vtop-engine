@@ -165,6 +165,17 @@ fn file_range(input: &Path) -> String {
     format!("b0-{}", std::fs::metadata(input).unwrap().len())
 }
 
+/// The process-wide count of `decision` for file batches of the default
+/// tenant (#626). Tests run in parallel and only ever add, so a test asserts
+/// that its own decision moved the count, never an exact total.
+fn decisions(decision: &str) -> u64 {
+    vtop_core::telemetry::init()
+        .unwrap()
+        .object_key_decisions_total
+        .with_label_values(&["default", "file", "raw", decision])
+        .get()
+}
+
 /// Whether the store holds a second version at `uri`: a second put to it.
 async fn put_twice(backend: &MockBackend, uri: &str) -> bool {
     backend.get_object_pinned(uri, "v2", 1 << 20).await.is_ok()
@@ -200,6 +211,7 @@ async fn a_replay_of_an_uploaded_range_writes_no_second_object() {
     .await;
     let (logs, _guard) = Logs::capture();
     let range = file_range(&input);
+    let (derived_before, reused_before) = (decisions("derived"), decisions("reused"));
 
     let first = engine.process_once(SourceType::File).await.unwrap();
     assert_eq!(first.len(), 1, "{first:?}");
@@ -245,8 +257,17 @@ async fn a_replay_of_an_uploaded_range_writes_no_second_object() {
         &logs.one("object_key_reused", &second[0].batch_id),
         &uploaded,
         &range,
-        &["already archived and verified; reusing key", "no upload"],
+        &[
+            "already archived and verified; reusing key",
+            "no upload",
+            "nothing to do",
+        ],
     );
+    assert!(
+        decisions("derived") > derived_before,
+        "the first attempt is counted"
+    );
+    assert!(decisions("reused") > reused_before, "the reuse is counted");
 
     // The committed row scrubs clean against the reused object.
     let rows = scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
