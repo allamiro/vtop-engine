@@ -298,6 +298,103 @@ pub async fn run_prune_battery(store: &dyn StateStore) {
     superseded_rows_are_pruned_like_committed_history(store).await;
 }
 
+/// #664: the state machine lets a row leave VERIFIED (FAILED, REPLAY_REQUIRED)
+/// and come back through BATCHING to VERIFIED. The engine never takes that
+/// path - a replay is a new batch with a new id - but the store allows it, so
+/// it must not leave the first verification's class on the second: the
+/// transition to VERIFIED writes the class it is given, `None` included.
+async fn a_reverified_row_takes_the_class_of_its_new_verification(store: &dyn StateStore) {
+    let id = "vclass-reverified";
+    store.save_batch_state(&sample_record(id)).await.unwrap();
+    let walk_to_verified = |class: Option<VerificationClass>| async move {
+        for st in &LEGAL_WALK[..5] {
+            store
+                .update_batch_state(id, *st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+        match class {
+            Some(class) => store.mark_verified(id, class).await.unwrap(),
+            None => store
+                .update_batch_state(id, BatchState::Verified, &BatchPatch::default())
+                .await
+                .unwrap(),
+        }
+    };
+    let back_to_batching = || async move {
+        store.mark_failed(id, "re-check failed").await.unwrap();
+        // Leaving VERIFIED keeps the class it was verified with.
+        let failed = store.get_batch(id).await.unwrap().unwrap();
+        assert_eq!(failed.state, BatchState::Failed);
+        store
+            .update_batch_state(id, BatchState::ReplayRequired, &BatchPatch::default())
+            .await
+            .unwrap();
+        claim_again(store, id).await;
+        store
+            .update_batch_state(id, BatchState::Batching, &BatchPatch::default())
+            .await
+            .unwrap();
+        failed.verification_class
+    };
+    walk_to_verified(Some(VerificationClass::SizeOnly)).await;
+    assert_eq!(back_to_batching().await, Some(VerificationClass::SizeOnly));
+    walk_to_verified(Some(VerificationClass::Strong)).await;
+    let got = store.get_batch(id).await.unwrap().unwrap();
+    assert_eq!(
+        got.verification_class,
+        Some(VerificationClass::Strong),
+        "a second verification records its own class, not the first's"
+    );
+    assert_eq!(back_to_batching().await, Some(VerificationClass::Strong));
+    walk_to_verified(None).await;
+    let got = store.get_batch(id).await.unwrap().unwrap();
+    assert_eq!(
+        (got.state, got.verification_class),
+        (BatchState::Verified, None),
+        "a verification with no class (an older writer) leaves none, not the last one's"
+    );
+    store.mark_failed(id, "done").await.unwrap();
+}
+
+/// #664 with #567: a row that was VERIFIED, failed its re-check and was
+/// handed back, then retired as SUPERSEDED, keeps the class it was verified
+/// with - the record of what admitted it - and is never recovery work again.
+async fn a_retired_row_keeps_its_class_and_is_never_recovery_work(store: &dyn StateStore) {
+    let id = "vclass-superseded";
+    store.save_batch_state(&sample_record(id)).await.unwrap();
+    for st in &LEGAL_WALK[..5] {
+        store
+            .update_batch_state(id, *st, &BatchPatch::default())
+            .await
+            .unwrap();
+    }
+    store
+        .mark_verified(id, VerificationClass::SizeOnly)
+        .await
+        .unwrap();
+    store.mark_failed(id, "re-check failed").await.unwrap();
+    store
+        .update_batch_state(id, BatchState::ReplayRequired, &BatchPatch::default())
+        .await
+        .unwrap();
+    claim_again(store, id).await;
+    store
+        .update_batch_state(id, BatchState::Superseded, &BatchPatch::default())
+        .await
+        .unwrap();
+    let got = store.get_batch(id).await.unwrap().unwrap();
+    assert_eq!(
+        (got.state, got.verification_class),
+        (BatchState::Superseded, Some(VerificationClass::SizeOnly))
+    );
+    let incomplete = store.list_incomplete_batches().await.unwrap();
+    assert!(
+        incomplete.iter().all(|row| row.batch_id != id),
+        "a retired row is never recovery work: {incomplete:?}"
+    );
+}
+
 /// Rows for [`every_read_path_returns_whole_rows`]: one VERIFIED with a class,
 /// one FAILED. Call once, on a store no other battery claims from afterwards.
 pub async fn seed_rows_for_every_read_path(store: &dyn StateStore) {
@@ -493,6 +590,26 @@ pub async fn verification_class_after_restart(store: &dyn StateStore) {
             "{id}: the commit after recovery changed the class"
         );
     }
+    // Both claim the rows they hand back, as recovery does.
+    a_reverified_row_takes_the_class_of_its_new_verification(store).await;
+    a_retired_row_keeps_its_class_and_is_never_recovery_work(store).await;
+}
+
+/// Claims `id` again after REPLAY_REQUIRED released this handle's claim on
+/// it, as recovery does.
+async fn claim_again(store: &dyn StateStore, id: &str) {
+    let claimed = store
+        .claim_incomplete_batches(
+            "engine-restarted",
+            "2070-01-01T00:00:00+00:00",
+            "2070-01-01T00:05:00+00:00",
+        )
+        .await
+        .unwrap();
+    assert!(
+        claimed.iter().any(|row| row.batch_id == id),
+        "{id}: {claimed:?}"
+    );
 }
 
 /// #567: a FAILED / REPLAY_REQUIRED row whose range its source has since

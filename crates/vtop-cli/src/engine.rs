@@ -900,19 +900,32 @@ impl<'a> Pipeline<'a> {
         // (VERIFIED -> SOURCE_COMMITTED below). The on-disk manifest was written
         // and uploaded *before* this step (its hash must be stable), so we do
         // not re-stamp it here — querying the store is the source of truth.
-        if backend_limited {
-            tracing::warn!(batch_id, "verification_passed (backend_limited: size-only)");
-        } else {
-            tracing::info!(batch_id, "verification_passed");
-        }
         // The class goes into the ledger with the transition (#664): a
         // recovery after a restart counts the commit by it, not by what its
-        // own re-check of the store finds then.
+        // own re-check of the store finds then. The backends' own messages
+        // name the check that ran (a store checksum, a read-back, size only).
         let class = if backend_limited {
             vtop_state::VerificationClass::SizeOnly
         } else {
             vtop_state::VerificationClass::Strong
         };
+        if backend_limited {
+            tracing::warn!(
+                batch_id,
+                verification_class = class.as_str(),
+                object_check = %obj_v.message,
+                manifest_check = %man_v.message,
+                "verification_passed (backend_limited: size-only)"
+            );
+        } else {
+            tracing::info!(
+                batch_id,
+                verification_class = class.as_str(),
+                object_check = %obj_v.message,
+                manifest_check = %man_v.message,
+                "verification_passed"
+            );
+        }
         let t_write = Instant::now();
         self.store.mark_verified(&batch_id, class).await?;
         state_write += t_write.elapsed();
@@ -1929,6 +1942,7 @@ impl Engine {
                 tracing::info!(
                     batch_id = %rec.batch_id,
                     held_back = row.held_back,
+                    verification_class = verification_mode::class_name(&rec),
                     "source_committed (an earlier pass left it VERIFIED)"
                 );
                 true
@@ -2544,6 +2558,7 @@ impl Engine {
                         tracing::warn!(
                             batch_id = %rec.batch_id,
                             object_uri = rec.object_uri.as_deref().unwrap_or(""),
+                            verification_class = verification_mode::class_name(&rec),
                             "recovery: VERIFIED batch failed storage re-check; replaying instead of committing"
                         );
                         // The replay decision must be DURABLE before the
@@ -2606,6 +2621,7 @@ impl Engine {
                         summary.replay_required += 1;
                         continue;
                     }
+                    verification_mode::note_stored_class(&rec, recheck);
                     verified.push((rec, recheck));
                 }
                 RecoveryAction::None => {}
@@ -3016,7 +3032,12 @@ impl Engine {
                     // with none.
                     verification_mode::count_size_only_commit(recheck, rec);
                     summary.committed += 1;
-                    tracing::info!(batch_id = %rec.batch_id, "recovered: source_committed");
+                    tracing::info!(
+                        batch_id = %rec.batch_id,
+                        verification_class = verification_mode::class_name(rec),
+                        recheck = recheck.as_str(),
+                        "recovered: source_committed"
+                    );
                 }
                 Err(e) => {
                     tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery commit failed");

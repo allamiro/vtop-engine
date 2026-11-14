@@ -97,6 +97,21 @@ impl VerificationClass {
     }
 }
 
+/// Tells the operator that a migration added the verification class column
+/// to a table that already held rows (#664): what happened, what it means for
+/// those rows, and that nothing needs doing.
+pub(crate) fn log_class_column_added(backend: &str, existing_rows: i64) {
+    tracing::info!(
+        backend,
+        existing_rows,
+        column = "verification_class",
+        "state store: added the verification_class column; {existing_rows} existing rows left \
+         NULL (verification class unknown). A VERIFIED row among them is counted, when recovery \
+         commits it, by recovery's re-check of the stored object, as before this release. \
+         Nothing to do"
+    );
+}
+
 /// Reads a serialized `verification_class` leniently: a value this build does
 /// not know is unknown (`None`), never an error. A prune digest is read whole
 /// or refused, so a strict enum would make one row from a newer release fail

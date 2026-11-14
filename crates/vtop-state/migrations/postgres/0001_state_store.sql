@@ -54,8 +54,11 @@ ALTER TABLE batches ADD COLUMN IF NOT EXISTS claim_gen BIGINT NOT NULL DEFAULT 0
 -- write it, so a row an older engine verifies keeps NULL. But engines before
 -- #664 read rows with `SELECT *` / `RETURNING *` through statements cached
 -- per connection, and after this ALTER Postgres refuses those ("cached plan
--- must not change result type") until the connection is replaced: restart
--- every older engine right after this migration (or drain them first).
+-- must not change result type") until the connection is replaced. A running
+-- engine reads whole rows only in startup recovery and when it settles a
+-- VERIFIED row whose source commit failed; that read fails and the row waits
+-- for the next restart. Restart every older engine right after this
+-- migration (or drain them first).
 -- Engines of this release name their columns, so a column a later migration
 -- adds does not affect them. The class decides only which counter a
 -- recovered commit is counted in; whether the row commits is still decided
@@ -145,13 +148,16 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
 -- checks the CHECK itself as well, so a CHECK replaced or restored on its own
 -- is refused under a current marker too. ANY change to the trigger or its
 -- function, or to the schema this migration leaves that an engine could
--- misread or an older release's migrate would undo, MUST bump this number and
+-- misread or an older release's migrate would undo, MUST bump this number,
+-- SCHEMA_VERSION and (when older schemas stop being readable)
 -- MIN_SCHEMA_VERSION together. A new nullable column that startup names
--- (check_schema's column list) and that older engines never name needs no
--- bump: startup already refuses a schema without it, an older release's
--- migrate never drops it, and the marker cannot make an older engine refuse
--- anything - it accepts every marker at or above its own minimum. The
--- verification_class column (#664) is such a change.
+-- (batch_columns!) and that older engines never name needs no bump: startup
+-- already refuses a schema without it, and an older release's migrate never
+-- drops it. The verification_class column (#664) is such a change. From #664
+-- on, engines and migrate refuse a marker above their SCHEMA_VERSION (a newer
+-- release's); releases before it accept every marker at or above their
+-- minimum, which is why the marker is bumped only for what they would
+-- misread.
 CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$
 -- vtop-state-schema 3
 BEGIN

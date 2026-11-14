@@ -72,6 +72,65 @@ pub(crate) enum Recheck {
     SizeOnly,
 }
 
+impl Recheck {
+    /// The re-check's result, as the logs name it.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::Strong => "strong",
+            Self::SizeOnly => "size_only",
+        }
+    }
+}
+
+/// The class a row was verified with, as the logs name it: `unknown` for a
+/// row with none (#664).
+pub(crate) fn class_name(rec: &BatchRecord) -> &'static str {
+    rec.verification_class
+        .map_or("unknown", VerificationClass::as_str)
+}
+
+/// Recovery re-checked a VERIFIED row and may commit it (#664): say how its
+/// commit will be counted when the recorded class cannot speak for itself -
+/// it has none, or the re-check found something else - and what, if
+/// anything, to do. A row whose class and re-check agree is not logged here;
+/// its commit is logged as before.
+pub(crate) fn note_stored_class(rec: &BatchRecord, recheck: Recheck) {
+    let found = recheck.as_str();
+    match rec.verification_class {
+        None => tracing::info!(
+            batch_id = %rec.batch_id,
+            verification_class = "unknown",
+            recheck = found,
+            "verification class unknown for batch {}: it was verified by a release before the \
+             ledger recorded classes (or one newer than this). Recovery re-checked the stored \
+             object ({found}) and counts its commit by that, as before. Nothing to do",
+            rec.batch_id
+        ),
+        Some(VerificationClass::Strong) if recheck == Recheck::SizeOnly => tracing::warn!(
+            batch_id = %rec.batch_id,
+            verification_class = "strong",
+            recheck = found,
+            "batch {} was verified strong, but recovery's re-check could confirm only its size \
+             (upload.require_strong_verification: false lets it commit). Its commit is counted \
+             as strong, the class that admitted it. The store can no longer show its content \
+             matches: check the backend's checksum support, and run `vtopctl scrub` to re-check \
+             committed batches",
+            rec.batch_id
+        ),
+        Some(VerificationClass::SizeOnly) if recheck == Recheck::Strong => tracing::info!(
+            batch_id = %rec.batch_id,
+            verification_class = "size_only",
+            recheck = found,
+            "batch {} was verified size-only, and recovery's re-check now matched its content. \
+             Its commit is counted as size-only, the class that admitted it. Nothing to do",
+            rec.batch_id
+        ),
+        Some(_) => {}
+    }
+}
+
 /// Recovery's storage re-check got a size-only result for a VERIFIED row.
 /// Under the strong default the row fails the re-check; under the opt-out it
 /// passes as [`Recheck::SizeOnly`]. Either way the decision is logged with
@@ -127,6 +186,8 @@ pub(crate) fn count_size_only_commit(recheck: Recheck, rec: &BatchRecord) {
     }
     tracing::warn!(
         batch_id = %rec.batch_id,
+        verification_class = class_name(rec),
+        recheck = recheck.as_str(),
         "recovered: source_committed on a size-only verification"
     );
     if let Some(mx) = telemetry::metrics() {

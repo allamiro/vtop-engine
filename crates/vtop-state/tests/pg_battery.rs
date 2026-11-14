@@ -13,7 +13,42 @@
 //!
 //! Build with `--features postgres,test-support`.
 
+use tracing::instrument::WithSubscriber;
 use vtop_state::pg_store::PgStateStore;
+
+/// Log lines captured as JSON, to assert the messages an operator reads.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Captured {
+    fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(self.clone())
+            .finish()
+    }
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 use vtop_state::test_battery;
 use vtop_state::StateStore;
 
@@ -133,10 +168,12 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         .await
         .unwrap();
 
-    // #664: a schema from before the verification class lacks its column.
-    // Startup names every column it reads, so it refuses the schema with the
-    // migrate guidance; `vtopctl migrate` adds the column, and a row verified
-    // before it reads with no class (unknown), as SQLite reads one.
+    // #664: a schema from before the verification class lacks its column,
+    // and holds rows in every state a ledger has. Startup names every column
+    // it reads, so it refuses the schema with the migrate guidance, naming
+    // the column; `vtopctl migrate` adds the column, says how many rows it
+    // left without a class, and every row reads back as it was, with no class
+    // (unknown), as SQLite reads one.
     PgStateStore::migrate(&migrator_conn).await.unwrap();
     let admin = PgStateStore::connect(&migrator_conn).await.unwrap();
     admin
@@ -145,33 +182,61 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
              INSERT INTO batches \
              (batch_id, tenant, source_type, source_name, format, state, \
               progress_start_json, progress_end_json, created_at, updated_at) \
-             VALUES ('pre-664','default','kafka','app','cef','batching', \
+             SELECT id, 'default', 'kafka', 'app', 'cef', 'batching', \
               '{\"source_type\":\"kafka\",\"topic\":\"app\",\"partition\":0,\"start_offset\":0,\"end_offset\":1,\"consumer_group\":\"g\"}', \
               '{\"source_type\":\"kafka\",\"topic\":\"app\",\"partition\":0,\"start_offset\":0,\"end_offset\":1,\"consumer_group\":\"g\"}', \
-              't','t'); \
-             UPDATE batches SET state = 'verified' WHERE batch_id = 'pre-664'; \
+              't', 't' \
+             FROM unnest(ARRAY['pre-664','pre-664-committed','pre-664-failed','pre-664-batching']) AS id; \
+             UPDATE batches SET state = 'verified' WHERE batch_id IN ('pre-664', 'pre-664-committed'); \
+             UPDATE batches SET state = 'source_committed' WHERE batch_id = 'pre-664-committed'; \
+             UPDATE batches SET state = 'failed', error_message = 'upload failed' WHERE batch_id = 'pre-664-failed'; \
              ALTER TABLE batches DROP COLUMN verification_class;",
         )
         .await
         .unwrap();
     let err = match PgStateStore::connect(&migrator_conn).await {
         Ok(_) => panic!("runtime connect must reject a schema without verification_class"),
-        Err(err) => err,
+        Err(err) => err.to_string(),
     };
     assert!(
-        err.to_string().contains("vtopctl migrate"),
-        "a pre-#664 schema must give migration guidance: {err}"
+        err.contains("vtopctl migrate") && err.contains("verification_class"),
+        "a pre-#664 schema must give migration guidance naming the column: {err}"
     );
-    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    let logs = Captured::default();
+    PgStateStore::migrate(&migrator_conn)
+        .with_subscriber(logs.subscriber())
+        .await
+        .unwrap();
+    assert!(
+        logs.text()
+            .contains("added the verification_class column; 4 existing rows left NULL"),
+        "the migration must say what it did to the existing rows: {}",
+        logs.text()
+    );
     let admin = PgStateStore::connect(&migrator_conn)
         .await
         .expect("migrate adds the verification_class column");
-    let legacy = admin.get_batch("pre-664").await.unwrap().unwrap();
-    assert_eq!(
-        (legacy.state, legacy.verification_class),
-        (vtop_core::state_machine::BatchState::Verified, None),
-        "a row verified before #664 has no class"
-    );
+    use vtop_core::state_machine::BatchState;
+    for (id, state) in [
+        ("pre-664", BatchState::Verified),
+        ("pre-664-committed", BatchState::SourceCommitted),
+        ("pre-664-failed", BatchState::Failed),
+        ("pre-664-batching", BatchState::Batching),
+    ] {
+        let legacy = admin.get_batch(id).await.unwrap().unwrap();
+        assert_eq!(
+            (legacy.state, legacy.verification_class),
+            (state, None),
+            "{id}: a row written before #664 keeps its state and has no class"
+        );
+    }
+    // A second migrate adds nothing and says nothing.
+    let logs = Captured::default();
+    PgStateStore::migrate(&migrator_conn)
+        .with_subscriber(logs.subscriber())
+        .await
+        .unwrap();
+    assert!(!logs.text().contains("added the verification_class column"));
     // A value this build does not know (a newer release's) reads as unknown,
     // not as an error and not as either class.
     admin
@@ -180,6 +245,66 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         .unwrap();
     let newer = admin.get_batch("pre-664").await.unwrap().unwrap();
     assert_eq!(newer.verification_class, None);
+
+    // #664: a schema a NEWER release migrated - its marker above the newest
+    // this release reads - is refused, by startup and by this release's
+    // migrate (which would install its older trigger over it), with the
+    // marker and the versions this release reads in the message. Nothing is
+    // changed: the newer body is still there afterwards.
+    admin
+        .execute_raw(
+            "CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$
+-- vtop-state-schema 4
+BEGIN
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;",
+        )
+        .await
+        .unwrap();
+    for (what, refused) in [
+        (
+            "startup",
+            PgStateStore::connect(&migrator_conn)
+                .await
+                .err()
+                .map(|e| e.to_string()),
+        ),
+        (
+            "migrate",
+            PgStateStore::migrate(&migrator_conn)
+                .await
+                .err()
+                .map(|e| e.to_string()),
+        ),
+    ] {
+        let refused = refused.unwrap_or_else(|| panic!("{what} accepted a newer schema marker"));
+        for part in [
+            "schema marker 4",
+            "-- vtop-state-schema 4",
+            "minimum 3",
+            "newest 3",
+            "newer release",
+        ] {
+            assert!(
+                refused.contains(part),
+                "{what}: {part:?} missing from: {refused}"
+            );
+        }
+    }
+    admin
+        .execute_raw(
+            "DO $chk$ BEGIN \
+               IF (SELECT prosrc FROM pg_catalog.pg_proc WHERE proname = 'vtop_enforce_commit_after_verify') \
+                  NOT LIKE '%vtop-state-schema 4%' THEN \
+                 RAISE EXCEPTION 'the refused migrate replaced the newer trigger body'; \
+               END IF; \
+             END $chk$; \
+             DROP FUNCTION vtop_enforce_commit_after_verify() CASCADE;",
+        )
+        .await
+        .unwrap();
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
 
     // Nor is a trigger that exists by name but whose function body has no
     // current schema marker, or one a restore left disabled. The old body is

@@ -23,6 +23,17 @@ use vtop_core::errors::VtopError;
 use vtop_core::state_machine::{transition, BatchState};
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 
+/// The SQLite ledger's schema version, kept in the file's `PRAGMA
+/// user_version` (#664). 1 is the first: the schema with `verification_class`.
+/// Files from before it read 0 and are brought up to it on open. A higher
+/// value means a newer release has opened the file for a change this release
+/// could misread - the version is raised for nothing else - and this release
+/// refuses the file rather than run on it. Releases before #664 never read the
+/// version; this is the refusal path for the releases from here on. Raise it,
+/// and the `PRAGMA user_version = 1` in `migrate`, together
+/// (`sqlite_refuses_a_file_a_newer_release_opened` checks they agree).
+const SQLITE_SCHEMA_VERSION: i64 = 1;
+
 /// How many times a write that lost a race to another writer is re-validated
 /// and retried before giving up.
 const MAX_CONFLICT_RETRIES: u32 = 5;
@@ -810,6 +821,20 @@ impl StateStore for SqliteStateStore {
 /// on every open. See [`SqliteStateStore::connect`] for why it runs on one
 /// connection.
 async fn migrate(conn: &mut sqlx::SqliteConnection) -> Result<(), VtopError> {
+    // A file a newer release has opened is left alone (#664): see
+    // SQLITE_SCHEMA_VERSION.
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(map_sqlx)?;
+    if version > SQLITE_SCHEMA_VERSION {
+        return Err(VtopError::State(format!(
+            "SQLite state-store schema version {version} (the ledger file's PRAGMA user_version) \
+             is newer than this release supports (newest {SQLITE_SCHEMA_VERSION}): a newer \
+             release has opened this file. Nothing was started or changed. Run that release or a \
+             later one; downgrade is not supported"
+        )));
+    }
     // Execute each statement in the schema script.
     for stmt in SCHEMA.split(';') {
         let stmt = stmt.trim();
@@ -839,10 +864,21 @@ async fn migrate(conn: &mut sqlx::SqliteConnection) -> Result<(), VtopError> {
         // reads rows by column name and never writes it.
         "ALTER TABLE batches ADD COLUMN verification_class TEXT",
     ] {
-        if let Err(e) = sqlx::raw_sql(stmt).execute(&mut *conn).await {
-            if !e.to_string().contains("duplicate column name") {
+        match sqlx::raw_sql(stmt).execute(&mut *conn).await {
+            Err(e) if !e.to_string().contains("duplicate column name") => {
                 return Err(map_sqlx(e));
             }
+            Err(_) => {}
+            // Added to a table that already existed: a new table is created
+            // with the column, and this ALTER finds it there.
+            Ok(_) if stmt.contains("verification_class") => {
+                let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM batches")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(map_sqlx)?;
+                crate::models::log_class_column_added("SQLite", rows);
+            }
+            Ok(_) => {}
         }
     }
     // A row is born only as batching (#625), in the database too, so a
@@ -859,6 +895,12 @@ async fn migrate(conn: &mut sqlx::SqliteConnection) -> Result<(), VtopError> {
     .execute(&mut *conn)
     .await
     .map_err(map_sqlx)?;
+    if version < SQLITE_SCHEMA_VERSION {
+        sqlx::raw_sql("PRAGMA user_version = 1")
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx)?;
+    }
     Ok(())
 }
 
@@ -1170,19 +1212,42 @@ mod tests {
             let marker =
                 serde_json::to_string(&test_battery::sample_record("pre-664").progress_end)
                     .unwrap();
-            sqlx::query(
-                "INSERT INTO batches (batch_id, tenant, source_type, source_name, format, \
-                 state, progress_start_json, progress_end_json, created_at, updated_at) \
-                 VALUES ('pre-664', 'default', 'kafka', 'app_events', 'cef', 'verified', \
-                 ?, ?, 't', 't')",
-            )
-            .bind(&marker)
-            .bind(&marker)
-            .execute(&pool)
-            .await
-            .unwrap();
+            // A row in each state a ledger holds.
+            for (id, state) in [
+                ("pre-664", "verified"),
+                ("pre-664-committed", "source_committed"),
+                ("pre-664-failed", "failed"),
+                ("pre-664-batching", "batching"),
+            ] {
+                sqlx::query(
+                    "INSERT INTO batches (batch_id, tenant, source_type, source_name, format, \
+                     state, progress_start_json, progress_end_json, created_at, updated_at) \
+                     VALUES (?, 'default', 'kafka', 'app_events', 'cef', ?, ?, ?, 't', 't')",
+                )
+                .bind(id)
+                .bind(state)
+                .bind(&marker)
+                .bind(&marker)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
         }
+        // The message the open logs is asserted in tests/operator_messages.rs.
         let store = SqliteStateStore::connect(&url).await.unwrap();
+        for (id, state) in [
+            ("pre-664", BatchState::Verified),
+            ("pre-664-committed", BatchState::SourceCommitted),
+            ("pre-664-failed", BatchState::Failed),
+            ("pre-664-batching", BatchState::Batching),
+        ] {
+            let got = store.get_batch(id).await.unwrap().unwrap();
+            assert_eq!(
+                (got.state, got.verification_class),
+                (state, None),
+                "{id}: a row written before #664 keeps its state and has no class"
+            );
+        }
         let claimed = store
             .claim_incomplete_batches(
                 "engine-upgraded",
@@ -1191,9 +1256,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(claimed.len(), 1, "{claimed:?}");
+        let verified = claimed
+            .iter()
+            .find(|row| row.batch_id == "pre-664")
+            .unwrap_or_else(|| panic!("{claimed:?}"));
         assert_eq!(
-            (claimed[0].state, claimed[0].verification_class),
+            (verified.state, verified.verification_class),
             (BatchState::Verified, None),
             "a row verified before #664 has no class"
         );
@@ -1225,7 +1293,58 @@ mod tests {
             Some(crate::VerificationClass::SizeOnly)
         );
         // Reopening is idempotent: the column is added once.
+        drop(store);
         SqliteStateStore::connect(&url).await.unwrap();
+    }
+
+    /// #664: a file a newer release has opened - its schema version above
+    /// the newest this release reads - is refused, naming the version and
+    /// the newest this release reads, and left as it was. A file this
+    /// release opens carries its version.
+    #[tokio::test]
+    async fn sqlite_refuses_a_file_a_newer_release_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("newer.db").display());
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        store
+            .save_batch_state(&test_battery::sample_record("kept"))
+            .await
+            .unwrap();
+        drop(store);
+        let mut other = sqlx::ConnectOptions::connect(&parse_sqlite_opts(&url).unwrap())
+            .await
+            .unwrap();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut other)
+            .await
+            .unwrap();
+        assert_eq!(version, SQLITE_SCHEMA_VERSION);
+        sqlx::raw_sql("PRAGMA user_version = 2")
+            .execute(&mut other)
+            .await
+            .unwrap();
+        let refused = match SqliteStateStore::connect(&url).await {
+            Ok(_) => panic!("a file a newer release opened was accepted"),
+            Err(e) => e.to_string(),
+        };
+        for part in [
+            "schema version 2",
+            "newest 1",
+            "newer release",
+            "downgrade is not supported",
+        ] {
+            assert!(refused.contains(part), "{part:?} missing from: {refused}");
+        }
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut other)
+            .await
+            .unwrap();
+        assert_eq!(version, 2, "left as it was");
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM batches")
+            .fetch_one(&mut other)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     /// Review of #664: a store that is open while another connection adds a

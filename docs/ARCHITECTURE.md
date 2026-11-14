@@ -713,8 +713,19 @@ A table change, unlike the two notes above: one new column on both backends,
 - SQLite adds the column when it opens the file. PostgreSQL adds it in
   `vtopctl migrate` (`ADD COLUMN IF NOT EXISTS`); engine startup names it, so
   an engine of this release refuses a schema without it and asks for the
-  migration. The schema marker stays at 3: see the migration notes in
+  migration, naming the missing column. Either way, adding it to a table
+  that holds rows logs `state store: added the verification_class column; N
+  existing rows left NULL (verification class unknown) ...` once, with
+  `backend`, `existing_rows` and `column` as fields. The PostgreSQL schema
+  marker stays at 3: see the migration notes in
   [`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md).
+- SQLite has a schema version of its own from #664: the file's `PRAGMA
+  user_version`, 1 for this schema, set on open (a file from before reads
+  0). A file whose version is higher was opened by a newer release, and this
+  release refuses it - `SQLite state-store schema version N (the ledger
+  file's PRAGMA user_version) is newer than this release supports (newest
+  1) ...` - and leaves it as it was. The PostgreSQL schema has the same rule
+  for its marker. Releases before #664 do not read the version.
 - The serialized record (a prune digest row) carries `verification_class`
   only when it is known, so a legacy row serializes as before; a value the
   reader does not know reads as unknown rather than failing the digest.
@@ -725,7 +736,9 @@ A table change, unlike the two notes above: one new column on both backends,
   statements cached per connection, and a connection open while the column
   is added fails those reads until it is replaced (PostgreSQL: `cached plan
   must not change result type`; SQLite: the driver panics on the extra
-  column). Restart older PostgreSQL engines right after `vtopctl migrate`,
+  column). A running engine makes such reads only in startup recovery and
+  when it settles a VERIFIED row whose source commit failed; its batch
+  writes name their columns. Restart older PostgreSQL engines right after `vtopctl migrate`,
   and stop any other process on a SQLite file before a newer release first
   opens it. This release names every column it reads (`batch_columns!` in
   vtop-state), so a column a later release adds does not affect it.

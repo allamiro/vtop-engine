@@ -1373,7 +1373,17 @@ async fn recovery_commits_a_verified_range_above_a_failed_row_that_a_retry_alrea
 /// class, as every release before #664 wrote it.
 async fn size_only_verified_ledger(dir: &Path, tenant: &str, failed_below: bool) -> Engine {
     let url = format!("sqlite://{}", dir.join("state.db").display());
-    verified_ledger(dir, &url, tenant, StoredBy::SizeOnly, None, failed_below).await
+    verified_ledger(
+        dir,
+        &url,
+        "b-629",
+        tenant,
+        StoredBy::SizeOnly,
+        None,
+        failed_below,
+        false,
+    )
+    .await
 }
 
 /// What recovery's re-check of `b-629` will find in the store.
@@ -1390,13 +1400,16 @@ enum StoredBy {
 /// with `class` - or, for `None`, with no class, as a release before #664
 /// did. The ledger is written through a store that is closed again before
 /// the engine opens it: the engine is the process after a restart.
+#[allow(clippy::too_many_arguments)]
 async fn verified_ledger(
     dir: &Path,
     url: &str,
+    id: &str,
     tenant: &str,
     stored: StoredBy,
     class: Option<VerificationClass>,
     failed_below: bool,
+    strict: bool,
 ) -> Engine {
     let work = dir.join("work");
     let input = dir.join("in.log");
@@ -1412,8 +1425,8 @@ async fn verified_ledger(
         content_fingerprint: None,
         tail_fingerprint: None,
     };
-    let object_uri = "s3://telemetry-data/x/b-629.raw.gz";
-    let manifest_uri = "s3://telemetry-data/x/b-629.manifest.json";
+    let object_uri = &format!("s3://telemetry-data/x/{id}.raw.gz");
+    let manifest_uri = &format!("s3://telemetry-data/x/{id}.manifest.json");
     let object_bytes = b"fourteen-bytes";
     let digest = vtop_core::checksum::sha256_bytes(object_bytes);
     let (algorithm, checksum) = match stored {
@@ -1422,7 +1435,7 @@ async fn verified_ledger(
     };
     let (manifest, manifest_path) = write_recovery_manifest(
         &work,
-        "b-629",
+        id,
         &path,
         range(7, 14),
         object_uri,
@@ -1458,15 +1471,20 @@ async fn verified_ledger(
         let store = vtop_state::connect_state_store(url).await.unwrap();
         if failed_below {
             store
-                .save_batch_state(&row("b-629-failed", 0, 7, "2026-01-01T00:00:00+00:00"))
+                .save_batch_state(&row(
+                    &format!("{id}-failed"),
+                    0,
+                    7,
+                    "2026-01-01T00:00:00+00:00",
+                ))
                 .await
                 .unwrap();
             store
-                .mark_failed("b-629-failed", "upload failed")
+                .mark_failed(&format!("{id}-failed"), "upload failed")
                 .await
                 .unwrap();
         }
-        let mut verified = row("b-629", 7, 14, "2026-01-01T00:00:01+00:00");
+        let mut verified = row(id, 7, 14, "2026-01-01T00:00:01+00:00");
         verified.object_uri = Some(object_uri.into());
         verified.manifest_uri = Some(manifest_uri.into());
         verified.object_sha256 = Some(checksum.to_owned());
@@ -1481,14 +1499,14 @@ async fn verified_ledger(
             BatchState::ManifestUploaded,
         ] {
             store
-                .update_batch_state("b-629", st, &BatchPatch::default())
+                .update_batch_state(id, st, &BatchPatch::default())
                 .await
                 .unwrap();
         }
         match class {
-            Some(class) => store.mark_verified("b-629", class).await.unwrap(),
+            Some(class) => store.mark_verified(id, class).await.unwrap(),
             None => store
-                .update_batch_state("b-629", BatchState::Verified, &BatchPatch::default())
+                .update_batch_state(id, BatchState::Verified, &BatchPatch::default())
                 .await
                 .unwrap(),
         }
@@ -1501,6 +1519,7 @@ async fn verified_ledger(
         "mock", // testkit config has require_strong_verification: false
     );
     cfg.engine.tenant = tenant.into();
+    cfg.upload.require_strong_verification = strict;
     if url.starts_with("postgres") {
         // The engine takes a PostgreSQL URL only from a secret reference:
         // the variable the Postgres test reads `url` from.
@@ -1548,7 +1567,7 @@ async fn size_only_count_of_recovery(
     class: Option<VerificationClass>,
 ) -> u64 {
     let before = size_only_count(tenant);
-    let mut engine = verified_ledger(dir, url, tenant, stored, class, false).await;
+    let mut engine = verified_ledger(dir, url, "b-629", tenant, stored, class, false, false).await;
     let summary = engine.recover().await.unwrap();
     assert_eq!(
         summary.committed, 1,
@@ -1662,6 +1681,11 @@ async fn on_postgres_a_recovered_commit_is_counted_by_its_stored_class() {
             _ => assert_strong_row_is_never_counted_size_only(dir.path(), &url, tenant).await,
         }
     }
+    // And every combination the SQLite matrix covers, on Postgres.
+    recovery_matrix(&url, "pg", || {
+        Box::pin(async { admin.execute_raw("TRUNCATE batches").await.unwrap() })
+    })
+    .await;
     admin.execute_raw("TRUNCATE batches").await.unwrap();
 }
 
@@ -2749,4 +2773,520 @@ async fn an_unfingerprinted_older_commit_never_suppresses_a_newer_generations() 
         through, 84,
         "the new generation is archived only through {through}: {covered:?}"
     );
+}
+
+// ---- #664: every combination recovery meets, and what it says ---------------
+
+/// Every log line this test process writes, as JSON. One process-wide capture:
+/// a capture scoped to one test thread misses events when other tests in the
+/// process race it for the tracing callsite cache. Lines are told apart by
+/// batch id, which each test below makes unique.
+fn logs() -> &'static Captured {
+    static LOGS: std::sync::OnceLock<Captured> = std::sync::OnceLock::new();
+    LOGS.get_or_init(|| {
+        let captured = Captured::default();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .json()
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(captured.clone())
+                .finish(),
+        )
+        .expect("the only global subscriber in this binary");
+        captured
+    })
+}
+
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Captured {
+    /// The captured lines about batch `id`.
+    fn about(&self, id: &str) -> Vec<String> {
+        let field = format!(r#""batch_id":"{id}""#);
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .lines()
+            .filter(|line| line.contains(&field))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Asserts one captured line about `id` carries every part.
+fn assert_said(id: &str, parts: &[&str]) {
+    let lines = logs().about(id);
+    assert!(
+        lines
+            .iter()
+            .any(|line| parts.iter().all(|part| line.contains(part))),
+        "no line about {id} carries all of {parts:?}; lines about it:\n{}",
+        lines.join("\n")
+    );
+}
+
+/// Asserts no captured line about `id` contains `part`.
+fn assert_not_said(id: &str, part: &str) {
+    let lines = logs().about(id);
+    assert!(
+        lines.iter().all(|line| !line.contains(part)),
+        "a line about {id} says {part:?}:\n{}",
+        lines.join("\n")
+    );
+}
+
+/// What recovery of one VERIFIED row must do, for each class it may have
+/// been verified with, each result its re-check may find, and each setting of
+/// `upload.require_strong_verification` (#664):
+///
+/// - strict, re-check size-only: not committed, replayed, nothing counted;
+///   the class is kept on the handed-back row;
+/// - otherwise committed, and counted as size-only exactly when the row was
+///   verified size-only - or, with no class, when the re-check was;
+/// - each says what happened in the log: an unknown class, or a class the
+///   re-check disagrees with, by name, with the batch id, class and re-check
+///   result as fields.
+async fn recovery_matrix<'a, F>(url: &str, label: &str, reset: F)
+where
+    F: Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>,
+{
+    let _ = logs();
+    let classes = [
+        None,
+        Some(VerificationClass::Strong),
+        Some(VerificationClass::SizeOnly),
+    ];
+    for strict in [false, true] {
+        for class in classes {
+            for stored in [StoredBy::SizeOnly, StoredBy::Digest] {
+                reset().await;
+                let class_name = class.map_or("unknown", VerificationClass::as_str);
+                let id = format!(
+                    "b664-{label}-{}-{class_name}-{stored:?}",
+                    if strict { "strict" } else { "optout" }
+                );
+                let tenant = format!("tenant-{id}");
+                let dir = tempfile::tempdir().unwrap();
+                // A Postgres ledger is reset per case; a SQLite one is new.
+                let url = if url.is_empty() {
+                    format!("sqlite://{}", dir.path().join("state.db").display())
+                } else {
+                    url.to_owned()
+                };
+                let before = size_only_count(&tenant);
+                let mut engine =
+                    verified_ledger(dir.path(), &url, &id, &tenant, stored, class, false, strict)
+                        .await;
+                let summary = engine.recover().await.unwrap();
+                let moved = size_only_count(&tenant) - before;
+                let row = engine.store.get_batch(&id).await.unwrap().unwrap();
+                let case = format!("{id}: {summary:?}");
+                if strict && matches!(stored, StoredBy::SizeOnly) {
+                    assert_eq!(
+                        (summary.committed, summary.replay_required, moved),
+                        (0, 1, 0),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        (row.state, row.verification_class),
+                        (BatchState::ReplayRequired, class),
+                        "{case}"
+                    );
+                    assert_said(
+                        &id,
+                        &[
+                            "failed storage re-check; replaying",
+                            &format!(r#""verification_class":"{class_name}""#),
+                        ],
+                    );
+                    continue;
+                }
+                let counted = match class {
+                    Some(VerificationClass::SizeOnly) => 1,
+                    Some(VerificationClass::Strong) => 0,
+                    None => u64::from(matches!(stored, StoredBy::SizeOnly)),
+                };
+                assert_eq!((summary.committed, moved), (1, counted), "{case}");
+                assert_eq!(
+                    (row.state, row.verification_class),
+                    (BatchState::SourceCommitted, class),
+                    "{case}"
+                );
+                let recheck = match stored {
+                    StoredBy::SizeOnly => "size_only",
+                    StoredBy::Digest => "strong",
+                };
+                let fields = [
+                    format!(r#""verification_class":"{class_name}""#),
+                    format!(r#""recheck":"{recheck}""#),
+                ];
+                assert_said(
+                    &id,
+                    &["recovered: source_committed", &fields[0], &fields[1]],
+                );
+                match (class, stored) {
+                    (None, _) => assert_said(
+                        &id,
+                        &[
+                            &format!("verification class unknown for batch {id}"),
+                            "counts its commit by that",
+                            &fields[0],
+                            &fields[1],
+                        ],
+                    ),
+                    (Some(VerificationClass::Strong), StoredBy::SizeOnly) => assert_said(
+                        &id,
+                        &[
+                            "was verified strong, but recovery's re-check could confirm only its size",
+                            "vtopctl scrub",
+                            r#""level":"WARN""#,
+                            &fields[0],
+                        ],
+                    ),
+                    (Some(VerificationClass::SizeOnly), StoredBy::Digest) => assert_said(
+                        &id,
+                        &[
+                            "was verified size-only, and recovery's re-check now matched",
+                            "counted as size-only",
+                            &fields[0],
+                        ],
+                    ),
+                    // Class and re-check agree: nothing more to say.
+                    _ => {
+                        assert_not_said(&id, "verification class unknown");
+                        assert_not_said(&id, "re-check could confirm only");
+                        assert_not_said(&id, "re-check now matched");
+                    }
+                }
+                if counted == 1 {
+                    assert_said(
+                        &id,
+                        &["source_committed on a size-only verification", &fields[0]],
+                    );
+                } else {
+                    assert_not_said(&id, "source_committed on a size-only verification");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn recovery_counts_and_reports_every_class_recheck_and_mode() {
+    recovery_matrix("", "sqlite", || Box::pin(async {})).await;
+}
+
+/// A row recovery re-checked and found good, but whose source commit failed,
+/// is committed by a later pass (#659's settle pass) - and counted there by
+/// the class it was verified with, not by the re-check (#664).
+#[tokio::test]
+async fn a_recovered_row_whose_commit_failed_is_counted_by_its_class_when_it_settles() {
+    let _ = logs();
+    for (class, stored, expected) in [
+        (Some(VerificationClass::Strong), StoredBy::SizeOnly, 0),
+        (Some(VerificationClass::SizeOnly), StoredBy::Digest, 1),
+        (None, StoredBy::SizeOnly, 1),
+        (None, StoredBy::Digest, 0),
+    ] {
+        let class_name = class.map_or("unknown", VerificationClass::as_str);
+        let id = format!("b664-settle-recovered-{class_name}-{stored:?}");
+        let tenant = format!("tenant-{id}");
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let mut engine =
+            verified_ledger(dir.path(), &url, &id, &tenant, stored, class, false, false).await;
+        let fails = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let adapter = engine.adapters.remove(&SourceType::File).unwrap();
+        engine.adapters.insert(
+            SourceType::File,
+            Box::new(FlakyCommit {
+                inner: adapter,
+                fails: fails.clone(),
+            }),
+        );
+        let before = size_only_count(&tenant);
+        let summary = engine.recover().await.unwrap();
+        assert_eq!(
+            (summary.committed, summary.still_pending),
+            (0, 1),
+            "{id}: the recovery commit failed: {summary:?}"
+        );
+        assert_eq!(size_only_count(&tenant) - before, 0, "{id}: nothing yet");
+        engine.process_once(SourceType::File).await.unwrap();
+        let row = engine.store.get_batch(&id).await.unwrap().unwrap();
+        assert_eq!(
+            (row.state, row.verification_class),
+            (BatchState::SourceCommitted, class),
+            "{id}"
+        );
+        assert_eq!(
+            size_only_count(&tenant) - before,
+            expected,
+            "{id}: counted at the settle by its class"
+        );
+        assert_said(
+            &id,
+            &[
+                "source_committed (an earlier pass left it VERIFIED)",
+                &format!(r#""verification_class":"{class_name}""#),
+            ],
+        );
+        engine.process_once(SourceType::File).await.unwrap();
+        assert_eq!(size_only_count(&tenant) - before, expected, "{id}: once");
+    }
+}
+
+/// A batch the running engine verified size-only, whose source commit
+/// failed, is counted once - at its verification - and not again when a later
+/// pass settles it (#659), though the ledger now says size-only (#664).
+#[tokio::test]
+async fn a_pipeline_row_whose_commit_failed_is_not_counted_again_when_it_settles() {
+    let tenant = "tenant-664-pipeline-settle";
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    std::fs::write(&input, "line-0\nline-1\n").unwrap();
+    let url = format!("sqlite://{}", dir.path().join("state.db").display());
+    let mut cfg = file_config(
+        work.to_str().unwrap(),
+        &url,
+        vec![input.to_string_lossy().into_owned()],
+        "mock",
+    );
+    cfg.engine.tenant = tenant.into();
+    // Checksums off, under the opt-out testkit sets: size-only.
+    cfg.checksum.algorithm = vtop_core::types::ChecksumAlgorithm::None;
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let adapter = engine.adapters.remove(&SourceType::File).unwrap();
+    engine.adapters.insert(
+        SourceType::File,
+        Box::new(FlakyCommit {
+            inner: adapter,
+            fails: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        }),
+    );
+    let before = size_only_count(tenant);
+    let outcomes = engine.process_once(SourceType::File).await.unwrap();
+    assert!(!outcomes[0].committed, "{outcomes:?}");
+    assert_eq!(
+        size_only_count(tenant) - before,
+        1,
+        "counted at verification"
+    );
+    let rows = engine.store.list_batches().await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.state, row.verification_class))
+            .collect::<Vec<_>>(),
+        vec![(BatchState::Verified, Some(VerificationClass::SizeOnly))]
+    );
+    engine.process_once(SourceType::File).await.unwrap();
+    let row = engine
+        .store
+        .get_batch(&rows[0].batch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, BatchState::SourceCommitted);
+    assert_eq!(
+        size_only_count(tenant) - before,
+        1,
+        "the settle pass does not count a pipeline row's verification again"
+    );
+}
+
+/// A VERIFIED row recovery holds back under a failed lower range is counted
+/// at no restart, whatever its class (#664 with #629's review).
+#[tokio::test]
+async fn a_held_back_row_is_counted_at_no_restart_whatever_its_class() {
+    for class in [
+        None,
+        Some(VerificationClass::Strong),
+        Some(VerificationClass::SizeOnly),
+    ] {
+        let class_name = class.map_or("unknown", VerificationClass::as_str);
+        let id = format!("b664-held-{class_name}");
+        let tenant = format!("tenant-{id}");
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let before = size_only_count(&tenant);
+        let mut engine = verified_ledger(
+            dir.path(),
+            &url,
+            &id,
+            &tenant,
+            StoredBy::SizeOnly,
+            class,
+            true,
+            false,
+        )
+        .await;
+        for pass in 1..=2 {
+            let summary = engine.recover().await.unwrap();
+            assert_eq!(summary.committed, 0, "{id} pass {pass}: held back");
+            let row = engine.store.get_batch(&id).await.unwrap().unwrap();
+            assert_eq!(
+                (row.state, row.verification_class),
+                (BatchState::Verified, class),
+                "{id} pass {pass}"
+            );
+            assert_eq!(size_only_count(&tenant) - before, 0, "{id} pass {pass}");
+        }
+    }
+}
+
+/// A row verified size-only that later failed and was handed back, then
+/// retired as SUPERSEDED: the retirement counts nothing - not the size-only
+/// counter either - and the row keeps its class (#664 with #567).
+#[tokio::test]
+async fn a_retired_row_verified_size_only_counts_nothing() {
+    let tenant = "tenant-664-retired-size-only";
+    let size_only = || size_only_count(tenant);
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    std::fs::write(&input, "line-0\nline-1\nline-2\nline-3\n").unwrap();
+    let inode = inode_of(&input);
+    let url = format!("sqlite://{}", dir.path().join("state.db").display());
+    let path = input.to_string_lossy().into_owned();
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        let mut stale = file_row("b664-stale", &path, inode, (0, 14), "2026-01-01T00:00:00Z");
+        stale.tenant = tenant.into();
+        store.save_batch_state(&stale).await.unwrap();
+        for st in [
+            BatchState::Sealed,
+            BatchState::Compressed,
+            BatchState::Checksummed,
+            BatchState::ObjectUploaded,
+            BatchState::ManifestUploaded,
+        ] {
+            store
+                .update_batch_state("b664-stale", st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+        store
+            .mark_verified("b664-stale", VerificationClass::SizeOnly)
+            .await
+            .unwrap();
+        // Its re-check failed: handed back, as recovery leaves it.
+        store
+            .mark_failed("b664-stale", "storage re-check failed")
+            .await
+            .unwrap();
+        store
+            .update_batch_state(
+                "b664-stale",
+                BatchState::ReplayRequired,
+                &BatchPatch::default(),
+            )
+            .await
+            .unwrap();
+        let mut retry = file_row("b664-retry", &path, inode, (0, 28), "2026-01-01T00:00:02Z");
+        retry.tenant = tenant.into();
+        commit_row(&store, &retry).await;
+    }
+    let before = size_only();
+    let mut cfg = file_config(work.to_str().unwrap(), &url, vec![path.clone()], "mock");
+    cfg.engine.tenant = tenant.into();
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(summary.superseded, 1, "{summary:?}");
+    let row = engine.store.get_batch("b664-stale").await.unwrap().unwrap();
+    assert_eq!(
+        (row.state, row.verification_class),
+        (BatchState::Superseded, Some(VerificationClass::SizeOnly))
+    );
+    assert_eq!(
+        size_only() - before,
+        0,
+        "a retirement counts no size-only commit"
+    );
+}
+
+/// Fails the first `fails` source commits, then commits; everything else is
+/// the wrapped adapter's.
+struct FlakyCommit {
+    inner: Box<dyn vtop_adapters::base::SourceAdapter>,
+    fails: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl vtop_adapters::base::SourceAdapter for FlakyCommit {
+    async fn discover_sources(
+        &self,
+    ) -> Result<Vec<vtop_adapters::base::DiscoveredSource>, vtop_core::errors::VtopError> {
+        self.inner.discover_sources().await
+    }
+    async fn read_batch_candidates(
+        &mut self,
+        source: &vtop_adapters::base::DiscoveredSource,
+        records: usize,
+        bytes: usize,
+        wait: std::time::Duration,
+    ) -> Result<Vec<vtop_adapters::base::ReadResult>, vtop_core::errors::VtopError> {
+        self.inner
+            .read_batch_candidates(source, records, bytes, wait)
+            .await
+    }
+    async fn commit_progress(
+        &mut self,
+        marker: &ProgressMarker,
+    ) -> Result<(), vtop_core::errors::VtopError> {
+        use std::sync::atomic::Ordering;
+        // One adapter, driven by one engine at a time: no race to guard.
+        let left = self.fails.load(Ordering::SeqCst);
+        if left > 0 {
+            self.fails.store(left - 1, Ordering::SeqCst);
+            return Err(vtop_core::errors::VtopError::Source(
+                "simulated source commit failure".into(),
+            ));
+        }
+        self.inner.commit_progress(marker).await
+    }
+    async fn replay_from_marker(
+        &mut self,
+        marker: &ProgressMarker,
+    ) -> Result<(), vtop_core::errors::VtopError> {
+        self.inner.replay_from_marker(marker).await
+    }
+    fn read_position(&self, marker: &ProgressMarker) -> Option<i128> {
+        self.inner.read_position(marker)
+    }
+    fn committed_through(&self, marker: &ProgressMarker) -> Option<i128> {
+        self.inner.committed_through(marker)
+    }
+    async fn replay_from_markers(
+        &mut self,
+        markers: &[ProgressMarker],
+    ) -> Vec<Result<(), vtop_core::errors::VtopError>> {
+        self.inner.replay_from_markers(markers).await
+    }
+    fn source_type(&self) -> SourceType {
+        self.inner.source_type()
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self.inner.as_any_mut()
+    }
 }

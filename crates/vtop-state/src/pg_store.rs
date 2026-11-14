@@ -56,16 +56,41 @@ const MIGRATION: &str = include_str!("../migrations/postgres/0001_state_store.sq
 /// under the newer comment.
 const SCHEMA_MARKER_PREFIX: &str = "-- vtop-state-schema ";
 const MIN_SCHEMA_VERSION: u32 = 3;
+/// The newest marker this build reads: the one its own migration writes.
+/// A higher marker means a newer release migrated the database for a change
+/// this build could misread - the marker is bumped for nothing else - so this
+/// build refuses it, at startup and in `vtopctl migrate`, rather than run on
+/// it or reinstall its older trigger over it (#664). Releases before this one
+/// accepted any marker at or above their minimum, and cannot be made to
+/// refuse; this is the refusal path for the releases from here on.
+const SCHEMA_VERSION: u32 = 3;
 
-/// Whether the trigger function's body opens with a schema version this
-/// engine accepts. A marker anywhere but the first non-empty line, or a
-/// missing or unparseable one, is an old schema.
-fn schema_marker_is_current(function_body: Option<&str>) -> bool {
+/// The schema version the trigger function's body opens with: the first
+/// non-empty line. A marker anywhere else, or a missing or unparseable one,
+/// is no marker.
+fn schema_marker(function_body: Option<&str>) -> Option<u32> {
     function_body
         .and_then(|body| body.lines().map(str::trim).find(|line| !line.is_empty()))
         .and_then(|line| line.strip_prefix(SCHEMA_MARKER_PREFIX))
         .and_then(|v| v.trim().parse::<u32>().ok())
-        .is_some_and(|v| v >= MIN_SCHEMA_VERSION)
+}
+
+/// Whether the trigger function's body opens with a schema version this
+/// engine accepts. A missing or older marker is an old schema.
+fn schema_marker_is_current(function_body: Option<&str>) -> bool {
+    schema_marker(function_body).is_some_and(|v| (MIN_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&v))
+}
+
+/// The refusal for a schema a newer release migrated, or `None`.
+fn newer_schema_refusal(function_body: Option<&str>) -> Option<VtopError> {
+    let marker = schema_marker(function_body).filter(|v| *v > SCHEMA_VERSION)?;
+    Some(VtopError::State(format!(
+        "PostgreSQL state-store schema marker {marker} (`{SCHEMA_MARKER_PREFIX}{marker}` in the \
+         commit-rule trigger) is newer than this release supports (minimum {MIN_SCHEMA_VERSION}, \
+         newest {SCHEMA_VERSION}): a newer release has migrated this database. Nothing was \
+         started or changed. Run the release that migrated it, or a later one; do not run this \
+         release's `vtopctl migrate` against it"
+    )))
 }
 
 /// Retry budget for transient serialization failures (SQLSTATE 40001). One
@@ -219,13 +244,29 @@ fn schema_migration_required() -> VtopError {
     )
 }
 
+/// [`schema_migration_required`], naming what the database reported missing
+/// (a column such as `verification_class`, #664, or the table), so the
+/// operator can see which release's migration has not run.
+fn schema_migration_required_because(what: &str) -> VtopError {
+    VtopError::State(format!(
+        "PostgreSQL state-store schema is missing or outdated ({}); run `vtopctl migrate --config <path>` with the privileged migration identity before starting the engine",
+        redact_postgres_urls(what)
+    ))
+}
+
 fn map_schema_check(error: sqlx::Error) -> VtopError {
+    let what = error
+        .as_database_error()
+        .map(|database_error| database_error.message().to_owned());
     match error
         .as_database_error()
         .and_then(|database_error| database_error.code())
         .as_deref()
     {
-        Some("42P01" | "42703" | "42883" | "3F000") => schema_migration_required(),
+        Some("42P01" | "42703" | "42883" | "3F000") => match what {
+            Some(what) => schema_migration_required_because(&what),
+            None => schema_migration_required(),
+        },
         Some("42501") => VtopError::State(
             "PostgreSQL runtime identity lacks schema/table access; grant USAGE on the state-store schema and SELECT, INSERT, UPDATE on batches"
                 .into(),
@@ -281,10 +322,46 @@ impl PgStateStore {
     /// deployment identity. The engine never calls this during startup.
     pub async fn migrate(conn_str: &str) -> Result<(), VtopError> {
         let pool = connect_pool(conn_str, 1).await?;
+        // A schema a newer release migrated is left alone: this release's
+        // `CREATE OR REPLACE` would install its older trigger body over it
+        // (#664).
+        let body: Option<String> = sqlx::query_scalar(
+            "SELECT p.prosrc \
+             FROM pg_catalog.pg_trigger t \
+             JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid \
+             WHERE t.tgrelid = to_regclass('batches') \
+               AND t.tgname = 'trg_commit_after_verify' \
+               AND NOT t.tgisinternal",
+        )
+        .fetch_optional(&pool)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(refusal) = newer_schema_refusal(body.as_deref()) {
+            return Err(refusal);
+        }
+        // Whether this run adds the verification class column (#664) to a
+        // table that already holds rows: those rows keep no class, and the
+        // operator is told how many.
+        let adds_class_column: bool = sqlx::query_scalar(
+            "SELECT to_regclass('batches') IS NOT NULL AND NOT EXISTS ( \
+                SELECT 1 FROM pg_catalog.pg_attribute \
+                WHERE attrelid = to_regclass('batches') \
+                  AND attname = 'verification_class' AND NOT attisdropped)",
+        )
+        .fetch_one(&pool)
+        .await
+        .map_err(map_sqlx)?;
         sqlx::raw_sql(MIGRATION)
             .execute(&pool)
             .await
             .map_err(map_sqlx)?;
+        if adds_class_column {
+            let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM batches")
+                .fetch_one(&pool)
+                .await
+                .map_err(map_sqlx)?;
+            crate::models::log_class_column_added("PostgreSQL", rows);
+        }
         Self {
             pool,
             fence: Default::default(),
@@ -339,6 +416,9 @@ impl PgStateStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(map_schema_check)?;
+        if let Some(refusal) = newer_schema_refusal(body.as_deref()) {
+            return Err(refusal);
+        }
         if !schema_marker_is_current(body.as_deref()) {
             return Err(schema_migration_required());
         }
@@ -966,9 +1046,25 @@ mod security_tests {
         assert!(schema_marker_is_current(Some(&body(
             "-- vtop-state-schema 3"
         ))));
-        assert!(schema_marker_is_current(Some(&body(
+        // A newer release's marker is not current: it is refused as newer,
+        // naming the marker and the versions this release reads (#664).
+        assert!(!schema_marker_is_current(Some(&body(
             "    -- vtop-state-schema 4"
         ))));
+        let refusal = newer_schema_refusal(Some(&body("-- vtop-state-schema 4")))
+            .expect("a newer marker is refused")
+            .to_string();
+        for part in [
+            "schema marker 4",
+            "-- vtop-state-schema 4",
+            "minimum 3",
+            "newest 3",
+        ] {
+            assert!(refusal.contains(part), "{part:?} missing from: {refusal}");
+        }
+        for not_newer in ["-- vtop-state-schema 3", "-- vtop-state-schema 2", ""] {
+            assert!(newer_schema_refusal(Some(&body(not_newer))).is_none());
+        }
     }
 
     #[test]

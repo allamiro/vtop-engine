@@ -124,12 +124,17 @@ migration job per database; engine replicas should start only after it succeeds.
   rewrite of existing rows). Engines of that release name the column at
   startup and refuse a schema without it, asking for `vtopctl migrate`; run
   it before rolling them out, as above. **Restart every older engine right
-  after the migration** (or drain them before it): engines before #664 read
-  rows with `SELECT *` and `RETURNING *` through statements each connection
-  caches, and once the column exists PostgreSQL refuses those with `cached
-  plan must not change result type` until the connection is replaced -
-  failing that engine's ledger reads and writes meanwhile, which fails
-  batches into replay (the commit rule is not affected). Restarted, an older
+  after the migration** (or drain them before it). Engines before #664 read
+  whole rows with `SELECT *` and `RETURNING *` through statements each
+  connection caches, and once the column exists PostgreSQL refuses a cached
+  one with `cached plan must not change result type` until the connection is
+  replaced. A running engine reads whole rows in its startup recovery and
+  when a later pass settles a VERIFIED row whose source commit failed
+  (#659): that settle read fails and is retried, and the row waits for the
+  next restart's recovery. Its batch writes (insert, transitions) name their
+  columns and are unaffected; a v0.8.0 engine running through this
+  migration archived and committed its next batch normally. The commit rule
+  is not affected either way. Restarted, an older
   engine runs on the migrated schema, before and after an upgraded engine
   has written a class: it never names the column, a row it verifies keeps
   NULL, and NULL is read as unknown and counted as before. The class decides
@@ -166,13 +171,25 @@ migration job per database; engine replicas should start only after it succeeds.
   **Any future change to the trigger or its function, or to the schema the
   migration leaves that an engine could misread or an older release's
   migration would undo, must bump this marker** in the migration together
-  with `MIN_SCHEMA_VERSION` in `pg_store.rs`. A new nullable column that
-  startup names and older engines never name does not: startup already
-  refuses a schema without it, an older release's migration never drops it,
-  and a higher marker cannot make an older engine refuse anything, since an
-  engine accepts every marker at or above its own minimum. The
-  `verification_class` column (#664) is such a change, and leaves the marker
-  at 3.
+  with `MIN_SCHEMA_VERSION` and `SCHEMA_VERSION` in `pg_store.rs`. A new
+  nullable column that startup names and older engines never name does not:
+  startup already refuses a schema without it, and an older release's
+  migration never drops it. The `verification_class` column (#664) is such a
+  change, and leaves the marker at 3.
+- **A newer schema is refused (since #664).** Engines and `vtopctl migrate`
+  from #664 on read markers from `MIN_SCHEMA_VERSION` to `SCHEMA_VERSION`
+  (both 3 today). A higher marker means a newer release migrated the
+  database for a change this one could misread, so startup refuses it, and
+  so does this release's `vtopctl migrate`, which would otherwise install its
+  older trigger body over the newer one. The refusal names the marker it
+  found and the versions this release reads: `schema marker 4 (-- vtop-state-schema 4 ...)
+  is newer than this release supports (minimum 3, newest 3): a newer release
+  has migrated this database. Nothing was started or changed. ...`. Releases
+  before #664 accept every marker at or above their minimum and cannot be
+  made to refuse; they are covered by the rule that the marker is bumped
+  only for changes they would misread. When a later release bumps the
+  marker, engines of this release keep running until restarted, and refuse
+  to start after: upgrade them before restarting them.
 - Restoring the ledger from a backup. Stop every engine first, and **always
   finish with `vtopctl migrate`**. A schema restored from an older archive
   (`pg_restore`, or `--schema-only`) carries that release's trigger
