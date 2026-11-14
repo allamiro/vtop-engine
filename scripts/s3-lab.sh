@@ -11,9 +11,10 @@
 #   scripts/s3-lab.sh label <id>          the variables that label its results:
 #                                         release, image digest (or local image id)
 #   scripts/s3-lab.sh gating <id>         true or false, from its capability file
-#   scripts/s3-lab.sh test <id> <dir> <results>
+#   scripts/s3-lab.sh test <id> <dir> <results> [name...]
 #                                         run every live test binary in <dir>
-#                                         against it, appending to <results>
+#                                         (or only those named) against it,
+#                                         appending to <results>
 #   scripts/s3-lab.sh summary <id> <results>
 #                                         the results as a Markdown table, then each
 #                                         unexpected outcome
@@ -134,9 +135,11 @@ gating)
     esac
     ;;
 test)
-    [ $# -eq 2 ] || usage
+    [ $# -ge 2 ] || usage
     bins=$1
     results=$2
+    shift 2
+    only=("$@")
     [ -d "$bins" ] || die "no binary directory $bins"
     mkdir -p "$(dirname "$results")"
     set -a
@@ -149,6 +152,9 @@ test)
     ran=0
     for bin in "$bins"/*; do
         [ -x "$bin" ] || continue
+        if [ ${#only[@]} -gt 0 ] && [[ " ${only[*]} " != *" $(basename "$bin") "* ]]; then
+            continue
+        fi
         ran=$((ran + 1))
         echo "::group::$(basename "$bin")"
         # One thread: the tests share the store, and the multipart ones count

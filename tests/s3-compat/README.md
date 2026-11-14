@@ -127,6 +127,22 @@ the two disagree. A weekly job (`.github/workflows/s3-pins.yml`) checks that
 every pulled server image is pinned by digest and that the digest still
 resolves.
 
+## Probes and the second checksum pass
+
+`crates/vtop-upload/tests/live_s3_probes.rs` asks each server two things
+VTOP's guarantees lean on or may: whether a PUT with a wrong
+`x-amz-checksum-sha256` is refused and nothing stored
+(`checksum_sha256_enforced`; `store_checksum` verification trusts the
+SHA-256 a store reports, so a store that echoed an unchecked header would
+pass corrupt data), and whether `If-None-Match: *` on PUT is honoured
+(`conditional_put`, informational).
+
+Each leg also reruns the verification and Object Lock write tests with
+`AWS_REQUEST_CHECKSUM_CALCULATION=when_required` (D13), into
+`when_required-<id>.jsonl` beside the leg's results. In that pass a PUT
+carries no default CRC32, so `checksum_crc32_default` is dropped from each
+case's capabilities, and every line records its `sdk_checksum` mode.
+
 ## Licences
 
 The servers run as unmodified test containers in CI and on a laptop. VTOP

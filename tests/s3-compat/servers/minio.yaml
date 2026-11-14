@@ -15,9 +15,7 @@ capabilities:
   path_style: pass
   # The lab is reached by path style only (decision D12): no wildcard DNS.
   virtual_host: not_applicable
-  # No live case probes these yet; the checksum and conditional-PUT probes
-  # of #722 settle them.
-  checksum_sha256_enforced: unknown
+  checksum_sha256_enforced: pass
   checksum_sha256_returned: pass
   checksum_crc32_default: pass
   multipart: pass
@@ -27,4 +25,4 @@ capabilities:
   versioning: pass
   object_lock: pass
   object_lock_enforced: pass
-  conditional_put: unknown
+  conditional_put: pass

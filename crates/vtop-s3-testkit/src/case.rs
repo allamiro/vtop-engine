@@ -175,6 +175,10 @@ pub struct Recorder {
     pub server_version: Option<String>,
     pub image_digest: Option<String>,
     pub vtop_commit: Option<String>,
+    /// The SDK's checksum calculation for the run
+    /// (`AWS_REQUEST_CHECKSUM_CALCULATION`, default `when_supported`): each
+    /// leg runs the verification and lock-write tests in both (D13).
+    pub sdk_checksum: Option<String>,
 }
 
 impl Recorder {
@@ -185,6 +189,10 @@ impl Recorder {
             server_version: var(SERVER_VERSION_ENV),
             image_digest: var(IMAGE_DIGEST_ENV),
             vtop_commit: var(COMMIT_ENV).or_else(|| var("GITHUB_SHA")),
+            sdk_checksum: Some(
+                var("AWS_REQUEST_CHECKSUM_CALCULATION")
+                    .unwrap_or_else(|| "when_supported".to_owned()),
+            ),
         }
     }
 }
@@ -196,6 +204,9 @@ pub struct ResultLine {
     pub server_version: Option<String>,
     pub image_digest: Option<String>,
     pub vtop_commit: Option<String>,
+    /// `when_supported` or `when_required` (D13).
+    #[serde(default)]
+    pub sdk_checksum: Option<String>,
     pub case: String,
     pub capabilities: Vec<String>,
     /// The capability whose expectation decided the case, if any was not
@@ -343,6 +354,12 @@ impl LiveS3 {
         if !needs.contains(&self.addressing()) {
             needs.push(self.addressing());
         }
+        // With the SDK computing checksums only when an operation requires
+        // one, a PUT carries no default CRC32: the case does not exercise
+        // that capability, so it is not judged by it (D13).
+        if self.recorder.sdk_checksum.as_deref() == Some("when_required") {
+            needs.retain(|&c| c != Capability::ChecksumCrc32Default);
+        }
         if let Err(failure) = run_case(
             &self.server,
             &self.recorder,
@@ -431,6 +448,7 @@ where
         server_version: recorder.server_version.clone(),
         image_digest: recorder.image_digest.clone(),
         vtop_commit: recorder.vtop_commit.clone(),
+        sdk_checksum: recorder.sdk_checksum.clone(),
         case: name.to_owned(),
         capabilities: needs.iter().map(|c| c.to_string()).collect(),
         deciding_capability: plan.deciding.map(|(c, _)| c.to_string()),
@@ -546,6 +564,7 @@ mod tests {
             server_version: Some("1.0".into()),
             image_digest: Some("sha256:abc".into()),
             vtop_commit: Some("deadbeef".into()),
+            sdk_checksum: Some("when_supported".into()),
         }
     }
 
@@ -863,5 +882,32 @@ mod tests {
                 && text.contains("UNEXPECTED FAIL c "),
             "{text}"
         );
+    }
+
+    /// D13: in the `when_required` pass a PUT carries no default CRC32, so a
+    /// case is not judged by that capability there (a server with it xfail
+    /// would otherwise pass it unexpectedly), and the line says which pass.
+    #[tokio::test]
+    async fn the_when_required_pass_does_not_judge_the_default_crc32() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = recorder(dir.path());
+        r.sdk_checksum = Some("when_required".into());
+        let path = r.path.clone().unwrap();
+        let s = server(
+            false,
+            &[("checksum_crc32_default", "{ state: xfail, issue: 778 }")],
+        );
+        let live = LiveS3::new(s, settings(true), r).unwrap();
+        live.case(
+            "verification.blake3_by_read_back",
+            &[Capability::PutGetHead, Capability::ChecksumCrc32Default],
+            || async {},
+        )
+        .await;
+        assert!(live.unexpected().is_empty(), "{:?}", live.unexpected());
+        let l = &lines(&path)[0];
+        assert_eq!(l.outcome, "pass");
+        assert_eq!(l.capabilities, vec!["put_get_head", "path_style"]);
+        assert_eq!(l.sdk_checksum.as_deref(), Some("when_required"));
     }
 }

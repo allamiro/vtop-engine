@@ -1317,13 +1317,13 @@ jobs:
           }
           {
             build -p vtop-upload --test live_s3_verification --test transport_conformance \
-              --test live_s3_multipart_resume --test live_s3_object_lock
+              --test live_s3_multipart_resume --test live_s3_object_lock --test live_s3_probes
             build -p vtop-cli --test live_s3_object_lock_engine --test live_s3_verification_receipts
           } | while read -r name exe; do
             cp "$exe" "$out/$name"
           done
           ls -la "$out"
-          test "$(find "$out" -type f | wc -l)" -eq 6
+          test "$(find "$out" -type f | wc -l)" -eq 7
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -1395,16 +1395,36 @@ jobs:
       - name: Run the live S3 tests
         run: scripts/s3-lab.sh test "${{ matrix.server }}" "$RUNNER_TEMP/s3-compat-bin" "$RESULTS"
 
+      # D13: the verification and Object Lock write tests again, with the SDK
+      # computing checksums only when an operation requires one, a setting
+      # many deployments use with third-party stores. Recorded beside the
+      # leg's results, not instead of them.
+      - name: Run them again with AWS_REQUEST_CHECKSUM_CALCULATION=when_required
+        if: always()
+        env:
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+        run: |
+          scripts/s3-lab.sh test "${{ matrix.server }}" "$RUNNER_TEMP/s3-compat-bin" \
+            "${RESULTS%/*}/when_required-${{ matrix.server }}.jsonl" \
+            live_s3_verification transport_conformance live_s3_object_lock live_s3_object_lock_engine
+
       - name: Summarise the results
         if: always()
-        run: scripts/s3-lab.sh summary "${{ matrix.server }}" "$RESULTS" >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          scripts/s3-lab.sh summary "${{ matrix.server }}" "$RESULTS" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo
+            echo "With AWS_REQUEST_CHECKSUM_CALCULATION=when_required:"
+            echo
+            scripts/s3-lab.sh summary "${{ matrix.server }}" "${RESULTS%/*}/when_required-${{ matrix.server }}.jsonl"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: s3-compat-results-${{ matrix.server }}
-          path: ${{ github.workspace }}/s3-compat-out/results-${{ matrix.server }}.jsonl
+          path: ${{ github.workspace }}/s3-compat-out/
           if-no-files-found: ignore
 
       - name: Server logs on failure
