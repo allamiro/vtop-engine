@@ -11,6 +11,8 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 serde_json = "1"
 vtop-core = { path = "../crates/vtop-core" }
+# The Kafka gateway's batch decoder only: no broker, no metadata plane.
+vtop-kafka = { path = "../crates/vtop-kafka", default-features = false }
 
 [[bin]]
 name = "detect_record"
@@ -22,6 +24,13 @@ bench = false
 [[bin]]
 name = "detect_batch"
 path = "fuzz_targets/detect_batch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kafka_batch"
+path = "fuzz_targets/kafka_batch.rs"
 test = false
 doc = false
 bench = false

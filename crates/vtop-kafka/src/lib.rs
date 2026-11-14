@@ -9,6 +9,7 @@
 //!
 //!   [`wire`]      primitives only — how a field is written, never what it means
 //!   [`records`]   RecordBatch v2, the container Produce carries in and Fetch out
+//!   [`codec`]     decompression of a compressed batch's records (gzip, zstd)
 //!   [`messages`]  request framing, API identity, and the version gate
 //!
 //!   [`api`]       the five phase-1 APIs, request and response, every served version
@@ -30,6 +31,7 @@
 pub mod api;
 pub mod api_groups;
 pub mod bridge;
+pub mod codec;
 pub mod dual;
 pub mod gateway;
 pub mod groups;

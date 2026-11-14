@@ -63,8 +63,8 @@ META_PEER_BASE_PORT="${CHAOS_META_PEER_BASE_PORT:-9100}"
 META_ADMIN_BASE_PORT="${CHAOS_META_ADMIN_BASE_PORT:-9200}"
 REPLICA_BASE_PORT="${CHAOS_REPLICA_BASE_PORT:-9300}"
 NATIVE_PORT="${CHAOS_NATIVE_PORT:-9400}"
-# The Kafka gateway listeners (#225): kafka-0 for the standalone of scenario
-# 16, kafka-1 for the leader of scenario 17, kafka-2 for the leader of
+# The Kafka gateway listeners (#225): kafka-0 for the standalones of
+# scenarios 16 and 25, kafka-1 for the leader of scenario 17, kafka-2 for the leader of
 # scenario 18, kafka-3 for the leader of scenarios 19 and 20, kafka-4 and
 # kafka-5 for the two partitions of scenario 21. Above the candidate natives
 # (NATIVE_PORT + 11..13) so the default layout has no overlap.

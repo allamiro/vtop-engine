@@ -19,6 +19,10 @@ metadata = ["dep:vtop-meta"]
 
 [dependencies]
 thiserror = { workspace = true }
+# Compressed produce batches (#596): both are already workspace dependencies
+# through vtop-core, so they add no licence or advisory surface.
+flate2 = { workspace = true }
+zstd = { workspace = true }
 vtop-broker = { workspace = true, optional = true }
 vtop-protocol = { workspace = true, optional = true }
 vtop-meta = { workspace = true, optional = true }

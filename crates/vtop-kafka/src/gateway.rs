@@ -2054,8 +2054,22 @@ impl Gateway {
         // EVERY batch the field carries (review): a RECORDS field may hold
         // several back to back, and the decoder stops at the first one's
         // declared length by design. All are decoded and judged before any
-        // is appended, so a refusal appends nothing.
-        let batches = split_batches(records)?;
+        // is appended, so a refusal appends nothing. A large compressed
+        // field is decompressed on the blocking pool (#596); nothing is held
+        // across the wait, and the copy is the field's compressed size.
+        let batches = if records.len() > INLINE_DECODE_BYTES && any_compressed(records) {
+            let owned = records.to_vec();
+            tokio::task::spawn_blocking(move || split_batches(&owned))
+                .await
+                .map_err(|error| {
+                    (
+                        ErrorCode::CorruptMessage,
+                        format!("the batches could not be decoded: the decoder failed ({error})"),
+                    )
+                })??
+        } else {
+            split_batches(records)?
+        };
         if batches.is_empty() {
             return Err((
                 ErrorCode::InvalidRecord,
@@ -2505,8 +2519,41 @@ fn mint_producer_id(node_id: u8) -> i64 {
     }
 }
 
+/// A produce whose records field is larger than this, and compressed, is
+/// decoded on the blocking pool (#596): decompressing up to the field cap is
+/// CPU work an async worker should not do inline. Smaller ones, the common
+/// case, decode in place.
+const INLINE_DECODE_BYTES: usize = 64 * 1024;
+
+/// Whether any batch in a records field declares a codec, read from the
+/// headers alone. Framing is not judged here: `split_batches` does that.
+fn any_compressed(mut bytes: &[u8]) -> bool {
+    while bytes.len() >= 23 {
+        if i16::from_be_bytes([bytes[21], bytes[22]]) & 0x07 != 0 {
+            return true;
+        }
+        let declared = i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        match usize::try_from(declared)
+            .ok()
+            .and_then(|n| n.checked_add(12))
+            .filter(|n| *n <= bytes.len())
+        {
+            Some(len) => bytes = &bytes[len..],
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Every batch a records field carries, decoded and judged.
+///
+/// The compressed batches in one field share one budget (#596): together
+/// they may expand to at most [`crate::wire::MAX_FIELD_BYTES`], the most an
+/// uncompressed field can carry. A per-batch cap alone would let many small
+/// batches, each just under it, expand one request without bound.
 fn split_batches(mut bytes: &[u8]) -> Result<Vec<RecordBatch>, (ErrorCode, String)> {
     let mut batches = Vec::new();
+    let mut budget = crate::wire::MAX_FIELD_BYTES;
     while !bytes.is_empty() {
         if bytes.len() < 12 {
             return Err((
@@ -2529,22 +2576,68 @@ fn split_batches(mut bytes: &[u8]) -> Result<Vec<RecordBatch>, (ErrorCode, Strin
                     ),
                 )
             })?;
-        let batch = RecordBatch::decode(&bytes[..len]).map_err(|error| {
-            let code = match &error {
-                BatchError::Compressed { .. } => ErrorCode::UnsupportedCompressionType,
-                BatchError::Transactional | BatchError::Control => {
-                    ErrorCode::UnsupportedForMessageFormat
-                }
-                BatchError::CrcMismatch { .. } => ErrorCode::CorruptMessage,
-                BatchError::UnsupportedMagic { .. } => ErrorCode::UnsupportedForMessageFormat,
-                _ => ErrorCode::InvalidRecord,
-            };
-            (code, format!("batch {}: {error}", batches.len()))
-        })?;
+        let which = batches.len();
+        let (batch, expanded) =
+            RecordBatch::decode_within(&bytes[..len], budget).map_err(|error| {
+                let code = match &error {
+                    BatchError::CodecNotServed { .. } | BatchError::UnknownCodec { .. } => {
+                        ErrorCode::UnsupportedCompressionType
+                    }
+                    BatchError::CorruptCompressed { .. } => ErrorCode::CorruptMessage,
+                    BatchError::DecompressedTooLarge { .. } => ErrorCode::MessageTooLarge,
+                    BatchError::Transactional | BatchError::Control => {
+                        ErrorCode::UnsupportedForMessageFormat
+                    }
+                    BatchError::CrcMismatch { .. } => ErrorCode::CorruptMessage,
+                    BatchError::UnsupportedMagic { .. } => ErrorCode::UnsupportedForMessageFormat,
+                    _ => ErrorCode::InvalidRecord,
+                };
+                (code, refusal_reason(which, &error))
+            })?;
+        budget -= expanded;
         batches.push(batch);
         bytes = &bytes[len..];
     }
     Ok(batches)
+}
+
+/// What a refused batch is reported as, to the client (Produce v8 carries it)
+/// and in the gateway's WARN. A compression refusal says what happened, what
+/// the gateway did and what to do (#596); every other refusal names the
+/// batch and the decoder's reason, as before.
+fn refusal_reason(which: usize, error: &BatchError) -> String {
+    let name = |codec: &i16| crate::codec::name(*codec);
+    match error {
+        BatchError::CodecNotServed { codec } => format!(
+            "batch {which} uses compression codec {codec} ({}), which this gateway does not \
+             serve. Nothing from this request was appended; the client was answered \
+             UNSUPPORTED_COMPRESSION_TYPE. Set the producer's compression.type to one of {}, or \
+             upgrade the gateway",
+            name(codec),
+            crate::codec::served_list()
+        ),
+        BatchError::UnknownCodec { codec } => format!(
+            "batch {which} declares compression codec {codec}, which Kafka does not define. \
+             Nothing from this request was appended; the client was answered \
+             UNSUPPORTED_COMPRESSION_TYPE. Set the producer's compression.type to one of {}",
+            crate::codec::served_list()
+        ),
+        BatchError::DecompressedTooLarge { codec, .. } => format!(
+            "batch {which} expands past {} bytes after {} decompression (the most one produce's \
+             records may hold, across its batches). The request was refused whole and nothing \
+             was appended (MESSAGE_TOO_LARGE). Send smaller batches: lower the producer's \
+             batch.size or linger.ms",
+            crate::wire::MAX_FIELD_BYTES,
+            name(codec)
+        ),
+        BatchError::CorruptCompressed { codec, reason } => format!(
+            "batch {which}'s {} stream does not decompress ({reason}) although its CRC \
+             matched, so the client compressed it badly. Nothing was appended; the client was \
+             answered CORRUPT_MESSAGE. Check the producer library and its compression settings",
+            name(codec)
+        ),
+        other => format!("batch {which}: {other}"),
+    }
 }
 
 /// The turn is over; an entry nobody else holds is dropped, so the map
@@ -6652,6 +6745,232 @@ mod tests {
         );
     }
 
+    /// A batch built from `values` as `batch_bytes` builds it, its records
+    /// section compressed with `codec` (#596).
+    fn compressed_batch_bytes(codec: i16, plain: &[u8]) -> Vec<u8> {
+        crate::records::tests::compressed(codec, plain)
+    }
+
+    /// The records of a fetched batch, decoded, with the batch's codec bits.
+    fn fetched_records(bytes: &[u8]) -> (i16, Vec<Record>) {
+        let codec = i16::from_be_bytes([bytes[21], bytes[22]]) & 0x07;
+        let batch = RecordBatch::decode(bytes).expect("a fetched batch decodes, CRC and all");
+        (codec, batch.records)
+    }
+
+    /// #596: a zstd batch is decompressed on Produce and stored as native
+    /// records; Fetch serves them as an uncompressed v2 batch whose CRC is
+    /// valid, with contiguous offsets and the producer's create times.
+    #[tokio::test]
+    async fn a_zstd_batch_is_stored_and_fetched_uncompressed_with_offsets_and_create_time_intact() {
+        let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        let plain = batch_bytes(&["alpha", "beta", "gamma"], false);
+        let sent = RecordBatch::decode(&plain).unwrap().records;
+        for (correlation, codec) in [(1, crate::codec::ZSTD), (2, crate::codec::GZIP)] {
+            let reply = call(
+                addr,
+                0,
+                8,
+                correlation,
+                &produce_body(
+                    "events",
+                    0,
+                    -1,
+                    None,
+                    &compressed_batch_bytes(codec, &plain),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                read_produce(&reply, 8),
+                (0, i64::from(correlation - 1) * 3, None),
+                "{}",
+                crate::codec::name(codec)
+            );
+        }
+        let reply = call(addr, 1, 4, 3, &fetch_body(4, "events", 0, 0, 0))
+            .await
+            .unwrap();
+        let (error, watermark, bytes) = read_fetch(&reply, 4);
+        assert_eq!((error, watermark), (0, 6));
+        let mut fetched = Vec::new();
+        let mut rest = &bytes[..];
+        while !rest.is_empty() {
+            let len = i32::from_be_bytes(rest[8..12].try_into().unwrap()) as usize + 12;
+            let (codec, records) = fetched_records(&rest[..len]);
+            assert_eq!(codec, 0, "fetch serves uncompressed batches");
+            fetched.extend(records);
+            rest = &rest[len..];
+        }
+        assert_eq!(fetched.len(), 6);
+        for (i, record) in fetched.iter().enumerate() {
+            assert_eq!(record.offset, i as i64, "contiguous");
+            assert_eq!(record.value, sent[i % 3].value);
+            assert_eq!(
+                record.timestamp_millis,
+                sent[i % 3].timestamp_millis,
+                "the create time survives"
+            );
+        }
+    }
+
+    /// One request carrying a plain batch then a compressed one gets one
+    /// contiguous run of offsets across both.
+    #[tokio::test]
+    async fn a_mixed_request_of_plain_and_compressed_batches_gets_contiguous_offsets() {
+        let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        let mut set = batch_bytes(&["a", "b"], false);
+        set.extend(compressed_batch_bytes(
+            crate::codec::ZSTD,
+            &batch_bytes(&["c", "d", "e"], false),
+        ));
+        let reply = call(addr, 0, 8, 1, &produce_body("events", 0, -1, None, &set))
+            .await
+            .unwrap();
+        assert_eq!(read_produce(&reply, 8), (0, 0, None));
+        let reply = call(
+            addr,
+            0,
+            8,
+            2,
+            &produce_body("events", 0, -1, None, &batch_bytes(&["f"], false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_produce(&reply, 8),
+            (0, 5, None),
+            "five appended before"
+        );
+    }
+
+    /// An idempotent producer's compressed batch, sent twice with the same
+    /// id, epoch and sequence, is appended once: the identity is in the
+    /// batch header, which compression leaves plain.
+    #[tokio::test]
+    async fn an_idempotent_retry_of_a_compressed_batch_is_deduplicated() {
+        let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        let set = compressed_batch_bytes(
+            crate::codec::ZSTD,
+            &sequenced_batch_bytes(&["a", "b"], 7, 0, 0),
+        );
+        for correlation in [1, 2] {
+            let reply = call(
+                addr,
+                0,
+                8,
+                correlation,
+                &produce_body("events", 0, -1, None, &set),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                read_produce(&reply, 8),
+                (0, 0, None),
+                "attempt {correlation}"
+            );
+        }
+        let reply = call(addr, 1, 4, 3, &fetch_body(4, "events", 0, 0, 0))
+            .await
+            .unwrap();
+        assert_eq!(read_fetch(&reply, 4).1, 2, "appended once");
+    }
+
+    /// Codec 7 is not Kafka's: refused with UNSUPPORTED_COMPRESSION_TYPE,
+    /// naming the codec and what to set instead, and nothing is appended.
+    #[tokio::test]
+    async fn a_batch_with_an_unknown_codec_is_refused_naming_it() {
+        let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        let plain = batch_bytes(&["a"], false);
+        let batch = crate::records::tests::with_records_section(7, &plain, &plain[61..]);
+        let reply = call(addr, 0, 8, 1, &produce_body("events", 0, -1, None, &batch))
+            .await
+            .unwrap();
+        let (error, _, message) = read_produce(&reply, 8);
+        assert_eq!(error, ErrorCode::UnsupportedCompressionType.as_i16());
+        let message = message.unwrap();
+        for part in [
+            "codec 7",
+            "Kafka does not define",
+            "Nothing from this request was appended",
+            "gzip, zstd, none",
+        ] {
+            assert!(message.contains(part), "{part:?} missing from {message}");
+        }
+        let reply = call(addr, 1, 4, 2, &fetch_body(4, "events", 0, 0, 0))
+            .await
+            .unwrap();
+        assert_eq!(read_fetch(&reply, 4).1, 0);
+    }
+
+    /// Until snappy and lz4 are served, a batch in either is refused with
+    /// UNSUPPORTED_COMPRESSION_TYPE and a message naming the codecs that are.
+    #[tokio::test]
+    async fn an_interim_gateway_refuses_a_codec_it_does_not_serve_with_the_served_list() {
+        let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        let plain = batch_bytes(&["a"], false);
+        for (correlation, codec) in [(1, crate::codec::SNAPPY), (2, crate::codec::LZ4)] {
+            let batch = crate::records::tests::with_records_section(codec, &plain, &plain[61..]);
+            let reply = call(
+                addr,
+                0,
+                8,
+                correlation,
+                &produce_body("events", 0, -1, None, &batch),
+            )
+            .await
+            .unwrap();
+            let (error, _, message) = read_produce(&reply, 8);
+            assert_eq!(error, ErrorCode::UnsupportedCompressionType.as_i16());
+            let message = message.unwrap();
+            let named = format!("codec {codec} ({})", crate::codec::name(codec));
+            for part in [
+                named.as_str(),
+                "does not serve",
+                "compression.type",
+                "gzip, zstd, none",
+            ] {
+                assert!(message.contains(part), "{part:?} missing from {message}");
+            }
+        }
+    }
+
+    /// The compressed batches of one request share one budget: several, each
+    /// well under the cap, that together expand past it are refused whole
+    /// with MESSAGE_TOO_LARGE, and nothing is appended. The field is over
+    /// the inline bound, so this also runs the blocking-pool path.
+    #[tokio::test]
+    async fn compressed_batches_share_one_expansion_budget_per_request() {
+        let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        // Each batch: one record of 6 MiB of zeros, a few KiB compressed.
+        let big = "\0".repeat(6 * 1024 * 1024);
+        let one = compressed_batch_bytes(crate::codec::ZSTD, &batch_bytes(&[big.as_str()], false));
+        let mut set = Vec::new();
+        while set.len() <= super::INLINE_DECODE_BYTES {
+            set.extend_from_slice(&one);
+        }
+        assert!(super::any_compressed(&set));
+        let reply = call(addr, 0, 8, 1, &produce_body("events", 0, -1, None, &set))
+            .await
+            .unwrap();
+        let (error, _, message) = read_produce(&reply, 8);
+        assert_eq!(error, ErrorCode::MessageTooLarge.as_i16(), "{message:?}");
+        let message = message.unwrap();
+        assert!(message.contains("batch 2 expands past"), "{message}");
+        assert!(message.contains("batch.size"), "{message}");
+        let reply = call(addr, 1, 4, 2, &fetch_body(4, "events", 0, 0, 0))
+            .await
+            .unwrap();
+        assert_eq!(read_fetch(&reply, 4).1, 0, "refused whole");
+        // Two of them fit: each is under the cap and so is their sum.
+        let two = [one.clone(), one].concat();
+        let reply = call(addr, 0, 8, 3, &produce_body("events", 0, -1, None, &two))
+            .await
+            .unwrap();
+        assert_eq!(read_produce(&reply, 8).0, 0);
+    }
+
     #[tokio::test]
     async fn every_gap_is_refused_by_name() {
         let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
@@ -6685,9 +7004,10 @@ mod tests {
         assert_eq!(error, ErrorCode::UnsupportedForMessageFormat.as_i16());
         assert!(message.unwrap().contains("transactional"));
 
-        // A compressed batch is refused with the compression code, not as corrupt.
+        // A codec Kafka does not define is refused with the compression
+        // code, not as corrupt (#596: gzip, the case here before, is served).
         let mut compressed = plain.clone();
-        compressed[21..23].copy_from_slice(&1_i16.to_be_bytes()); // gzip
+        compressed[21..23].copy_from_slice(&7_i16.to_be_bytes());
         let crc = crc32c(&compressed[21..]);
         compressed[17..21].copy_from_slice(&crc.to_be_bytes());
         let reply = call(

@@ -161,10 +161,12 @@ jobs:
               - '.github/workflows/ci.yml'
 
             # The fuzz targets (detect_batch, detect_record, manifest_parse)
-            # exercise vtop-core only, and need a pinned nightly toolchain.
+            # exercise vtop-core, and kafka_batch the Kafka gateway's batch
+            # decoder (#596); they need a pinned nightly toolchain.
             fuzz:
               - 'fuzz/**'
               - 'crates/vtop-core/**'
+              - 'crates/vtop-kafka/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -252,6 +254,9 @@ jobs:
               # bats suite reads it.
               - 'scripts/check-naming.sh'
               - 'scripts/check-egress-claims.sh'
+              # The Kafka fixture generator (#596): in the shellcheck step,
+              # so here too, for the reason the paragraphs above give.
+              - 'scripts/gen-kafka-fixtures.sh'
               - 'scripts/naming-denylist.txt'
               - 'scripts/tests/**'
               # The test-progress runner: developer tooling, but shell that people
@@ -1121,7 +1126,8 @@ jobs:
             scripts/k8s-smoke.sh scripts/e2e-smoke.sh scripts/upgrade-compat.sh \
             scripts/manifest-compat.sh \
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
-            scripts/check-naming.sh scripts/check-egress-claims.sh
+            scripts/check-naming.sh scripts/check-egress-claims.sh \
+            scripts/gen-kafka-fixtures.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
@@ -1913,7 +1919,7 @@ jobs:
           key: ${{ runner.os }}-fuzz-${{ hashFiles('**/Cargo.lock', 'fuzz/Cargo.toml') }}
       - name: Smoke-fuzz each target (fails on any crash)
         run: |
-          for t in detect_record detect_batch manifest_parse; do
+          for t in detect_record detect_batch manifest_parse kafka_batch; do
             echo "::group::fuzz $t"
             cargo +nightly-2026-07-22 fuzz run "$t" --target x86_64-unknown-linux-gnu -- \
               -max_total_time=60 -print_final_stats=1
