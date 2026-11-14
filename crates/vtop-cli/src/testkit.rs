@@ -56,6 +56,7 @@ pub fn file_config(
             algorithm: ChecksumAlgorithm::Sha256,
         },
         manifest_mac_key_env: None,
+        manifest: Default::default(),
         sources: SourcesConfig {
             kafka: None,
             file: Some(FileSourceConfig {

@@ -80,6 +80,9 @@ pub struct EffectiveStream {
     #[serde(rename = "upload.require_strong_verification")]
     pub require_strong_verification: EffectiveSetting<bool>,
     pub manifest_mac: EffectiveSetting<String>,
+    /// Global (#671 release B): the version new manifests are written in.
+    #[serde(rename = "manifest.write_version")]
+    pub manifest_write_version: EffectiveSetting<String>,
     #[serde(rename = "upload.require_object_versioning")]
     pub require_object_versioning: EffectiveSetting<bool>,
     #[serde(rename = "upload.backend")]
@@ -383,6 +386,10 @@ pub fn effective_streams(config: &VtopConfig, streams: Option<&StreamsConfig>) -
                 }
                 .into(),
                 origin: global("manifest_mac_key_env"),
+            },
+            manifest_write_version: EffectiveSetting {
+                value: config.manifest.write_version.as_str().to_owned(),
+                origin: global("manifest.write_version"),
             },
             require_object_versioning: EffectiveSetting {
                 value: config.upload.require_object_versioning,
