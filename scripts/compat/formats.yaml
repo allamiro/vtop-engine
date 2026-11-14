@@ -117,7 +117,7 @@ formats:
     class: B
     marker: "`VTOPSEG1`, `VTOPREC1`, `VTOPIDX1`; `VTOPSEG2`, `VTOPREC2`; `VTOPCHK1`; `VTOPCMT1`"
     status: v1 stable, v2 evolving
-    at_1_0: v1 stable; v2 decided in its own issue
+    at_1_0: v1 stable; v2's status and the release that makes it the default writer are decided in their own issue
     constants:
       - {file: crates/vtop-log/src/codec.rs, name: HEADER_MAGIC, value: 'b"VTOPSEG1"'}
       - {file: crates/vtop-log/src/codec.rs, name: RECORD_MAGIC, value: 'b"VTOPREC1"'}

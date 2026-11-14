@@ -8,10 +8,12 @@ for each rule, is issue
 [#743](https://github.com/allamiro/vtop-engine/issues/743).
 
 > [!IMPORTANT]
-> VTOP is at 0.x. Until a rule below says "from 1.0", it describes how
-> changes are made now. **Downgrade is not supported in 0.x**: nothing tests
-> it yet. The downgrade rules below take effect for a pair of releases only
-> once the compatibility matrix records a downgrade result for it.
+> This is the policy 1.0 is held to. VTOP is at 0.x, and where 0.x differs
+> today, the rule says so. **Downgrade is not supported in 0.x**: nothing
+> tests it yet. The downgrade rules below are targets; they take effect for
+> a pair of releases only once the compatibility matrix records a downgrade
+> result for that pair. The compatibility matrix this page refers to is
+> being added under #743.
 
 ## Status words
 
@@ -20,22 +22,22 @@ Every format in the [inventory](#inventory) carries one of three statuses.
 | Status | Meaning |
 |---|---|
 | **stable** | Documented. A change needs a version bump, a reader-first release (below) and a deprecation entry. |
-| **evolving** | Expected to change before 1.0, through its version mechanism. Each one is classified stable or preview when 1.0 is frozen. |
+| **evolving** | Expected to change before 1.0, through its version mechanism. Each one is classified when 1.0 is frozen: stable, or left outside the 1.0 guarantees (the cluster-plane formats follow the scope decision in [#740](https://github.com/allamiro/vtop-engine/issues/740)). |
 | **experimental** | May change in any minor release with a release-note entry. Outside every guarantee on this page. |
 
 ## Four classes of format
 
 | Class | Formats | A reader must accept | The writer writes | Mixed versions | Downgrade |
 |---|---|---|---|---|---|
-| **A. Archive artifacts** (outlive every release) | manifests, verification receipts, object keys, ledger digests | Every version any release has written. Never dropped before 2.0. | One version, the default. A new version is opt-in until the default changes (see [reader first](#reader-first)). | Any reader of any release reads any archive. A reader older than the version's first reader reports a failure, and the matrix records which. | The archive is never rewritten. Going back means setting the write version back; what was written stays. |
-| **B. Node-local state** | the state ledger (SQLite and PostgreSQL), progress markers, audit records, segment logs and their sidecars, broker journals, multipart sessions, the scrub cursor, the metadata log, snapshots and their files | Everything its own release and the previous minor wrote, and everything the bridge release wrote (see [upgrade](#upgrade)). | One version. | One node, or a fleet sharing a ledger: minor N and N-1. | Supported until the first one-way step (see [downgrade](#downgrade)). After it, the older binary refuses cleanly and changes nothing. |
-| **C. Wire** | the native protocol, replica protocol negotiation, the metadata peer and admin transport, the Kafka gateway's advertised surface | N-1 and N during a rolling upgrade. | The highest version the peer advertised. | N-1 and N. N-2 is not a mixed-version guarantee. | A peer that predates a feature is never sent it. |
-| **D. Operator interface** | `config.yaml`, `validate --print-effective`, `vtopctl` JSON output and exit codes, metric names and labels, the Helm values | Every config key, flag and JSON field of N-1. | Not applicable. | Per node: an older node ignores or refuses a new key ([change rules](#change-rules-within-1x)). | Not applicable. |
+| **A. Archive artifacts** (outlive every release) | manifests, verification receipts, object keys, ledger digests | Every version any release has written, forever. | One version, the default. A new version is opt-in until the default changes (see [reader first](#reader-first)). | Every release reads every archive version up to its own. A reader older than a version's first reader reports a failure, and the matrix records which. | The archive is never rewritten. Going back means setting the write version back; what was written stays. |
+| **B. Node-local state** | the state ledger (SQLite and PostgreSQL), progress markers, audit records, segment logs and their sidecars, broker journals, multipart sessions, the scrub cursor, the metadata log, snapshots and their files | What minors N and N-1 wrote (and N-2's, at rest: stop, upgrade, start), and what the bridge release wrote (see [upgrade](#upgrade)). | One version. | One node, or a fleet sharing a ledger: minor N and N-1. | Target: supported until the first one-way step (see [downgrade](#downgrade)). After it, the older binary refuses cleanly and changes nothing. |
+| **C. Wire** | the native protocol, replica protocol negotiation, the metadata peer and admin transport, the Kafka gateway's advertised surface | N-1 and N during a rolling upgrade. | The highest version the peer advertised (replica negotiation does this today; the native protocol from 1.0, see [before 1.0](#config-json-output-and-the-wire-before-10)). | N-1 and N. N-2 is not a mixed-version guarantee. | A peer that predates a feature is never sent it (from 1.0 for native message kinds). |
+| **D. Operator interface** | `config.yaml`, `validate --print-effective`, `vtopctl` JSON output and exit codes, metric names and labels, the Helm values | From 1.0: every config key, flag and JSON field of N-1. | Not applicable. | Per node: an older node ignores or refuses a new key ([change rules](#change-rules-within-1x)). | Not applicable. |
 
 ## What frozen means
 
 A format is frozen at 1.0 when all six of these hold. The format registry
-records which do for each format.
+([inventory](#inventory)) records which do for each format.
 
 1. **The marker is read first.** Every reader checks the version before it
    decodes anything else, and its error says one of three different things:
@@ -55,7 +57,7 @@ records which do for each format.
    unknown value as unknown, or sits behind a version gate whose error is
    classified as *newer*.
 6. **A byte lock.** The golden files are hashed in the registry, and a change
-   to one without a registry edit fails CI.
+   to one without a registry edit and a `format-change` label fails CI.
 
 ## Change rules within 1.x
 
@@ -64,14 +66,14 @@ records which do for each format.
 | A new optional field in an unhashed JSON document (an audit record, a multipart session file, the effective-settings JSON) | Yes | Readers ignore unknown fields, and a new value of a closed set reads as unknown. |
 | A new field in a **hashed** JSON document (a manifest) | Only under the `0.4` canonical scheme | Manifests `0.1` to `0.3` hash the decoded document, so a reader drops an unknown field and reports the document as tampered. Such a field stays ledger-only until every supported reader uses the `0.4` scheme. |
 | A new nullable ledger column | Yes | Named in the column list, never written by N-1, never dropped, no schema-version or marker bump. |
-| A new ledger state or source type, or any change N-1 would misread | No; it needs a version bump | A one-way step: announced, operator-gated, with its refusal test. |
+| A new ledger state or source type, or any change N-1 would misread | No; it needs a version bump | A one-way step: announced, operator-gated, with its refusal test. For SQLite that gate does not exist yet: the ledger migrates on every open, so a bump must first be made something only `vtopctl migrate` takes. |
 | A new metadata command kind, snapshot category or value tag, or a changed apply behaviour | Yes, behind a feature level | The level gates it, voters are upgraded first, and an older reader classifies the new tag as *newer*. |
-| A new native protocol message kind | From 1.0, only with a `PROTOCOL_MINOR` bump and a sender that checks the peer's minor | Before 1.0, kinds are added under minor 0 and follow the N-1/N rolling rule. |
-| A new config key | Yes | A safe default, so an older engine that ignores the key is harmless; otherwise the release notes say so. A key inside a section that refuses unknown keys (the cluster role configs, `manifest.mac`, `upload.object_lock`) makes an older node refuse the file: the notes say that too. |
+| A new native protocol message kind | From 1.0, only with a `PROTOCOL_MINOR` bump and a sender that checks the peer's minor | Before 1.0, kinds are added under minor 0 and an N-1 peer rejects one as unknown, so a new kind is used only once every node runs N. |
+| A new config key | Yes | A safe default, so an older engine that ignores the key is harmless; otherwise the release notes say so. A key inside a section that refuses unknown keys (for example the cluster role configs, `manifest.mac`, `upload.object_lock`) makes an older node refuse the file: the notes say that too. |
 | Renaming, removing or repurposing anything stable, or a default that changes the bytes written | No | A version bump, a reader-first release and the [deprecation](#deprecation) notice. A removal waits for 2.0. |
 | A new metric label value | Yes | From a bounded set, pinned by a test. |
 | A metric name or label name | No | Deprecation first. |
-| **A patch release** | **No format change of any kind** | No new marker, default, feature level or one-way step. |
+| **A patch release** | **No format change of any kind** | No new marker, default, feature level or one-way step. In 0.x a patch that cannot avoid one says so in its notes as a one-way change. |
 
 ## Reader first
 
@@ -97,25 +99,35 @@ warning. Verification receipts stay opt-in for 1.0.
 
 ## Upgrade
 
-- **From any release of minor N-1 to any release of minor N** is supported
-  and tested.
+- **From any release of minor N-1 to any release of minor N** is supported.
+  What is tested today is below; cells for the ledger and the other
+  node-local formats are being added under #743.
 - **From 0.x to 1.0** goes through a **bridge release**: the last 0.x minor.
   It reads every 0.x ledger it is upgraded from, and 1.0 reads the bridge
   release's state. 1.0 does not have to read a v0.7.0 or v0.8.0 ledger
   directly, so upgrade to the bridge release first.
-- **N-2 to N** is supported for state at rest (stop, upgrade, start). A
-  rolling fleet mixing N-2 and N is not.
+- **N-2 to N** is the target for state at rest (stop, upgrade, start); its
+  tests come with the 1.0 freeze. A rolling fleet mixing N-2 and N is not
+  supported.
 
-Today's test: a data directory written by the newest patch of each released
-minor (v0.2 onwards) must open under the current build, serve its records
-byte for byte, and still serve them after a restart
-([`scripts/upgrade-compat.sh`](../../scripts/upgrade-compat.sh)). The
-released `vtopctl` of v0.7.0 and later is run over a manifest archive the
-current build wrote: v0.8.0 and later must verify it, and v0.7.0 must report
-the documented self-hash failure
-([`scripts/manifest-compat.sh`](../../scripts/manifest-compat.sh)).
+What is tested today:
+
+- A data node's directory (segment log v1), written by the newest patch of
+  each minor from v0.2, built from each tag's source, must open under the
+  current build, serve its records byte for byte, and still serve them after
+  a restart ([`scripts/upgrade-compat.sh`](../../scripts/upgrade-compat.sh)).
+- The metadata tier rolls from the newest release to the current build, one
+  voter at a time (live-chaos scenario 22).
+- The released `vtopctl` of v0.7.0 and later is run over a manifest archive
+  the current build wrote: v0.8.0 and later must verify it, and v0.7.0 must
+  report the documented self-hash failure
+  ([`scripts/manifest-compat.sh`](../../scripts/manifest-compat.sh)).
 
 ## Downgrade
+
+In 0.x, downgrade is not supported. The rules below are the target; each
+applies to a pair of releases once the matrix records a downgrade result for
+it.
 
 - **Between patches of one minor:** supported in both directions.
 - **From minor N to N-1:** supported **until the first one-way step**. The
@@ -127,22 +139,23 @@ the documented self-hash failure
   feature level, running `vtopctl migrate` for a PostgreSQL marker bump,
   setting a write version. No binary takes one on its own on first open. A
   future exception needs a written sign-off in that release's notes. Each
-  one-way step is justified in its pull request and has a refusal test.
+  one-way step is justified in its pull request and has a refusal test. (The
+  SQLite ledger has no such gate yet; see the change rules.)
 - **After a feature level is raised,** the metadata tier can go back only by
-  restoring a backup taken before the raise. That restore is documented and
-  drilled with the backup work
-  ([#734](https://github.com/allamiro/vtop-engine/issues/734)); there is no
-  export tool.
+  restoring a backup taken before the raise. That restore will be documented
+  and drilled with the backup work
+  ([#734](https://github.com/allamiro/vtop-engine/issues/734)); until then
+  there is no tested way back after a raise, and there is no export tool.
 
 What an older binary does with newer data, by case:
 
-| Newer data | The N-1 binary | Policy |
-|---|---|---|
-| A nullable ledger column | Names its own columns, ignores the new one and writes `NULL` in the rows it inserts. A later release reads `NULL` as unknown. | Supported. No marker bump, and the column is never dropped. Only N-1 shares a PostgreSQL ledger with N. |
-| A ledger row in a state, or of a source type, N-1 does not know | Fails closed. | One-way: needs a marker or version bump, so the refusal comes at startup and not mid-run. |
-| A `0.4` manifest | v0.8.0 and later verify it; v0.7.0 and earlier report it as tampered. | The documented cutoff. Archives are never rewritten; set `write_version: "0.3"` to stop writing more. |
-| A metadata log entry or snapshot record from a raised feature level | The voter refuses to start, saying *newer format*, and changes nothing. | One-way at the raise, which is operator-gated and permanent. The notes say which level first puts a new kind in the log. |
-| A segment v2 directory | Every release since v0.5.0 reads v2. | Supported. A later segment version follows [reader first](#reader-first). |
+| Newer data | The N-1 binary | Policy (target) | Tested today |
+|---|---|---|---|
+| A nullable ledger column | Names its own columns, ignores the new one and writes `NULL` in the rows it inserts. A later release reads `NULL` as unknown. | Supported. No marker bump, and the column is never dropped. Only N-1 shares a PostgreSQL ledger with N. | No |
+| A ledger row in a state, or of a source type, N-1 does not know | Fails closed. | One-way: needs a marker or version bump, so the refusal comes at startup and not mid-run. | No |
+| A `0.4` manifest | v0.8.0 and later verify it; v0.7.0 and earlier report it as tampered. | The documented cutoff. Archives are never rewritten; set `write_version: "0.3"` to stop writing more. | Yes: v0.7.0, and v0.8.0 and later (`manifest-compat`) |
+| A metadata log entry or snapshot record from a raised feature level | The voter refuses to start, saying *newer format*, and changes nothing. Today that holds for a new command kind, log entry kind, value tag or key category; other enum values inside records are reported as corrupt until [#763](https://github.com/allamiro/vtop-engine/pull/763). | One-way at the raise, which is operator-gated and permanent. The notes say which level first puts a new kind in the log. | No |
+| A segment v2 directory | Every release since v0.5.0 reads v2. | Supported. A later segment version follows [reader first](#reader-first). | No |
 
 ## Deprecation
 
@@ -166,17 +179,21 @@ What an older binary does with newer data, by case:
 
 - **Config.** Loading stays lenient through 0.x: the engine's top-level
   `config.yaml` sections ignore a key they do not know, while the cluster
-  role configs and some nested sections (`manifest.mac`,
-  `upload.object_lock`, the state-store references) refuse one. A `config_version` key
-  and a `vtopctl validate --strict` that refuses unknown keys are planned.
+  role configs and some nested sections refuse one: `manifest.mac` and its
+  `keys`, `upload.object_lock`, `upload.transports.<name>`, the state-store
+  `env`/`file` references, and a stream's `checksum` in `streams.yaml`. A
+  `config_version` key and a `vtopctl validate --strict` that refuses
+  unknown keys are planned.
   Until then, each release's notes list the new keys an older engine
   silently ignores.
 - **JSON output.** `validate --print-effective` carries
   `effective_version: 1`, audit records carry `audit_version: 1` and ledger
-  digests carry `vtop_ledger_digest: 1`. The other `--json` reports gain a
-  `report_version` field, an additive change.
-- **Native protocol.** The rule that a new message kind needs a minor bump
-  starts at 1.0. Until then, wire changes follow the N-1/N rolling rule.
+  digests carry `vtop_ledger_digest: 1`. The other `--json` reports will
+  gain a `report_version` field, an additive change (planned for v0.11.0).
+- **Native protocol.** The rule that a new message kind needs a minor bump,
+  and a sender that checks the peer's minor, starts at 1.0. Until then, a
+  new kind is added under minor 0, an N-1 peer rejects it as unknown, and it
+  is used only once every node runs N.
 - **Cluster plane.** The metadata, native and replica formats (inventory
   rows 15 to 21) are classified here but not frozen. Whether they are frozen
   at 1.0 follows the 1.0 scope decision
@@ -212,7 +229,7 @@ table differs from what the registry generates. Edit the registry and run
 | 7 | Progress markers (ledger, digests, manifests) | none: optional fields | B | evolving; key names frozen | stable |
 | 8 | `audit_events` table and hash chain | `audit_version` column | B | evolving | stable |
 | 9 | Audit record (JSONL) | `audit_version` `1` | B | evolving | stable |
-| 10 | Segment log v1 and v2, index, chunk sidecar, commit marker | `VTOPSEG1`, `VTOPREC1`, `VTOPIDX1`; `VTOPSEG2`, `VTOPREC2`; `VTOPCHK1`; `VTOPCMT1` | B | v1 stable, v2 evolving | v1 stable; v2 decided in its own issue |
+| 10 | Segment log v1 and v2, index, chunk sidecar, commit marker | `VTOPSEG1`, `VTOPREC1`, `VTOPIDX1`; `VTOPSEG2`, `VTOPREC2`; `VTOPCHK1`; `VTOPCMT1` | B | v1 stable, v2 evolving | v1 stable; v2's status and the release that makes it the default writer are decided in their own issue |
 | 11 | Retention and truncate intents, producer snapshot | `VTOPRIN1`, `VTOPTIN1`, `VTOPPRD1` | B | evolving | classified at the freeze |
 | 12 | Broker journals: fencing epochs, lineage, epoch, kept dispute, committed floor | `VTOPFNC1`, `VTOPFLN1`, `VTOPEPC1`, `VTOPKDS1`, `VTOPFLR1` | B | evolving | classified at the freeze |
 | 13 | Multipart session (`*.multipart.json`) | `schema_version` `1` | B | evolving | stable |

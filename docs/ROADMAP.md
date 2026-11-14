@@ -50,8 +50,8 @@ first live-chaos scenarios on real processes.
 
 The release pipeline ships `vtop-node` alongside `vtopctl`, publishes a
 multi-arch GHCR image, and attaches an SBOM, cosign signatures and
-`SHA256SUMS`. Tagged as a pre-release: the 0.x series makes no compatibility
-promise across minor versions.
+`SHA256SUMS`. The 0.x series makes no compatibility promise across minor
+versions.
 
 **Not in it:** replicated-range failover without harness-style follower
 restarts, and any form of replica replacement.
@@ -1078,7 +1078,7 @@ mode_mismatch. The deployment profile is
 ## Versioning
 
 0.x. Minor versions may break compatibility. Every release so far is published
-as a full GitHub release; only a hyphenated version such as `0.9.0-rc.1` would
+as a full GitHub release; only a hyphenated version such as `1.0.0-rc.1` would
 be published as a pre-release. What each format promises, the rules for
 changing one, the deprecation notice and the path to 1.0 are in the
 [compatibility policy](reference/compatibility.md) (#743). **Upgrades are
