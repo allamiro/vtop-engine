@@ -1976,6 +1976,11 @@ impl Gateway {
         let mut topics = Vec::with_capacity(request.topics.len());
         // Once for the request, and only if a redirect is ever considered.
         let mut served = None;
+        // ONE decompression budget for the request (#596, review): every
+        // compressed batch of every partition entry draws it down, so a
+        // request may expand to no more than one uncompressed field carries,
+        // however many entries (repeated ones included) it lists.
+        let mut budget = crate::wire::MAX_FIELD_BYTES;
         for topic in request.topics {
             let mut partitions = Vec::with_capacity(topic.partitions.len());
             for partition in topic.partitions {
@@ -1988,6 +1993,7 @@ impl Gateway {
                             partition.records.as_deref(),
                             deadline,
                             &mut served,
+                            &mut budget,
                         )
                         .await
                     }
@@ -2035,6 +2041,7 @@ impl Gateway {
         records: Option<&[u8]>,
         deadline: tokio::time::Instant,
         served: &mut Option<Result<Vec<String>, ErrorCode>>,
+        budget: &mut usize,
     ) -> Result<crate::bridge::Appended, (ErrorCode, String)> {
         if !self.leads(partition) {
             return Err((
@@ -2051,25 +2058,62 @@ impl Gateway {
                 "no records in the produce".to_owned(),
             ));
         };
+        // Judged by name before any decoding (#596, review): a topic this
+        // gateway does not serve costs no decompression.
+        let kafka_topic = topic.to_owned();
+        let resolved = self.resolve(topic).map_err(|error| {
+            (
+                error,
+                format!("topic {kafka_topic:?} is not in this gateway's topic map"),
+            )
+        })?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err((
+                ErrorCode::RequestTimedOut,
+                "the request's deadline passed before this partition was reached".to_owned(),
+            ));
+        }
         // EVERY batch the field carries (review): a RECORDS field may hold
         // several back to back, and the decoder stops at the first one's
         // declared length by design. All are decoded and judged before any
-        // is appended, so a refusal appends nothing. A large compressed
-        // field is decompressed on the blocking pool (#596); nothing is held
-        // across the wait, and the copy is the field's compressed size.
-        let batches = if records.len() > INLINE_DECODE_BYTES && any_compressed(records) {
+        // is appended, so a refusal appends nothing. A compressed field is
+        // decompressed on the blocking pool whatever its size (#596,
+        // review): its cost is its output, up to the request's budget, and
+        // a small input says nothing about that. Nothing is held across the
+        // wait, and the copy is the field's compressed size.
+        let (batches, used) = if any_compressed(records) {
             let owned = records.to_vec();
-            tokio::task::spawn_blocking(move || split_batches(&owned))
-                .await
-                .map_err(|error| {
-                    (
-                        ErrorCode::CorruptMessage,
-                        format!("the batches could not be decoded: the decoder failed ({error})"),
-                    )
-                })??
+            let left = *budget;
+            match tokio::task::spawn_blocking(move || split_batches(&owned, left)).await {
+                Ok(decoded) => decoded?,
+                Err(error) if error.is_panic() => {
+                    tracing::error!(
+                        topic,
+                        partition,
+                        %error,
+                        "kafka produce: the batch decoder panicked, which is a gateway fault, not \
+                         the client's; nothing was appended and the client was answered \
+                         UNKNOWN_SERVER_ERROR. Report it with the producer's library and codec."
+                    );
+                    return Err((
+                        ErrorCode::UnknownServerError,
+                        "the gateway failed decoding this partition's batches; nothing was appended"
+                            .to_owned(),
+                    ));
+                }
+                Err(_) => {
+                    return Err((
+                        ErrorCode::RequestTimedOut,
+                        "the gateway stopped before this partition's batches were decoded; \
+                         nothing was appended"
+                            .to_owned(),
+                    ))
+                }
+            }
         } else {
-            split_batches(records)?
+            split_batches(records, *budget)?
         };
+        *budget -= used;
         if batches.is_empty() {
             return Err((
                 ErrorCode::InvalidRecord,
@@ -2103,13 +2147,6 @@ impl Gateway {
         // it (#457): one producer, contiguous sequences, or a refusal that
         // appends nothing.
         let sequenced = sequenced_identity(&batches)?;
-        let kafka_topic = topic.to_owned();
-        let resolved = self.resolve(topic).map_err(|error| {
-            (
-                error,
-                format!("topic {kafka_topic:?} is not in this gateway's topic map"),
-            )
-        })?;
         // The bridge is synchronous and a real one fsyncs: off the runtime's
         // threads, the way the broker's own session loop does it. The SET is
         // one append (review) — whole or not at all — and the wait for it
@@ -2519,17 +2556,11 @@ fn mint_producer_id(node_id: u8) -> i64 {
     }
 }
 
-/// A produce whose records field is larger than this, and compressed, is
-/// decoded on the blocking pool (#596): decompressing up to the field cap is
-/// CPU work an async worker should not do inline. Smaller ones, the common
-/// case, decode in place.
-const INLINE_DECODE_BYTES: usize = 64 * 1024;
-
 /// Whether any batch in a records field declares a codec, read from the
 /// headers alone. Framing is not judged here: `split_batches` does that.
 fn any_compressed(mut bytes: &[u8]) -> bool {
     while bytes.len() >= 23 {
-        if i16::from_be_bytes([bytes[21], bytes[22]]) & 0x07 != 0 {
+        if crate::records::declared_codec(bytes) != 0 {
             return true;
         }
         let declared = i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
@@ -2547,13 +2578,16 @@ fn any_compressed(mut bytes: &[u8]) -> bool {
 
 /// Every batch a records field carries, decoded and judged.
 ///
-/// The compressed batches in one field share one budget (#596): together
-/// they may expand to at most [`crate::wire::MAX_FIELD_BYTES`], the most an
-/// uncompressed field can carry. A per-batch cap alone would let many small
-/// batches, each just under it, expand one request without bound.
-fn split_batches(mut bytes: &[u8]) -> Result<Vec<RecordBatch>, (ErrorCode, String)> {
+/// The compressed batches draw on `budget` (#596), the request's: together
+/// they may expand to what is left of it, and the bytes used are returned
+/// beside the batches. A per-batch cap alone would let many small batches,
+/// each just under it, expand one request without bound.
+fn split_batches(
+    mut bytes: &[u8],
+    mut budget: usize,
+) -> Result<(Vec<RecordBatch>, usize), (ErrorCode, String)> {
     let mut batches = Vec::new();
-    let mut budget = crate::wire::MAX_FIELD_BYTES;
+    let start = budget;
     while !bytes.is_empty() {
         if bytes.len() < 12 {
             return Err((
@@ -2596,7 +2630,7 @@ fn split_batches(mut bytes: &[u8]) -> Result<Vec<RecordBatch>, (ErrorCode, Strin
         batches.push(batch);
         bytes = &bytes[len..];
     }
-    Ok(batches)
+    Ok((batches, start - budget))
 }
 
 /// What a refused batch is reported as, to the client (Produce v8 carries it)
@@ -2608,15 +2642,16 @@ fn refusal_reason(which: usize, error: &BatchError) -> String {
     match error {
         BatchError::UnknownCodec { codec } => format!(
             "batch {which} declares compression codec {codec}, which Kafka does not define. \
-             Nothing from this request was appended; the client was answered \
+             Nothing from this partition's records was appended; the client was answered \
              UNSUPPORTED_COMPRESSION_TYPE. Set the producer's compression.type to one of {}",
             crate::codec::served_list()
         ),
         BatchError::DecompressedTooLarge { codec, .. } => format!(
-            "batch {which} expands past {} bytes after {} decompression (the most one produce's \
-             records may hold, across its batches). The request was refused whole and nothing \
-             was appended (MESSAGE_TOO_LARGE). Send smaller batches: lower the producer's \
-             batch.size or linger.ms",
+            "batch {which} expands past what is left of the {} bytes one produce request may \
+             decompress to, across all its partitions and batches, after {} decompression. This \
+             partition's records were refused whole and nothing from them was appended \
+             (MESSAGE_TOO_LARGE). Send smaller batches: lower the producer's batch.size or \
+             linger.ms",
             crate::wire::MAX_FIELD_BYTES,
             name(codec)
         ),
@@ -6883,7 +6918,7 @@ mod tests {
         for part in [
             "codec 7",
             "Kafka does not define",
-            "Nothing from this request was appended",
+            "Nothing from this partition's records was appended",
             "gzip, snappy, lz4, zstd, none",
         ] {
             assert!(message.contains(part), "{part:?} missing from {message}");
@@ -6945,7 +6980,7 @@ mod tests {
         let big = "\0".repeat(6 * 1024 * 1024);
         let one = compressed_batch_bytes(crate::codec::ZSTD, &batch_bytes(&[big.as_str()], false));
         let mut set = Vec::new();
-        while set.len() <= super::INLINE_DECODE_BYTES {
+        while set.len() <= 64 * 1024 {
             set.extend_from_slice(&one);
         }
         assert!(super::any_compressed(&set));
@@ -6967,6 +7002,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_produce(&reply, 8).0, 0);
+    }
+
+    /// One request listing the gateway's partition many times, each entry a
+    /// small zstd stream that expands to 6 MiB: the entries share the
+    /// request's one budget (review), so the third is refused, and the work
+    /// is bounded by the budget, not by how many entries fit in a frame.
+    #[tokio::test]
+    async fn repeated_partition_entries_share_the_request_budget() {
+        let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        let big = "\0".repeat(6 * 1024 * 1024);
+        let one = compressed_batch_bytes(crate::codec::ZSTD, &batch_bytes(&[big.as_str()], false));
+        assert!(
+            one.len() < 64 * 1024,
+            "small on the wire: {} bytes",
+            one.len()
+        );
+        let mut body = Encoder::new();
+        body.nullable_string(None);
+        body.i16(-1);
+        body.i32(30_000);
+        body.array_len(1);
+        body.string("events");
+        body.array_len(4);
+        for _ in 0..4 {
+            body.i32(0);
+            body.nullable_bytes(Some(&one));
+        }
+        let reply = call(addr, 0, 8, 1, body.as_slice()).await.unwrap();
+        let mut d = Decoder::new(&reply);
+        d.array_len("topics").unwrap();
+        d.string("topic").unwrap();
+        assert_eq!(d.array_len("partitions").unwrap(), Some(4));
+        let mut codes = Vec::new();
+        for _ in 0..4 {
+            d.i32("index").unwrap();
+            codes.push(d.i16("error").unwrap());
+            d.i64("base_offset").unwrap();
+            d.i64("log_append_time").unwrap();
+            d.i64("log_start_offset").unwrap();
+            d.array_len("record_errors").unwrap();
+            let message = d.nullable_string("error_message").unwrap();
+            if codes.len() == 3 {
+                assert!(
+                    message
+                        .unwrap_or_default()
+                        .contains("one produce request may decompress"),
+                    "the third entry names the request budget"
+                );
+            }
+        }
+        let too_large = ErrorCode::MessageTooLarge.as_i16();
+        assert_eq!(codes, vec![0, 0, too_large, too_large]);
     }
 
     #[tokio::test]

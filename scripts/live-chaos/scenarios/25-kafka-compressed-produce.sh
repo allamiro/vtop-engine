@@ -79,11 +79,16 @@ for codec in $SERVED_CODECS; do
     || fail "a $codec delivery failed: $(grep -m 3 'Delivery failed' "$PLOG")"
   sent_compressed="$(grep -c "Produce MessageSet with .*, $codec)" "$PLOG" || true)"
   sent_plain="$(grep -c 'Produce MessageSet with .*, uncompressed)' "$PLOG" || true)"
-  if [[ "$sent_compressed" -gt 0 && "$sent_plain" -eq 0 ]]; then
-    log "librdkafka sent all $sent_compressed $codec batch(es) compressed"
+  # librdkafka sends a batch uncompressed when compressing would not make
+  # it smaller, which a trailing one-record batch can hit; batches of more
+  # than one record sent uncompressed are what would mean the codec was off.
+  plain_multi="$({ grep -o 'Produce MessageSet with [0-9]* message(s) .*, uncompressed)' "$PLOG" || true; } \
+    | awk '$4 > 1' | wc -l | tr -d ' ')"
+  if [[ "$sent_compressed" -gt 0 && "$plain_multi" -eq 0 ]]; then
+    log "librdkafka sent $sent_compressed $codec batch(es) compressed ($sent_plain single-record batch(es) uncompressed)"
     compressed_codecs=$((compressed_codecs + 1))
   elif [[ " $MUST_COMPRESS " == *" $codec "* ]]; then
-    fail "librdkafka sent $sent_plain of $((sent_compressed + sent_plain)) $codec batch(es) uncompressed: $(grep -m 1 -i 'not compressing' "$PLOG" || true)"
+    fail "librdkafka sent $plain_multi multi-record $codec batch(es) uncompressed: $(grep -m 1 -i 'not compressing' "$PLOG" || true)"
   else
     log "librdkafka sent $codec batches uncompressed ($(grep -m 1 -o 'does not support compression type [a-z0-9]*: not compressing batch' "$PLOG" || echo "$sent_plain uncompressed"), $sent_compressed compressed): round-tripped, not counted as decompression coverage"
   fi

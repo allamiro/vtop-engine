@@ -152,6 +152,13 @@ pub struct RecordBatch {
     pub records: Vec<Record>,
 }
 
+/// The codec a batch's header declares, from its `attributes`, without
+/// judging anything else. The caller has checked the slice is at least 23
+/// bytes long.
+pub fn declared_codec(batch: &[u8]) -> i16 {
+    i16::from_be_bytes([batch[21], batch[22]]) & COMPRESSION_MASK
+}
+
 impl RecordBatch {
     /// Parse one batch, verifying its CRC; a compressed batch may expand to
     /// at most [`MAX_FIELD_BYTES`], the most an uncompressed one can carry.

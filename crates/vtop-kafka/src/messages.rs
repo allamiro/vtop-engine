@@ -194,6 +194,9 @@ impl ApiKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i16)]
 pub enum ErrorCode {
+    /// A fault in the gateway itself (a decoder panic, #596), never the
+    /// client's data: a client must not be told to fix what it sent.
+    UnknownServerError = -1,
     None = 0,
     OffsetOutOfRange = 1,
     CorruptMessage = 2,

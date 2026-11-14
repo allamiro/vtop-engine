@@ -922,12 +922,15 @@ stores their records as ordinary native records, so Fetch serves them as an
 uncompressed batch (codec bits 0, CRC recomputed, the producer's create
 times kept). The CRC is checked over the compressed bytes before the
 decoder sees any of them, and the record count stays binding over the
-decompressed records. The compressed batches of one produce may expand to
-16 MiB in total, the most an uncompressed one can carry: past that the
-request is refused whole with `MESSAGE_TOO_LARGE`, a stream that does not
-decompress is `CORRUPT_MESSAGE`, and codec ids Kafka does not define stay
-`UNSUPPORTED_COMPRESSION_TYPE` with the codecs to use instead. A
-large compressed produce is decompressed off the async workers. The cost is
+decompressed records. The compressed batches of one produce request, across all
+its partition entries, may expand to 16 MiB in total, the most an
+uncompressed field can carry: past that the partition is refused whole with
+`MESSAGE_TOO_LARGE`, a stream that does not decompress is `CORRUPT_MESSAGE`,
+and codec ids Kafka does not define stay `UNSUPPORTED_COMPRESSION_TYPE` with
+the codecs to use instead. Every compressed field is decompressed off the
+async workers, and a zstd frame that asks for a window wider than 16 MiB is
+refused before it is allocated (`CORRUPT_MESSAGE`; producers at zstd levels
+20 to 22 can ask for one). The cost is
 stated, not hidden: the native log stores and Fetch serves the uncompressed
 bytes where Kafka keeps the producer's compressed ones. No stored format
 and no advertised API version changes.
@@ -936,8 +939,8 @@ against the gateway but send gzip, snappy and lz4 uncompressed: librdkafka
 2.8.0 logs "Broker does not support compression type gzip: not compressing
 batch", because its feature check wants protocol versions below the
 gateway's Produce v3 floor. Those batches are stored as sent (live-chaos
-scenario 25). The gateway's unit tests decode gzip and zstd batches the
-pinned Java producer wrote (`scripts/gen-kafka-fixtures.sh`).
+scenario 25). The gateway's unit tests decode batches the pinned Java
+producer wrote with each of the four codecs (`scripts/gen-kafka-fixtures.sh`).
 
 **Manifest format evolution (#671).** v0.8.0's readers check a
 manifest's `version` first, read `0.1`-`0.4`, verify `0.4` over the stored
