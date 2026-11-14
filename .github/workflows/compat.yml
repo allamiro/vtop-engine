@@ -87,8 +87,8 @@ jobs:
           set -euo pipefail
           # A push to main gets the pull request's cells: the nightly run
           # covers the rest.
-          mode=full
-          if [[ "$EVENT" == pull_request || "$EVENT" == push ]]; then mode=pr; fi
+          mode="full"
+          if [[ "$EVENT" == pull_request || "$EVENT" == push ]]; then mode="pr"; fi
           matrix="$(python scripts/compat/select_cells.py --mode "$mode" --tags-from-git)"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "mode: $mode"
