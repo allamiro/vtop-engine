@@ -82,3 +82,20 @@ before the active key changes.
 `crates/vtop-core/tests/manifest_keyring.rs` verifies both under their ids
 and refuses `q3` under a keyring that does not hold it; they also seed the
 fuzz corpus (`v04-keyring-*.seed`).
+
+## Verification receipts (`release-b-receipt-*.json`, `release-b-receipted-0.4-*.json`)
+
+The first verification receipts (#671 release B, PR 3), each with the `0.4`
+manifest of the same batch, written by the receipts release's
+`vtopctl process-once` built from this branch: the localfs backend, no
+compression, SHA-256, `manifest: {write_version: "0.4",
+verification_receipts: true}`, and the inputs `release B receipt fixture\n`
+and `signed release B receipt fixture\n`, the signed one with
+`manifest_mac_key_env` holding the fixture key `11` x 32. Copied as stored,
+without parsing or rewriting. Each receipt binds its manifest's self-hash and
+records `class: strong` and `method: read_back` (localfs reads the object
+back). localfs gives no object versions, so neither carries a `version_id`.
+
+`crates/vtop-core/tests/verification_receipt.rs` verifies each receipt from
+its stored bytes and checks it binds the manifest beside it; the receipts
+also seed the fuzz corpus (`receipt-release-b-*.seed`).

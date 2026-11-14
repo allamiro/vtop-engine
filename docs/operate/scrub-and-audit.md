@@ -62,6 +62,7 @@ pinned version.
 | `--seed` | random | The sample's seed; printed either way. Needs `--sample`. |
 | `--metrics-file` | - | Write the results as a Prometheus text file. Totals carry forward from the file it replaces. |
 | `--check-retention` | off | Also read each batch's S3 Object Lock retention and expect the mode `upload.object_lock` sets. Refused when the config has no `upload.object_lock`. See below. |
+| `--require-receipts` | off | Check each batch's verification receipt, and report a missing one as a finding. Receipts are checked without it when the config sets `manifest.verification_receipts`; a missing one is then counted, not a finding. See below. |
 
 Each batch gets one result:
 
@@ -96,6 +97,24 @@ and printed as a `retention:` line:
 
 A retention that cannot be read makes the batch `unreadable`. The scrub needs
 `s3:GetObjectRetention`; see [S3 Object Lock](../OBJECT_LOCK_DEPLOYMENT.md).
+
+When the config sets `manifest.verification_receipts`, or with
+`--require-receipts` (#671), each batch also gets a receipt result: its
+verification receipt read beside the manifest, authenticated with the key it
+names, and bound to the ledger row. Counted in
+`vtop_scrub_receipts_total{result}` and printed as a `receipts:` line:
+
+| Receipt | Meaning | Finding |
+|---|---|---|
+| `ok` | It authenticates and names this batch as the ledger recorded it. | No |
+| `missing` | No receipt is stored: normal for a batch archived before receipts were enabled. | Only with `--require-receipts` |
+| `invalid` | It does not parse, or fails its self-hash or MAC with a key this config holds: edited, or forged without the key. | Yes |
+| `unauthenticated` | It names a key this config does not hold, or a retired one. Not proven bad. | Yes |
+| `mismatched` | Another batch's receipt, or one naming another manifest digest or version, another object, or another verification class than the ledger's. | Yes |
+| `unreadable` | The store answered with an error other than absence. | Yes |
+
+The scrub writes no receipt. What a receipt proves is in
+[Verification receipts](verification-receipts.md).
 
 ## Schedule them
 

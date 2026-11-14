@@ -39,6 +39,15 @@ archive is complete, then the procedures you will need less often.
 
     [:octicons-arrow-right-24: Key rotation](manifest-key-rotation.md)
 
+-   **Verification receipts**
+
+    ---
+
+    Record in the archive how each object was verified, and check those
+    records with the scrub.
+
+    [:octicons-arrow-right-24: Verification receipts](verification-receipts.md)
+
 -   **S3 Object Lock**
 
     ---
