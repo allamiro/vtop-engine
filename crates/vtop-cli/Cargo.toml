@@ -52,6 +52,12 @@ rdkafka = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The in-memory span exporter the trace tests assert against (#683).
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# Decoding what the fake collector receives (tests/otel_messages.rs).
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
 # s3_native_object_keys (#626) counts stored object versions on a live store.
 aws-sdk-s3 = { workspace = true }
 # `PgStateStore::execute_raw` resets the Postgres ledger between the recovery

@@ -1,9 +1,8 @@
 # Tempo — single-binary, filesystem storage. LAB ONLY.
 #
-# Wired up ahead of the engine actually emitting traces (issue #46): the pipeline
-# stage timings the engine already measures ARE a trace, they simply have no
-# exporter yet. Until then Tempo runs idle rather than being absent, so adding
-# OTLP export needs no stack change.
+# The engine exports OTLP traces (#683) to Alloy, which forwards them here on
+# 4317. The receivers below also accept OTLP directly, for a sender outside the
+# lab's Alloy.
 server:
   http_listen_port: 3200
   log_level: warn

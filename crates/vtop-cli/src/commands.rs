@@ -258,8 +258,14 @@ impl From<SourceKind> for SourceType {
 /// JSON is selected by `--json` OR `VTOP_LOG_FORMAT=json`. The encoding rules
 /// and the reasoning behind them live in [`vtop_observe::logging`], shared with
 /// the cluster nodes so engine and node lines land in Loki with one shape.
-pub fn init_tracing(level: &str, json: bool) {
-    vtop_observe::logging::init(level, json);
+///
+/// OpenTelemetry export (traces and metrics over OTLP) is installed beside
+/// the logs when `OTEL_EXPORTER_OTLP_ENDPOINT` (or a per-signal variable) is
+/// set, and not otherwise; see [`crate::otel`]. A setting that cannot be
+/// honoured is an error naming the variable. [`dispatch`] flushes export
+/// before the process exits.
+pub fn init_tracing(level: &str, json: bool, instance: Option<&str>) -> Result<(), VtopError> {
+    crate::otel::init_tracing(level, json, instance)
 }
 
 fn load(config: &Path) -> Result<(VtopConfig, StreamsConfig), VtopError> {
@@ -273,6 +279,62 @@ fn load(config: &Path) -> Result<(VtopConfig, StreamsConfig), VtopError> {
     };
     streams.validate(&cfg)?;
     Ok((cfg, streams))
+}
+
+/// The effective OpenTelemetry settings (#683), from the environment. Each
+/// endpoint is shown as host and path only; headers are shown as set or not,
+/// never their values.
+fn effective_otel_lines(settings: &vtop_observe::otel::Settings) -> Vec<(&'static str, String)> {
+    use vtop_observe::otel::{endpoint_display, Settings};
+    match settings {
+        Settings::Off(reason) => vec![("export", format!("off ({reason})"))],
+        Settings::On(export) => {
+            let signal = |s: &Option<vtop_observe::otel::Signal>| {
+                s.as_ref()
+                    .map_or_else(|| "off".to_owned(), |s| endpoint_display(&s.endpoint))
+            };
+            let headers = |s: &Option<vtop_observe::otel::Signal>| {
+                s.as_ref().map_or("none", |s| {
+                    if s.headers.is_empty() {
+                        "none"
+                    } else {
+                        "set (values not shown)"
+                    }
+                })
+            };
+            vec![
+                ("export", "on".to_owned()),
+                ("traces", signal(&export.traces)),
+                ("metrics", signal(&export.metrics)),
+                ("protocol", vtop_observe::otel::PROTOCOL.to_owned()),
+                ("sampler", export.sampler.describe()),
+                ("service_name", export.service_name.clone()),
+                ("traces_headers", headers(&export.traces).to_owned()),
+                ("metrics_headers", headers(&export.metrics).to_owned()),
+                ("queue_size", export.queue.max_queue.to_string()),
+                (
+                    "metric_interval_ms",
+                    export.metric_interval.as_millis().to_string(),
+                ),
+            ]
+        }
+    }
+}
+
+fn print_effective_otel(settings: &vtop_observe::otel::Settings) {
+    println!("opentelemetry:");
+    for (key, value) in effective_otel_lines(settings) {
+        println!("  {key}: {value}");
+    }
+}
+
+fn effective_otel_json(settings: &vtop_observe::otel::Settings) -> serde_json::Value {
+    serde_json::Value::Object(
+        effective_otel_lines(settings)
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), serde_json::Value::String(v)))
+            .collect(),
+    )
 }
 
 /// Render only the dedicated allowlist; never walk the configuration model.
@@ -374,7 +436,7 @@ pub async fn dispatch(cli: Cli) -> i32 {
     if let Command::Tier { command } = cli.command {
         return crate::tier_tools::run(command, cli.json).await;
     }
-    match run_command(&cli).await {
+    let code = match run_command(&cli).await {
         Ok(()) => 0,
         Err(e) => {
             // Errors are reported on stderr without leaking secrets.
@@ -382,7 +444,11 @@ pub async fn dispatch(cli: Cli) -> i32 {
             eprintln!("error: {e}");
             1
         }
-    }
+    };
+    // The last spans of a stop (the shutdown flush's batches) are still
+    // queued; send them before exiting, within a bounded wait (#683).
+    crate::otel::shutdown().await;
+    code
 }
 
 async fn run_command(cli: &Cli) -> Result<(), VtopError> {
@@ -392,7 +458,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
             // Metrics are opt-in via VTOP_METRICS_ADDR and only for the
             // long-running `run` action: one-shot commands would expose a port
             // for a few milliseconds and never be scraped. Failure to start is
@@ -406,7 +473,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
             let engine = Engine::new(cfg, streams).await?;
             let sources = engine.discover().await?;
             if cli.json {
@@ -434,7 +502,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
             let mut engine = Engine::new_exclusive(cfg, streams).await?;
             engine.recover().await?;
             let outcomes = engine.process_once((*source).into()).await?;
@@ -473,7 +542,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
             let mut engine = Engine::new_exclusive(cfg, streams).await?;
             if let Some(id) = batch_id {
                 match engine.store.get_batch(id).await? {
@@ -501,7 +571,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
             let engine = Engine::new(cfg, streams).await?;
             let batches = engine.store.list_batches().await?;
             let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
@@ -523,7 +594,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
             let engine = Engine::new(cfg, streams).await?;
             let batches = engine.store.list_batches().await?;
             if cli.json {
@@ -560,7 +632,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
             let engine = Engine::new(cfg, streams).await?;
             let report = verify_manifest_deep(
                 engine.store.as_ref(),
@@ -593,6 +666,11 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             // documented opt-out, and refusing it here would only push
             // operators to skip the check.
             let (cfg, streams) = load(config)?;
+            // The OpenTelemetry variables are part of the deployment's
+            // configuration too (#683): one the engine would refuse at
+            // startup fails the check here, naming the variable.
+            let otel = vtop_observe::otel::settings_from_env(crate::otel::SERVICE_NAME)
+                .map_err(|e| VtopError::Config(format!("OpenTelemetry: {e}")))?;
             let warnings = streams.warnings(&cfg);
             if *print_effective {
                 let effective =
@@ -600,7 +678,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 if cli.json {
                     println!(
                         "{}",
-                        serde_json::json!({"status": "ok", "warnings": warnings, "effective_version": 1, "effective": effective})
+                        serde_json::json!({"status": "ok", "warnings": warnings, "effective_version": 1, "effective": effective, "opentelemetry": effective_otel_json(&otel)})
                     );
                 } else {
                     for warning in &warnings {
@@ -621,6 +699,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                             stream,
                         )?;
                     }
+                    print_effective_otel(&otel);
                 }
                 return Ok(());
             }
@@ -647,7 +726,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
             let state_store = cfg.engine.state_store.resolve()?;
             let backend = if state_store.is_postgres() {
                 "postgresql"
@@ -675,7 +755,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
             let digest_dir = digest_dir
                 .clone()
                 .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
@@ -734,7 +815,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
             let digest_dir = digest_dir
                 .clone()
                 .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
@@ -858,7 +940,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             init_tracing(
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
-            );
+                Some(&cfg.engine.name),
+            )?;
             let state_store = cfg.engine.state_store.resolve()?;
             // The configured bound, as the engine uses (review of #568).
             let store = crate::engine::connect_configured_store(&cfg.engine, &state_store).await?;

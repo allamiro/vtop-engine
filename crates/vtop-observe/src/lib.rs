@@ -18,6 +18,8 @@
 //!   running". This is what replaces log-grep readiness in the chaos harness.
 //! * [`logging`] — one definition of `VTOP_LOG_FORMAT=json`, so node logs and
 //!   engine logs land in Loki with the same shape.
+//! * [`otel`] — OpenTelemetry export (traces and metrics over OTLP/HTTP, log
+//!   correlation), compiled in and idle until an OTLP endpoint is set (#683).
 //!
 //! What deliberately does NOT live here: metric *definitions*. Each process
 //! registers its own metrics against its own registry and hands this crate a
@@ -25,6 +27,7 @@
 //! what stops it from growing a dependency on every crate in the workspace.
 
 pub mod logging;
+pub mod otel;
 pub mod readiness;
 pub mod server;
 

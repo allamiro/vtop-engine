@@ -82,8 +82,11 @@ As of **August 2026** (repo at v0.3.0):
   on SQLite; `vtopctl prune-ledger` under a maintenance identity on
   PostgreSQL (#128, part of Phase 8).
 - Prometheus metrics + readiness endpoint, opt-in via `VTOP_METRICS_ADDR`
-  (`vtop-observe`); structured per-stage events; Grafana/Loki/Mimir/Tempo/Alloy
-  compose stack and generated dashboards in `observability/` (part of Phase 6).
+  (`vtop-observe`); structured per-stage events; OpenTelemetry export (traces
+  of each batch's lifecycle, the metrics over OTLP, trace ids in the JSON
+  logs), built in and idle until `OTEL_EXPORTER_OTLP_ENDPOINT` is set (#683);
+  Grafana/Loki/Mimir/Tempo/Alloy compose stack and generated dashboards in
+  `observability/` (part of Phase 6).
 - Single-instance safety: exclusive work-dir lock at startup (#66) so the
   unsupported multi-writer configuration fails loudly instead of corrupting
   progress.
@@ -104,8 +107,8 @@ As of **August 2026** (repo at v0.3.0):
   the engine.
 
 **Partially done**
-- Phase 6 (observability & ops): metrics, readiness, dashboards exist; OTel
-  trace export from the engine and Alertmanager rules do not.
+- Phase 6 (observability & ops): metrics, readiness, dashboards and OTLP trace
+  export exist; Alertmanager rules do not.
 - Phase 8 (retention/backup/DR/security): retention shipped; backup/restore
   runbook, DR drills, and the divergence checker have not been exercised.
 
@@ -167,7 +170,7 @@ section calls out the consequence.
 | Kafka offset | Committed to the **broker** after VERIFIED (resumes broker-side) | Same; consumer-group mode for multi-instance **[PROPOSED]** |
 | Concurrency | Single process, **single-instance lock enforced at startup** (#66) | N replicas via Kafka consumer groups **[PROPOSED]** |
 | State backend | **SQLite and PostgreSQL** (feature-gated) behind the `StateStore` trait **[IMPLEMENTED]** | Same; Postgres-compatible store is the production path |
-| Metrics | Prometheus endpoint, opt-in via `VTOP_METRICS_ADDR` **[IMPLEMENTED]** | Same, plus traces and alerting (§14) |
+| Metrics | Prometheus endpoint, opt-in via `VTOP_METRICS_ADDR` **[IMPLEMENTED]**; OTLP traces, opt-in via `OTEL_EXPORTER_OTLP_ENDPOINT` **[IMPLEMENTED]** | Same, plus alerting (§14) |
 
 ---
 
@@ -356,7 +359,7 @@ The honest, minimal set — **one** durable store, not a zoo.
 | Work distribution + failover (Kafka) | **Kafka consumer groups** | **Required for HA** | Single-node Kafka **reading exists today**; **fleet consumer-group mode is [PROPOSED]**. Kafka is the coordinator — no extra coordination DB for the Kafka path. |
 | Durable data plane | **S3 / MinIO** | **Yes (have it)** | Distributed MinIO (erasure-coded) or S3; Object Lock for WORM. |
 | Orchestration / heal / scale | **Kubernetes (+ KEDA)** | **Yes for HA** | Restarts, rolling upgrades, lag-based autoscale. An engine chart is **[PROPOSED]** — the existing `helm/vtop` chart deploys the *cluster*, not the engine (§9). |
-| Observability | **Prometheus + Grafana (+ traces)** | **Yes** | Metrics endpoint **[IMPLEMENTED]**; dashboards in `observability/`; traces **[PROPOSED]** (§14). |
+| Observability | **Prometheus + Grafana (+ traces)** | **Yes** | Metrics endpoint **[IMPLEMENTED]**; dashboards in `observability/`; OTLP trace export **[IMPLEMENTED]** (§14). |
 | Secrets | **Vault / external-secrets / k8s Secrets** | Recommended | Creds already injected via env. |
 | File/syslog HA ownership | **etcd / Consul** (leases) | **Only if** file/syslog must be HA-distributed | The only thing Kafka groups don't solve. |
 
@@ -1103,6 +1106,9 @@ path needed by the distributed options is already implemented (§6.3).
 | `VTOP_METRICS_ADDR` | opt-in Prometheus metrics + readiness endpoint (e.g. `0.0.0.0:9090`); nothing listens unless set |
 | `VTOP_METRICS_TLS_CERT` / `VTOP_METRICS_TLS_KEY` | serve the metrics endpoint over TLS 1.3 (#294): both or neither — half a pair disables the endpoint rather than serving it plaintext |
 | `VTOP_METRICS_TLS_CLIENT_CA` | with the pair above, make the endpoint mutual: only scrapers presenting a certificate under this CA are served |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` (or `..._TRACES_ENDPOINT` / `..._METRICS_ENDPOINT`) | OpenTelemetry export over OTLP/HTTP (#683): traces, and the `/metrics` series. Nothing is exported, and no exporter exists, unless one is set. Every standard `OTEL_*` variable honoured, with its default, is listed in [observability/README.md](../observability/README.md#opentelemetry); one set to something unsupported stops the process at startup |
+| `OTEL_SERVICE_NAME` | `service.name` (default `vtop-engine`; `vtop-node` for the nodes) |
+| `OTEL_EXPORTER_OTLP_HEADERS` | collector request headers, e.g. an auth token; a secret |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | S3 credentials |
 | `AWS_REGION` | S3 region |
 | `VTOP_S3_ENDPOINT_URL` | S3/MinIO endpoint |
@@ -1117,7 +1123,6 @@ path needed by the distributed options is already implemented (§6.3).
 | `VTOP_PG_STATEMENT_TIMEOUT_MS` | guard stuck statements |
 | `VTOP_OBJECT_KEY_MODE` | `legacy` \| `deterministic` \| `content-addressed` |
 | `VTOP_KAFKA_GROUP_MODE` | `assign` (single-node) \| `subscribe` (fleet) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry collector |
 | `VTOP_INSTANCE_ID` | stable replica identity (group member / lease owner) |
 | `VTOP_ETCD_ENDPOINTS` | etcd/Consul endpoints for leases |
 | `VTOP_LEASE_TTL_SECONDS` | source-ownership lease TTL |
@@ -1134,6 +1139,14 @@ path needed by the distributed options is already implemented (§6.3).
   (`crates/vtop-observe`, served by `vtopctl`), including a readiness probe.
 - **Structured per-stage events** — one logical span per batch with child
   events per pipeline stage.
+- **OpenTelemetry export** (#683) — built into `vtopctl` and `vtop-node`, idle
+  until `OTEL_EXPORTER_OTLP_ENDPOINT` is set: a `batch` span with a child per
+  step (seal, compress, checksum, upload_object, upload_manifest, verify,
+  commit), a span per recovery decision and per scrub check, the `/metrics`
+  series over OTLP, trace ids in the JSON log lines, and the exporter's own
+  counters on `/metrics`; HTTP/protobuf; a bounded queue, so the data path
+  never waits on the collector; flushed within 5 s at shutdown. See the
+  [observability README](../observability/README.md#opentelemetry).
 - **Dashboard tooling** — the `observability/` directory carries a
   Grafana/Loki/Mimir/Tempo/Alloy compose stack
   (`docker-compose.observability.yml`) and generated dashboards for the
@@ -1148,8 +1161,6 @@ path needed by the distributed options is already implemented (§6.3).
 - **Alerting rules** (Alertmanager): verification failures > 0; replay-rate
   spike; lag growth; store write-latency SLO breach; no committed batches in N
   minutes.
-- **OpenTelemetry trace export** from the engine (the Tempo backend is already
-  in the stack; the engine does not yet emit OTLP).
 - Metric coverage review: **verification-failure rate**, **replay /
   REPLAY_REQUIRED rate**, Kafka **consumer lag**, state-store write latency,
   **duplicate-object rate** (needed until deterministic keys land).
@@ -1639,10 +1650,10 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 ### Phase 6 — Observability & alerting ◐ PARTIAL
 - **Done:** Prometheus metrics + readiness endpoint (`VTOP_METRICS_ADDR`,
   `vtop-observe`); structured per-stage events; `observability/` compose stack
-  (Grafana, Loki, Mimir, Tempo, Alloy) with generated dashboards.
+  (Grafana, Loki, Mimir, Tempo, Alloy) with generated dashboards; OTLP trace
+  export from the engine into that Tempo (#683).
 - **Remaining:** Alertmanager rules (verification failures > 0, replay-rate
-  spike, lag growth, store-latency SLO breach, no-commits-in-N-minutes); OTLP
-  trace export from the engine into the existing Tempo backend; metric
+  spike, lag growth, store-latency SLO breach, no-commits-in-N-minutes); metric
   coverage review (duplicate-object rate until Phase 4 lands, consumer lag,
   state-store write latency); documented SLOs.
 - **Test plan:** force a verification failure and confirm the alert; load test
@@ -1777,7 +1788,7 @@ Operability
   [x] Prometheus metrics endpoint + readiness probe (VTOP_METRICS_ADDR)
   [x] dashboards defined (observability/ stack)
   [ ] Alertmanager rules wired                                         (Phase 6)
-  [ ] OpenTelemetry traces exported                                    (Phase 6)
+  [x] OpenTelemetry traces exported (opt-in, OTEL_EXPORTER_OTLP_ENDPOINT)
   [ ] engine k8s chart: probes, limits, PDB, NetworkPolicy, runbook    (Phase 7)
 
 Security

@@ -177,9 +177,26 @@ async fn main() {
     // Structured logs use the same `VTOP_LOG_FORMAT` contract as `vtopctl`, so
     // node and engine lines land in Loki with one shape. Stderr only: stdout
     // carries the ready markers the chaos harness parses.
-    vtop_observe::logging::init("info", false);
+    //
+    // OpenTelemetry export (#683) comes up with the logs when an OTLP
+    // endpoint is set: the node's registry is sent as OTLP metrics beside
+    // `/metrics`. A setting it cannot honour stops the node at startup.
+    if let Err(e) = vtop_observe::otel::init(
+        "info",
+        false,
+        vtop_observe::otel::Process {
+            service: "vtop-node",
+            instance: None,
+            traces: false,
+        },
+    ) {
+        eprintln!("error: OpenTelemetry: {e}");
+        std::process::exit(1);
+    }
     let cli = Cli::parse();
     let outcome = run(cli).await;
+    // Bounded: see `vtop_observe::otel::SHUTDOWN_FLUSH_DEADLINE`.
+    vtop_observe::otel::shutdown().await;
     match outcome {
         Ok(code) => std::process::exit(code),
         Err(message) => {

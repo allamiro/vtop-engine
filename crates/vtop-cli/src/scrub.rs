@@ -34,6 +34,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
+use tracing::Instrument;
 use vtop_core::errors::VtopError;
 use vtop_core::manifest::{
     KeyOutcome, KeyResult, ManifestKeyring, ParsedManifest, MAX_MANIFEST_BYTES,
@@ -460,6 +461,15 @@ pub enum RowOrigin {
     Ledger,
     /// A prune digest: the row was deleted from the ledger (#560).
     Digest,
+}
+
+impl RowOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RowOrigin::Ledger => "ledger",
+            RowOrigin::Digest => "digest",
+        }
+    }
 }
 
 /// One committed row to check.
@@ -957,7 +967,22 @@ pub async fn scrub_held(
                     .and_then(|size| u64::try_from(size).ok())
                     .unwrap_or(0);
                 pacer.admit(bytes).await;
-                (row, scrub_one(backend, keyring, &row.record).await)
+                // Opened after the pacer, so the span times the check and not
+                // the wait for its turn (#683).
+                let span = crate::spans::scrub_check(&row.record, row.origin.as_str());
+                let check = scrub_one(backend, keyring, &row.record)
+                    .instrument(span.clone())
+                    .await;
+                span.record("result", check.result.as_str());
+                span.record(
+                    "otel.status_code",
+                    if check.result.is_finding() {
+                        "error"
+                    } else {
+                        "ok"
+                    },
+                );
+                (row, check)
             })
             // In order, so the cursor only ever passes a contiguous run of
             // checked batches.

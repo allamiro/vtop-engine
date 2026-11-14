@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use futures::StreamExt;
+use tracing::Instrument;
 use vtop_adapters::base::{DiscoveredSource, ReadResult, SourceAdapter};
 use vtop_adapters::file_source::ArchivedEnd;
 #[cfg(feature = "kafka")]
@@ -42,6 +43,7 @@ use vtop_state::{connect_state_store_with_deadline, BatchPatch, BatchRecord, Sta
 use vtop_upload::multipart::{self, MultipartFence, MultipartUploadConfig};
 use vtop_upload::{ObjectChecksum, UploadBackend};
 
+use crate::spans::{self, BatchTrace, Stage};
 use crate::verification_mode::{self, Recheck};
 
 /// How long a batch claim stays exclusive without renewal (#93). Batches
@@ -77,6 +79,9 @@ pub struct VerifiedBatch {
     format: vtop_core::types::TelemetryFormat,
     metrics: BatchMetrics,
     started: Instant,
+    /// The batch's span, kept open across the hand-off so the commit is a
+    /// child of the same batch (#683).
+    trace: BatchTrace,
 }
 
 /// Deletes batch-local scratch files on every normal return path, including
@@ -274,7 +279,30 @@ impl<'a> Pipeline<'a> {
                 metrics: None,
             }));
         }
+        // The batch's span (#683), opened before anything can fail so that a
+        // batch failing at any step is a trace with an error, not a gap. It is
+        // current while this batch's future is polled, and only then, so the
+        // batch's log lines carry its trace id.
+        let trace = BatchTrace::start(
+            source.source_type.as_str(),
+            &source.source_name,
+            read.records.len(),
+        );
+        let span = trace.span().clone();
+        self.verify_traced(trace, source, read, stream, sealed_at)
+            .instrument(span)
+            .await
+    }
 
+    /// [`Pipeline::process_until_verified`] inside its batch's span.
+    async fn verify_traced(
+        &self,
+        mut trace: BatchTrace,
+        source: &DiscoveredSource,
+        read: ReadResult,
+        stream: Option<&StreamConfig>,
+        sealed_at: chrono::DateTime<Utc>,
+    ) -> Result<VerifyStep, VtopError> {
         let started = Instant::now();
 
         let tenant = stream
@@ -306,6 +334,9 @@ impl<'a> Pipeline<'a> {
         let window = window_marker(&read);
         let batch_id = vtop_core::batch::build_batch_id(&source.source_name, &window);
         let now = Utc::now().to_rfc3339();
+        trace.record("batch_id", batch_id.as_str());
+        trace.record("tenant", tenant.as_str());
+        trace.record("format", format.as_str());
 
         // ---- DISCOVERED -> BATCHING (persisted) -------------------------
         let mut batch = TelemetryBatch {
@@ -382,6 +413,9 @@ impl<'a> Pipeline<'a> {
         macro_rules! fail {
             ($msg:expr) => {{
                 let m: String = $msg;
+                // The message goes on the span redacted: a backend error can
+                // quote the signed URL it failed on.
+                trace.fail_with("failed", &m);
                 self.store.mark_failed(&batch_id, &m).await?;
                 let replay_recorded = match self
                     .store
@@ -460,6 +494,7 @@ impl<'a> Pipeline<'a> {
         // batch may have waited for an upload slot and its first ledger write
         // since, possibly across an hour boundary, and the partition below and
         // the recorded seal time must name the same hour (review on #570).
+        trace.begin(Stage::Seal);
         batch.seal_at(sealed_at)?;
         let t_write = Instant::now();
         self.store
@@ -468,10 +503,12 @@ impl<'a> Pipeline<'a> {
         state_write += t_write.elapsed();
         mark_state!(BatchState::Sealed);
         tracing::info!(batch_id, records = batch.record_count, "batch_sealed");
+        trace.end();
 
         let mut metrics = BatchMetrics::new(&batch_id, batch.record_count, 0);
 
         // ---- SEALED -> COMPRESSED ---------------------------------------
+        trace.begin(Stage::Compress);
         let work_dir = std::path::PathBuf::from(&self.config.engine.work_dir);
         let t = Instant::now();
         // Compression is CPU-bound AND writes the object to disk, so running it
@@ -514,13 +551,22 @@ impl<'a> Pipeline<'a> {
             ratio = format!("{:.2}", metrics.compression_ratio),
             "object_compressed"
         );
+        trace.record("bytes", compressed.uncompressed_bytes);
+        trace.record("compressed_bytes", compressed.size_bytes);
+        trace.end();
 
         // ---- COMPRESSED -> CHECKSUMMED ----------------------------------
         // Algorithm is configurable: sha256, blake3, or disabled (None), per
         // stream with the global value as the default (#669). This is the
         // only place a new batch's algorithm is chosen; recovery and scrub
         // re-verify with the algorithm recorded in each batch's manifest.
+        trace.begin(Stage::Checksum);
         let algo = vtop_core::config::effective_algorithm(self.config, stream);
+        trace.record("checksum_algorithm", algo.as_str());
+        trace.record(
+            "verification_method",
+            vtop_upload::verification_method(self.config.upload.backend.as_str(), algo).as_str(),
+        );
         let t = Instant::now();
         let object_checksum = match vtop_core::checksum::digest_file(algo, &compressed.path).await {
             Ok(d) => d,
@@ -539,8 +585,12 @@ impl<'a> Pipeline<'a> {
             checksum = object_checksum.as_deref().unwrap_or("(disabled)"),
             "checksum_calculated"
         );
+        trace.end();
 
         // ---- Resolve object / manifest URIs -----------------------------
+        // Counted in the object upload: the bucket provisioning and the
+        // versioning preflight below are that upload's store round trips.
+        trace.begin(Stage::UploadObject);
         // The time partition comes from the seal time (or, on request, the
         // earliest record time), never from the wall clock at this point: by
         // now the batch has been compressed and checksummed, and a batch
@@ -877,6 +927,8 @@ impl<'a> Pipeline<'a> {
         let t = Instant::now();
         let multipart_used =
             !reused && mp_cfg.should_multipart(self.backend.as_ref(), compressed.size_bytes);
+        trace.record_stage("multipart", multipart_used);
+        trace.record_stage("reused", reused);
         let upload_result = if reused {
             None
         } else if multipart_used {
@@ -972,8 +1024,10 @@ impl<'a> Pipeline<'a> {
         if !reused {
             tracing::info!(batch_id, uri = %object_uri, "object_uploaded");
         }
+        trace.end();
 
         // ---- Build + upload manifest ------------------------------------
+        trace.begin(Stage::UploadManifest);
         // `manifest.write_version` (#671 release B): 0.3 unless opted in.
         // A 0.4 plan names the method `validate --print-effective` and the
         // startup log print for this backend and algorithm; a backend with
@@ -1081,8 +1135,10 @@ impl<'a> Pipeline<'a> {
             version = %manifest_version,
             "manifest_uploaded"
         );
+        trace.end();
 
         // ---- MANIFEST_UPLOADED -> VERIFIED (or FAILED) ------------------
+        trace.begin(Stage::Verify);
         let t = Instant::now();
         // 1) the manifest is internally consistent (self-hash),
         if let Err(e) = manifest.authenticate(&self.manifest_keyring).into_result() {
@@ -1197,6 +1253,14 @@ impl<'a> Pipeline<'a> {
         }
         metrics.verify_ms = t.elapsed().as_millis() as u64;
         let backend_limited = obj_v.backend_limited || man_v.backend_limited;
+        trace.record(
+            "verification_result",
+            if backend_limited {
+                "size_only"
+            } else {
+                "strong"
+            },
+        );
         // Strict by default: refuse to commit on size-only (backend-limited)
         // verification. `false` is an explicit compatibility/lab opt-out.
         if backend_limited && self.config.upload.require_strong_verification {
@@ -1265,6 +1329,7 @@ impl<'a> Pipeline<'a> {
         // Converted ONCE: per-write as_millis() truncation made eight sub-ms
         // WAL writes export as 0.
         metrics.state_write_ms = state_write.as_millis() as u64;
+        trace.end();
 
         Ok(VerifyStep::Verified(VerifiedBatch {
             batch_id,
@@ -1276,6 +1341,7 @@ impl<'a> Pipeline<'a> {
             format,
             metrics,
             started,
+            trace,
         }))
     }
 
@@ -1283,6 +1349,16 @@ impl<'a> Pipeline<'a> {
     /// serially even when the verify phase above ran concurrently. This is
     /// cheap (~1ms measured) next to the stages it follows.
     async fn commit_verified(
+        &self,
+        adapter: &mut dyn SourceAdapter,
+        v: VerifiedBatch,
+    ) -> Result<BatchOutcome, VtopError> {
+        let span = v.trace.span().clone();
+        self.commit_traced(adapter, v).instrument(span).await
+    }
+
+    /// [`Pipeline::commit_verified`] inside its batch's span.
+    async fn commit_traced(
         &self,
         adapter: &mut dyn SourceAdapter,
         v: VerifiedBatch,
@@ -1297,15 +1373,18 @@ impl<'a> Pipeline<'a> {
             format,
             mut metrics,
             started,
+            mut trace,
         } = v;
 
         // ---- VERIFIED -> SOURCE_COMMITTED -------------------------------
         // Only now is it legal to advance source progress.
+        trace.begin(Stage::Commit);
         let t = Instant::now();
         if let Err(e) = adapter.commit_progress(&progress_end).await {
             // Verified but commit failed: leave as VERIFIED so recovery retries
             // the commit. NEVER lose the verified object.
             tracing::error!(batch_id, error = %e, "source_commit_failed (will retry on recovery)");
+            trace.fail_with("commit_failed", &e.to_string());
             metrics.finalize(started.elapsed().as_millis() as u64);
             return Ok(BatchOutcome {
                 batch_id,
@@ -1321,6 +1400,7 @@ impl<'a> Pipeline<'a> {
         self.store.mark_source_committed(&batch_id).await?;
         metrics.state_write_ms += t_write.elapsed().as_millis() as u64;
         tracing::info!(batch_id, "source_committed");
+        trace.finish("committed");
 
         metrics.finalize(started.elapsed().as_millis() as u64);
 
@@ -2925,6 +3005,8 @@ impl Engine {
     /// resolves incomplete batches without ever advancing source progress for
     /// unverified data.
     pub async fn recover(&mut self) -> Result<RecoverySummary, VtopError> {
+        // One trace per scan (#683), a child span per row it decides on.
+        let recovery_span = spans::recovery();
         // Seed file/syslog/Kafka committed positions from the ledger.
         self.seed_committed_offsets().await?;
 
@@ -2940,6 +3022,7 @@ impl Engine {
                 &(now + chrono::Duration::seconds(LEASE_TTL_SECS)).to_rfc3339(),
             )
             .await?;
+        recovery_span.record("rows", incomplete.len());
         let mut summary = RecoverySummary::default();
         // Rewinds are COLLECTED, not applied row by row. Each call to
         // `replay_from_marker` overwrites the adapter's read position, so with
@@ -2954,6 +3037,7 @@ impl Engine {
         for rec in incomplete {
             let action = next_recovery_action(rec.state);
             tracing::info!(batch_id = %rec.batch_id, state = %rec.state, ?action, "recovery_scan");
+            let row = spans::recovery_row(&recovery_span, &rec, action);
             match action {
                 RecoveryAction::RetrySourceCommit => {
                     // The ledger says VERIFIED, but that was true of STORAGE at
@@ -2964,6 +3048,7 @@ impl Engine {
                     // anything less trusts a stale claim about a system this
                     // process has never observed.
                     let recheck = self.storage_still_verified(&rec).await;
+                    row.record("recheck", recheck.as_str());
                     verification_mode::count_recheck(&rec, recheck);
                     if recheck == Recheck::UnsupportedVersion {
                         // Written by a newer release (#671): not stale, only
@@ -2979,6 +3064,7 @@ impl Engine {
                             // and never pruned (review of #674). Retiring it
                             // makes no source commit.
                             self.retire_unsupported(&rec, &mut summary).await;
+                            spans::decide(&row, "retired_unsupported_version");
                             continue;
                         }
                         // Held (#639) otherwise: its range is not committed,
@@ -2986,6 +3072,7 @@ impl Engine {
                         // not commit past it.
                         rewinds.hold(&rec.progress_start);
                         summary.still_pending += 1;
+                        spans::decide(&row, "held_unsupported_version");
                         continue;
                     }
                     if recheck == Recheck::Failed {
@@ -3017,6 +3104,7 @@ impl Engine {
                             tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist re-check failure");
                             rewinds.hold(&rec.progress_start);
                             summary.still_pending += 1;
+                            spans::decide_error(&row, "held_ledger_write_failed");
                             continue;
                         }
                         if let Err(e) = self
@@ -3031,6 +3119,7 @@ impl Engine {
                             tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist REPLAY_REQUIRED");
                             rewinds.hold(&rec.progress_start);
                             summary.still_pending += 1;
+                            spans::decide_error(&row, "held_ledger_write_failed");
                             continue;
                         }
                         rewinds.add(&rec.progress_start);
@@ -3053,12 +3142,16 @@ impl Engine {
                                 .inc();
                         }
                         summary.replay_required += 1;
+                        spans::decide(&row, "replay_required");
                         continue;
                     }
                     verification_mode::note_stored_class(&rec, recheck);
+                    // The commit itself waits for every replay decision; see
+                    // `recovery_commit` below.
+                    spans::decide(&row, "recheck_passed");
                     verified.push((rec, recheck));
                 }
-                RecoveryAction::None => {}
+                RecoveryAction::None => spans::decide(&row, "none"),
                 _ if self.committed_past(&rec) => {
                     // Its source has committed past it (#567): a rewind would
                     // land at or above its end and read nothing again, so
@@ -3071,6 +3164,7 @@ impl Engine {
                     // decides again.
                     match self.retire_superseded(&rec).await {
                         Ok(()) => {
+                            spans::decide(&row, "superseded");
                             summary.superseded += 1;
                             if let Some(mx) = telemetry::metrics() {
                                 mx.batches_total
@@ -3095,6 +3189,7 @@ impl Engine {
                                 "recovery: could not retire a range its source has committed past; \
                                  it stays as it is, and nothing below the committed point is re-read"
                             );
+                            spans::decide_error(&row, "superseded_write_failed");
                             summary.still_pending += 1;
                         }
                     }
@@ -3125,6 +3220,7 @@ impl Engine {
                         tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist the replay decision; not rewinding");
                         rewinds.hold(&rec.progress_start);
                         summary.still_pending += 1;
+                        spans::decide_error(&row, "held_ledger_write_failed");
                         continue;
                     }
                     if let Err(e) = self
@@ -3139,6 +3235,7 @@ impl Engine {
                         tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist REPLAY_REQUIRED; not rewinding");
                         rewinds.hold(&rec.progress_start);
                         summary.still_pending += 1;
+                        spans::decide_error(&row, "held_ledger_write_failed");
                         continue;
                     }
                     rewinds.add(&rec.progress_start);
@@ -3162,6 +3259,7 @@ impl Engine {
                             .inc();
                     }
                     summary.replay_required += 1;
+                    spans::decide(&row, "replay_required");
                     tracing::warn!(batch_id = %rec.batch_id, "recovered: REPLAY_REQUIRED (source progress preserved)");
                 }
             }
@@ -3216,7 +3314,9 @@ impl Engine {
         // decision could not be recorded holds it back too, though nothing
         // rewinds for it (#639).
         for (rec, recheck) in verified {
+            let commit_span = spans::recovery_commit(&recovery_span, &rec, recheck.as_str());
             if rewinds.holds_back(&rec.progress_start) {
+                spans::decide(&commit_span, "held_back");
                 tracing::warn!(
                     batch_id = %rec.batch_id,
                     "recovery: not committing a VERIFIED range above an incomplete one of the same source; \
@@ -3231,7 +3331,13 @@ impl Engine {
                     .push(Unsettled::held_back(&rec, at_hold, recheck));
                 continue;
             }
+            let committed_before = summary.committed;
             self.commit_recovered(&rec, recheck, &mut summary).await?;
+            if summary.committed > committed_before {
+                spans::decide(&commit_span, "committed");
+            } else {
+                spans::decide_error(&commit_span, "not_committed");
+            }
         }
         // Second pass: the commits above moved committed points up, and the
         // first pass's rewinds are not clamped to them. Rewind again so no
@@ -3266,6 +3372,10 @@ impl Engine {
                 }
             }
         }
+        recovery_span.record("committed", summary.committed);
+        recovery_span.record("replay_required", summary.replay_required);
+        recovery_span.record("superseded", summary.superseded);
+        recovery_span.record("still_pending", summary.still_pending);
         Ok(summary)
     }
 
