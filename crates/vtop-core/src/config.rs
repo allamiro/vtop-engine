@@ -645,6 +645,15 @@ pub struct UploadConfig {
     /// abandoned and safe to abort + delete from the state directory.
     #[serde(default = "default_multipart_abandon_after_secs")]
     pub multipart_abandon_after_secs: u64,
+    /// Requests per multipart part before the part, and the upload, fail
+    /// (#668): the first plus the retries, with exponential backoff and full
+    /// jitter between them (1 s doubling to at most 30 s). Only the failed
+    /// part is sent again; the parts that completed are kept. Each request
+    /// also has the backend's own retries and the per-request deadline of
+    /// `request_timeout_seconds` and `request_min_bytes_per_second`, so the
+    /// longest a part can take is this many times that. Default 3; at least 1.
+    #[serde(default = "default_multipart_part_attempts")]
+    pub multipart_part_attempts: u32,
     /// Per-transport egress tuning (#480): ONE shape, keyed by transport name,
     /// so the two paths are tuned with the identical struct rather than each
     /// growing its own knobs. Defaults to an empty map — all-`None` tuning,
@@ -1088,6 +1097,9 @@ fn default_multipart_max_parallelism() -> usize {
 fn default_multipart_abandon_after_secs() -> u64 {
     24 * 60 * 60
 }
+fn default_multipart_part_attempts() -> u32 {
+    3
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartitioningConfig {
@@ -1317,6 +1329,13 @@ impl VtopConfig {
         if self.upload.multipart_abandon_after_secs == 0 {
             return Err(VtopError::Config(
                 "upload.multipart_abandon_after_secs must be > 0".into(),
+            ));
+        }
+        if self.upload.multipart_part_attempts == 0 {
+            return Err(VtopError::Config(
+                "upload.multipart_part_attempts must be at least 1: it counts the first \
+                 request for a part as well as its retries"
+                    .into(),
             ));
         }
         if matches!(self.upload.backend.as_str(), "awscli" | "s3cmd" | "minio") {

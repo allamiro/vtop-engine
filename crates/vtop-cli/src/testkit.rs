@@ -92,6 +92,7 @@ pub fn file_config(
             multipart_threshold_bytes: 8 * 1024 * 1024,
             multipart_max_parallelism: 4,
             multipart_abandon_after_secs: 24 * 60 * 60,
+            multipart_part_attempts: 3,
             transports: Default::default(),
             max_egress_bytes_per_second: None,
             max_concurrency_ceiling: None,

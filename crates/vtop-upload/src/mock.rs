@@ -97,6 +97,25 @@ pub struct MockBackend {
     /// When set, every `head_object` fails this way instead of answering
     /// (#626): a refusal that says nothing about the key, or a throttle.
     head_fault: Option<HeadFault>,
+    /// Faults injected into `upload_part` by part number (#668), each with how
+    /// many more requests for that part it answers.
+    part_faults: Mutex<HashMap<u32, (PartFault, usize)>>,
+    /// Every `upload_part` request by part number, answered or not (#668):
+    /// what a test reads to prove only the failed part was sent again.
+    part_sends: Mutex<HashMap<u32, usize>>,
+}
+
+/// How [`MockBackend::with_part_fault`] makes `upload_part` fail (#668).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartFault {
+    /// The connection was reset mid-request: an `Upload` error, nothing stored.
+    Reset,
+    /// The store asked for less: `UploadThrottled`, nothing stored.
+    Throttled,
+    /// The store no longer has the upload, as S3 answers `NoSuchUpload` once
+    /// an upload was aborted or expired: the pending upload and its parts are
+    /// dropped and the request answers `UploadSessionGone`.
+    SessionGone,
 }
 
 /// How [`MockBackend::with_head_fault`] makes `head_object` fail.
@@ -149,6 +168,8 @@ impl MockBackend {
             min_part_size: 0,
             fail_abort: false,
             head_fault: None,
+            part_faults: Mutex::new(HashMap::new()),
+            part_sends: Mutex::new(HashMap::new()),
             multipart_fail_after_parts: Arc::new(AtomicUsize::new(usize::MAX)),
             multipart_parts_uploaded: Arc::new(AtomicUsize::new(0)),
             bucket_ensures: AtomicUsize::new(0),
@@ -227,6 +248,89 @@ impl MockBackend {
 
     pub fn multipart_parts_uploaded(&self) -> usize {
         self.multipart_parts_uploaded.load(Ordering::SeqCst)
+    }
+
+    /// The next `times` requests for part `part_number` fail as `fault`
+    /// (#668); later requests for it, and every other part, succeed. Adding a
+    /// fault for a part that already has one replaces it.
+    pub fn with_part_fault(self, part_number: u32, fault: PartFault, times: usize) -> Self {
+        self.set_part_fault(part_number, fault, times);
+        self
+    }
+
+    /// [`MockBackend::with_part_fault`] on a backend already shared with the
+    /// code under test.
+    pub fn set_part_fault(&self, part_number: u32, fault: PartFault, times: usize) {
+        self.part_faults
+            .lock()
+            .unwrap()
+            .insert(part_number, (fault, times));
+    }
+
+    /// How many `upload_part` requests named `part_number`, answered or not.
+    pub fn part_sends(&self, part_number: u32) -> usize {
+        self.part_sends
+            .lock()
+            .unwrap()
+            .get(&part_number)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Every `upload_part` request, answered or not.
+    pub fn part_sends_total(&self) -> usize {
+        self.part_sends.lock().unwrap().values().sum()
+    }
+
+    /// Whether the store still holds the multipart upload `upload_id` for
+    /// `object_uri`, as `ListMultipartUploads` would show it.
+    pub fn has_pending_multipart(&self, object_uri: &str, upload_id: &str) -> bool {
+        self.multiparts
+            .lock()
+            .unwrap()
+            .contains_key(&(object_uri.to_owned(), upload_id.to_owned()))
+    }
+
+    /// Drop every pending multipart upload, as a bucket lifecycle rule
+    /// (`AbortIncompleteMultipartUpload`) does once its window passes.
+    pub fn expire_pending_multiparts(&self) {
+        self.multiparts.lock().unwrap().clear();
+    }
+
+    /// Install a pending multipart upload with `parts` already stored, the
+    /// state a session file written by an earlier process refers to.
+    pub fn seed_multipart(&self, object_uri: &str, upload_id: &str, parts: Vec<(u32, Vec<u8>)>) {
+        self.multiparts.lock().unwrap().insert(
+            (object_uri.to_owned(), upload_id.to_owned()),
+            PendingMultipart {
+                parts: parts.into_iter().collect(),
+            },
+        );
+    }
+
+    /// Flip the first byte of part `part_number` in every pending upload: a
+    /// store that lost or damaged a part it acknowledged. Nothing the client
+    /// holds changes, so only a read-back of the completed object can see it.
+    pub fn corrupt_pending_part(&self, part_number: u32) {
+        for pending in self.multiparts.lock().unwrap().values_mut() {
+            if let Some(byte) = pending
+                .parts
+                .get_mut(&part_number)
+                .and_then(|p| p.first_mut())
+            {
+                *byte ^= 0xff;
+            }
+        }
+    }
+
+    fn take_part_fault(&self, part_number: u32) -> Option<PartFault> {
+        let mut faults = self.part_faults.lock().unwrap();
+        let (fault, left) = faults.get_mut(&part_number)?;
+        if *left == 0 {
+            return None;
+        }
+        *left -= 1;
+        Some(*fault)
     }
 
     pub fn pending_multipart_count(&self) -> usize {
@@ -607,6 +711,32 @@ impl UploadBackend for MockBackend {
         part_number: u32,
         data: Bytes,
     ) -> Result<UploadedPart, VtopError> {
+        *self
+            .part_sends
+            .lock()
+            .unwrap()
+            .entry(part_number)
+            .or_default() += 1;
+        match self.take_part_fault(part_number) {
+            None => {}
+            Some(PartFault::Reset) => {
+                return Err(VtopError::Upload(format!(
+                    "mock upload_part {object_uri}#{part_number}: connection reset by peer"
+                )))
+            }
+            Some(PartFault::Throttled) => {
+                return Err(VtopError::UploadThrottled(format!(
+                    "mock upload_part {object_uri}#{part_number}: SlowDown (http 503)"
+                )))
+            }
+            Some(PartFault::SessionGone) => {
+                self.multiparts
+                    .lock()
+                    .unwrap()
+                    .remove(&(object_uri.to_owned(), upload_id.to_owned()));
+                return Err(no_such_upload(object_uri, upload_id));
+            }
+        }
         let uploaded = self.multipart_parts_uploaded.fetch_add(1, Ordering::SeqCst);
         let limit = self.multipart_fail_after_parts.load(Ordering::SeqCst);
         if uploaded >= limit {
@@ -617,11 +747,7 @@ impl UploadBackend for MockBackend {
         let mut map = self.multiparts.lock().unwrap();
         let pending = map
             .get_mut(&(object_uri.to_owned(), upload_id.to_owned()))
-            .ok_or_else(|| {
-                VtopError::Upload(format!(
-                    "mock: unknown multipart upload {upload_id} for {object_uri}"
-                ))
-            })?;
+            .ok_or_else(|| no_such_upload(object_uri, upload_id))?;
         pending.parts.insert(part_number, data.to_vec());
         Ok(UploadedPart {
             part_number,
@@ -638,11 +764,7 @@ impl UploadBackend for MockBackend {
         let mut map = self.multiparts.lock().unwrap();
         let pending = map
             .remove(&(object_uri.to_owned(), upload_id.to_owned()))
-            .ok_or_else(|| {
-                VtopError::Upload(format!(
-                    "mock: unknown multipart upload {upload_id} for {object_uri}"
-                ))
-            })?;
+            .ok_or_else(|| no_such_upload(object_uri, upload_id))?;
         let mut body = Vec::new();
         let mut ordered = parts.to_vec();
         ordered.sort_by_key(|p| p.part_number);
@@ -676,9 +798,17 @@ impl UploadBackend for MockBackend {
         self.multiparts
             .lock()
             .unwrap()
-            .remove(&(object_uri.to_owned(), upload_id.to_owned()));
-        Ok(())
+            .remove(&(object_uri.to_owned(), upload_id.to_owned()))
+            .map(|_| ())
+            .ok_or_else(|| no_such_upload(object_uri, upload_id))
     }
+}
+
+/// What S3 answers for an upload id it does not hold (#668): `NoSuchUpload`.
+fn no_such_upload(object_uri: &str, upload_id: &str) -> VtopError {
+    VtopError::UploadSessionGone(format!(
+        "mock: multipart upload {upload_id} for {object_uri}: NoSuchUpload (http 404)"
+    ))
 }
 
 #[cfg(test)]

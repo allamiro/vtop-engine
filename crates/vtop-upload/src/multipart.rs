@@ -7,17 +7,24 @@
 //!
 //! Stale-generation fencing: a session is keyed by destination URI plus the
 //! operator fence tokens (generation, fencing epoch, content digest). A resume
-//! that disagrees with those tokens aborts the remote upload and refuses.
+//! that disagrees with those tokens refuses.
+//!
+//! A failed part keeps what already completed (#668). Parts go out through a
+//! bounded pool and each success is written to the session as it finishes; a
+//! failed part is retried alone, up to `upload.multipart_part_attempts`, with
+//! exponential backoff and full jitter; and a session is identified by its
+//! content, never by the local file's name, so the engine's replay of the same
+//! bytes (from a file named after another batch attempt) resumes it.
 
 use crate::base::{ObjectChecksum, StoredObject, UploadBackend, UploadedPart};
 use bytes::Bytes;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-use tokio::sync::Semaphore;
 use vtop_core::config::MAX_SEMAPHORE_PERMITS;
 use vtop_core::errors::VtopError;
 
@@ -30,6 +37,97 @@ pub struct MultipartUploadConfig {
     pub abandon_after_secs: u64,
     /// Directory holding `*.multipart.json` session files.
     pub state_dir: PathBuf,
+    /// Requests per part before the part, and the call, fail (#668): the
+    /// first plus the retries. `upload.multipart_part_attempts`.
+    pub part_attempts: u32,
+    /// The wait between two attempts at one part (#668).
+    pub part_backoff: PartBackoff,
+}
+
+/// The wait before a part's next attempt (#668): exponential from `base`,
+/// capped at `cap`, with full jitter (anywhere from zero to that ceiling), so
+/// parts that failed together do not all come back at once. Fixed in code,
+/// not configuration: the attempt count is the operator's knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartBackoff {
+    pub base: Duration,
+    pub cap: Duration,
+}
+
+impl Default for PartBackoff {
+    fn default() -> Self {
+        Self {
+            base: Duration::from_secs(1),
+            cap: Duration::from_secs(30),
+        }
+    }
+}
+
+impl PartBackoff {
+    /// The longest wait after `failed` attempts (1 for the first failure).
+    pub fn ceiling(&self, failed: u32) -> Duration {
+        let doublings = failed.saturating_sub(1).min(31);
+        self.base.saturating_mul(1_u32 << doublings).min(self.cap)
+    }
+
+    /// The wait after `failed` attempts, drawn from `[0, ceiling]` by `seed`.
+    pub fn delay(&self, failed: u32, seed: u64) -> Duration {
+        // splitmix64: a well-spread fraction from a seed that is only a
+        // clock reading and two small numbers.
+        let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        let fraction = (z >> 11) as f64 / (1_u64 << 53) as f64;
+        self.ceiling(failed).mul_f64(fraction)
+    }
+}
+
+/// What one resumable upload did (#668), filled in as it goes so a caller
+/// learns it on failure as well as on success. The engine turns it into
+/// metrics and into its width controller's throttle count: retries inside
+/// this module would otherwise hide every throttle the store answered.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MultipartReport {
+    /// Parts the object has.
+    pub parts_total: u32,
+    /// Parts an earlier call left in the session that matched the local
+    /// bytes and were not sent again.
+    pub parts_reused: u32,
+    /// Their bytes: what resuming saved.
+    pub bytes_reused: u64,
+    /// Parts this call sent successfully.
+    pub parts_uploaded: u32,
+    /// Extra attempts at a part, beyond its first.
+    pub part_retries: u32,
+    /// Parts whose last attempt in this call failed.
+    pub parts_failed: u32,
+    /// Every request this call made to the store.
+    pub requests: u32,
+    /// Of those, the ones the store answered with a throttle.
+    pub throttled_requests: u32,
+    /// An in-progress session an earlier call left was adopted.
+    pub resumed: bool,
+    /// The store no longer held the upload and a new one was started.
+    pub restarted: bool,
+    /// The object was completed.
+    pub completed: bool,
+    /// When the call failed: parts the session still holds.
+    pub parts_kept: u32,
+    /// When the call failed: an in-progress session is on disk that a later
+    /// call with the same bytes resumes. False when there is nothing to
+    /// resume, or when the session on disk cannot be resumed (it disagrees
+    /// with this upload's fence), which a caller should abort.
+    pub session_left: bool,
+}
+
+impl MultipartReport {
+    fn count<T>(&mut self, result: &Result<T, VtopError>) {
+        self.requests += 1;
+        if result.as_ref().is_err_and(VtopError::is_upload_throttle) {
+            self.throttled_requests += 1;
+        }
+    }
 }
 
 impl MultipartUploadConfig {
@@ -63,6 +161,8 @@ impl MultipartUploadConfig {
                 .unwrap_or(upload.multipart_max_parallelism),
             abandon_after_secs: upload.multipart_abandon_after_secs,
             state_dir,
+            part_attempts: upload.multipart_part_attempts,
+            part_backoff: PartBackoff::default(),
         }
     }
 
@@ -235,37 +335,63 @@ pub async fn upload_resumable(
     checksum: Option<ObjectChecksum<'_>>,
     fence: MultipartFence,
 ) -> Result<StoredObject, VtopError> {
+    let mut report = MultipartReport::default();
+    upload_resumable_with_report(
+        backend,
+        cfg,
+        local_path,
+        object_uri,
+        checksum,
+        fence,
+        &mut report,
+    )
+    .await
+}
+
+/// [`upload_resumable`], recording what it did in `report` as it goes, so the
+/// caller learns it whether the upload succeeds or fails (#668).
+pub async fn upload_resumable_with_report(
+    backend: &dyn UploadBackend,
+    cfg: &MultipartUploadConfig,
+    local_path: &Path,
+    object_uri: &str,
+    checksum: Option<ObjectChecksum<'_>>,
+    fence: MultipartFence,
+    report: &mut MultipartReport,
+) -> Result<StoredObject, VtopError> {
     if !backend.supports_multipart() {
         return Err(VtopError::Upload(format!(
             "backend {} does not support resumable multipart",
             backend.backend_name()
         )));
     }
-    if cfg.part_size_bytes == 0 || cfg.max_parallelism == 0 {
+    if cfg.part_size_bytes == 0 || cfg.max_parallelism == 0 || cfg.part_attempts == 0 {
         return Err(VtopError::Config(
-            "multipart part size and parallelism must be > 0".into(),
+            "multipart part size, parallelism and part attempts must be > 0".into(),
         ));
     }
     // The other end of the same knob, guarded in the same place and for the
-    // sharper failure (review). Zero degrades — the wave below would carry no
+    // sharper failure (review). Zero degrades — the pool below would carry no
     // parts — and is refused above; a count above tokio's ceiling does not
-    // degrade at all: `Semaphore::new` PANICS, so an operator's typo aborts the
-    // process mid-copy instead of failing one upload.
+    // degrade at all: it was a semaphore's permit count, and `Semaphore::new`
+    // PANICS, so an operator's typo aborted the process mid-copy instead of
+    // failing one upload. The pool no longer builds a semaphore, but the
+    // bound stays: a width past it is a typo, not a plan.
     //
     // `UploadConfig::validate_multipart_limits` bounds the same value at config
     // load, which is where an operator would rather hear about it, but that is
     // not the last word: `vtopctl tier copy` applies
     // --multipart-max-parallelism to the DERIVED MultipartUploadConfig after
     // build_backend has validated the UploadConfig, so the number that becomes
-    // the permit count was never the number that check saw. This function is
+    // the pool's width was never the number that check saw. This function is
     // the one door every caller — the engine, a tier copy, a flag nobody has
-    // written yet — passes through on the way to that semaphore, so the bound
-    // it cannot be routed around lives here.
+    // written yet — passes through, so the bound it cannot be routed around
+    // lives here.
     if cfg.max_parallelism > MAX_SEMAPHORE_PERMITS {
         return Err(VtopError::Config(format!(
             "multipart parallelism {} exceeds the maximum permits a semaphore can hold \
-             ({MAX_SEMAPHORE_PERMITS}); the value becomes a permit count and an oversized \
-             one panics rather than degrading",
+             ({MAX_SEMAPHORE_PERMITS}); the value bounds the parts in flight and an \
+             oversized one is refused rather than attempted",
             cfg.max_parallelism
         )));
     }
@@ -297,89 +423,238 @@ pub async fn upload_resumable(
     }
 
     let path = session_path(&cfg.state_dir, object_uri, &fence);
-    let mut session = match load_session(&path) {
-        Ok(existing) => {
-            validate_resume(&existing, backend, object_uri, local_path, &fence)?;
-            if existing.phase == MultipartSessionPhase::Completed {
-                let stored = finish_idempotent(backend, object_uri, &existing, checksum).await?;
-                delete_session(&path)?;
-                return Ok(stored);
-            }
-            existing
-        }
-        Err(_) => {
-            let upload_id = backend
-                .create_multipart_upload(object_uri, "application/octet-stream", checksum)
-                .await?;
-            let now = now_unix_secs();
-            let session = MultipartSession {
-                schema_version: SESSION_SCHEMA,
-                backend_id: backend.backend_name().to_owned(),
-                object_uri: object_uri.to_owned(),
-                local_path: local_path.to_path_buf(),
-                upload_id,
-                part_size_bytes: cfg.part_size_bytes,
-                fence: fence.clone(),
-                phase: MultipartSessionPhase::InProgress,
-                parts: BTreeMap::new(),
-                created_at_unix_secs: now,
-                updated_at_unix_secs: now,
-                completed_version_id: None,
-            };
-            save_session(&path, &session)?;
-            session
-        }
+    let call = SessionCall {
+        backend,
+        cfg,
+        local_path,
+        object_uri,
+        checksum,
+        fence: &fence,
+        path: &path,
     };
+    match call.run(report).await {
+        // The store no longer holds the upload (#668): S3's NoSuchUpload,
+        // after a lifecycle rule or a sweep aborted it, or an earlier attempt
+        // completed it. The same request would fail the same way, so the
+        // session is dropped and the object starts again under a new upload,
+        // once. A second loss in the same call is an error, not a loop.
+        Err(VtopError::UploadSessionGone(cause)) => {
+            let cause = redact_urls(&cause);
+            tracing::warn!(
+                event = "multipart_session_restarted",
+                key = object_uri,
+                error = %cause,
+                "the store no longer has the multipart upload for {object_uri} ({cause}); \
+                 starting a new upload and sending every part to it; no data is affected, \
+                 nothing to do"
+            );
+            delete_session(&path)?;
+            report.restarted = true;
+            report.session_left = false;
+            match call.run(report).await {
+                Err(VtopError::UploadSessionGone(again)) => {
+                    delete_session(&path)?;
+                    report.session_left = false;
+                    report.parts_kept = 0;
+                    Err(VtopError::Upload(format!(
+                        "the store lost the multipart upload for {object_uri} again after a \
+                         restart ({}); nothing is kept, and the next attempt starts a new upload",
+                        redact_urls(&again)
+                    )))
+                }
+                other => other,
+            }
+        }
+        other => other,
+    }
+}
 
-    // Re-verify persisted parts against local bytes; drop mismatches so they
-    // are retransmitted (local file rewritten under the same fence is fatal).
-    revalidate_persisted_parts(&mut session, local_path).await?;
-    save_session(&path, &session)?;
+/// One pass at an upload: load or create its session, send what is missing,
+/// complete. [`upload_resumable_with_report`] runs it again once when the
+/// store has lost the upload.
+struct SessionCall<'a> {
+    backend: &'a dyn UploadBackend,
+    cfg: &'a MultipartUploadConfig,
+    local_path: &'a Path,
+    object_uri: &'a str,
+    checksum: Option<ObjectChecksum<'a>>,
+    fence: &'a MultipartFence,
+    path: &'a Path,
+}
 
-    upload_missing_parts(backend, cfg, &mut session, local_path, &path).await?;
+impl SessionCall<'_> {
+    async fn run(&self, report: &mut MultipartReport) -> Result<StoredObject, VtopError> {
+        let (backend, object_uri, fence, path) =
+            (self.backend, self.object_uri, self.fence, self.path);
+        let mut adopted = false;
+        let mut session = match load_session(path) {
+            Ok(existing) => {
+                if let Err(refused) = validate_resume(&existing, backend, object_uri, fence) {
+                    // The session on disk cannot be this upload's: the caller
+                    // aborts it rather than keep it.
+                    report.session_left = false;
+                    return Err(refused);
+                }
+                if existing.phase == MultipartSessionPhase::Completed {
+                    let stored =
+                        finish_idempotent(backend, object_uri, &existing, self.checksum, report)
+                            .await?;
+                    delete_session(path)?;
+                    report.completed = true;
+                    return Ok(stored);
+                }
+                if existing.fence.content_digest_hex.is_empty() {
+                    // Nothing identifies the bytes this session was for
+                    // (checksums are off), so it is never resumed (#668): its
+                    // upload is aborted, best effort, and the object starts
+                    // again. A failed abort leaves parts the abandon window
+                    // and a bucket lifecycle rule reclaim.
+                    let aborted = backend
+                        .abort_multipart_upload(&existing.object_uri, &existing.upload_id)
+                        .await;
+                    report.count(&aborted);
+                    delete_session(path)?;
+                    self.create(report).await?
+                } else {
+                    report.resumed = true;
+                    adopted = true;
+                    existing
+                }
+            }
+            Err(_) => self.create(report).await?,
+        };
 
-    let parts: Vec<UploadedPart> = session
-        .parts
-        .values()
-        .map(|p| UploadedPart {
-            part_number: p.part_number,
-            etag: p.etag.clone(),
-        })
-        .collect();
-    let stored = match backend
-        .complete_multipart_upload(object_uri, &session.upload_id, &parts)
+        // The session is identified by its content, not by where the bytes
+        // are read from (#668): the engine names its compressed file after
+        // the attempt's batch id, so a replay reads the same bytes from
+        // another path. Every kept part is re-read from the current file and
+        // its digest compared before it is skipped, and the whole object is
+        // read back before anything is committed, so the path adds nothing.
+        session.local_path = self.local_path.to_path_buf();
+        // Re-verify persisted parts against local bytes; drop mismatches so
+        // they are retransmitted.
+        revalidate_persisted_parts(&mut session, self.local_path).await?;
+        save_session(path, &session)?;
+        let total = part_count(session.fence.byte_length, session.part_size_bytes);
+        report.parts_total = total;
+        report.parts_reused = session.parts.len() as u32;
+        report.bytes_reused = session.parts.values().map(|p| p.size_bytes).sum();
+        report.session_left = true;
+        if adopted {
+            tracing::info!(
+                event = "multipart_session_resumed",
+                key = object_uri,
+                parts_reused = report.parts_reused,
+                parts_total = total,
+                bytes_reused = report.bytes_reused,
+                "resuming multipart session for {object_uri}: {} of {total} parts already \
+                 uploaded ({} not re-sent); nothing to do",
+                report.parts_reused,
+                human_bytes(report.bytes_reused)
+            );
+        }
+
+        if let Err(failed) = upload_missing_parts(
+            backend,
+            self.cfg,
+            &mut session,
+            self.local_path,
+            path,
+            report,
+        )
         .await
-    {
-        Ok(stored) => stored,
-        Err(err) => {
-            // Crash between complete and session update: object may already
-            // exist. Strong verify + optional version recovery makes complete
-            // idempotent.
-            if let Ok(stored) =
-                recover_completed(backend, object_uri, checksum, fence.byte_length).await
-            {
-                stored
-            } else {
-                return Err(err);
+        {
+            report.parts_kept = session.parts.len() as u32;
+            if matches!(failed, VtopError::UploadSessionGone(_)) {
+                report.session_left = false;
             }
+            return Err(failed);
         }
-    };
 
-    session.phase = MultipartSessionPhase::Completed;
-    session.completed_version_id = stored.version_id.clone();
-    session.updated_at_unix_secs = now_unix_secs();
-    save_session(&path, &session)?;
-    // Keep the completed marker briefly so concurrent/retry callers see it,
-    // then delete — a missing file simply starts a new upload next time.
-    delete_session(&path)?;
-    Ok(stored)
+        let parts: Vec<UploadedPart> = session
+            .parts
+            .values()
+            .map(|p| UploadedPart {
+                part_number: p.part_number,
+                etag: p.etag.clone(),
+            })
+            .collect();
+        let completed = backend
+            .complete_multipart_upload(object_uri, &session.upload_id, &parts)
+            .await;
+        report.count(&completed);
+        let stored = match completed {
+            Ok(stored) => stored,
+            Err(err) => {
+                // Crash between complete and session update: object may already
+                // exist. Strong verify + optional version recovery makes complete
+                // idempotent. (S3 answers a second complete of the same upload
+                // with NoSuchUpload, which is why this is tried before the
+                // restart a gone session otherwise gets.)
+                match recover_completed(
+                    backend,
+                    object_uri,
+                    self.checksum,
+                    fence.byte_length,
+                    report,
+                )
+                .await
+                {
+                    Ok(stored) => stored,
+                    Err(_) => {
+                        report.parts_kept = session.parts.len() as u32;
+                        if matches!(err, VtopError::UploadSessionGone(_)) {
+                            report.session_left = false;
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+        };
+
+        session.phase = MultipartSessionPhase::Completed;
+        session.completed_version_id = stored.version_id.clone();
+        session.updated_at_unix_secs = now_unix_secs();
+        save_session(path, &session)?;
+        // Keep the completed marker briefly so concurrent/retry callers see it,
+        // then delete — a missing file simply starts a new upload next time.
+        delete_session(path)?;
+        report.completed = true;
+        report.session_left = false;
+        report.parts_kept = 0;
+        Ok(stored)
+    }
+
+    async fn create(&self, report: &mut MultipartReport) -> Result<MultipartSession, VtopError> {
+        let created = self
+            .backend
+            .create_multipart_upload(self.object_uri, "application/octet-stream", self.checksum)
+            .await;
+        report.count(&created);
+        let now = now_unix_secs();
+        let session = MultipartSession {
+            schema_version: SESSION_SCHEMA,
+            backend_id: self.backend.backend_name().to_owned(),
+            object_uri: self.object_uri.to_owned(),
+            local_path: self.local_path.to_path_buf(),
+            upload_id: created?,
+            part_size_bytes: self.cfg.part_size_bytes,
+            fence: self.fence.clone(),
+            phase: MultipartSessionPhase::InProgress,
+            parts: BTreeMap::new(),
+            created_at_unix_secs: now,
+            updated_at_unix_secs: now,
+            completed_version_id: None,
+        };
+        save_session(self.path, &session)?;
+        Ok(session)
+    }
 }
 
 fn validate_resume(
     session: &MultipartSession,
     backend: &dyn UploadBackend,
     object_uri: &str,
-    local_path: &Path,
     fence: &MultipartFence,
 ) -> Result<(), VtopError> {
     if session.schema_version != SESSION_SCHEMA {
@@ -400,13 +675,6 @@ fn validate_resume(
             "multipart session object_uri mismatch (stale fence)".into(),
         ));
     }
-    if session.local_path != local_path {
-        return Err(VtopError::Upload(format!(
-            "multipart session local path {} does not match {}",
-            session.local_path.display(),
-            local_path.display()
-        )));
-    }
     if &session.fence != fence {
         return Err(VtopError::Upload(
             "multipart session fence mismatch: refusing to resume a stale generation \
@@ -414,6 +682,13 @@ fn validate_resume(
                 .into(),
         ));
     }
+    if session.part_size_bytes == 0 {
+        return Err(VtopError::Upload(
+            "multipart session records a part size of zero; refusing to resume it".into(),
+        ));
+    }
+    // The local path is deliberately not compared (#668): see
+    // `SessionCall::run`.
     Ok(())
 }
 
@@ -422,9 +697,16 @@ async fn finish_idempotent(
     object_uri: &str,
     session: &MultipartSession,
     checksum: Option<ObjectChecksum<'_>>,
+    report: &mut MultipartReport,
 ) -> Result<StoredObject, VtopError> {
-    let stored =
-        recover_completed(backend, object_uri, checksum, session.fence.byte_length).await?;
+    let stored = recover_completed(
+        backend,
+        object_uri,
+        checksum,
+        session.fence.byte_length,
+        report,
+    )
+    .await?;
     if session.completed_version_id.is_some()
         && stored.version_id != session.completed_version_id
         && session
@@ -446,21 +728,25 @@ async fn recover_completed(
     object_uri: &str,
     checksum: Option<ObjectChecksum<'_>>,
     byte_length: u64,
+    report: &mut MultipartReport,
 ) -> Result<StoredObject, VtopError> {
     let verification = backend
         .verify_object(object_uri, byte_length, checksum)
-        .await?;
+        .await;
+    report.count(&verification);
+    let verification = verification?;
     if !verification.passed || verification.backend_limited {
         return Err(VtopError::Upload(format!(
             "idempotent multipart complete could not strongly verify {object_uri}: {}",
             verification.message
         )));
     }
-    let head = backend.head_object(object_uri).await?;
+    let head = backend.head_object(object_uri).await;
+    report.count(&head);
+    head?;
     // head_object does not currently surface version id; leave None and let
     // callers that require versioning re-complete or treat as unversioned.
     // Mock/S3 complete paths return version ids on the happy path.
-    let _ = head;
     Ok(StoredObject { version_id: None })
 }
 
@@ -483,67 +769,373 @@ async fn revalidate_persisted_parts(
     Ok(())
 }
 
+/// How one part's requests ended.
+enum PartError {
+    /// The local file could not be read: no request was sent.
+    Local(VtopError),
+    /// The store no longer holds the upload; retrying cannot help.
+    Gone(VtopError),
+    /// The part's last attempt failed.
+    Store { last: VtopError },
+}
+
+/// One part's run through its attempts.
+struct PartRun {
+    part_number: u32,
+    attempts: u32,
+    throttled: u32,
+    outcome: Result<(UploadedPart, u64, String), PartError>,
+}
+
+/// What every part in one call shares.
+struct PartPool<'a> {
+    backend: &'a dyn UploadBackend,
+    local_path: &'a Path,
+    object_uri: &'a str,
+    upload_id: &'a str,
+    total: u32,
+    attempts: u32,
+    backoff: PartBackoff,
+    /// Parts the session holds, for the retry notice.
+    kept: &'a AtomicU32,
+    /// Set once a part has failed for good: no part starts, and no part
+    /// begins another attempt, after that.
+    stop: &'a AtomicBool,
+    notices: &'a RetryNotices,
+}
+
+impl PartPool<'_> {
+    async fn send(&self, part_number: u32, offset: u64, len: u64) -> PartRun {
+        let mut run = PartRun {
+            part_number,
+            attempts: 0,
+            throttled: 0,
+            outcome: Err(PartError::Local(VtopError::Upload("not started".into()))),
+        };
+        let (data, digest) = match read_part_bytes(self.local_path, offset, len).await {
+            Ok(read) => read,
+            Err(e) => {
+                run.outcome = Err(PartError::Local(e));
+                return run;
+            }
+        };
+        loop {
+            run.attempts += 1;
+            // `UploadPart` is idempotent per part number: a retry after an
+            // unknown outcome replaces the part, it cannot double it.
+            let sent = self
+                .backend
+                .upload_part(self.object_uri, self.upload_id, part_number, data.clone())
+                .await;
+            let error = match sent {
+                Ok(uploaded) => {
+                    run.outcome = Ok((uploaded, len, digest));
+                    return run;
+                }
+                Err(e) => e,
+            };
+            if error.is_upload_throttle() {
+                run.throttled += 1;
+            }
+            if matches!(error, VtopError::UploadSessionGone(_)) {
+                run.outcome = Err(PartError::Gone(error));
+                return run;
+            }
+            if run.attempts >= self.attempts || self.stop.load(Ordering::SeqCst) {
+                run.outcome = Err(PartError::Store { last: error });
+                return run;
+            }
+            let delay = self
+                .backoff
+                .delay(run.attempts, jitter_seed(part_number, run.attempts));
+            if let Some(suppressed) = self.notices.admit() {
+                let cause = redact_urls(&error.to_string());
+                tracing::warn!(
+                    event = "multipart_part_retry",
+                    key = self.object_uri,
+                    part = part_number,
+                    parts_total = self.total,
+                    attempt = run.attempts,
+                    attempts = self.attempts,
+                    delay_ms = delay.as_millis() as u64,
+                    throttled = error.is_upload_throttle(),
+                    suppressed,
+                    error = %cause,
+                    "{}",
+                    retry_message(
+                        part_number,
+                        self.total,
+                        self.object_uri,
+                        run.attempts,
+                        self.attempts,
+                        &cause,
+                        delay,
+                        self.kept.load(Ordering::SeqCst),
+                        suppressed,
+                    )
+                );
+            }
+            tokio::time::sleep(delay).await;
+            if self.stop.load(Ordering::SeqCst) {
+                run.outcome = Err(PartError::Store { last: error });
+                return run;
+            }
+        }
+    }
+}
+
+/// The retry notice (#668): what happened, what the engine does, what to do.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every argument is one fact the notice states; a struct would only name them twice"
+)]
+fn retry_message(
+    part: u32,
+    total: u32,
+    object_uri: &str,
+    attempt: u32,
+    attempts: u32,
+    cause: &str,
+    delay: Duration,
+    kept: u32,
+    suppressed: u64,
+) -> String {
+    let kept = match kept {
+        1 => "1 completed part is kept".to_owned(),
+        n => format!("{n} completed parts are kept"),
+    };
+    let suppressed = match suppressed {
+        0 => String::new(),
+        n => {
+            format!(" ({n} more part retries of this object were not logged since the last notice)")
+        }
+    };
+    format!(
+        "part {part} of {total} of {object_uri} failed (attempt {attempt} of {attempts}: \
+         {cause}); retrying this part in {:.1} s; {kept}; nothing to do unless this repeats, \
+         then check the link to the store{suppressed}",
+        delay.as_secs_f64()
+    )
+}
+
+/// At most one retry notice per object a minute, with how many were held
+/// back in between (#668): a slow link can fail many parts in a row, and
+/// each is counted in the report whether or not it is logged.
+struct RetryNotices {
+    every: Duration,
+    state: std::sync::Mutex<(Option<tokio::time::Instant>, u64)>,
+}
+
+impl RetryNotices {
+    fn new(every: Duration) -> Self {
+        Self {
+            every,
+            state: std::sync::Mutex::new((None, 0)),
+        }
+    }
+
+    /// `Some(suppressed since the last notice)` when one should be logged.
+    fn admit(&self) -> Option<u64> {
+        let now = tokio::time::Instant::now();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        match state.0 {
+            Some(last) if now.duration_since(last) < self.every => {
+                state.1 += 1;
+                None
+            }
+            _ => {
+                let suppressed = state.1;
+                *state = (Some(now), 0);
+                Some(suppressed)
+            }
+        }
+    }
+}
+
+fn jitter_seed(part: u32, attempt: u32) -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ (u64::from(part) << 32) ^ u64::from(attempt)
+}
+
+/// Remove what a URL in an error must not carry (#668, vtop-observability):
+/// the user info and the query string, where a presigned request keeps its
+/// signature and credential scope. The scheme, host and path stay, so the
+/// message still says where the request went. `s3://` object paths are not
+/// URLs of this kind and are left alone.
+pub fn redact_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let next = ["https://", "http://"]
+            .iter()
+            .filter_map(|scheme| rest.find(scheme).map(|at| (at, scheme.len())))
+            .min();
+        let Some((start, scheme_len)) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..start]);
+        let end = rest[start..]
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '}')
+            })
+            .map(|offset| start + offset)
+            .unwrap_or(rest.len());
+        let url = &rest[start..end];
+        let (scheme, after) = url.split_at(scheme_len);
+        let authority_end = after.find(['/', '?', '#']).unwrap_or(after.len());
+        let authority = &after[..authority_end];
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        let tail = &after[authority_end..];
+        let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+        out.push_str(scheme);
+        out.push_str(host);
+        out.push_str(&tail[..path_end]);
+        if path_end < tail.len() {
+            out.push_str("?[redacted]");
+        }
+        rest = &rest[end..];
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= KIB * KIB * KIB {
+        format!("{:.1} GiB", b / (KIB * KIB * KIB))
+    } else if b >= KIB * KIB {
+        format!("{:.1} MiB", b / (KIB * KIB))
+    } else if b >= KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// Send every part the session does not hold (#668). Up to `max_parallelism`
+/// parts are in flight, and the next one starts as soon as one finishes,
+/// rather than in rounds that each wait for their slowest part. Every success
+/// is written to the session the moment it arrives. On the first part that
+/// fails for good no new part is started and no part begins another attempt,
+/// but the requests already on the wire are waited for and their parts kept:
+/// their bandwidth is already spent. (The rounds this replaces walked their
+/// results with `?`, so a part that finished beside a failing one was
+/// uploaded and then forgotten.)
 async fn upload_missing_parts(
     backend: &dyn UploadBackend,
     cfg: &MultipartUploadConfig,
     session: &mut MultipartSession,
     local_path: &Path,
     session_path: &Path,
+    report: &mut MultipartReport,
 ) -> Result<(), VtopError> {
     let total = part_count(session.fence.byte_length, session.part_size_bytes);
     if total == 0 {
         return Err(VtopError::Upload("multipart part count is zero".into()));
     }
-    let mut pending: Vec<u32> = (1..=total)
+    let missing: Vec<u32> = (1..=total)
         .filter(|n| !session.parts.contains_key(n))
         .collect();
-    pending.sort_unstable();
+    let mut pending = missing.into_iter();
+    let width = cfg.max_parallelism.max(1);
+    let kept = AtomicU32::new(session.parts.len() as u32);
+    let stop = AtomicBool::new(false);
+    let notices = RetryNotices::new(Duration::from_secs(60));
+    let upload_id = session.upload_id.clone();
+    let object_uri = session.object_uri.clone();
+    let (part_size, byte_length) = (session.part_size_bytes, session.fence.byte_length);
+    let pool = PartPool {
+        backend,
+        local_path,
+        object_uri: &object_uri,
+        upload_id: &upload_id,
+        total,
+        attempts: cfg.part_attempts.max(1),
+        backoff: cfg.part_backoff,
+        kept: &kept,
+        stop: &stop,
+        notices: &notices,
+    };
 
-    let semaphore = Arc::new(Semaphore::new(cfg.max_parallelism.max(1)));
-    // Upload sequentially in waves so we can persist after each success
-    // without racing the BTreeMap. Parallelism is within each wave.
-    for chunk in pending.chunks(cfg.max_parallelism.max(1)) {
-        let mut joins = Vec::with_capacity(chunk.len());
-        for &part_number in chunk {
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|e| VtopError::Upload(format!("multipart semaphore closed: {e}")))?;
-            let offset = u64::from(part_number.saturating_sub(1)) * session.part_size_bytes;
-            let remaining = session.fence.byte_length.saturating_sub(offset);
-            let len = remaining.min(session.part_size_bytes);
-            let path = local_path.to_path_buf();
-            let upload_id = session.upload_id.clone();
-            let object_uri = session.object_uri.clone();
-            // Backend is Sync; upload_part takes &self. Use a raw pointer-free
-            // approach: call directly in the async block with the shared ref
-            // lifetime tied to this function — spawn_local isn't available, so
-            // use futures::future::join_all with async blocks that borrow backend.
-            joins.push(async move {
-                let _permit = permit;
-                let (data, digest) = read_part_bytes(&path, offset, len).await?;
-                let uploaded = backend
-                    .upload_part(&object_uri, &upload_id, part_number, data)
-                    .await?;
-                Ok::<_, VtopError>((uploaded, len, digest))
-            });
+    let mut in_flight = FuturesUnordered::new();
+    let mut failed: Option<(u32, u32, VtopError)> = None;
+    let mut gone: Option<VtopError> = None;
+    let mut local: Option<VtopError> = None;
+    loop {
+        while !stop.load(Ordering::SeqCst) && in_flight.len() < width {
+            let Some(part_number) = pending.next() else {
+                break;
+            };
+            let offset = u64::from(part_number - 1) * part_size;
+            let len = byte_length.saturating_sub(offset).min(part_size);
+            in_flight.push(pool.send(part_number, offset, len));
         }
-        let results = futures::future::join_all(joins).await;
-        for result in results {
-            let (uploaded, len, digest) = result?;
-            session.parts.insert(
-                uploaded.part_number,
-                PersistedPart {
-                    part_number: uploaded.part_number,
-                    etag: uploaded.etag,
-                    size_bytes: len,
-                    part_digest_hex: digest,
-                },
-            );
-            session.updated_at_unix_secs = now_unix_secs();
-            save_session(session_path, session)?;
+        let Some(run) = in_flight.next().await else {
+            break;
+        };
+        report.requests += run.attempts;
+        report.throttled_requests += run.throttled;
+        report.part_retries += run.attempts.saturating_sub(1);
+        match run.outcome {
+            Ok((uploaded, len, digest)) => {
+                session.parts.insert(
+                    uploaded.part_number,
+                    PersistedPart {
+                        part_number: uploaded.part_number,
+                        etag: uploaded.etag,
+                        size_bytes: len,
+                        part_digest_hex: digest,
+                    },
+                );
+                session.updated_at_unix_secs = now_unix_secs();
+                report.parts_uploaded += 1;
+                kept.store(session.parts.len() as u32, Ordering::SeqCst);
+                if let Err(e) = save_session(session_path, session) {
+                    stop.store(true, Ordering::SeqCst);
+                    local.get_or_insert(e);
+                }
+            }
+            Err(PartError::Local(e)) => {
+                stop.store(true, Ordering::SeqCst);
+                local.get_or_insert(e);
+            }
+            Err(PartError::Gone(e)) => {
+                stop.store(true, Ordering::SeqCst);
+                gone.get_or_insert(e);
+            }
+            Err(PartError::Store { last }) => {
+                report.parts_failed += 1;
+                stop.store(true, Ordering::SeqCst);
+                failed.get_or_insert((run.part_number, run.attempts, last));
+            }
         }
+    }
+    // A lost upload first: whatever else failed, the next step is a new one.
+    if let Some(e) = gone {
+        return Err(e);
+    }
+    if let Some(e) = local {
+        return Err(e);
+    }
+    if let Some((part, attempts, last)) = failed {
+        let cause = redact_urls(&last.to_string());
+        let message = format!(
+            "part {part} of {total} of {object_uri} failed after {attempts} attempt{} \
+             ({cause}); the upload session keeps {} of {total} parts",
+            if attempts == 1 { "" } else { "s" },
+            session.parts.len()
+        );
+        // A throttle stays a throttle, for a caller that tells them apart.
+        return Err(if last.is_upload_throttle() {
+            VtopError::UploadThrottled(message)
+        } else {
+            VtopError::Upload(message)
+        });
     }
     if session.parts.len() as u32 != total {
         return Err(VtopError::Upload(format!(
@@ -602,6 +1194,12 @@ pub async fn cleanup_abandoned(
             if let Err(e) = backend
                 .abort_multipart_upload(&session.object_uri, &session.upload_id)
                 .await
+                // The store no longer holds it (#668): a lifecycle rule
+                // aborted it already, which is what this sweep was for.
+                .or_else(|e| match e {
+                    VtopError::UploadSessionGone(_) => Ok(()),
+                    other => Err(other),
+                })
             {
                 tracing::warn!(
                     object = %session.object_uri,
@@ -629,9 +1227,14 @@ pub async fn abort_session(
     let path = session_path(state_dir, object_uri, fence);
     if let Ok(session) = load_session(&path) {
         if session.phase == MultipartSessionPhase::InProgress {
-            backend
+            match backend
                 .abort_multipart_upload(&session.object_uri, &session.upload_id)
-                .await?;
+                .await
+            {
+                // Already gone at the store (#668): nothing left to abort.
+                Ok(()) | Err(VtopError::UploadSessionGone(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
         delete_session(&path)?;
     }
@@ -738,6 +1341,16 @@ mod tests {
             max_parallelism: 2,
             abandon_after_secs: 60,
             state_dir: dir.to_path_buf(),
+            part_attempts: 3,
+            part_backoff: quick(),
+        }
+    }
+
+    /// A backoff short enough for a test on the real clock.
+    fn quick() -> PartBackoff {
+        PartBackoff {
+            base: Duration::from_millis(1),
+            cap: Duration::from_millis(4),
         }
     }
 
@@ -810,6 +1423,8 @@ mod tests {
             max_parallelism: 2,
             abandon_after_secs: 60,
             state_dir: dir.path().to_path_buf(),
+            part_attempts: 3,
+            part_backoff: PartBackoff::default(),
         };
         assert!(
             cfg.should_multipart(&MockBackend::new(), 10_000),
@@ -1024,7 +1639,6 @@ mod tests {
             &session,
             &backend,
             uri,
-            file.path(),
             &fence(&digest, data.len() as u64, 99),
         )
         .expect_err("fence mismatch");
@@ -1148,5 +1762,283 @@ mod tests {
             backend.pending_multipart_count() >= 1,
             "the remote upload is still tracked, not orphaned"
         );
+    }
+
+    fn three_part_file(seed: u8) -> (tempfile::NamedTempFile, Vec<u8>, String) {
+        let data: Vec<u8> = (0..3_000_u32).map(|i| seed ^ (i % 251) as u8).collect();
+        let (file, digest) = tmp_file(&data);
+        (file, data, digest)
+    }
+
+    async fn run(
+        backend: &MockBackend,
+        cfg: &MultipartUploadConfig,
+        path: &Path,
+        uri: &str,
+        digest: &str,
+        len: u64,
+    ) -> (Result<StoredObject, VtopError>, MultipartReport) {
+        let mut report = MultipartReport::default();
+        let result = upload_resumable_with_report(
+            backend,
+            cfg,
+            path,
+            uri,
+            Some(ObjectChecksum::new("blake3", digest)),
+            fence(digest, len, 1),
+            &mut report,
+        )
+        .await;
+        (result, report)
+    }
+
+    /// #668: the report counts every request, so the engine's throttle count
+    /// and metrics see what the per-part retries did, on success...
+    #[tokio::test]
+    async fn the_report_counts_every_request_and_every_retry() {
+        let (file, data, digest) = three_part_file(1);
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new().with_part_fault(2, crate::PartFault::Throttled, 1);
+        let (result, report) = run(
+            &backend,
+            &cfg(state.path(), 1_000),
+            file.path(),
+            "s3://b/report.raw",
+            &digest,
+            data.len() as u64,
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(
+            report,
+            MultipartReport {
+                parts_total: 3,
+                parts_reused: 0,
+                bytes_reused: 0,
+                parts_uploaded: 3,
+                part_retries: 1,
+                parts_failed: 0,
+                // create + four part requests + complete
+                requests: 6,
+                throttled_requests: 1,
+                resumed: false,
+                restarted: false,
+                completed: true,
+                parts_kept: 0,
+                session_left: false,
+            }
+        );
+    }
+
+    /// ...and on failure, with what the session keeps, and then on the resume.
+    #[tokio::test]
+    async fn the_report_says_what_was_kept_and_what_a_resume_reused() {
+        let (file, data, digest) = three_part_file(2);
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new().with_part_fault(2, crate::PartFault::Reset, usize::MAX);
+        let mut cfg = cfg(state.path(), 1_000);
+        cfg.max_parallelism = 3;
+        let uri = "s3://b/kept.raw";
+        let (result, report) =
+            run(&backend, &cfg, file.path(), uri, &digest, data.len() as u64).await;
+        result.expect_err("part 2 never succeeds");
+        assert_eq!(report.parts_failed, 1);
+        assert_eq!(report.part_retries, 2, "part 2 had three attempts");
+        assert_eq!(report.parts_kept, 2);
+        assert!(report.session_left && !report.completed);
+
+        backend.set_part_fault(2, crate::PartFault::Reset, 0);
+        let (result, report) =
+            run(&backend, &cfg, file.path(), uri, &digest, data.len() as u64).await;
+        result.unwrap();
+        assert!(report.resumed && report.completed && !report.restarted);
+        assert_eq!(
+            (
+                report.parts_reused,
+                report.bytes_reused,
+                report.parts_uploaded
+            ),
+            (2, 2_000, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_report_says_when_a_lost_upload_was_restarted() {
+        let (file, data, digest) = three_part_file(3);
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new().with_part_fault(1, crate::PartFault::SessionGone, 1);
+        let (result, report) = run(
+            &backend,
+            &cfg(state.path(), 1_000),
+            file.path(),
+            "s3://b/restart.raw",
+            &digest,
+            data.len() as u64,
+        )
+        .await;
+        result.unwrap();
+        assert!(report.restarted && report.completed, "{report:?}");
+    }
+
+    /// The wait before each retry is bounded by an exponential ceiling (1 s,
+    /// 2 s, 4 s ... capped at 30 s) and drawn anywhere below it (full
+    /// jitter), so parts that failed together do not return together.
+    #[test]
+    fn the_backoff_doubles_to_its_cap_and_is_jittered_below_it() {
+        let b = PartBackoff::default();
+        let ceilings: Vec<u64> = (1..=8).map(|n| b.ceiling(n).as_secs()).collect();
+        assert_eq!(ceilings, vec![1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(b.ceiling(u32::MAX), Duration::from_secs(30), "no overflow");
+        let delays: std::collections::BTreeSet<Duration> =
+            (0..64_u64).map(|seed| b.delay(3, seed)).collect();
+        assert!(delays.iter().all(|d| *d <= Duration::from_secs(4)));
+        assert!(
+            delays.len() > 32,
+            "jitter spreads the waits: {} distinct of 64",
+            delays.len()
+        );
+    }
+
+    /// A part that never succeeds costs exactly its attempts, and the waits
+    /// between them stay under the backoff's ceilings (paused clock).
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_failure_costs_its_attempts_and_bounded_waits() {
+        let (file, data, digest) = three_part_file(4);
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new().with_part_fault(1, crate::PartFault::Reset, usize::MAX);
+        let mut cfg = cfg(state.path(), 1_000);
+        cfg.max_parallelism = 1;
+        cfg.part_attempts = 5;
+        cfg.part_backoff = PartBackoff::default();
+        let started = tokio::time::Instant::now();
+        let (result, report) = run(
+            &backend,
+            &cfg,
+            file.path(),
+            "s3://b/permanent.raw",
+            &digest,
+            data.len() as u64,
+        )
+        .await;
+        result.expect_err("part 1 never succeeds");
+        assert_eq!(backend.part_sends(1), 5);
+        assert_eq!(report.part_retries, 4);
+        assert!(
+            started.elapsed() <= Duration::from_secs(1 + 2 + 4 + 8),
+            "four waits, each under its ceiling: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A presigned URL in an SDK error keeps its signature in the query
+    /// string; the messages this module writes never carry it, nor user info.
+    #[test]
+    fn urls_in_a_cause_lose_their_query_and_user_info() {
+        let cause = "dispatch failure: io error sending request to \
+            https://AKIDEXAMPLE:secret@bucket.s3.example.com/key/part?uploadId=abc&partNumber=2\
+            &X-Amz-Signature=deadbeef&X-Amz-Credential=AKIDEXAMPLE%2F20261114 (connection reset); \
+            object s3://bucket/key";
+        let redacted = redact_urls(cause);
+        for secret in [
+            "X-Amz-Signature",
+            "deadbeef",
+            "AKIDEXAMPLE",
+            "secret",
+            "uploadId",
+        ] {
+            assert!(!redacted.contains(secret), "{secret} leaked: {redacted}");
+        }
+        assert!(
+            redacted.contains("https://bucket.s3.example.com/key/part?[redacted]"),
+            "{redacted}"
+        );
+        assert!(redacted.contains("object s3://bucket/key"), "{redacted}");
+        assert_eq!(redact_urls("no url here"), "no url here");
+    }
+
+    #[test]
+    fn the_retry_notice_says_what_happened_what_is_done_and_what_to_do() {
+        let message = retry_message(
+            2,
+            3,
+            "s3://b/k",
+            1,
+            3,
+            "connection reset",
+            Duration::from_millis(2_100),
+            1,
+            0,
+        );
+        assert_eq!(
+            message,
+            "part 2 of 3 of s3://b/k failed (attempt 1 of 3: connection reset); retrying \
+             this part in 2.1 s; 1 completed part is kept; nothing to do unless this \
+             repeats, then check the link to the store"
+        );
+        let message = retry_message(2, 3, "s3://b/k", 2, 3, "x", Duration::ZERO, 2, 5);
+        assert!(message.contains("2 completed parts are kept"), "{message}");
+        assert!(message.contains("(5 more part retries"), "{message}");
+    }
+
+    /// The notices are rate-limited per object, and say how many were held.
+    #[tokio::test(start_paused = true)]
+    async fn retry_notices_are_rate_limited_with_a_suppressed_count() {
+        let notices = RetryNotices::new(Duration::from_secs(60));
+        assert_eq!(notices.admit(), Some(0));
+        assert_eq!(notices.admit(), None);
+        assert_eq!(notices.admit(), None);
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert_eq!(notices.admit(), Some(2));
+    }
+
+    /// A session file written by the v0.8.0 release's own code still resumes
+    /// after #668: from another local path, its kept part checked against
+    /// the bytes and reused, and only the missing parts sent. The fixture was
+    /// generated at the v0.8.0 tag, not by the code under test: that tag's
+    /// `upload_resumable`, mock backend and `with_multipart_fail_after_parts(1)`,
+    /// a 3000-byte file of `5 ^ (i % 251)` read from `/out/fixture.raw`,
+    /// 1000-byte parts, one in flight, uploaded to `s3://bucket/fixture.raw`
+    /// under a BLAKE3 fence of generation 1 and epoch 1. It failed after
+    /// part 1, and the session file it left is committed as written.
+    #[tokio::test]
+    async fn a_session_written_by_v0_8_0_resumes() {
+        let (file, data, digest) = three_part_file(5);
+        let state = tempfile::tempdir().unwrap();
+        let uri = "s3://bucket/fixture.raw";
+        let f = fence(&digest, data.len() as u64, 1);
+        let text = include_str!("../tests/fixtures/multipart-session-v0.8.0.json");
+        let written: MultipartSession = serde_json::from_str(text).unwrap();
+        assert_eq!(written.fence, f, "the fixture is for these bytes");
+        assert_ne!(
+            written.local_path,
+            file.path(),
+            "and was read from another path"
+        );
+        std::fs::write(state.path().join(session_file_name(uri, &f)), text).unwrap();
+        let backend = MockBackend::new();
+        backend.seed_multipart(uri, &written.upload_id, vec![(1, data[..1_000].to_vec())]);
+
+        let (result, report) = run(
+            &backend,
+            &cfg(state.path(), 1_000),
+            file.path(),
+            uri,
+            &digest,
+            data.len() as u64,
+        )
+        .await;
+        result.unwrap();
+        assert!(report.resumed, "{report:?}");
+        assert_eq!(backend.part_sends(1), 0, "the kept part is not sent again");
+        assert_eq!([backend.part_sends(2), backend.part_sends(3)], [1, 1]);
+        let v = backend
+            .verify_object(
+                uri,
+                data.len() as u64,
+                Some(ObjectChecksum::new("blake3", &digest)),
+            )
+            .await
+            .unwrap();
+        assert!(v.passed && !v.backend_limited, "{v:?}");
     }
 }

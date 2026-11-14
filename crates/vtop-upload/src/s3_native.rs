@@ -945,6 +945,12 @@ where
         || code.as_deref().is_some_and(crate::base::is_throttle_code);
     if throttled {
         VtopError::UploadThrottled(detail)
+    } else if code.as_deref() == Some("NoSuchUpload") {
+        // The multipart upload this request names is gone (#668): aborted by
+        // a lifecycle rule or a sweep, or completed by an earlier attempt.
+        // Sending the same request again fails the same way, so the caller
+        // must start a new upload rather than retry this one.
+        VtopError::UploadSessionGone(detail)
     } else {
         VtopError::Upload(detail)
     }
@@ -3152,6 +3158,36 @@ mod throttle_classification {
         }
         let error = sdk_failure("upload_part", "s3://b/k", response_error(502));
         assert!(!error.is_upload_throttle(), "{error}");
+    }
+
+    /// S3 answers `NoSuchUpload` for an upload id it no longer holds (#668):
+    /// aborted by a lifecycle rule or a sweep, or already completed. That is
+    /// not a failure a retry of the same request can fix, so it is told apart
+    /// from every other error and the caller starts a new upload.
+    #[test]
+    fn no_such_upload_is_a_gone_session_and_nothing_else_is() {
+        let error = sdk_failure(
+            "upload_part",
+            "s3://b/k#2",
+            service_error(404, Some("NoSuchUpload")),
+        );
+        assert!(
+            matches!(error, VtopError::UploadSessionGone(_)),
+            "NoSuchUpload must classify as a gone session: {error:?}"
+        );
+        assert!(error.to_string().contains("NoSuchUpload"), "{error}");
+        assert!(error.to_string().contains("s3://b/k#2"), "{error}");
+        for (status, code) in [
+            (404, Some("NoSuchKey")),
+            (404, None),
+            (400, Some("InvalidPart")),
+        ] {
+            let error = sdk_failure("upload_part", "s3://b/k", service_error(status, code));
+            assert!(
+                matches!(error, VtopError::Upload(_)),
+                "{status} {code:?} is not a gone session: {error:?}"
+            );
+        }
     }
 }
 

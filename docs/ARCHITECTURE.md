@@ -919,15 +919,39 @@ Large sealed segments (and other objects above `upload.multipart_threshold_bytes
 upload through a persisted multipart session when the backend advertises
 `supports_multipart()`:
 
-- Configurable `multipart_part_size_bytes`, `multipart_max_parallelism`, and
-  `multipart_abandon_after_secs`.
-- Session files under an operator-supplied state directory record upload id,
-  completed parts, and per-part BLAKE3 digests so a process restart resumes
-  without retransmitting finished parts.
+- Configurable `multipart_part_size_bytes`, `multipart_max_parallelism`,
+  `multipart_part_attempts` and `multipart_abandon_after_secs`.
+- Session files under an operator-supplied state directory (the engine's
+  `work_dir`) record upload id, completed parts, and per-part BLAKE3 digests
+  so a process restart resumes without retransmitting finished parts.
 - Sessions are fenced by destination URI + segment generation + fencing epoch
-  + content digest; a mismatched fence refuses resume (stale generation).
+  + content digest; a mismatched fence refuses resume (stale generation). A
+  session is identified by that content, not by the local file's name (#668):
+  every kept part is re-read from the current file and its digest compared
+  before it is skipped. A session with no content digest (checksums off) is
+  never resumed.
+- A failed part keeps what already completed (#668). Up to
+  `multipart_max_parallelism` parts are in flight and each success is written
+  to the session as it arrives. A failed part is retried alone, up to
+  `multipart_part_attempts` requests, with exponential backoff and full jitter
+  (1 s doubling to at most 30 s); after the first part fails for good no new
+  part starts, and the requests already on the wire are waited for and kept.
+  Every request and every throttle is reported to the caller, so the engine's
+  width controller still sees throttles the retries absorbed. A session the
+  store no longer holds (`NoSuchUpload`) is restarted once with a new upload.
+- **The telemetry path resumes across replays (#668).** When a batch's upload
+  fails, the engine keeps the session if the object is under its derived key
+  (#626): the replay of the same bytes names the same key and session and
+  sends only the missing parts. Under a per-attempt key nothing will name the
+  session again, so it is aborted as before. A replay whose bytes differ (the
+  source grew) names another key and leaves the old session to the sweep.
+- Abandoned sessions are swept at startup and, while the engine runs, every
+  quarter of `multipart_abandon_after_secs` (at most every 15 minutes). A
+  bucket lifecycle rule (`AbortIncompleteMultipartUpload`) is the backstop for
+  an engine that never comes back; see PRODUCTION_HA §7.6.
 - Multipart ETags are **not** integrity evidence. Evidence commit still requires
   strong whole-object `verify_object` and immutable version pins (#183/#184).
+  A resumed object is read back and verified exactly like a fresh one.
 - `vtopctl tier cleanup-abandoned` aborts aged in-progress uploads.
 
 Protocol §17 grades verification into three classes: **strong**

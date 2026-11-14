@@ -888,6 +888,51 @@ spec:
 
 ---
 
+### 7.6 Incomplete multipart uploads: a lifecycle rule **[RECOMMENDED, #668]**
+
+An incomplete multipart upload is invisible to `GET` and `LIST`, but its parts
+are **stored, and billed, until the upload is completed or aborted**. Since
+#668 the engine keeps a failed upload's session and parts so that the replay
+of the same bytes resumes it, rather than sending the object again. A session
+no replay resumes (the source grew, or the range was never read again) is
+aborted by the engine's sweep once it is older than
+`upload.multipart_abandon_after_secs` (24 h by default), at startup and every
+quarter of that window while the engine runs.
+
+The sweep only knows the uploads listed in its own work directory. An engine
+that never comes back, or whose work directory is lost, leaves its incomplete
+uploads behind. Add a bucket lifecycle rule as the backstop, with a window
+**longer** than the engine's abandon window, so it never aborts an upload a
+replay could still resume:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "vtop-abort-incomplete-multipart",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "" },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 2 }
+    }
+  ]
+}
+```
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket <bucket> \
+  --lifecycle-configuration file://abort-incomplete.json
+```
+
+`DaysAfterInitiation` counts from when the upload was created, not from its
+last part, so a long upload on a slow link can be older than a part written a
+minute ago: keep the rule's window well above the abandon window plus the
+longest a batch's upload and replays can take. If the rule aborts an upload a
+replay later resumes, the store answers `NoSuchUpload` and the engine starts
+one new upload for that object (`vtop_multipart_sessions_total{outcome="restarted"}`):
+the cost is the parts sent again, never data.
+
+---
+
 ## 8. Kafka HA: choreography, rebalance, autoscaling **[PROPOSED multi-instance]**
 
 ### 8.1 Commit choreography (exact order)
@@ -1089,6 +1134,8 @@ path needed by the distributed options is already implemented (§6.3).
 | `upload.create_bucket` | auto-create per-format buckets |
 | `upload.require_strong_verification` | defaults true — false explicitly permits size-only commit, which accepts same-size corruption; warned at startup and by `vtopctl validate` (#629) |
 | `upload.max_egress_bytes_per_second` | operator ceiling on the process's total upload body bytes per second (#481), unset by default. One token bucket per process, shared by every backend in it, in front of each `s3_native` object, manifest and multipart-part body — application-layer rate policy over kernel TCP, not a network-aware mechanism; no one-second window admits more than the cap, retries included. Headers and the small XML bodies of `CreateMultipartUpload`, `CompleteMultipartUpload` and `CreateBucket` are neither shaped nor counted. Other backends refuse it at startup. Accounted in `vtop_upload_egress_bytes_total`, exported only when set |
+| `upload.multipart_part_attempts` | requests per multipart part before the part and the upload fail (default 3, at least 1) (#668). Only the failed part is sent again, after a wait that doubles from 1 s to at most 30 s with full jitter; the completed parts are kept, and on failure the session is kept for the replay. Each request also has the SDK's retries and the `request_timeout_seconds` / `request_min_bytes_per_second` deadline, so the longest one part can take is this many times that deadline times the SDK's attempts |
+| `upload.multipart_abandon_after_secs` | age after which an incomplete multipart session is abandoned (default 86400): its upload is aborted at the store and its file deleted, at startup and every quarter of the window (at most every 15 minutes) while the engine runs (#668). Keep a bucket lifecycle rule above it (§7.6) |
 | `upload.max_concurrency_ceiling` | operator maximum above the concurrency knobs (#481), unset by default: `batching.max_concurrent_batches`, `batching.adaptive_width.min_width` and `upload.transports.*.max_concurrency` above it are refused naming both numbers, and the adaptive width controller's ceiling and floor are clamped to it |
 | `partitioning.template` | object key layout |
 
@@ -1136,6 +1183,13 @@ path needed by the distributed options is already implemented (§6.3).
   Grafana/Loki/Mimir/Tempo/Alloy compose stack
   (`docker-compose.observability.yml`) and generated dashboards for the
   pipeline, Kafka, and flow views.
+- **Multipart metrics** (#668) — `vtop_multipart_parts_total{result}`
+  (`uploaded`, `reused`, `retried`, `failed`),
+  `vtop_multipart_sessions_total{outcome}` (`completed`, `resumed`,
+  `restarted`, `kept_after_failure`, `swept`) and
+  `vtop_multipart_bytes_reused_total`. `kept_after_failure` growing while
+  neither `resumed` nor `swept` does means incomplete uploads are piling up in
+  the bucket (§7.6).
 - **Archive scrub metrics** — `vtopctl scrub --metrics-file` (§7.5) writes
   `vtop_scrub_objects_total{result}` and the last-success, last-pass and
   last-finding times
@@ -1174,6 +1228,9 @@ Invariant preserved: source progress is NEVER advanced for unverified data.
 | Kafka rebalance (fleet) | Revoked partitions: finish/abandon in-flight, no commit; reassigned replica resumes from committed offset | Offsets commit only post-verify |
 | File-owner replica dies (Tier 3) | Lease expires; another replica resumes from stored byte cursor | Cursor in shared durable store |
 | Object Lock blocks overwrite | Retry uses deterministic key / new version, never overwrite | §7.2 rule |
+| A multipart part fails (#668) | Only that part is sent again, up to `upload.multipart_part_attempts`, with backoff; the completed parts stay in the session. If it still fails, the batch fails and is replayed, and the session is kept: the replay of the same bytes resumes it and sends only the missing parts | The whole object is read back and verified before VERIFIED, as for a fresh upload; ETags are never evidence |
+| The store lost a multipart upload (`NoSuchUpload`) (#668) | The upload restarts once with a new upload id and sends every part; a second loss in the same call fails the batch, which is replayed | A new upload, verified by read-back like any other |
+| A kept session is never resumed (#668) | The sweep aborts its upload once it is older than `upload.multipart_abandon_after_secs`; a failed abort keeps the session for the next sweep | Only incomplete uploads are aborted; a lifecycle rule (§7.6) covers a lost work directory |
 
 ---
 
