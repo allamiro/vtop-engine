@@ -4421,3 +4421,275 @@ mod tests {
         assert_eq!(handler.node_id(), node);
     }
 }
+
+/// A candidate serves once a write QUORUM of replica streams is up, not once
+/// every stream is (#750).
+///
+/// System model: crash-recovery processes, a partially synchronous network,
+/// honest nodes. Every property here is LIVENESS: the build returns, and how
+/// soon. Safety is untouched by the wait either way: a produce still needs
+/// a quorum of durable acks, and a stream that connects late opens
+/// reconciled against the leader (#641).
+#[cfg(test)]
+mod stream_wait_tests {
+    use super::*;
+    use std::time::Instant;
+
+    const EPOCH: u64 = 3;
+    const SELF: Uuid = Uuid::from_u128(0x5E1F);
+    const LIVE_PEER: Uuid = Uuid::from_u128(0xA11E);
+    const DEAD_PEER: Uuid = Uuid::from_u128(0xDEAD);
+    const OTHER_DEAD_PEER: Uuid = Uuid::from_u128(0xDEAE);
+
+    fn range() -> RangeIdentity {
+        RangeIdentity {
+            topic: "events.v1".to_owned(),
+            topic_epoch: 1,
+            range_id: Uuid::from_u128(0xC1),
+            range_generation: 0,
+        }
+    }
+
+    fn roll() -> SegmentRoll {
+        SegmentRoll {
+            max_bytes: crate::config::default_max_segment_bytes(),
+            max_records: crate::config::default_max_segment_records(),
+            max_group_bytes: crate::config::default_max_group_bytes(),
+            max_record_bytes: crate::config::default_max_record_bytes(),
+        }
+    }
+
+    fn creation(node: Uuid) -> RangeCreation {
+        RangeCreation {
+            format: crate::config::SegmentFormatConfig::V1,
+            node_uuid: node,
+            fencing_epoch: EPOCH,
+        }
+    }
+
+    /// A plaintext candidate over `dir`: the plane the build dials on is the
+    /// only part of the config the wait reads.
+    fn candidate_config(dir: &Path) -> DataNodeConfig {
+        serde_yaml::from_str(&format!(
+            "role: candidate\n\
+             node_uuid: {SELF}\n\
+             cluster_id: aaaaaaaa-0000-0000-0000-0000000000c0\n\
+             data_dir: {}\n\
+             fencing_epoch: {EPOCH}\n\
+             range: {{ topic: events.v1, topic_epoch: 1, range_id: {}, range_generation: 0 }}\n\
+             segment_id: aaaaaaaa-0000-0000-0000-0000000000e0\n\
+             replica_transport: plaintext\n\
+             native_transport: plaintext\n",
+            dir.display(),
+            Uuid::from_u128(0xC1),
+        ))
+        .expect("the test's candidate config parses")
+    }
+
+    fn peer(node: Uuid, addr: std::net::SocketAddr) -> crate::config::FollowerPeerConfig {
+        crate::config::FollowerPeerConfig {
+            node_uuid: node,
+            addr: addr.to_string(),
+            server_name: "localhost".to_owned(),
+        }
+    }
+
+    /// An address nothing listens on: bound, read, and released, so a dial
+    /// is refused at once — a peer that is down, not one that is slow.
+    async fn closed_port() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    }
+
+    /// A real follower on the replica plane: the stream to it connects the
+    /// way a surviving peer's does after a failover.
+    async fn live_follower(
+        dir: &Path,
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
+        let (set, _) = open_range(dir, Uuid::from_u128(0xE1), &range(), roll(), creation(LIVE_PEER))
+            .unwrap();
+        let epochs = ProducerEpochJournal::open(dir.join("epochs")).unwrap();
+        let follower = Arc::new(
+            InProcessFollower::new(
+                LIVE_PEER,
+                set,
+                epochs,
+                range(),
+                EPOCH,
+                MetaFencingEpoch::new(EPOCH),
+                ClusterCommittedOffset::new(0),
+            )
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = ReplicaPeerServer::plaintext(LIVE_PEER, follower as Arc<dyn ReplicaPeerHandler>);
+        tokio::spawn(async move {
+            let _ = server.serve(listener, stopped).await;
+        });
+        (addr, stop)
+    }
+
+    /// Test 1 (#750): one peer up and one down is a write quorum of three,
+    /// so the build returns as soon as the live stream connects. On `main`
+    /// it waited the full ten seconds for the dead peer's stream, which is
+    /// what every failover paid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_candidate_with_one_peer_down_serves_within_the_quorum_wait() {
+        let leader_dir = tempfile::tempdir().unwrap();
+        let follower_dir = tempfile::tempdir().unwrap();
+        let (live, _stop) = live_follower(follower_dir.path()).await;
+        let config = candidate_config(leader_dir.path());
+        let peers = vec![peer(LIVE_PEER, live), peer(DEAD_PEER, closed_port().await)];
+
+        let started = Instant::now();
+        let built = build_leader_phase(
+            &config,
+            &range(),
+            &peers,
+            roll(),
+            &MetaFencingEpoch::new(EPOCH),
+        )
+        .await
+        .expect("the build succeeds with a quorum of streams");
+        let took = started.elapsed();
+
+        assert!(
+            took < Duration::from_secs(3),
+            "a candidate with 1 of 2 peers up holds a write quorum and must serve within 3 s; \
+             the build took {took:?} (on main it waited ~10 s for the dead peer's stream)"
+        );
+        assert_eq!(built.replicas.follower_connected(LIVE_PEER), Some(true));
+        assert_eq!(
+            built.replicas.follower_connected(DEAD_PEER),
+            Some(false),
+            "the dead peer cannot be connected; the build did not wait for it"
+        );
+    }
+
+    /// Logs written while `run` executes on this thread, as JSON lines at
+    /// INFO and above: the format and filter the binary ships.
+    fn capture_logs<T>(run: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        use tracing_subscriber::layer::SubscriberExt;
+        let captured = Captured::default();
+        let layer =
+            vtop_observe::logging::log_layer_with_writer("info", None, true, false, captured.clone());
+        let out = {
+            let _guard =
+                tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+            run()
+        };
+        let text = String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
+        (out, text)
+    }
+
+    /// Test 2 (#750): with BOTH peers down there is no quorum to wait for.
+    /// The build still waits out its deadline and then proceeds (a scenario
+    /// may start a leader against deliberately dead followers), but it says
+    /// so in a WARN with `connected=0`, and the leader it built refuses a
+    /// quorum write as "quorum not reached" (retryable) rather than
+    /// acknowledging one. On `main` the deadline passed silently.
+    #[test]
+    fn a_candidate_with_both_peers_down_waits_the_deadline_then_refuses_quorum_writes() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let leader_dir = tempfile::tempdir().unwrap();
+        let config = candidate_config(leader_dir.path());
+        let ((built, took), logs) = capture_logs(|| {
+            runtime.block_on(async {
+                let peers = vec![
+                    peer(DEAD_PEER, closed_port().await),
+                    peer(OTHER_DEAD_PEER, closed_port().await),
+                ];
+                let started = Instant::now();
+                let built = build_leader_phase(
+                    &config,
+                    &range(),
+                    &peers,
+                    roll(),
+                    &MetaFencingEpoch::new(EPOCH),
+                )
+                .await
+                .expect("the build falls through after its deadline");
+                (built, started.elapsed())
+            })
+        });
+        assert!(
+            took >= Duration::from_secs(10),
+            "with no quorum possible the build must still wait its whole deadline before \
+             giving up on the streams; it returned after {took:?}"
+        );
+        let warn = logs
+            .lines()
+            .find(|line| line.contains("no write quorum of replica streams"))
+            .unwrap_or_else(|| {
+                panic!("the deadline passing with no quorum must be a WARN; logs were:\n{logs}")
+            });
+        assert!(warn.contains("\"level\":\"WARN\""), "{warn}");
+        assert!(warn.contains("\"connected\":0"), "{warn}");
+        assert!(warn.contains("\"needed\":1"), "{warn}");
+        assert!(warn.contains(&format!("\"epoch\":{EPOCH}")), "{warn}");
+
+        // The node is serving, and a quorum write is refused, retryably.
+        let broker = Arc::clone(&built.broker);
+        let response = runtime
+            .block_on(tokio::task::spawn_blocking(move || {
+                broker.handle(
+                    Role::Producer,
+                    vtop_protocol::WireFrame {
+                        request_id: 1,
+                        stream_id: 1,
+                        message: vtop_protocol::Message::ProduceRequest(
+                            vtop_protocol::ProduceRequest {
+                                range: range(),
+                                fencing_epoch: EPOCH,
+                                producer_id: Uuid::from_u128(0xB1),
+                                producer_epoch: 1,
+                                first_sequence: 0,
+                                durability: vtop_protocol::Durability::Quorum,
+                                records: vec![vtop_protocol::ProduceRecord {
+                                    timestamp_millis: 1_000,
+                                    key: b"k".to_vec(),
+                                    value: b"v".to_vec(),
+                                }],
+                            },
+                        ),
+                    },
+                )
+            }))
+            .unwrap();
+        match response.message {
+            vtop_protocol::Message::Error(error) => {
+                assert_eq!(error.code, vtop_protocol::ErrorCode::Overloaded, "{error:?}");
+                assert!(error.retryable, "{error:?}");
+                assert!(error.message.contains("quorum not reached"), "{error:?}");
+            }
+            other => panic!("a quorum write with no follower connected was not refused: {other:?}"),
+        }
+        drop(built);
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+}
