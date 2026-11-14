@@ -70,6 +70,9 @@ fn populated() -> String {
     m.file_delete_decisions_total
         .with_label_values(&["no_open_check"])
         .inc();
+    m.kafka_partition_events_total
+        .with_label_values(&["recreated_or_truncated"])
+        .inc();
     m.encode().expect("encode must succeed")
 }
 
@@ -114,6 +117,8 @@ fn expected_labels_are_present() {
         r#"stage="compress""#,
         // #619: why delete_after_commit kept a file, a fixed set.
         r#"vtop_file_delete_decisions_total{outcome="no_open_check"}"#,
+        // #675: what the Kafka source did about a partition-list change.
+        r#"vtop_kafka_partition_events_total{event="recreated_or_truncated"}"#,
     ] {
         assert!(text.contains(l), "missing label {l}");
     }
@@ -153,8 +158,10 @@ fn every_exported_label_is_from_a_bounded_set() {
     // "le" is Prometheus's own histogram bucket label. It is bounded by the
     // bucket list defined in telemetry.rs, not free-form, so it is legitimate.
     // "outcome" is `vtop_file_delete_decisions_total`'s, from a fixed list in
-    // file_source.rs (#619), never the path.
-    const BOUNDED: [&str; 7] = [
+    // file_source.rs (#619), never the path; "event" is
+    // `vtop_kafka_partition_events_total`'s, from a fixed list in
+    // kafka_source.rs (#675), never the topic or partition.
+    const BOUNDED: [&str; 8] = [
         "tenant",
         "source_type",
         "format",
@@ -162,6 +169,7 @@ fn every_exported_label_is_from_a_bounded_set() {
         "stage",
         "le",
         "outcome",
+        "event",
     ];
     let text = populated();
     let mut seen = std::collections::BTreeSet::new();
