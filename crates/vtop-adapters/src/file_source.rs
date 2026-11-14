@@ -127,8 +127,8 @@ fn ctime_of(_md: &std::fs::Metadata) -> Option<(i64, i64)> {
     None
 }
 
-/// A ctime as a marker records it (#619): RFC 3339 with nanoseconds, the
-/// form `mtime` takes. `None` without one.
+/// A ctime as a marker records it (#619): RFC 3339 in UTC, up to nanosecond
+/// precision, the form `mtime` takes. `None` without one.
 fn ctime_text(md: &std::fs::Metadata) -> Option<String> {
     let (secs, nanos) = ctime_of(md)?;
     let at = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, u32::try_from(nanos).ok()?)?;
@@ -7736,6 +7736,42 @@ mod tests {
             fs.notices
         );
         assert!(decisions("metadata_changed") > metadata_changed);
+    }
+
+    /// Review of #713: a marker whose mtime is empty recorded none, so the
+    /// file is kept - nothing proves it unchanged - with the general
+    /// message, not one that says the file's mtime "is not the one the
+    /// archiving batch recorded".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_marker_with_no_mtime_is_kept_without_claiming_one_was_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO)
+            .with_delete_without_open_check(!cfg!(target_os = "linux"));
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let mut end = read[0].progress_end.clone();
+        if let ProgressMarker::File { mtime, .. } = &mut end {
+            mtime.clear();
+        }
+        fs.commit_progress(&end).await.unwrap();
+        assert!(
+            Path::new(&path).exists(),
+            "deleted on a marker that recorded no mtime"
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!("not deleting {path}: its 8 bytes look archived")
+            ) && !notice(&fs, "is not the one the archiving batch recorded"),
+            "{:?}",
+            fs.notices
+        );
     }
 
     /// #619 (C3): a ledger row written before the marker recorded a ctime

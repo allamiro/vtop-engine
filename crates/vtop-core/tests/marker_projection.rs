@@ -26,57 +26,77 @@ fn fingerprint(bytes: &[u8]) -> Option<ContentFingerprint> {
     ContentFingerprint::of(bytes)
 }
 
-/// One marker per variant, every optional field set. The match is
-/// exhaustive, so a new variant fails to compile here until it has a golden.
-fn every_variant() -> Vec<(&'static str, ProgressMarker)> {
-    let all = vec![
-        (
-            "file",
-            ProgressMarker::File {
-                path: "/var/log/app/app.log".into(),
-                inode: Some(4242),
-                start_byte: 100,
-                end_byte: 4196,
-                file_size: 5000,
-                mtime: "2026-11-14T11:15:06.796566426+00:00".into(),
-                content_fingerprint: fingerprint(b"first page"),
-                tail_fingerprint: fingerprint(b"page below the end"),
-                ctime: Some("2026-11-14T11:15:07.000000123+00:00".into()),
-            },
-        ),
-        (
-            "syslog_spool",
-            ProgressMarker::SyslogSpool {
-                spool_id: "edge-1".into(),
-                path: "/var/spool/vtop/edge-1.spool".into(),
-                inode: Some(5151),
-                start_byte: 0,
-                end_byte: 2048,
-                received_time_start: Some("2026-11-14T11:00:00.000000001+00:00".into()),
-                received_time_end: Some("2026-11-14T11:05:00.000000002+00:00".into()),
-                file_size: Some(4096),
-                content_fingerprint: fingerprint(b"spool head"),
-            },
-        ),
-        (
-            "kafka",
-            ProgressMarker::Kafka {
-                topic: "events".into(),
-                partition: 3,
-                start_offset: 1000,
-                end_offset: 1999,
-                consumer_group: "vtop-archive".into(),
-            },
-        ),
-    ];
-    for (_, marker) in &all {
-        match marker {
-            ProgressMarker::File { .. }
-            | ProgressMarker::SyslogSpool { .. }
-            | ProgressMarker::Kafka { .. } => {}
-        }
+/// The golden a variant's projection is held to. Exhaustive: a new variant
+/// does not compile here until it names its golden (and `every_variant`
+/// then has to build one, or `every_variant_has_a_marker` fails).
+fn golden_name(marker: &ProgressMarker) -> &'static str {
+    match marker {
+        ProgressMarker::File { .. } => "file",
+        ProgressMarker::SyslogSpool { .. } => "syslog_spool",
+        ProgressMarker::Kafka { .. } => "kafka",
     }
-    all
+}
+
+/// One marker per variant, every optional field set.
+fn every_variant() -> Vec<(&'static str, ProgressMarker)> {
+    [
+        ProgressMarker::File {
+            path: "/var/log/app/app.log".into(),
+            inode: Some(4242),
+            start_byte: 100,
+            end_byte: 4196,
+            file_size: 5000,
+            mtime: "2026-11-14T11:15:06.796566426+00:00".into(),
+            content_fingerprint: fingerprint(b"first page"),
+            tail_fingerprint: fingerprint(b"page below the end"),
+            ctime: Some("2026-11-14T11:15:07.000000123+00:00".into()),
+        },
+        ProgressMarker::SyslogSpool {
+            spool_id: "edge-1".into(),
+            path: "/var/spool/vtop/edge-1.spool".into(),
+            inode: Some(5151),
+            start_byte: 0,
+            end_byte: 2048,
+            received_time_start: Some("2026-11-14T11:00:00.000000001+00:00".into()),
+            received_time_end: Some("2026-11-14T11:05:00.000000002+00:00".into()),
+            file_size: Some(4096),
+            content_fingerprint: fingerprint(b"spool head"),
+        },
+        ProgressMarker::Kafka {
+            topic: "events".into(),
+            partition: 3,
+            start_offset: 1000,
+            end_offset: 1999,
+            consumer_group: "vtop-archive".into(),
+        },
+    ]
+    .into_iter()
+    .map(|marker| (golden_name(&marker), marker))
+    .collect()
+}
+
+/// Every golden file has a marker built for it: a variant added to
+/// `golden_name` without one in `every_variant` fails here.
+#[test]
+fn every_variant_has_a_marker() {
+    let dir = format!("{}/tests/fixtures/markers", env!("CARGO_MANIFEST_DIR"));
+    let mut goldens: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| {
+            let name = e.unwrap().file_name().to_string_lossy().into_owned();
+            name.strip_suffix("-0.3.json").map(str::to_owned)
+        })
+        .collect();
+    goldens.sort();
+    let mut built: Vec<String> = every_variant()
+        .into_iter()
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    built.sort();
+    assert_eq!(
+        built, goldens,
+        "a golden with no marker built for it, or the reverse"
+    );
 }
 
 #[test]
