@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use VTOP Engine in research, please cite it as below."
+title: "VTOP Engine: Verified Telemetry Object Protocol Engine"
+abstract: >-
+  A replay-safe, manifest-driven engine that moves telemetry from Kafka, files
+  and syslog spools into S3-compatible object storage, and commits source
+  progress only after the stored object has been verified.
+type: software
+authors:
+  - family-names: Suliman
+    given-names: Tamir
+repository-code: "https://github.com/allamiro/vtop-engine"
+url: "https://github.com/allamiro/vtop-engine"
+license: MIT
+version: "0.8.0"
+date-released: "2026-11-12"
+keywords:
+  - telemetry
+  - object storage
+  - verification before commit
+  - replay safety
+  - Kafka
+  - S3

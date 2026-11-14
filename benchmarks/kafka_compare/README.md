@@ -111,6 +111,11 @@ that no run writes. SVG and Markdown must match byte for byte. PNGs must match p
 pixel, not byte for byte: Pillow's macOS and Linux wheels compress identical pixels to different bytes, so a
 PNG whose decoded image is unchanged keeps its committed bytes.
 
+The same job then runs [`../readme_charts.py`](../readme_charts.py), which draws the project README's
+evidence charts (light and dark SVGs under `docs/assets/readme/`) from these runs and from
+`benchmarks/measurements/`, with the same pinned stack, and fails on any difference there too.
+`tests/test_readme_charts.py` fails when the README stops quoting a figure the data gives.
+
 ## Fairness rules applied (#595)
 
 | rule | how |
