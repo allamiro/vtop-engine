@@ -133,6 +133,54 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         .await
         .unwrap();
 
+    // #664: a schema from before the verification class lacks its column.
+    // Startup names every column it reads, so it refuses the schema with the
+    // migrate guidance; `vtopctl migrate` adds the column, and a row verified
+    // before it reads with no class (unknown), as SQLite reads one.
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    let admin = PgStateStore::connect(&migrator_conn).await.unwrap();
+    admin
+        .execute_raw(
+            "TRUNCATE batches; \
+             INSERT INTO batches \
+             (batch_id, tenant, source_type, source_name, format, state, \
+              progress_start_json, progress_end_json, created_at, updated_at) \
+             VALUES ('pre-664','default','kafka','app','cef','batching', \
+              '{\"source_type\":\"kafka\",\"topic\":\"app\",\"partition\":0,\"start_offset\":0,\"end_offset\":1,\"consumer_group\":\"g\"}', \
+              '{\"source_type\":\"kafka\",\"topic\":\"app\",\"partition\":0,\"start_offset\":0,\"end_offset\":1,\"consumer_group\":\"g\"}', \
+              't','t'); \
+             UPDATE batches SET state = 'verified' WHERE batch_id = 'pre-664'; \
+             ALTER TABLE batches DROP COLUMN verification_class;",
+        )
+        .await
+        .unwrap();
+    let err = match PgStateStore::connect(&migrator_conn).await {
+        Ok(_) => panic!("runtime connect must reject a schema without verification_class"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("vtopctl migrate"),
+        "a pre-#664 schema must give migration guidance: {err}"
+    );
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    let admin = PgStateStore::connect(&migrator_conn)
+        .await
+        .expect("migrate adds the verification_class column");
+    let legacy = admin.get_batch("pre-664").await.unwrap().unwrap();
+    assert_eq!(
+        (legacy.state, legacy.verification_class),
+        (vtop_core::state_machine::BatchState::Verified, None),
+        "a row verified before #664 has no class"
+    );
+    // A value this build does not know (a newer release's) reads as unknown,
+    // not as an error and not as either class.
+    admin
+        .execute_raw("UPDATE batches SET verification_class = 'quantum' WHERE batch_id = 'pre-664'")
+        .await
+        .unwrap();
+    let newer = admin.get_batch("pre-664").await.unwrap().unwrap();
+    assert_eq!(newer.verification_class, None);
+
     // Nor is a trigger that exists by name but whose function body has no
     // current schema marker, or one a restore left disabled. The old body is
     // the trigger function as released before #625 (no marker):
@@ -314,6 +362,14 @@ $fn$ LANGUAGE plpgsql;",
         .prune_committed_history("2100-01-01T00:00:00+00:00", 10)
         .await
         .expect_err("the runtime identity must be denied ledger pruning");
+
+    // ---- 2c. #664: the verification class survives a restart ----
+    // A second runtime connection, with no claims of its own, stands for the
+    // engine after a restart. Last of the batteries: it claims every
+    // claimable row.
+    test_battery::verification_class_before_restart(&store).await;
+    let restarted = PgStateStore::connect(&runtime_conn).await.unwrap();
+    test_battery::verification_class_after_restart(&restarted).await;
 
     // ---- 3. Defense in depth: the DB trigger rejects a bypass ----
     // Write straight to the table (skipping update_batch_state's guard) to force

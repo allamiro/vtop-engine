@@ -688,6 +688,40 @@ backend: the restart seed reads the new field out of the stored
   The coverage audit does not use it.
 - An older binary ignores it, as above.
 
+#### Ledger format note: verification class (#664)
+
+A table change, unlike the two notes above: one new column on both backends,
+`verification_class TEXT`, nullable, no default.
+
+- Written with the transition to VERIFIED, in the same statement:
+  `strong` (the stored content matched a digest, by a store-computed
+  checksum or a read-back) or `size_only` (the store confirmed only size and
+  existence, `backend_limited`, accepted under
+  `upload.require_strong_verification: false`). The store refuses a class on
+  any other transition, and every other transition leaves it as it is, so a
+  committed row keeps the class it was verified with. The method within
+  `strong` (store checksum or read-back) is not recorded: the native S3
+  backend falls back from one to the other per object without reporting
+  which ran.
+- Recovery counts a commit of a VERIFIED row, in `commit_recovered` and in
+  the settle pass for a row it held back, by this class, not by its own
+  storage re-check. The re-check still decides whether the row may commit.
+- NULL is unknown: every row verified before #664, and a value this release
+  does not know (a later release's). Both are counted as before, by the
+  re-check. The column has no CHECK, so a later release can add a value
+  without a constraint migration, and an older reader treats it as unknown.
+- SQLite adds the column when it opens the file. PostgreSQL adds it in
+  `vtopctl migrate` (`ADD COLUMN IF NOT EXISTS`); engine startup names it, so
+  an engine of this release refuses a schema without it and asks for the
+  migration. The schema marker stays at 3: see the migration notes in
+  [`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md).
+- The serialized record (a prune digest row) carries `verification_class`
+  only when it is known, so a legacy row serializes as before; a value the
+  reader does not know reads as unknown rather than failing the digest.
+- An older binary ignores the column on both backends: it reads rows by
+  column name, inserts by an explicit column list, and never writes it. A row
+  it verifies has no class, and is counted by the re-check, as it always was.
+
 ---
 
 ## 8. Upload backends

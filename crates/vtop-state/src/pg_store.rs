@@ -26,7 +26,9 @@
 //!
 //! Compiled only with `--features postgres`.
 
-use crate::models::{BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset};
+use crate::models::{
+    BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset, VerificationClass,
+};
 use crate::store::StateStore;
 use async_trait::async_trait;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
@@ -314,7 +316,8 @@ impl PgStateStore {
             "SELECT batch_id, tenant, source_type, source_name, format, state, \
                     progress_start_json, progress_end_json, object_uri, manifest_uri, \
                     object_sha256, manifest_sha256, manifest_version_id, object_size_bytes, record_count, \
-                    error_message, owner, lease_expires_at, created_at, updated_at, claim_gen \
+                    error_message, owner, lease_expires_at, created_at, updated_at, claim_gen, \
+                    verification_class \
              FROM batches WHERE FALSE",
         )
         .fetch_optional(&self.pool)
@@ -460,6 +463,7 @@ impl StateStore for PgStateStore {
         // names recur. A lost claim is not a lost update — retrying cannot
         // help — so it is reported at once. A row this process holds no
         // generation for is refused (see the fence module).
+        crate::store::require_class_only_at_verified(batch_id, to, patch)?;
         let held = self.fence.held(batch_id);
         let mut attempt = 0;
         loop {
@@ -480,7 +484,8 @@ impl StateStore for PgStateStore {
                          object_size_bytes = COALESCE($7, object_size_bytes),
                          record_count = COALESCE($8, record_count),
                          error_message = COALESCE($9, error_message),
-                         updated_at = $10
+                         updated_at = $10,
+                         verification_class = CASE WHEN $14 THEN $15 ELSE verification_class END
                        WHERE batch_id = $11 AND state = $12 AND claim_gen = $13"#,
                 )
                 .bind(validated.as_str())
@@ -496,6 +501,10 @@ impl StateStore for PgStateStore {
                 .bind(batch_id)
                 .bind(expected)
                 .bind(held)
+                // As SQLite: the transition to VERIFIED writes the class it
+                // was given, NULL included (#664).
+                .bind(validated == BatchState::Verified)
+                .bind(patch.verification_class.map(VerificationClass::as_str))
                 .execute(&self.pool)
             })
             .await?
@@ -771,8 +780,16 @@ impl StateStore for PgStateStore {
             .await
     }
 
-    async fn mark_verified(&self, batch_id: &str) -> Result<(), VtopError> {
-        self.update_batch_state(batch_id, BatchState::Verified, &BatchPatch::default())
+    async fn mark_verified(
+        &self,
+        batch_id: &str,
+        class: VerificationClass,
+    ) -> Result<(), VtopError> {
+        let patch = BatchPatch {
+            verification_class: Some(class),
+            ..Default::default()
+        };
+        self.update_batch_state(batch_id, BatchState::Verified, &patch)
             .await
     }
 
@@ -881,6 +898,10 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> Result<BatchRecord, VtopError> {
         manifest_sha256: row.get("manifest_sha256"),
         manifest_version_id: row.get("manifest_version_id"),
         object_size_bytes: row.get("object_size_bytes"),
+        verification_class: VerificationClass::from_stored(
+            row.get::<Option<String>, _>("verification_class")
+                .as_deref(),
+        ),
         record_count: row.get("record_count"),
         error_message: row.get("error_message"),
         owner: row.get("owner"),

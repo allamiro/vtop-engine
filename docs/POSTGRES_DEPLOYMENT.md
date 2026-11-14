@@ -81,7 +81,8 @@ reference keeps credentials out of config serialization and command arguments.
 
 ## Failure behavior
 
-If the table, required columns, or invariant trigger are absent, the
+If the table, required columns (`verification_class` since #664), or
+invariant trigger are absent, the
 trigger is disabled or its function lacks a current schema version marker,
 or the `state_enum` CHECK does not admit every state the engine writes
 (`superseded` since #567), engine startup fails with instructions to run
@@ -117,6 +118,19 @@ migration job per database; engine replicas should start only after it succeeds.
   restart. Upgrade every
   engine on a ledger together, or drain the older ones first. Rolling back
   past this release means restoring a ledger backup taken before the upgrade.
+- **`verification_class` (#664) needs the migration.** The release that
+  records which class of verification a row passed adds a nullable
+  `verification_class` column (`ADD COLUMN IF NOT EXISTS`, no default, no
+  rewrite of existing rows). Engines of that release name the column at
+  startup and refuse a schema without it, asking for `vtopctl migrate`; run
+  it before rolling them out, as above. Older engines keep running on the
+  migrated schema, before and after an upgraded engine has written a class:
+  they never name the column, a row they verify keeps NULL, and NULL is read
+  as unknown and counted as before. The class decides only which counter a
+  recovered commit is counted in, never whether a row commits, so an older
+  engine ignoring it misreads nothing. The schema marker is not bumped (see
+  below). A rollback may keep the column; do not drop it while any engine of
+  that release can reach the database.
 - Changes to the JSON inside ledger rows need no migration step. The content
   fingerprint added to file and spool markers (#578) is such a change: no
   DDL, older rows keep being read and judged as before. See the ledger format
@@ -141,9 +155,16 @@ migration job per database; engine replicas should start only after it succeeds.
   `vtopctl migrate` is run against an upgraded database, its
   `CREATE OR REPLACE` installs the older, unmarked body, and this release's
   engines refuse to start until this release's migration runs again.
-  **Any future change to the trigger, its function, or the schema the
-  migration leaves must bump this marker** in the migration together with
-  `MIN_SCHEMA_VERSION` in `pg_store.rs`.
+  **Any future change to the trigger or its function, or to the schema the
+  migration leaves that an engine could misread or an older release's
+  migration would undo, must bump this marker** in the migration together
+  with `MIN_SCHEMA_VERSION` in `pg_store.rs`. A new nullable column that
+  startup names and older engines never name does not: startup already
+  refuses a schema without it, an older release's migration never drops it,
+  and a higher marker cannot make an older engine refuse anything, since an
+  engine accepts every marker at or above its own minimum. The
+  `verification_class` column (#664) is such a change, and leaves the marker
+  at 3.
 - Restoring the ledger from a backup. Stop every engine first, and **always
   finish with `vtopctl migrate`**. A schema restored from an older archive
   (`pg_restore`, or `--schema-only`) carries that release's trigger

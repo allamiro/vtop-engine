@@ -276,6 +276,7 @@ impl<'a> Pipeline<'a> {
             manifest_sha256: None,
             manifest_version_id: None,
             object_size_bytes: None,
+            verification_class: None,
             record_count: Some(batch.records.len() as i64),
             error_message: None,
             // Ownership (#93): this engine claims the batch at birth, leased so
@@ -904,8 +905,16 @@ impl<'a> Pipeline<'a> {
         } else {
             tracing::info!(batch_id, "verification_passed");
         }
+        // The class goes into the ledger with the transition (#664): a
+        // recovery after a restart counts the commit by it, not by what its
+        // own re-check of the store finds then.
+        let class = if backend_limited {
+            vtop_state::VerificationClass::SizeOnly
+        } else {
+            vtop_state::VerificationClass::Strong
+        };
         let t_write = Instant::now();
-        self.store.mark_verified(&batch_id).await?;
+        self.store.mark_verified(&batch_id, class).await?;
         state_write += t_write.elapsed();
         // Counted only AFTER the store has persisted ManifestUploaded ->
         // Verified. Incrementing first would let a failed state write leave
@@ -1910,8 +1919,10 @@ impl Engine {
                         ])
                         .inc();
                 }
-                // A size-only acceptance at recovery's re-check is counted at
-                // the commit, as `commit_recovered` counts it (#651).
+                // A size-only verification is counted at the commit, as
+                // `commit_recovered` counts it (#651): by the class `rec`,
+                // read again just above, was verified with (#664), and by
+                // recovery's re-check only for a row with none.
                 if let Some(recheck) = row.recheck {
                     verification_mode::count_size_only_commit(recheck, &rec);
                 }
@@ -2999,7 +3010,10 @@ impl Engine {
                     }
                     // Counted at the commit, like verified_total above, not
                     // at the re-check: a held-back row passes the re-check on
-                    // every restart without committing (#629 review).
+                    // every restart without committing (#629 review). By the
+                    // class the row was verified with, as the claim read it
+                    // from the ledger (#664); by the re-check only for a row
+                    // with none.
                     verification_mode::count_size_only_commit(recheck, rec);
                     summary.committed += 1;
                     tracing::info!(batch_id = %rec.batch_id, "recovered: source_committed");
@@ -3787,8 +3801,10 @@ struct Unsettled {
     /// it; a pipeline row's verification is counted already.
     count_verified: bool,
     /// What recovery's storage re-check of the row concluded (#651), for a
-    /// row recovery left: a size-only acceptance is counted when the row
-    /// commits, as `commit_recovered` counts it, never at the hold.
+    /// row recovery left. A size-only verification is counted when the row
+    /// commits, as `commit_recovered` counts it, never at the hold - by the
+    /// class the ledger holds for the row, and by this only for a row with
+    /// none (#664).
     recheck: Option<Recheck>,
 }
 
@@ -5470,9 +5486,13 @@ mod tests {
             self.refuse(LedgerWrite::To(BatchState::Failed))?;
             self.inner.mark_failed(batch_id, message).await
         }
-        async fn mark_verified(&self, batch_id: &str) -> Result<(), VtopError> {
+        async fn mark_verified(
+            &self,
+            batch_id: &str,
+            class: vtop_state::VerificationClass,
+        ) -> Result<(), VtopError> {
             self.refuse(LedgerWrite::To(BatchState::Verified))?;
-            self.inner.mark_verified(batch_id).await
+            self.inner.mark_verified(batch_id, class).await
         }
         async fn mark_source_committed(&self, batch_id: &str) -> Result<(), VtopError> {
             self.refuse(LedgerWrite::To(BatchState::SourceCommitted))?;

@@ -10,7 +10,7 @@
 
 use vtop_core::config::{effective_algorithm, StreamsConfig, VtopConfig};
 use vtop_core::telemetry;
-use vtop_state::BatchRecord;
+use vtop_state::{BatchRecord, VerificationClass};
 use vtop_upload::verification_method;
 
 /// Called once when an engine starts for mutating work (`run`,
@@ -97,11 +97,32 @@ pub(crate) fn recheck_size_only(config: &VtopConfig, rec: &BatchRecord, why: &st
     Recheck::SizeOnly
 }
 
-/// Recovery committed a row whose re-check was size-only: count it in
+/// Whether a commit recovery makes of `rec` counts as a size-only one: by
+/// the class the row was verified with, as the ledger recorded it with the
+/// VERIFIED transition (#664).
+///
+/// The re-check decides only whether the row may commit. Its class can
+/// differ from the verification that admitted the row: a strong row whose
+/// re-check confirms size alone, which the opt-out lets commit, or a
+/// size-only one whose re-check finds a digest. Counting by the re-check
+/// called the first a size-only commit and the second a strong one. A row
+/// with no class (verified by a release before #664, or a class this build
+/// does not know) is counted by the re-check, as before.
+pub(crate) fn counts_as_size_only(rec: &BatchRecord, recheck: Recheck) -> bool {
+    match rec.verification_class {
+        Some(VerificationClass::SizeOnly) => true,
+        Some(VerificationClass::Strong) => false,
+        None => recheck == Recheck::SizeOnly,
+    }
+}
+
+/// Recovery committed a row that was verified size-only (see
+/// [`counts_as_size_only`]): count it in
 /// `vtop_verification_backend_limited_total` with the running engine's labels,
-/// beside the `verified_total` recovery counts for the same commit.
+/// beside the `verified_total` recovery counts for the same commit. `rec`
+/// must be the row as the ledger holds it, class included.
 pub(crate) fn count_size_only_commit(recheck: Recheck, rec: &BatchRecord) {
-    if recheck != Recheck::SizeOnly {
+    if !counts_as_size_only(rec, recheck) {
         return;
     }
     tracing::warn!(

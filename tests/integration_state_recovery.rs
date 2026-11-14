@@ -13,7 +13,7 @@ use vtop_core::config::StreamsConfig;
 use vtop_core::manifest::{ManifestBuilder, VtopManifest};
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::{CompressionType, ProgressMarker, SourceType, TelemetryFormat};
-use vtop_state::{BatchPatch, BatchRecord, SqliteStateStore, StateStore};
+use vtop_state::{BatchPatch, BatchRecord, SqliteStateStore, StateStore, VerificationClass};
 
 #[allow(clippy::too_many_arguments)]
 fn write_recovery_manifest_with_records(
@@ -110,6 +110,7 @@ async fn state_persists_across_reopen() {
         manifest_sha256: None,
         manifest_version_id: None,
         object_size_bytes: None,
+        verification_class: None,
         record_count: Some(10),
         error_message: None,
         owner: None,
@@ -203,6 +204,7 @@ async fn recovery_commits_verified_but_uncommitted_batch() {
         manifest_sha256: Some(manifest.manifest.sha256.clone()),
         manifest_version_id: None,
         object_size_bytes: Some(object_bytes.len() as i64),
+        verification_class: None,
         record_count: Some(4),
         error_message: None,
         owner: None,
@@ -329,6 +331,7 @@ async fn recovery_rejects_same_size_replacement_with_matching_metadata() {
         manifest_sha256: Some(manifest.manifest.sha256.clone()),
         manifest_version_id: None,
         object_size_bytes: Some(expected_bytes.len() as i64),
+        verification_class: None,
         record_count: Some(1),
         error_message: None,
         owner: None,
@@ -465,6 +468,7 @@ async fn recovery_rejects_rehashed_manifest_not_bound_to_ledger() {
         manifest_sha256: Some(original_manifest.manifest.sha256.clone()),
         manifest_version_id: None,
         object_size_bytes: Some(original_bytes.len() as i64),
+        verification_class: None,
         record_count: Some(1),
         error_message: None,
         owner: None,
@@ -572,6 +576,7 @@ async fn recovery_refuses_to_commit_when_storage_no_longer_verifies() {
         manifest_sha256: Some("feedface".into()),
         manifest_version_id: None,
         object_size_bytes: None,
+        verification_class: None,
         record_count: Some(2),
         error_message: None,
         owner: None,
@@ -687,6 +692,7 @@ async fn recovery_rejects_unsigned_manifest_after_mac_cutover() {
         manifest_sha256: Some(unsigned.manifest.sha256.clone()),
         manifest_version_id: None,
         object_size_bytes: Some(14),
+        verification_class: None,
         record_count: Some(1),
         error_message: None,
         owner: None,
@@ -811,6 +817,7 @@ async fn recovery_size_check_rejects_replaced_object_without_checksums() {
         manifest_version_id: None,
         // …but it DID record the uploaded size.
         object_size_bytes: Some(100),
+        verification_class: None,
         record_count: Some(1),
         error_message: None,
         owner: None,
@@ -963,6 +970,7 @@ async fn recovery_resumes_from_the_lowest_incomplete_range_not_the_last_one_visi
                 manifest_sha256: None,
                 manifest_version_id: None,
                 object_size_bytes: None,
+                verification_class: None,
                 record_count: Some(1),
                 error_message: None,
                 owner: None,
@@ -1067,6 +1075,7 @@ async fn recovery_does_not_commit_a_verified_range_above_a_failed_one() {
         manifest_sha256: None,
         manifest_version_id: None,
         object_size_bytes: None,
+        verification_class: None,
         record_count: Some(2),
         error_message: None,
         owner: None,
@@ -1249,6 +1258,7 @@ async fn recovery_commits_a_verified_range_above_a_failed_row_that_a_retry_alrea
         manifest_sha256: None,
         manifest_version_id: None,
         object_size_bytes: None,
+        verification_class: None,
         record_count: Some(2),
         error_message: None,
         owner: None,
@@ -1359,12 +1369,38 @@ async fn recovery_commits_a_verified_range_above_a_failed_row_that_a_retry_alrea
 /// by size alone (checksums disabled, testkit's `require_strong_verification:
 /// false`), with its object and manifest staged in the engine's backend. With
 /// `failed_below`, a FAILED row over `[0,7)` of the same file sits under it,
-/// so recovery must hold `b-629` back (#552).
+/// so recovery must hold `b-629` back (#552). The row has no verification
+/// class, as every release before #664 wrote it.
 async fn size_only_verified_ledger(dir: &Path, tenant: &str, failed_below: bool) -> Engine {
+    let url = format!("sqlite://{}", dir.join("state.db").display());
+    verified_ledger(dir, &url, tenant, StoredBy::SizeOnly, None, failed_below).await
+}
+
+/// What recovery's re-check of `b-629` will find in the store.
+#[derive(Clone, Copy, Debug)]
+enum StoredBy {
+    /// Checksums disabled: the re-check can confirm size only.
+    SizeOnly,
+    /// A SHA-256 the mock backend checks the stored bytes against.
+    Digest,
+}
+
+/// [`size_only_verified_ledger`] on the state store at `url`, with the
+/// re-check finding `stored`, and `b-629` made VERIFIED by `mark_verified`
+/// with `class` - or, for `None`, with no class, as a release before #664
+/// did. The ledger is written through a store that is closed again before
+/// the engine opens it: the engine is the process after a restart.
+async fn verified_ledger(
+    dir: &Path,
+    url: &str,
+    tenant: &str,
+    stored: StoredBy,
+    class: Option<VerificationClass>,
+    failed_below: bool,
+) -> Engine {
     let work = dir.join("work");
     let input = dir.join("in.log");
     std::fs::write(&input, "line-0\nline-1\n").unwrap();
-    let url = format!("sqlite://{}", dir.join("state.db").display());
     let path = input.to_string_lossy().into_owned();
     let range = |start: u64, end: u64| ProgressMarker::File {
         path: path.clone(),
@@ -1378,7 +1414,12 @@ async fn size_only_verified_ledger(dir: &Path, tenant: &str, failed_below: bool)
     };
     let object_uri = "s3://telemetry-data/x/b-629.raw.gz";
     let manifest_uri = "s3://telemetry-data/x/b-629.manifest.json";
-    // Checksums disabled: the only thing the re-check can confirm is size.
+    let object_bytes = b"fourteen-bytes";
+    let digest = vtop_core::checksum::sha256_bytes(object_bytes);
+    let (algorithm, checksum) = match stored {
+        StoredBy::SizeOnly => ("none", ""),
+        StoredBy::Digest => ("sha256", digest.as_str()),
+    };
     let (manifest, manifest_path) = write_recovery_manifest(
         &work,
         "b-629",
@@ -1387,8 +1428,8 @@ async fn size_only_verified_ledger(dir: &Path, tenant: &str, failed_below: bool)
         object_uri,
         manifest_uri,
         14,
-        "none",
-        "",
+        algorithm,
+        checksum,
     );
     let row = |id: &str, start: u64, end: u64, at: &str| BatchRecord {
         batch_id: id.into(),
@@ -1405,6 +1446,7 @@ async fn size_only_verified_ledger(dir: &Path, tenant: &str, failed_below: bool)
         manifest_sha256: None,
         manifest_version_id: None,
         object_size_bytes: None,
+        verification_class: None,
         record_count: Some(1),
         error_message: None,
         owner: None,
@@ -1413,7 +1455,7 @@ async fn size_only_verified_ledger(dir: &Path, tenant: &str, failed_below: bool)
         updated_at: at.into(),
     };
     {
-        let store = SqliteStateStore::connect(&url).await.unwrap();
+        let store = vtop_state::connect_state_store(url).await.unwrap();
         if failed_below {
             store
                 .save_batch_state(&row("b-629-failed", 0, 7, "2026-01-01T00:00:00+00:00"))
@@ -1427,7 +1469,7 @@ async fn size_only_verified_ledger(dir: &Path, tenant: &str, failed_below: bool)
         let mut verified = row("b-629", 7, 14, "2026-01-01T00:00:01+00:00");
         verified.object_uri = Some(object_uri.into());
         verified.manifest_uri = Some(manifest_uri.into());
-        verified.object_sha256 = Some(String::new());
+        verified.object_sha256 = Some(checksum.to_owned());
         verified.manifest_sha256 = Some(manifest.manifest.sha256.clone());
         verified.object_size_bytes = Some(14);
         store.save_batch_state(&verified).await.unwrap();
@@ -1437,38 +1479,190 @@ async fn size_only_verified_ledger(dir: &Path, tenant: &str, failed_below: bool)
             BatchState::Checksummed,
             BatchState::ObjectUploaded,
             BatchState::ManifestUploaded,
-            BatchState::Verified,
         ] {
             store
                 .update_batch_state("b-629", st, &BatchPatch::default())
                 .await
                 .unwrap();
         }
+        match class {
+            Some(class) => store.mark_verified("b-629", class).await.unwrap(),
+            None => store
+                .update_batch_state("b-629", BatchState::Verified, &BatchPatch::default())
+                .await
+                .unwrap(),
+        }
     }
 
     let mut cfg = file_config(
         work.to_str().unwrap(),
-        &url,
+        url,
         vec![path.clone()],
         "mock", // testkit config has require_strong_verification: false
     );
     cfg.engine.tenant = tenant.into();
+    if url.starts_with("postgres") {
+        // The engine takes a PostgreSQL URL only from a secret reference:
+        // the variable the Postgres test reads `url` from.
+        cfg.engine.state_store =
+            vtop_core::config::StateStoreConfig::Env(vtop_core::config::StateStoreEnvRef {
+                env: "VTOP_TEST_POSTGRES".into(),
+            });
+    }
     let engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
         .await
         .unwrap();
     let staged = dir.join("staged");
-    std::fs::write(&staged, b"fourteen-bytes").unwrap();
+    std::fs::write(&staged, object_bytes).unwrap();
+    let (object_checksum, manifest_checksum) = match stored {
+        StoredBy::SizeOnly => (None, None),
+        StoredBy::Digest => (
+            Some(vtop_upload::ObjectChecksum::new("sha256", &digest)),
+            Some(vtop_upload::ObjectChecksum::new(
+                "sha256",
+                &manifest.manifest.sha256,
+            )),
+        ),
+    };
     engine
         .backend
-        .put_object(&staged, object_uri, None)
+        .put_object(&staged, object_uri, object_checksum)
         .await
         .unwrap();
     engine
         .backend
-        .put_manifest(&manifest_path, manifest_uri, None)
+        .put_manifest(&manifest_path, manifest_uri, manifest_checksum)
         .await
         .unwrap();
     engine
+}
+
+/// How much one recovery of `b-629`, from the ledger [`verified_ledger`]
+/// writes, moves the size-only counter of `tenant`. Asserts the recovery
+/// committed it.
+async fn size_only_count_of_recovery(
+    dir: &Path,
+    url: &str,
+    tenant: &str,
+    stored: StoredBy,
+    class: Option<VerificationClass>,
+) -> u64 {
+    let before = size_only_count(tenant);
+    let mut engine = verified_ledger(dir, url, tenant, stored, class, false).await;
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(
+        summary.committed, 1,
+        "recovery commits b-629 (re-check {stored:?}, class {class:?}): {summary:?}"
+    );
+    let row = engine.store.get_batch("b-629").await.unwrap().unwrap();
+    assert_eq!(
+        (row.state, row.verification_class),
+        (BatchState::SourceCommitted, class)
+    );
+    size_only_count(tenant) - before
+}
+
+/// #664: a row verified on size alone before a restart is counted as
+/// size-only when recovery commits it, though recovery's own re-check finds
+/// a digest match. Recovery re-derived the class from that re-check, so the
+/// commit was counted as strong.
+async fn assert_size_only_row_is_counted_size_only(dir: &Path, url: &str, tenant: &str) {
+    let moved = size_only_count_of_recovery(
+        dir,
+        url,
+        tenant,
+        StoredBy::Digest,
+        Some(VerificationClass::SizeOnly),
+    )
+    .await;
+    assert_eq!(
+        moved, 1,
+        "b-629 was verified size-only before the restart, so its recovered commit must \
+         count in vtop_verification_backend_limited_total{{tenant={tenant:?}}} once; it \
+         moved by {moved}"
+    );
+}
+
+/// #664: a row verified strongly is never counted as size-only, though
+/// recovery's re-check can confirm only its size (and the opt-out lets it
+/// commit on that).
+async fn assert_strong_row_is_never_counted_size_only(dir: &Path, url: &str, tenant: &str) {
+    let moved = size_only_count_of_recovery(
+        dir,
+        url,
+        tenant,
+        StoredBy::SizeOnly,
+        Some(VerificationClass::Strong),
+    )
+    .await;
+    assert_eq!(
+        moved, 0,
+        "b-629 was verified strongly before the restart, so its recovered commit must not \
+         count in vtop_verification_backend_limited_total{{tenant={tenant:?}}}; it moved \
+         by {moved}"
+    );
+}
+
+#[tokio::test]
+async fn a_row_verified_size_only_before_a_restart_is_counted_size_only_after_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite://{}", dir.path().join("state.db").display());
+    assert_size_only_row_is_counted_size_only(dir.path(), &url, "tenant-664-size-only").await;
+}
+
+#[tokio::test]
+async fn a_row_verified_strong_is_never_counted_size_only_after_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite://{}", dir.path().join("state.db").display());
+    assert_strong_row_is_never_counted_size_only(dir.path(), &url, "tenant-664-strong").await;
+}
+
+/// #664: a row with no class - verified by a release before it - is counted
+/// as before: by what recovery's re-check finds. Size-only is counted (also
+/// `recovery_counts_a_size_only_acceptance_like_the_running_engine`), a digest
+/// match is not.
+#[tokio::test]
+async fn a_legacy_row_without_a_class_is_counted_by_its_recheck_as_before() {
+    for (stored, expected) in [(StoredBy::SizeOnly, 1), (StoredBy::Digest, 0)] {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let tenant = format!("tenant-664-legacy-{stored:?}");
+        let moved = size_only_count_of_recovery(dir.path(), &url, &tenant, stored, None).await;
+        assert_eq!(
+            moved, expected,
+            "a legacy row whose re-check finds {stored:?} counts {expected} size-only commit(s), \
+             as before #664; it counted {moved}"
+        );
+    }
+}
+
+/// The same two recoveries on a PostgreSQL ledger. Runs when
+/// `VTOP_TEST_POSTGRES` names a migration identity on a throwaway database,
+/// as for the state store's battery (whose tables it truncates: do not run
+/// the two at once), in a build with the `postgres` feature.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn on_postgres_a_recovered_commit_is_counted_by_its_stored_class() {
+    let Ok(url) = std::env::var("VTOP_TEST_POSTGRES") else {
+        eprintln!("VTOP_TEST_POSTGRES not set; skipping the Postgres recovery test");
+        return;
+    };
+    vtop_state::migrate_state_store(&url).await.unwrap();
+    let admin = vtop_state::PgStateStore::connect(&url).await.unwrap();
+    for (scenario, tenant) in [
+        ("size-only", "tenant-664-pg-size-only"),
+        ("strong", "tenant-664-pg-strong"),
+    ] {
+        admin.execute_raw("TRUNCATE batches").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        match scenario {
+            "size-only" => {
+                assert_size_only_row_is_counted_size_only(dir.path(), &url, tenant).await
+            }
+            _ => assert_strong_row_is_never_counted_size_only(dir.path(), &url, tenant).await,
+        }
+    }
+    admin.execute_raw("TRUNCATE batches").await.unwrap();
 }
 
 /// `vtop_verification_backend_limited_total` for one tenant's raw file batches.
@@ -1580,6 +1774,7 @@ fn file_row(id: &str, path: &str, inode: Option<u64>, range: (u64, u64), at: &st
         manifest_sha256: None,
         manifest_version_id: None,
         object_size_bytes: None,
+        verification_class: None,
         record_count: Some(2),
         error_message: None,
         owner: None,
@@ -2180,7 +2375,41 @@ async fn a_held_back_verified_range_is_settled_without_a_restart_and_without_mov
 /// engine's tenant, so the counter below moves for the settle alone.
 #[tokio::test]
 async fn a_held_back_size_only_row_counts_its_size_only_acceptance_when_it_settles() {
-    let row_tenant = "tenant-624-settled-size-only";
+    let moved = held_back_row_settles("tenant-624-settled-size-only", None).await;
+    assert_eq!(moved, 1);
+}
+
+/// #664 on the settle path: a held-back row is counted by the class it was
+/// verified with before the restart, as `commit_recovered` counts one, not
+/// by what recovery's re-check found. Its re-check here can confirm only
+/// size; verified strongly, it is not counted as size-only when it settles.
+#[tokio::test]
+async fn a_held_back_row_verified_strong_is_not_counted_size_only_when_it_settles() {
+    let moved =
+        held_back_row_settles("tenant-664-settled-strong", Some(VerificationClass::Strong)).await;
+    assert_eq!(
+        moved, 0,
+        "b-held was verified strongly; settling it must not count a size-only commit"
+    );
+}
+
+/// And verified size-only, it is.
+#[tokio::test]
+async fn a_held_back_row_verified_size_only_is_counted_size_only_when_it_settles() {
+    let moved = held_back_row_settles(
+        "tenant-664-settled-size-only",
+        Some(VerificationClass::SizeOnly),
+    )
+    .await;
+    assert_eq!(moved, 1);
+}
+
+/// The ledger and passes of the settle tests above: `b-held`, verified with
+/// `class` (`None`: by a release before #664) and re-checked by size alone,
+/// is held back by recovery and settled by the next pass. Asserts nothing is
+/// counted at the hold and nothing after the settle, and returns how far
+/// the settle moved the size-only counter of `row_tenant`.
+async fn held_back_row_settles(row_tenant: &str, class: Option<VerificationClass>) -> u64 {
     let dir = tempfile::tempdir().unwrap();
     let work = dir.path().join("work");
     let input = dir.path().join("in.log");
@@ -2228,6 +2457,7 @@ async fn a_held_back_size_only_row_counts_its_size_only_acceptance_when_it_settl
         manifest_sha256: None,
         manifest_version_id: None,
         object_size_bytes: None,
+        verification_class: None,
         record_count: Some(1),
         error_message: None,
         owner: None,
@@ -2251,12 +2481,18 @@ async fn a_held_back_size_only_row_counts_its_size_only_acceptance_when_it_settl
             BatchState::Checksummed,
             BatchState::ObjectUploaded,
             BatchState::ManifestUploaded,
-            BatchState::Verified,
         ] {
             store
                 .update_batch_state("b-held", st, &BatchPatch::default())
                 .await
                 .unwrap();
+        }
+        match class {
+            Some(class) => store.mark_verified("b-held", class).await.unwrap(),
+            None => store
+                .update_batch_state("b-held", BatchState::Verified, &BatchPatch::default())
+                .await
+                .unwrap(),
         }
     }
 
@@ -2312,14 +2548,15 @@ async fn a_held_back_size_only_row_counts_its_size_only_acceptance_when_it_settl
         BatchState::SourceCommitted,
         "the held-back row settled without a restart"
     );
+    let moved = size_only_count(row_tenant) - before;
+    // And nothing more on a later pass.
+    engine.process_once(SourceType::File).await.unwrap();
     assert_eq!(
         size_only_count(row_tenant) - before,
-        1,
-        "the settled row's size-only acceptance is counted once, at its commit"
+        moved,
+        "a settled row is counted once, at its commit"
     );
-    // And not again.
-    engine.process_once(SourceType::File).await.unwrap();
-    assert_eq!(size_only_count(row_tenant) - before, 1);
+    moved
 }
 
 /// #659 review (Codex P1): a skipped commit must have content evidence.

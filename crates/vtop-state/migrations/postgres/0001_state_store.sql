@@ -41,6 +41,20 @@ ALTER TABLE batches ADD COLUMN IF NOT EXISTS manifest_version_id TEXT;
 -- stalled old engine can still overwrite a new claimant: drain every older
 -- engine before relying on it.
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS claim_gen BIGINT NOT NULL DEFAULT 0;
+-- The class of verification a VERIFIED row passed (#664): 'strong' or
+-- 'size_only', written with the transition to verified. Nullable, no
+-- default, no CHECK: NULL is every row from before it, and a value an engine
+-- does not know (a later release's) reads as unknown, which is decided as a
+-- NULL is, never refused. Engine startup names this column
+-- (PgStateStore::check_schema), so engines of this release refuse a schema
+-- without it and ask for `vtopctl migrate`.
+--
+-- Older engines are unaffected: they read rows by column name, insert by an
+-- explicit column list, and never write it, so a row an older engine
+-- verifies keeps NULL. The class decides only which counter a recovered
+-- commit is counted in; whether the row commits is still decided by the
+-- re-check, in every release. No marker bump: see the marker note below.
+ALTER TABLE batches ADD COLUMN IF NOT EXISTS verification_class TEXT;
 
 -- SUPERSEDED (#567): the terminal state of a handed-back range its source has
 -- since committed past. A table created before it carries the CHECK above
@@ -122,9 +136,15 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
 -- migration leaves, so an older release's migrate - which installs its own
 -- marker-2 body and leaves the CHECK as it found it - is refused. Startup
 -- checks the CHECK itself as well, so a CHECK replaced or restored on its own
--- is refused under a current marker too. ANY change to the trigger, its
--- function, or the schema this migration leaves MUST bump this number and
--- MIN_SCHEMA_VERSION together.
+-- is refused under a current marker too. ANY change to the trigger or its
+-- function, or to the schema this migration leaves that an engine could
+-- misread or an older release's migrate would undo, MUST bump this number and
+-- MIN_SCHEMA_VERSION together. A new nullable column that startup names
+-- (check_schema's column list) and that older engines never name needs no
+-- bump: startup already refuses a schema without it, an older release's
+-- migrate never drops it, and the marker cannot make an older engine refuse
+-- anything - it accepts every marker at or above its own minimum. The
+-- verification_class column (#664) is such a change.
 CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$
 -- vtop-state-schema 3
 BEGIN

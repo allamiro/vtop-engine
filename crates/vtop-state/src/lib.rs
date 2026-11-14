@@ -20,7 +20,9 @@ pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_battery;
 
-pub use models::{BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset};
+pub use models::{
+    BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset, VerificationClass,
+};
 #[cfg(feature = "postgres")]
 pub use pg_store::PgStateStore;
 pub use sqlite_store::SqliteStateStore;
