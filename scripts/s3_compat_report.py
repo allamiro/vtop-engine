@@ -60,7 +60,7 @@ CAPABILITIES = [
     "conditional_put",
 ]
 
-OUTCOMES = {"pass", "fail", "refused", "not_applicable", "unexpected_pass", "unexpected_fail"}
+OUTCOMES = {"pass", "fail", "refused", "not_applicable", "not_run", "unexpected_pass", "unexpected_fail"}
 
 # What a cell says, and its order of precedence (the first that applies wins).
 UNEXPECTED = "**unexpected**"
@@ -134,7 +134,8 @@ def pinned_digest(repo: str, server: str) -> str | None:
 
 def cell(cases: list[dict], cap: str) -> str:
     """One capability's cell, from the cases that named it."""
-    mine = [c for c in cases if cap in c.get("capabilities", [])]
+    # A case the harness could not run (`not_run`, with why) tested nothing.
+    mine = [c for c in cases if cap in c.get("capabilities", []) and c["outcome"] != "not_run"]
     if not mine:
         return NOT_TESTED
     if any(not c.get("expected", True) for c in mine):

@@ -1,0 +1,26 @@
+# AWS S3 itself, reached by the opt-in .github/workflows/s3-aws.yml (#722):
+# virtual-host addressing, verified TLS, and no endpoint override, so the SDK
+# finds the regional endpoint itself. Every capability is unknown until the
+# first run settles it; the workflow's results are what the file is settled
+# from, in a reviewed PR. It never gates a pull request: the workflow runs
+# only on its schedule and by hand.
+id: aws
+name: AWS S3
+gating: false
+sdk_default_endpoint: true
+capabilities:
+  put_get_head: unknown
+  # The workflow runs virtual-host addressing only (decision D12).
+  path_style: not_applicable
+  virtual_host: unknown
+  checksum_sha256_enforced: unknown
+  checksum_sha256_returned: unknown
+  checksum_crc32_default: unknown
+  multipart: unknown
+  multipart_abort: unknown
+  multipart_list_uploads: unknown
+  multipart_resume: unknown
+  versioning: unknown
+  object_lock: unknown
+  object_lock_enforced: unknown
+  conditional_put: unknown

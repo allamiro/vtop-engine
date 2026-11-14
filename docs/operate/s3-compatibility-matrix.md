@@ -64,6 +64,116 @@ by hand:
   name another image digest than the one its compose file pins. A digest
   bump therefore needs a fresh run before it merges cleanly.
 
+## AWS S3 (opt-in)
+
+`.github/workflows/s3-aws.yml` runs the same live tests against AWS S3
+itself, nightly and by hand (`workflow_dispatch`), never on a pull request.
+It uses virtual-host addressing and no endpoint override, runs every test
+twice (`AWS_REQUEST_CHECKSUM_CALCULATION=when_supported`, then
+`when_required`), and uploads its results as the `s3-compat-results-aws`
+artifact. Until the steps below are done it skips, says so in its summary,
+and is green: a skipped run is not a pass, and the compatibility page shows
+AWS as not tested.
+
+There are no access keys anywhere. The job gets short-lived credentials from
+GitHub's OIDC provider, for a role that trusts only this repository's
+`aws-s3-tests` environment.
+
+### What the maintainer sets up
+
+1. **An AWS account for CI tests**, with an AWS Budget alarm (5 USD is
+   plenty; a nightly run is estimated at cents a month, which the first
+   bills should confirm).
+2. **Two buckets**, in the region you choose (`us-east-1` unless you prefer
+   another), each with Block Public Access on and default encryption SSE-S3:
+   - `vtop-ci-plain-<account>-<region>`, with versioning enabled;
+   - `vtop-ci-locked-<account>-<region>`, created **with Object Lock
+     enabled** (it can only be enabled at creation, and it turns versioning
+     on). No default retention: the tests set a few seconds of governance
+     retention per object, so they can delete their own versions once it
+     ends, and the role never needs `s3:BypassGovernanceRetention`.
+
+   On both, a lifecycle rule that expires current versions after 1 day,
+   noncurrent versions after 1 day, removes expired delete markers, and
+   aborts incomplete multipart uploads after 1 day.
+3. **The OIDC provider** for `token.actions.githubusercontent.com` (audience
+   `sts.amazonaws.com`), if the account has none, and **a role** with this
+   trust policy:
+
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [{
+       "Effect": "Allow",
+       "Principal": {"Federated": "arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com"},
+       "Action": "sts:AssumeRoleWithWebIdentity",
+       "Condition": {
+         "StringEquals": {
+           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+           "token.actions.githubusercontent.com:sub": "repo:allamiro/vtop-engine:environment:aws-s3-tests"
+         }
+       }
+     }]
+   }
+   ```
+
+   and this permission policy, on the two buckets only:
+
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Action": [
+           "s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads",
+           "s3:GetBucketLocation", "s3:GetBucketVersioning", "s3:GetBucketObjectLockConfiguration"
+         ],
+         "Resource": [
+           "arn:aws:s3:::vtop-ci-plain-<account>-<region>",
+           "arn:aws:s3:::vtop-ci-locked-<account>-<region>"
+         ]
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "s3:PutObject", "s3:GetObject", "s3:GetObjectVersion",
+           "s3:DeleteObject", "s3:DeleteObjectVersion",
+           "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts",
+           "s3:PutObjectRetention", "s3:GetObjectRetention",
+           "s3:PutObjectLegalHold", "s3:GetObjectLegalHold"
+         ],
+         "Resource": [
+           "arn:aws:s3:::vtop-ci-plain-<account>-<region>/*",
+           "arn:aws:s3:::vtop-ci-locked-<account>-<region>/*"
+         ]
+       }
+     ]
+   }
+   ```
+
+   Deliberately absent: `s3:CreateBucket`, `s3:DeleteBucket`,
+   `s3:PutBucketObjectLockConfiguration`, `s3:PutBucketVersioning`,
+   `s3:BypassGovernanceRetention`, and anything outside the two buckets.
+4. **In the GitHub repository:** create the `aws-s3-tests` environment and
+   restrict it to the `main` branch; then add the repository **variables**
+   `AWS_S3_TEST_ROLE_ARN`, `AWS_S3_TEST_REGION`, `AWS_S3_TEST_BUCKET` (the
+   plain bucket) and `AWS_S3_TEST_LOCKED_BUCKET`. None of them is a
+   credential; the role's trust policy is the boundary. They are variables
+   rather than secrets because the guard that decides whether to run must
+   read them before the job enters the environment.
+5. **Run the workflow once by hand** (Actions, `s3-aws`, Run workflow) and
+   read its first results before relying on the schedule. The
+   `s3-compat-results` workflow takes the newest AWS run's results with the
+   matrix's and opens the pull request that commits them; settle
+   `tests/s3-compat/servers/aws.yaml` from them in a reviewed pull request.
+
+What the AWS run cannot do: the multipart tests that inject faults through
+a local forwarder need a plain-HTTP endpoint, so on AWS they are recorded
+`not_run`, with that reason, and the capability shows as not tested. The
+engine test's clean-up cannot bypass governance retention with this role;
+it leaves those objects to the lifecycle rule, and says so in the log.
+
 ## Run a server yourself
 
 ```bash
@@ -98,4 +208,5 @@ Garage, are acceptable on those terms; the decision is recorded in #722.
   2 to 3 GB of memory. It is a candidate for a later weekly leg, worth it for
   the checksum-trailer failures reported against it.
 - **Hosted stores** other than AWS S3 (Cloudflare R2, Backblaze B2, Wasabi)
-  need long-lived keys, which this matrix does not hold.
+  need long-lived keys, which this matrix does not hold. They could reuse
+  the AWS workflow's shape later.

@@ -1,0 +1,180 @@
+name: s3-aws
+
+# VTOP's live S3 tests against AWS S3 itself (#722), the same binaries and
+# cases the open-source matrix in ci.yml runs, with virtual-host addressing
+# and no endpoint override.
+#
+# OPT-IN AND INERT UNTIL THE MAINTAINER SETS IT UP. It needs an AWS account,
+# two buckets, an IAM role that trusts this repository's `aws-s3-tests`
+# environment through GitHub's OIDC provider, and the repository variables
+# below; docs/operate/s3-compatibility-matrix.md lists every step. Without
+# them the run skips, says so in its summary, and is green.
+#
+# A separate workflow from ci.yml on purpose: it needs `id-token: write`,
+# which ci.yml (run for every pull request) must never hold. It runs only on
+# its schedule and by hand, never on a pull request, so a fork cannot reach
+# it; GitHub disables a fork's scheduled runs, and a fork has no secrets.
+# There are no access keys anywhere: credentials are short-lived, from OIDC.
+on:
+  schedule:
+    # 03:37 UTC nightly. Off the hour, as traffic.yml is: scheduled runs
+    # queue heavily at :00.
+    - cron: "37 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  # Two runs would share the buckets.
+  group: s3-aws
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Says whether the run is configured, and skips cleanly when it is not.
+  # Everything it reads is a repository VARIABLE, not a secret: a role ARN, a
+  # region and two bucket names are not credentials (the role's trust policy,
+  # which admits only this repository's aws-s3-tests environment, is the
+  # boundary), and a guard that ran before the environment could not see the
+  # environment's secrets anyway. It names no environment, so a run on an
+  # unconfigured repository creates none.
+  configured:
+    name: AWS S3 tests configured?
+    if: github.repository == 'allamiro/vtop-engine'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          ROLE_ARN: ${{ vars.AWS_S3_TEST_ROLE_ARN }}
+          REGION: ${{ vars.AWS_S3_TEST_REGION }}
+          PLAIN_BUCKET: ${{ vars.AWS_S3_TEST_BUCKET }}
+          LOCKED_BUCKET: ${{ vars.AWS_S3_TEST_LOCKED_BUCKET }}
+        run: |
+          missing=""
+          for name in ROLE_ARN REGION PLAIN_BUCKET LOCKED_BUCKET; do
+            [ -n "${!name}" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### AWS S3 tests skipped"
+              echo
+              echo "Not configured: the repository variables AWS_S3_TEST_ROLE_ARN, AWS_S3_TEST_REGION,"
+              echo "AWS_S3_TEST_BUCKET and AWS_S3_TEST_LOCKED_BUCKET must all be set (missing:$missing)."
+              echo "Nothing ran against AWS; this is not a pass. The setup is in"
+              echo "docs/operate/s3-compatibility-matrix.md."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  aws:
+    name: live S3 tests (AWS S3)
+    needs: configured
+    if: needs.configured.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: aws-s3-tests
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VTOP_TEST_S3_SERVER: aws
+      VTOP_TEST_S3_PATH_STYLE: "false"
+      VTOP_TEST_S3_VERIFY_TLS: "true"
+      VTOP_TEST_S3_REGION: ${{ vars.AWS_S3_TEST_REGION }}
+      VTOP_TEST_S3_BUCKET: ${{ vars.AWS_S3_TEST_BUCKET }}
+      VTOP_TEST_S3_LOCKED_BUCKET: ${{ vars.AWS_S3_TEST_LOCKED_BUCKET }}
+      VTOP_TEST_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-s3-aws-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+      # Built before credentials are fetched, so the short-lived session is
+      # spent on the tests, not the compile.
+      - name: Build the live test binaries
+        run: |
+          cargo test --locked --no-run -p vtop-upload \
+            --test live_s3_verification --test transport_conformance \
+            --test live_s3_multipart_resume --test live_s3_object_lock
+          cargo test --locked --no-run -p vtop-cli \
+            --test live_s3_object_lock_engine --test live_s3_verification_receipts
+      - name: Assume the test role (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_S3_TEST_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_S3_TEST_REGION }}
+          role-duration-seconds: 3600
+      # Twice (D13): with the SDK's default checksum calculation, whose
+      # results are the server's (results-aws.jsonl, what the report reads),
+      # then with AWS_REQUEST_CHECKSUM_CALCULATION=when_required, a client
+      # setting many deployments use with third-party stores, recorded beside
+      # them (when_required-aws.jsonl).
+      - name: Run the live tests, in both checksum modes
+        run: |
+          set -uo pipefail
+          out="$GITHUB_WORKSPACE/s3-compat-out"
+          mkdir -p "$out"
+          status=0
+          for mode in when_supported when_required; do
+            if [ "$mode" = when_supported ]; then
+              results="$out/results-aws.jsonl"
+            else
+              results="$out/when_required-aws.jsonl"
+            fi
+            echo "::group::AWS_REQUEST_CHECKSUM_CALCULATION=$mode"
+            AWS_REQUEST_CHECKSUM_CALCULATION=$mode VTOP_TEST_S3_RESULTS="$results" \
+              cargo test --locked -p vtop-upload \
+              --test live_s3_verification --test transport_conformance \
+              --test live_s3_multipart_resume --test live_s3_object_lock \
+              -- --ignored --test-threads=1 || status=1
+            AWS_REQUEST_CHECKSUM_CALCULATION=$mode VTOP_TEST_S3_RESULTS="$results" \
+              cargo test --locked -p vtop-cli \
+              --test live_s3_object_lock_engine --test live_s3_verification_receipts \
+              -- --ignored --test-threads=1 || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+
+      - name: Summarise the results
+        if: always()
+        run: |
+          set -euo pipefail
+          for f in "$GITHUB_WORKSPACE"/s3-compat-out/*.jsonl; do
+            [ -s "$f" ] || continue
+            {
+              echo "### $(basename "$f")"
+              echo
+              echo "| case | outcome | expectation | method |"
+              echo "|---|---|---|---|"
+              jq -r '"| \(.case) | \(.outcome) | \(.expectation) | \(.method // "-") |"' "$f"
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      # Named like the matrix's artifacts, so the s3-compat-results
+      # workflow can take it the same way once the maintainer wants AWS in
+      # the committed results.
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: s3-compat-results-aws
+          path: ${{ github.workspace }}/s3-compat-out/
+          if-no-files-found: ignore

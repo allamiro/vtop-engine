@@ -191,17 +191,29 @@ async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
                     until >= before + 86_400 && until <= unix_now() + 86_400 + 1,
                     "{uri} is retained one day from its write: {until}"
                 );
-                // Clean up: the lab's root credentials may bypass governance.
+                // Clean up: the lab's root credentials may bypass
+                // governance; the AWS leg's role deliberately may not (#722:
+                // it holds no s3:BypassGovernanceRetention), and there the
+                // bucket's lifecycle rule removes the version once its
+                // one-day retention ends.
                 let version = head.version_id().unwrap().to_owned();
-                client
+                let deleted = client
                     .delete_object()
                     .bucket(&bucket)
                     .key(&key)
                     .version_id(&version)
                     .bypass_governance_retention(true)
                     .send()
-                    .await
-                    .unwrap_or_else(|e| panic!("cleaning up {uri}: {e:?}"));
+                    .await;
+                if let Err(e) = deleted {
+                    use aws_sdk_s3::error::ProvideErrorMetadata;
+                    let denied =
+                        e.as_service_error().and_then(|se| se.code()) == Some("AccessDenied");
+                    assert!(denied, "cleaning up {uri}: {e:?}");
+                    eprintln!(
+                        "{uri}: governance bypass refused; left for the bucket's lifecycle rule"
+                    );
+                }
             }
         },
     )
