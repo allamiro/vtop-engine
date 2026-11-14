@@ -7,7 +7,12 @@
 //! - against a locked bucket it starts, archives a batch to
 //!   SOURCE_COMMITTED, and the object, the manifest and the verification
 //!   receipt (#671) it wrote are under the configured mode until a date about
-//!   `retain_days` away, read back from the store behind the engine's back.
+//!   `retain_days` away, read back from the store behind the engine's back;
+//! - `vtopctl scrub --check-retention`, with receipts checked, reads the
+//!   batch's and the receipt's retention from the store and finds both
+//!   locked; once the receipt's retention is cleared (by a principal allowed
+//!   to bypass governance), it reports the receipt, and only the receipt,
+//!   as a `missing` retention finding (#710).
 //!
 //! Run against the compose MinIO lab with:
 //! `VTOP_TEST_S3_ENDPOINT=http://localhost:9000 AWS_ACCESS_KEY_ID=minioadmin
@@ -23,6 +28,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use vtop_cli::scrub::{RetentionResult, ScrubOptions};
 use vtop_cli::testkit::file_config;
 use vtop_cli::Engine;
 use vtop_core::config::{ObjectLockConfig, ObjectLockMode, StreamsConfig, VtopConfig};
@@ -162,18 +168,47 @@ async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
                 .unwrap()
                 .unwrap();
 
+            // The scrub reads the retention back through the backend (#710): the
+            // batch's object and manifest, and the receipt at its key.
+            let rows = vtop_cli::scrub::committed_rows(
+                engine.store.list_batches().await.unwrap(),
+                Vec::new(),
+            );
+            let report = engine
+                .scrub(
+                    rows,
+                    &ScrubOptions {
+                        check_retention: Some(ObjectLockMode::Governance),
+                        check_receipts: true,
+                        ..ScrubOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(report.passed, "{report:#?}");
+            let locked = RetentionResult::Locked.as_str();
+            assert_eq!(report.retention.get(locked), Some(&1), "{report:#?}");
+            assert_eq!(
+                report.receipt_retention.get(locked),
+                Some(&1),
+                "{report:#?}"
+            );
+
             let client = s3_client().await;
             let receipt =
                 vtop_core::partitioning::receipt_uri(row.manifest_uri.as_deref().unwrap()).unwrap();
+            let key_of = |uri: &str| {
+                uri.strip_prefix(&format!("s3://{bucket}/"))
+                    .unwrap()
+                    .to_owned()
+            };
+            let mut written = Vec::new();
             for uri in [
                 row.object_uri.clone().unwrap(),
                 row.manifest_uri.clone().unwrap(),
-                receipt,
+                receipt.clone(),
             ] {
-                let key = uri
-                    .strip_prefix(&format!("s3://{bucket}/"))
-                    .unwrap()
-                    .to_owned();
+                let key = key_of(&uri);
                 let head = client
                     .head_object()
                     .bucket(&bucket)
@@ -191,8 +226,53 @@ async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
                     until >= before + 86_400 && until <= unix_now() + 86_400 + 1,
                     "{uri} is retained one day from its write: {until}"
                 );
-                // Clean up: the lab's root credentials may bypass governance.
-                let version = head.version_id().unwrap().to_owned();
+                written.push((uri, key, head.version_id().unwrap().to_owned()));
+            }
+
+            // Clear the receipt's retention, as a principal allowed to bypass
+            // governance can (#710): the scrub reports the receipt, not the batch.
+            client
+                .put_object_retention()
+                .bucket(&bucket)
+                .key(key_of(&receipt))
+                .bypass_governance_retention(true)
+                .retention(aws_sdk_s3::types::ObjectLockRetention::builder().build())
+                .send()
+                .await
+                .expect("the lab's root credentials may clear a governance retention");
+            let rows = vtop_cli::scrub::committed_rows(
+                engine.store.list_batches().await.unwrap(),
+                Vec::new(),
+            );
+            let report = engine
+                .scrub(
+                    rows,
+                    &ScrubOptions {
+                        check_retention: Some(ObjectLockMode::Governance),
+                        check_receipts: true,
+                        ..ScrubOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(!report.passed, "{report:#?}");
+            assert_eq!(report.retention.get(locked), Some(&1), "{report:#?}");
+            assert_eq!(
+                report
+                    .receipt_retention
+                    .get(RetentionResult::Missing.as_str()),
+                Some(&1),
+                "{report:#?}"
+            );
+            assert_eq!(report.findings.len(), 1, "{report:#?}");
+            assert_eq!(
+                report.findings[0].receipt_retention,
+                Some(RetentionResult::Missing),
+                "{report:#?}"
+            );
+
+            // Clean up: the lab's root credentials may bypass governance.
+            for (uri, key, version) in written {
                 client
                     .delete_object()
                     .bucket(&bucket)
