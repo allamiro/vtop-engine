@@ -401,7 +401,7 @@ async fn a_newer_manifest_stays_pending_without_replay_or_commit() {
         sc.engine.store.as_ref(),
         sc.engine.backend.as_ref(),
         sc.manifest_uri,
-        None,
+        &Default::default(),
     )
     .await;
     let Err(err) = report else {
@@ -493,7 +493,7 @@ async fn a_supported_04_batch_recovers_from_a_shared_ledger_without_replay() {
     .await;
     let check = vtop_cli::scrub::check_stored_batch(
         sc.engine.backend.as_ref(),
-        None,
+        &Default::default(),
         &sc.engine
             .store
             .get_batch(sc.batch_id)
@@ -507,7 +507,7 @@ async fn a_supported_04_batch_recovers_from_a_shared_ledger_without_replay() {
         sc.engine.store.as_ref(),
         sc.engine.backend.as_ref(),
         sc.manifest_uri,
-        None,
+        &Default::default(),
     )
     .await
     .unwrap();
@@ -733,13 +733,15 @@ async fn recovery_commits_engine_written_03_and_04_batches_from_one_ledger() {
         .unwrap();
     engine.backend = backend;
     for row in &batches {
-        let check = vtop_cli::scrub::check_stored_batch(engine.backend.as_ref(), None, row).await;
+        let check =
+            vtop_cli::scrub::check_stored_batch(engine.backend.as_ref(), &Default::default(), row)
+                .await;
         assert_eq!(check.result.as_str(), "ok", "{check:?}");
         let report = vtop_cli::commands::verify_manifest_deep(
             engine.store.as_ref(),
             engine.backend.as_ref(),
             row.manifest_uri.as_deref().unwrap(),
-            None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -759,5 +761,280 @@ async fn recovery_commits_engine_written_03_and_04_batches_from_one_ledger() {
                 .state,
             BatchState::SourceCommitted
         );
+    }
+}
+
+/// #685: recovery across a key rotation. Two VERIFIED-but-uncommitted
+/// batches (the source commit failed after VERIFIED, as in a crash), one
+/// signed before the active key was switched (`q3`) and one after (`q4`).
+///
+/// - With the rotated keyring (`q3` verify-only, `q4` active) recovery
+///   re-checks both with the key each names and commits both, no replay.
+/// - With a keyring that no longer holds `q3`, or retired it, the `q3`
+///   batch is unauthenticated: recovery replays it (duplicates, never a gap)
+///   and never commits it, and the `q4` batch still commits.
+#[tokio::test]
+async fn recovery_across_a_key_rotation_commits_old_key_batches_and_replays_unknown_ones() {
+    use std::sync::Arc;
+    use vtop_adapters::base::SourceAdapter;
+    use vtop_adapters::FileSource;
+    use vtop_cli::testkit::{pipeline, FailCommitAdapter};
+    use vtop_core::config::{ManifestKeyConfig, ManifestMacConfig};
+    use vtop_core::manifest::{KeyResult, ManifestWriteVersion};
+
+    fn mac(dir: &Path, active: &str, keys: &[(&str, bool)], retired: &[&str]) -> ManifestMacConfig {
+        ManifestMacConfig {
+            active: active.into(),
+            keys: keys
+                .iter()
+                .map(|(id, legacy)| ManifestKeyConfig {
+                    id: (*id).into(),
+                    env: None,
+                    file: Some(dir.join(id).to_string_lossy().into_owned()),
+                    legacy: *legacy,
+                })
+                .collect(),
+            retired: retired.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    // The operator messages and the per-key counter are part of the
+    // contract: captured for this test's thread only.
+    let logs = Captured::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish(),
+    );
+    let metrics = vtop_core::telemetry::init().expect("metrics registry");
+    let auths = |key: &str, result: &str| {
+        metrics
+            .manifest_authentications_total
+            .with_label_values(&[key, result])
+            .get()
+    };
+
+    let rotated: &[(&str, bool)] = &[("q3", true), ("q4", false)];
+    for (recover_keys, retired, want_q3) in [
+        (rotated, &[][..], None),
+        (&[("q4", false)][..], &[][..], Some(KeyResult::UnknownKey)),
+        (
+            &[("q4", false)][..],
+            &["q3"][..],
+            Some(KeyResult::RetiredKey),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        for (id, hex) in [("q3", "3c".repeat(32)), ("q4", "4d".repeat(32))] {
+            std::fs::write(dir.path().join(id), hex).unwrap();
+        }
+        let work = dir.path().join("work");
+        let url = format!("sqlite://{}", dir.path().join("rotation.db").display());
+        let inputs: Vec<String> = ["before-switch.log", "after-switch.log"]
+            .iter()
+            .map(|name| {
+                let path = dir.path().join(name);
+                let mut f = std::fs::File::create(&path).unwrap();
+                writeln!(f, "{name} line").unwrap();
+                path.to_string_lossy().into_owned()
+            })
+            .collect();
+        let mut cfg = file_config(work.to_str().unwrap(), &url, inputs.clone(), "mock");
+        cfg.manifest.write_version = ManifestWriteVersion::V0_4;
+        let mock = Arc::new(vtop_upload::MockBackend::new());
+        let backend: Arc<dyn vtop_upload::UploadBackend> = mock.clone();
+
+        let mut batches = Vec::new();
+        // The engine's read-back of each stored manifest is counted by the
+        // key that verified it (review of #703).
+        let written_ok = (auths("q3", "ok"), auths("q4", "ok"));
+        {
+            let store = SqliteStateStore::connect(&url).await.unwrap();
+            for (input, active) in inputs.iter().zip(["q3", "q4"]) {
+                cfg.manifest.mac = Some(mac(dir.path(), active, rotated, &[]));
+                cfg.validate().unwrap();
+                let inner = FileSource::new(vec![input.clone()], TelemetryFormat::Raw, false);
+                let mut adapter = FailCommitAdapter::new(inner, 1);
+                let source = adapter.discover_sources().await.unwrap().pop().unwrap();
+                let read = adapter
+                    .read_batch_candidates(&source, 1000, 1 << 20, std::time::Duration::ZERO)
+                    .await
+                    .unwrap()
+                    .remove(0);
+                let outcome = pipeline(&store, backend.clone(), &cfg)
+                    .process(&mut adapter, &source, read, None)
+                    .await
+                    .unwrap();
+                assert_eq!(outcome.final_state, BatchState::Verified, "{active}");
+                batches.push(store.get_batch(&outcome.batch_id).await.unwrap().unwrap());
+            }
+        }
+
+        assert!(auths("q3", "ok") > written_ok.0 && auths("q4", "ok") > written_ok.1);
+        cfg.manifest.mac = Some(mac(dir.path(), "q4", recover_keys, retired));
+        let mut engine = Engine::new(cfg.clone(), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        engine.backend = backend.clone();
+        let keyring = cfg.resolve_manifest_keyring().unwrap();
+        let q3_check =
+            vtop_cli::scrub::check_stored_batch(engine.backend.as_ref(), &keyring, &batches[0])
+                .await;
+        let (other_before, retired_before) =
+            (auths("other", "unknown_key"), auths("q3", "retired_key"));
+        let summary = engine.recover().await.unwrap();
+        let about_q3 = logs.about(&batches[0].batch_id);
+        let state = |i: usize| {
+            let store = &engine.store;
+            let id = batches[i].batch_id.clone();
+            async move { store.get_batch(&id).await.unwrap().unwrap().state }
+        };
+        assert_eq!(
+            state(1).await,
+            BatchState::SourceCommitted,
+            "the q4 batch commits"
+        );
+        match want_q3 {
+            None => {
+                assert_eq!(q3_check.result.as_str(), "ok", "{q3_check:?}");
+                assert_eq!(q3_check.key.as_ref().unwrap().key_id, "q3");
+                let report = vtop_cli::commands::verify_manifest_deep(
+                    engine.store.as_ref(),
+                    engine.backend.as_ref(),
+                    batches[1].manifest_uri.as_deref().unwrap(),
+                    &keyring,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    report
+                        .lines
+                        .iter()
+                        .any(|l| l.ends_with("OK (keyed BLAKE3, key id q4)")),
+                    "{:?}",
+                    report.lines
+                );
+                assert_eq!(summary.committed, 2, "{summary:?}");
+                assert_eq!(summary.replay_required, 0, "{summary:?}");
+                assert_eq!(state(0).await, BatchState::SourceCommitted);
+            }
+            Some(result) => {
+                assert_eq!(q3_check.result.as_str(), "unauthenticated", "{q3_check:?}");
+                let key = q3_check.key.clone().unwrap();
+                assert_eq!(key.result, result);
+                assert_eq!(
+                    key.key_id,
+                    if result == KeyResult::RetiredKey {
+                        "q3"
+                    } else {
+                        "other"
+                    }
+                );
+                assert!(
+                    q3_check.detail.contains("key id \"q3\""),
+                    "{}",
+                    q3_check.detail
+                );
+                // `verify-manifest` says the same, naming the key.
+                let report = vtop_cli::commands::verify_manifest_deep(
+                    engine.store.as_ref(),
+                    engine.backend.as_ref(),
+                    batches[0].manifest_uri.as_deref().unwrap(),
+                    &keyring,
+                )
+                .await
+                .unwrap();
+                assert!(!report.passed);
+                let line = report
+                    .lines
+                    .iter()
+                    .find(|l| l.starts_with("authentication"))
+                    .unwrap();
+                assert!(
+                    line.contains("FAILED (manifest is unauthenticated: it names key id \"q3\""),
+                    "{line}"
+                );
+                assert_eq!(summary.committed, 1, "{summary:?}");
+                assert_eq!(summary.replay_required, 1, "{summary:?}");
+                assert_eq!(
+                    state(0).await,
+                    BatchState::ReplayRequired,
+                    "an unauthenticated batch is replayed, never committed"
+                );
+                // What happened, what the engine did, what to do: named by
+                // the key's bounded label, never as damage.
+                let (level, label, needles): (&str, &str, &[&str]) =
+                    if result == KeyResult::RetiredKey {
+                        (
+                            "WARN",
+                            "q3",
+                            &[
+                                "signed with a retired key",
+                                "replayed instead of committed",
+                                "withdrawn",
+                            ],
+                        )
+                    } else {
+                        (
+                            "ERROR",
+                            "other",
+                            &[
+                                "signed with a key this engine does not hold",
+                                "unauthenticated (not corrupt)",
+                                "replayed instead of committed",
+                                "Add the key to manifest.mac.keys as a verify-only entry",
+                            ],
+                        )
+                    };
+                let line = about_q3
+                    .iter()
+                    .find(|l| l.contains(&format!(r#""level":"{level}""#)) && l.contains("key_id"))
+                    .unwrap_or_else(|| panic!("no {level} naming the key: {about_q3:#?}"));
+                assert!(line.contains(&format!(r#""key_id":"{label}""#)), "{line}");
+                for needle in needles {
+                    assert!(line.contains(needle), "{needle}: {line}");
+                }
+                assert!(!line.contains(&"3c".repeat(32)), "{line}");
+                if result == KeyResult::RetiredKey {
+                    assert!(auths("q3", "retired_key") > retired_before);
+                } else {
+                    assert!(auths("other", "unknown_key") > other_before);
+                }
+            }
+        }
+    }
+}
+
+/// Log lines this test's thread writes, as JSON.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Captured {
+    fn about(&self, id: &str) -> Vec<String> {
+        let field = format!(r#""batch_id":"{id}""#);
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .lines()
+            .filter(|line| line.contains(&field))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
     }
 }

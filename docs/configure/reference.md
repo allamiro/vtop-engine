@@ -27,7 +27,7 @@ Default column means the key is unset unless you set it.
 | `batching` | **Required** (may be `{}`) | When a batch is sealed, and how many are verified at once. |
 | `compression` | **Required** (may be `{}`) | Codec for sealed batches. |
 | `checksum` | `algorithm: sha256` | Global object checksum. |
-| `manifest_mac_key_env` | - | Name of an environment variable holding the manifest MAC key. |
+| `manifest_mac_key_env` | - | Name of an environment variable holding the manifest MAC key: one key, with no key id. For several keys, use [`manifest.mac`](#manifestmac). |
 | `manifest` | `{}` | How manifests are written; see [`manifest`](#manifest). |
 | `sources` | **Required** (may be `{}`) | Kafka, file and syslog spool sources. |
 | `upload` | **Required** | Object storage target and upload limits. |
@@ -90,14 +90,17 @@ The **name** of an environment variable whose value is a 32-byte key in 64 hex
 characters. When set, every manifest carries a keyed BLAKE3 MAC, and a missing
 or invalid MAC fails verification and recovery. A configured but missing or
 malformed key is a startup error. Unsigned manifests written before the
-cutover are rejected, so verify any backlog first. Key rotation is not
-implemented. See [Security model §8](../SECURITY_MODEL.md#8-manifest-authentication).
+cutover are rejected, so verify any backlog first. This key writes no key id;
+to rotate it, move to [`manifest.mac`](#manifestmac), listing it there with
+`legacy: true`. Setting both is refused. See
+[Security model §8](../SECURITY_MODEL.md#8-manifest-authentication).
 
 ## `manifest`
 
 | Key | Default | Meaning |
 |---|---|---|
 | `write_version` | `"0.3"` | The manifest version new batches get: `"0.3"` or `"0.4"`, quoted. Anything else, an unquoted number included, fails config load. `"0.4"` adds `verification_plan` (the configured verification method and `require_strong`) and is hashed over the stored document. |
+| `mac` | - | The manifest MAC keyring: several keys by id, one signing. Needs `write_version: "0.4"`. See [`manifest.mac`](#manifestmac). |
 
 Set `"0.4"` only once every engine, `vtopctl scrub` and auditor that reads the
 archive runs v0.8.0 or later: v0.7.0 and earlier report `0.4` manifests as
@@ -107,6 +110,54 @@ a misspelled key inside it, so check the startup line or
 `validate --print-effective`. Setting `"0.3"` again goes back; `0.4`
 manifests already written stay readable. See the protocol draft,
 [§11.2](../VTOP_PROTOCOL_DRAFT.md#112-field-reference).
+
+### `manifest.mac`
+
+Several manifest MAC keys, each with an id, so the key can be rotated (#685).
+The active key signs new manifests and its id is written in
+`manifest.mac_key_id`; every key verifies the manifests that name it. The
+procedure is [Rotate the manifest MAC key](../operate/manifest-key-rotation.md).
+
+```yaml
+manifest:
+  write_version: "0.4"
+  mac:
+    active: q4-2026
+    keys:
+      - {id: q3-2026, env: VTOP_MANIFEST_MAC_Q3, legacy: true}
+      - {id: q4-2026, file: /run/secrets/vtop-manifest-mac-q4}
+    retired: [q1-2026]
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `active` | required | The id of the key that signs new manifests. It must be one of `keys`, not a retired id. |
+| `keys` | required | Every key that verifies, the active one included. Each entry has `id`, one of `env` or `file`, and optionally `legacy`. |
+| `keys[].id` | required | 1 to 64 characters from `[A-Za-z0-9._-]`, unique across `keys` and `retired`. `none` and `other` are reserved (they are metric labels). The id appears in manifests, messages and the per-key metrics, so it is a label, never a secret. |
+| `keys[].env` | - | Name of the environment variable holding the key, 64 hex characters. |
+| `keys[].file` | - | Path of a file holding the key, such as a mounted secret. Read once at startup, at most 4 KiB, trimmed. Its permissions are not checked: mount it readable by the engine's user only. |
+| `keys[].legacy` | `false` | This key verifies manifests that name no key id: every manifest written before key ids, and any written with `manifest_mac_key_env`. At most one key. |
+| `retired` | `[]` | Tombstoned ids, for a key that was withdrawn or compromised. A manifest naming one fails authentication as "retired". No key material is configured for them. A key rotated out in the normal way is not retired: it stays in `keys` as a verify-only entry. |
+
+Rules checked when the config loads, each refused with a message naming the
+key:
+
+- `write_version` must be `"0.4"`: a key id can only be recorded in a version
+  0.4 manifest, because a 0.3 reader drops fields it does not know and would
+  report the manifest as tampered.
+- `manifest.mac` and `manifest_mac_key_env` cannot both be set.
+- Ids are well formed and unique, `active` names a key, at most one key is
+  `legacy`, and each key sets exactly one of `env` and `file`.
+- Unknown keys inside `manifest.mac` are refused, unlike most of the config:
+  a misspelt `retired` would otherwise leave a withdrawn key authenticating.
+  A later release's new key here is therefore refused by this one.
+
+At startup, a key that is missing or not 64 hex characters stops the engine,
+naming the key id and the variable or file, never the value. The startup log
+and `validate --print-effective` show the keyring by id and source kind
+(`env` or `file`), never a value, a variable name or a path. Engines before
+the keyring release ignore the whole section; see the rotation page for why
+every reader must be upgraded first.
 
 ## `sources`
 

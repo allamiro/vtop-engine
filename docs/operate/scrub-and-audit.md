@@ -70,9 +70,16 @@ Each batch gets one result:
 | `limited` | Present at its size, no digest compared (size-only verification). | No |
 | `missing` | The object, the pinned manifest version or the manifest's current key is gone. | Yes |
 | `mismatched` | Something is stored, and it is not what was committed. | Yes |
-| `unauthenticated` | The manifest does not parse, fails its self-hash or MAC, or does not bind to the ledger row. | Yes |
+| `unauthenticated` | The manifest does not parse, fails its self-hash or MAC, or does not bind to the ledger row. Also a manifest signed with a key this config does not hold, or a retired one: the detail names the key id ([key rotation](manifest-key-rotation.md#what-the-messages-mean)). | Yes |
 | `unreadable` | The store answered with an error other than absence. Nothing was proven. | Yes |
 | `unsupported_version` | The manifest is from a newer release than this binary reads. Upgrade the scrub's binary and run it again. | Yes |
+
+With a manifest key configured, the report also counts the manifests that
+authenticated by the key that verified them (`manifests authenticated by
+key: q3-2026=4 q4-2026=2`, and `vtop_scrub_manifest_keys_total{key_id}` in
+the metrics file). After a key rotation, that line is how you confirm every
+key the archive was signed with still verifies; see
+[Rotate the manifest MAC key](manifest-key-rotation.md).
 
 ## Schedule them
 

@@ -60,3 +60,25 @@ verifies them from their stored bytes; they also seed the fuzz corpus
 (`v04-release-b-*.seed`). The released v0.8.0 `vtopctl verify-manifest`
 passed the signed one in its localfs archive, and the released v0.7.0 one
 reported its self-hash and MAC as failed, which is the documented cutoff.
+
+## Key ids (`keyring-0.4-q3.json`, `keyring-0.4-q4.json`)
+
+The first manifests that name their MAC key (#685), written by the keyring
+release's `vtopctl process-once` built from this branch: the localfs
+backend, no compression, SHA-256, `manifest: {write_version: "0.4"}` and a
+keyring of two key files, `q3` (`11` x 32, legacy, the key every earlier
+signed fixture uses) and `q4` (`22` x 32). One run had `active: q3` and the
+input `keyring q3 0.4 manifest fixture\n`, the other `active: q4` and
+`keyring q4 0.4 manifest fixture\n`. Each records `manifest.mac_key_id`, and
+this build's `verify-manifest` passed both, naming the key.
+
+The released v0.8.0 `vtopctl verify-manifest` (asset SHA-256 as above),
+configured with `manifest_mac_key_env` holding the `q3` key, passed the `q3`
+manifest (self-hash OK: it authenticates `mac_key_id` as an unknown field)
+and reported the `q4` one as "MAC missing or invalid". That is the reader
+gate of the rotation procedure: every reader must run the keyring release
+before the active key changes.
+
+`crates/vtop-core/tests/manifest_keyring.rs` verifies both under their ids
+and refuses `q3` under a keyring that does not hold it; they also seed the
+fuzz corpus (`v04-keyring-*.seed`).

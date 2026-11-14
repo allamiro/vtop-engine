@@ -11,6 +11,12 @@ use crate::types::{CompressionType, ProgressMarker, SourceType, TelemetryFormat}
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod keyring;
+pub use keyring::{
+    Authentication, KeyOutcome, KeyResult, KeySourceKind, KeyringKey, ManifestKeyring,
+    KEY_LABEL_NONE, KEY_LABEL_OTHER,
+};
+
 /// Protocol identifier embedded in every manifest.
 pub const VTOP_PROTOCOL: &str = "VTOP";
 /// Manifest schema version.
@@ -226,6 +232,16 @@ pub struct ManifestMetadata {
     /// is configured, verification requires this field to exist and match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
+    /// The id of the key that made `mac` (#685). Version 0.4 only, for the
+    /// same reason as `verification_plan`: a 0.1-0.3 reader re-encodes the
+    /// decoded struct before hashing, so it would drop the field and report
+    /// the manifest as tampered. Never decoded with the struct: in a legacy
+    /// document the key is unknown and ignored, so such a manifest is
+    /// verified with the legacy key, as v0.8.0 verifies it, and
+    /// [`ParsedManifest`] fills it for 0.4 only. In 0.4 it is not blanked
+    /// for the hash, so the hash and the MAC both cover it.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub mac_key_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +379,18 @@ impl ParsedManifest {
                     .get("verification_plan")
                     .map(VerificationPlan::deserialize)
                     .transpose()?;
+                // Defined in 0.4 too (#685). Any string is accepted here:
+                // an id the keyring does not hold is an authentication
+                // outcome (unknown key), not a malformed document.
+                decoded.manifest.mac_key_id = value
+                    .get("manifest")
+                    .and_then(|m| m.get("mac_key_id"))
+                    .map(|id| {
+                        id.as_str().map(str::to_owned).ok_or_else(|| {
+                            VtopError::Manifest("manifest.mac_key_id must be a string".into())
+                        })
+                    })
+                    .transpose()?;
                 let auth_bytes = canonical_auth_bytes(value)?;
                 Ok(Self {
                     decoded,
@@ -383,9 +411,24 @@ impl ParsedManifest {
         check_self_hash(&self.decoded, &self.auth_bytes)
     }
 
+    /// [`ParsedManifest::authenticate`] with one key that has no id (or
+    /// none): the `manifest_mac_key_env` behaviour.
     pub fn verify_authentication(&self, mac_key: Option<&ManifestMacKey>) -> Result<(), VtopError> {
-        self.verify_self_hash()?;
-        check_mac(&self.decoded, &self.auth_bytes, mac_key)
+        self.authenticate(&ManifestKeyring::from_key(mac_key))
+            .into_result()
+    }
+
+    /// Verify the self-hash, then the MAC with the key the manifest names
+    /// (#685), or the legacy key when it names none. The outcome says which
+    /// key was used, for the caller to count ([`Authentication::count`]).
+    pub fn authenticate(&self, keyring: &ManifestKeyring) -> Authentication {
+        if let Err(e) = self.verify_self_hash() {
+            return Authentication {
+                key: None,
+                result: Err(e),
+            };
+        }
+        keyring.check(&self.decoded, &self.auth_bytes)
     }
 }
 
@@ -616,43 +659,6 @@ fn check_self_hash(manifest: &VtopManifest, bytes: &[u8]) -> Result<(), VtopErro
     }
 }
 
-fn check_mac(
-    manifest: &VtopManifest,
-    bytes: &[u8],
-    mac_key: Option<&ManifestMacKey>,
-) -> Result<(), VtopError> {
-    let Some(key) = mac_key else {
-        return Ok(());
-    };
-    let actual_hex = manifest.manifest.mac.as_deref().ok_or_else(|| {
-        VtopError::Manifest(
-            "manifest MAC is required because manifest_mac_key_env is configured".into(),
-        )
-    })?;
-    let actual = hex::decode(actual_hex)
-        .map_err(|_| VtopError::Manifest("manifest MAC is not valid hex".into()))?;
-    if actual.len() != 32 {
-        return Err(VtopError::Manifest(
-            "manifest MAC must be exactly 32 bytes".into(),
-        ));
-    }
-    let expected = key.authenticate(bytes);
-    // Compare without an early exit so a remote verification path does not
-    // leak how many prefix bytes were correct.
-    let mismatch = expected
-        .as_bytes()
-        .iter()
-        .zip(actual.iter())
-        .fold(0_u8, |acc, (left, right)| acc | (left ^ right));
-    if mismatch == 0 {
-        Ok(())
-    } else {
-        Err(VtopError::Manifest(
-            "manifest MAC verification failed".into(),
-        ))
-    }
-}
-
 /// Inputs needed to assemble a manifest.
 pub struct ManifestBuilder {
     pub batch_id: String,
@@ -714,6 +720,39 @@ impl ManifestBuilder {
         format: ManifestFormat,
         mac_key: Option<&ManifestMacKey>,
     ) -> Result<WrittenManifest, VtopError> {
+        self.build_written_with(format, mac_key, None)
+    }
+
+    /// Build the manifest `format` names, signed with the keyring's active
+    /// key (#685). A version 0.4 manifest records that key's id in
+    /// `manifest.mac_key_id`; the `manifest_mac_key_env` key has none and
+    /// writes none. An id cannot be recorded in version 0.3 (a 0.3 reader
+    /// would drop it and report tampering), so that combination is refused;
+    /// config load refuses it first.
+    pub fn build_signed(
+        self,
+        format: ManifestFormat,
+        keyring: &ManifestKeyring,
+    ) -> Result<WrittenManifest, VtopError> {
+        let (key, key_id) = match keyring.signing_key() {
+            Some((key, id)) => (Some(key), id),
+            None => (None, None),
+        };
+        if let (ManifestFormat::V0_3, Some(id)) = (&format, key_id) {
+            return Err(VtopError::Manifest(format!(
+                "key id {id:?} can only be recorded in a version {VTOP_VERSION_04} manifest; \
+                 manifest.mac needs manifest.write_version: \"{VTOP_VERSION_04}\""
+            )));
+        }
+        self.build_written_with(format, key, key_id)
+    }
+
+    fn build_written_with(
+        self,
+        format: ManifestFormat,
+        mac_key: Option<&ManifestMacKey>,
+        mac_key_id: Option<&str>,
+    ) -> Result<WrittenManifest, VtopError> {
         let manifest = match format {
             ManifestFormat::V0_3 => {
                 let manifest = self.build_with_mac(mac_key)?;
@@ -723,6 +762,8 @@ impl ManifestBuilder {
             ManifestFormat::V0_4 { plan } => self.assemble(VTOP_VERSION_04, Some(plan), mac_key),
         };
         let mut manifest = manifest;
+        // Before the hash: the id is covered by both the hash and the MAC.
+        manifest.manifest.mac_key_id = mac_key.and(mac_key_id).map(str::to_owned);
         let auth = canonical_auth_bytes(serde_json::to_value(&manifest)?)?;
         manifest.manifest.sha256 = sha256_bytes(&auth);
         if let Some(key) = mac_key {
@@ -769,6 +810,7 @@ impl ManifestBuilder {
                 // Presence is authenticated too: signed manifests canonicalize
                 // this to an empty string, while unsigned manifests omit it.
                 mac: mac_key.map(|_| String::new()),
+                mac_key_id: None,
             },
             partitioning: PartitionMetadata {
                 path_template: self.path_template,
@@ -811,6 +853,17 @@ impl WrittenManifest {
         ParsedManifest::from_slice(&self.bytes)?.verify_authentication(mac_key)
     }
 
+    /// [`WrittenManifest::verify_authentication`] against a keyring (#685).
+    pub fn authenticate(&self, keyring: &ManifestKeyring) -> Authentication {
+        match ParsedManifest::from_slice(&self.bytes) {
+            Ok(parsed) => parsed.authenticate(keyring),
+            Err(e) => Authentication {
+                key: None,
+                result: Err(e),
+            },
+        }
+    }
+
     /// Persist the bytes to `work_dir` as `<batch_id>.manifest.json`,
     /// returning the local path.
     pub fn write_to_file(&self, work_dir: &Path) -> Result<PathBuf, VtopError> {
@@ -848,6 +901,14 @@ impl VtopManifest {
                 self.version
             )));
         }
+        if self.manifest.mac_key_id.is_some() {
+            // Nor this one (#685): a legacy reader would drop it.
+            return Err(VtopError::Manifest(format!(
+                "manifest.mac_key_id is a version {VTOP_VERSION_04} field; a version {} manifest \
+                 cannot carry it",
+                self.version
+            )));
+        }
         Ok(serde_json::to_vec_pretty(self)?)
     }
 
@@ -859,6 +920,7 @@ impl VtopManifest {
         // Never covered by the legacy scheme: v0.8.0 and earlier do not know
         // the field and drop it before hashing.
         clone.verification_plan = None;
+        clone.manifest.mac_key_id = None;
         clone.manifest.sha256 = String::new();
         if clone.manifest.mac.is_some() {
             clone.manifest.mac = Some(String::new());
@@ -893,9 +955,19 @@ impl VtopManifest {
     /// enabling authentication rather than silently grandfathering it forever.
     pub fn verify_authentication(&self, mac_key: Option<&ManifestMacKey>) -> Result<(), VtopError> {
         self.require_legacy_scheme()?;
+        if self.manifest.mac_key_id.is_some() {
+            // No legacy hash covers it, so it may not choose the key.
+            return Err(VtopError::Manifest(format!(
+                "manifest.mac_key_id is a version {VTOP_VERSION_04} field; a version {} manifest \
+                 cannot carry it",
+                self.version
+            )));
+        }
         let bytes = self.legacy_auth_bytes()?;
         check_self_hash(self, &bytes)?;
-        check_mac(self, &bytes, mac_key)
+        ManifestKeyring::from_key(mac_key)
+            .check(self, &bytes)
+            .into_result()
     }
 
     fn require_legacy_scheme(&self) -> Result<(), VtopError> {

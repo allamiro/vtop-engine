@@ -166,7 +166,7 @@ pub fn pipeline<'a>(
         store,
         backend,
         config,
-        manifest_mac_key: config.resolve_manifest_mac_key().unwrap(),
+        manifest_keyring: Arc::new(config.resolve_manifest_keyring().unwrap()),
         versioned_buckets: std::sync::Arc::default(),
         provisioned_buckets: std::sync::Arc::default(),
         key_notices: std::sync::Arc::default(),

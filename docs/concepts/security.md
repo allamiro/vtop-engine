@@ -32,8 +32,11 @@ Where it is configured: [Config basics](../configure/basics.md#secrets).
   copy before the source is committed. Size-only checking is an explicit
   opt-out that the engine announces at startup.
 - Each manifest carries a self-hash, and optionally a keyed BLAKE3 MAC
-  (`manifest_mac_key_env`) so a party who can write to the bucket cannot
-  forge one.
+  (`manifest_mac_key_env`, or a keyring in `manifest.mac`) so a party who can
+  write to the bucket cannot forge one. With a keyring, a version 0.4
+  manifest names the key that signed it, so the key can be
+  [rotated](../operate/manifest-key-rotation.md) without re-signing the
+  archive.
 - With `upload.require_object_versioning`, manifests are pinned by version,
   so overwriting a manifest cannot roll a batch back.
 - `vtopctl scrub` re-verifies committed objects later.
@@ -55,8 +58,8 @@ Operated in [Scrub and coverage audit](../operate/scrub-and-audit.md).
 ## Not provided by VTOP
 
 Encryption at rest (use the store's), object lock retention (bucket policy),
-access control between tenants (storage IAM), and manifest MAC key rotation
-(not implemented). See the
+access control between tenants (storage IAM), and public-key manifest
+signatures (not implemented: a MAC key is a shared secret). See the
 [security model §14](../SECURITY_MODEL.md#14-security-properties-provided-vs-not-provided).
 
 ## Releases

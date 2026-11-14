@@ -378,14 +378,22 @@ pub fn effective_streams(config: &VtopConfig, streams: Option<&StreamsConfig>) -
                 value: config.upload.require_strong_verification,
                 origin: global("upload.require_strong_verification"),
             },
-            manifest_mac: EffectiveSetting {
-                value: if config.manifest_mac_key_env.is_some() {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-                .into(),
-                origin: global("manifest_mac_key_env"),
+            // The keyring (#685) by id and source kind only; the shorthand
+            // and no key print as they always have.
+            manifest_mac: match &config.manifest.mac {
+                Some(mac) => EffectiveSetting {
+                    value: format!("keyring: {}", mac.describe()),
+                    origin: global("manifest.mac"),
+                },
+                None => EffectiveSetting {
+                    value: if config.manifest_mac_key_env.is_some() {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                    .into(),
+                    origin: global("manifest_mac_key_env"),
+                },
             },
             manifest_write_version: EffectiveSetting {
                 value: config.manifest.write_version.as_str().to_owned(),
