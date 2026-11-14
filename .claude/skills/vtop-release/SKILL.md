@@ -25,7 +25,7 @@ Ground truth: `.github/workflows/release.yml` (a push of a `v*` tag publishes), 
 
 ## 1. The bump PR
 
-Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.7.0` for 0.7.0). Title `release: bump the workspace to X.Y.Z`. Four files, plus the citation file:
+Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.7.0` for 0.7.0). Title `release: bump the workspace to X.Y.Z`. Four files, plus the citation file and the pages that print the version:
 
 | File | Change |
 |---|---|
@@ -34,6 +34,8 @@ Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.
 | `helm/vtop/Chart.yaml` | `appVersion: "X.Y.Z"` (it must track the workspace version; GHCR tags follow it). The chart's own `version` follows its contract, not the app: **patch** bump when no template or values changed since the last tag, **minor** when they did (a values-contract change). Check with `git diff vPREV..origin/main --stat -- helm/vtop/templates helm/vtop/values.yaml helm/vtop/ci`. Add the matching comment line above `version:` (0.5.1 for 0.8.0: "no template or values change — the bump carries appVersion 0.8.0"). Nothing in CI ties `appVersion` to `Cargo.toml`, so review it by eye. |
 | `docs/ROADMAP.md` | A section for the release (below), and the forward section renamed to the next release. |
 | `CITATION.cff` | `version` and `date-released` (the day the tag is pushed, as `YYYY-MM-DD`; v0.8.0 is `2026-11-12`). If the tag goes out on another day, fix the date in a follow-up PR; the tag does not move. |
+| `README.md` | The BibTeX entry's `version = {X.Y.Z}` under "Citing VTOP Engine". Nothing else in the README. |
+| `docs/install/helm.md`, `docs/install/container.md` | The chart version and `appVersion` rows and the `--branch vX.Y.Z` checkout (helm.md), and every `ghcr.io/allamiro/vtop-engine:X.Y.Z` image. `docs/operate/upgrades.md` gets a short "Upgrading from vPREV to vX.Y.Z" section, the operator steps of the ROADMAP section, not a copy of it. |
 
 ### The ROADMAP section
 
@@ -46,6 +48,10 @@ Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.
 - **Downgrade is not supported.**
 
 Also retire a stale "Next release" block at the top of the file if what it describes has shipped.
+
+### Status sentences
+
+`scripts/check-version-claims.py` (run by the `docs` workflow) fails when the BibTeX entry, `CITATION.cff`, the chart's `appVersion` or the install pages disagree with `Cargo.toml`, and on a dated "As of <month> <year> (repo at vX)" lead-in. It cannot read prose. Before the bump, re-read each present-tense status sentence ("not yet", "planned", "future work", "today", a "Done" or "Not started" list, a checklist box) in `docs/reference/limitations.md`, `docs/PRODUCTION_HA.md` §1, §19 and §23, `docs/ARCHITECTURE.md` §18, `docs/SECURITY_MODEL.md` §14, `docs/COMPARISON.md`, `docs/LIVE_CHAOS_VALIDATION.md` "Scope boundaries" and `docs/introduction/when-to-use.md` against the milestone and the code, and fix what the release made stale in the same PR. A sentence that says something shipped and has not is fixed toward the code.
 
 ### The PR body
 
@@ -121,7 +127,8 @@ Also: the image's `latest` tag moved (only for a non-pre-release), `helm/vtop/Ch
 ## Checklist
 
 - [ ] Milestone empty or deliberately moved; the bug-only rule respected.
-- [ ] Bump PR touches only Cargo.toml (11 edits), Cargo.lock (12 `vtop-*` entries), Chart.yaml, ROADMAP.md, CITATION.cff.
+- [ ] Bump PR touches only Cargo.toml (11 edits), Cargo.lock (12 `vtop-*` entries), Chart.yaml, ROADMAP.md, CITATION.cff, the README BibTeX version, the install pages and the upgrades page, and status sentences the release made stale.
+- [ ] `python3 scripts/check-version-claims.py` passes; the status sentences were re-read against the milestone and the code.
 - [ ] Chart version bump matches whether templates or values changed.
 - [ ] ROADMAP: upgrade order, one-way changes with reasons, silently ignored keys, known open, no downgrade.
 - [ ] CI green on the exact head; head contains current `main`; merged by REST with `sha` pinned.

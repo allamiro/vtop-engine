@@ -3,7 +3,9 @@
 #
 #   pull_request        mkdocs build --strict (broken links, broken anchors,
 #                       pages missing from the nav all fail), plus the check
-#                       that every config.yaml key has a reference row.
+#                       that every config.yaml key has a reference row and
+#                       the check that every stated version agrees with
+#                       Cargo.toml.
 #   push to main        the same build, then deploy to GitHub Pages.
 #   workflow_dispatch   rebuild and redeploy main by hand.
 #
@@ -21,7 +23,12 @@ on:
       - "CONTRIBUTING.md"
       - "scripts/docs_hooks.py"
       - "scripts/check-config-reference.py"
+      - "scripts/check-version-claims.py"
+      - "scripts/tests/test_check_version_claims.py"
       - "crates/vtop-core/src/config.rs"
+      - "Cargo.toml"
+      - "CITATION.cff"
+      - "helm/vtop/Chart.yaml"
       - ".github/workflows/docs.yml"
   push:
     branches: [main]
@@ -33,7 +40,12 @@ on:
       - "CONTRIBUTING.md"
       - "scripts/docs_hooks.py"
       - "scripts/check-config-reference.py"
+      - "scripts/check-version-claims.py"
+      - "scripts/tests/test_check_version_claims.py"
       - "crates/vtop-core/src/config.rs"
+      - "Cargo.toml"
+      - "CITATION.cff"
+      - "helm/vtop/Chart.yaml"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
@@ -64,6 +76,17 @@ jobs:
 
       - name: Every config.yaml key has a reference row
         run: python scripts/check-config-reference.py
+
+      # README's BibTeX, CITATION.cff, the chart's appVersion and the install
+      # pages repeat the workspace version by hand; the BibTeX said 0.8.0 for
+      # the whole of 0.9.0. The tests run first so a broken check cannot pass
+      # by accident.
+      - name: Every stated version agrees with Cargo.toml
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -m unittest discover -s scripts/tests -p 'test_*.py' -v
+          python scripts/check-version-claims.py
 
       - name: mkdocs build --strict
         env:

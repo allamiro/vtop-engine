@@ -29,7 +29,7 @@ procedure.
 
 ## Run-time libraries
 
-From the release after v0.8.0, the Linux and macOS binaries need no extra
+From v0.9.0, the Linux and macOS binaries need no extra
 libraries. The v0.8.0 binaries and earlier still link OpenSSL 3 and Cyrus
 SASL dynamically:
 

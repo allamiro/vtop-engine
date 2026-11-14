@@ -9,40 +9,6 @@ what each release does **not** yet do.
 
 ---
 
-## Next release — per-stream checksum selection
-
-- **[#669](https://github.com/allamiro/vtop-engine/issues/669)** — choose
-  `checksum.algorithm` per stream, inheriting the global value by default.
-  This is the manual selection step motivated by the paper's cost-aware
-  future work (Eq. 4), recorded in the
-  [implementation plan](https://github.com/allamiro/vtop-engine/issues/669#issuecomment-6806355703).
-  Automatic selection still needs a measured cost model and is future work.
-- **Upgrade note:** older engines silently ignore the new stream key and
-  use the global algorithm. Upgrade all engines before relying on it; keep
-  the global algorithm strong during mixed-version operation. Recovery and
-  scrub continue checking each old batch with its manifest's algorithm.
-  No manifest format or ledger migration is introduced. Downgrade remains
-  unsupported.
-
-- **[#668](https://github.com/allamiro/vtop-engine/issues/668)** — a failed
-  multipart part no longer discards the parts that completed. The failed part
-  alone is retried, up to the new `upload.multipart_part_attempts` (default 3),
-  with backoff; a batch that still fails keeps its multipart session, and the
-  replay of the same bytes resumes it and sends only the missing parts. A
-  running engine sweeps abandoned sessions periodically, not only at startup.
-  New metrics: `vtop_multipart_parts_total{result}`,
-  `vtop_multipart_sessions_total{outcome}`, `vtop_multipart_bytes_reused_total`.
-  `vtopctl tier copy` shares the code, so it gets the per-part retries too.
-- **Upgrade note (#668):** an older engine ignores
-  `upload.multipart_part_attempts` and keeps its behaviour (the SDK's retries
-  only). Session files keep schema 1. An older engine that finds a session
-  the new one kept refuses it (it still compares the local file's name), fails
-  that attempt and aborts the session, and its replay uploads the object
-  afresh: one wasted attempt, no data at risk. Incomplete uploads
-  kept for a replay are billed storage until resumed or swept: add the
-  `AbortIncompleteMultipartUpload` lifecycle rule in PRODUCTION_HA §7.6.
-  Downgrade remains unsupported.
-
 ## v0.1.0 — a range that fails over
 
 Metadata leases, a lease agent on the data node, verified promotion, and the
@@ -50,8 +16,9 @@ first live-chaos scenarios on real processes.
 
 The release pipeline ships `vtop-node` alongside `vtopctl`, publishes a
 multi-arch GHCR image, and attaches an SBOM, cosign signatures and
-`SHA256SUMS`. Tagged as a pre-release: the 0.x series makes no compatibility
-promise across minor versions.
+`SHA256SUMS`. First published as a GitHub pre-release; #248 then made every
+0.x version without a pre-release suffix a full release, and v0.1.0 is listed
+as one. The 0.x series makes no compatibility promise across minor versions.
 
 **Not in it:** replicated-range failover without harness-style follower
 restarts, and any form of replica replacement.
@@ -768,7 +735,9 @@ test that failed first.
     commits instead of timing out (#663).
   - An operator egress ceiling (#481).
   - Each stream may choose its checksum algorithm, with
-    `require_strong_verification` as a floor (#669).
+    `require_strong_verification` as a floor (#669). Automatic selection
+    still needs a measured cost model
+    ([plan](https://github.com/allamiro/vtop-engine/issues/669#issuecomment-6806355703)).
   - `vtopctl validate --print-effective` shows what each stream runs with
     (#670).
   - The #483 gate kept TCP as the only egress path (#475 is closed).
@@ -1073,12 +1042,34 @@ mode_mismatch. The deployment profile is
   write needs, the permissions a HEAD needs to return the lock headers), not
   measured.
 
+**Multipart resume (#668).** A failed multipart part no longer discards the
+parts that completed. The failed part alone is retried, up to the new
+`upload.multipart_part_attempts` (default 3), with backoff; a batch that still
+fails keeps its multipart session, and the replay of the same bytes resumes it
+and sends only the missing parts. A running engine sweeps abandoned sessions
+periodically, not only at startup. New metrics:
+`vtop_multipart_parts_total{result}`, `vtop_multipart_sessions_total{outcome}`,
+`vtop_multipart_bytes_reused_total`. `vtopctl tier copy` shares the code, so it
+gets the per-part retries too.
+
+- **Older engines ignore `upload.multipart_part_attempts`** and keep their
+  behaviour (the SDK's retries only). Session files keep schema 1. An older
+  engine that finds a session the new one kept refuses it (it still compares
+  the local file's name), fails that attempt and aborts the session, and its
+  replay uploads the object afresh: one wasted attempt, no data at risk.
+- **Incomplete uploads kept for a replay are billed storage** until resumed
+  or swept: add the `AbortIncompleteMultipartUpload` lifecycle rule in
+  PRODUCTION_HA §7.6.
+- Downgrade remains unsupported.
+
 ---
 
 ## Versioning
 
-0.x. Minor versions may break compatibility, and releases are published as
-GitHub pre-releases to say so. **Upgrades are tested** (#291): CI proves a
+0.x. Minor versions may break compatibility, and the release notes say where.
+Every release is published as a full GitHub release, signed and attested; only
+a version with a pre-release suffix, such as `1.0.0-rc.1`, is published as a
+pre-release (`release.yml`, #248). **Upgrades are tested** (#291): CI proves a
 data directory written by the newest patch of each released minor series
 (v0.2+) opens under the current build, serves byte-exactly, and still serves
 after a restart; newly published tags join that matrix automatically.

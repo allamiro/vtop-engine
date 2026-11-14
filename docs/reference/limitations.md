@@ -10,15 +10,15 @@ engine's HA status is in [PRODUCTION_HA.md](../PRODUCTION_HA.md).
 |---|---|---|
 | Deterministic object naming | partly — objects are keyed by source, range and content digest, so a replay of the same bytes reuses the stored object (#626); a replay with other boundaries, a later seal-time hour, no checksum or a command backend still writes a second object, and manifests stay per attempt ([protocol §15.1](../VTOP_PROTOCOL_DRAFT.md#151-object-key)/§16) | reproducible batch boundaries, per-range manifests ([PRODUCTION_HA.md Phase 4](../PRODUCTION_HA.md)) |
 | Verification classes | strong (default) / backend-limited / disabled (size-only), per [protocol §17](../VTOP_PROTOCOL_DRAFT.md#17-verification-semantics); non-strong commit requires explicit opt-out | — |
-| Large objects | native S3 + mock support resumable multipart with persisted sessions (`vtopctl tier copy --multipart-state-dir`); compatibility backends still single-shot `put_object` | wire remaining backends / streaming rehydrate |
+| Large objects | `s3_native` (and the mock) upload above `upload.multipart_threshold_bytes` as resumable multipart with persisted sessions, in the engine (#482, #668) and in `vtopctl tier copy --multipart-state-dir`; the command backends and `localfs` upload in one request | wire remaining backends / streaming rehydrate |
 | Large records / whole files | `max_bytes` is a hard per-source/per-batch ceiling; an oversized record is rejected without advancing source progress | raise the explicit budget only when the deployment has matching memory headroom |
-| Partial upload recovery | replays from source instead of resuming half-written local objects | add resumable local staging |
+| Partial upload recovery | a failed multipart upload on `s3_native` keeps its completed parts, and the replay of the same bytes resumes it (#668); anything else, including a half-written local object, replays from the source | add resumable local staging |
 | Command backend verification cost | `aws`, `s3cmd`, and `mc` download each stored object to hash it | prefer native S3 SHA-256 when read-back bandwidth is costly |
 | Syslog timestamps | `received_time_*` is not yet extracted into the spool marker | add timestamp extraction |
 | Manifest integrity | self-hash plus optional keyed-BLAKE3 authentication; key rotation through key ids and a keyring (`manifest.mac`, version 0.4 manifests only, every reader on the keyring release first) | add public-key signatures if required |
 | Object immutability | manifest version pinning + bucket-versioning validation (hardened profile, `upload.require_object_versioning`); **S3 Object Lock profile implemented** (#684, `upload.object_lock`, `s3_native` only): objects and manifests written under retention, the bucket's Object Lock checked, the stored retention verified before VERIFIED. The bucket and its default retention are the operator's; older engines ignore the key ([OBJECT_LOCK_DEPLOYMENT.md](../OBJECT_LOCK_DEPLOYMENT.md)) | lock cold-tier copies (`vtopctl tier copy` refuses the profile) |
 | Metrics and trace export | **Prometheus `/metrics` implemented** (opt-in via `VTOP_METRICS_ADDR`); **OpenTelemetry export implemented** (#683): traces of the batch lifecycle, recovery and scrub, the same metrics over OTLP, and trace ids in the JSON logs, built in and idle until `OTEL_EXPORTER_OTLP_ENDPOINT` is set (HTTP/protobuf only, no gRPC) | gRPC transport if a deployment needs it |
-| Kafka integration test | requires live broker and is ignored by default | add optional CI service profile |
+| Kafka integration test | needs a live broker, so a plain `cargo test` skips it; CI runs it against an Apache Kafka service container (`integration_kafka_to_minio -- --ignored`) | — |
 | Binary / pre-compressed inputs | **supported** via the file source `whole_file` mode (archived verbatim, byte-exact) | streaming for very large files |
 | Local filesystem backend | **available** (`backend: localfs`, objects under `local_path/<bucket>/<key>`; sidecars are inventory hints only) | — |
 | Checksums | **SHA-256 and BLAKE3**, or disabled (size-only); strong verification defaults on and `require_strong_verification: false` is an explicit weak-mode opt-out | — |
@@ -47,7 +47,7 @@ engine's HA status is in [PRODUCTION_HA.md](../PRODUCTION_HA.md).
 - [x] bounded file/syslog/whole-file reads, pre-clone Kafka record checks, and
       streaming local compression; `max_bytes` is enforced before source
       progress advances
-- [x] multipart resumable upload (native S3 + mock; persisted sessions, fencing, abandoned cleanup)
+- [x] multipart resumable upload (native S3 + mock; persisted sessions, fencing, abandoned cleanup; a failed part keeps the completed ones, #668)
 - [x] optional keyed-BLAKE3 manifest authentication via a named secret env var
 - [x] **native three-node metadata/control plane** — an embedded Raft group
       with linearizable reads, membership change, and an mTLS admin endpoint
@@ -66,15 +66,17 @@ engine's HA status is in [PRODUCTION_HA.md](../PRODUCTION_HA.md).
       against the new leader while fenced, and truncates a diverged tail
       instead of being stranded — bounded so it can never discard
       acknowledged records
-- [x] **15-scenario live-chaos suite in CI** — real processes over real TLS:
+- [x] **live-chaos suite in CI** — every scenario under
+      `scripts/live-chaos/scenarios/`, on real processes over real TLS:
       SIGKILL durability, disk-full and fsync failure, metadata partition,
-      clock skew, membership change under load, and range-leader failover
+      clock skew, membership change under load, range-leader failover, the
+      Kafka gateway with stock clients, and a rolling metadata upgrade
+- [x] manifest MAC key rotation (#685)
+- [x] S3 Object Lock profile (#684)
 - [x] **signed, attested releases** — multi-arch image and per-target binaries
       with keyless Sigstore signatures, SBOM, and provenance attestations
 
 ## Not implemented yet
 
-- [x] manifest MAC key rotation (#685)
 - [ ] optional public-key manifest signatures
-- [x] S3 Object Lock profile (#684)
 - [ ] million-file benchmark suite

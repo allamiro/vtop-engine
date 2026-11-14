@@ -14,6 +14,31 @@ every upgrade.
 The source for this page is the release notes in the [roadmap](../ROADMAP.md);
 read the section for the release you are moving to.
 
+## Upgrading from v0.8.0 to v0.9.0
+
+v0.9.0 is a bug-fix release. The full notes are in
+[v0.9.0](../ROADMAP.md#v090--bug-fixes-deletes-that-wait-for-proof-kafka-partitions-that-are-never-left-unread-portable-builds)
+in the roadmap; the steps that need an operator are:
+
+- **PostgreSQL: run `vtopctl migrate` before starting v0.9.0 engines.** It
+  adds the nullable `verification_class` column, and the schema marker stays
+  3, so v0.8.0 engines keep working against the migrated database. Restart
+  any v0.8.0 engine that was running during the migration: until its
+  connections are replaced, its whole-row reads fail. SQLite migrates on
+  connect.
+- **`delete_after_commit` keeps files it cannot prove are closed**, which
+  includes the shipped Helm chart's unprivileged pod. Watch disk use and
+  `vtop_file_delete_decisions_total{outcome}`.
+- **Kerberos (SASL GSSAPI) for the Kafka source is no longer in the default
+  build.** If you use `sasl_mechanism: GSSAPI`, build with
+  `--features kafka-gssapi`.
+- **New key older engines silently ignore:**
+  `sources.file.delete_without_open_check`. Upgrade every engine before
+  relying on the new delete rules.
+
+On Kubernetes, install chart `0.5.2` from the v0.9.0 checkout (its
+`appVersion`, and so its default image tag, is `0.9.0`).
+
 ## Upgrading from v0.7.0 to v0.8.0
 
 ### 1. Upgrade every node first
@@ -75,11 +100,11 @@ read `0.4`, so upgrade every engine and auditor before a later release turns
 `0.4` on. The details are under
 [v0.10.0 and beyond](../ROADMAP.md#v0100-and-beyond) in the roadmap.
 
-Verification receipts (`manifest.verification_receipts`) need no reader
-upgrade: a reader that does not know them never fetches them. Older engines
-ignore the key and write none, so turn on `vtopctl scrub --require-receipts`
-only once every engine writes them; see
-[Verification receipts](verification-receipts.md).
+Verification receipts (`manifest.verification_receipts`) are on `main` for
+v0.10.0 and in no release yet. They need no reader upgrade: a reader that
+does not know them never fetches them. Older engines ignore the key and write
+none, so turn on `vtopctl scrub --require-receipts` only once every engine
+writes them; see [Verification receipts](verification-receipts.md).
 
 ## Before any upgrade
 

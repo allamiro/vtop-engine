@@ -10,8 +10,8 @@ To run the engine, use the [container image](container.md).
 | Chart field | Value |
 |---|---|
 | Chart name | `vtop` |
-| Chart version | `0.5.1` |
-| `appVersion` (the default image tag) | `0.8.0` |
+| Chart version | `0.5.2` |
+| `appVersion` (the default image tag) | `0.9.0` |
 | Kubernetes | `>=1.25.0-0` |
 | Image | `ghcr.io/allamiro/vtop-engine`, tag defaults to `appVersion` |
 
@@ -24,7 +24,7 @@ The chart is not published to a chart repository. Install it from a checkout
 of the release you are deploying:
 
 ```bash
-git clone --branch v0.8.0 https://github.com/allamiro/vtop-engine.git
+git clone --branch v0.9.0 https://github.com/allamiro/vtop-engine.git
 cd vtop-engine
 ```
 

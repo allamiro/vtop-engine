@@ -5,7 +5,7 @@ ceremony: the point of publishing signatures is that somebody checks them, and
 an unverified download from a release page is a download from whoever could
 reach the release page.
 
-Replace `VERSION` with the release you are installing, for example `0.3.0`.
+Replace `VERSION` with the release you are installing, for example `0.9.0`.
 (This is the software release version; the VTOP *protocol* version carried
 inside manifests is separate — see
 [VTOP_PROTOCOL_DRAFT.md §11.2](VTOP_PROTOCOL_DRAFT.md#112-field-reference).
@@ -68,9 +68,10 @@ the container image carries an SBOM attestation.
 
 ## Maturity
 
-VTOP is a **prototype / reference implementation**. The 0.x series signals that
-the API may still change — not that a tag is a preview. Each release is signed,
-attested, and intended for use.
+VTOP is a **prototype / reference implementation**. Each release is signed,
+attested and published as a full release, not a GitHub pre-release; the 0.x
+series means a minor version may still break compatibility, and the release
+notes say where.
 
 Read [Known limitations](PRODUCTION_HA.md#19-known-limitations-current-code) (§19)
 before depending on this in production.

@@ -3,9 +3,12 @@
 **Verified Telemetry Object Protocol (VTOP)**
 
 Status: Draft / proposed protocol
-Version: 0.3 (reference implementation specification; 0.2 added the optional
+Version: 0.4 (reference implementation specification; 0.2 added the optional
 keyed BLAKE3 manifest authenticator, §11.2 and §18; 0.3 makes a manifest's
-`source_progress` span the whole batch, §11.2)
+`source_progress` span the whole batch, §11.2; 0.4 hashes and authenticates
+the stored document in a canonical form and adds `verification_plan` and the
+MAC key id, §11.2. The reference implementation reads `0.1` to `0.4` and
+writes `0.3` unless `manifest.write_version: "0.4"` is set)
 
 > This document describes a **proposed protocol** and accompanies a **reference implementation** ("VTOP Engine"). It is a draft for technical review and is part of an **invention-disclosure support package**. It does not describe a shipped standard.
 

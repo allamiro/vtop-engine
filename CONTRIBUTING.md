@@ -53,8 +53,9 @@ Shell changes are linted with the same pinned shellcheck CI uses, in two steps:
 # The same file lists CI lints — a shorter one gives a false green.
 docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 \
   docker/*.sh scripts/release-notes.sh scripts/k8s-smoke.sh \
-  scripts/e2e-smoke.sh scripts/upgrade-compat.sh scripts/traffic-snapshot.sh \
-  scripts/test-progress.sh scripts/check-naming.sh scripts/check-egress-claims.sh
+  scripts/e2e-smoke.sh scripts/upgrade-compat.sh scripts/manifest-compat.sh \
+  scripts/traffic-snapshot.sh scripts/test-progress.sh scripts/check-naming.sh \
+  scripts/check-egress-claims.sh
 
 docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 \
   -x -P scripts/live-chaos/scenarios \

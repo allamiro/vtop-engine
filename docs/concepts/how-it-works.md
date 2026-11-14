@@ -54,8 +54,11 @@ past, so recovery stops revisiting it. It is not a commit.
 | After verification, before the commit | Retries the source commit. |
 | After the commit | Nothing: the batch is complete. |
 
-A replayed range is written under a new object key, so it can be stored
-twice: a duplicate, never a gap.
+A replay of the same bytes resolves to the object already stored and reuses
+it once it verifies (#626). A replay that produces other bytes (a source that
+grew, a later hour under seal-time partitioning) writes a second object, as
+does any replay with no checksum or on a command backend: a duplicate, never a
+gap.
 
 ## Where the pieces are set and watched
 

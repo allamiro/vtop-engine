@@ -65,7 +65,8 @@
 
 ## 1. Where things stand
 
-As of **August 2026** (repo at v0.3.0):
+This section describes `main`. What each release shipped, and the limits
+it shipped with, are in [ROADMAP.md](ROADMAP.md).
 
 **Done**
 - `StateStore` trait extracted; engine holds `Box<dyn StateStore>`; scheme
@@ -94,12 +95,6 @@ As of **August 2026** (repo at v0.3.0):
   (part of Phase 8's security baseline).
 
 **Not started — the critical path to a fleet**
-- Phase 4: deterministic / content-addressed object keys + idempotent retry.
-  **Objects done (#626):** the object key is derived from the source, the
-  range and the content digest, and an existing object is reused only after
-  it verifies strongly. Remaining: batch boundaries are not reproduced after a
-  power loss, a seal-time partition moves a replay in a later hour, and
-  manifests stay per attempt ([ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3).
 - Phase 5: Kafka consumer-group fleet mode. The consumer still uses per-read
   `assign()`; no `VTOP_KAFKA_GROUP_MODE` toggle; no multi-writer recovery
   (`FOR UPDATE SKIP LOCKED` / leases, #93).
@@ -107,10 +102,21 @@ As of **August 2026** (repo at v0.3.0):
   the engine.
 
 **Partially done**
+- Phase 4: deterministic / content-addressed object keys + idempotent retry.
+  **Objects done (#626, #688):** the object key is derived from the source,
+  the range and the content digest, and an existing object is reused only
+  after it verifies strongly. Remaining: batch boundaries are not reproduced
+  after a power loss, a seal-time partition moves a replay in a later hour,
+  and manifests stay per attempt ([ARCHITECTURE.md](ARCHITECTURE.md) §13
+  item 3).
 - Phase 6 (observability & ops): metrics, readiness, dashboards and OTLP trace
-  export exist; Alertmanager rules do not.
-- Phase 8 (retention/backup/DR/security): retention shipped; backup/restore
-  runbook, DR drills, and the divergence checker have not been exercised.
+  export exist, and the lab's Grafana provisions alert rules
+  (`observability/grafana/provisioning/alerting/vtop-alerts.yaml`). A tested
+  Prometheus alert rule set for deployments does not exist yet (#720).
+- Phase 8 (retention/backup/DR/security): retention shipped, and an
+  attributable audit trail for every state-changing command (#694); a
+  backup/restore runbook (#734), DR drills (#735), and the divergence checker
+  have not been exercised.
 
 **Optional / gated**
 - Phase 9 (file/syslog HA via leases) — only if distributed file/syslog
@@ -1710,9 +1716,14 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
   (`build_object_name`); an object already at the key is reused only after a
   strong verification, and anything else there is never overwritten (the
   batch falls back to its per-attempt key). There is no key-mode toggle: the
-  attempt key is the fallback, not a mode. Not done: reproducing batch
-  boundaries after a power loss, a partition hour stable under
-  `time_source = seal`, per-range manifests, and the Object Lock compose test.
+  attempt key is the fallback, not a mode. Under the Object Lock profile
+  (#684) a reused object must still be locked, and a damaged object at the
+  derived key is never written over (`crates/vtop-cli/tests/object_lock.rs`,
+  against the mock store); the store's own behaviour, an overwrite that makes
+  a new version and a locked version that survives a delete, is tested
+  against the lab's MinIO in CI (`minio-integration`). Not done: reproducing
+  batch boundaries after a power loss, a partition hour stable under
+  `time_source = seal`, and per-range manifests.
   See [ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3.
 
 ### Phase 5 — Kafka consumer-group fleet mode ⬜ NOT STARTED
@@ -1736,8 +1747,11 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 - **Done:** Prometheus metrics + readiness endpoint (`VTOP_METRICS_ADDR`,
   `vtop-observe`); structured per-stage events; `observability/` compose stack
   (Grafana, Loki, Mimir, Tempo, Alloy) with generated dashboards; OTLP trace
-  export from the engine into that Tempo (#683).
-- **Remaining:** Alertmanager rules (verification failures > 0, replay-rate
+  export from the engine into that Tempo (#683); Grafana alert rules for the
+  lab (retention loss, replication health, consumer-group eviction: #454,
+  #561, #571).
+- **Remaining:** a tested Prometheus alert rule set for deployments (#720:
+  verification failures > 0, replay-rate
   spike, lag growth, store-latency SLO breach, no-commits-in-N-minutes); metric
   coverage review (duplicate-object rate until Phase 4 lands, consumer lag,
   state-store write latency); documented SLOs.
@@ -1849,8 +1863,9 @@ Correctness & invariant
   [x] verify-before-commit enforced in core AND database (state-aware CHECKs)
   [x] crash before VERIFIED → replay; crash after VERIFIED/before COMMIT → safe
   [x] require_strong_verification defaults true
-  [ ] deterministic or content-addressed object keys enabled           (Phase 4)
-  [ ] Object Lock behavior tested (retry never overwrites)             (Phase 4)
+  [x] content-addressed object keys (#626, #688)
+  [ ] batch boundaries reproduced after power loss; per-range manifests (Phase 4)
+  [x] Object Lock behavior tested (retry never overwrites; #684)
 
 State store
   [x] StateStore trait + shared test battery green on SQLite AND Postgres
@@ -1872,7 +1887,7 @@ Object storage
 Operability
   [x] Prometheus metrics endpoint + readiness probe (VTOP_METRICS_ADDR)
   [x] dashboards defined (observability/ stack)
-  [ ] Alertmanager rules wired                                         (Phase 6)
+  [ ] tested Prometheus alert rules for deployments (#720)            (Phase 6)
   [x] OpenTelemetry traces exported (opt-in, OTEL_EXPORTER_OTLP_ENDPOINT)
   [ ] engine k8s chart: probes, limits, PDB, NetworkPolicy, runbook    (Phase 7)
 
