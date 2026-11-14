@@ -86,6 +86,58 @@ pub(crate) fn codec_corrupt(path: &Path, error: &CodecError) -> MetaStoreError {
     corrupt(path, error.to_string())
 }
 
+/// The `UnknownTag` `what`s of enums a later release may extend. On a reader
+/// that predates the variant, a checksum-valid record carrying it was
+/// written by a newer release, so it is reported as a newer format, never
+/// as corruption (#554, #743). Every `UnknownTag` site in this crate is in
+/// this list or in [`CLOSED_FOREVER_WHATS`]; a test scans the sources.
+pub(crate) const NEWER_FORMAT_WHATS: &[&str] = &[
+    "command kind",
+    "log entry kind",
+    "record value tag",
+    "meta key category",
+    "snapshot payload version",
+    // Inside a known kind (#577): a promotion outcome or answer verdict this
+    // build does not know was written by a newer one, exactly as an unknown
+    // kind is.
+    "promotion outcome",
+    "quorum answer lineage",
+    // A refusal reason this build does not know (#636 added one) is the
+    // same: a newer writer, not corruption.
+    "promotion refusal",
+    // The closed-enum review (#743): enums inside snapshot records and the
+    // request dedup table (which travels in snapshots), and the transition
+    // grant on the wire. Each can gain a variant behind a feature level; a
+    // voter that predates it must say "newer format", not "corrupt".
+    "node state",
+    "verification method",
+    "segment state",
+    "key state",
+    "transition grant kind",
+    "response kind",
+    "error kind",
+];
+
+/// The `UnknownTag` `what`s that no release will extend, so an unknown value
+/// is damage, not a newer writer. Each is a transport reply decoded only
+/// from a peer or an admin endpoint of the same VTPM version (a new shape is
+/// a new op or a VTPM version bump, which the frame header already reports
+/// as newer, #554), never from disk.
+#[cfg(test)]
+pub(crate) const CLOSED_FOREVER_WHATS: &[&str] = &[
+    // AppendEntries reply kinds: a new kind is a new VTPM version (review
+    // of #554 kept it out of the newer set).
+    "append response kind",
+    // Presence bytes of an admin range view: absent or present (and, for a
+    // placement proposal, refused). A new shape is a new admin op.
+    "rebalance intent presence",
+    "segment presence",
+    "proposal presence",
+    // The redirect hint of an admin error: none, unknown leader or a leader
+    // id. A new hint is a new admin op.
+    "admin error redirect",
+];
+
 /// Whether a decode failure is a kind, tag or version this build does not
 /// know - the signature of a newer writer - rather than malformed bytes. Only
 /// meaningful once the bytes' checksum has verified, as it has everywhere
@@ -93,22 +145,7 @@ pub(crate) fn codec_corrupt(path: &Path, error: &CodecError) -> MetaStoreError {
 pub(crate) fn is_newer_format(error: &CodecError) -> bool {
     matches!(
         error,
-        CodecError::UnknownTag {
-            what: "command kind"
-                | "log entry kind"
-                | "record value tag"
-                | "meta key category"
-                | "snapshot payload version"
-                // Inside a known kind (#577): a promotion outcome or answer
-                // verdict this build does not know was written by a newer
-                // one, exactly as an unknown kind is.
-                | "promotion outcome"
-                | "quorum answer lineage"
-                // A refusal reason this build does not know (#636 added
-                // one) is the same: a newer writer, not corruption.
-                | "promotion refusal",
-            ..
-        }
+        CodecError::UnknownTag { what, .. } if NEWER_FORMAT_WHATS.contains(what)
     )
 }
 
@@ -487,5 +524,98 @@ impl MetaStorage {
             self.log.discard_all()?;
         }
         Ok(())
+    }
+}
+
+/// #743: the closed-enum review, made mechanical. Every `UnknownTag` a
+/// decoder in this crate can raise names its `what`; each must be either a
+/// newer format (the enum can gain a variant, so an older reader must say
+/// "newer", not "corrupt") or closed forever. A new site that is in neither
+/// list fails here, so the decision is made when the enum is written, not
+/// the day an older node meets its first new variant.
+#[cfg(test)]
+mod closed_enum_review_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Every literal `what` passed to `CodecError::UnknownTag { .. }` in this
+    /// crate's sources.
+    fn unknown_tag_whats() -> BTreeSet<String> {
+        let mut found = BTreeSet::new();
+        let mut pending = vec![std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src"
+        ))];
+        while let Some(path) = pending.pop() {
+            for entry in std::fs::read_dir(&path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                for (at, opening) in source.match_indices("UnknownTag {") {
+                    // The struct literal up to its closing brace; a site that
+                    // passes a variable `what` has no literal in it.
+                    let body = &source[at + opening.len()..];
+                    let window = &body[..body.find('}').unwrap_or(body.len())];
+                    let Some(start) = window.find("what: \"") else {
+                        continue;
+                    };
+                    let rest = &window[start + "what: \"".len()..];
+                    let end = rest.find('"').expect("an unterminated what literal");
+                    found.insert(rest[..end].to_owned());
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn unknown_tag_sites_are_classified() {
+        let whats = unknown_tag_whats();
+        assert!(
+            whats.contains("command kind") && whats.contains("node state"),
+            "the source scan found nothing it should: {whats:?}"
+        );
+        let unclassified: Vec<_> = whats
+            .iter()
+            .filter(|what| {
+                !NEWER_FORMAT_WHATS.contains(&what.as_str())
+                    && !CLOSED_FOREVER_WHATS.contains(&what.as_str())
+            })
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "UnknownTag sites with no classification: {unclassified:?}. Add each to \
+             NEWER_FORMAT_WHATS if a later release may add a variant (an older reader then \
+             reports it as newer, not corrupt), or to CLOSED_FOREVER_WHATS with the reason it \
+             can never grow"
+        );
+        for what in NEWER_FORMAT_WHATS {
+            assert!(
+                !CLOSED_FOREVER_WHATS.contains(what),
+                "{what} is in both lists"
+            );
+            assert!(
+                is_newer_format(&CodecError::UnknownTag { what, tag: 0x7f }),
+                "{what} is listed as newer but not classified so"
+            );
+        }
+        for what in CLOSED_FOREVER_WHATS {
+            assert!(
+                !is_newer_format(&CodecError::UnknownTag { what, tag: 0x7f }),
+                "{what} is closed forever but classified as newer"
+            );
+        }
+        let stale: Vec<_> = NEWER_FORMAT_WHATS
+            .iter()
+            .chain(CLOSED_FOREVER_WHATS)
+            .filter(|what| !whats.contains(**what))
+            .collect();
+        assert!(stale.is_empty(), "listed but raised nowhere: {stale:?}");
     }
 }
