@@ -1147,7 +1147,7 @@ fn capture_adapter_warnings() {
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
             .with_ansi(false)
-            .with_env_filter(tracing_subscriber::EnvFilter::new("vtop_adapters=warn"))
+            .with_env_filter(tracing_subscriber::EnvFilter::new("vtop_adapters=info"))
             .try_init();
     });
 }
@@ -1680,6 +1680,39 @@ async fn add_partitions(topic: &str, partitions: usize) {
         .expect("adding partitions failed");
 }
 
+/// Wait until the broker lists `partitions` partitions for `topic`, so a
+/// producer or consumer that asks next sees them: like a new topic, new
+/// partitions reach the broker's metadata a moment after the admin call
+/// returns (review of #675).
+fn wait_for_partitions(topic: &str, partitions: usize) {
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    let probe: BaseConsumer = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-probe"))
+        .unwrap()
+        .create()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let listed = probe
+            .fetch_metadata(Some(topic), std::time::Duration::from_secs(5))
+            .ok()
+            .and_then(|md| {
+                md.topics()
+                    .iter()
+                    .find(|t| t.name() == topic)
+                    .map(|t| t.partitions().len())
+            })
+            .unwrap_or_default();
+        if listed >= partitions {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "precondition: the broker lists {partitions} partitions for {topic} (it lists {listed})"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// Write `n` records to one partition of `topic`.
 fn produce_to(topic: &str, partition: i32, n: usize) {
     use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
@@ -1733,6 +1766,7 @@ async fn a_partition_added_while_the_topic_is_read_is_read_from_its_start() {
             .unwrap_or_default();
     }
     add_partitions(&topic, 2).await;
+    wait_for_partitions(&topic, 2);
     produce_to(&topic, 1, 3);
 
     let started = std::time::Instant::now();
@@ -1787,6 +1821,9 @@ async fn renewing_the_assignment_does_not_move_a_partition_that_started_at_the_e
     produce(&quiet, 3);
 
     let (extra, _extra_cleanup) = fresh_topic("renew_extra", 0).await;
+    // Listed before it joins, so the next pass really renews the assignment
+    // (a topic listed without partitions would leave the set unchanged).
+    wait_for_partitions(&extra, 1);
     let sources = vec![
         kafka_source(&busy),
         kafka_source(&quiet),
@@ -1804,6 +1841,56 @@ async fn renewing_the_assignment_does_not_move_a_partition_that_started_at_the_e
          the end of the log (within {:?}; stall recoveries: {})",
         started.elapsed(),
         adapter.stall_recoveries()
+    );
+    assert_eq!(
+        adapter.stall_recoveries(),
+        0,
+        "quiet was recovered by the stall check, not read through the renewal"
+    );
+}
+
+/// Review of #675: a topic deleted while one of its partitions still waited
+/// at the end of the log (`latest`, nothing delivered). The next pass renews
+/// the assignment without it; the renewal pinned every waiting partition of
+/// the LAST assignment first, the deleted one included, and asking the
+/// broker about a deleted topic fails, so every pass failed and no topic was
+/// read again until a restart. Only partitions that stay are pinned.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn deleting_a_topic_with_a_waiting_partition_does_not_stop_the_others() {
+    let (busy, _busy_cleanup) = fresh_topic("deleted_busy", 0).await;
+    let (gone, gone_cleanup) = fresh_topic("deleted_gone", 0).await;
+    let group = unique_group("deleted");
+    let mut cfg = kafka_cfg(&bootstrap(), &group);
+    cfg.auto_offset_reset = "latest".into();
+    let mut adapter = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
+    let sources = vec![kafka_source(&busy), kafka_source(&gone)];
+
+    let mut busy_read = 0;
+    let warmup = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while busy_read == 0 {
+        assert!(
+            std::time::Instant::now() < warmup,
+            "precondition: the busy topic is read"
+        );
+        produce(&busy, 2);
+        busy_read += read_pass(&mut adapter, &sources).await[0];
+    }
+    // As discovery does once the topic is gone.
+    drop(gone_cleanup);
+    let sources = vec![kafka_source(&busy)];
+    produce(&busy, 3);
+
+    let started = std::time::Instant::now();
+    let mut after = 0;
+    while after < 3 && started.elapsed() < std::time::Duration::from_secs(20) {
+        after += read_pass(&mut adapter, &sources).await[0];
+    }
+    assert_eq!(
+        after,
+        3,
+        "after {gone} was deleted, {busy} was not read again within {:?}",
+        started.elapsed()
     );
 }
 

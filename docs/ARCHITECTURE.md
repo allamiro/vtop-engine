@@ -263,25 +263,37 @@ is a real and silent condition.
 While running, the partition list changes in ways a restart never sees, and
 `latest` must not skip what arrived meanwhile (#675):
 
-- **A partition added to a topic being read**, or **a topic that listed no
+- **A partition added to a topic being read**, **a topic that listed no
   partitions when first asked for** (created moments later, or not yet known to
-  the broker), starts from the group's committed offset, else from its
-  **beginning**: every record in it is newer than the start `latest` promised
-  when the engine began reading the topic. Partition counts are re-checked in
-  one metadata request every 30s, so a new partition is assigned within that.
-  An answer with no partitions is never cached.
+  the broker), or **a topic first read after the engine started** (discovery
+  lists every topic each cycle, so it was created since) starts from the
+  group's committed offset, else, under `latest`, from its **beginning**:
+  every record in it is newer than the start `latest` promised when the engine
+  began reading. Partition counts are re-checked every cycle from discovery's
+  own listing (with no listing, one metadata request every 30s), so a new
+  partition is assigned within a cycle. An answer with no partitions is never
+  cached. When the start cannot be established, the partition waits, never
+  assigned at `Offset::Stored`.
 - **A whole re-assign** (the topic set or a partition count changed, a record
-  was rejected, a poll failed) first pins every partition still waiting at
-  `Offset::Stored` under `latest` where it started; when that cannot be
-  established, the renewal waits for the next pass.
-- **A failed partition lookup** serves the topic's last known list.
+  was rejected, a poll failed) first pins every partition that stays assigned
+  and is still waiting at `Offset::Stored` under `latest` where it started. A
+  partition whose start cannot be established is left out and asked again
+  10s later; every other partition is assigned and read. A partition whose
+  records in a pass were all rejected or discarded is pinned at the first of
+  them.
+- **A failed partition lookup**, or a topic answer carrying an error other
+  than "unknown topic", serves the topic's last known list.
 - **A deleted and recreated topic** (fewer partitions than before, a topic that
   lists partitions again after listing none, or an end offset below the
   position held) is reported, not acted on: the ledger cannot tell the two
   topics apart, and offsets alone cannot tell a recreate from a truncated log.
+  Where the new log is shorter than the old position, the broker answers out
+  of range and `auto.offset.reset` applies; where it already reaches past it,
+  the records below are skipped without an error, which the warning says.
 
 Each of these logs what happened, what the engine did and what the operator
-should check, with the topic, partition and offsets as fields.
+should check, with the topic, partition and offsets as fields, and counts in
+`vtop_kafka_partition_events_total{event}`.
 
 When retention has already removed records past that position, `auto.offset.reset`
 applies by two different routes, and both end the same way:
