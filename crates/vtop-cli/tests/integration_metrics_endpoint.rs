@@ -400,6 +400,28 @@ fn the_audit_counters_are_exported_with_bounded_labels() {
     assert_eq!(sinks, telemetry::AUDIT_SINKS);
 }
 
+/// #733: the count of secret files accepted under
+/// `security.allow_loose_secret_permissions` is exported under its name with
+/// no labels at all: the path and mode are in the log line and the audit
+/// record, never a label.
+#[test]
+fn the_secret_file_override_counter_is_exported_without_labels() {
+    let text = populated();
+    let name = "vtop_secret_file_permission_overrides_total";
+    assert!(
+        text.contains(&format!("# TYPE {name} counter")),
+        "{name} is not exported:\n{text}"
+    );
+    let series: Vec<_> = text.lines().filter(|line| line.starts_with(name)).collect();
+    assert_eq!(series.len(), 1, "{series:?}");
+    assert!(
+        series[0].starts_with(&format!("{name} ")),
+        "{name} must carry no labels: {}",
+        series[0]
+    );
+    assert!(telemetry::AUDIT_ACTIONS.contains(&"security.override"));
+}
+
 /// #664: the counter an alert on "verified strong, re-checked size-only" reads
 /// is exported under its name, with the class and result as labels.
 #[test]

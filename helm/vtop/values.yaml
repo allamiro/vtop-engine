@@ -544,5 +544,13 @@ priorityClassName: ""
 terminationGracePeriodSeconds: 60
 
 extraEnv: []
+# Extra volumes and mounts, verbatim. For a secret file from an external
+# manager (a Secret synced by External Secrets Operator, or a Secrets Store
+# CSI volume with readOnly: true), mount the whole volume at a directory,
+# never with subPath, and set `defaultMode: 0400`: with the fsGroup above the
+# kubelet makes it 0440, root-owned, group 10001. A Secret's default mode is
+# 0644, readable by every user in the container. ci/external-secret-values.yaml
+# is a rendered example; the archive engine's rule for secret files is in
+# docs/operate/secrets.md.
 extraVolumes: []
 extraVolumeMounts: []

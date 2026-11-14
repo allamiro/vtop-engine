@@ -7,6 +7,7 @@ use crate::errors::VtopError;
 use crate::manifest::{
     KeySourceKind, KeyringKey, ManifestKeyring, ManifestMacKey, ManifestWriteVersion,
 };
+use crate::secret_file::{SecretFile, SecretFileKind, SecretPolicy};
 use crate::types::{ChecksumAlgorithm, CompressionType, SourceType, TelemetryFormat};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
@@ -45,6 +46,26 @@ pub struct VtopConfig {
     pub upload: UploadConfig,
     #[serde(default)]
     pub partitioning: PartitioningConfig,
+    /// How the engine treats files other local users can reach (#733).
+    /// Absent means every default.
+    #[serde(default)]
+    pub security: SecurityConfig,
+}
+
+/// The `security:` section (#733). Unknown keys are refused: a misspelt
+/// override must fail loudly, not leave the check on while the operator
+/// believes it off, or the reverse. The cost is that a later release's new
+/// key in this section is refused by this one, which its release note says.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityConfig {
+    /// Start even when a manifest key file, the state-store secret file, the
+    /// SQLite ledger or the audit file can be read by other local users. Each
+    /// such file is announced (a WARN, a count on
+    /// `vtop_secret_file_permission_overrides_total` and an audit record).
+    /// Never accepts a file other users can write. Default false.
+    #[serde(default)]
+    pub allow_loose_secret_permissions: bool,
 }
 
 /// The `manifest:` section (#671 release B).
@@ -104,8 +125,9 @@ pub struct ManifestKeyConfig {
     /// Name of the environment variable holding the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<String>,
-    /// Path of a file holding the key, such as a mounted secret. Its
-    /// permissions are not checked.
+    /// Path of a file holding the key, such as a mounted secret. Refused when
+    /// other local users can write it, or read it (see
+    /// [`crate::secret_file`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     /// This key verifies manifests that name no key id: every manifest
@@ -154,6 +176,14 @@ impl ManifestMacConfig {
 const MAX_KEY_FILE_BYTES: u64 = 4096;
 
 impl ManifestKeyConfig {
+    fn secret_file(&self, path: &str) -> SecretFile {
+        SecretFile::new(
+            SecretFileKind::ManifestKey,
+            format!("manifest key {:?}", self.id),
+            path,
+        )
+    }
+
     fn source(&self) -> Result<(KeySourceKind, &str), VtopError> {
         let id = &self.id;
         match (self.env.as_deref(), self.file.as_deref()) {
@@ -172,8 +202,9 @@ impl ManifestKeyConfig {
     }
 
     /// Read and decode the key. Errors name the id and the variable or file,
-    /// never the value.
-    fn resolve(&self) -> Result<ManifestMacKey, VtopError> {
+    /// never the value. A key file other users can reach is refused before
+    /// it is opened (#733).
+    fn resolve(&self, policy: &SecretPolicy) -> Result<ManifestMacKey, VtopError> {
         use std::io::Read;
         let id = &self.id;
         let value = match self.source()? {
@@ -184,6 +215,8 @@ impl ManifestKeyConfig {
                 ))
             })?,
             (KeySourceKind::File, path) => {
+                crate::secret_file::enforce(&self.secret_file(path), policy)
+                    .map_err(|refused| VtopError::Config(refused.to_string()))?;
                 let mut text = String::new();
                 std::fs::File::open(path)
                     .and_then(|f| f.take(MAX_KEY_FILE_BYTES).read_to_string(&mut text))
@@ -331,7 +364,10 @@ impl fmt::Debug for ResolvedStateStore {
 }
 
 impl StateStoreConfig {
-    pub fn resolve(&self) -> Result<ResolvedStateStore, VtopError> {
+    /// The connection string. A `file:` reference other users can reach is
+    /// refused before it is read (#733); [`VtopConfig::resolve_state_store`]
+    /// passes the config's policy.
+    pub fn resolve(&self, policy: &SecretPolicy) -> Result<ResolvedStateStore, VtopError> {
         let value = match self {
             Self::Inline(value) => value.clone(),
             Self::Env(reference) => std::env::var(reference.env.trim()).map_err(|_| {
@@ -341,6 +377,15 @@ impl StateStoreConfig {
                 ))
             })?,
             Self::File(reference) => {
+                crate::secret_file::enforce(
+                    &SecretFile::new(
+                        SecretFileKind::StateStoreSecret,
+                        "the state-store secret file",
+                        reference.file.trim(),
+                    ),
+                    policy,
+                )
+                .map_err(|refused| VtopError::Config(refused.to_string()))?;
                 std::fs::read_to_string(reference.file.trim()).map_err(|e| {
                     VtopError::Config(format!(
                         "reading state-store secret file {}: {e}",
@@ -425,6 +470,30 @@ impl Serialize for StateStoreConfig {
             }
         }
     }
+}
+
+/// The database file a SQLite connection string names, or `None` for
+/// PostgreSQL and an in-memory database. Accepts `sqlite://path`,
+/// `sqlite:path` and a bare path, as the state store does.
+pub fn sqlite_database_file(conn: &str) -> Option<std::path::PathBuf> {
+    let conn = conn.trim();
+    if is_postgres_url(conn) {
+        return None;
+    }
+    let rest = conn
+        .strip_prefix("sqlite://")
+        .or_else(|| conn.strip_prefix("sqlite:"))
+        .unwrap_or(conn);
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    // The `mode=memory` QUERY PARAMETER, exactly - not those characters
+    // anywhere in the string, which a real path can contain (review).
+    let in_memory = query
+        .split('&')
+        .any(|parameter| parameter.eq_ignore_ascii_case("mode=memory"));
+    if path.is_empty() || path == ":memory:" || in_memory {
+        return None;
+    }
+    Some(std::path::PathBuf::from(path))
 }
 
 fn is_postgres_url(value: &str) -> bool {
@@ -1492,6 +1561,53 @@ impl VtopConfig {
         warnings
     }
 
+    /// How secret and ledger files are checked (#733): the override and the
+    /// engine's name for the audit record of an override.
+    pub fn secret_policy(&self) -> SecretPolicy {
+        SecretPolicy {
+            allow_loose: self.security.allow_loose_secret_permissions,
+            engine: Some(self.engine.name.clone()),
+        }
+    }
+
+    /// The state-store connection string, a `file:` reference checked under
+    /// [`VtopConfig::secret_policy`].
+    pub fn resolve_state_store(&self) -> Result<ResolvedStateStore, VtopError> {
+        self.engine.state_store.resolve(&self.secret_policy())
+    }
+
+    /// Every file the config names that [`crate::secret_file`] checks,
+    /// without reading any of them: the key files, the state-store secret
+    /// file, and an inline SQLite ledger with its `-wal` and `-shm` files. A
+    /// SQLite ledger named through `env:` or `file:` is checked when the
+    /// engine opens it, since naming it here would mean reading the secret.
+    pub fn secret_files(&self) -> Vec<SecretFile> {
+        let mut files = Vec::new();
+        if let Some(mac) = &self.manifest.mac {
+            for key in &mac.keys {
+                if let Ok((KeySourceKind::File, path)) = key.source() {
+                    files.push(key.secret_file(path));
+                }
+            }
+        }
+        match &self.engine.state_store {
+            StateStoreConfig::File(reference) if !reference.file.trim().is_empty() => {
+                files.push(SecretFile::new(
+                    SecretFileKind::StateStoreSecret,
+                    "the state-store secret file",
+                    reference.file.trim(),
+                ));
+            }
+            StateStoreConfig::Inline(value) => {
+                if let Some(database) = sqlite_database_file(value) {
+                    files.extend(crate::secret_file::sqlite_files(&database));
+                }
+            }
+            _ => {}
+        }
+        files
+    }
+
     /// Load and validate config from a YAML file.
     pub fn from_path(path: &Path) -> Result<Self, VtopError> {
         let text = std::fs::read_to_string(path)
@@ -1851,6 +1967,7 @@ impl VtopConfig {
     /// variable or file, never its value.
     pub fn resolve_manifest_keyring(&self) -> Result<ManifestKeyring, VtopError> {
         self.validate_manifest_mac()?;
+        let policy = self.secret_policy();
         if let Some(mac) = &self.manifest.mac {
             let keys = mac
                 .keys
@@ -1858,7 +1975,7 @@ impl VtopConfig {
                 .map(|k| {
                     Ok(KeyringKey {
                         id: k.id.clone(),
-                        key: k.resolve()?,
+                        key: k.resolve(&policy)?,
                         source: k.source()?.0,
                         legacy: k.legacy,
                     })
@@ -3217,12 +3334,179 @@ upload:
         let reference = StateStoreConfig::File(StateStoreFileRef {
             file: secret.path().to_string_lossy().into_owned(),
         });
-        let resolved = reference.resolve().unwrap();
+        let resolved = reference
+            .resolve(&crate::secret_file::SecretPolicy::strict())
+            .unwrap();
         assert_eq!(
             resolved.expose_secret(),
             "postgres://vtop:password@localhost/vtop?sslmode=disable"
         );
         assert!(!format!("{resolved:?}").contains("password"));
+    }
+
+    /// #733: a directory other users can enter, holding `name` at `mode`.
+    #[cfg(unix)]
+    fn file_in_open_dir(root: &Path, name: &str, contents: &str, mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = root.join("open");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    /// A keyring of one key read from `path`, with the override `loose`.
+    #[cfg(unix)]
+    fn keyring_from_file(path: &Path, loose: bool) -> VtopConfig {
+        let section = format!(
+            "  write_version: \"0.4\"\n  mac:\n    active: q4-2026\n    keys:\n      \
+             - {{id: q4-2026, file: {}}}\n",
+            path.display()
+        );
+        let mut yaml = with_manifest(&section);
+        if loose {
+            yaml.push_str("security:\n  allow_loose_secret_permissions: true\n");
+        }
+        let cfg = VtopConfig::from_yaml_str(&yaml).unwrap();
+        cfg.validate().unwrap();
+        cfg
+    }
+
+    /// #733: a key file other users can read or write is refused before it
+    /// is read, naming the key, the path, the mode, what was done and the
+    /// fix; an owner-only one is read.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_file_others_can_reach_is_refused_and_an_owner_only_one_is_read() {
+        let root = tempfile::tempdir().unwrap();
+        let key = "4d".repeat(32);
+        for (mode, readable) in [
+            (0o644, true),
+            (0o640, true),
+            (0o666, false),
+            (0o620, false),
+            (0o602, false),
+        ] {
+            let path = file_in_open_dir(root.path(), "q4", &key, mode);
+            let err = keyring_from_file(&path, false)
+                .resolve_manifest_keyring()
+                .unwrap_err()
+                .to_string();
+            for needle in [
+                "manifest key \"q4-2026\"".to_owned(),
+                path.display().to_string(),
+                format!("{mode:04o}"),
+                "the file was not read and nothing was started".to_owned(),
+            ] {
+                assert!(err.contains(&needle), "{mode:o}: {needle}: {err}");
+            }
+            let fix = if readable { "chmod 0400" } else { "chmod go-w" };
+            assert!(err.contains(fix), "{mode:o}: {err}");
+            assert!(!err.contains(&key), "the key leaked: {err}");
+        }
+        for mode in [0o400, 0o600] {
+            let path = file_in_open_dir(root.path(), "q4", &key, mode);
+            let keyring = keyring_from_file(&path, false)
+                .resolve_manifest_keyring()
+                .unwrap();
+            assert_eq!(keyring.active_id(), Some("q4-2026"), "{mode:o}");
+        }
+    }
+
+    /// #733: the override accepts a readable key file and never a writable
+    /// one.
+    #[cfg(unix)]
+    #[test]
+    fn the_override_accepts_a_readable_key_file_but_never_a_writable_one() {
+        let root = tempfile::tempdir().unwrap();
+        let key = "4d".repeat(32);
+        let path = file_in_open_dir(root.path(), "q4", &key, 0o644);
+        let keyring = keyring_from_file(&path, true)
+            .resolve_manifest_keyring()
+            .unwrap();
+        assert_eq!(keyring.active_id(), Some("q4-2026"));
+        for mode in [0o664, 0o646, 0o666] {
+            let path = file_in_open_dir(root.path(), "q4", &key, mode);
+            let err = keyring_from_file(&path, true)
+                .resolve_manifest_keyring()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no setting accepts it"), "{mode:o}: {err}");
+        }
+    }
+
+    /// #733: the state-store secret file follows the same rule.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_store_secret_file_others_can_read_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let url = "postgres://vtop:password@db/vtop";
+        let path = file_in_open_dir(root.path(), "store", url, 0o644);
+        let mut cfg = VtopConfig::from_yaml_str(tuning_base()).unwrap();
+        cfg.engine.state_store = StateStoreConfig::File(StateStoreFileRef {
+            file: path.to_string_lossy().into_owned(),
+        });
+        let err = cfg.resolve_state_store().unwrap_err().to_string();
+        assert!(
+            err.contains("the state-store secret file") && err.contains("0644"),
+            "{err}"
+        );
+        assert!(!err.contains("password"), "{err}");
+        cfg.security.allow_loose_secret_permissions = true;
+        assert_eq!(cfg.resolve_state_store().unwrap().expose_secret(), url);
+        let path = file_in_open_dir(root.path(), "store", url, 0o400);
+        cfg.security.allow_loose_secret_permissions = false;
+        cfg.engine.state_store = StateStoreConfig::File(StateStoreFileRef {
+            file: path.to_string_lossy().into_owned(),
+        });
+        assert_eq!(cfg.resolve_state_store().unwrap().expose_secret(), url);
+    }
+
+    /// #733: `security` defaults off, and a misspelt key in it is refused.
+    #[test]
+    fn the_security_section_defaults_off_and_refuses_unknown_keys() {
+        let cfg = VtopConfig::from_yaml_str(tuning_base()).unwrap();
+        assert!(!cfg.security.allow_loose_secret_permissions);
+        let err = VtopConfig::from_yaml_str(&format!(
+            "{}security:\n  allow_loose_secret_permission: true\n",
+            tuning_base()
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("allow_loose_secret_permission"), "{err}");
+    }
+
+    /// #733: the files `vtopctl validate` checks, by kind, without reading
+    /// any of them.
+    #[test]
+    fn secret_files_lists_the_key_files_the_secret_file_and_an_inline_sqlite_ledger() {
+        use crate::secret_file::SecretFileKind::*;
+        let section = KEYRING.replace("/run/secrets/q4", "/keys/q4");
+        let mut cfg = VtopConfig::from_yaml_str(&with_manifest(&section)).unwrap();
+        cfg.engine.state_store = StateStoreConfig::Inline("sqlite:///data/s.db".into());
+        let files: Vec<_> = cfg
+            .secret_files()
+            .into_iter()
+            .map(|f| (f.kind, f.path.display().to_string()))
+            .collect();
+        assert_eq!(
+            files,
+            [
+                (ManifestKey, "/keys/q4".to_owned()),
+                (StateStoreDatabase, "/data/s.db".to_owned()),
+                (StateStoreDatabase, "/data/s.db-wal".to_owned()),
+                (StateStoreDatabase, "/data/s.db-shm".to_owned()),
+            ]
+        );
+        cfg.engine.state_store = StateStoreConfig::File(StateStoreFileRef {
+            file: "/run/secrets/store".into(),
+        });
+        let kinds: Vec<_> = cfg.secret_files().into_iter().map(|f| f.kind).collect();
+        assert_eq!(kinds, [ManifestKey, StateStoreSecret]);
+        cfg.engine.state_store = StateStoreConfig::Inline("sqlite::memory:".into());
+        assert_eq!(cfg.secret_files().len(), 1);
     }
 
     #[test]

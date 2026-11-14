@@ -185,6 +185,7 @@ nav:
       - Logs and auditing: operate/logs-and-auditing.md
       - Auditing: operate/auditing.md
       - Scrub and coverage audit: operate/scrub-and-audit.md
+      - Secret files and their permissions: operate/secrets.md
       - Rotate the manifest MAC key: operate/manifest-key-rotation.md
       - Verification receipts: operate/verification-receipts.md
       - S3 Object Lock: OBJECT_LOCK_DEPLOYMENT.md

@@ -129,6 +129,28 @@ default anti-affinity is only preferred, so set required anti-affinity or zone
 spreading; on SIGTERM a leader releases its range lease so failover starts at
 once (`terminationGracePeriodSeconds`, default 60).
 
+## Secrets from an external manager
+
+The chart mounts its own TLS Secrets with `defaultMode: 0440` and the pod's
+`fsGroup: 10001`. To add a secret file from a manager (External Secrets
+Operator, the Secrets Store CSI driver, Vault Agent) to the chart's pods, use
+`extraVolumes` and `extraVolumeMounts`; mount the whole volume at a directory,
+never with `subPath`, and use `defaultMode: 0400`, which the kubelet turns
+into `0440` because of `fsGroup`.
+[`ci/external-secret-values.yaml`](../../helm/vtop/ci/external-secret-values.yaml)
+is a rendered example; the [chart README](../../helm/vtop/README.md#secrets-from-an-external-manager)
+has the details.
+
+The archive engine, which this chart does not run, checks the files that hold
+its secrets and its ledger before reading them, and refuses ones other users
+can reach. When you run it in Kubernetes yourself, mount its manifest keys
+and its `engine.state_store` secret the same way: a Secret volume with
+`defaultMode: 0400`, a pod `fsGroup` the engine's user belongs to, no
+`subPath`, and the file paths in `config.yaml`. The resulting `0440` files
+are accepted as a Kubernetes Secret mount. The rule, the override and the
+recipes for each manager are on
+[Secret files and their permissions](../operate/secrets.md).
+
 ## Upgrade notes
 
 Upgrade every node first, by `helm upgrade` with the new release's chart (or

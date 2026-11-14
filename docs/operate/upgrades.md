@@ -81,6 +81,20 @@ ignore the key and write none, so turn on `vtopctl scrub --require-receipts`
 only once every engine writes them; see
 [Verification receipts](verification-receipts.md).
 
+## Secret-file permissions (next release, #733)
+
+Engines of the next release refuse to start when a manifest key file, the
+`engine.state_store` secret file, the SQLite ledger (or its `-wal` or `-shm`
+file) or the `VTOP_AUDIT_LOG` file can be read or written by other local
+users, where earlier releases started. A `0644` ledger inside a `0700` data
+directory still starts, and so does a Kubernetes Secret mounted with
+`defaultMode: 0400` and `fsGroup`. Before upgrading, run the new
+`vtopctl validate` against each engine's config on its host or in its pod:
+it names every file that would be refused, with the `chmod` that fixes it.
+The rule, the mounting recipes and the
+`security.allow_loose_secret_permissions` override are in
+[Secret files and their permissions](secrets.md#upgrading-to-the-release-with-this-check).
+
 ## Before any upgrade
 
 - Read the release's section in the [roadmap](../ROADMAP.md), including its
@@ -92,4 +106,8 @@ only once every engine writes them; see
   `vtopctl migrate` from the new release with the migration identity before
   the new engines start, as in the
   [deployment sequence](../POSTGRES_DEPLOYMENT.md#deployment-sequence).
+- Run the new release's `vtopctl validate` against each engine's config,
+  where the engine runs: it reports what the new engine would refuse at
+  startup (from the next release, the
+  [secret-file permissions](secrets.md) too).
 - Stop each engine with SIGTERM and let its shutdown flush finish.

@@ -2255,19 +2255,48 @@ fn acquire_instance_locks(
     Ok(locks)
 }
 
+/// Refuse a SQLite ledger, `-wal` or `-shm` file other users can reach
+/// (#733), all of them in one message. Existing files only: a new ledger is
+/// created owner-only by the store. Nothing for PostgreSQL.
+pub(crate) fn check_sqlite_files(
+    config: &VtopConfig,
+    state_store: &vtop_core::config::ResolvedStateStore,
+) -> Result<(), VtopError> {
+    match vtop_core::config::sqlite_database_file(state_store.expose_secret()) {
+        Some(database) => vtop_core::secret_file::enforce_all(
+            &vtop_core::secret_file::sqlite_files(&database),
+            &config.secret_policy(),
+        )
+        .map_err(VtopError::Config),
+        None => Ok(()),
+    }
+}
+
 /// The state store, every request bounded by `engine.state_store_timeout_seconds`
 /// (#556). One function for every path that opens the ledger - the engine and
 /// `vtopctl prune-ledger` alike - so none can fall back to the default bound
-/// while the operator configured another (review of #568).
+/// while the operator configured another (review of #568), and none can open
+/// a SQLite ledger other users can reach (#733).
 pub(crate) async fn connect_configured_store(
-    engine: &vtop_core::config::EngineConfig,
+    config: &VtopConfig,
     state_store: &vtop_core::config::ResolvedStateStore,
 ) -> Result<Box<dyn StateStore>, VtopError> {
+    check_sqlite_files(config, state_store)?;
+    let engine = &config.engine;
     connect_state_store_with_deadline(
         state_store.expose_secret(),
         Duration::from_secs(engine.state_store_timeout_seconds),
     )
     .await
+}
+
+/// Every file the config names that holds a secret or the ledger, checked
+/// together before any is read (#733), so a refusal names all of the
+/// offenders at once. The readers check again, which covers a ledger named
+/// through `env:` or `file:` and any path that does not come through here.
+fn preflight_secret_files(config: &VtopConfig) -> Result<(), VtopError> {
+    vtop_core::secret_file::enforce_all(&config.secret_files(), &config.secret_policy())
+        .map_err(VtopError::Config)
 }
 
 impl Engine {
@@ -2282,7 +2311,8 @@ impl Engine {
     ) -> Result<Self, VtopError> {
         config.validate()?;
         streams.validate(&config)?;
-        let state_store = config.engine.state_store.resolve()?;
+        preflight_secret_files(&config)?;
+        let state_store = config.resolve_state_store()?;
         let locks = acquire_instance_locks(&config, &state_store)?;
         let cleanup = cleanup_work_dir(
             std::path::Path::new(&config.engine.work_dir),
@@ -2331,7 +2361,8 @@ impl Engine {
     pub async fn new(config: VtopConfig, streams: StreamsConfig) -> Result<Self, VtopError> {
         config.validate()?;
         streams.validate(&config)?;
-        let state_store = config.engine.state_store.resolve()?;
+        preflight_secret_files(&config)?;
+        let state_store = config.resolve_state_store()?;
         Self::new_with_state_store(config, streams, state_store).await
     }
 
@@ -2354,7 +2385,7 @@ impl Engine {
         }
 
         let manifest_keyring = Arc::new(config.resolve_manifest_keyring()?);
-        let store = connect_configured_store(&config.engine, &state_store).await?;
+        let store = connect_configured_store(&config, &state_store).await?;
         let backend = vtop_upload::build_backend(&config.upload).await?;
 
         let mut adapters: HashMap<SourceType, Box<dyn SourceAdapter>> = HashMap::new();
@@ -4197,7 +4228,7 @@ impl Engine {
         // The rows go to a digest before they are deleted (#560): without it,
         // a coverage audit would read the pruned history as holes, and lose
         // the ledger's record of what each manifest was.
-        let digest_dir = crate::coverage::default_digest_dir(&self.config.engine);
+        let digest_dir = crate::coverage::default_digest_dir(&self.config);
         match crate::coverage::prune_with_digest(
             self.store.as_ref(),
             &cutoff,

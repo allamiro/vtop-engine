@@ -35,7 +35,7 @@ async fn crash_before_commit_is_replayable_then_recovers() {
         "mock",
     );
 
-    let state_store = cfg.engine.state_store.resolve().unwrap();
+    let state_store = cfg.resolve_state_store().unwrap();
     let store = SqliteStateStore::connect(state_store.expose_secret())
         .await
         .unwrap();
@@ -125,7 +125,7 @@ async fn verification_failure_never_commits() {
         "mock",
     );
 
-    let state_store = cfg.engine.state_store.resolve().unwrap();
+    let state_store = cfg.resolve_state_store().unwrap();
     let store = SqliteStateStore::connect(state_store.expose_secret())
         .await
         .unwrap();
@@ -190,7 +190,7 @@ async fn metadata_preserving_content_replacement_never_commits() {
         vec![path.clone()],
         "mock",
     );
-    let state_store = cfg.engine.state_store.resolve().unwrap();
+    let state_store = cfg.resolve_state_store().unwrap();
     let store = SqliteStateStore::connect(state_store.expose_secret())
         .await
         .unwrap();
@@ -252,7 +252,7 @@ async fn backend_limited_verification_requires_explicit_opt_out() {
             "mock",
         );
         cfg.upload.require_strong_verification = require_strong;
-        let state_store = cfg.engine.state_store.resolve().unwrap();
+        let state_store = cfg.resolve_state_store().unwrap();
         let store = SqliteStateStore::connect(state_store.expose_secret())
             .await
             .unwrap();
