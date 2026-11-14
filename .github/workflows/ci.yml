@@ -1354,6 +1354,10 @@ jobs:
           - server: minio
             gating: true
             timeout: 30
+          # Second wave: a gateway over a POSIX tree.
+          - server: versity
+            gating: false
+            timeout: 20
     env:
       RESULTS: ${{ github.workspace }}/s3-compat-out/results-${{ matrix.server }}.jsonl
     steps:

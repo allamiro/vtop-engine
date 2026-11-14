@@ -1,0 +1,23 @@
+# Versity S3 Gateway v1.11.0 over a POSIX directory, versions in a second
+# directory (docker/s3-servers/versity). Settled from a first run of every
+# live case, in both SDK checksum modes, with every capability unknown
+# (#722): all passed. New to the matrix, so not gating yet (D11).
+id: versity
+name: Versity S3 Gateway
+gating: false
+capabilities:
+  put_get_head: pass
+  path_style: pass
+  # The lab is reached by path style only (decision D12).
+  virtual_host: not_applicable
+  checksum_sha256_enforced: pass
+  checksum_sha256_returned: pass
+  checksum_crc32_default: pass
+  multipart: pass
+  multipart_abort: pass
+  multipart_list_uploads: pass
+  multipart_resume: pass
+  versioning: pass
+  object_lock: pass
+  object_lock_enforced: pass
+  conditional_put: pass
