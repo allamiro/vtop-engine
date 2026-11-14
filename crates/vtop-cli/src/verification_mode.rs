@@ -91,6 +91,23 @@ pub(crate) fn class_name(rec: &BatchRecord) -> &'static str {
         .map_or("unknown", VerificationClass::as_str)
 }
 
+/// Count one recovery re-check of a VERIFIED row in
+/// `vtop_recovery_rechecks_total`, by the class the row was verified with and
+/// the re-check's result (#664). Bounded labels: three classes, four results.
+pub(crate) fn count_recheck(rec: &BatchRecord, recheck: Recheck) {
+    if let Some(mx) = telemetry::metrics() {
+        mx.recovery_rechecks_total
+            .with_label_values(&[
+                rec.tenant.as_str(),
+                rec.source_type.as_str(),
+                rec.format.extension(),
+                class_name(rec),
+                recheck.as_str(),
+            ])
+            .inc();
+    }
+}
+
 /// Recovery re-checked a VERIFIED row and may commit it (#664): say how its
 /// commit will be counted when the recorded class cannot speak for itself -
 /// it has none, or the re-check found something else - and what, if

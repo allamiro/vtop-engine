@@ -2889,6 +2889,25 @@ where
                 } else {
                     url.to_owned()
                 };
+                let result = match stored {
+                    StoredBy::SizeOnly if strict => "failed",
+                    StoredBy::SizeOnly => "size_only",
+                    StoredBy::Digest => "strong",
+                };
+                let rechecks = || {
+                    vtop_core::telemetry::init()
+                        .expect("metrics registry")
+                        .recovery_rechecks_total
+                        .with_label_values(&[
+                            &tenant,
+                            "file",
+                            TelemetryFormat::Raw.extension(),
+                            class_name,
+                            result,
+                        ])
+                        .get()
+                };
+                let rechecks_before = rechecks();
                 let before = size_only_count(&tenant);
                 let mut engine =
                     verified_ledger(dir.path(), &url, &id, &tenant, stored, class, false, strict)
@@ -2897,6 +2916,12 @@ where
                 let moved = size_only_count(&tenant) - before;
                 let row = engine.store.get_batch(&id).await.unwrap().unwrap();
                 let case = format!("{id}: {summary:?}");
+                assert_eq!(
+                    rechecks() - rechecks_before,
+                    1,
+                    "{case}: vtop_recovery_rechecks_total{{verification_class={class_name:?}, \
+                     result={result:?}}} counts the re-check"
+                );
                 if strict && matches!(stored, StoredBy::SizeOnly) {
                     assert_eq!(
                         (summary.committed, summary.replay_required, moved),

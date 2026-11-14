@@ -2531,6 +2531,7 @@ impl Engine {
                     // anything less trusts a stale claim about a system this
                     // process has never observed.
                     let recheck = self.storage_still_verified(&rec).await;
+                    verification_mode::count_recheck(&rec, recheck);
                     if recheck == Recheck::UnsupportedVersion {
                         // Written by a newer release (#671): not stale, only
                         // unreadable here. It is neither committed nor marked
