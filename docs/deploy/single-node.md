@@ -1,42 +1,46 @@
 # Single engine with SQLite
 
-The simplest production shape: one `vtopctl run` process on one host, with its
-ledger in a local SQLite file. This is Tier 0 in
+One `vtopctl run` process on one host, with its ledger in a local SQLite
+file. This is Tier 0 in
 [Production HA §9](../PRODUCTION_HA.md#9-deployment-topologies). There is no
-failover; a stopped engine resumes from its ledger when it starts again.
+failover: while the engine is down, data waits at the source, and a restart
+resumes from the ledger. If you have not archived anything yet, do
+[Your first real archive](../getting-started/first-archive.md) first.
 
-## What it needs
+## Prerequisites
 
-| Item | Purpose |
+| Item | Notes |
 |---|---|
 | `vtopctl` | From the [release binaries](../install/binaries.md) or the [container image](../install/container.md). |
-| `config.yaml` | Sources, upload target, batching. See the [reference](../configure/reference.md). |
-| `streams.yaml` (optional) | Per-stream tenant, format and checksum, in the same directory as `config.yaml`. See [Streams](../configure/streams.md). |
+| A bucket and credentials | Grant only what the backend needs: [security model §5](../SECURITY_MODEL.md#5-object-storage-permissions-and-least-privilege). |
 | A state directory | Holds the SQLite ledger. Create the directory; the database file is created on first start. Durable: back it up. |
 | A work directory | `engine.work_dir`, staging for batches in flight, created if missing. Scratch. |
-| Object storage credentials | From the environment, never the config file. |
 
 One engine per ledger. `run`, `process-once` and `replay` refuse to start
 while another engine on the same host holds the same state store or work
-directory, with an error that names "another VTOP engine".
+directory.
 
-## 1. Write the config
+## Steps
 
-Start from [`examples/config.yaml`](../../examples/config.yaml). The keys a
-single node always sets:
+### 1. Write the config
+
+Start from [`examples/config.yaml`](../../examples/config.yaml) or the
+minimal config in
+[Your first real archive](../getting-started/first-archive.md#1-write-a-minimal-config).
+The keys every deployment sets:
 
 ```yaml
 engine:
   name: vtop-engine
   state_store: "sqlite:///var/lib/vtop/state/vtop-state.db"
   work_dir: /var/lib/vtop/work
-
+batching: {}
+compression: {}
 sources:
   file:
     enabled: true
     paths:
       - /var/log/app/*.log
-
 upload:
   backend: s3_native
   bucket: telemetry-data
@@ -44,48 +48,27 @@ upload:
   region: us-east-1
 ```
 
-`upload.verify_tls` defaults to `true`, which requires an `https://` endpoint.
-`upload.require_strong_verification` also defaults to `true`; leave it on.
+Leave `upload.verify_tls` and `upload.require_strong_verification` at their
+default, `true`. Add per-source settings in [`streams.yaml`](../configure/streams.md).
 
-## 2. Validate it
-
-`validate` reads `config.yaml` and the `streams.yaml` beside it and contacts
-nothing:
+### 2. Validate it
 
 ```bash
 vtopctl validate --config /etc/vtop/config.yaml
 vtopctl validate --config /etc/vtop/config.yaml --print-effective
 ```
 
-It exits non-zero only for an invalid config. A risky setting is printed as a
-warning and still passes. `--print-effective` shows what each stream will run
-with and where each value came from; see
-[Streams](../configure/streams.md#check-what-each-stream-runs-with).
+`validate` contacts nothing and exits non-zero only for an invalid config.
+[`--print-effective`](../configure/print-effective.md) shows what each stream
+will run with.
 
-## 3. Provide credentials and start
+### 3. Run it as a service
 
-The native S3 backend uses the AWS SDK's standard credential chain, so the
-usual variables work:
-
-```bash
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export AWS_REGION=us-east-1
-export VTOP_METRICS_ADDR=127.0.0.1:9090   # optional: /metrics, /healthz, /readyz
-
-vtopctl run --config /etc/vtop/config.yaml
-```
-
-Grant the credentials only what the backend needs; the per-backend list is in
-the [security model §5](../SECURITY_MODEL.md#5-object-storage-permissions-and-least-privilege).
-
-## 4. Run it under a service manager
-
-SIGINT and SIGTERM are orderly stops: the engine finishes the source pass in
-progress, flushes every buffered batch through verification and commit, and
-exits 0. A second signal during that flush abandons it. Give the service
-manager a stop timeout long enough for one source pass plus one flush; the
-details are in [Stopping `vtopctl run`](../reference/cli.md#stopping-vtopctl-run).
+SIGINT and SIGTERM are orderly stops: the engine finishes the current source
+pass, flushes every buffered batch through verification and commit, and exits
+0. A second signal during that flush abandons it. Give the service manager a
+stop timeout long enough for one source pass plus one flush
+([Stopping `vtopctl run`](../reference/cli.md#stopping-vtopctl-run)).
 
 An example systemd unit (adjust paths, user and timeout to your host):
 
@@ -107,32 +90,42 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
-Keep `/etc/vtop/vtop.env` readable only by the service user: it holds the
-object storage credentials.
+`/etc/vtop/vtop.env` holds the object storage credentials
+(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`) and, to expose
+metrics, `VTOP_METRICS_ADDR=127.0.0.1:9090`. Keep it readable only by the
+service user.
 
-## 5. Check it is working
+In a container, the same config runs with the
+[image](../install/container.md#run-the-engine).
+
+## Verify it works
 
 ```bash
 vtopctl status --config /etc/vtop/config.yaml
 vtopctl list-batches --config /etc/vtop/config.yaml --json
+vtopctl audit-coverage --config /etc/vtop/config.yaml --check-storage
 curl -s http://127.0.0.1:9090/readyz
 ```
 
-Then set up [metrics and alerts](../operate/monitoring.md) and a scheduled
-[scrub and coverage audit](../operate/scrub-and-audit.md).
+Batches should reach `source_committed`, the audit should print
+`coverage audit PASSED`, and `/readyz` should answer `200`.
 
-## What to back up
+## What to monitor
 
-| Path | Why |
-|---|---|
-| The SQLite database file | The ledger: every batch's state, and the cursor recovery resumes from. |
-| `<database file>.ledger-digests/` | Written by ledger pruning. The coverage audit and the scrub read it to account for pruned rows. Unless `engine.ledger_digest_dir` names another directory. |
+- `vtop_verification_failures_total`, `vtop_source_read_errors_total`,
+  `vtop_retention_lost_records_total` and
+  `vtop_verification_mode{mode="size_only"}`: see
+  [Metrics and alerts](../operate/monitoring.md).
+- A scheduled `vtopctl scrub` and `audit-coverage`:
+  [Scrub and coverage audit](../operate/scrub-and-audit.md).
+- The ledger's size; set `engine.ledger_retention_days` to prune committed
+  rows ([reference](../configure/reference.md#engine)).
 
-`engine.work_dir` is scratch: staging files are removed after each batch, and
-leftovers from a crash are cleaned on restart.
+Back up the SQLite file and its `<database file>.ledger-digests/` directory:
+[Backup and recovery](../operate/backup-and-recovery.md).
 
-## Growing out of it
+## Upgrade notes
 
-Move to a [PostgreSQL ledger](../POSTGRES_DEPLOYMENT.md) when the ledger must
-survive the loss of the engine's host. That needs a `vtopctl` built with
-`--features postgres`. Several engines sharing one ledger is not supported yet.
+Stop the engine with SIGTERM, back up the ledger, replace the binary, start
+it. Downgrades are not supported. Read [Upgrades](../operate/upgrades.md) for
+the release you are moving to.

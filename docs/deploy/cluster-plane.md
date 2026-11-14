@@ -1,39 +1,48 @@
-# Cluster plane
+# Native cluster plane
 
 The cluster plane is VTOP's own replicated log, built alongside the archive
-engine. It is optional: the archive engine does not need it. Its design is
-[the native broker architecture](../NATIVE_BROKER_ARCHITECTURE.md) and its
-release-by-release status, including what each release does not do, is the
-[roadmap](../ROADMAP.md).
+engine and not needed by it. This page runs it as processes you manage; on
+Kubernetes, use [Kubernetes with Helm](kubernetes.md). What it is:
+[Architecture](../concepts/architecture.md#the-cluster-plane-optional). Its
+design is the [native broker architecture](../NATIVE_BROKER_ARCHITECTURE.md).
 
 !!! warning "Prototype"
 
     Read the known limitations of the release you deploy in the
-    [roadmap](../ROADMAP.md) before depending on the cluster plane.
+    [roadmap](../ROADMAP.md) before depending on it.
 
-## Parts
+## Prerequisites
 
-| Part | What it does |
-|---|---|
-| **Metadata Raft group** | Three or five voters holding cluster metadata: topics, ranges, node registrations, leases, placement and the feature level. Administered with `vtopctl meta`. |
-| **Data plane** | Range replicas that store sealed, proof-carrying segments. A range is led by the holder of its metadata lease; followers replicate, and a write is acknowledged on a quorum. Inspected with `vtopctl node`. |
-| **Promotion** | When the lease holder fails, a candidate takes the range after establishing the committed boundary from a quorum of fenced replicas. |
-| **Kafka gateway** | A Kafka wire-compatible listener in front of a range, so Kafka clients can produce and fetch. |
-| **Cold tier** | `vtopctl tier` copies sealed segments to object storage, verifies them and records the evidence in metadata. |
+- `vtop-node` and `vtopctl` from the same release.
+- Three or five hosts (or ports) for the metadata voters.
+- A CA and per-node leaf certificates for each plane, with the CN rules on
+  [Kubernetes with Helm](kubernetes.md#tls-secrets).
+- A YAML config per node. Every config struct rejects unknown keys, so a
+  misspelled key is a startup error. The quickest way to see a complete,
+  valid config is to render the chart: `helm template` writes each node's
+  config into the ConfigMap. The live-chaos harness,
+  [`scripts/live-chaos/lib.sh`](../../scripts/live-chaos/lib.sh), writes and
+  starts real three-node clusters and is the reference for hand-written
+  configs.
 
-## The `vtop-node` process
+## Steps
 
-`vtop-node` runs one of three roles, each from a YAML config:
+1. **Start each node** in its role:
 
-```bash
-vtop-node meta --config meta.yaml   # a metadata Raft voter
-vtop-node data --config data.yaml   # a data-plane replica
-vtop-node node --config node.yaml   # both roles in one process
-```
+    ```bash
+    vtop-node meta --config meta.yaml   # a metadata Raft voter
+    vtop-node data --config data.yaml   # a data-plane replica
+    vtop-node node --config node.yaml   # both roles in one process
+    ```
 
-Every config struct rejects unknown keys, so a misspelled key is a startup
-error. The quickest way to see a complete, valid config is to render the Helm
-chart: `helm template` writes each node's config into the ConfigMap.
+2. **Bootstrap the metadata group once**, with every listed voter running and
+   empty: `vtopctl meta init --members 1,2,3 --config admin.yaml`.
+
+3. **Register topics, ranges and nodes** through `vtopctl meta`
+   (`create-topic`, `register-node`, and the rest; `vtopctl meta --help` lists
+   them).
+
+The ports the Helm chart uses for each plane:
 
 | Port (chart default) | Plane |
 |---|---|
@@ -43,30 +52,32 @@ chart: `helm template` writes each node's config into the ConfigMap.
 | 9400 | Native produce and fetch |
 | 9500 | `/metrics`, `/healthz`, `/readyz` (unauthenticated) |
 
-Every plane uses mutual TLS unless the config says otherwise by name.
-
-## Deploying it
-
-- **Kubernetes:** the [Helm chart](kubernetes.md), co-located or separated
-  tiers, standalone or replicated ranges.
-- **Processes on hosts:** the live-chaos harness in
-  [`scripts/live-chaos/`](../../scripts/live-chaos/lib.sh) starts real
-  three-node clusters and is the reference for hand-written configs; what it
-  covers is in [Live chaos validation](../LIVE_CHAOS_VALIDATION.md).
-
-## The Kafka gateway
+### The Kafka gateway
 
 The gateway is a `kafka:` block in a data node's config. Only a leader or a
 standalone node may serve it, and its listener stays on loopback unless the
-config sets `any_interface`. The Helm chart does not render this block.
-
-How the gateway compares with Apache Kafka on the same machine, with every
-condition of the measurement, is in the
+config sets `any_interface`. The Helm chart does not render this block. How it
+compares with Apache Kafka, with every condition, is in the
 [Kafka comparison](../benchmarks/kafka-comparison.md) and
-[Kafka failover](../benchmarks/kafka-failover.md) benchmarks.
+[Kafka failover](../benchmarks/kafka-failover.md) reports.
 
-## Feature levels
+## Verify it works
 
-Metadata commands are gated by a cluster feature level, raised with
-`vtopctl meta enable-features` once every node runs a release that supports
-it. Raising is permanent. The procedure is on [Upgrades](../operate/upgrades.md).
+- `vtopctl meta status --config admin.yaml`: membership and a leader.
+- `vtopctl node status --config node-client.yaml`: each replica's committed
+  offset and lag.
+- `/readyz` on each node's observability address.
+- [Live chaos validation](../LIVE_CHAOS_VALIDATION.md) describes the
+  scenarios the harness runs, and what they do not prove yet.
+
+## What to monitor
+
+The node metrics and readiness rules are in
+[Node endpoints and metrics](../NODE_OBSERVABILITY.md), and the provisioned
+cluster alerts on [Metrics and alerts](../operate/monitoring.md#alerts).
+
+## Upgrade notes
+
+Upgrade every node first, then raise the feature level with
+`vtopctl meta node-versions` and `vtopctl meta enable-features`. Raising is
+permanent; see [Upgrades](../operate/upgrades.md#2-then-raise-the-cluster-feature-level).
