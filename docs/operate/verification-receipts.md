@@ -122,7 +122,8 @@ same retention, and the engine reads its retention back the way it reads the
 manifest's. A receipt the store did not lock is a failed receipt, not a
 failed batch. Because recovery never writes over an existing receipt, no
 second locked version appears beside the first. `vtopctl scrub
---check-retention` does not read receipts' retention yet.
+--check-retention` does not read receipts' retention yet
+([#710](https://github.com/allamiro/vtop-engine/issues/710)).
 
 ## Check them
 

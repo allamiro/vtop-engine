@@ -1001,7 +1001,8 @@ known limitations:
   different statement. Recovery writes one only for a batch still VERIFIED.
 - **Object Lock.** A receipt is written and its retention read back like a
   manifest's, and recovery never adds a second version beside one.
-  `vtopctl scrub --check-retention` does not read receipts' retention yet.
+  `vtopctl scrub --check-retention` does not read receipts' retention yet
+  ([#710](https://github.com/allamiro/vtop-engine/issues/710)).
 - **Going back.** Set `verification_receipts: false`. Receipts already written
   stay readable; drop `--require-receipts` from scheduled scrubs.
 
