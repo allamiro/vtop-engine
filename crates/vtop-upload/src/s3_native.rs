@@ -36,6 +36,7 @@ use bytes::Bytes;
 use std::path::Path;
 use std::sync::Arc;
 use vtop_core::checksum::digest_reader;
+use vtop_core::effective_config::VerificationMethod;
 use vtop_core::errors::VtopError;
 use vtop_core::types::ChecksumAlgorithm;
 
@@ -1338,7 +1339,8 @@ impl UploadBackend for S3NativeBackend {
                     Ok(VerificationResult::passed(
                         "stored content SHA-256 verified by read-back (no service \
                          whole-object checksum; multipart or unchecked upload)",
-                    ))
+                    )
+                    .by(VerificationMethod::ReadBack))
                 } else {
                     Ok(VerificationResult::failed(
                         "stored content SHA-256 mismatch on read-back",
@@ -1355,7 +1357,8 @@ impl UploadBackend for S3NativeBackend {
                     )));
                 }
                 if actual.eq_ignore_ascii_case(expected.hex) {
-                    Ok(VerificationResult::passed("stored content BLAKE3 verified"))
+                    Ok(VerificationResult::passed("stored content BLAKE3 verified")
+                        .by(VerificationMethod::ReadBack))
                 } else {
                     Ok(VerificationResult::failed("stored content BLAKE3 mismatch"))
                 }

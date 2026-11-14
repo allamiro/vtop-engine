@@ -63,6 +63,14 @@ pub struct ManifestConfig {
     /// or no key at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<ManifestMacConfig>,
+    /// Write a verification receipt, `<batch_id>.receipt.json`, beside each
+    /// manifest once its batch is VERIFIED (#671 release B): the class the
+    /// ledger recorded and the method the backend ran, signed like a 0.4
+    /// manifest. Off by default, because a consumer that lists the prefix
+    /// sees the extra objects. A receipt that cannot be written never holds
+    /// a batch back. Engines before this release ignore the key.
+    #[serde(default)]
+    pub verification_receipts: bool,
 }
 
 /// `manifest.mac` (#685). Unknown keys are refused, unlike the rest of the
@@ -2517,6 +2525,52 @@ upload:
             assert!(err.contains("manifest.write_version"), "{value}: {err}");
             assert!(err.contains(r#""0.3" or "0.4""#), "{value}: {err}");
         }
+    }
+
+    /// `manifest.verification_receipts` (#671 release B): off unless set,
+    /// a boolean, recorded as configured, and ignored by the v0.9.0 shape of
+    /// the section (no `deny_unknown_fields`), so an engine that has not been
+    /// upgraded keeps running and writes no receipts.
+    #[test]
+    fn verification_receipts_default_off_and_take_a_boolean() {
+        let base = tuning_base();
+        let parsed = VtopConfig::from_yaml_str(base).unwrap();
+        assert!(!parsed.manifest.verification_receipts);
+        assert!(!parsed
+            .configured_fields
+            .contains("manifest.verification_receipts"));
+        let cfg =
+            VtopConfig::from_yaml_str(&format!("{base}manifest:\n  verification_receipts: true\n"))
+                .unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.manifest.verification_receipts);
+        assert!(cfg
+            .configured_fields
+            .contains("manifest.verification_receipts"));
+        for value in ["\"yes\"", "1", "[true]"] {
+            let err = VtopConfig::from_yaml_str(&format!(
+                "{base}manifest:\n  verification_receipts: {value}\n"
+            ))
+            .expect_err(value)
+            .to_string();
+            assert!(
+                err.contains("manifest.verification_receipts"),
+                "{value}: {err}"
+            );
+        }
+
+        // A test-local copy of the section as v0.9.0 declares it.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct ManifestV090 {
+            #[serde(default)]
+            write_version: ManifestWriteVersion,
+            #[serde(default)]
+            mac: Option<ManifestMacConfig>,
+        }
+        let old: ManifestV090 =
+            serde_yaml::from_str("write_version: \"0.4\"\nverification_receipts: true\n").unwrap();
+        assert_eq!(old.write_version, ManifestWriteVersion::V0_4);
     }
 
     fn tuning_base() -> &'static str {

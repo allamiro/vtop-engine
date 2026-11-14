@@ -203,7 +203,7 @@ impl KeyNotices {
     /// about `source` should be logged now, `None` when it is suppressed. Per
     /// source, so one stream's notices never hide another's; sources are
     /// bounded by configuration and discovery.
-    fn admit(&self, kind: &'static str, source: &str) -> Option<u64> {
+    pub(crate) fn admit(&self, kind: &'static str, source: &str) -> Option<u64> {
         self.admit_at(kind, source, Instant::now())
     }
 
@@ -1538,6 +1538,40 @@ impl<'a> Pipeline<'a> {
                     .with_label_values(&l)
                     .inc();
             }
+        }
+
+        // The verification receipt (#671 release B, D5): after VERIFIED is
+        // durable, in this concurrent phase rather than the serial commit.
+        // Never a precondition for the commit (D6): a receipt that cannot be
+        // written is counted and logged, and the batch goes on to commit.
+        if self.config.manifest.verification_receipts {
+            let facts = crate::receipts::Facts {
+                batch_id: &batch_id,
+                tenant: &tenant,
+                manifest_uri: &manifest_uri,
+                manifest_sha256: &manifest.fields().manifest.sha256,
+                manifest_version_id: stored_manifest.version_id.as_deref(),
+                object_uri: &object_uri,
+                object_size_bytes: compressed.size_bytes,
+                checksum_algorithm: algo.as_str(),
+                object_checksum: object_checksum.as_deref().unwrap_or_default(),
+                // The version this attempt wrote; none for a reused object.
+                object_version_id: written.as_ref().and_then(|w| w.version_id.as_deref()),
+                class,
+                // What the backend ran on the OBJECT (D9): native S3's
+                // store checksum, or its read-back of a multipart object.
+                method: obj_v.method,
+                origin: vtop_core::manifest::RECEIPT_ORIGIN_ENGINE,
+            };
+            crate::receipts::write_after_verify(
+                self.backend.as_ref(),
+                &self.manifest_keyring,
+                self.config,
+                &self.key_notices,
+                &source.source_name,
+                &facts,
+            )
+            .await;
         }
 
         // Converted ONCE: per-write as_millis() truncation made eight sub-ms
@@ -3230,7 +3264,10 @@ impl Engine {
     /// manifest, binds it to the ledger, then asks the backend to verify the
     /// stored object content using the manifest's algorithm. HEAD metadata and
     /// uploader-written sidecars are never sufficient for a strong result.
-    async fn storage_still_verified(&self, rec: &BatchRecord) -> Recheck {
+    async fn storage_still_verified(
+        &self,
+        rec: &BatchRecord,
+    ) -> (Recheck, crate::scrub::BatchCheck) {
         // The check itself is shared with `vtopctl scrub` (#628), which runs
         // it on committed rows, so the two cannot drift apart. Its `Limited`
         // is exactly what this re-check calls size-only (#629): the backend
@@ -3240,6 +3277,12 @@ impl Engine {
         let check =
             crate::scrub::check_stored_batch(self.backend.as_ref(), &self.manifest_keyring, rec)
                 .await;
+        let recheck = self.judge_recheck(rec, &check);
+        (recheck, check)
+    }
+
+    /// What recovery concludes from its re-check of a VERIFIED row.
+    fn judge_recheck(&self, rec: &BatchRecord, check: &crate::scrub::BatchCheck) -> Recheck {
         match check.result {
             crate::scrub::ScrubResult::Ok => Recheck::Strong,
             crate::scrub::ScrubResult::UnsupportedVersion => {
@@ -3300,6 +3343,89 @@ impl Engine {
         }
     }
 
+    /// Write the verification receipt of a VERIFIED row recovery's re-check
+    /// passed, when the store has none (#671 release B, D8). The class is
+    /// the one the ledger recorded (#664), or the re-check's for a row from
+    /// before it; the method and the object are what the re-check verified.
+    /// A receipt already there is left as it is. Never holds the commit back.
+    async fn repair_receipt(
+        &self,
+        rec: &BatchRecord,
+        recheck: Recheck,
+        checked: &crate::scrub::BatchCheck,
+    ) {
+        let (Some(manifest_uri), Some(manifest_sha256), Some(object)) = (
+            rec.manifest_uri.as_deref(),
+            rec.manifest_sha256.as_deref(),
+            checked.object.as_ref(),
+        ) else {
+            // Not expected after a passing re-check; said, never skipped
+            // silently.
+            tracing::warn!(
+                batch_id = %rec.batch_id,
+                "recovery: no verification receipt written for a VERIFIED batch: the ledger row or \
+                 its re-check names no manifest or object; the batch is committed regardless, \
+                 and vtopctl scrub reports the receipt missing"
+            );
+            return;
+        };
+        let class = rec
+            .verification_class
+            .unwrap_or(if recheck == Recheck::SizeOnly {
+                vtop_state::VerificationClass::SizeOnly
+            } else {
+                vtop_state::VerificationClass::Strong
+            });
+        let facts = crate::receipts::Facts {
+            batch_id: &rec.batch_id,
+            tenant: &rec.tenant,
+            manifest_uri,
+            manifest_sha256,
+            manifest_version_id: rec.manifest_version_id.as_deref(),
+            object_uri: &object.uri,
+            object_size_bytes: object.size_bytes,
+            checksum_algorithm: &object.checksum_algorithm,
+            object_checksum: &object.checksum,
+            // Recovery did not write the object, so it has no version to name.
+            object_version_id: None,
+            class,
+            method: checked.method,
+            origin: vtop_core::manifest::RECEIPT_ORIGIN_RECOVERY,
+        };
+        match crate::receipts::repair(
+            self.backend.as_ref(),
+            &self.manifest_keyring,
+            &self.config,
+            &facts,
+        )
+        .await
+        {
+            Ok(crate::receipts::Repair::Written) => {
+                crate::receipts::count(&rec.tenant, "repaired");
+                tracing::info!(
+                    batch_id = %rec.batch_id,
+                    verification_class = class.as_str(),
+                    "recovery: wrote the missing verification receipt of a VERIFIED batch"
+                );
+            }
+            Ok(crate::receipts::Repair::AlreadyThere) => {}
+            Err(why) => {
+                crate::receipts::count(&rec.tenant, "failed");
+                if let Some(suppressed) = self.key_notices.admit("receipt_failed", &rec.source_name)
+                {
+                    tracing::warn!(
+                        event = "verification_receipt_failed",
+                        batch_id = %rec.batch_id,
+                        tenant = %rec.tenant,
+                        suppressed,
+                        "{}",
+                        crate::receipts::recovery_failure_message(&rec.batch_id, &why)
+                    );
+                }
+            }
+        }
+    }
+
     /// Recovery scan run at startup. Seeds adapters from committed batches and
     /// resolves incomplete batches without ever advancing source progress for
     /// unverified data.
@@ -3346,7 +3472,7 @@ impl Engine {
                     // verified (#69). Re-check the store before committing;
                     // anything less trusts a stale claim about a system this
                     // process has never observed.
-                    let recheck = self.storage_still_verified(&rec).await;
+                    let (recheck, checked) = self.storage_still_verified(&rec).await;
                     row.record("recheck", recheck.as_str());
                     verification_mode::count_recheck(&rec, recheck);
                     if recheck == Recheck::UnsupportedVersion {
@@ -3445,6 +3571,12 @@ impl Engine {
                         continue;
                     }
                     verification_mode::note_stored_class(&rec, recheck);
+                    // A VERIFIED row with no receipt: written now (D8 of
+                    // the #671 plan), from what this re-check proved, before
+                    // the commit, as the pipeline writes one before its own.
+                    if self.config.manifest.verification_receipts {
+                        self.repair_receipt(&rec, recheck, &checked).await;
+                    }
                     // The commit itself waits for every replay decision; see
                     // `recovery_commit` below.
                     spans::decide(&row, "recheck_passed");

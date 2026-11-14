@@ -12,9 +12,15 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub mod keyring;
+pub mod receipt;
 pub use keyring::{
     Authentication, KeyOutcome, KeyResult, KeySourceKind, KeyringKey, ManifestKeyring,
     KEY_LABEL_NONE, KEY_LABEL_OTHER,
+};
+pub use receipt::{
+    ParsedReceipt, ReceiptAuth, ReceiptBuilder, ReceiptManifest, ReceiptObject,
+    ReceiptVerification, VerificationReceipt, WrittenReceipt, MAX_RECEIPT_BYTES,
+    RECEIPT_METHOD_UNSPECIFIED, RECEIPT_ORIGIN_ENGINE, RECEIPT_ORIGIN_RECOVERY, RECEIPT_VERSION,
 };
 
 /// Protocol identifier embedded in every manifest.
@@ -463,7 +469,8 @@ impl ParsedManifest {
                 })
             }
             HashScheme::Canonical => {
-                let StrictJson(value) = serde_json::from_slice(bytes)?;
+                let StrictJson(value, _) =
+                    serde_json::from_slice::<StrictJson<ManifestDoc>>(bytes)?;
                 let mut decoded = VtopManifest::deserialize(&value)?;
                 // Defined in 0.4, so a malformed plan is a malformed document.
                 decoded.verification_plan = value
@@ -638,11 +645,23 @@ fn version_scheme(version: &str) -> Result<HashScheme, VtopError> {
 /// The 0.4 hash/MAC input: the stored document with `manifest.sha256` set to
 /// `""` (and `manifest.mac` too where the key is present), object keys sorted
 /// at every depth, serialized as compact JSON. Unknown fields are kept.
-fn canonical_auth_bytes(mut value: serde_json::Value) -> Result<Vec<u8>, VtopError> {
+fn canonical_auth_bytes(value: serde_json::Value) -> Result<Vec<u8>, VtopError> {
+    canonical_auth_bytes_of(value, "manifest")
+}
+
+/// The canonical form of a document whose embedded hash and MAC live in the
+/// object `block` (`manifest` for a 0.4 manifest, `receipt` for a
+/// verification receipt): `block.sha256` set to `""` (and `block.mac` too
+/// where the key is present), object keys sorted at every depth, compact
+/// JSON. Every other field is kept, known or not.
+pub(crate) fn canonical_auth_bytes_of(
+    mut value: serde_json::Value,
+    block: &str,
+) -> Result<Vec<u8>, VtopError> {
     let metadata = value
-        .get_mut("manifest")
+        .get_mut(block)
         .and_then(serde_json::Value::as_object_mut)
-        .ok_or_else(|| VtopError::Manifest("manifest metadata must be an object".into()))?;
+        .ok_or_else(|| VtopError::Manifest(format!("{block} metadata must be an object")))?;
     metadata.insert("sha256".into(), serde_json::Value::String(String::new()));
     if metadata.contains_key("mac") {
         metadata.insert("mac".into(), serde_json::Value::String(String::new()));
@@ -663,17 +682,34 @@ fn canonical_auth_bytes(mut value: serde_json::Value) -> Result<Vec<u8>, VtopErr
 ///   as an `f64`, so different stored numbers (`0.1` and
 ///   `0.10000000000000001`, or two integers above `u64::MAX`) would share
 ///   one hash, and an edit between them would pass verification.
-struct StrictJson(serde_json::Value);
+///
+/// `D` names the kind of document in the refusal: a 0.4 manifest, or a
+/// verification receipt, which is canonicalized the same way.
+pub(crate) struct StrictJson<D>(pub(crate) serde_json::Value, std::marker::PhantomData<D>);
 
-impl<'de> Deserialize<'de> for StrictJson {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(StrictVisitor).map(StrictJson)
+/// The document [`StrictJson`] is parsing, as its refusals name it.
+pub(crate) trait StrictDoc {
+    const NAME: &'static str;
+}
+
+/// A version 0.4 manifest.
+pub(crate) struct ManifestDoc;
+
+impl StrictDoc for ManifestDoc {
+    const NAME: &'static str = "a version 0.4 manifest";
+}
+
+impl<'de, D: StrictDoc> Deserialize<'de> for StrictJson<D> {
+    fn deserialize<De: serde::Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
+        deserializer
+            .deserialize_any(StrictVisitor::<D>(std::marker::PhantomData))
+            .map(|value| StrictJson(value, std::marker::PhantomData))
     }
 }
 
-struct StrictVisitor;
+struct StrictVisitor<D>(std::marker::PhantomData<D>);
 
-impl<'de> serde::de::Visitor<'de> for StrictVisitor {
+impl<'de, D: StrictDoc> serde::de::Visitor<'de> for StrictVisitor<D> {
     type Value = serde_json::Value;
 
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -694,7 +730,8 @@ impl<'de> serde::de::Visitor<'de> for StrictVisitor {
 
     fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
         Err(E::custom(format_args!(
-            "a version 0.4 manifest number must be an integer in the 64-bit range, not {v}"
+            "{} number must be an integer in the 64-bit range, not {v}",
+            D::NAME
         )))
     }
 
@@ -716,7 +753,7 @@ impl<'de> serde::de::Visitor<'de> for StrictVisitor {
 
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         let mut values = Vec::new();
-        while let Some(StrictJson(value)) = seq.next_element()? {
+        while let Some(StrictJson(value, _)) = seq.next_element::<StrictJson<D>>()? {
             values.push(value);
         }
         Ok(serde_json::Value::Array(values))
@@ -727,10 +764,11 @@ impl<'de> serde::de::Visitor<'de> for StrictVisitor {
         while let Some(key) = map.next_key::<String>()? {
             if object.contains_key(&key) {
                 return Err(serde::de::Error::custom(format_args!(
-                    "duplicate key {key:?} in a version 0.4 manifest"
+                    "duplicate key {key:?} in {}",
+                    D::NAME
                 )));
             }
-            let StrictJson(value) = map.next_value()?;
+            let StrictJson(value, _) = map.next_value::<StrictJson<D>>()?;
             object.insert(key, value);
         }
         Ok(serde_json::Value::Object(object))

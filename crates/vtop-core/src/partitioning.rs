@@ -211,6 +211,23 @@ pub fn manifest_file_name(batch_id: &str) -> String {
     format!("{batch_id}.manifest.json")
 }
 
+/// The verification receipt's file name (#671 release B):
+/// `{batch_id}.receipt.json`, beside `{batch_id}.manifest.json`.
+pub fn receipt_file_name(batch_id: &str) -> String {
+    format!("{batch_id}.receipt.json")
+}
+
+/// The URI of the verification receipt beside the manifest at
+/// `manifest_uri`: the same key with `.manifest.json` replaced by
+/// `.receipt.json`. `None` for a URI that does not end in `.manifest.json`,
+/// which no engine writes.
+pub fn receipt_uri(manifest_uri: &str) -> Option<String> {
+    manifest_uri
+        .strip_suffix(".manifest.json")
+        .filter(|stem| !stem.is_empty() && !stem.ends_with('/'))
+        .map(|stem| format!("{stem}.receipt.json"))
+}
+
 /// Build a full object URI:
 /// `s3://{bucket}/{prefix}/{resolved}/{object_file_name}`.
 pub fn object_uri(
@@ -297,6 +314,12 @@ mod tests {
         let resolved = resolve_template(DEFAULT_TEMPLATE, &ctx());
         let m = manifest_uri("telemetry-data", "telemetry-data", &resolved, "vtop-b1");
         assert!(m.ends_with("vtop-b1.manifest.json"));
+        assert_eq!(
+            receipt_uri(&m).unwrap(),
+            m.replace("vtop-b1.manifest.json", "vtop-b1.receipt.json")
+        );
+        assert_eq!(receipt_uri("s3://b/x/obj.raw.gz"), None);
+        assert_eq!(receipt_uri("s3://b/x/.manifest.json"), None);
     }
 
     #[test]

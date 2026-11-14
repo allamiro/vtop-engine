@@ -24,13 +24,22 @@ async fn assert_read_back(backend: &dyn UploadBackend, uri: &str) {
             result.message
         );
         assert_eq!(result.backend_limited, algorithm == ChecksumAlgorithm::None);
+        let expected_method = if result.backend_limited {
+            VerificationMethod::SizeOnly
+        } else {
+            VerificationMethod::ReadBack
+        };
         assert_eq!(
             verification_method(backend.backend_name(), algorithm),
-            if result.backend_limited {
-                VerificationMethod::SizeOnly
-            } else {
-                VerificationMethod::ReadBack
-            }
+            expected_method
+        );
+        // #671 release B (D9): the result says which check ran, so a
+        // verification receipt names it instead of guessing from the config.
+        assert_eq!(
+            result.method,
+            Some(expected_method),
+            "{}: {algorithm_name}",
+            backend.backend_name()
         );
         if algorithm != ChecksumAlgorithm::None {
             let wrong = backend
@@ -132,8 +141,11 @@ fn native_s3_method_matches_verify_object() {
                     let head = request.starts_with(b"HEAD ");
                     captured.lock().unwrap().push(if head { "HEAD" } else { "GET" });
                     // base64 SHA-256 of 'payload', computed independently.
-                    let checksum = "I59Z7VXnN8dxR89VrQwbAwttfudIp0JpUvm4UtWpNeU=";
-                    let response = format!("HTTP/1.1 200 OK\r\nContent-Length: 7\r\nx-amz-checksum-sha256: {checksum}\r\nConnection: close\r\n\r\n{}", if head { "" } else { "payload" });
+                    // The `multipart` key has no whole-object checksum, as
+                    // S3 answers for a multipart upload (#482).
+                    let multipart = String::from_utf8_lossy(&request).contains("/multipart");
+                    let checksum = if multipart { String::new() } else { "x-amz-checksum-sha256: I59Z7VXnN8dxR89VrQwbAwttfudIp0JpUvm4UtWpNeU=\r\n".to_owned() };
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Length: 7\r\n{checksum}Connection: close\r\n\r\n{}", if head { "" } else { "payload" });
                     socket.write_all(response.as_bytes()).await.unwrap();
                 });
             }
@@ -149,7 +161,17 @@ fn native_s3_method_matches_verify_object() {
             assert_eq!(method, match algorithm { ChecksumAlgorithm::Sha256=>VerificationMethod::StoreChecksum, ChecksumAlgorithm::Blake3=>VerificationMethod::ReadBack, ChecksumAlgorithm::None=>VerificationMethod::SizeOnly });
             assert_eq!(*requests.lock().unwrap(), if method==VerificationMethod::ReadBack {vec!["HEAD","GET"]} else {vec!["HEAD"]});
             assert_eq!(result.backend_limited, method==VerificationMethod::SizeOnly);
+            assert_eq!(result.method, Some(method), "{name}: {}", result.message);
         }
+        // The fallback (#482): no service checksum, so the SHA-256 is read
+        // back, and the result says so (D9 of the #671 plan): the configured
+        // method was store_checksum, the one that ran is read_back.
+        requests.lock().unwrap().clear();
+        let digest = digest_bytes(ChecksumAlgorithm::Sha256, b"payload").unwrap();
+        let result = backend.verify_object("s3://b/multipart", 7, Some(ObjectChecksum::new("sha256", &digest))).await.unwrap();
+        assert!(result.passed && !result.backend_limited, "{}", result.message);
+        assert_eq!(*requests.lock().unwrap(), vec!["HEAD", "GET"]);
+        assert_eq!(result.method, Some(VerificationMethod::ReadBack), "{}", result.message);
         server.abort();
     });
 }
@@ -288,4 +310,83 @@ async fn mock_backends_method_matches_verify_object() {
             }
         }
     }
+}
+
+/// The in-process mock says which check ran too (#671 release B, D9), so the
+/// engine tests that pin a receipt's method exercise the same field the real
+/// backends set: hashing the stored bytes is `read_back`; S3 semantics give
+/// `store_checksum` for a single PUT and `read_back` for a multipart object
+/// (no whole-object service checksum); a size-only pass is `size_only`; a
+/// failed check names none.
+#[tokio::test]
+async fn the_mock_reports_the_method_it_ran() {
+    use vtop_upload::MockBackend;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("input");
+    std::fs::write(&file, b"payload").unwrap();
+    let digest = digest_bytes(ChecksumAlgorithm::Sha256, b"payload").unwrap();
+    let sha = || Some(ObjectChecksum::new("sha256", &digest));
+
+    let plain = MockBackend::new();
+    plain.put_object(&file, "s3://b/k", sha()).await.unwrap();
+    let r = plain.verify_object("s3://b/k", 7, sha()).await.unwrap();
+    assert_eq!(
+        (r.passed, r.method),
+        (true, Some(VerificationMethod::ReadBack))
+    );
+    let r = plain.verify_object("s3://b/k", 7, None).await.unwrap();
+    assert_eq!(
+        (r.passed, r.method),
+        (true, Some(VerificationMethod::SizeOnly))
+    );
+    let r = plain
+        .verify_object(
+            "s3://b/k",
+            7,
+            Some(ObjectChecksum::new("sha256", &"0".repeat(64))),
+        )
+        .await
+        .unwrap();
+    assert_eq!((r.passed, r.method), (false, None), "{}", r.message);
+
+    let limited = MockBackend::limited();
+    limited.put_object(&file, "s3://b/k", sha()).await.unwrap();
+    let r = limited.verify_object("s3://b/k", 7, sha()).await.unwrap();
+    assert_eq!(
+        (r.backend_limited, r.method),
+        (true, Some(VerificationMethod::SizeOnly))
+    );
+
+    let s3 = MockBackend::new().with_s3_checksum_semantics();
+    s3.put_object(&file, "s3://b/single", sha()).await.unwrap();
+    let r = s3.verify_object("s3://b/single", 7, sha()).await.unwrap();
+    assert_eq!(
+        (r.passed, r.method),
+        (true, Some(VerificationMethod::StoreChecksum)),
+        "{}",
+        r.message
+    );
+    let created = s3
+        .create_multipart_upload("s3://b/multi", "application/octet-stream", sha())
+        .await
+        .unwrap();
+    let part = s3
+        .upload_part(
+            "s3://b/multi",
+            &created.upload_id,
+            1,
+            bytes::Bytes::from_static(b"payload"),
+        )
+        .await
+        .unwrap();
+    s3.complete_multipart_upload("s3://b/multi", &created.upload_id, &[part])
+        .await
+        .unwrap();
+    let r = s3.verify_object("s3://b/multi", 7, sha()).await.unwrap();
+    assert_eq!(
+        (r.passed, r.method),
+        (true, Some(VerificationMethod::ReadBack)),
+        "{}",
+        r.message
+    );
 }

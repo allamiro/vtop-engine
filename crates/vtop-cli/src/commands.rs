@@ -171,6 +171,14 @@ pub enum Command {
         /// in the config, and `s3:GetObjectRetention` on the bucket.
         #[arg(long)]
         check_retention: bool,
+        /// Check each batch's verification receipt (#671), and report a
+        /// missing one as a finding. Receipts are checked without this flag
+        /// when the config sets `manifest.verification_receipts`, and then a
+        /// missing one (such as a batch archived before receipts were
+        /// enabled) is counted, not a finding. Read-only: the scrub writes no
+        /// receipt.
+        #[arg(long)]
+        require_receipts: bool,
     },
     /// Incrementally delete old SOURCE_COMMITTED ledger rows (#128). The
     /// newest committed row per source path always survives, so recovery
@@ -938,6 +946,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             seed,
             metrics_file,
             check_retention,
+            require_receipts,
         } => {
             let (cfg, streams) = load(config)?;
             init_tracing(
@@ -956,6 +965,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 let retention_days = cfg.engine.ledger_retention_days;
                 let retention_mode =
                     crate::object_lock::scrub_retention_mode(&cfg, *check_retention)?;
+                let check_receipts = cfg.manifest.verification_receipts || *require_receipts;
                 // Read-only construction, as for audit-coverage: a scrub may run
                 // beside a live engine.
                 let engine = Engine::new(cfg, streams).await?;
@@ -984,6 +994,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                     sample: sample.map(to_usize),
                     seed: *seed,
                     check_retention: retention_mode,
+                    check_receipts,
+                    require_receipts: *require_receipts,
                 };
                 // The run's locks, from before anything it will replace is read
                 // until it has published or rolled back (review of #652): an
@@ -1094,6 +1106,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 .engine(&engine_name)
                 .param("cursor_file", cursor.display())
                 .param("check_retention", check_retention)
+                .param("require_receipts", require_receipts)
                 .after("cursor_moved", cursor_moved)
                 .after("passed", scrubbed.is_ok());
                 if let Some(limit) = limit {

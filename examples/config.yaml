@@ -123,6 +123,13 @@ compression:
 # this release ignore the section and keep writing 0.3. Quote the value.
 # manifest:
 #   write_version: "0.4"
+#   # Verification receipts (#671): after each batch is verified, write
+#   # <batch_id>.receipt.json beside its manifest, naming the verification
+#   # class and the method the store ran, signed like the manifest. Off by
+#   # default: a consumer listing the prefix sees the extra objects. Never part
+#   # of the commit; `vtopctl scrub` reports missing ones (as findings with
+#   # --require-receipts). Works with either manifest version.
+#   verification_receipts: true
 #   # The manifest MAC keyring (#685), version 0.4 only. The active key signs
 #   # and its id is written in manifest.mac_key_id; every key verifies the
 #   # manifests that name it; the legacy key verifies manifests with no id.

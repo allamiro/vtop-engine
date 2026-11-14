@@ -101,6 +101,7 @@ to rotate it, move to [`manifest.mac`](#manifestmac), listing it there with
 |---|---|---|
 | `write_version` | `"0.3"` | The manifest version new batches get: `"0.3"` or `"0.4"`, quoted. Anything else, an unquoted number included, fails config load. `"0.4"` adds `verification_plan` (the configured verification method and `require_strong`) and is hashed over the stored document. |
 | `mac` | - | The manifest MAC keyring: several keys by id, one signing. Needs `write_version: "0.4"`. See [`manifest.mac`](#manifestmac). |
+| `verification_receipts` | `false` | Write a verification receipt, `<batch_id>.receipt.json`, beside each manifest once its batch is verified: the verification class and the method the store ran, signed like a 0.4 manifest. Never part of the commit. Works with either manifest version. See [Verification receipts](../operate/verification-receipts.md). |
 
 Set `"0.4"` only once every engine, `vtopctl scrub` and auditor that reads the
 archive runs v0.8.0 or later: v0.7.0 and earlier report `0.4` manifests as
@@ -110,6 +111,13 @@ a misspelled key inside it, so check the startup line or
 `validate --print-effective`. Setting `"0.3"` again goes back; `0.4`
 manifests already written stay readable. See the protocol draft,
 [§11.2](../VTOP_PROTOCOL_DRAFT.md#112-field-reference).
+
+`verification_receipts: true` adds one small object per batch beside its
+manifest. A consumer that lists the archive's prefix sees them, which is why
+it is off by default. An engine before this release ignores the key and
+writes none. A receipt that cannot be written is logged and counted, and the
+batch commits regardless; `vtopctl scrub` reports receipts that are missing.
+See the protocol draft, [§11.3](../VTOP_PROTOCOL_DRAFT.md#113-verification-receipt-extension).
 
 ### `manifest.mac`
 

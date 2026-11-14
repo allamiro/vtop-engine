@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 const ARTIFACT_SUFFIXES: &[&str] = &[
     ".manifest.json",
+    ".receipt.json",
     ".cef.gz",
     ".cef.zst",
     ".cef",

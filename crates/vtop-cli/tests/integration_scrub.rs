@@ -1677,3 +1677,406 @@ async fn the_single_key_setting_verifies_a_keyring_manifest_signed_with_its_key(
         }
     }
 }
+
+// ---- #671 release B: verification receipts -----------------------------------
+
+use vtop_cli::scrub::ReceiptResult;
+use vtop_core::manifest::{ManifestKeyring, ParsedReceipt, ReceiptBuilder};
+use vtop_core::partitioning::receipt_uri;
+
+/// An archive of `n` batches written with `manifest.verification_receipts`.
+async fn receipted_archive(n: usize, mac_env: Option<&str>) -> Archive {
+    let dir = tempfile::tempdir().unwrap();
+    let inputs: Vec<PathBuf> = (0..n)
+        .map(|i| write_input(dir.path(), &format!("receipt-{i}.log"), 3 + i))
+        .collect();
+    let mut cfg = config(dir.path(), &inputs, "mock");
+    cfg.manifest_mac_key_env = mac_env.map(str::to_owned);
+    cfg.manifest.verification_receipts = true;
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let mock = Arc::new(MockBackend::new());
+    engine.backend = mock.clone();
+    let outcomes = engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(outcomes.len(), n);
+    assert!(outcomes.iter().all(|o| o.committed), "{outcomes:?}");
+    Archive { dir, engine, mock }
+}
+
+fn with_receipts(require: bool) -> ScrubOptions {
+    ScrubOptions {
+        check_receipts: true,
+        require_receipts: require,
+        ..ScrubOptions::default()
+    }
+}
+
+fn receipt_count(report: &ScrubReport, result: ReceiptResult) -> u64 {
+    report.receipts.get(result.as_str()).copied().unwrap_or(0)
+}
+
+/// Receipt findings as `(batch_id, result)`.
+fn receipt_findings(report: &ScrubReport) -> Vec<(String, ReceiptResult)> {
+    report
+        .findings
+        .iter()
+        .filter_map(|f| f.receipt.map(|r| (f.batch_id.clone(), r)))
+        .collect()
+}
+
+impl Archive {
+    fn receipt_uri_of(&self, row: &BatchRecord) -> String {
+        receipt_uri(row.manifest_uri.as_deref().unwrap()).unwrap()
+    }
+
+    async fn stored_receipt(&self, row: &BatchRecord) -> Vec<u8> {
+        self.mock
+            .get_object_bounded(&self.receipt_uri_of(row), 1 << 16)
+            .await
+            .unwrap()
+    }
+
+    /// A receipt for `row` built from its stored one with `edit` applied,
+    /// signed with `keyring`: well formed, hashed and (with a key) MAC'd.
+    async fn rebuilt_receipt(
+        &self,
+        row: &BatchRecord,
+        keyring: &ManifestKeyring,
+        edit: impl FnOnce(&mut ReceiptBuilder),
+    ) -> Vec<u8> {
+        let stored = ParsedReceipt::from_slice(&self.stored_receipt(row).await).unwrap();
+        let r = stored.fields();
+        let mut b = ReceiptBuilder {
+            batch_id: r.batch_id.clone(),
+            manifest_uri: r.manifest.uri.clone(),
+            manifest_sha256: r.manifest.sha256.clone(),
+            manifest_version_id: r.manifest.version_id.clone(),
+            object_uri: r.object.uri.clone(),
+            object_size_bytes: r.object.size_bytes,
+            object_checksum_algorithm: r.object.checksum_algorithm.clone(),
+            object_checksum: r.object.checksum.clone(),
+            object_version_id: r.object.version_id.clone(),
+            class: r.verification.class.clone(),
+            method: r.verification.method.clone(),
+            verified_at: r.verified_at.clone(),
+            verified_by: r.verified_by.clone(),
+            origin: r.origin.clone(),
+        };
+        edit(&mut b);
+        b.build_signed(keyring).unwrap().bytes().to_vec()
+    }
+}
+
+#[tokio::test]
+async fn a_receipted_archive_scrubs_clean_with_every_receipt_ok() {
+    let a = receipted_archive(3, None).await;
+    let report = a.scrub(&with_receipts(true)).await;
+    assert!(report.passed, "{report:#?}");
+    assert_eq!(receipt_count(&report, ReceiptResult::Ok), 3, "{report:#?}");
+    assert!(report.lines().iter().any(|l| l.starts_with("receipts: ")));
+    // Without the check, nothing about receipts is read or reported.
+    let report = a.scrub(&opts()).await;
+    assert!(report.receipts.is_empty(), "{report:#?}");
+}
+
+/// D8: a missing receipt is reported; it fails the scrub only under
+/// `--require-receipts`.
+#[tokio::test]
+async fn a_missing_receipt_is_reported_and_is_a_finding_only_when_required() {
+    let a = receipted_archive(2, None).await;
+    let ledger = a.ledger().await;
+    let victim = &ledger[1];
+    a.mock
+        .delete_object(&a.receipt_uri_of(victim))
+        .await
+        .unwrap();
+
+    let report = a.scrub(&with_receipts(false)).await;
+    assert!(
+        report.passed,
+        "missing is not a finding by default: {report:#?}"
+    );
+    assert_eq!(receipt_count(&report, ReceiptResult::Missing), 1);
+    assert_eq!(receipt_count(&report, ReceiptResult::Ok), 1);
+
+    let report = a.scrub(&with_receipts(true)).await;
+    assert!(!report.passed);
+    assert_eq!(
+        receipt_findings(&report),
+        vec![(victim.batch_id.clone(), ReceiptResult::Missing)]
+    );
+    let finding = &report.findings[0];
+    assert!(
+        finding.detail.contains(&a.receipt_uri_of(victim)),
+        "{finding:?}"
+    );
+    assert_eq!(
+        finding.result,
+        ScrubResult::Ok,
+        "the content itself is fine"
+    );
+    let line = report
+        .lines()
+        .into_iter()
+        .find(|l| l.starts_with("FAIL receipt missing"))
+        .unwrap();
+    assert!(line.contains(&victim.batch_id), "{line}");
+}
+
+/// Batches archived before receipts were enabled have none; that backlog
+/// does not fail a scrub unless `--require-receipts` asks for it.
+#[tokio::test]
+async fn a_pre_opt_in_backlog_does_not_fail_the_scrub_by_default() {
+    let a = archive(3).await;
+    let report = a.scrub(&with_receipts(false)).await;
+    assert!(report.passed, "{report:#?}");
+    assert_eq!(receipt_count(&report, ReceiptResult::Missing), 3);
+    let report = a.scrub(&with_receipts(true)).await;
+    assert!(!report.passed);
+    assert_eq!(receipt_findings(&report).len(), 3);
+}
+
+/// Each kind of damage is reported with its own result, naming the batch,
+/// and nothing else is: a receipt edited in place (its hash fails), one
+/// bound to another manifest digest or another batch, and one whose class
+/// disagrees with the ledger.
+#[tokio::test]
+async fn a_tampered_or_rebound_receipt_is_reported() {
+    let a = receipted_archive(3, None).await;
+    let ledger = a.ledger().await;
+    let none = ManifestKeyring::default();
+
+    // Edited in place: the method changed, the hash left as it was.
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&a.stored_receipt(&ledger[0]).await).unwrap();
+    doc["verification"]["method"] = serde_json::json!("store_checksum");
+    a.overwrite(
+        &a.receipt_uri_of(&ledger[0]),
+        &serde_json::to_vec_pretty(&doc).unwrap(),
+        true,
+    )
+    .await;
+    // Well formed and hashed, but naming another batch's manifest digest.
+    let other_digest = ledger[2].manifest_sha256.clone().unwrap();
+    let rebound = a
+        .rebuilt_receipt(&ledger[1], &none, |b| b.manifest_sha256 = other_digest)
+        .await;
+    a.overwrite(&a.receipt_uri_of(&ledger[1]), &rebound, true)
+        .await;
+    // Well formed, its class is not the one the ledger recorded.
+    let reclassed = a
+        .rebuilt_receipt(&ledger[2], &none, |b| b.class = "size_only".into())
+        .await;
+    a.overwrite(&a.receipt_uri_of(&ledger[2]), &reclassed, true)
+        .await;
+
+    let report = a.scrub(&with_receipts(false)).await;
+    assert!(!report.passed);
+    assert_eq!(
+        receipt_findings(&report),
+        vec![
+            (ledger[0].batch_id.clone(), ReceiptResult::Invalid),
+            (ledger[1].batch_id.clone(), ReceiptResult::Mismatched),
+            (ledger[2].batch_id.clone(), ReceiptResult::Mismatched),
+        ],
+        "{report:#?}"
+    );
+    assert_eq!(count(&report, ScrubResult::Ok), 3, "content is intact");
+    let details: Vec<&str> = report.findings.iter().map(|f| f.detail.as_str()).collect();
+    assert!(details[0].contains("does not authenticate"), "{details:?}");
+    assert!(details[1].contains("manifest digest"), "{details:?}");
+    assert!(details[2].contains("class"), "{details:?}");
+
+    // Batch 0's genuine receipt copied to batch 1's key: another batch's.
+    let copied = a.rebuilt_receipt(&ledger[0], &none, |_| {}).await;
+    a.overwrite(&a.receipt_uri_of(&ledger[1]), &copied, true)
+        .await;
+    let report = a.scrub(&with_receipts(false)).await;
+    assert!(receipt_findings(&report)
+        .contains(&(ledger[1].batch_id.clone(), ReceiptResult::Mismatched)));
+}
+
+/// With a key configured, a receipt forged without the MAC fails, even with
+/// a correct unkeyed hash; one signed by a key this scrub does not hold is
+/// unauthenticated, not invalid (#685: unknown is never corrupt).
+#[tokio::test]
+async fn a_forged_or_foreign_key_receipt_is_reported_by_its_kind() {
+    let env = format!("VTOP_TEST_SCRUB_RECEIPT_MAC_{}", std::process::id());
+    std::env::set_var(&env, "5a".repeat(32));
+    let a = receipted_archive(2, Some(&env)).await;
+    std::env::remove_var(&env);
+    let report = a.scrub(&with_receipts(true)).await;
+    assert!(report.passed, "signed receipts verify: {report:#?}");
+    let ledger = a.ledger().await;
+
+    let forged = a
+        .rebuilt_receipt(&ledger[0], &ManifestKeyring::default(), |_| {})
+        .await;
+    a.overwrite(&a.receipt_uri_of(&ledger[0]), &forged, true)
+        .await;
+    let foreign = ManifestKeyring::new(
+        "elsewhere",
+        vec![vtop_core::manifest::KeyringKey {
+            id: "elsewhere".into(),
+            key: vtop_core::manifest::ManifestMacKey::from_hex(&"9e".repeat(32)).unwrap(),
+            source: vtop_core::manifest::KeySourceKind::Env,
+            legacy: false,
+        }],
+        Vec::new(),
+    )
+    .unwrap();
+    let signed_elsewhere = a.rebuilt_receipt(&ledger[1], &foreign, |_| {}).await;
+    a.overwrite(&a.receipt_uri_of(&ledger[1]), &signed_elsewhere, true)
+        .await;
+
+    let report = a.scrub(&with_receipts(false)).await;
+    assert_eq!(
+        receipt_findings(&report),
+        vec![
+            (ledger[0].batch_id.clone(), ReceiptResult::Invalid),
+            (ledger[1].batch_id.clone(), ReceiptResult::Unauthenticated),
+        ],
+        "{report:#?}"
+    );
+    assert!(report.findings[0].detail.contains("MAC"), "{report:#?}");
+    assert!(
+        report.findings[1].detail.contains("elsewhere"),
+        "{report:#?}"
+    );
+}
+
+/// The command: receipts are checked when the config enables them or
+/// `--require-receipts` is given, and counted in the metrics file.
+#[tokio::test]
+async fn the_command_checks_receipts_and_require_receipts_fails_on_a_missing_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let inputs = vec![
+        write_input(dir.path(), "a.log", 3),
+        write_input(dir.path(), "b.log", 4),
+    ];
+    let mut cfg = config(dir.path(), &inputs, "localfs");
+    cfg.upload.local_path = Some(dir.path().join("store").to_string_lossy().into_owned());
+    cfg.manifest.verification_receipts = true;
+    let config_path = dir.path().join("config.yaml");
+    std::fs::write(&config_path, serde_yaml::to_string(&cfg).unwrap()).unwrap();
+    {
+        let mut engine = Engine::new(cfg.clone(), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let done = engine.process_once(SourceType::File).await.unwrap();
+        assert!(done.iter().all(|o| o.committed) && done.len() == 2);
+    }
+    let metrics = dir.path().join("scrub.prom");
+    let run = |require: bool| {
+        let mut args = vec![
+            "vtopctl",
+            "scrub",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--metrics-file",
+            metrics.to_str().unwrap(),
+        ];
+        if require {
+            args.push("--require-receipts");
+        }
+        let cli = vtop_cli::commands::Cli::try_parse_from(args).unwrap();
+        // On the heap: with the receipt check, the debug build's command
+        // future outgrows a test thread's 2 MiB stack.
+        Box::pin(vtop_cli::commands::dispatch(cli))
+    };
+    assert_eq!(run(true).await, 0, "every receipt is there");
+    let text = std::fs::read_to_string(&metrics).unwrap();
+    assert!(
+        text.contains("vtop_scrub_receipts_total{result=\"ok\"} 2"),
+        "{text}"
+    );
+
+    // Delete one receipt on disk.
+    let mut stack = vec![dir.path().join("store")];
+    let mut removed = 0;
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if removed == 0 && p.to_string_lossy().ends_with(".receipt.json") {
+                std::fs::remove_file(&p).unwrap();
+                removed += 1;
+            }
+        }
+    }
+    assert_eq!(removed, 1);
+    assert_eq!(run(false).await, 0, "missing is reported, not a finding");
+    let text = std::fs::read_to_string(&metrics).unwrap();
+    assert!(
+        text.contains("vtop_scrub_receipts_total{result=\"missing\"} 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("vtop_scrub_receipts_total{result=\"ok\"} 3"),
+        "carried across runs: {text}"
+    );
+    assert_eq!(run(true).await, 1, "--require-receipts fails on it");
+    let text = std::fs::read_to_string(&metrics).unwrap();
+    assert_eq!(metric_value(&text, "vtop_scrub_last_run_findings"), 1.0);
+}
+
+/// Review of #711: the ledger pinned the manifest's version, and a receipt
+/// that names none is not bound to it.
+#[tokio::test]
+async fn a_receipt_without_the_pinned_manifest_version_is_mismatched() {
+    let a = receipted_archive(1, None).await;
+    let ledger = a.ledger().await;
+    assert!(
+        ledger[0].manifest_version_id.is_some(),
+        "the mock pins versions"
+    );
+    let unpinned = a
+        .rebuilt_receipt(&ledger[0], &ManifestKeyring::default(), |b| {
+            b.manifest_version_id = None
+        })
+        .await;
+    a.overwrite(&a.receipt_uri_of(&ledger[0]), &unpinned, true)
+        .await;
+    let report = a.scrub(&with_receipts(false)).await;
+    assert_eq!(
+        receipt_findings(&report),
+        vec![(ledger[0].batch_id.clone(), ReceiptResult::Mismatched)],
+        "{report:#?}"
+    );
+    assert!(report.findings[0].detail.contains("version"), "{report:#?}");
+}
+
+/// Review of #711: a finding quotes strings read from the stored receipt,
+/// which anyone who can write the bucket can set when no key is configured:
+/// they are cut short and stripped of URL query strings, and the finding
+/// says what to do.
+#[tokio::test]
+async fn a_receipt_finding_quotes_stored_strings_bounded_and_redacted() {
+    let a = receipted_archive(1, None).await;
+    let ledger = a.ledger().await;
+    let hostile = format!(
+        "https://store.example/x?X-Amz-Signature=deadbeef{}",
+        "y".repeat(10_000)
+    );
+    let forged = a
+        .rebuilt_receipt(&ledger[0], &ManifestKeyring::default(), |b| {
+            b.batch_id = hostile.clone()
+        })
+        .await;
+    a.overwrite(&a.receipt_uri_of(&ledger[0]), &forged, true)
+        .await;
+    let report = a.scrub(&with_receipts(false)).await;
+    assert_eq!(
+        receipt_findings(&report),
+        vec![(ledger[0].batch_id.clone(), ReceiptResult::Mismatched)]
+    );
+    let detail = &report.findings[0].detail;
+    assert!(!detail.contains("X-Amz-Signature"), "{detail}");
+    assert!(detail.len() < 2_000, "bounded: {} bytes", detail.len());
+    assert!(
+        detail.contains("not this batch's as the ledger recorded it"),
+        "what to do: {detail}"
+    );
+}

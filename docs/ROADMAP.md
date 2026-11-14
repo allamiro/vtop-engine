@@ -930,9 +930,8 @@ over the canonical form v0.8.0 verifies, and still says
 off, manifests are byte for byte what v0.8.0 writes. Startup logs the version
 written and why, `vtopctl validate --print-effective` shows
 `manifest.write_version`, and `vtop_manifests_written_total{tenant,version}`
-counts manifests by version. Verification receipts follow in a later PR, now
-that #664 has landed. Known
-limitations:
+counts manifests by version. Verification receipts (below) complete release
+B. Known limitations:
 
 - **Every reader must run v0.8.0 or later before `0.4` is enabled.** That
   means every engine sharing the ledger, every `vtopctl scrub` and
@@ -961,12 +960,51 @@ limitations:
   row with no pinned manifest version cannot prove its manifest is the
   writer's, so an older engine treats it as unauthenticated and replays it
   (duplicates), as before #671.
-- **`scripts/upgrade-compat.sh` does not cover manifests.** The old-release
-  coverage is the committed fixtures in
-  `crates/vtop-core/tests/fixtures/manifests/`: v0.7.0 and v0.8.0 output, and
-  the first `0.4` documents release B wrote. A CI step that runs the released
-  v0.8.0 and v0.7.0 binaries against a `0.4` archive is the next change
-  (#671, PR 2).
+- **`scripts/upgrade-compat.sh` does not cover manifests; `manifest-compat`
+  does.** Old writers are covered by the committed fixtures in
+  `crates/vtop-core/tests/fixtures/manifests/` (v0.7.0 and v0.8.0 output, and
+  the first `0.4` manifests and receipts release B wrote). Old readers are
+  covered by the `manifest-compat` CI job (`scripts/manifest-compat.sh`): HEAD
+  writes a signed `0.4` archive with receipts, the published v0.8.0 and later
+  `vtopctl` (checked against each release's `SHA256SUMS`) must pass
+  `verify-manifest` on it and accept the config in `validate`, and v0.7.0
+  must report the self-hash failure.
+
+**Verification receipts (#671 release B).** With
+`manifest.verification_receipts: true` the engine writes
+`<batch_id>.receipt.json` beside each manifest once the batch is VERIFIED:
+the class the ledger recorded (#664) and the method the store actually ran
+(`store_checksum`, or `read_back` for a multipart object on native S3, or
+`size_only`), bound to the manifest's self-hash and signed like a `0.4`
+manifest, naming its key (#685). It is evidence, not part of the commit: a
+receipt that cannot be written is a rate-limited WARN and
+`vtop_verification_receipts_total{result="failed"}`, and the batch commits.
+Recovery writes the receipt of a VERIFIED batch that has none (`origin:
+recovery`), never over an existing one. `vtopctl scrub` checks receipts when
+the config writes them or with `--require-receipts`, and reports `missing`,
+`invalid`, `unauthenticated` and `mismatched` (another batch, digest,
+version, object or class than the ledger's) in
+`vtop_scrub_receipts_total{result}`. The procedure is
+[Verification receipts](operate/verification-receipts.md). Upgrade notes and
+known limitations:
+
+- **Off by default; no reader upgrade needed.** A reader that does not know
+  about receipts never fetches one. A consumer that **lists** the archive's
+  prefix sees one extra `.receipt.json` object per batch: check such
+  consumers before turning it on.
+- **Older engines ignore the key** and write no receipts, so in a mixed fleet
+  only upgraded engines write them; the scrub reports the rest `missing`,
+  which is a finding only with `--require-receipts`. Turn that flag on once
+  every engine writes receipts and the scrubbed archive was written with them.
+- **No backfill.** A batch committed before receipts were enabled, or whose
+  receipt could not be written, keeps none: a later re-read would be a
+  different statement. Recovery writes one only for a batch still VERIFIED.
+- **Object Lock.** A receipt is written and its retention read back like a
+  manifest's, and recovery never adds a second version beside one.
+  `vtopctl scrub --check-retention` does not read receipts' retention yet
+  ([#710](https://github.com/allamiro/vtop-engine/issues/710)).
+- **Going back.** Set `verification_receipts: false`. Receipts already written
+  stay readable; drop `--require-receipts` from scheduled scrubs.
 
 **Manifest MAC key rotation (#685).** A keyring, `manifest.mac`, holds
 several keys by id: `active` signs, every key in `keys` verifies the manifests

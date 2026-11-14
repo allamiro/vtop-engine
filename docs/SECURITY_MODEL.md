@@ -441,6 +441,7 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 - When `manifest_mac_key_env` is configured, the stored manifest **MUST** carry a valid keyed BLAKE3 `manifest.mac`; missing or invalid MACs fail pipeline, CLI, and recovery verification.
 - Where only size/existence can be confirmed, verification is **backend-limited** and the engine **MUST** report it as such rather than as cryptographic verification. The engine defaults to rejecting this result; accepting it requires the explicit `require_strong_verification: false` compatibility opt-out. That opt-out accepts same-size corruption, so the engine announces it: one WARN at startup and a `vtopctl validate` warning naming the key, `vtop_verification_mode{mode="size_only"} 1` from `vtopctl run`'s metrics endpoint, and a WARN with the batch id for every size-only verification, counted in `vtop_verification_backend_limited_total` where `vtop_verified_total` counts it (at VERIFIED in the running engine, at the commit in recovery) (#629).
 - A keyed MAC authenticates data among key holders but does not provide public verification or non-repudiation.
+- With `manifest.verification_receipts: true`, a **verification receipt** (`<batch_id>.receipt.json`, [VTOP_PROTOCOL_DRAFT.md §11.3](VTOP_PROTOCOL_DRAFT.md#113-verification-receipt-extension)) records in the archive what the ledger records after `VERIFIED`: the class and the method the backend ran. It is **evidence from the engine, not a commit precondition**: the commit never waits for it, and a receipt that cannot be written is a WARN and a `vtop_verification_receipts_total{result="failed"}` count, never a failed batch. What it proves and does not prove is in §8.4.
 
 ## 7. Data at rest and object immutability
 
@@ -449,6 +450,7 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
   - a bucket without Object Lock enabled is refused before anything is written to it: at startup for a literal bucket name, at the first batch for each bucket a template names (and for a literal bucket whose startup check the store could not answer);
   - before a batch may reach `VERIFIED`, the retention of the object and manifest versions it wrote is read back (the exact versions, except a reused object and a multipart object whose version the store did not report again, which are read at the version whose content was just verified) and compared with what the engine asked for (same mode, a date no earlier, the legal hold). A missing, shorter, other-mode or hold-less lock **fails the batch** (`FAILED` then `REPLAY_REQUIRED`, source progress not committed). An object reused from an earlier attempt (#626) must still be under the configured mode;
   - recovery and the scrub never fail a batch for a retention that has ended; `vtopctl scrub --check-retention` reports locked, elapsed, missing and mode_mismatch, the last two as findings.
+  - a verification receipt (§8.4) is written through the manifest write path, so it carries the same retention headers, and its retention is read back the same way. A receipt whose retention does not match is counted as a failed receipt and logged; it never fails the batch. Recovery writes a missing receipt only after the store says none is there, so it never adds a second version beside an existing one. `--check-retention` does not yet read receipts' retention (#710).
 - The engine does **not** create a locked bucket, set a bucket default retention, or remove a lock. Object Lock is enabled when a bucket is created, and a bucket default retention **SHOULD** be set as the floor: an engine older than v0.10.0 ignores `upload.object_lock` and writes unlocked objects, which only a bucket default retention locks.
 - Where the backend supports it (e.g., S3 Object Lock / WORM), telemetry objects and manifests **SHOULD** be written as immutable for the configured retention period.
 - Immutability complements verification: verification detects tampering, immutability prevents post-write tampering or accidental overwrite.
@@ -591,6 +593,40 @@ key-aware:
   active key changes. The engine cannot see which releases read the archive,
   so this gate is the operator's. The procedure is
   [Rotate the manifest MAC key](operate/manifest-key-rotation.md).
+
+### 8.4 Verification receipts (#671)
+
+A receipt is signed like a version 0.4 manifest: the self-hash and the keyed
+BLAKE3 MAC cover its stored document, canonicalized, and it names the key in
+`receipt.mac_key_id`. A reader verifies it with that key only, and an
+unknown or retired key is unauthenticated, not corrupt (§8.3).
+
+**What a receipt proves**, when a MAC key is configured and the receipt
+verifies with it: a holder of that key wrote it, and it is bound to one
+batch's manifest, by that manifest's self-hash, which the manifest's own MAC
+covers. A receipt copied to another batch's key, or naming another manifest
+digest, version or object, or another class than the ledger's, is reported
+by `vtopctl scrub` as `mismatched`.
+
+**What it does not prove:**
+
+- **Without a MAC key, nothing about who wrote it.** Its self-hash is
+  corruption detection only: anyone who can write the bucket can write a
+  receipt with a correct hash.
+- **Not that the object is intact now.** It records a verification that
+  passed when it was written. The scrub re-verifies the object itself.
+- **Not when, or by whom, beyond the writer's word.** `verified_at` is the
+  engine's clock and `verified_by` its configured name. Both are covered by
+  the MAC, so they are the key holder's statement, not independent facts.
+- **Not that the source was committed.** A receipt is written after
+  `VERIFIED` and before `SOURCE_COMMITTED`; the ledger stays the authority for
+  commit state (§6). A missing receipt never makes a batch suspect, and is
+  reported by the scrub, as a finding only under `--require-receipts`.
+
+The receipt carries no record content, no key material, and no URI with a
+query string, fragment or user info; the writer refuses such a URI rather
+than record it. The warning for a receipt that could not be written strips
+URL query strings and user info from the store's error.
 
 ## 9. Resource exhaustion controls
 

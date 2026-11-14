@@ -82,6 +82,13 @@ pub const OBJECT_LOCK_CHECK_RESULTS: [&str; 7] = [
     "bucket_not_locked",
 ];
 
+/// The values of `result` on `vtop_verification_receipts_total` (#671
+/// release B): a receipt the engine `written` after verifying a batch, one
+/// that `failed` (it could not be built, stored or, under Object Lock, read
+/// back locked), and one recovery `repaired` for a VERIFIED row that had
+/// none.
+pub const RECEIPT_WRITE_RESULTS: [&str; 3] = ["written", "failed", "repaired"];
+
 /// The values of `mode` on `vtop_object_lock_mode` (#684).
 pub const OBJECT_LOCK_MODES: [&str; 3] = ["off", "governance", "compliance"];
 
@@ -178,6 +185,10 @@ pub struct Metrics {
     /// `0.4` sample is the signal that every reader of this archive must run
     /// v0.8.0 or later; an earlier one reports those manifests as tampered.
     pub manifests_written_total: IntCounterVec,
+    /// Verification receipts (#671 release B), by tenant and
+    /// [`RECEIPT_WRITE_RESULTS`]. `failed` never fails a batch: a receipt is
+    /// evidence about verification, not a precondition for the commit.
+    pub verification_receipts_total: IntCounterVec,
     /// Manifest MAC checks (#685), by the key used and what it found.
     /// `key_id` is a CONFIGURED id, `none` (a key with no id, or a manifest
     /// naming none where no key is legacy) or `other` (an id this process
@@ -427,6 +438,11 @@ impl Metrics {
             "Manifests stored, by manifest version (manifest.write_version); readers before v0.8.0 report version 0.4 manifests as tampered",
             vec!["tenant", "version"],
         )?;
+        let verification_receipts_total = cv(
+            "verification_receipts_total",
+            "Verification receipts by result: written (by the engine after VERIFIED), failed (could not be written, or under Object Lock not stored locked; the batch committed regardless, and the WARN verification_receipt_failed says why), repaired (written by recovery for a VERIFIED batch that had none)",
+            vec!["tenant", "result"],
+        )?;
         let manifest_authentications_total = cv(
             "manifest_authentications_total",
             "Manifest MAC checks by key_id (a configured key id; none: a key with no id, or no id and no legacy key; other: an id not in this keyring) and result (ok, failed, unknown_key, retired_key). unknown_key or retired_key: the manifest is unauthenticated, not corrupt; add the key as verify-only, or accept that the id was retired",
@@ -588,6 +604,7 @@ impl Metrics {
             recovery_unsupported_manifest_total,
             recovery_rechecks_total,
             manifests_written_total,
+            verification_receipts_total,
             manifest_authentications_total,
             records_total,
             bytes_in_total,

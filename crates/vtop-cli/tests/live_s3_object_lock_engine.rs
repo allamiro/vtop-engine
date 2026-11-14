@@ -5,9 +5,9 @@
 //! - against a bucket created without Object Lock it refuses to start, and
 //!   says what to do;
 //! - against a locked bucket it starts, archives a batch to
-//!   SOURCE_COMMITTED, and the object and the manifest it wrote are under the
-//!   configured mode until a date about `retain_days` away, read back from
-//!   the store behind the engine's back.
+//!   SOURCE_COMMITTED, and the object, the manifest and the verification
+//!   receipt (#671) it wrote are under the configured mode until a date about
+//!   `retain_days` away, read back from the store behind the engine's back.
 //!
 //! Run against the compose MinIO lab with:
 //! `VTOP_TEST_S3_ENDPOINT=http://localhost:9000 AWS_ACCESS_KEY_ID=minioadmin
@@ -70,6 +70,8 @@ fn config(dir: &Path, bucket: &str, prefix: &str) -> VtopConfig {
         retain_days: 1,
         legal_hold: false,
     });
+    // The receipt goes through the manifest write path, so it is locked too.
+    cfg.manifest.verification_receipts = true;
     cfg
 }
 
@@ -137,9 +139,12 @@ async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
         .unwrap();
 
     let client = s3_client().await;
+    let receipt =
+        vtop_core::partitioning::receipt_uri(row.manifest_uri.as_deref().unwrap()).unwrap();
     for uri in [
         row.object_uri.clone().unwrap(),
         row.manifest_uri.clone().unwrap(),
+        receipt,
     ] {
         let key = uri
             .strip_prefix(&format!("s3://{bucket}/"))

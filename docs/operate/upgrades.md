@@ -75,6 +75,12 @@ read `0.4`, so upgrade every engine and auditor before a later release turns
 `0.4` on. The details are under
 [v0.10.0 and beyond](../ROADMAP.md#v0100-and-beyond) in the roadmap.
 
+Verification receipts (`manifest.verification_receipts`) need no reader
+upgrade: a reader that does not know them never fetches them. Older engines
+ignore the key and write none, so turn on `vtopctl scrub --require-receipts`
+only once every engine writes them; see
+[Verification receipts](verification-receipts.md).
+
 ## Before any upgrade
 
 - Read the release's section in the [roadmap](../ROADMAP.md), including its

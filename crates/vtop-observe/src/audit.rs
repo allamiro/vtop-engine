@@ -144,8 +144,15 @@ impl Action {
             // database password.
             Action::LedgerMigrate => &["backend"],
             // `check_retention` (#684): whether the run read Object Lock
-            // retention, a boolean.
-            Action::ScrubCursor => &["cursor_file", "limit", "metrics_file", "check_retention"],
+            // retention, a boolean; `require_receipts` (#671): whether a
+            // missing verification receipt was a finding, a boolean.
+            Action::ScrubCursor => &[
+                "cursor_file",
+                "limit",
+                "metrics_file",
+                "check_retention",
+                "require_receipts",
+            ],
             Action::ClusterInit => &["members"],
             Action::ClusterMembership => &[
                 "operation",
