@@ -1,0 +1,190 @@
+# Documentation site, published to GitHub Pages by .github/workflows/docs.yml.
+# Build locally:
+#   pip install -r docs/requirements.txt && mkdocs build --strict
+# The pages are the Markdown files under docs/, which also read correctly on
+# GitHub; scripts/docs_hooks.py adapts them at build time (links that leave
+# docs/, GitHub alert blockquotes) rather than forking them.
+site_name: VTOP Engine
+site_description: >-
+  Replay-safe, manifest-driven telemetry archiving from Kafka, files and syslog
+  spools into S3-compatible object storage. Source progress is committed only
+  after the stored object is verified.
+site_url: https://allamiro.github.io/vtop-engine/
+repo_url: https://github.com/allamiro/vtop-engine
+repo_name: allamiro/vtop-engine
+edit_uri: edit/main/docs/
+docs_dir: docs
+copyright: VTOP Engine contributors. MIT License.
+
+# Kept in the repository, not published:
+# - requirements.txt is the site's build input.
+# - README.md is the GitHub index of docs/; on the site index.md is the home
+#   page, and a README.md beside it would collide with it.
+# - The invention-disclosure and prior-art drafts are internal drafts for
+#   technical and legal review (docs/README.md, "Legal note"); links to them
+#   resolve to GitHub instead.
+exclude_docs: |
+  requirements.txt
+  /README.md
+  /INVENTION_DISCLOSURE_DRAFT.md
+  /PRIOR_ART_SEARCH_PLAN.md
+
+# Every warning fails `mkdocs build --strict`: a page missing from the nav, a
+# link to a missing file and a link to a missing heading are all errors.
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+hooks:
+  - scripts/docs_hooks.py
+
+theme:
+  name: material
+  logo: assets/site/logo.png
+  favicon: assets/site/favicon.png
+  icon:
+    repo: fontawesome/brands/github
+  font:
+    text: Inter
+    code: JetBrains Mono
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: white
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.indexes
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.path
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - content.action.edit
+
+extra_css:
+  - assets/site/extra.css
+
+plugins:
+  - search:
+      # No '-' or '_' here: identifiers such as print-effective and
+      # require_strong_verification stay whole tokens, so searching for one
+      # finds it.
+      separator: '[\s,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;'
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      # GitHub-compatible heading ids, so the anchors the docs already link
+      # to (written for GitHub) resolve on the site too.
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.snippets:
+      check_paths: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - getting-started/index.md
+      - Quick start (Docker lab): getting-started/quickstart.md
+  - Install:
+      - install/index.md
+      - Release binaries: install/binaries.md
+      - Container image: install/container.md
+      - Helm chart: install/helm.md
+      - Build from source: install/from-source.md
+      - Verify a release: RELEASE_VERIFICATION.md
+  - Deploy:
+      - deploy/index.md
+      - Single engine with SQLite: deploy/single-node.md
+      - PostgreSQL ledger: POSTGRES_DEPLOYMENT.md
+      - Kubernetes with Helm: deploy/kubernetes.md
+      - Production HA: PRODUCTION_HA.md
+      - Cluster plane: deploy/cluster-plane.md
+  - Configure:
+      - configure/index.md
+      - Streams (streams.yaml): configure/streams.md
+  - Operate:
+      - operate/index.md
+      - Metrics and alerts: operate/monitoring.md
+      - Node endpoints and metrics: NODE_OBSERVABILITY.md
+      - Scrub and coverage audit: operate/scrub-and-audit.md
+      - Upgrades: operate/upgrades.md
+      - Troubleshooting: operate/troubleshooting.md
+  - Reference:
+      - CLI (vtopctl): reference/cli.md
+      - Configuration (config.yaml): configure/reference.md
+      - Archive path: reference/archive-path.md
+      - Known limitations: reference/limitations.md
+  - Concepts:
+      - Architecture: ARCHITECTURE.md
+      - Protocol (normative draft): VTOP_PROTOCOL_DRAFT.md
+      - Security model: SECURITY_MODEL.md
+      - Native broker architecture: NATIVE_BROKER_ARCHITECTURE.md
+      - Comparison: COMPARISON.md
+  - Benchmarks:
+      - Kafka comparison: benchmarks/kafka-comparison.md
+      - Kafka failover: benchmarks/kafka-failover.md
+      - Throughput research: THROUGHPUT_RESEARCH.md
+      - Egress transport research: EGRESS_TRANSPORT_RESEARCH.md
+      - Fetch I/O research: FETCH_IO_RESEARCH.md
+      - Write amplification and proof overhead: WRITE_AMP_PROOF_OVERHEAD.md
+      - Metadata saturation research: METADATA_SATURATION_RESEARCH.md
+      - Live chaos validation: LIVE_CHAOS_VALIDATION.md
+  - Roadmap and releases:
+      - Roadmap: ROADMAP.md
+      - Releases: https://github.com/allamiro/vtop-engine/releases
+  - Contributing: contributing.md

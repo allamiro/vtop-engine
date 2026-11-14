@@ -1,0 +1,31 @@
+/* Site-wide adjustments to the Material theme (mkdocs.yml extra_css). */
+
+/* The logo is dark ink on a transparent background; on the dark header give
+   it a light backing so it stays legible. */
+[data-md-color-scheme="slate"] .md-header__button.md-logo img,
+[data-md-color-scheme="slate"] .md-nav__button.md-logo img {
+  background: #ffffff;
+  border-radius: 4px;
+  padding: 2px;
+}
+
+/* Long identifiers and URLs in table cells wrap instead of widening the
+   table past the viewport; very wide tables still scroll inside their own
+   container, never the page. */
+.md-typeset table:not([class]) td,
+.md-typeset table:not([class]) th {
+  overflow-wrap: anywhere;
+}
+.md-typeset table:not([class]) code {
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+/* Keep the home page cards at a readable measure on wide screens. */
+.md-typeset .grid.cards > ul > li {
+  display: flex;
+  flex-direction: column;
+}
+.md-typeset .grid.cards > ul > li > :last-child {
+  margin-top: auto;
+}
