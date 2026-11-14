@@ -9015,6 +9015,144 @@ mod tests {
         assert!(decisions("links_changed") > links_before);
     }
 
+    /// Review of #753: the engine's own path. Both names are read and
+    /// committed in one pass, so both deletes fall due in one later pass and
+    /// run side by side (`read_all_batch_candidates`). Each holds the file
+    /// open while it checks it, and moves its ctime when it renames it
+    /// aside and back, so either can keep the other: as `open`, as
+    /// `metadata_changed`, or - when one finishes first - as
+    /// `links_changed`. Deletes are not serialised per inode, by decision.
+    /// What must hold whatever the interleaving: nothing is lost, at least
+    /// one name keeps the file, and every name kept says the other name may
+    /// be why.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn hard_links_due_in_the_same_pass_lose_nothing_and_say_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = hard_linked(dir.path());
+        let quiet = Duration::from_millis(50);
+        let mut fs = deleting(&[&a, &b], quiet);
+        let sources = [src(&a), src(&b)];
+        let pass = fs
+            .read_all_batch_candidates(&sources, 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        for outcome in &pass.outcomes {
+            for read in outcome.result.as_ref().unwrap() {
+                fs.commit_progress(&read.progress_end).await.unwrap();
+            }
+        }
+        std::thread::sleep(quiet * 2);
+        fs.read_all_batch_candidates(&sources, 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let left: Vec<&String> = [&a, &b]
+            .into_iter()
+            .filter(|p| Path::new(p).exists())
+            .collect();
+        assert!(!left.is_empty(), "both names deleted: {:?}", fs.notices);
+        for p in &left {
+            assert_eq!(std::fs::read_to_string(p).unwrap(), "one\ntwo\n", "{p}");
+        }
+        let kept: Vec<&String> = fs
+            .notices
+            .iter()
+            .filter(|n| n.starts_with("not deleting"))
+            .collect();
+        assert!(!kept.is_empty(), "{:?}", fs.notices);
+        for n in kept {
+            assert!(
+                n.contains("names (hard links)") || n.contains("link count"),
+                "a name kept beside another name's delete, without saying the other name may \
+                 be why: {n}"
+            );
+        }
+    }
+
+    /// Review of #753: an open that reaches the file between the final check
+    /// and the unlink, through ANOTHER hard link. The file keeps that name,
+    /// so nothing the opener writes is lost; the engine said "what that
+    /// process writes to it is not archived", an ERROR that sends the
+    /// operator hunting for a loss there is not.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_open_through_another_hard_link_at_the_unlink_says_nothing_is_lost() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let other = dir.path().join("other.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        std::fs::hard_link(&path, &other).unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let opener: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+        let (seam_opener, seam_other) = (opener.clone(), other.clone());
+        fs.before_unlink = Some(Arc::new(move |_| {
+            let mut slot = seam_opener.lock().unwrap();
+            if slot.is_some() {
+                return;
+            }
+            let inode = std::fs::metadata(&seam_other).unwrap().ino();
+            let (opened, has_opened) = std::sync::mpsc::channel::<()>();
+            let other = seam_other.clone();
+            *slot = Some(std::thread::spawn(move || {
+                let mut w = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&other)
+                    .unwrap();
+                let _ = opened.send(());
+                w.write_all(b"late\n").unwrap();
+            }));
+            let breaking = format!(":{inode} ");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if has_opened.try_recv().is_ok() {
+                    return;
+                }
+                let locks = std::fs::read_to_string("/proc/locks").unwrap_or_default();
+                if locks
+                    .lines()
+                    .any(|l| l.contains("LEASE") && l.contains("BREAKING") && l.contains(&breaking))
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            panic!("the open through the other name never reached the file");
+        }));
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        opener
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam never ran")
+            .join()
+            .unwrap();
+        assert!(!Path::new(&path).exists());
+        assert_eq!(
+            std::fs::read_to_string(&other).ok().as_deref(),
+            Some("one\ntwo\nlate\n")
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "deleted the name {path} after a process opened the file between the final \
+                     check and the unlink"
+                )
+            ) && notice(&fs, "still has 1 other name(s)")
+                && notice(&fs, "nothing to do")
+                && !notice(&fs, "is not archived"),
+            "{:?}",
+            fs.notices
+        );
+    }
+
     /// H3 (#619), the boundary: with no quiet period the first name is
     /// deleted at its commit, and a name read and committed after that sees
     /// the file as it is then - one name - so it is deleted too.
