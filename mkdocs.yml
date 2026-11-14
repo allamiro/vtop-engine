@@ -176,6 +176,7 @@ nav:
       - Native broker architecture: NATIVE_BROKER_ARCHITECTURE.md
       - Comparison: COMPARISON.md
   - Benchmarks:
+      - benchmarks/index.md
       - Kafka comparison: benchmarks/kafka-comparison.md
       - Kafka failover: benchmarks/kafka-failover.md
       - Throughput research: THROUGHPUT_RESEARCH.md

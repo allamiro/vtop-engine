@@ -65,4 +65,5 @@ VTOP is a prototype and reference implementation. Read the
   [`config.yaml` reference](configure/reference.md).
 - How it works: [Architecture](ARCHITECTURE.md) and the
   [protocol](VTOP_PROTOCOL_DRAFT.md).
+- How it measures up, with every condition: [Measured results](benchmarks/index.md).
 - What is shipped and what is not: the [roadmap](ROADMAP.md).
