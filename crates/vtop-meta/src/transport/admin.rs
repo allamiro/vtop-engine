@@ -27,7 +27,7 @@ use super::wire::{
     KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ, KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP,
     KIND_ADMIN_STATUS_REQ, KIND_ADMIN_STATUS_RESP,
 };
-use crate::command::MetadataCommand;
+use crate::command::{MetadataCommand, MetadataResponse};
 use crate::keys::MetaNodeId;
 use async_trait::async_trait;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -309,12 +309,24 @@ async fn serve_admin_connection(
             ))
         }
     };
+    // Warned once per connection (#694): the audit records of its writes
+    // name no actor, and the operator should know why.
+    let mut warned_anonymous = false;
     loop {
         let frame = match read_frame(&mut stream).await {
             Ok(frame) => frame,
             Err(TransportError::Closed) => return Ok(()),
             Err(error) => return Err(error),
         };
+        if identity == AdminIdentity::Anonymous && !warned_anonymous && is_write(frame.kind) {
+            warned_anonymous = true;
+            eprintln!(
+                "warning: a write on the plaintext admin endpoint: the caller presented no \
+                 certificate, so its audit records name no actor (anonymous). The request is \
+                 handled as before. To attribute admin commands, serve the admin endpoint over \
+                 mTLS (admin_transport: tls) with one certificate per operator"
+            );
+        }
         let response = match dispatch_admin(handler.as_ref(), &authorizer, &identity, frame).await {
             Ok(frame) => frame,
             // The redirect survives the trip to the wire. Building the frame
@@ -482,6 +494,18 @@ pub fn resolve_endpoint(endpoint: &str) -> TransportResult<SocketAddr> {
     })
 }
 
+/// Whether an admin frame asks for a change: a proposal, bootstrap or a
+/// membership change. Everything else is a read.
+fn is_write(kind: u16) -> bool {
+    matches!(
+        kind,
+        KIND_ADMIN_PROPOSE_REQ
+            | KIND_ADMIN_INIT_REQ
+            | KIND_ADMIN_ADD_LEARNER_REQ
+            | KIND_ADMIN_CHANGE_MEMBERSHIP_REQ
+    )
+}
+
 /// Dispatch one admin frame, authorizing it first.
 ///
 /// Every arm authorizes **before** calling the handler, and the authorization
@@ -589,8 +613,58 @@ async fn dispatch_admin(
         }
         KIND_ADMIN_PROPOSE_REQ => {
             let request = AdminProposeRequest::decode(&frame.payload)?;
-            authorize(authorizer.authorize_command(identity, &request.command))?;
-            let response = handler.propose(request.command).await?;
+            // Every refusal is audited, whatever the command (#694): a
+            // refused write is the record an auditor most needs.
+            if let Err(refusal) = authorizer.authorize_command(identity, &request.command) {
+                crate::audit::emit(&crate::audit::refusal(
+                    identity,
+                    &request.command,
+                    format!("{}; nothing was proposed", refusal.message()),
+                ));
+                return Err(TransportError::Unauthorized(refusal.message()));
+            }
+            // An audited command's edge record: the caller's identity, the
+            // outcome and the index it committed at. Taken before the
+            // command moves into the handler.
+            let audited = crate::audit::command_audit(&request.command).map(|audit| {
+                crate::audit::AuditRecord::for_command(
+                    crate::audit::AuditStage::Edge,
+                    crate::audit::AuditActor::Caller(identity.clone()),
+                    &request.command,
+                    audit,
+                    crate::audit::AuditOutcome::Success,
+                )
+            });
+            let result = handler.propose(request.command).await;
+            // A follower's redirect is not an outcome: the client asks the
+            // leader next, which writes the record that counts (review of
+            // #705).
+            let redirected = matches!(result, Err(TransportError::NotLeader { .. }));
+            if let Some(mut record) = audited.filter(|_| !redirected) {
+                match &result {
+                    Ok(response) => {
+                        record.log_index = Some(response.log_id.index);
+                        if let MetadataResponse::Rejected(error) = &response.response {
+                            record.outcome = crate::audit::AuditOutcome::Failure;
+                            record.reason = Some(format!(
+                                "the state machine rejected it at index {}: {error}",
+                                response.log_id.index
+                            ));
+                        }
+                    }
+                    // A transport error, a timeout above all, leaves the
+                    // outcome unknown: the entry may still commit.
+                    Err(error) => {
+                        record.outcome = crate::audit::AuditOutcome::Failure;
+                        record.reason = Some(format!(
+                            "outcome unknown (it may still commit; the applied records say): \
+                             {error}"
+                        ));
+                    }
+                }
+                crate::audit::emit(&record);
+            }
+            let response = result?;
             Ok(VtpmFrame {
                 kind: KIND_ADMIN_PROPOSE_RESP,
                 payload: response.encode()?,
@@ -598,32 +672,63 @@ async fn dispatch_admin(
         }
         KIND_ADMIN_INIT_REQ => {
             let request = AdminInitRequest::decode(&frame.payload)?;
-            authorize(authorizer.authorize_cluster(identity))?;
-            let response = handler.init(request.members).await?;
-            Ok(VtpmFrame {
-                kind: KIND_ADMIN_MEMBERSHIP_RESP,
-                payload: response.encode()?,
+            let members = request
+                .members
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let record = membership_record(
+                identity,
+                crate::audit::AuditAction::ClusterInit,
+                vec![("members", members)],
+            );
+            audited_membership(record, authorizer.authorize_cluster(identity), async {
+                handler.init(request.members).await
             })
+            .await
         }
         KIND_ADMIN_ADD_LEARNER_REQ => {
             let request = AdminAddLearnerRequest::decode(&frame.payload)?;
-            authorize(authorizer.authorize_cluster(identity))?;
-            let response = handler.add_learner(request.node_id).await?;
-            Ok(VtpmFrame {
-                kind: KIND_ADMIN_MEMBERSHIP_RESP,
-                payload: response.encode()?,
+            let record = membership_record(
+                identity,
+                crate::audit::AuditAction::ClusterMembership,
+                vec![
+                    ("operation", "add_learner".to_owned()),
+                    ("node_id", request.node_id.to_string()),
+                ],
+            );
+            audited_membership(record, authorizer.authorize_cluster(identity), async {
+                handler.add_learner(request.node_id).await
             })
+            .await
         }
         KIND_ADMIN_CHANGE_MEMBERSHIP_REQ => {
             let request = AdminChangeMembershipRequest::decode(&frame.payload)?;
-            authorize(authorizer.authorize_cluster(identity))?;
-            let response = handler
-                .change_membership(request.voters, request.retain_removed_as_learners)
-                .await?;
-            Ok(VtpmFrame {
-                kind: KIND_ADMIN_MEMBERSHIP_RESP,
-                payload: response.encode()?,
+            let voters = request
+                .voters
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let record = membership_record(
+                identity,
+                crate::audit::AuditAction::ClusterMembership,
+                vec![
+                    ("operation", "change_membership".to_owned()),
+                    ("voters", voters),
+                    (
+                        "retain_removed_as_learners",
+                        request.retain_removed_as_learners.to_string(),
+                    ),
+                ],
+            );
+            audited_membership(record, authorizer.authorize_cluster(identity), async {
+                handler
+                    .change_membership(request.voters, request.retain_removed_as_learners)
+                    .await
             })
+            .await
         }
         other => Err(TransportError::UnexpectedKind(other)),
     }
@@ -631,6 +736,58 @@ async fn dispatch_admin(
 
 fn authorize(outcome: Result<(), Refusal>) -> TransportResult<()> {
     outcome.map_err(|refusal| TransportError::Unauthorized(refusal.message()))
+}
+
+/// The edge record of a bootstrap or membership request (#694); its outcome
+/// is filled in by [`audited_membership`].
+fn membership_record(
+    identity: &AdminIdentity,
+    action: crate::audit::AuditAction,
+    params: Vec<(&'static str, String)>,
+) -> crate::audit::AuditRecord {
+    crate::audit::AuditRecord {
+        stage: crate::audit::AuditStage::Edge,
+        action,
+        actor: crate::audit::AuditActor::Caller(identity.clone()),
+        target_kind: "cluster",
+        target_id: None,
+        params,
+        outcome: crate::audit::AuditOutcome::Success,
+        reason: None,
+        request_id: None,
+        log_index: None,
+    }
+}
+
+/// Authorize a bootstrap or membership request, run it, and audit what
+/// happened: refused, failed, or done.
+async fn audited_membership(
+    mut record: crate::audit::AuditRecord,
+    authorized: Result<(), Refusal>,
+    run: impl std::future::Future<Output = TransportResult<AdminMembershipResponse>>,
+) -> TransportResult<VtpmFrame> {
+    if let Err(refusal) = authorized {
+        record.outcome = crate::audit::AuditOutcome::Refused;
+        record.reason = Some(format!("{}; nothing was changed", refusal.message()));
+        crate::audit::emit(&record);
+        return Err(TransportError::Unauthorized(refusal.message()));
+    }
+    let result = run.await;
+    match &result {
+        // The leader the client is sent to writes the record (review of #705).
+        Err(TransportError::NotLeader { .. }) => {}
+        Err(error) => {
+            record.outcome = crate::audit::AuditOutcome::Failure;
+            record.reason = Some(error.to_string());
+            crate::audit::emit(&record);
+        }
+        Ok(_) => crate::audit::emit(&record),
+    }
+    let response = result?;
+    Ok(VtpmFrame {
+        kind: KIND_ADMIN_MEMBERSHIP_RESP,
+        payload: response.encode()?,
+    })
 }
 
 /// One metadata node this client may talk to.
@@ -3081,6 +3238,18 @@ mod tests {
         Arc<CountingHandler>,
         tokio::task::JoinHandle<()>,
     ) {
+        live_endpoint_with(authorizer, client_cn, Arc::new(CountingHandler::default())).await
+    }
+
+    /// [`live_endpoint`] over a caller-supplied handler.
+    async fn live_endpoint_with<H>(
+        authorizer: AdminAuthorizer,
+        client_cn: &str,
+        handler: Arc<H>,
+    ) -> (AdminClient, Arc<H>, tokio::task::JoinHandle<()>)
+    where
+        H: AdminHandler + 'static,
+    {
         let (server_leaf, server_key) = mint_leaf("localhost");
         let (client_leaf, client_key) = mint_leaf(client_cn);
 
@@ -3099,7 +3268,6 @@ mod tests {
             trust_roots: client_roots,
         };
 
-        let handler = Arc::new(CountingHandler::default());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = AdminServer::with_authorization(
@@ -3243,6 +3411,290 @@ mod tests {
         assert_eq!(handler.proposals.load(Ordering::SeqCst), 1);
         assert_eq!(handler.membership_changes.load(Ordering::SeqCst), 1);
 
+        task.abort();
+    }
+
+    /// A backend that commits every proposal at index 41 with `reply`, and
+    /// accepts membership changes. Reads as [`CountingHandler`].
+    struct CommittingHandler {
+        reads: CountingHandler,
+        reply: MetadataResponse,
+    }
+
+    impl CommittingHandler {
+        fn replying(reply: MetadataResponse) -> Arc<Self> {
+            Arc::new(Self {
+                reads: CountingHandler::default(),
+                reply,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl AdminHandler for CommittingHandler {
+        async fn status(&self) -> TransportResult<AdminStatusResponse> {
+            self.reads.status().await
+        }
+        async fn read_segment_placement(
+            &self,
+            request: AdminReadSegmentPlacementRequest,
+        ) -> TransportResult<AdminReadSegmentPlacementResponse> {
+            self.reads.read_segment_placement(request).await
+        }
+        async fn propose(&self, _: MetadataCommand) -> TransportResult<AdminProposeResponse> {
+            Ok(AdminProposeResponse {
+                log_id: super::super::wire::WireLogId { term: 3, index: 41 },
+                response: self.reply.clone(),
+            })
+        }
+        async fn init(&self, _: Vec<u64>) -> TransportResult<AdminMembershipResponse> {
+            self.reads.init(Vec::new()).await
+        }
+        async fn add_learner(&self, node_id: u64) -> TransportResult<AdminMembershipResponse> {
+            self.reads.add_learner(node_id).await
+        }
+        async fn change_membership(
+            &self,
+            voters: Vec<u64>,
+            retain: bool,
+        ) -> TransportResult<AdminMembershipResponse> {
+            self.reads.change_membership(voters, retain).await
+        }
+        async fn read_range_lease(
+            &self,
+            request: AdminReadRangeLeaseRequest,
+        ) -> TransportResult<AdminReadRangeLeaseResponse> {
+            self.reads.read_range_lease(request).await
+        }
+    }
+
+    fn create_topic(request_id: Uuid) -> MetadataCommand {
+        MetadataCommand::CreateTopic {
+            env: CommandEnvelope {
+                request_id,
+                issued_at_ms: 0,
+            },
+            name: "events.v1".to_owned(),
+            topic_uuid: Uuid::from_u128(0x694),
+            root_range_uuid: Uuid::from_u128(0x695),
+        }
+    }
+
+    fn with_request_id(mut command: MetadataCommand, request_id: Uuid) -> MetadataCommand {
+        if let MetadataCommand::AcquireRangeLease { env, .. } = &mut command {
+            env.request_id = request_id;
+        }
+        command
+    }
+
+    /// #694: an operator's write is recorded at the edge with the identity
+    /// its certificate carries, the outcome and the index it committed at.
+    #[tokio::test]
+    async fn an_operators_write_is_audited_at_the_edge_with_its_certificate_identity() {
+        let audit = crate::audit::Recording::installed();
+        let (client, _handler, task) = live_endpoint_with(
+            AdminAuthorizer::with_operators(["ops-alice".to_owned()]),
+            "ops-alice",
+            CommittingHandler::replying(MetadataResponse::TopicCreated {
+                topic_uuid: Uuid::from_u128(0x694),
+                topic_epoch: 1,
+                root_range_uuid: Uuid::from_u128(0x695),
+            }),
+        )
+        .await;
+        let request_id = Uuid::new_v4();
+        client.propose(create_topic(request_id)).await.unwrap();
+        let records = audit.for_request(request_id);
+        assert_eq!(records.len(), 1, "exactly one edge record: {records:?}");
+        let record = &records[0];
+        assert_eq!(record.stage, crate::audit::AuditStage::Edge);
+        assert_eq!(record.action, crate::audit::AuditAction::ClusterCreateTopic);
+        assert_eq!(
+            record.actor,
+            crate::audit::AuditActor::Caller(AdminIdentity::Named("ops-alice".to_owned()))
+        );
+        assert_eq!(record.outcome, crate::audit::AuditOutcome::Success);
+        assert_eq!(record.log_index, Some(41));
+        assert!(record.params.contains(&("name", "events.v1".to_owned())));
+
+        // Rejected by the state machine: a failure, with the reason.
+        let (client, _handler, task2) = live_endpoint_with(
+            AdminAuthorizer::with_operators(["ops-alice".to_owned()]),
+            "ops-alice",
+            CommittingHandler::replying(MetadataResponse::Rejected(
+                crate::command::MetadataError::GenerationMismatch {
+                    expected: 1,
+                    actual: 2,
+                },
+            )),
+        )
+        .await;
+        let request_id = Uuid::new_v4();
+        client.propose(create_topic(request_id)).await.unwrap();
+        let records = audit.for_request(request_id);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, crate::audit::AuditOutcome::Failure);
+        let reason = records[0].reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("rejected") && reason.contains("generation mismatch"),
+            "{reason}"
+        );
+        task.abort();
+        task2.abort();
+    }
+
+    /// #694: a refused write is audited whatever the command, naming the
+    /// caller and the refusal, and saying nothing was proposed.
+    #[tokio::test]
+    async fn a_refused_write_is_audited_with_the_refusal_reason() {
+        let audit = crate::audit::Recording::installed();
+        let (client, _handler, task) =
+            live_endpoint(AdminAuthorizer::with_operators([]), &NODE_A.to_string()).await;
+        let request_id = Uuid::new_v4();
+        client
+            .propose(with_request_id(acquire(NODE_B), request_id))
+            .await
+            .unwrap_err();
+        let records = audit.for_request(request_id);
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = &records[0];
+        assert_eq!(record.outcome, crate::audit::AuditOutcome::Refused);
+        assert_eq!(
+            record.actor,
+            crate::audit::AuditActor::Caller(AdminIdentity::Node(NODE_A))
+        );
+        assert!(record
+            .params
+            .contains(&("command", "AcquireRangeLease".to_owned())));
+        let reason = record.reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains(&NODE_A.to_string())
+                && reason.contains(&NODE_B.to_string())
+                && reason.contains("nothing was proposed"),
+            "{reason}"
+        );
+
+        // A refused membership change too.
+        client.add_learner(9_694_001).await.unwrap_err();
+        let refused: Vec<_> = audit
+            .all()
+            .into_iter()
+            .filter(|r| r.params.contains(&("node_id", "9694001".to_owned())))
+            .collect();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(
+            refused[0].action,
+            crate::audit::AuditAction::ClusterMembership
+        );
+        assert_eq!(refused[0].outcome, crate::audit::AuditOutcome::Refused);
+        assert!(refused[0]
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("nothing was changed"));
+        task.abort();
+    }
+
+    /// Review of #705: a follower that redirects a proposal to the leader
+    /// writes no edge record (the leader writes the one that counts); a
+    /// failure that leaves the outcome unknown says so.
+    #[tokio::test]
+    async fn a_redirect_writes_no_edge_record() {
+        let audit = crate::audit::Recording::installed();
+        let (client, _handler, task) = live_endpoint_with(
+            AdminAuthorizer::permissive(),
+            "ops-alice",
+            Arc::new(NotLeaderHandler {
+                leader: None,
+                asked: AtomicUsize::new(0),
+            }),
+        )
+        .await;
+        let request_id = Uuid::new_v4();
+        client.propose(create_topic(request_id)).await.unwrap_err();
+        assert!(
+            audit.for_request(request_id).is_empty(),
+            "{:?}",
+            audit.for_request(request_id)
+        );
+        task.abort();
+
+        let (client, _handler, task) = live_endpoint_with(
+            AdminAuthorizer::permissive(),
+            "ops-alice",
+            Arc::new(CountingHandler::default()),
+        )
+        .await;
+        let request_id = Uuid::new_v4();
+        client.propose(create_topic(request_id)).await.unwrap_err();
+        let records = audit.for_request(request_id);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, crate::audit::AuditOutcome::Failure);
+        assert!(
+            records[0]
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outcome unknown"),
+            "{:?}",
+            records[0].reason
+        );
+        task.abort();
+    }
+
+    /// #694: a node's own lease command is authorized and NOT audited: it
+    /// runs continuously and is recorded as a transition already.
+    #[tokio::test]
+    async fn a_nodes_own_lease_command_writes_no_audit_record() {
+        let audit = crate::audit::Recording::installed();
+        let (client, _handler, task) = live_endpoint_with(
+            AdminAuthorizer::with_operators([]),
+            &NODE_A.to_string(),
+            CommittingHandler::replying(MetadataResponse::LeaseGranted { fencing_epoch: 3 }),
+        )
+        .await;
+        let request_id = Uuid::new_v4();
+        client
+            .propose(with_request_id(acquire(NODE_A), request_id))
+            .await
+            .unwrap();
+        assert!(audit.for_request(request_id).is_empty());
+        task.abort();
+    }
+
+    /// #694: a write on a plaintext endpoint is recorded as anonymous: that
+    /// nobody can be identified is the fact an auditor needs.
+    #[tokio::test]
+    async fn a_plaintext_write_is_audited_as_anonymous() {
+        let audit = crate::audit::Recording::installed();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = AdminServer::plaintext(
+            CommittingHandler::replying(MetadataResponse::Ack { generation: 1 })
+                as Arc<dyn AdminHandler>,
+            AdminAuthorizer::permissive(),
+        )
+        .unwrap();
+        let task = tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let client = AdminClient::plaintext(vec![AdminCandidate {
+            node_id: Some(MetaNodeId(1)),
+            endpoint: addr,
+            host: None,
+            server_name: String::new(),
+            plaintext: true,
+        }])
+        .unwrap();
+        let request_id = Uuid::new_v4();
+        client.propose(create_topic(request_id)).await.unwrap();
+        let records = audit.for_request(request_id);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].actor,
+            crate::audit::AuditActor::Caller(AdminIdentity::Anonymous)
+        );
         task.abort();
     }
 

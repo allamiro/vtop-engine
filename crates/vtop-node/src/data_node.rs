@@ -444,6 +444,10 @@ struct LeaderStatusReplica {
     /// replica is in the second set and not the first: it is being repaired
     /// because it is not a follower yet.
     transfer_allowed: std::collections::BTreeSet<Uuid>,
+    /// Whether a peer's UUID comes from a certificate the replica plane
+    /// verified (TLS) or only from its declaration (plaintext), for the
+    /// transfer's audit record (#694).
+    peer_verified: bool,
 }
 
 impl ReplicaPeerHandler for LeaderStatusReplica {
@@ -524,7 +528,8 @@ impl ReplicaPeerHandler for LeaderStatusReplica {
         range: &vtop_protocol::RangeIdentity,
         fencing_epoch: u64,
     ) -> Result<Vec<vtop_protocol::SealedSegmentEntry>, (vtop_protocol::ErrorCode, String)> {
-        self.authorize_transfer(peer)?;
+        // The listing starts a transfer: audited granted or refused (#694).
+        self.audited_authorization(peer, "list_sealed_segments", Some(range), true)?;
         self.transfer
             .list_sealed_segments(peer, range, fencing_epoch)
     }
@@ -538,7 +543,9 @@ impl ReplicaPeerHandler for LeaderStatusReplica {
         // fetch are separate requests on a connection that may be reused, and
         // authorizing only the cheap one would leave the expensive one — the
         // one that actually moves bytes — open.
-        self.authorize_transfer(peer)?;
+        // Audited when refused only: a granted chunk is one of many in a
+        // transfer whose listing was audited.
+        self.audited_authorization(peer, "fetch_segment_chunk", None, false)?;
         self.transfer.fetch_segment_chunk(peer, request)
     }
 
@@ -552,12 +559,58 @@ impl ReplicaPeerHandler for LeaderStatusReplica {
         // transfer, and a peer that may not pull the bytes has no business
         // reshaping the leader's segments to prepare for a pull it will be
         // refused.
-        self.authorize_transfer(peer)?;
-        self.transfer.seal_tail(peer, range, fencing_epoch)
+        self.audited_authorization(peer, "seal_tail", Some(range), false)?;
+        // Sealing changes the leader's segments: its outcome is audited.
+        let sealed = self.transfer.seal_tail(peer, range, fencing_epoch);
+        crate::audit::transfer(
+            self.node_id,
+            peer,
+            self.peer_verified,
+            "seal_tail",
+            Some(range_target(range)),
+            match &sealed {
+                Ok(_) => vtop_observe::audit::Outcome::Success,
+                Err(_) => vtop_observe::audit::Outcome::Failure,
+            },
+            sealed.as_ref().err().map(|(_, message)| message.as_str()),
+        );
+        sealed
     }
 }
 
+fn range_target(range: &vtop_protocol::RangeIdentity) -> String {
+    format!("{}/{}", range.topic, range.range_id)
+}
+
 impl LeaderStatusReplica {
+    /// [`Self::authorize_transfer`], with its audit record (#694): every
+    /// refusal, and a grant when `audit_grant`.
+    fn audited_authorization(
+        &self,
+        peer: Uuid,
+        request: &str,
+        range: Option<&vtop_protocol::RangeIdentity>,
+        audit_grant: bool,
+    ) -> Result<(), (vtop_protocol::ErrorCode, String)> {
+        let decision = self.authorize_transfer(peer);
+        if decision.is_err() || audit_grant {
+            crate::audit::transfer(
+                self.node_id,
+                peer,
+                self.peer_verified,
+                request,
+                range.map(range_target),
+                if decision.is_ok() {
+                    vtop_observe::audit::Outcome::Success
+                } else {
+                    vtop_observe::audit::Outcome::Refused
+                },
+                decision.as_ref().err().map(|(_, message)| message.as_str()),
+            );
+        }
+        decision
+    }
+
     /// Refuse a sealed-segment transfer to a peer that is neither a follower
     /// nor a named repair destination.
     fn authorize_transfer(&self, peer: Uuid) -> Result<(), (vtop_protocol::ErrorCode, String)> {
@@ -1314,6 +1367,7 @@ async fn run_leader(
                         .map(|follower| follower.node_uuid)
                         .chain(config.transfer_peers.iter().copied())
                         .collect(),
+                    peer_verified: config.replica_transport.is_tls(),
                 }) as Arc<dyn ReplicaPeerHandler>,
             )
             .map_err(|error| error.to_string())?,
@@ -3082,6 +3136,7 @@ async fn build_leader_phase(
             .map(|peer| peer.node_uuid)
             .chain(config.transfer_peers.iter().copied())
             .collect(),
+        peer_verified: config.replica_transport.is_tls(),
     }) as Arc<dyn ReplicaPeerHandler>;
     Ok(BuiltLeader {
         broker,

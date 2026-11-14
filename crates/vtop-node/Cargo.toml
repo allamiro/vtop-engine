@@ -34,3 +34,5 @@ tempfile = { workspace = true }
 # Only for the promotion-probe test: building a ReplicaStatusClient needs real
 # TLS material even when the point of the test is that the connection fails.
 rcgen = { workspace = true }
+# Captures the audit records the node writes to its log (#694).
+tracing-subscriber = { workspace = true }

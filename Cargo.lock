@@ -4271,6 +4271,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "vtop-broker",
  "vtop-kafka",
@@ -4285,6 +4286,7 @@ name = "vtop-observe"
 version = "0.9.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures",
  "http-body-util",
  "hyper",
@@ -4300,11 +4302,15 @@ dependencies = [
  "rcgen",
  "rustix",
  "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

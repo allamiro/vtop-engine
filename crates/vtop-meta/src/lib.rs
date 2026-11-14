@@ -29,6 +29,7 @@
 //! `meta.membership_log_id` so reopen does not invent LogIds after purge or
 //! blank-follower snapshot install.
 
+pub mod audit;
 pub mod command;
 pub mod keys;
 pub mod placement;

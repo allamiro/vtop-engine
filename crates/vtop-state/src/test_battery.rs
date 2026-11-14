@@ -296,6 +296,81 @@ pub async fn run_prune_battery(store: &dyn StateStore) {
     prune_preserves_cursor_seeds_and_bounds_deletion(store).await;
     listed_prune_deletes_only_what_was_listed(store).await;
     superseded_rows_are_pruned_like_committed_history(store).await;
+    prune_never_touches_the_audit_table(store).await;
+}
+
+/// The audit table (#694), as every backend must keep it: a row reads back
+/// exactly as appended, each row chains to the one before it, and the whole
+/// table's chain verifies. Unkeyed only, so a database that runs the battery
+/// again (a reused PostgreSQL) chains to the earlier runs' rows.
+pub async fn run_audit_battery(store: &dyn StateStore) {
+    let run = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let mut appended = Vec::new();
+    for (i, outcome) in ["attempt", "success", "refused"].iter().enumerate() {
+        let audit_id = format!("battery-{run}-{i}");
+        let record = format!(
+            r#"{{"audit_version":1,"audit_id":"{audit_id}","time":"2026-11-14T00:00:0{i}.000Z","action":"ledger.prune","stage":"local","outcome":"{outcome}","actor":{{"kind":"os","uid":1000,"name":"ops","source":"os"}},"target":{{"kind":"ledger"}}}}"#
+        );
+        let row = crate::audit::AuditInsert::from_record(&record).unwrap();
+        let stored = store.append_audit(&row, &Default::default()).await.unwrap();
+        assert_eq!(stored.audit_id, audit_id);
+        assert_eq!(stored.actor.as_deref(), Some("ops"));
+        assert_eq!(stored.chain, "blake3");
+        if let Some(previous) = appended.last() {
+            let previous: &crate::audit::AuditRow = previous;
+            assert!(stored.seq > previous.seq, "seq orders the chain");
+            assert_eq!(stored.prev_hash.as_deref(), Some(previous.hash.as_str()));
+        }
+        appended.push(stored);
+    }
+    // Read back exactly as appended.
+    let first = appended[0].seq;
+    let listed = store.list_audit(first - 1, 10).await.unwrap();
+    assert_eq!(&listed[..3], &appended[..], "rows read back as appended");
+    // A page boundary returns the rest in order.
+    let page = store.list_audit(first, 1).await.unwrap();
+    assert_eq!(page, vec![appended[1].clone()]);
+    // The whole table's chain verifies, earlier runs' rows included.
+    let mut all = Vec::new();
+    let mut after = 0;
+    loop {
+        let page = store.list_audit(after, 500).await.unwrap();
+        let Some(last) = page.last() else { break };
+        after = last.seq;
+        all.extend(page);
+    }
+    let report = crate::audit::verify_chain(&all, &Default::default());
+    assert!(report.passed(), "{:?}", report.problems);
+    assert_eq!(report.last_hash.as_deref(), Some(appended[2].hash.as_str()));
+    // An audit_id is unique: a record is stored once.
+    let again = crate::audit::AuditInsert::from_record(&appended[0].record).unwrap();
+    store
+        .append_audit(&again, &Default::default())
+        .await
+        .expect_err("an audit_id is stored once");
+}
+
+/// D11 of the #694 plan: `prune-ledger` deletes ledger rows and never an
+/// audit row, however old.
+async fn prune_never_touches_the_audit_table(store: &dyn StateStore) {
+    let record = r#"{"audit_version":1,"audit_id":"prune-keeps-me","time":"2000-01-01T00:00:00.000Z","action":"ledger.prune","stage":"local","outcome":"success","actor":{"kind":"os","uid":0,"source":"os"},"target":{"kind":"ledger"}}"#;
+    let row = crate::audit::AuditInsert::from_record(record).unwrap();
+    // A reused database may hold it from an earlier run.
+    let _ = store.append_audit(&row, &Default::default()).await;
+    let count = |rows: Vec<crate::audit::AuditRow>| rows.len();
+    let before = count(store.list_audit(0, 100_000).await.unwrap());
+    store
+        .prune_committed_history("2100-01-01T00:00:00+00:00", 1000)
+        .await
+        .unwrap();
+    let after = count(store.list_audit(0, 100_000).await.unwrap());
+    assert_eq!(before, after, "prune-ledger must not delete audit rows");
+    assert!(store
+        .list_audit(0, 100_000)
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.audit_id == "prune-keeps-me"));
 }
 
 /// #664: the state machine lets a row leave VERIFIED (FAILED, REPLAY_REQUIRED)

@@ -334,6 +334,30 @@ produces.
 - **Telemetry can never break the data path.** A bad `VTOP_METRICS_ADDR`, a port
   clash, or a registry failure logs an error and the engine keeps archiving.
 
+## The audit trail
+
+Commands that change engine or cluster state write audit records (#694) on
+the `vtop::audit` log target, which the operator's `RUST_LOG` cannot
+silence, and, with `VTOP_AUDIT_LOG` set, to an append-only JSONL file. Two
+counters, on the engine's and every node's `/metrics`:
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `vtop_audit_events_total` | `action` (`ledger.prune`, `ledger.replay`, `ledger.migrate`, `scrub.cursor`, `cluster.*`, `node.repair`, `node.reconfigure_range`, `promotion.attest`), `outcome` (`attempt`, `success`, `failure`, `refused`) | Records written. |
+| `vtop_audit_write_failures_total` | `sink` (`log`, `file`, `ledger`) | Records a sink could not take. Any increase needs a look: a destructive ledger command was refused, or a record is in fewer places than configured. |
+
+With JSON logs, the records in Loki (the lab's Alloy labels lines by
+`service`):
+
+```logql
+{service=~"vtop.*"} | json | target="vtop::audit" | fields_record != "" | line_format "{{.fields_record}}"
+```
+
+Each line's `fields_record` is the full record; `fields_summary`,
+`fields_action`, `fields_outcome`, `fields_actor` and `fields_audit_id` are
+beside it for filtering. The message (Alloy's `event` label) is only
+`audit: <action> <outcome>`, so the label stays bounded. See [docs/operate/auditing.md](../docs/operate/auditing.md).
+
 ## OpenTelemetry
 
 `vtopctl` and `vtop-node` export over OTLP (#683): traces of the batch

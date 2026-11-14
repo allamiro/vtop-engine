@@ -74,6 +74,97 @@ impl ManifestMacKey {
     fn authenticate(&self, bytes: &[u8]) -> blake3::Hash {
         blake3::keyed_hash(&self.0, bytes)
     }
+
+    /// The keyed link of the audit table's hash chain (#694), under a key
+    /// derived from this one for that purpose alone: an audit link can never
+    /// be presented as a manifest MAC, nor a manifest MAC as a link.
+    fn audit_link(&self, bytes: &[u8]) -> blake3::Hash {
+        let key = blake3::derive_key(AUDIT_CHAIN_CONTEXT, &self.0);
+        blake3::keyed_hash(&key, bytes)
+    }
+}
+
+/// The BLAKE3 key-derivation context of the audit chain's key.
+const AUDIT_CHAIN_CONTEXT: &str = "vtop-engine 2026 audit_events chain v1";
+
+/// The chain's name for an unkeyed link.
+pub const AUDIT_CHAIN_UNKEYED: &str = "blake3";
+/// The chain's name for a link keyed with (a key derived from) a manifest
+/// MAC key; `blake3-keyed:<id>` names the keyring key (#685) it used, plain
+/// `blake3-keyed` the `manifest_mac_key_env` key, which has no id.
+pub const AUDIT_CHAIN_KEYED: &str = "blake3-keyed";
+
+/// One link of the audit table's hash chain (#694): the hash of the previous
+/// row's link and this row's record, exactly as stored. Keyed with the
+/// keyring's signing key when one is configured, so a writer who can edit
+/// the table cannot recompute the chain without it. Returns the link
+/// (lowercase hex) and the chain's name, which names the key's id.
+pub fn audit_chain_link(
+    previous: Option<&str>,
+    record: &str,
+    keyring: &ManifestKeyring,
+) -> (String, String) {
+    match keyring.signing_key() {
+        Some((key, id)) => (
+            audit_chain_digest(previous, record, Some(key)),
+            match id {
+                Some(id) => format!("{AUDIT_CHAIN_KEYED}:{id}"),
+                None => AUDIT_CHAIN_KEYED.to_owned(),
+            },
+        ),
+        None => (
+            audit_chain_digest(previous, record, None),
+            AUDIT_CHAIN_UNKEYED.to_owned(),
+        ),
+    }
+}
+
+/// Recompute a stored link: `chain` is the name [`audit_chain_link`]
+/// returned. `Err` names why it cannot be checked here: a key this keyring
+/// does not hold (retired, or never configured), or a chain from a newer
+/// release.
+pub fn audit_chain_recompute(
+    previous: Option<&str>,
+    record: &str,
+    chain: &str,
+    keyring: &ManifestKeyring,
+) -> Result<String, String> {
+    if chain == AUDIT_CHAIN_UNKEYED {
+        return Ok(audit_chain_digest(previous, record, None));
+    }
+    let id = match chain.strip_prefix(AUDIT_CHAIN_KEYED) {
+        Some("") => None,
+        Some(rest) => match rest.strip_prefix(':') {
+            Some(id) => Some(id),
+            None => return Err(format!("chain {chain:?} is not one this build reads")),
+        },
+        None => return Err(format!("chain {chain:?} is not one this build reads")),
+    };
+    let key = keyring.chain_key(id).ok_or_else(|| match id {
+        Some(id) => format!(
+            "keyed with manifest key {id:?}, which this configuration does not hold \
+             (retired or never configured in manifest.mac)"
+        ),
+        None => "keyed with the manifest MAC key, which is not configured here; set \
+                 manifest_mac_key_env (or manifest.mac with a legacy key)"
+            .to_owned(),
+    })?;
+    Ok(audit_chain_digest(previous, record, Some(key)))
+}
+
+fn audit_chain_digest(
+    previous: Option<&str>,
+    record: &str,
+    key: Option<&ManifestMacKey>,
+) -> String {
+    let mut bytes = Vec::with_capacity(record.len() + 72);
+    bytes.extend_from_slice(previous.unwrap_or("").as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(record.as_bytes());
+    match key {
+        Some(key) => key.audit_link(&bytes).to_hex().to_string(),
+        None => blake3::hash(&bytes).to_hex().to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

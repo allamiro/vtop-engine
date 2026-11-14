@@ -14,7 +14,7 @@ Use two database identities:
 | Identity | Used by | Required access |
 |---|---|---|
 | migration owner | deployment job or init step | owns the VTOP schema objects and applies DDL |
-| engine runtime | every running engine | `CONNECT`, schema `USAGE`, and `SELECT, INSERT, UPDATE` on `batches` |
+| engine runtime | every running engine | `CONNECT`, schema `USAGE`, `SELECT, INSERT, UPDATE` on `batches`, and `SELECT, INSERT` on `audit_events` with `USAGE` on its sequence (#694) |
 
 Do not make the runtime role a table owner. Do not grant it `CREATE`, `ALTER`,
 `DROP`, `DELETE`, `TRUNCATE`, `REFERENCES`, or `TRIGGER`.
@@ -44,10 +44,22 @@ engine:
    GRANT CONNECT ON DATABASE vtop TO vtop_runtime;
    GRANT USAGE ON SCHEMA public TO vtop_runtime;
    GRANT SELECT, INSERT, UPDATE ON TABLE public.batches TO vtop_runtime;
+   GRANT SELECT, INSERT ON TABLE public.audit_events TO vtop_runtime;
+   GRANT USAGE ON SEQUENCE public.audit_events_seq_seq TO vtop_runtime;
 
    REVOKE DELETE, TRUNCATE, REFERENCES, TRIGGER
        ON TABLE public.batches FROM vtop_runtime;
    ```
+
+   `audit_events` (#694) holds the audit records of `replay`,
+   `prune-ledger` and `migrate`, which are refused when they cannot write
+   them. It is append only: a trigger refuses `UPDATE`, `DELETE` and
+   `TRUNCATE` to every role but the table's owner (the migration identity),
+   whatever is granted. Engines of this release refuse a schema without the
+   table at startup, naming it and `vtopctl migrate`; an older release
+   pointed at a migrated database ignores it. The migration creates it with
+   `CREATE TABLE IF NOT EXISTS`, and the schema marker is unchanged. See
+   [Auditing](operate/auditing.md).
 
    Ledger retention (#128) is a MAINTENANCE operation, not a runtime one:
    the runtime role keeps its DELETE denial, and the engine refuses
@@ -65,7 +77,12 @@ engine:
    GRANT CONNECT ON DATABASE vtop TO vtop_maintenance;
    GRANT USAGE ON SCHEMA public TO vtop_maintenance;
    GRANT SELECT, DELETE ON TABLE public.batches TO vtop_maintenance;
+   GRANT SELECT, INSERT ON TABLE public.audit_events TO vtop_maintenance;
+   GRANT USAGE ON SEQUENCE public.audit_events_seq_seq TO vtop_maintenance;
    ```
+
+   `prune-ledger` writes its attempt to `audit_events` before it deletes
+   anything, and is refused without these grants.
 
    The prune predicate itself protects recovery: only SOURCE_COMMITTED rows
    below the age cutoff whose per-path max-end_byte successor survives are

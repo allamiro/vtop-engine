@@ -10,6 +10,7 @@
 //! trait (Phase 1 of the HA plan). The Postgres implementation (Phase 3) lives
 //! behind a Cargo feature and implements the same trait.
 
+use crate::audit::{AuditInsert, AuditRow};
 use crate::models::{
     parse_content_fingerprint, BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset,
     VerificationClass,
@@ -84,6 +85,25 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
     created_at,
     batch_id
 );
+-- The audit trail (#694): one row per audit record, append only, chained
+-- (see crate::audit). A new table: an older release opening this file never
+-- reads it, so the schema version is unchanged. AUTOINCREMENT, so a deleted
+-- row's seq is never reused.
+CREATE TABLE IF NOT EXISTS audit_events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    audit_id TEXT NOT NULL UNIQUE,
+    time TEXT NOT NULL,
+    action TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    actor TEXT,
+    target TEXT,
+    audit_version INTEGER NOT NULL,
+    record TEXT NOT NULL,
+    prev_hash TEXT,
+    hash TEXT NOT NULL,
+    chain TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(time);
 "#;
 
 /// Prune predicate shared between the store method and the plan-shape test.
@@ -261,6 +281,18 @@ impl SqliteStateStore {
             durable,
             fence: Default::default(),
         })
+    }
+
+    /// Execute raw SQL against the file. TEST-ONLY, as
+    /// `PgStateStore::execute_raw`: a test stands for someone who can write
+    /// the file (to tamper with the audit table, #694, or make it fail).
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn execute_raw(&self, sql: &'static str) -> Result<(), VtopError> {
+        sqlx::raw_sql(sql)
+            .execute(&self.durable)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(())
     }
 
     async fn get_state(&self, batch_id: &str) -> Result<BatchState, VtopError> {
@@ -815,6 +847,106 @@ impl StateStore for SqliteStateStore {
             .map_err(map_sqlx)?;
         Ok(result.rows_affected())
     }
+
+    async fn append_audit(
+        &self,
+        row: &AuditInsert,
+        keyring: &vtop_core::manifest::ManifestKeyring,
+    ) -> Result<AuditRow, VtopError> {
+        // Through the synchronous=FULL connection: the row is on disk before
+        // the action it records runs. BEGIN IMMEDIATE takes the write lock
+        // before the last link is read, so two writers (two vtopctl runs)
+        // cannot both chain to the same row.
+        //
+        // A transaction sqlx tracks (review of #705): dropped before COMMIT -
+        // a deadline that expired, a COMMIT that failed - it rolls back, so
+        // the pooled connection never goes back holding the write lock.
+        let mut tx = self
+            .durable
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_sqlx)?;
+        let stored = append_audit_in(&mut tx, row, keyring).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(stored)
+    }
+
+    async fn list_audit(&self, after_seq: i64, limit: u32) -> Result<Vec<AuditRow>, VtopError> {
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            audit_columns!(),
+            " FROM audit_events WHERE seq > ? ORDER BY seq LIMIT ?"
+        ))
+        .bind(after_seq)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows.into_iter().map(row_to_audit).collect())
+    }
+}
+
+async fn append_audit_in(
+    conn: &mut sqlx::SqliteConnection,
+    row: &AuditInsert,
+    keyring: &vtop_core::manifest::ManifestKeyring,
+) -> Result<AuditRow, VtopError> {
+    let previous: Option<String> =
+        sqlx::query_scalar("SELECT hash FROM audit_events ORDER BY seq DESC LIMIT 1")
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(map_sqlx)?;
+    let (hash, chain) = crate::audit::link_for(previous.as_deref(), &row.record, keyring);
+    let seq: i64 = sqlx::query_scalar(
+        "INSERT INTO audit_events (audit_id, time, action, outcome, actor, target, \
+         audit_version, record, prev_hash, hash, chain) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
+    )
+    .bind(&row.audit_id)
+    .bind(&row.time)
+    .bind(&row.action)
+    .bind(&row.outcome)
+    .bind(&row.actor)
+    .bind(&row.target)
+    .bind(row.audit_version)
+    .bind(&row.record)
+    .bind(&previous)
+    .bind(&hash)
+    .bind(&chain)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(AuditRow {
+        seq,
+        audit_id: row.audit_id.clone(),
+        time: row.time.clone(),
+        action: row.action.clone(),
+        outcome: row.outcome.clone(),
+        actor: row.actor.clone(),
+        target: row.target.clone(),
+        audit_version: row.audit_version,
+        record: row.record.clone(),
+        prev_hash: previous,
+        hash,
+        chain,
+    })
+}
+
+fn row_to_audit(row: sqlx::sqlite::SqliteRow) -> AuditRow {
+    AuditRow {
+        seq: row.get("seq"),
+        audit_id: row.get("audit_id"),
+        time: row.get("time"),
+        action: row.get("action"),
+        outcome: row.get("outcome"),
+        actor: row.get("actor"),
+        target: row.get("target"),
+        audit_version: row.get("audit_version"),
+        record: row.get("record"),
+        prev_hash: row.get("prev_hash"),
+        hash: row.get("hash"),
+        chain: row.get("chain"),
+    }
 }
 
 /// Create the schema, or bring an older one up to date: idempotent, and run
@@ -930,6 +1062,22 @@ async fn migrate_in_transaction(conn: &mut sqlx::SqliteConnection) -> Result<boo
     .execute(&mut *conn)
     .await
     .map_err(map_sqlx)?;
+    // The audit table is append only (#694): an outcome is a second row,
+    // never an update of the attempt. Anyone who can write this file can
+    // drop the triggers; the chain is what shows that.
+    for trigger in [
+        "CREATE TRIGGER IF NOT EXISTS trg_audit_events_no_update \
+         BEFORE UPDATE ON audit_events \
+         BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END",
+        "CREATE TRIGGER IF NOT EXISTS trg_audit_events_no_delete \
+         BEFORE DELETE ON audit_events \
+         BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END",
+    ] {
+        sqlx::raw_sql(trigger)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx)?;
+    }
     if version < SQLITE_SCHEMA_VERSION {
         sqlx::raw_sql("PRAGMA user_version = 1")
             .execute(&mut *conn)
@@ -1516,6 +1664,77 @@ mod tests {
         // SQLite has no role separation: the same handle is the maintenance
         // identity, so the prune contract runs here directly.
         test_battery::run_prune_battery(&store).await;
+        test_battery::run_audit_battery(&store).await;
+    }
+
+    /// #694: the audit table is append only in the database too, created on
+    /// open of a file from before it without raising the schema version, and
+    /// a keyed chain round-trips through the store.
+    #[tokio::test]
+    async fn sqlite_keeps_an_append_only_chained_audit_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = format!("sqlite://{}", path.display());
+        // A file as a release before #694 left it: the ledger, no audit table.
+        {
+            let store = SqliteStateStore::connect(&conn).await.unwrap();
+            sqlx::raw_sql(
+                "DROP TRIGGER trg_audit_events_no_update; \
+                 DROP TRIGGER trg_audit_events_no_delete; DROP TABLE audit_events",
+            )
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        }
+        let store = SqliteStateStore::connect(&conn).await.unwrap();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(version, SQLITE_SCHEMA_VERSION, "a new table needs no bump");
+        let key = vtop_core::manifest::ManifestKeyring::single(
+            vtop_core::manifest::ManifestMacKey::from_hex(&"ab".repeat(32)).unwrap(),
+        );
+        for i in 0..3 {
+            let record = format!(
+                r#"{{"audit_version":1,"audit_id":"k{i}","time":"t","action":"ledger.replay","outcome":"attempt","actor":{{"kind":"os","uid":1,"source":"os"}},"target":{{"kind":"ledger"}}}}"#
+            );
+            let row = crate::audit::AuditInsert::from_record(&record).unwrap();
+            let stored = store.append_audit(&row, &key).await.unwrap();
+            assert_eq!(stored.chain, "blake3-keyed");
+        }
+        let rows = store.list_audit(0, 10).await.unwrap();
+        assert!(crate::audit::verify_chain(&rows, &key).passed());
+        for (sql, what) in [
+            (
+                "UPDATE audit_events SET outcome = 'success' WHERE seq = 1",
+                "UPDATE",
+            ),
+            ("DELETE FROM audit_events WHERE seq = 1", "DELETE"),
+        ] {
+            let err = sqlx::raw_sql(sql)
+                .execute(&store.pool)
+                .await
+                .expect_err(what);
+            assert!(err.to_string().contains("append-only"), "{what}: {err}");
+        }
+        // Someone with the file drops the triggers and edits a row: the
+        // chain shows it.
+        sqlx::raw_sql(
+            "DROP TRIGGER trg_audit_events_no_update; \
+             UPDATE audit_events SET record = replace(record, 'attempt', 'success') WHERE seq = 2",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let rows = store.list_audit(0, 10).await.unwrap();
+        let report = crate::audit::verify_chain(&rows, &key);
+        assert!(!report.passed());
+        assert!(
+            report.problems[0].contains("row 2"),
+            "{:?}",
+            report.problems
+        );
     }
 
     // The prune successor probe must resolve through idx_batches_commit_newest;

@@ -310,6 +310,21 @@ impl ManifestKeyring {
             .to_owned()
     }
 
+    /// The key an audit-chain link (#694) names: the key with that id, or,
+    /// for a link that names none, the `manifest_mac_key_env` key (or the
+    /// legacy key that took its place).
+    pub fn chain_key(&self, id: Option<&str>) -> Option<&ManifestMacKey> {
+        match id {
+            Some(id) => self.by_id(id).map(|e| &e.key),
+            None => self
+                .entries
+                .iter()
+                .find(|e| e.id.is_none())
+                .or_else(|| self.legacy())
+                .map(|e| &e.key),
+        }
+    }
+
     fn by_id(&self, id: &str) -> Option<&Entry> {
         self.entries.iter().find(|e| e.id.as_deref() == Some(id))
     }
