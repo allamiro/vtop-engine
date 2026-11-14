@@ -471,33 +471,55 @@ pub struct FileSourceConfig {
     pub enabled: bool,
     pub paths: Vec<String>,
     /// If true, a source file is deleted once a committed batch covers it to
-    /// its end AND it has then stayed unwritten - same inode, first page,
-    /// length and mtime - for `delete_quiet_seconds` (#619).
+    /// its end, it has then stayed unwritten - same inode, first page, page
+    /// below the archived end, length, the mtime the batch read and the
+    /// ctime - for `delete_quiet_seconds`, AND no process has it open (#619).
     ///
     /// Safe for files nothing writes to any more: whole-file drops, and
-    /// rotated logs once the writer has reopened its new file. The quiet
-    /// period is what keeps a live log that a writer still holds open from
-    /// being deleted when the engine catches up with it - a deleted file keeps
-    /// taking that writer's lines into an inode no path names. It is a
-    /// heuristic, not a proof: no portable check shows that no process holds
-    /// a file open, so a writer that keeps the file open, is silent for longer
-    /// than the quiet period and then writes again loses those lines - as does
-    /// one whose write, after that silence, lands between the delete's final
-    /// check and the unlink. Point this option at files that are finished, not
-    /// at a live log.
+    /// rotated logs once the writer has reopened its new file. A deleted file
+    /// a writer still holds open keeps taking that writer's lines into an
+    /// inode no path names, so the quiet period alone is not enough: a writer
+    /// can be silent for longer than it and then write again. The engine
+    /// proves that no process has the file open with a Linux write lease,
+    /// held from before the file is moved aside until after the unlink, so a
+    /// writer that holds the file open - or opens it while it is being
+    /// deleted - keeps it, however long it has been silent.
+    ///
+    /// The lease needs Linux, a local filesystem (ext2/3/4, xfs, btrfs,
+    /// tmpfs, overlay, f2fs, zfs or bcachefs: on NFS, CIFS, FUSE, 9p,
+    /// virtiofs or CephFS it could not see a writer on another machine, so it
+    /// is not asked for), and the engine running as the files' owner or with
+    /// `CAP_LEASE` in its effective set. Without it there is no check, and a
+    /// fully archived file is KEPT, with a warning naming the reason, unless
+    /// `delete_without_open_check` is set. On a platform without inode
+    /// numbers no file is ever deleted.
+    ///
+    /// Also KEPT, each with a message saying why and what to do: a file whose
+    /// mtime or ctime changed after the commit (a touch cannot be told from a
+    /// same-length rewrite between its first and last pages); a configured
+    /// path that is a symbolic link; and a file that cannot be renamed aside
+    /// within its own directory (`EXDEV` for a bind-mounted single file,
+    /// `EACCES` for a directory the engine cannot write).
     #[serde(default)]
     pub delete_after_commit: bool,
     /// How long, in seconds, a fully archived file must stay unwritten before
     /// `delete_after_commit` deletes it (#619). Timed on the engine's own
     /// clock from the commit that covered the file, so a restart starts the
     /// wait again; the file's mtime is compared, never trusted as a clock. 0
-    /// deletes as soon as a commit covers the file - still through the
-    /// rename-and-check, which puts the file back if a write landed before
-    /// the move - but with no quiet-period protection: a writer that still
-    /// has the file open loses every line it writes after the delete.
-    /// Default 3600.
+    /// deletes as soon as a commit covers the file, still only if no process
+    /// has it open (see `delete_after_commit`). Default 3600.
     #[serde(default = "default_delete_quiet_seconds")]
     pub delete_quiet_seconds: u64,
+    /// Where the engine cannot check that no process holds a file open (see
+    /// `delete_after_commit`), delete it on `delete_quiet_seconds` alone
+    /// (#619). Default false: such a file is kept. With true, a writer that
+    /// still holds the file open loses lines in two ways: it is silent for
+    /// longer than the quiet period and then writes again, or its write
+    /// lands between the delete's final check and the unlink. Where the
+    /// check is possible it is always made, and a file some process has open
+    /// is kept whatever this says.
+    #[serde(default)]
+    pub delete_without_open_check: bool,
     /// Read each file as a single whole-file record instead of line by line.
     /// Required for binary / already-compressed source files (which have no
     /// line structure). Default false (line-oriented).
@@ -1141,6 +1163,15 @@ pub const SIZE_ONLY_VERIFICATION_WARNING: &str =
      upload.require_strong_verification: true unless this is a lab or a backend \
      with no content digest";
 
+/// Said on every start and by `vtopctl validate` when a file source deletes
+/// on the quiet period alone where it cannot check for open writers (#619).
+pub const DELETE_WITHOUT_OPEN_CHECK_WARNING: &str =
+    "sources.file.delete_without_open_check is true: where the engine cannot check that \
+     no process holds a file open (a platform other than Linux, an NFS or FUSE mount, a \
+     file another user owns while the engine lacks CAP_LEASE), delete_after_commit deletes \
+     a fully archived file on delete_quiet_seconds alone, and a writer that still holds it \
+     open loses every line it writes after. Set it to false to keep such files instead";
+
 impl VtopConfig {
     /// Settings that are valid but unsafe enough to say so on every start
     /// and in `vtopctl validate` (#629). Never a reason to refuse: each one
@@ -1157,6 +1188,11 @@ impl VtopConfig {
                 );
             }
             warnings.push(w);
+        }
+        if self.sources.file.as_ref().is_some_and(|file| {
+            file.enabled && file.delete_after_commit && file.delete_without_open_check
+        }) {
+            warnings.push(DELETE_WITHOUT_OPEN_CHECK_WARNING.to_string());
         }
         warnings
     }
@@ -1664,6 +1700,47 @@ upload:
             weak.warnings()[0].contains("EVERY batch"),
             "with checksums off every batch is size-only: {:?}",
             weak.warnings()
+        );
+    }
+
+    /// #619: deleting on the quiet period alone, where no open-file check is
+    /// possible, is an opt-out from a data-loss guard, so it is said on every
+    /// start - and only when it can delete anything.
+    #[test]
+    fn deleting_without_an_open_check_is_warned_about() {
+        let yaml = r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources:
+  file:
+    enabled: true
+    paths: ["/var/log/app/*.log"]
+    delete_after_commit: true
+upload:
+  bucket: telemetry-data
+"#;
+        let mut cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        let file = cfg.sources.file.as_ref().unwrap();
+        assert!(
+            !file.delete_without_open_check,
+            "the default keeps a file no open-file check can clear"
+        );
+        assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+        cfg.sources.file.as_mut().unwrap().delete_without_open_check = true;
+        cfg.validate().expect("the opt-out stays valid config");
+        assert_eq!(
+            cfg.warnings(),
+            vec![DELETE_WITHOUT_OPEN_CHECK_WARNING.to_string()]
+        );
+        cfg.sources.file.as_mut().unwrap().delete_after_commit = false;
+        assert!(
+            cfg.warnings().is_empty(),
+            "nothing is deleted, so nothing to warn about: {:?}",
+            cfg.warnings()
         );
     }
 

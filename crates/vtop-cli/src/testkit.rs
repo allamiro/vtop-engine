@@ -64,6 +64,7 @@ pub fn file_config(
                 paths,
                 delete_after_commit: false,
                 delete_quiet_seconds: vtop_core::config::DEFAULT_DELETE_QUIET_SECONDS,
+                delete_without_open_check: false,
                 whole_file: false,
             }),
             syslog_spool: None,
@@ -168,5 +169,6 @@ pub fn pipeline<'a>(
         manifest_mac_key: config.resolve_manifest_mac_key().unwrap(),
         versioned_buckets: std::sync::Arc::default(),
         provisioned_buckets: std::sync::Arc::default(),
+        key_notices: std::sync::Arc::default(),
     }
 }

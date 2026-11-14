@@ -137,8 +137,9 @@ Each source is optional. A source block that is present but has
 | `enabled` | `false` | Read files. |
 | `paths` | **Required** in the block | Glob patterns of files to read. |
 | `whole_file` | `false` | Read each file as one record instead of line by line. Needed for binary or already-compressed files. |
-| `delete_after_commit` | `false` | Delete a file once a committed batch covers it to its end and it has stayed unwritten for `delete_quiet_seconds`. For finished files only, never a live log. |
+| `delete_after_commit` | `false` | Delete a file once a committed batch covers it to its end and it has stayed unwritten for `delete_quiet_seconds`. On Linux the engine first takes a write lease, so a file any process still holds open is kept. Where no lease can be taken (macOS, NFS or FUSE, another user's file, a container without `CAP_LEASE`) the file is kept, unless `delete_without_open_check` is set. For finished files only, never a live log. |
 | `delete_quiet_seconds` | `3600` | How long a fully archived file must stay unwritten before it is deleted. |
+| `delete_without_open_check` | `false` | Where the engine can't check that no process holds a file open, delete it on `delete_quiet_seconds` alone. Risky: a writer still holding the file can lose lines if it stays silent past the quiet period and then writes again, or writes between the final check and the unlink. Where the check is possible it is always made. The engine warns at startup and in `vtopctl validate` when this is set. |
 
 ### `sources.syslog_spool`
 

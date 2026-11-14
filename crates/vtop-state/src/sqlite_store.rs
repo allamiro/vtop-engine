@@ -12,6 +12,7 @@
 
 use crate::models::{
     parse_content_fingerprint, BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset,
+    VerificationClass,
 };
 use crate::store::StateStore;
 use async_trait::async_trait;
@@ -21,6 +22,17 @@ use std::str::FromStr;
 use vtop_core::errors::VtopError;
 use vtop_core::state_machine::{transition, BatchState};
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
+
+/// The SQLite ledger's schema version, kept in the file's `PRAGMA
+/// user_version` (#664). 1 is the first: the schema with `verification_class`.
+/// Files from before it read 0 and are brought up to it on open. A higher
+/// value means a newer release has opened the file for a change this release
+/// could misread - the version is raised for nothing else - and this release
+/// refuses the file rather than run on it. Releases before #664 never read the
+/// version; this is the refusal path for the releases from here on. Raise it,
+/// and the `PRAGMA user_version = 1` in `migrate`, together
+/// (`sqlite_refuses_a_file_a_newer_release_opened` checks they agree).
+const SQLITE_SCHEMA_VERSION: i64 = 1;
 
 /// How many times a write that lost a race to another writer is re-validated
 /// and retried before giving up.
@@ -48,7 +60,8 @@ CREATE TABLE IF NOT EXISTS batches (
     lease_expires_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    claim_gen INTEGER NOT NULL DEFAULT 0
+    claim_gen INTEGER NOT NULL DEFAULT 0,
+    verification_class TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
 CREATE INDEX IF NOT EXISTS idx_batches_source ON batches(source_type, source_name);
@@ -137,7 +150,9 @@ macro_rules! prune_committed_sql {
 macro_rules! prune_candidates_sql {
     () => {
         concat!(
-            "SELECT * FROM batches WHERE batch_id IN ( \
+            "SELECT ",
+            batch_columns!(),
+            " FROM batches WHERE batch_id IN ( \
                 SELECT b.batch_id FROM batches b WHERE ",
             prune_predicate_sql!(),
             " LIMIT ?3 ) ORDER BY created_at, batch_id"
@@ -204,13 +219,31 @@ impl SqliteStateStore {
     /// `sqlite:///data/vtop-state.db` or `sqlite::memory:`.
     pub async fn connect(conn_str: &str) -> Result<Self, VtopError> {
         let opts = parse_sqlite_opts(conn_str)?;
+        let in_memory = is_in_memory(conn_str);
+        // A file is migrated on a connection of its own, closed before the
+        // pools that serve requests open (#664). Migrating through the pool,
+        // a statement at a time, could leave a pool connection that opened
+        // before an `ALTER TABLE ... ADD COLUMN` ran, holding statements
+        // prepared against the old column list; with `SELECT *` the first
+        // recovery claim on an upgraded file returned no rows (see
+        // `batch_columns!` for why reads now name their columns, which also
+        // covers a column another process adds). An in-memory database is
+        // new, so its `ALTER`s add nothing, and it lives only as long as its
+        // pool.
+        if !in_memory {
+            let mut conn = sqlx::ConnectOptions::connect(&opts)
+                .await
+                .map_err(map_sqlx)?;
+            migrate(&mut conn).await?;
+            sqlx::Connection::close(conn).await.map_err(map_sqlx)?;
+        }
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(opts.clone())
             .await
             .map_err(map_sqlx)?;
         // An in-memory database has nothing to sync.
-        let durable = if is_in_memory(conn_str) {
+        let durable = if in_memory {
             pool.clone()
         } else {
             SqlitePoolOptions::new()
@@ -219,61 +252,15 @@ impl SqliteStateStore {
                 .await
                 .map_err(map_sqlx)?
         };
-        let store = Self {
+        if in_memory {
+            let mut conn = pool.acquire().await.map_err(map_sqlx)?;
+            migrate(&mut conn).await?;
+        }
+        Ok(Self {
             pool,
             durable,
             fence: Default::default(),
-        };
-        store.migrate().await?;
-        Ok(store)
-    }
-
-    async fn migrate(&self) -> Result<(), VtopError> {
-        // Execute each statement in the schema script.
-        for stmt in SCHEMA.split(';') {
-            let stmt = stmt.trim();
-            if stmt.is_empty() {
-                continue;
-            }
-            sqlx::query(stmt)
-                .execute(&self.pool)
-                .await
-                .map_err(map_sqlx)?;
-        }
-        // Pre-#93 databases lack the ownership columns; SQLite has no IF NOT
-        // EXISTS for columns, so ONLY the duplicate-column error is ignored -
-        // any other failure (locked file, corruption) must surface now, not as
-        // a missing-column error on the first batch write.
-        for stmt in [
-            "ALTER TABLE batches ADD COLUMN owner TEXT",
-            "ALTER TABLE batches ADD COLUMN lease_expires_at TEXT",
-            "ALTER TABLE batches ADD COLUMN object_size_bytes INTEGER",
-            "ALTER TABLE batches ADD COLUMN manifest_version_id TEXT",
-            // The claim fence (#557): every claim bumps it; a writer holding an
-            // older generation is refused.
-            "ALTER TABLE batches ADD COLUMN claim_gen INTEGER NOT NULL DEFAULT 0",
-        ] {
-            if let Err(e) = sqlx::raw_sql(stmt).execute(&self.pool).await {
-                if !e.to_string().contains("duplicate column name") {
-                    return Err(map_sqlx(e));
-                }
-            }
-        }
-        // A row is born only as batching (#625), in the database too, so a
-        // write that skips save_batch_state cannot create one born verified.
-        // A trigger, not a CHECK: an existing table gains it without a
-        // rebuild. Run apart from SCHEMA, whose split on ';' would cut the
-        // trigger body. Every release inserts only batching, so an older
-        // binary opening this file is unaffected.
-        sqlx::raw_sql(
-            "CREATE TRIGGER IF NOT EXISTS trg_batches_insert_as_batching \
-             BEFORE INSERT ON batches WHEN NEW.state <> 'batching' \
-             BEGIN SELECT RAISE(ABORT, 'a batch must be inserted as batching'); END",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
-        Ok(())
+        })
     }
 
     async fn get_state(&self, batch_id: &str) -> Result<BatchState, VtopError> {
@@ -404,6 +391,7 @@ impl StateStore for SqliteStateStore {
         // retried, so a `mark_failed` is not lost to an unrelated update; an
         // illegal one fails on the next pass. A LOST CLAIM is not a lost
         // update - retrying cannot help - so it is reported at once (#557).
+        crate::store::require_class_only_at_verified(batch_id, to, patch)?;
         let held = self.fence.held(batch_id);
         let mut attempt = 0;
         loop {
@@ -430,6 +418,7 @@ impl StateStore for SqliteStateStore {
                      object_size_bytes = COALESCE(?, object_size_bytes),
                      record_count = COALESCE(?, record_count),
                      error_message = COALESCE(?, error_message),
+                     verification_class = CASE WHEN ? THEN ? ELSE verification_class END,
                      updated_at = ?
                    WHERE batch_id = ? AND state = ? AND claim_gen = ?"#,
             )
@@ -442,6 +431,11 @@ impl StateStore for SqliteStateStore {
             .bind(patch.object_size_bytes)
             .bind(patch.record_count)
             .bind(&patch.error_message)
+            // The transition to VERIFIED writes the class it was given, NULL
+            // included, rather than keeping an older one: the class describes
+            // the verification that admitted the row this time (#664).
+            .bind(validated == BatchState::Verified)
+            .bind(patch.verification_class.map(VerificationClass::as_str))
             .bind(now)
             .bind(batch_id)
             .bind(current.as_str())
@@ -469,11 +463,15 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn get_batch(&self, batch_id: &str) -> Result<Option<BatchRecord>, VtopError> {
-        let row = sqlx::query("SELECT * FROM batches WHERE batch_id = ?")
-            .bind(batch_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            batch_columns!(),
+            " FROM batches WHERE batch_id = ?"
+        ))
+        .bind(batch_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         row.map(row_to_record).transpose()
     }
 
@@ -520,8 +518,15 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
-        self.query_records("SELECT * FROM batches ORDER BY created_at DESC", None)
-            .await
+        self.query_records(
+            concat!(
+                "SELECT ",
+                batch_columns!(),
+                " FROM batches ORDER BY created_at DESC"
+            ),
+            None,
+        )
+        .await
     }
 
     async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError> {
@@ -564,13 +569,14 @@ impl StateStore for SqliteStateStore {
         // fence (review of #569). A row in either terminal state is never
         // claimed. Before SUPERSEDED existed (#567), a range it now retires
         // was claimed, rewritten and re-planned at every restart.
-        let claimed = sqlx::query(
+        let claimed = sqlx::query(concat!(
             "UPDATE batches SET owner = ?1, lease_expires_at = ?2, updated_at = ?3, \
                     claim_gen = claim_gen + 1 \
              WHERE state NOT IN (?4, ?5) \
                AND (owner IS NULL OR owner = ?1 OR lease_expires_at IS NULL OR lease_expires_at <= ?3) \
-             RETURNING *",
-        )
+             RETURNING ",
+            batch_columns!()
+        ))
         .bind(owner)
         .bind(lease_until)
         .bind(now)
@@ -707,19 +713,26 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn list_incomplete_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
-        let rows =
-            sqlx::query("SELECT * FROM batches WHERE state NOT IN (?, ?) ORDER BY created_at ASC")
-                .bind(BatchState::SourceCommitted.as_str())
-                .bind(BatchState::Superseded.as_str())
-                .fetch_all(&self.pool)
-                .await
-                .map_err(map_sqlx)?;
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            batch_columns!(),
+            " FROM batches WHERE state NOT IN (?, ?) ORDER BY created_at ASC"
+        ))
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(BatchState::Superseded.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         rows.into_iter().map(row_to_record).collect()
     }
 
     async fn list_failed_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
         self.query_records(
-            "SELECT * FROM batches WHERE state = ? ORDER BY created_at ASC",
+            concat!(
+                "SELECT ",
+                batch_columns!(),
+                " FROM batches WHERE state = ? ORDER BY created_at ASC"
+            ),
             Some(BatchState::Failed.as_str().to_string()),
         )
         .await
@@ -734,8 +747,16 @@ impl StateStore for SqliteStateStore {
             .await
     }
 
-    async fn mark_verified(&self, batch_id: &str) -> Result<(), VtopError> {
-        self.update_batch_state(batch_id, BatchState::Verified, &BatchPatch::default())
+    async fn mark_verified(
+        &self,
+        batch_id: &str,
+        class: VerificationClass,
+    ) -> Result<(), VtopError> {
+        let patch = BatchPatch {
+            verification_class: Some(class),
+            ..Default::default()
+        };
+        self.update_batch_state(batch_id, BatchState::Verified, &patch)
             .await
     }
 
@@ -796,6 +817,128 @@ impl StateStore for SqliteStateStore {
     }
 }
 
+/// Create the schema, or bring an older one up to date: idempotent, and run
+/// on every open. See [`SqliteStateStore::connect`] for why it runs on one
+/// connection.
+///
+/// One `BEGIN IMMEDIATE` transaction from the version check to the version
+/// write (review of #664): it takes the write lock before reading the
+/// version, so a newer release raising the version at the same moment is
+/// either seen and refused, or waits; this release never writes its version
+/// over a newer one.
+async fn migrate(conn: &mut sqlx::SqliteConnection) -> Result<(), VtopError> {
+    sqlx::raw_sql("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx)?;
+    let added = match migrate_in_transaction(&mut *conn).await {
+        Ok(added) => added,
+        Err(e) => {
+            // The refusal or failure is the error reported; a failed
+            // rollback adds nothing to it, and the connection is closed.
+            let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
+            return Err(e);
+        }
+    };
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx)?;
+    if added {
+        // Counted after the commit, and best effort: the column is there
+        // either way, and a failed count must not fail the open.
+        match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM batches")
+            .fetch_one(&mut *conn)
+            .await
+        {
+            Ok(rows) => crate::models::log_class_column_added("SQLite", rows),
+            Err(e) => crate::models::log_class_column_added_uncounted("SQLite", &e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// [`migrate`]'s statements, in its transaction. `true` when this run added
+/// the verification class column to a table that already existed.
+async fn migrate_in_transaction(conn: &mut sqlx::SqliteConnection) -> Result<bool, VtopError> {
+    let mut added = false;
+    // A file a newer release has opened is left alone (#664): see
+    // SQLITE_SCHEMA_VERSION.
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(map_sqlx)?;
+    if version > SQLITE_SCHEMA_VERSION {
+        return Err(VtopError::State(format!(
+            "SQLite state-store schema version {version} (the ledger file's PRAGMA user_version) \
+             is newer than this release supports (newest {SQLITE_SCHEMA_VERSION}): a newer \
+             release has opened this file. Nothing was started or changed. Run that release or a \
+             later one; downgrade is not supported"
+        )));
+    }
+    // Execute each statement in the schema script.
+    for stmt in SCHEMA.split(';') {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        sqlx::query(stmt)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx)?;
+    }
+    // Pre-#93 databases lack the ownership columns; SQLite has no IF NOT
+    // EXISTS for columns, so ONLY the duplicate-column error is ignored -
+    // any other failure (locked file, corruption) must surface now, not as
+    // a missing-column error on the first batch write.
+    for stmt in [
+        "ALTER TABLE batches ADD COLUMN owner TEXT",
+        "ALTER TABLE batches ADD COLUMN lease_expires_at TEXT",
+        "ALTER TABLE batches ADD COLUMN object_size_bytes INTEGER",
+        "ALTER TABLE batches ADD COLUMN manifest_version_id TEXT",
+        // The claim fence (#557): every claim bumps it; a writer holding an
+        // older generation is refused.
+        "ALTER TABLE batches ADD COLUMN claim_gen INTEGER NOT NULL DEFAULT 0",
+        // The class of verification a VERIFIED row passed (#664). NULL on
+        // every row from before it: unknown, decided as those rows always
+        // were. An older binary opening this file ignores the column: it
+        // reads rows by column name and never writes it.
+        "ALTER TABLE batches ADD COLUMN verification_class TEXT",
+    ] {
+        match sqlx::raw_sql(stmt).execute(&mut *conn).await {
+            Err(e) if !e.to_string().contains("duplicate column name") => {
+                return Err(map_sqlx(e));
+            }
+            Err(_) => {}
+            // Added to a table that already existed: a new table is created
+            // with the column, and this ALTER finds it there.
+            Ok(_) if stmt.contains("verification_class") => added = true,
+            Ok(_) => {}
+        }
+    }
+    // A row is born only as batching (#625), in the database too, so a
+    // write that skips save_batch_state cannot create one born verified.
+    // A trigger, not a CHECK: an existing table gains it without a
+    // rebuild. Run apart from SCHEMA, whose split on ';' would cut the
+    // trigger body. Every release inserts only batching, so an older
+    // binary opening this file is unaffected.
+    sqlx::raw_sql(
+        "CREATE TRIGGER IF NOT EXISTS trg_batches_insert_as_batching \
+         BEFORE INSERT ON batches WHEN NEW.state <> 'batching' \
+         BEGIN SELECT RAISE(ABORT, 'a batch must be inserted as batching'); END",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+    if version < SQLITE_SCHEMA_VERSION {
+        sqlx::raw_sql("PRAGMA user_version = 1")
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx)?;
+    }
+    Ok(added)
+}
+
 fn is_in_memory(conn_str: &str) -> bool {
     conn_str == "sqlite::memory:" || conn_str == ":memory:"
 }
@@ -854,6 +997,10 @@ fn row_to_record(row: sqlx::sqlite::SqliteRow) -> Result<BatchRecord, VtopError>
         manifest_sha256: row.get("manifest_sha256"),
         manifest_version_id: row.get("manifest_version_id"),
         object_size_bytes: row.get("object_size_bytes"),
+        verification_class: VerificationClass::from_stored(
+            row.get::<Option<String>, _>("verification_class")
+                .as_deref(),
+        ),
         record_count: row.get("record_count"),
         error_message: row.get("error_message"),
         owner: row.get("owner"),
@@ -1004,7 +1151,10 @@ mod tests {
             0,
             "nothing before VERIFIED"
         );
-        store.mark_verified("sync-1").await.unwrap();
+        store
+            .mark_verified("sync-1", crate::VerificationClass::Strong)
+            .await
+            .unwrap();
         assert_eq!(written_at_full().await.unwrap(), 1, "VERIFIED");
         store.mark_source_committed("sync-1").await.unwrap();
         assert_eq!(written_at_full().await.unwrap(), 2, "SOURCE_COMMITTED");
@@ -1050,6 +1200,280 @@ mod tests {
             .unwrap();
         // Reopening is idempotent: the column is added once.
         SqliteStateStore::connect(&url).await.unwrap();
+    }
+
+    /// #664: a row's verification class survives a restart - the store
+    /// closed and the file reopened - and recovery's claim reads it back.
+    #[tokio::test]
+    async fn sqlite_keeps_the_verification_class_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("class.db").display());
+        {
+            let store = SqliteStateStore::connect(&url).await.unwrap();
+            test_battery::verification_class_before_restart(&store).await;
+        }
+        let reopened = SqliteStateStore::connect(&url).await.unwrap();
+        test_battery::verification_class_after_restart(&reopened).await;
+    }
+
+    /// #664: a database from before the verification class gains the column
+    /// on open, and its VERIFIED rows read with no class - unknown, which
+    /// recovery decides as it did before the class existed.
+    #[tokio::test]
+    async fn sqlite_upgrades_a_database_that_predates_the_verification_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-664.db");
+        let url = format!("sqlite://{}", path.display());
+        {
+            // The table exactly as releases before #664 left it, with a
+            // VERIFIED row in it.
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .connect_with(parse_sqlite_opts(&url).unwrap())
+                .await
+                .unwrap();
+            sqlx::raw_sql(
+                "CREATE TABLE batches (batch_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, \
+                 source_type TEXT NOT NULL, source_name TEXT NOT NULL, format TEXT NOT NULL, \
+                 state TEXT NOT NULL, progress_start_json TEXT NOT NULL, \
+                 progress_end_json TEXT NOT NULL, object_uri TEXT, manifest_uri TEXT, \
+                 object_sha256 TEXT, manifest_sha256 TEXT, manifest_version_id TEXT, \
+                 object_size_bytes INTEGER, record_count INTEGER, error_message TEXT, \
+                 owner TEXT, lease_expires_at TEXT, created_at TEXT NOT NULL, \
+                 updated_at TEXT NOT NULL, claim_gen INTEGER NOT NULL DEFAULT 0)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let marker =
+                serde_json::to_string(&test_battery::sample_record("pre-664").progress_end)
+                    .unwrap();
+            // A row in each state a ledger holds.
+            for (id, state) in [
+                ("pre-664", "verified"),
+                ("pre-664-committed", "source_committed"),
+                ("pre-664-failed", "failed"),
+                ("pre-664-batching", "batching"),
+            ] {
+                sqlx::query(
+                    "INSERT INTO batches (batch_id, tenant, source_type, source_name, format, \
+                     state, progress_start_json, progress_end_json, created_at, updated_at) \
+                     VALUES (?, 'default', 'kafka', 'app_events', 'cef', ?, ?, ?, 't', 't')",
+                )
+                .bind(id)
+                .bind(state)
+                .bind(&marker)
+                .bind(&marker)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
+        // The message the open logs is asserted in tests/operator_messages.rs.
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        for (id, state) in [
+            ("pre-664", BatchState::Verified),
+            ("pre-664-committed", BatchState::SourceCommitted),
+            ("pre-664-failed", BatchState::Failed),
+            ("pre-664-batching", BatchState::Batching),
+        ] {
+            let got = store.get_batch(id).await.unwrap().unwrap();
+            assert_eq!(
+                (got.state, got.verification_class),
+                (state, None),
+                "{id}: a row written before #664 keeps its state and has no class"
+            );
+        }
+        let claimed = store
+            .claim_incomplete_batches(
+                "engine-upgraded",
+                "2070-01-01T00:00:00+00:00",
+                "2070-01-01T00:05:00+00:00",
+            )
+            .await
+            .unwrap();
+        let verified = claimed
+            .iter()
+            .find(|row| row.batch_id == "pre-664")
+            .unwrap_or_else(|| panic!("{claimed:?}"));
+        assert_eq!(
+            (verified.state, verified.verification_class),
+            (BatchState::Verified, None),
+            "a row verified before #664 has no class"
+        );
+        store.mark_source_committed("pre-664").await.unwrap();
+        // And the upgraded file records a class from now on.
+        store
+            .save_batch_state(&test_battery::sample_record("post-664"))
+            .await
+            .unwrap();
+        for st in [
+            BatchState::Sealed,
+            BatchState::Compressed,
+            BatchState::Checksummed,
+            BatchState::ObjectUploaded,
+            BatchState::ManifestUploaded,
+        ] {
+            store
+                .update_batch_state("post-664", st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+        store
+            .mark_verified("post-664", crate::VerificationClass::SizeOnly)
+            .await
+            .unwrap();
+        let got = store.get_batch("post-664").await.unwrap().unwrap();
+        assert_eq!(
+            got.verification_class,
+            Some(crate::VerificationClass::SizeOnly)
+        );
+        // Reopening is idempotent: the column is added once.
+        drop(store);
+        SqliteStateStore::connect(&url).await.unwrap();
+    }
+
+    /// #664: a file a newer release has opened - its schema version above
+    /// the newest this release reads - is refused, naming the version and
+    /// the newest this release reads, and left as it was. A file this
+    /// release opens carries its version.
+    #[tokio::test]
+    async fn sqlite_refuses_a_file_a_newer_release_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("newer.db").display());
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        store
+            .save_batch_state(&test_battery::sample_record("kept"))
+            .await
+            .unwrap();
+        drop(store);
+        let mut other = sqlx::ConnectOptions::connect(&parse_sqlite_opts(&url).unwrap())
+            .await
+            .unwrap();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut other)
+            .await
+            .unwrap();
+        assert_eq!(version, SQLITE_SCHEMA_VERSION);
+        sqlx::raw_sql("PRAGMA user_version = 2")
+            .execute(&mut other)
+            .await
+            .unwrap();
+        let refused = match SqliteStateStore::connect(&url).await {
+            Ok(_) => panic!("a file a newer release opened was accepted"),
+            Err(e) => e.to_string(),
+        };
+        for part in [
+            "schema version 2",
+            "newest 1",
+            "newer release",
+            "downgrade is not supported",
+        ] {
+            assert!(refused.contains(part), "{part:?} missing from: {refused}");
+        }
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut other)
+            .await
+            .unwrap();
+        assert_eq!(version, 2, "left as it was");
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM batches")
+            .fetch_one(&mut other)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    /// Review of #664: the version check and the version write are one
+    /// transaction with the migration. A newer release that raises the
+    /// version while this one opens the file must be refused, not have its
+    /// version written back down: this release read 0, then ran its DDL,
+    /// then wrote 1 over the newer release's 2.
+    #[tokio::test]
+    async fn sqlite_does_not_write_a_newer_releases_version_back_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.db");
+        let url = format!("sqlite://{}", path.display());
+        // A pre-#664 file: version 0, no class column.
+        {
+            let mut conn = sqlx::ConnectOptions::connect(&parse_sqlite_opts(&url).unwrap())
+                .await
+                .unwrap();
+            sqlx::raw_sql(
+                "CREATE TABLE batches (batch_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, \
+                 source_type TEXT NOT NULL, source_name TEXT NOT NULL, format TEXT NOT NULL, \
+                 state TEXT NOT NULL, progress_start_json TEXT NOT NULL, \
+                 progress_end_json TEXT NOT NULL, created_at TEXT NOT NULL, \
+                 updated_at TEXT NOT NULL)",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        // The newer release holds the write lock and raises the version.
+        let mut newer = sqlx::ConnectOptions::connect(&parse_sqlite_opts(&url).unwrap())
+            .await
+            .unwrap();
+        sqlx::raw_sql("BEGIN IMMEDIATE; PRAGMA user_version = 2;")
+            .execute(&mut newer)
+            .await
+            .unwrap();
+        let opening = tokio::spawn({
+            let url = url.clone();
+            async move { SqliteStateStore::connect(&url).await.map(|_| ()) }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        sqlx::raw_sql("COMMIT").execute(&mut newer).await.unwrap();
+        let opened = opening.await.unwrap();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut newer)
+            .await
+            .unwrap();
+        assert_eq!(
+            version, 2,
+            "the newer release's version was written back down"
+        );
+        let refused = opened.expect_err("this release opened a file a newer release had raised");
+        assert!(
+            refused.to_string().contains("schema version 2"),
+            "{refused}"
+        );
+    }
+
+    /// Review of #664: a store that is open while another connection adds a
+    /// column - a newer release opening the same file - keeps reading whole
+    /// rows.
+    #[tokio::test]
+    async fn sqlite_reads_whole_rows_after_another_connection_adds_a_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("later.db").display());
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        test_battery::seed_rows_for_every_read_path(&store).await;
+        test_battery::every_read_path_returns_whole_rows(&store).await;
+        let mut other = sqlx::ConnectOptions::connect(&parse_sqlite_opts(&url).unwrap())
+            .await
+            .unwrap();
+        sqlx::raw_sql("ALTER TABLE batches ADD COLUMN vtop_test_later TEXT")
+            .execute(&mut other)
+            .await
+            .unwrap();
+        test_battery::every_read_path_returns_whole_rows(&store).await;
+    }
+
+    /// A value this build does not know - written by a newer release - reads
+    /// as unknown, not as an error and not as either class.
+    #[tokio::test]
+    async fn sqlite_reads_an_unknown_verification_class_as_unknown() {
+        let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
+        store
+            .save_batch_state(&test_battery::sample_record("newer-class"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE batches SET verification_class = 'quantum' WHERE batch_id = ?")
+            .bind("newer-class")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let got = store.get_batch("newer-class").await.unwrap().unwrap();
+        assert_eq!(got.verification_class, None);
     }
 
     /// #625, in the database: a write that skips `save_batch_state` (a tool

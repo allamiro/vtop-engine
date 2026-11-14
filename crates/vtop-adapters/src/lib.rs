@@ -11,6 +11,7 @@ pub mod file_source;
 pub mod kafka_source;
 mod rotated;
 pub mod syslog_spool_source;
+mod write_lease;
 
 pub use base::{DiscoveredSource, ReadResult, SourceAdapter};
 pub use file_source::FileSource;

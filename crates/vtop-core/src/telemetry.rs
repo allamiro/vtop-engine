@@ -40,6 +40,39 @@ pub const STAGES: [&str; 7] = [
     "state_write",
 ];
 
+/// The values of `decision` on `vtop_object_key_decisions_total` (#626).
+pub const OBJECT_KEY_DECISIONS: [&str; 8] = [
+    "derived",
+    "reused",
+    "fallback_differs",
+    "fallback_size_only",
+    "fallback_unreadable",
+    "fallback_unchecked",
+    "probe_throttled",
+    "per_attempt",
+];
+
+/// The values of `outcome` on `vtop_file_delete_decisions_total` (#619):
+/// `deleted`, or why `delete_after_commit` kept a fully archived file.
+pub const FILE_DELETE_OUTCOMES: [&str; 16] = [
+    "deleted",
+    "appended",
+    "shorter",
+    "other_file",
+    "rewritten",
+    "unprovable",
+    "metadata_changed",
+    "gone",
+    "symlink",
+    "open",
+    "no_open_check",
+    "rename_refused",
+    "failed",
+    "stale_commit",
+    "leftover_archived",
+    "opened_at_unlink",
+];
+
 /// The engine's metric set. Cheap to clone (all fields are `Arc` internally).
 pub struct Metrics {
     pub registry: Registry,
@@ -88,6 +121,12 @@ pub struct Metrics {
     /// Non-zero means an engine is older than a writer sharing its ledger,
     /// which the upgrade order rules out: upgrade this engine.
     pub recovery_unsupported_manifest_total: IntCounterVec,
+    /// VERIFIED batches recovery re-checked against storage, by the class the
+    /// ledger recorded they were verified with and what the re-check found
+    /// (#664). `verification_class="strong", result="size_only"` is the one
+    /// to alert on: content verified strongly that the store can no longer
+    /// confirm.
+    pub recovery_rechecks_total: IntCounterVec,
 
     /// Manifests stored, by the version they were written in (#671 release
     /// B): `version` is `0.3` or `0.4`, from `manifest.write_version`. A
@@ -157,6 +196,10 @@ pub struct Metrics {
     /// retrying at the same width is the overload it is complaining about.
     /// `stage` says which upload (`object_upload`, `manifest_upload`).
     pub upload_throttled_total: IntCounterVec,
+    /// How each batch's object key was decided (#626). `decision` is the
+    /// bounded set [`OBJECT_KEY_DECISIONS`]: a rising `fallback_*` or
+    /// `per_attempt` rate means replays are writing second objects.
+    pub object_key_decisions_total: IntCounterVec,
 
     /// Request-body bytes admitted through the egress shaper (#481) — VTOP's
     /// own account of what it handed the wire under
@@ -172,6 +215,29 @@ pub struct Metrics {
     /// process-wide, so the account is too. Unshaped volume is
     /// `bytes_out_total`.
     pub upload_egress_bytes_total: IntCounterVec,
+
+    /// Every decision `sources.file.delete_after_commit` takes about a fully
+    /// archived file (#619), by `outcome`: `deleted`, or why it was kept -
+    /// `appended`, `shorter`, `other_file`, `rewritten`, `unprovable`,
+    /// `metadata_changed`, `gone`, `symlink`, `open`, `no_open_check`,
+    /// `rename_refused`, `failed`, `stale_commit` - plus `leftover_archived`
+    /// for a file found under a delete's hidden name, and
+    /// `opened_at_unlink` for a delete a late open slipped past. A fixed set,
+    /// never the path: the path is in the log line beside each count. A
+    /// rising `no_open_check` or `rename_refused` means files that will not
+    /// be deleted until the operator acts.
+    pub file_delete_decisions_total: IntCounterVec,
+
+    /// Changes to a Kafka topic's partition list seen while reading, and what
+    /// the source did about them (#675), by `event`: `no_partitions` (a topic
+    /// listed without partitions), `lookup_failed`, `grew`,
+    /// `new_partition_from_beginning`, `start_deferred` (where a partition
+    /// starts could not be established; asked again), `pinned_before_renewal`
+    /// and `recreated_or_truncated`. The last one is the one to alert on: the
+    /// ledger cannot tell a recreated topic from the old one. Labelled by
+    /// event only, a fixed set; the topic and partition are in the log line
+    /// beside it.
+    pub kafka_partition_events_total: IntCounterVec,
 }
 
 fn labels3() -> Vec<&'static str> {
@@ -236,6 +302,11 @@ impl Metrics {
             "VERIFIED batches whose manifest recovery found to be from a newer release than this engine reads (#671); upgrade the engine",
             labels3(),
         )?;
+        let recovery_rechecks_total = cv(
+            "recovery_rechecks_total",
+            "VERIFIED batches recovery re-checked against storage, by the class they were verified with (strong, size_only; unknown for a row from before #664 or with a newer release's class) and the re-check's result (strong, size_only, failed, unsupported_version). verification_class=strong with result=size_only: the store can no longer confirm content verified strongly; restore checksum support on the backend, then run vtopctl scrub",
+            vec!["tenant", "source_type", "format", "verification_class", "result"],
+        )?;
         let manifests_written_total = cv(
             "manifests_written_total",
             "Manifests stored, by manifest version (manifest.write_version); readers before v0.8.0 report version 0.4 manifests as tampered",
@@ -266,6 +337,11 @@ impl Metrics {
             "Source reads that failed and were skipped for this cycle (see logs for the path)",
             vec!["tenant", "source_type"],
         )?;
+        let object_key_decisions_total = cv(
+            "object_key_decisions_total",
+            "How each batch's object key was decided (#626): derived (uploaded under its content-derived key), reused (the verified object was already stored, no upload), fallback_differs / fallback_size_only / fallback_unreadable (an object is at the derived key and does not verify, verifies by size only, or could not be read) and fallback_unchecked (the store refused or failed the check of the key): the batch was written under its per-attempt key instead of overwriting anything, probe_throttled (the batch failed and was handed back), per_attempt (no checksum, or a backend that cannot report an absent key)",
+            vec!["tenant", "source_type", "format", "decision"],
+        )?;
         let upload_throttled_total = cv(
             "upload_throttled_total",
             "Uploads the object store answered with a throttle (HTTP 429/503 or an S3 SlowDown/Throttling code) after the backend's own retries; a sustained rate means the store wants less concurrency, not more retries",
@@ -279,10 +355,20 @@ impl Metrics {
             "Request-body bytes admitted through the upload egress shaper, retries included; present only when upload.max_egress_bytes_per_second is set. Application-layer accounting, not a host network counter",
             vec![],
         )?;
+        let file_delete_decisions_total = cv(
+            "file_delete_decisions_total",
+            "delete_after_commit decisions about fully archived files, by outcome (deleted, or why kept); the path is in the log line",
+            vec!["outcome"],
+        )?;
         let retention_lost_records_total = cv(
             "retention_lost_records_total",
             "Records source-side retention removed before the engine read them; any increase is data loss upstream of the archive (see logs for topic/partition)",
             vec!["tenant", "source_type"],
+        )?;
+        let kafka_partition_events_total = cv(
+            "kafka_partition_events_total",
+            "Kafka partition-list changes seen while reading and what the source did (see logs for topic/partition): no_partitions, lookup_failed, grew, new_partition_from_beginning, start_deferred, pinned_before_renewal, recreated_or_truncated",
+            vec!["event"],
         )?;
         let source_replay_refused_total = cv(
             "source_replay_refused_total",
@@ -353,6 +439,7 @@ impl Metrics {
             replay_required_total,
             failed_total,
             recovery_unsupported_manifest_total,
+            recovery_rechecks_total,
             manifests_written_total,
             records_total,
             bytes_in_total,
@@ -367,6 +454,9 @@ impl Metrics {
             source_replay_refused_total,
             upload_throttled_total,
             upload_egress_bytes_total,
+            file_delete_decisions_total,
+            object_key_decisions_total,
+            kafka_partition_events_total,
         })
     }
 

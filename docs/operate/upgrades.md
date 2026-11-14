@@ -73,7 +73,7 @@ as tampered: recovery leaves such a batch VERIFIED and pending, and
 `vtopctl scrub` reports `unsupported_version`. Readers before v0.8.0 cannot
 read `0.4`, so upgrade every engine and auditor before a later release turns
 `0.4` on. The details are under
-[v0.9.0 and beyond](../ROADMAP.md#v090-and-beyond) in the roadmap.
+[v0.10.0 and beyond](../ROADMAP.md#v0100-and-beyond) in the roadmap.
 
 ## Before any upgrade
 
