@@ -21,7 +21,13 @@ pub const LZ4: i16 = 3;
 pub const ZSTD: i16 = 4;
 
 /// The codecs this build decompresses, in the order a refusal lists them.
-pub const SERVED: [i16; 2] = [GZIP, ZSTD];
+pub const SERVED: [i16; 4] = [GZIP, SNAPPY, LZ4, ZSTD];
+
+/// The header of snappy-java's stream format, which Kafka's Java client
+/// writes: the magic, then a 4-byte version and a 4-byte compatible version.
+/// Blocks follow, each a 4-byte big-endian length and one raw snappy block.
+const XERIAL_MAGIC: [u8; 8] = [0x82, b'S', b'N', b'A', b'P', b'P', b'Y', 0];
+const XERIAL_HEADER_BYTES: usize = 16;
 
 /// The name a producer's `compression.type` uses for a codec id.
 pub fn name(codec: i16) -> &'static str {
@@ -44,9 +50,6 @@ pub fn served_list() -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CodecError {
-    /// A codec Kafka defines and this build does not decompress.
-    #[error("codec {codec} ({}) is not served", name(*codec))]
-    NotServed { codec: i16 },
     /// A codec id Kafka does not define (5-7).
     #[error("codec {codec} is not a codec Kafka defines")]
     Unknown { codec: i16 },
@@ -78,9 +81,82 @@ pub fn decompress(codec: i16, input: &[u8], limit: usize) -> Result<Vec<u8>, Cod
             })?;
             bounded(codec, decoder, limit)
         }
-        SNAPPY | LZ4 => Err(CodecError::NotServed { codec }),
+        SNAPPY => snappy(input, limit),
+        // The LZ4 frame format, which Kafka writes for v2 batches (the
+        // broken header checksum of the pre-0.10 framing is magic 0 and 1
+        // only, and those batches are refused before this).
+        LZ4 => bounded(codec, lz4_flex::frame::FrameDecoder::new(input), limit),
         _ => Err(CodecError::Unknown { codec }),
     }
+}
+
+/// Snappy as Kafka's clients send it: snappy-java's framing (the Java
+/// client), or one bare snappy block (some other clients), told apart by the
+/// magic as Kafka's own reader does. Each block declares its decompressed
+/// length up front, so it is checked against what is left of `limit` before
+/// anything is allocated.
+fn snappy(input: &[u8], limit: usize) -> Result<Vec<u8>, CodecError> {
+    let corrupt = |reason: String| CodecError::Corrupt {
+        codec: SNAPPY,
+        reason,
+    };
+    let mut out = Vec::new();
+    if !input.starts_with(&XERIAL_MAGIC) {
+        snappy_block(input, limit, &mut out)?;
+        return Ok(out);
+    }
+    let Some(mut rest) = input.get(XERIAL_HEADER_BYTES..) else {
+        return Err(corrupt(format!(
+            "a snappy-java stream of {} bytes is shorter than its {XERIAL_HEADER_BYTES}-byte header",
+            input.len()
+        )));
+    };
+    while !rest.is_empty() {
+        let Some((len, tail)) = rest.split_first_chunk::<4>() else {
+            return Err(corrupt(format!(
+                "{} byte(s) left where a 4-byte block length belongs",
+                rest.len()
+            )));
+        };
+        let len = u32::from_be_bytes(*len) as usize;
+        if len > tail.len() {
+            return Err(corrupt(format!(
+                "a block declares {len} bytes but {} remain",
+                tail.len()
+            )));
+        }
+        let (block, next) = tail.split_at(len);
+        snappy_block(block, limit, &mut out)?;
+        rest = next;
+    }
+    Ok(out)
+}
+
+/// Append one raw snappy block to `out`, keeping `out` within `limit`.
+fn snappy_block(block: &[u8], limit: usize, out: &mut Vec<u8>) -> Result<(), CodecError> {
+    let corrupt = |error: snap::Error| CodecError::Corrupt {
+        codec: SNAPPY,
+        reason: error.to_string(),
+    };
+    let len = snap::raw::decompress_len(block).map_err(corrupt)?;
+    if len > limit.saturating_sub(out.len()) {
+        return Err(CodecError::TooLarge {
+            codec: SNAPPY,
+            limit,
+        });
+    }
+    let start = out.len();
+    out.resize(start + len, 0);
+    let written = snap::raw::Decoder::new()
+        .decompress(block, &mut out[start..])
+        .map_err(corrupt)?;
+    if written != len {
+        return Err(CodecError::Corrupt {
+            codec: SNAPPY,
+            reason: format!("a block declared {len} bytes and decompressed to {written}"),
+        });
+    }
+    Ok(())
 }
 
 /// Read `reader` to its end or to `limit + 1` bytes, whichever is first.
@@ -111,12 +187,90 @@ mod tests {
         e.finish().unwrap()
     }
 
+    /// snappy-java's framing around raw blocks, as the Java client writes it.
+    fn xerial(blocks: &[&[u8]]) -> Vec<u8> {
+        let mut out = XERIAL_MAGIC.to_vec();
+        out.extend_from_slice(&1_u32.to_be_bytes());
+        out.extend_from_slice(&1_u32.to_be_bytes());
+        for block in blocks {
+            let packed = snap::raw::Encoder::new().compress_vec(block).unwrap();
+            out.extend_from_slice(&(packed.len() as u32).to_be_bytes());
+            out.extend_from_slice(&packed);
+        }
+        out
+    }
+
+    fn lz4(bytes: &[u8]) -> Vec<u8> {
+        let mut e = lz4_flex::frame::FrameEncoder::new(Vec::new());
+        e.write_all(bytes).unwrap();
+        e.finish().unwrap()
+    }
+
     #[test]
     fn served_codecs_round_trip() {
         let plain = b"records section".repeat(100);
         assert_eq!(decompress(GZIP, &gzip(&plain), 1 << 20).unwrap(), plain);
         let z = zstd::encode_all(&plain[..], 3).unwrap();
         assert_eq!(decompress(ZSTD, &z, 1 << 20).unwrap(), plain);
+        assert_eq!(decompress(LZ4, &lz4(&plain), 1 << 20).unwrap(), plain);
+        let raw = snap::raw::Encoder::new().compress_vec(&plain).unwrap();
+        assert_eq!(
+            decompress(SNAPPY, &raw, 1 << 20).unwrap(),
+            plain,
+            "a bare block"
+        );
+        let (a, b) = plain.split_at(700);
+        assert_eq!(
+            decompress(SNAPPY, &xerial(&[a, b]), 1 << 20).unwrap(),
+            plain,
+            "snappy-java framing, two blocks"
+        );
+    }
+
+    /// A snappy block declares its length first: one that declares more than
+    /// the limit is refused before anything is allocated, and so is the
+    /// block that takes a framed stream past it.
+    #[test]
+    fn a_snappy_length_past_the_limit_is_refused_before_allocation() {
+        // A varint of 2^31 and nothing else: decompressing would need 2 GiB.
+        let lying = [0x80, 0x80, 0x80, 0x80, 0x08];
+        assert_eq!(
+            decompress(SNAPPY, &lying, 1 << 20),
+            Err(CodecError::TooLarge {
+                codec: SNAPPY,
+                limit: 1 << 20
+            })
+        );
+        let block = vec![1_u8; 600];
+        assert_eq!(
+            decompress(SNAPPY, &xerial(&[&block, &block]), 1000),
+            Err(CodecError::TooLarge {
+                codec: SNAPPY,
+                limit: 1000
+            })
+        );
+    }
+
+    #[test]
+    fn a_truncated_snappy_java_stream_is_corrupt() {
+        let whole = xerial(&[b"records section records section"]);
+        // Cut inside the header (the magic intact), inside a block length, and
+        // inside a block. A prefix shorter than the magic is not this format
+        // at all: it is read as a bare block, and judged as one.
+        for cut in [
+            XERIAL_HEADER_BYTES - 2,
+            XERIAL_HEADER_BYTES + 2,
+            whole.len() - 3,
+        ] {
+            assert!(
+                matches!(
+                    decompress(SNAPPY, &whole[..cut], 1024),
+                    Err(CodecError::Corrupt { .. })
+                ),
+                "cut at {cut}: {:?}",
+                decompress(SNAPPY, &whole[..cut], 1024)
+            );
+        }
     }
 
     /// Java writes one gzip member per batch, but a concatenation is legal
@@ -134,6 +288,12 @@ mod tests {
         for (codec, packed) in [
             (GZIP, gzip(&plain)),
             (ZSTD, zstd::encode_all(&plain[..], 3).unwrap()),
+            (LZ4, lz4(&plain)),
+            (SNAPPY, xerial(&[&plain])),
+            (
+                SNAPPY,
+                snap::raw::Encoder::new().compress_vec(&plain).unwrap(),
+            ),
         ] {
             assert_eq!(decompress(codec, &packed, 4096).unwrap().len(), 4096);
             assert_eq!(
@@ -144,22 +304,14 @@ mod tests {
     }
 
     #[test]
-    fn unserved_and_unknown_codecs_are_refused_by_name() {
-        assert_eq!(
-            decompress(SNAPPY, b"x", 10),
-            Err(CodecError::NotServed { codec: SNAPPY })
-        );
-        assert_eq!(
-            decompress(LZ4, b"x", 10),
-            Err(CodecError::NotServed { codec: LZ4 })
-        );
+    fn unknown_codecs_are_refused_by_name() {
         for codec in 5..=7 {
             assert_eq!(
                 decompress(codec, b"x", 10),
                 Err(CodecError::Unknown { codec })
             );
         }
-        assert_eq!(served_list(), "gzip, zstd, none");
+        assert_eq!(served_list(), "gzip, snappy, lz4, zstd, none");
     }
 
     #[test]

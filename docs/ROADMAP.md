@@ -913,18 +913,20 @@ gaps the Kafka comparison found (#596), measure failover and crash
 durability against Kafka (#597, #599), serve split children as Kafka
 partitions (#473), and ship the egress ceiling once measured (#481).
 
-**Kafka gateway: gzip and zstd produce batches are served (#596).** A
-producer with `compression.type=gzip` or `zstd` was refused with
-`UNSUPPORTED_COMPRESSION_TYPE`; the gateway now decompresses the batch and
-stores its records as ordinary native records, so Fetch serves them as an
+**Kafka gateway: compressed produce batches are served (#596).** A
+producer with any `compression.type` was refused with
+`UNSUPPORTED_COMPRESSION_TYPE`; the gateway now decompresses gzip, snappy
+(snappy-java's framing, which the Java client writes, or a bare block), lz4
+(the LZ4 frame format) and zstd batches and
+stores their records as ordinary native records, so Fetch serves them as an
 uncompressed batch (codec bits 0, CRC recomputed, the producer's create
 times kept). The CRC is checked over the compressed bytes before the
 decoder sees any of them, and the record count stays binding over the
 decompressed records. The compressed batches of one produce may expand to
 16 MiB in total, the most an uncompressed one can carry: past that the
 request is refused whole with `MESSAGE_TOO_LARGE`, a stream that does not
-decompress is `CORRUPT_MESSAGE`, and snappy, lz4 and codec ids Kafka does not
-define stay `UNSUPPORTED_COMPRESSION_TYPE` with the codecs to use instead. A
+decompress is `CORRUPT_MESSAGE`, and codec ids Kafka does not define stay
+`UNSUPPORTED_COMPRESSION_TYPE` with the codecs to use instead. A
 large compressed produce is decompressed off the async workers. The cost is
 stated, not hidden: the native log stores and Fetch serves the uncompressed
 bytes where Kafka keeps the producer's compressed ones. No stored format

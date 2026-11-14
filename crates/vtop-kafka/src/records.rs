@@ -78,13 +78,6 @@ pub enum BatchError {
     Wire(#[from] WireError),
     #[error("record batch magic {found} is not supported; this gateway serves magic {MAGIC_V2} (Kafka 0.11+) only")]
     UnsupportedMagic { found: i8 },
-    #[error(
-        "record batch is compressed with {} (codec {codec}), which this gateway does not \
-         decompress; it serves {}",
-        codec::name(*codec),
-        codec::served_list()
-    )]
-    CodecNotServed { codec: i16 },
     #[error("record batch declares compression codec {codec}, which Kafka does not define")]
     UnknownCodec { codec: i16 },
     #[error(
@@ -269,7 +262,6 @@ impl RecordBatch {
             let rest = d.rest();
             Some(
                 codec::decompress(codec, rest, limit).map_err(|error| match error {
-                    CodecError::NotServed { codec } => BatchError::CodecNotServed { codec },
                     CodecError::Unknown { codec } => BatchError::UnknownCodec { codec },
                     CodecError::Corrupt { codec, reason } => {
                         BatchError::CorruptCompressed { codec, reason }
@@ -689,6 +681,22 @@ pub(crate) mod tests {
                 e.finish().unwrap()
             }
             codec::ZSTD => zstd::encode_all(section, 3).unwrap(),
+            codec::LZ4 => {
+                use std::io::Write as _;
+                let mut e = lz4_flex::frame::FrameEncoder::new(Vec::new());
+                e.write_all(section).unwrap();
+                e.finish().unwrap()
+            }
+            // snappy-java's framing, as the Java client writes it.
+            codec::SNAPPY => {
+                let block = snap::raw::Encoder::new().compress_vec(section).unwrap();
+                let mut out = vec![
+                    0x82, b'S', b'N', b'A', b'P', b'P', b'Y', 0, 0, 0, 0, 1, 0, 0, 0, 1,
+                ];
+                out.extend_from_slice(&(block.len() as u32).to_be_bytes());
+                out.extend_from_slice(&block);
+                out
+            }
             _ => section.to_vec(),
         };
         with_records_section(codec, &plain[..HEADER_BYTES], &packed)
@@ -769,6 +777,42 @@ pub(crate) mod tests {
         );
     }
 
+    /// The Java client frames snappy in snappy-java's stream format.
+    #[test]
+    fn a_snappy_xerial_batch_decodes_to_its_records() {
+        let batch = include_bytes!("../tests/fixtures/snappy.batch");
+        assert_eq!(
+            &batch[HEADER_BYTES..HEADER_BYTES + 8],
+            b"\x82SNAPPY\x00",
+            "the JVM fixture is snappy-java framed"
+        );
+        the_jvm_batch_decodes_to_its_records(codec::SNAPPY, batch);
+    }
+
+    /// Other clients send one bare snappy block; Kafka's reader accepts it
+    /// and so does this one.
+    #[test]
+    fn a_snappy_raw_batch_decodes_to_its_records() {
+        let records: Vec<Record> = (0..20).map(|i| record(i, "key", "a value")).collect();
+        let plain = RecordBatch::encode(0, -1, -1, -1, &records);
+        let raw = snap::raw::Encoder::new()
+            .compress_vec(&plain[HEADER_BYTES..])
+            .unwrap();
+        let batch = with_records_section(codec::SNAPPY, &plain, &raw);
+        assert_eq!(RecordBatch::decode(&batch).unwrap().records, records);
+    }
+
+    #[test]
+    fn a_lz4_frame_batch_decodes_to_its_records() {
+        let batch = include_bytes!("../tests/fixtures/lz4.batch");
+        assert_eq!(
+            &batch[HEADER_BYTES..HEADER_BYTES + 4],
+            &[0x04, 0x22, 0x4d, 0x18],
+            "the JVM fixture is an LZ4 frame"
+        );
+        the_jvm_batch_decodes_to_its_records(codec::LZ4, batch);
+    }
+
     /// The CRC covers the compressed bytes and is checked first: a stream
     /// that would expand past the cap, or not decompress at all, is reported
     /// as a CRC mismatch when one of its bytes is flipped. The decoder never
@@ -777,7 +821,7 @@ pub(crate) mod tests {
     fn a_compressed_batch_with_a_bad_crc_is_corrupt_and_never_reaches_the_decoder() {
         let plain = RecordBatch::encode(0, -1, -1, -1, &[record(0, "k", "v")]);
         let bomb = zstd::encode_all(&vec![0_u8; MAX_FIELD_BYTES + 1][..], 19).unwrap();
-        for codec in [codec::GZIP, codec::ZSTD] {
+        for codec in codec::SERVED {
             for section in [bomb.clone(), b"not a stream at all".to_vec()] {
                 let mut batch = with_records_section(codec, &plain, &section);
                 let last = batch.len() - 1;
@@ -801,7 +845,7 @@ pub(crate) mod tests {
     fn a_decompression_bomb_stops_at_the_cap() {
         let plain = RecordBatch::encode(0, -1, -1, -1, &[record(0, "k", "v")]);
         let zeros = vec![0_u8; MAX_FIELD_BYTES + 4096];
-        for codec in [codec::GZIP, codec::ZSTD] {
+        for codec in codec::SERVED {
             let packed = match codec {
                 codec::GZIP => {
                     use std::io::Write as _;
@@ -810,9 +854,24 @@ pub(crate) mod tests {
                     e.write_all(&zeros).unwrap();
                     e.finish().unwrap()
                 }
-                _ => zstd::encode_all(&zeros[..], 19).unwrap(),
+                codec::ZSTD => zstd::encode_all(&zeros[..], 19).unwrap(),
+                // Built as the clients build them; snappy and lz4 compress
+                // zeros less tightly, so their bombs are larger on the wire.
+                _ => compressed(codec, &[&plain[..HEADER_BYTES], &zeros[..]].concat())
+                    [HEADER_BYTES..]
+                    .to_vec(),
             };
-            assert!(packed.len() < 64 * 1024, "{} bytes", packed.len());
+            let wire_cap = match codec {
+                codec::GZIP | codec::ZSTD => 64 * 1024,
+                codec::LZ4 => 256 * 1024,
+                _ => 1024 * 1024,
+            };
+            assert!(
+                packed.len() < wire_cap,
+                "{}: {} bytes",
+                codec::name(codec),
+                packed.len()
+            );
             let batch = with_records_section(codec, &plain, &packed);
             assert_eq!(
                 RecordBatch::decode(&batch),
@@ -833,7 +892,7 @@ pub(crate) mod tests {
     fn a_truncated_compressed_stream_is_corrupt() {
         let records: Vec<Record> = (0..50).map(|i| record(i, "key", "a value")).collect();
         let plain = RecordBatch::encode(0, -1, -1, -1, &records);
-        for codec in [codec::GZIP, codec::ZSTD] {
+        for codec in codec::SERVED {
             let whole = compressed(codec, &plain);
             assert_eq!(RecordBatch::decode(&whole).unwrap().records, records);
             let section = &whole[HEADER_BYTES..];
@@ -857,7 +916,7 @@ pub(crate) mod tests {
     fn a_record_count_that_disagrees_with_the_decompressed_records_is_refused() {
         let records: Vec<Record> = (0..5).map(|i| record(i, "k", "v")).collect();
         let plain = RecordBatch::encode(0, -1, -1, -1, &records);
-        for codec in [codec::GZIP, codec::ZSTD] {
+        for codec in codec::SERVED {
             for (declared, too_many) in [(6_i32, true), (4, false)] {
                 let mut header = plain[..HEADER_BYTES].to_vec();
                 header[57..61].copy_from_slice(&declared.to_be_bytes());
@@ -884,16 +943,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unserved_and_unknown_codecs_are_refused_by_name() {
+    fn unknown_codecs_are_refused_by_name() {
         let plain = RecordBatch::encode(0, -1, -1, -1, &[record(0, "k", "v")]);
-        for codec in [codec::SNAPPY, codec::LZ4] {
-            let batch = with_records_section(codec, &plain, &plain[HEADER_BYTES..]);
-            let error = RecordBatch::decode(&batch).unwrap_err();
-            assert_eq!(error, BatchError::CodecNotServed { codec });
-            let text = error.to_string();
-            assert!(text.contains(codec::name(codec)), "{text}");
-            assert!(text.contains("gzip, zstd, none"), "{text}");
-        }
         for codec in 5..=7 {
             let batch = with_records_section(codec, &plain, &plain[HEADER_BYTES..]);
             assert_eq!(

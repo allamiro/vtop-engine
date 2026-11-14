@@ -2580,9 +2580,7 @@ fn split_batches(mut bytes: &[u8]) -> Result<Vec<RecordBatch>, (ErrorCode, Strin
         let (batch, expanded) =
             RecordBatch::decode_within(&bytes[..len], budget).map_err(|error| {
                 let code = match &error {
-                    BatchError::CodecNotServed { .. } | BatchError::UnknownCodec { .. } => {
-                        ErrorCode::UnsupportedCompressionType
-                    }
+                    BatchError::UnknownCodec { .. } => ErrorCode::UnsupportedCompressionType,
                     BatchError::CorruptCompressed { .. } => ErrorCode::CorruptMessage,
                     BatchError::DecompressedTooLarge { .. } => ErrorCode::MessageTooLarge,
                     BatchError::Transactional | BatchError::Control => {
@@ -2608,14 +2606,6 @@ fn split_batches(mut bytes: &[u8]) -> Result<Vec<RecordBatch>, (ErrorCode, Strin
 fn refusal_reason(which: usize, error: &BatchError) -> String {
     let name = |codec: &i16| crate::codec::name(*codec);
     match error {
-        BatchError::CodecNotServed { codec } => format!(
-            "batch {which} uses compression codec {codec} ({}), which this gateway does not \
-             serve. Nothing from this request was appended; the client was answered \
-             UNSUPPORTED_COMPRESSION_TYPE. Set the producer's compression.type to one of {}, or \
-             upgrade the gateway",
-            name(codec),
-            crate::codec::served_list()
-        ),
         BatchError::UnknownCodec { codec } => format!(
             "batch {which} declares compression codec {codec}, which Kafka does not define. \
              Nothing from this request was appended; the client was answered \
@@ -6894,7 +6884,7 @@ mod tests {
             "codec 7",
             "Kafka does not define",
             "Nothing from this request was appended",
-            "gzip, zstd, none",
+            "gzip, snappy, lz4, zstd, none",
         ] {
             assert!(message.contains(part), "{part:?} missing from {message}");
         }
@@ -6904,36 +6894,44 @@ mod tests {
         assert_eq!(read_fetch(&reply, 4).1, 0);
     }
 
-    /// Until snappy and lz4 are served, a batch in either is refused with
-    /// UNSUPPORTED_COMPRESSION_TYPE and a message naming the codecs that are.
+    /// Every codec Kafka defines is served (#596): a batch in each, sent
+    /// as a stock client frames it, is appended and fetched back as plain
+    /// records with contiguous offsets.
     #[tokio::test]
-    async fn an_interim_gateway_refuses_a_codec_it_does_not_serve_with_the_served_list() {
+    async fn every_kafka_codec_is_appended_and_fetched_back() {
         let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
-        let plain = batch_bytes(&["a"], false);
-        for (correlation, codec) in [(1, crate::codec::SNAPPY), (2, crate::codec::LZ4)] {
-            let batch = crate::records::tests::with_records_section(codec, &plain, &plain[61..]);
+        let plain = batch_bytes(&["a", "b"], false);
+        for (n, codec) in crate::codec::SERVED.into_iter().enumerate() {
             let reply = call(
                 addr,
                 0,
                 8,
-                correlation,
-                &produce_body("events", 0, -1, None, &batch),
+                n as i32 + 1,
+                &produce_body(
+                    "events",
+                    0,
+                    -1,
+                    None,
+                    &compressed_batch_bytes(codec, &plain),
+                ),
             )
             .await
             .unwrap();
-            let (error, _, message) = read_produce(&reply, 8);
-            assert_eq!(error, ErrorCode::UnsupportedCompressionType.as_i16());
-            let message = message.unwrap();
-            let named = format!("codec {codec} ({})", crate::codec::name(codec));
-            for part in [
-                named.as_str(),
-                "does not serve",
-                "compression.type",
-                "gzip, zstd, none",
-            ] {
-                assert!(message.contains(part), "{part:?} missing from {message}");
-            }
+            assert_eq!(
+                read_produce(&reply, 8),
+                (0, 2 * n as i64, None),
+                "{}",
+                crate::codec::name(codec)
+            );
         }
+        let reply = call(addr, 1, 4, 9, &fetch_body(4, "events", 0, 0, 0))
+            .await
+            .unwrap();
+        let (error, watermark, _) = read_fetch(&reply, 4);
+        assert_eq!(
+            (error, watermark),
+            (0, 2 * crate::codec::SERVED.len() as i64)
+        );
     }
 
     /// The compressed batches of one request share one budget: several, each

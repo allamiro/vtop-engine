@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 25 — compressed produce from a stock client (#596): librdkafka, as `kcat`,
-# produces through the gateway on a standalone node with each codec the
-# gateway serves (gzip, zstd), and the same client reads every record back
+# produces through the gateway on a standalone node with each codec Kafka
+# defines (gzip, snappy, lz4, zstd), and the same client reads every record back
 # byte-exact and in order. The gateway decompresses each batch and stores
 # native records, so the read-back is an uncompressed fetch of what the
 # producer compressed.
@@ -9,12 +9,12 @@
 # Which batches librdkafka actually compresses is read from its own debug
 # lines, never assumed. Against this gateway librdkafka 2.8.0 compresses zstd
 # and logs "Broker does not support compression type gzip: not compressing
-# batch" for gzip (and snappy and lz4), then sends those batches
-# uncompressed. Its feature check gates those three codecs on protocol
-# versions below the gateway's floor (Produce v3, the first with v2 record
-# batches). So zstd must arrive compressed. gzip is round-tripped and
-# reported as compressed or not. The JVM client compresses every codec, and
-# the gateway's unit tests decode the batches it wrote (tests/fixtures).
+# batch" for gzip, snappy and lz4, then sends those batches uncompressed. Its
+# feature check gates those three codecs on protocol versions below the
+# gateway's floor (Produce v3, the first with v2 record batches). So zstd
+# must arrive compressed. The other three are round-tripped and reported as
+# compressed or not. The gateway's unit tests decode batches the pinned Java
+# producer compressed with each codec (tests/fixtures).
 #
 # A codec the local kcat was built without is skipped by name, never passed:
 # `kcat -V` lists librdkafka's builtin features.
@@ -32,7 +32,7 @@ KAFKA_PORT="$(kafka_port 0)"
 RECORDS="${CHAOS_KAFKA_RECORDS:-5000}"
 require_integer_in_range CHAOS_KAFKA_RECORDS "$RECORDS" 100 10000000
 RECORDS=$((10#$RECORDS))
-SERVED_CODECS="gzip zstd"
+SERVED_CODECS="gzip snappy lz4 zstd"
 # The codecs librdkafka must send compressed here (see the header).
 MUST_COMPRESS="zstd"
 [[ -n "${TOPIC:-}" ]] || fail "lib.sh did not set TOPIC"

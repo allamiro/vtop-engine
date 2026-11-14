@@ -19,10 +19,13 @@ metadata = ["dep:vtop-meta"]
 
 [dependencies]
 thiserror = { workspace = true }
-# Compressed produce batches (#596): both are already workspace dependencies
-# through vtop-core, so they add no licence or advisory surface.
+# Compressed produce batches (#596). flate2 and zstd were already workspace
+# dependencies through vtop-core; snap (BSD-3-Clause) and lz4_flex (MIT) are
+# new, pure Rust.
 flate2 = { workspace = true }
 zstd = { workspace = true }
+snap = { workspace = true }
+lz4_flex = { workspace = true }
 vtop-broker = { workspace = true, optional = true }
 vtop-protocol = { workspace = true, optional = true }
 vtop-meta = { workspace = true, optional = true }

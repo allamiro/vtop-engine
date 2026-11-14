@@ -22,7 +22,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-$ROOT/crates/vtop-kafka/tests/fixtures}"
 IMAGE="${KAFKA_IMAGE:-apache/kafka:4.3.2@sha256:852a0d49fc4e656b022e7f23785411802c9a088c78a7c5e39f33969de9c227a7}"
-CODECS="${FIXTURE_CODECS:-gzip zstd}"
+CODECS="${FIXTURE_CODECS:-gzip snappy lz4 zstd}"
 RECORDS="$OUT/records.txt"
 NAME="vtop-kafka-fixtures-$$"
 BIN=/opt/kafka/bin
