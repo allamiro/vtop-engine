@@ -738,6 +738,29 @@ struct FileSink {
     needs_newline: bool,
 }
 
+/// Whether the file at `path` is non-empty and its last byte is not a
+/// newline. A file
+/// that cannot be read is assumed whole: a stray newline costs a blank line,
+/// a missing one a record.
+fn ends_inside_a_line(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    // Opened again to read: the append handle is write-only.
+    let Ok(mut reader) = File::open(path) else {
+        return true;
+    };
+    let Ok(len) = reader.seek(SeekFrom::End(0)) else {
+        return true;
+    };
+    if len == 0 {
+        return false;
+    }
+    let mut last = [0_u8; 1];
+    let read = reader
+        .seek(SeekFrom::End(-1))
+        .and_then(|_| reader.read_exact(&mut last));
+    read.is_err() || last[0] != b'\n'
+}
+
 impl FileSink {
     /// Append one record as one line. A write that fails part-way (a full
     /// disk) leaves a fragment: it is cut off again, and when it cannot be,
@@ -803,10 +826,14 @@ impl AuditSink {
             path: path.to_owned(),
             error: e.to_string(),
         })?;
+        // A file that ends inside a line (a crash part-way through an append
+        // by an earlier run) gets a newline before the next record, so that
+        // record is not glued to the fragment (review of #767).
+        let needs_newline = ends_inside_a_line(path);
         *self.file.lock().unwrap_or_else(|e| e.into_inner()) = Some(FileSink {
             path: path.to_owned(),
             file,
-            needs_newline: false,
+            needs_newline,
         });
         Ok(())
     }
@@ -1136,6 +1163,56 @@ fn passwd_lookup(text: &str, uid: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review of #767 (Codex): a file an earlier run left ending inside a
+    /// line - a crash part-way through an append - gets a newline before the
+    /// first record of the next run, which the startup replay writes.
+    #[test]
+    fn a_record_after_a_reopened_torn_file_is_a_line_of_its_own() {
+        let dir = std::env::temp_dir().join(format!("vtop-767r-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        std::fs::write(&path, br#"{"audit_version":1,"aud"#).unwrap();
+        let sink = AuditSink::default();
+        sink.open_file(&path).unwrap();
+        sink.record(&AuditEvent::new(
+            Action::ClusterPropose,
+            Stage::Applied,
+            Actor::replica("meta-1"),
+            Target::new("cluster", None),
+            Outcome::Success,
+        ))
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(
+            serde_json::from_str::<AuditEvent>(lines[1]).is_ok(),
+            "{text}"
+        );
+
+        // A whole file gets no extra line.
+        let clean = dir.join("clean.jsonl");
+        let sink = AuditSink::default();
+        sink.open_file(&clean).unwrap();
+        let event = || {
+            AuditEvent::new(
+                Action::ClusterPropose,
+                Stage::Applied,
+                Actor::replica("meta-1"),
+                Target::new("cluster", None),
+                Outcome::Success,
+            )
+        };
+        sink.record(&event()).unwrap();
+        let sink = AuditSink::default();
+        sink.open_file(&clean).unwrap();
+        sink.record(&event()).unwrap();
+        let text = std::fs::read_to_string(&clean).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(!text.contains("\n\n"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Review of #767: a write that failed part-way leaves a fragment the
     /// next record must not be glued to, or the retried record is lost to
