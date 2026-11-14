@@ -754,8 +754,10 @@ test that failed first.
 **Upgrading from v0.7.0.** Downgrade is not supported.
 
 - **Upgrade every engine and data node first, then raise the feature level**
-  with `vtopctl node-versions` and `vtopctl enable-features`. Level 7 is
-  finalized only when every node reports it (#634).
+  with `vtopctl node-versions` and `vtopctl enable-features`. Level 7
+  turns node version reports on and is judged by the metadata tier alone;
+  every level above it is finalized only when every node reports it can run
+  it (#634).
 - **One-way changes:**
   - Once a SUPERSEDED row is written, the state store carries schema marker
     3 and v0.7.0 refuses it (#567).
