@@ -13,7 +13,7 @@
 //! # async fn example() {
 //! use vtop_s3_testkit::{Capability, LiveS3};
 //! let live = LiveS3::from_env();
-//! live.case("verification.store_checksum", &[Capability::PutGetHead], || async {
+//! live.case("verification.put_and_verify", &[Capability::PutGetHead], || async {
 //!     // ... the test body, against live.settings ...
 //! })
 //! .await;

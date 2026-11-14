@@ -30,32 +30,60 @@ fn native_config(s: &S3Settings) -> S3NativeConfig {
     }
 }
 
-#[tokio::test]
-#[ignore = "requires an S3-compatible endpoint and credentials"]
-async fn native_s3_verifies_service_sha256_and_streamed_blake3() {
-    let live = LiveS3::from_env();
-    let s = &live.settings;
+/// One object, PUT with `algorithm`'s checksum and verified, and deleted.
+/// Each case writes its own (review of #764), so no case depends on another
+/// having passed.
+async fn put_verify_delete(
+    s: &S3Settings,
+    tag: &str,
+    algorithm: &str,
+) -> vtop_upload::VerificationResult {
     let backend = S3NativeBackend::new(&native_config(s)).await.unwrap();
-
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let nonce = format!("{}-{nanos}", std::process::id());
-    let sha_uri = format!(
-        "s3://{}/vtop-live-verification/{nonce}-sha256.bin",
-        s.bucket
-    );
-    let b3_uri = format!(
-        "s3://{}/vtop-live-verification/{nonce}-blake3.bin",
-        s.bucket
+    let uri = format!(
+        "s3://{}/vtop-live-verification/{}-{nanos}-{tag}.bin",
+        s.bucket,
+        std::process::id()
     );
     let payload = b"VTOP stored-content verification";
     let mut file = tempfile::NamedTempFile::new().unwrap();
     file.write_all(payload).unwrap();
     file.flush().unwrap();
-    let sha = sha256_bytes(payload);
-    let b3 = blake3_bytes(payload);
+    let digest = match algorithm {
+        "sha256" => sha256_bytes(payload),
+        _ => blake3_bytes(payload),
+    };
+    backend
+        .put_object(
+            file.path(),
+            &uri,
+            Some(ObjectChecksum::new(algorithm, &digest)),
+        )
+        .await
+        .unwrap();
+    let result = backend
+        .verify_object(
+            &uri,
+            payload.len() as u64,
+            Some(ObjectChecksum::new(algorithm, &digest)),
+        )
+        .await
+        .unwrap();
+    if let Some(method) = result.method {
+        record_method(method.as_str());
+    }
+    backend.delete_object(&uri).await.unwrap();
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires an S3-compatible endpoint and credentials"]
+async fn native_s3_verifies_service_sha256_and_streamed_blake3() {
+    let live = LiveS3::from_env();
+    let s = &live.settings;
 
     // A SHA-256 object verifies strongly, by whichever method the store
     // allows.
@@ -63,54 +91,27 @@ async fn native_s3_verifies_service_sha256_and_streamed_blake3() {
         "verification.sha256_verifies_strongly",
         &[Capability::PutGetHead],
         || async {
-            backend
-                .put_object(
-                    file.path(),
-                    &sha_uri,
-                    Some(ObjectChecksum::new("sha256", &sha)),
-                )
-                .await
-                .unwrap();
-            let sha_result = backend
-                .verify_object(
-                    &sha_uri,
-                    payload.len() as u64,
-                    Some(ObjectChecksum::new("sha256", &sha)),
-                )
-                .await
-                .unwrap();
-            if let Some(method) = sha_result.method {
-                record_method(method.as_str());
-            }
-            assert!(sha_result.passed, "{}", sha_result.message);
-            assert!(!sha_result.backend_limited, "{}", sha_result.message);
+            let r = put_verify_delete(s, "sha256", "sha256").await;
+            assert!(r.passed, "{}", r.message);
+            assert!(!r.backend_limited, "{}", r.message);
         },
     )
     .await;
 
     // The store returned its own SHA-256 of the body, so the receipt says
     // store_checksum; a store that returns none is verified by read-back,
-    // which the case above already holds to strong.
+    // which the case above holds to strong.
     live.case(
         "verification.sha256_by_store_checksum",
         &[Capability::PutGetHead, Capability::ChecksumSha256Returned],
         || async {
-            let sha_result = backend
-                .verify_object(
-                    &sha_uri,
-                    payload.len() as u64,
-                    Some(ObjectChecksum::new("sha256", &sha)),
-                )
-                .await
-                .unwrap();
-            if let Some(method) = sha_result.method {
-                record_method(method.as_str());
-            }
+            let r = put_verify_delete(s, "sha256-method", "sha256").await;
+            assert!(r.passed, "{}", r.message);
             assert_eq!(
-                sha_result.method,
+                r.method,
                 Some(VerificationMethod::StoreChecksum),
                 "{}",
-                sha_result.message
+                r.message
             );
         },
     )
@@ -122,31 +123,10 @@ async fn native_s3_verifies_service_sha256_and_streamed_blake3() {
         "verification.blake3_by_read_back",
         &[Capability::PutGetHead, Capability::ChecksumCrc32Default],
         || async {
-            backend
-                .put_object(
-                    file.path(),
-                    &b3_uri,
-                    Some(ObjectChecksum::new("blake3", &b3)),
-                )
-                .await
-                .unwrap();
-            let b3_result = backend
-                .verify_object(
-                    &b3_uri,
-                    payload.len() as u64,
-                    Some(ObjectChecksum::new("blake3", &b3)),
-                )
-                .await
-                .unwrap();
-            if let Some(method) = b3_result.method {
-                record_method(method.as_str());
-            }
-            assert!(b3_result.passed, "{}", b3_result.message);
-            assert!(!b3_result.backend_limited, "{}", b3_result.message);
+            let r = put_verify_delete(s, "blake3", "blake3").await;
+            assert!(r.passed, "{}", r.message);
+            assert!(!r.backend_limited, "{}", r.message);
         },
     )
     .await;
-
-    backend.delete_object(&sha_uri).await.ok();
-    backend.delete_object(&b3_uri).await.ok();
 }

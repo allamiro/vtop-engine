@@ -13,14 +13,17 @@
 //! | `not_applicable` | nothing                 | recorded as such                  |
 //!
 //! An unexpected pass and an unexpected fail both fail the test, naming the
-//! case, the capability, the expectation and the file to edit (D4).
+//! case, the capability, the expectation and the file to edit (D4). The
+//! failure is raised when the test's [`LiveS3`] is dropped, after every case
+//! has run and written its line (review of #764), so one unexpected case does
+//! not hide the outcomes of the cases after it.
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::future::Future;
 use std::io::Write;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::Instant;
 
 use futures::FutureExt;
@@ -86,7 +89,8 @@ pub(crate) struct Plan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Step {
     Positive,
-    Refusal(RefusalAt),
+    /// The capability the server lacks, and where VTOP refuses it.
+    Refusal(Capability, RefusalAt),
     Skip,
     /// The case cannot run as the file stands: why.
     Refuse(String),
@@ -101,6 +105,23 @@ impl Plan {
 
 /// Decide a case from the server's file. Pure, so the rules are unit-tested.
 pub(crate) fn plan(server: &Server, needs: &[Capability], has_refusal: bool) -> Plan {
+    // On a gating server any unknown capability a case needs is refused,
+    // whatever else decides the case (review of #764).
+    if server.gating {
+        if let Some(&c) = needs
+            .iter()
+            .find(|&&c| server.expectation(c) == Expectation::Unknown)
+        {
+            return Plan {
+                deciding: Some((c, Expectation::Unknown)),
+                step: Step::Refuse(format!(
+                    "{c} is unknown on {}, whose leg gates; settle it (pass, unsupported, \
+                     xfail or not_applicable) before the leg is required",
+                    server.id
+                )),
+            };
+        }
+    }
     let deciding = needs
         .iter()
         .map(|&c| (c, server.expectation(c)))
@@ -115,7 +136,7 @@ pub(crate) fn plan(server: &Server, needs: &[Capability], has_refusal: bool) -> 
         Some((_, Expectation::NotApplicable)) => Step::Skip,
         Some((c, Expectation::Unsupported { refusal })) => {
             if has_refusal {
-                Step::Refusal(refusal)
+                Step::Refusal(c, refusal)
             } else {
                 Step::Refuse(format!(
                     "{c} is unsupported on {}, and this case has no refusal path to assert; \
@@ -124,17 +145,8 @@ pub(crate) fn plan(server: &Server, needs: &[Capability], has_refusal: bool) -> 
                 ))
             }
         }
-        Some((c, Expectation::Unknown)) => {
-            if server.gating {
-                Step::Refuse(format!(
-                    "{c} is unknown on {}, whose leg gates; settle it (pass, unsupported, xfail \
-                     or not_applicable) before the leg is required",
-                    server.id
-                ))
-            } else {
-                Step::Positive
-            }
-        }
+        // A gating server's unknown was refused above.
+        Some((_, Expectation::Unknown)) => Step::Positive,
         Some((_, Expectation::Pass)) => unreachable!("filtered out above"),
     };
     Plan { deciding, step }
@@ -145,8 +157,8 @@ pub(crate) fn judge(plan: &Plan, body_passed: Option<bool>) -> Outcome {
     match (&plan.step, plan.expectation(), body_passed) {
         (Step::Skip, _, _) => Outcome::NotApplicable,
         (Step::Refuse(_), _, _) => Outcome::UnexpectedFail,
-        (Step::Refusal(_), _, Some(true)) => Outcome::Refused,
-        (Step::Refusal(_), _, _) => Outcome::UnexpectedFail,
+        (Step::Refusal(..), _, Some(true)) => Outcome::Refused,
+        (Step::Refusal(..), _, _) => Outcome::UnexpectedFail,
         (Step::Positive, Expectation::Xfail { .. }, Some(true)) => Outcome::UnexpectedPass,
         (Step::Positive, Expectation::Xfail { .. }, _) => Outcome::Fail,
         (Step::Positive, Expectation::Unknown, Some(true)) => Outcome::Pass,
@@ -200,17 +212,22 @@ pub struct ResultLine {
     pub detail: Option<String>,
 }
 
-static METHOD: Mutex<Option<String>> = Mutex::new(None);
+thread_local! {
+    /// The method the running case recorded. Per thread (review of #764): a
+    /// case's body is polled on the thread that runs the case (the tests'
+    /// runtime is current-thread), so parallel tests cannot take each
+    /// other's.
+    static METHOD: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 /// Record the verification method the running case observed, for its
-/// results line. The live tests run one at a time (`--test-threads=1`), so
-/// one slot is enough.
+/// results line. Call it from the case's body, on the case's own task.
 pub fn record_method(method: &str) {
-    *METHOD.lock().unwrap_or_else(|e| e.into_inner()) = Some(method.to_owned());
+    METHOD.with(|m| *m.borrow_mut() = Some(method.to_owned()));
 }
 
 fn take_method() -> Option<String> {
-    METHOD.lock().unwrap_or_else(|e| e.into_inner()).take()
+    METHOD.with(|m| m.borrow_mut().take())
 }
 
 fn panic_text(payload: &(dyn Any + Send)) -> String {
@@ -222,12 +239,14 @@ fn panic_text(payload: &(dyn Any + Send)) -> String {
 }
 
 /// A server, the settings to reach it, and where results go: what every live
-/// test starts from.
-#[derive(Debug, Clone)]
+/// test starts from. Unexpected outcomes are collected and fail the test when
+/// it is dropped, after every case has run.
+#[derive(Debug)]
 pub struct LiveS3 {
     pub server: Server,
     pub settings: S3Settings,
     pub recorder: Recorder,
+    unexpected: RefCell<Vec<String>>,
 }
 
 impl LiveS3 {
@@ -236,20 +255,41 @@ impl LiveS3 {
     pub fn from_env() -> LiveS3 {
         let server = Server::from_env();
         let settings = S3Settings::from_env(&server);
-        LiveS3 {
+        LiveS3::new(server, settings, Recorder::from_env()).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Refuses settings that would let a run test nothing (review of #764):
+    /// an addressing style the server's file marks not_applicable or
+    /// unsupported decides every case Skip, and the run would pass having
+    /// run nothing.
+    pub fn new(server: Server, settings: S3Settings, recorder: Recorder) -> Result<LiveS3, String> {
+        let addressing = addressing(&settings);
+        if let state @ (Expectation::NotApplicable | Expectation::Unsupported { .. }) =
+            server.expectation(addressing)
+        {
+            return Err(format!(
+                "{} marks {addressing} {state}, so every case would be skipped and the run \
+                 would test nothing; set {} to the addressing the server supports",
+                server.file_hint(),
+                crate::settings::PATH_STYLE_ENV
+            ));
+        }
+        Ok(LiveS3 {
             server,
             settings,
-            recorder: Recorder::from_env(),
-        }
+            recorder,
+            unexpected: RefCell::new(Vec::new()),
+        })
     }
 
     /// The addressing capability every case needs, from the settings.
     fn addressing(&self) -> Capability {
-        if self.settings.force_path_style {
-            Capability::PathStyle
-        } else {
-            Capability::VirtualHost
-        }
+        addressing(&self.settings)
+    }
+
+    /// The unexpected outcomes so far, each as its failure line.
+    pub fn unexpected(&self) -> Vec<String> {
+        self.unexpected.borrow().clone()
     }
 
     /// Run a case with no refusal path: a server that lacks one of `needs`
@@ -259,12 +299,19 @@ impl LiveS3 {
         P: FnOnce() -> PF,
         PF: Future<Output = ()>,
     {
-        self.run(name, needs, positive, None::<fn(RefusalAt) -> PF>)
-            .await
+        self.run(
+            name,
+            needs,
+            positive,
+            None::<fn(Capability, RefusalAt) -> PF>,
+        )
+        .await
     }
 
     /// Run a case whose refusal body asserts VTOP's refusal of a missing
-    /// capability (D5): what is wrong, what the engine did, what to do.
+    /// capability (D5): what is wrong, what the engine did, what to do. The
+    /// body is told which capability the server lacks and where VTOP
+    /// refuses it.
     pub async fn case_with_refusal<P, PF, R, RF>(
         &self,
         name: &str,
@@ -274,7 +321,7 @@ impl LiveS3 {
     ) where
         P: FnOnce() -> PF,
         PF: Future<Output = ()>,
-        R: FnOnce(RefusalAt) -> RF,
+        R: FnOnce(Capability, RefusalAt) -> RF,
         RF: Future<Output = ()>,
     {
         self.run(name, needs, positive, Some(refusal)).await
@@ -289,14 +336,14 @@ impl LiveS3 {
     ) where
         P: FnOnce() -> PF,
         PF: Future<Output = ()>,
-        R: FnOnce(RefusalAt) -> RF,
+        R: FnOnce(Capability, RefusalAt) -> RF,
         RF: Future<Output = ()>,
     {
         let mut needs = needs.to_vec();
         if !needs.contains(&self.addressing()) {
             needs.push(self.addressing());
         }
-        run_case(
+        if let Err(failure) = run_case(
             &self.server,
             &self.recorder,
             name,
@@ -305,11 +352,40 @@ impl LiveS3 {
             refusal,
         )
         .await
+        {
+            eprintln!("{failure}");
+            self.unexpected.borrow_mut().push(failure);
+        }
+    }
+}
+
+fn addressing(settings: &S3Settings) -> Capability {
+    if settings.force_path_style {
+        Capability::PathStyle
+    } else {
+        Capability::VirtualHost
+    }
+}
+
+impl Drop for LiveS3 {
+    /// Fail the test with every unexpected outcome, once all its cases have
+    /// written their lines. Not while already panicking: that failure is the
+    /// test's own, and a second panic would abort.
+    fn drop(&mut self) {
+        let unexpected = self.unexpected.take();
+        if !unexpected.is_empty() && !std::thread::panicking() {
+            panic!(
+                "{} unexpected outcome(s):\n{}",
+                unexpected.len(),
+                unexpected.join("\n")
+            );
+        }
     }
 }
 
 /// The runner, over an explicit server and recorder (what the unit tests
-/// drive). Writes the results line, then panics on an unexpected outcome.
+/// drive). Writes the results line, then returns an unexpected outcome as
+/// its failure line.
 pub(crate) async fn run_case<P, PF, R, RF>(
     server: &Server,
     recorder: &Recorder,
@@ -317,10 +393,11 @@ pub(crate) async fn run_case<P, PF, R, RF>(
     needs: &[Capability],
     positive: P,
     refusal: Option<R>,
-) where
+) -> Result<(), String>
+where
     P: FnOnce() -> PF,
     PF: Future<Output = ()>,
-    R: FnOnce(RefusalAt) -> RF,
+    R: FnOnce(Capability, RefusalAt) -> RF,
     RF: Future<Output = ()>,
 {
     let plan = plan(server, needs, refusal.is_some());
@@ -328,8 +405,8 @@ pub(crate) async fn run_case<P, PF, R, RF>(
     let started = Instant::now();
     let ran = match (&plan.step, refusal) {
         (Step::Positive, _) => Some(AssertUnwindSafe(positive()).catch_unwind().await),
-        (Step::Refusal(at), Some(refusal)) => {
-            Some(AssertUnwindSafe(refusal(*at)).catch_unwind().await)
+        (Step::Refusal(c, at), Some(refusal)) => {
+            Some(AssertUnwindSafe(refusal(*c, *at)).catch_unwind().await)
         }
         _ => None,
     };
@@ -382,13 +459,14 @@ pub(crate) async fn run_case<P, PF, R, RF>(
             (_, Some(why)) => why.clone(),
             _ => "the body passed".to_owned(),
         };
-        panic!(
+        return Err(format!(
             "{label} {name} ({capability}, expected {expectation}) on {}: edit {} or fix the \
              cause: {why}",
             server.id,
             server.file_hint()
-        );
+        ));
     }
+    Ok(())
 }
 
 fn write_line(path: &std::path::Path, line: &ResultLine) {
@@ -424,7 +502,7 @@ mod tests {
             .collect()
     }
 
-    /// Run one case and return its panic text, if it panicked.
+    /// Run one case and return its failure line, if it was unexpected.
     async fn run(
         server: &Server,
         recorder: &Recorder,
@@ -436,33 +514,30 @@ mod tests {
             record_method("store_checksum");
             assert!(positive_passes, "the positive body failed");
         };
-        let fut = match refusal {
+        match refusal {
             Some(passes) => run_case(
                 server,
                 recorder,
                 "kit.case",
                 needs,
                 positive,
-                Some(move |_at: RefusalAt| async move {
+                Some(move |_c: Capability, _at: RefusalAt| async move {
                     assert!(passes, "the refusal body failed");
                 }),
             )
-            .boxed_local(),
+            .await
+            .err(),
             None => run_case(
                 server,
                 recorder,
                 "kit.case",
                 needs,
                 positive,
-                None::<fn(RefusalAt) -> std::future::Ready<()>>,
+                None::<fn(Capability, RefusalAt) -> std::future::Ready<()>>,
             )
-            .boxed_local(),
-        };
-        AssertUnwindSafe(fut)
-            .catch_unwind()
             .await
-            .err()
-            .map(|p| panic_text(p.as_ref()))
+            .err(),
+        }
     }
 
     fn recorder(dir: &Path) -> Recorder {
@@ -489,7 +564,7 @@ mod tests {
         assert_eq!(plan(&s, &[PutGetHead], false).step, Step::Positive);
         assert_eq!(
             plan(&s, &[ConditionalPut, Versioning], true).step,
-            Step::Refusal(RefusalAt::Startup)
+            Step::Refusal(Versioning, RefusalAt::Startup)
         );
         assert_eq!(
             plan(&s, &[ChecksumSha256Enforced, ConditionalPut], false).expectation(),
@@ -661,7 +736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_a_results_file_nothing_is_written_and_cases_still_judge() {
+    async fn without_a_results_file_cases_are_still_judged() {
         let s = server(true, &[]);
         let r = Recorder::default();
         assert_eq!(
@@ -671,5 +746,122 @@ mod tests {
         assert!(run(&s, &r, &[Capability::PutGetHead], false, None)
             .await
             .is_some());
+    }
+
+    /// Review of #764: on a gating server an unknown capability is refused
+    /// even when another capability of the case would decide it.
+    #[test]
+    fn an_unknown_on_a_gating_server_is_refused_whatever_else_the_case_needs() {
+        let s = server(
+            true,
+            &[
+                ("checksum_sha256_enforced", "unknown"),
+                ("conditional_put", "{ state: xfail, issue: 1 }"),
+                ("virtual_host", "not_applicable"),
+            ],
+        );
+        use Capability::*;
+        for needs in [
+            &[ConditionalPut, ChecksumSha256Enforced][..],
+            &[VirtualHost, ChecksumSha256Enforced][..],
+        ] {
+            let p = plan(&s, needs, true);
+            assert!(
+                matches!(&p.step, Step::Refuse(why) if why.contains("checksum_sha256_enforced is unknown")),
+                "{needs:?}: {p:?}"
+            );
+        }
+    }
+
+    /// The refusal body is told which capability decided the case.
+    #[tokio::test]
+    async fn the_refusal_body_is_told_which_capability_the_server_lacks() {
+        let s = server(
+            false,
+            &[
+                ("versioning", "{ state: unsupported, refusal: startup }"),
+                (
+                    "object_lock",
+                    "{ state: unsupported, refusal: first_batch }",
+                ),
+            ],
+        );
+        let seen = std::cell::Cell::new(None);
+        let outcome = run_case(
+            &s,
+            &Recorder::default(),
+            "kit.lock",
+            &[Capability::ObjectLock, Capability::Versioning],
+            || async { panic!("the positive body must not run") },
+            Some(|c: Capability, at: RefusalAt| {
+                seen.set(Some((c, at)));
+                async {}
+            }),
+        )
+        .await;
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            seen.get(),
+            Some((Capability::ObjectLock, RefusalAt::FirstBatch))
+        );
+    }
+
+    fn settings(path_style: bool) -> S3Settings {
+        S3Settings {
+            endpoint: Some("http://127.0.0.1:1".into()),
+            region: "us-east-1".into(),
+            force_path_style: path_style,
+            verify_tls: false,
+            bucket: "b".into(),
+            locked_bucket: "l".into(),
+        }
+    }
+
+    /// Review of #764: an addressing style the server does not support would
+    /// skip every case, and a run that tested nothing would pass.
+    #[test]
+    fn an_addressing_style_the_server_lacks_is_refused_before_any_case() {
+        let s = server(true, &[("virtual_host", "not_applicable")]);
+        let err = LiveS3::new(s.clone(), settings(false), Recorder::default()).unwrap_err();
+        assert!(
+            err.contains("marks virtual_host not_applicable")
+                && err.contains("VTOP_TEST_S3_PATH_STYLE"),
+            "{err}"
+        );
+        assert!(LiveS3::new(s, settings(true), Recorder::default()).is_ok());
+    }
+
+    /// Review of #764: an unexpected case does not stop the cases after it;
+    /// every one writes its line, and the test fails once, at the end,
+    /// listing them all.
+    #[tokio::test]
+    async fn every_case_runs_and_the_test_fails_at_the_end_listing_each_unexpected_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = recorder(dir.path());
+        let path = r.path.clone().unwrap();
+        let live = LiveS3::new(server(true, &[]), settings(true), r).unwrap();
+        let ran = std::cell::Cell::new(0);
+        for (name, passes) in [("a", false), ("b", true), ("c", false)] {
+            live.case(name, &[Capability::PutGetHead], || async {
+                ran.set(ran.get() + 1);
+                assert!(passes, "case {name} failed");
+            })
+            .await;
+        }
+        assert_eq!(ran.get(), 3, "every case ran");
+        assert_eq!(live.unexpected().len(), 2);
+        let outcomes: Vec<_> = lines(&path).into_iter().map(|l| l.outcome).collect();
+        assert_eq!(outcomes, vec!["unexpected_fail", "pass", "unexpected_fail"]);
+        let panic = AssertUnwindSafe(async move { drop(live) })
+            .catch_unwind()
+            .await
+            .expect_err("dropping it fails the test");
+        let text = panic_text(panic.as_ref());
+        assert!(
+            text.starts_with("2 unexpected outcome(s)")
+                && text.contains("UNEXPECTED FAIL a ")
+                && text.contains("UNEXPECTED FAIL c "),
+            "{text}"
+        );
     }
 }

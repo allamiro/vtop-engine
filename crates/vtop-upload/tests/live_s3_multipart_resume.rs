@@ -184,8 +184,12 @@ fn upstream(s: &S3Settings) -> (String, String) {
     (endpoint, host)
 }
 
+/// The plain bucket, from the kit's settings (#722), read once.
 fn bucket() -> String {
-    std::env::var("VTOP_TEST_S3_BUCKET").unwrap_or_else(|_| "telemetry-raw".into())
+    static BUCKET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BUCKET
+        .get_or_init(|| LiveS3::from_env().settings.bucket.clone())
+        .clone()
 }
 
 async fn backend(s: &S3Settings, endpoint: &str) -> S3NativeBackend {
@@ -295,6 +299,10 @@ async fn verifies(backend: &S3NativeBackend, uri: &str, data: &[u8], digest: &st
 #[ignore = "requires an S3-compatible endpoint and credentials"]
 async fn live_a_part_whose_connection_is_reset_is_sent_again_alone() {
     let live = LiveS3::from_env();
+    // The forwarder's precondition, checked before the case so a store it
+    // cannot sit in front of (https, or no endpoint) is a setup error, not an
+    // unexpected failure of the capability (review of #764).
+    upstream(&live.settings);
     live.case(
         "multipart.a_reset_part_is_sent_again_alone",
         &[Capability::Multipart],
@@ -311,17 +319,19 @@ async fn live_a_part_whose_connection_is_reset_is_sent_again_alone() {
 
             forwarder.refuse.store(3, Ordering::SeqCst);
             let mut report = MultipartReport::default();
+            // A part whose request failed every SDK attempt is retried, not
+            // the end of the upload.
             upload_resumable_with_report(
-        &backend,
-        &config(dir.path(), 3),
-        &path,
-        &uri,
-        Some(ObjectChecksum::new("sha256", &digest)),
-        fence(&data, &digest),
-        &mut report,
-    )
-    .await
-    .expect("a part whose request failed every SDK attempt is retried, not the end of the upload");
+                &backend,
+                &config(dir.path(), 3),
+                &path,
+                &uri,
+                Some(ObjectChecksum::new("sha256", &digest)),
+                fence(&data, &digest),
+                &mut report,
+            )
+            .await
+            .expect("a part that failed every SDK attempt is retried");
 
             assert_eq!(
                 [forwarder.sent(1), forwarder.sent(2), forwarder.sent(3)],
@@ -348,6 +358,10 @@ async fn live_a_part_whose_connection_is_reset_is_sent_again_alone() {
 #[ignore = "requires an S3-compatible endpoint and credentials"]
 async fn live_a_second_backend_resumes_the_session_the_first_left() {
     let live = LiveS3::from_env();
+    // The forwarder's precondition, checked before the case so a store it
+    // cannot sit in front of (https, or no endpoint) is a setup error, not an
+    // unexpected failure of the capability (review of #764).
+    upstream(&live.settings);
     live.case(
         "multipart.a_second_backend_resumes_the_session",
         &[
@@ -428,6 +442,10 @@ async fn live_a_second_backend_resumes_the_session_the_first_left() {
 #[ignore = "requires an S3-compatible endpoint and credentials"]
 async fn live_the_sweep_aborts_an_abandoned_upload_at_the_store() {
     let live = LiveS3::from_env();
+    // The forwarder's precondition, checked before the case so a store it
+    // cannot sit in front of (https, or no endpoint) is a setup error, not an
+    // unexpected failure of the capability (review of #764).
+    upstream(&live.settings);
     live.case(
         "multipart.the_sweep_aborts_an_abandoned_upload",
         &[

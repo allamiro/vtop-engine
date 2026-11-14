@@ -35,9 +35,12 @@ use vtop_upload::{
 
 const MIB: usize = 1024 * 1024;
 
-/// How to reach the store, from `VTOP_TEST_S3_*` (#722).
+/// How to reach the store, from `VTOP_TEST_S3_*` (#722), read once.
 fn settings() -> S3Settings {
-    LiveS3::from_env().settings
+    static SETTINGS: std::sync::OnceLock<S3Settings> = std::sync::OnceLock::new();
+    SETTINGS
+        .get_or_init(|| LiveS3::from_env().settings.clone())
+        .clone()
 }
 
 fn locked_bucket() -> String {
@@ -191,7 +194,6 @@ async fn live_every_write_path_lands_under_the_lock_it_asked_for() {
         &[
             Capability::Versioning,
             Capability::ObjectLock,
-            Capability::Multipart,
             Capability::ChecksumCrc32Default,
         ],
         || async {
@@ -373,7 +375,11 @@ async fn live_a_multipart_object_carries_the_lock_its_create_asked_for() {
     let live = LiveS3::from_env();
     live.case(
         "object_lock.a_multipart_object_carries_its_lock",
-        &[Capability::Multipart, Capability::ObjectLock],
+        &[
+            Capability::Multipart,
+            Capability::Versioning,
+            Capability::ObjectLock,
+        ],
         || async {
             let bucket = locked_bucket();
             let prefix = unique("multipart");
@@ -390,10 +396,13 @@ async fn live_a_multipart_object_carries_the_lock_its_create_asked_for() {
             let f = file(&data);
             let digest = vtop_core::checksum::sha256_bytes(&data);
             let state = tempfile::tempdir().unwrap();
-            let upload: vtop_core::config::UploadConfig = serde_json::from_str(
-        r#"{"bucket":"b","multipart_part_size_bytes":5242880,"multipart_threshold_bytes":5242880}"#,
-    )
-    .unwrap();
+            let upload: vtop_core::config::UploadConfig =
+                serde_json::from_value(serde_json::json!({
+                    "bucket": "b",
+                    "multipart_part_size_bytes": 5 * MIB,
+                    "multipart_threshold_bytes": 5 * MIB,
+                }))
+                .unwrap();
             let cfg = MultipartUploadConfig::from_upload(&upload, state.path().to_path_buf());
             let stored = upload_resumable(
                 &locked,

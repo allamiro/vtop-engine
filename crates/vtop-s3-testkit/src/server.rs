@@ -87,12 +87,21 @@ impl Server {
 
     /// Read `<servers_dir>/<id>.yaml`.
     pub fn load(id: &str) -> Result<Server, String> {
-        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        Server::load_from(&servers_dir(), id)
+    }
+
+    /// Read `<dir>/<id>.yaml`.
+    pub fn load_from(dir: &Path, id: &str) -> Result<Server, String> {
+        if id.is_empty()
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
             return Err(format!(
                 "{SERVER_ENV}={id:?} is not a server id (lower-case letters, digits and '-')"
             ));
         }
-        let file = servers_dir().join(format!("{id}.yaml"));
+        let file = dir.join(format!("{id}.yaml"));
         let text = std::fs::read_to_string(&file).map_err(|e| {
             format!(
                 "{SERVER_ENV}={id}: cannot read its capability file {}: {e}; add the file \
@@ -162,10 +171,15 @@ impl Server {
         self.notes.get(&capability).map(String::as_str)
     }
 
-    /// The file named in an unexpected outcome, relative to the repository
-    /// when it is under it.
+    /// The file named in an unexpected outcome: repository-relative when it
+    /// is the repository's own, else the path it was read from.
     pub fn file_hint(&self) -> String {
-        format!("tests/s3-compat/servers/{}.yaml", self.id)
+        let repo = format!("tests/s3-compat/servers/{}.yaml", self.id);
+        if self.file.ends_with(&repo) || std::env::var_os(SERVERS_DIR_ENV).is_none() {
+            repo
+        } else {
+            self.file.display().to_string()
+        }
     }
 }
 
@@ -318,19 +332,21 @@ pub(crate) mod tests {
     fn the_id_and_the_file_name_must_agree() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("other.yaml"), file_with(true, &[])).unwrap();
-        // Through the variable, as a test binary run elsewhere would.
-        std::env::set_var(SERVERS_DIR_ENV, dir.path());
-        let err = Server::load("other").unwrap_err();
-        let missing = Server::load("nope").unwrap_err();
-        std::env::remove_var(SERVERS_DIR_ENV);
+        let err = Server::load_from(dir.path(), "other").unwrap_err();
+        let missing = Server::load_from(dir.path(), "nope").unwrap_err();
         assert!(err.contains("id: test"), "{err}");
         assert!(
             missing.contains("cannot read its capability file"),
             "{missing}"
         );
-        assert!(Server::load("../etc")
-            .unwrap_err()
-            .contains("not a server id"));
+        for bad in ["../etc", "MinIO", ""] {
+            assert!(
+                Server::load_from(dir.path(), bad)
+                    .unwrap_err()
+                    .contains("not a server id"),
+                "{bad:?}"
+            );
+        }
     }
 
     /// Every committed file parses, and its id is its file name.

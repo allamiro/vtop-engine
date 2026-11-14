@@ -29,9 +29,12 @@ use vtop_core::config::{ObjectLockConfig, ObjectLockMode, StreamsConfig, VtopCon
 use vtop_core::types::SourceType;
 use vtop_s3_testkit::{Capability, LiveS3, S3Settings};
 
-/// How to reach the store, from `VTOP_TEST_S3_*` (#722).
+/// How to reach the store, from `VTOP_TEST_S3_*` (#722), read once.
 fn settings() -> S3Settings {
-    LiveS3::from_env().settings
+    static SETTINGS: std::sync::OnceLock<S3Settings> = std::sync::OnceLock::new();
+    SETTINGS
+        .get_or_init(|| LiveS3::from_env().settings.clone())
+        .clone()
 }
 
 fn locked_bucket() -> String {

@@ -69,11 +69,25 @@ impl S3Settings {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| default.to_owned())
         };
+        let verify_tls = flag(VERIFY_TLS_ENV, false)?;
+        // The tests' own SDK clients (listing versions, legal holds) verify
+        // TLS whatever the flag says, so an https endpoint with the flag off
+        // would fail in them, not in VTOP (review of #764). Every lab server
+        // is plain http; say so rather than fail later.
+        if let Some(endpoint) = endpoint.as_deref().filter(|e| e.starts_with("https://")) {
+            if !verify_tls {
+                return Err(format!(
+                    "{ENDPOINT_ENV}={endpoint} is https with {VERIFY_TLS_ENV}=false: the live \
+                     tests' direct SDK clients always verify TLS; use the lab's http endpoint, \
+                     or a certificate the host trusts and {VERIFY_TLS_ENV}=true"
+                ));
+            }
+        }
         Ok(S3Settings {
             endpoint,
             region: text(REGION_ENV, "us-east-1"),
             force_path_style: flag(PATH_STYLE_ENV, true)?,
-            verify_tls: flag(VERIFY_TLS_ENV, false)?,
+            verify_tls,
             bucket: text(BUCKET_ENV, "telemetry-raw"),
             locked_bucket: text(LOCKED_BUCKET_ENV, "telemetry-locked"),
         })
@@ -140,6 +154,21 @@ mod tests {
             (s.bucket.as_str(), s.locked_bucket.as_str()),
             ("plain", "locked")
         );
+    }
+
+    #[test]
+    fn an_https_endpoint_without_tls_verification_is_refused() {
+        let err = S3Settings::from_lookup(
+            &server(false),
+            lookup(&[(ENDPOINT_ENV, "https://lab:9000")]),
+        )
+        .unwrap_err();
+        assert!(err.contains("always verify TLS"), "{err}");
+        assert!(S3Settings::from_lookup(
+            &server(false),
+            lookup(&[(ENDPOINT_ENV, "https://lab:9000"), (VERIFY_TLS_ENV, "true")]),
+        )
+        .is_ok());
     }
 
     #[test]

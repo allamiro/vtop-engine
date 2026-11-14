@@ -113,6 +113,8 @@ jobs:
               - 'crates/vtop-protocol/**'
               - 'crates/vtop-state/**'
               - 'crates/vtop-upload/**'
+              # A dev-dependency of vtop-cli's tests (#722).
+              - 'crates/vtop-s3-testkit/**'
               - 'tests/**'
               # Executed by the job's seeding step, and its output is what the
               # test asserts on.
@@ -1314,6 +1316,21 @@ jobs:
       # count the requests a forwarder in front of it sees. The server and
       # what it is expected to do come from tests/s3-compat/servers/minio.yaml
       # (#722); every case appends a results line to VTOP_TEST_S3_RESULTS.
+      # What each results line names: the MinIO release the lab builds, the
+      # local image's id (it is built, not pulled, so it has no registry
+      # digest), and the PR's head commit rather than the merge commit
+      # GITHUB_SHA names on a pull request.
+      - name: Label the S3 compatibility results
+        run: |
+          set -euo pipefail
+          release=$(sed -n 's/^ARG MINIO_RELEASE=//p' docker/minio/Dockerfile)
+          image=$(docker compose config --format json | jq -r '.services.minio.image')
+          {
+            echo "VTOP_TEST_S3_SERVER_VERSION=RELEASE.${release//:/-}"
+            echo "VTOP_TEST_S3_IMAGE_DIGEST=$(docker image inspect --format '{{.Id}}' "$image")"
+            echo "VTOP_TEST_COMMIT=${{ github.event.pull_request.head.sha || github.sha }}"
+          } >> "$GITHUB_ENV"
+
       - name: Run the live S3 tests
         env:
           VTOP_TEST_S3_SERVER: minio
@@ -1364,7 +1381,7 @@ jobs:
           {
             echo "### S3 compatibility: minio"
             echo
-            echo "| case | outcome | expected | method |"
+            echo "| case | outcome | expectation | method |"
             echo "|---|---|---|---|"
             jq -r '"| \(.case) | \(.outcome) | \(.expectation) | \(.method // "-") |"' "$RESULTS"
             echo

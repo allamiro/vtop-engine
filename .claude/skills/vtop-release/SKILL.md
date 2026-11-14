@@ -29,8 +29,8 @@ Branch from `origin/main` (`release/vX.Y.Z-bump` was used for 0.8.0, `release/0.
 
 | File | Change |
 |---|---|
-| `Cargo.toml` | `[workspace.package] version`, and the `version =` on the ten `vtop-*` path dependencies (eleven edits). Nothing else. |
-| `Cargo.lock` | `cargo update --workspace`. The diff must be exactly the **twelve** `vtop-*` entries and no third-party package; if anything else moved, revert it. Then `cargo check --workspace --locked`. |
+| `Cargo.toml` | `[workspace.package] version`, and the `version =` on the eleven `vtop-*` path dependencies (twelve edits; `vtop-s3-testkit`, a never-published test crate, carries one because cargo deny refuses a versionless path dependency). Nothing else. |
+| `Cargo.lock` | `cargo update --workspace`. The diff must be exactly the **thirteen** `vtop-*` entries and no third-party package; if anything else moved, revert it. Then `cargo check --workspace --locked`. |
 | `helm/vtop/Chart.yaml` | `appVersion: "X.Y.Z"` (it must track the workspace version; GHCR tags follow it). The chart's own `version` follows its contract, not the app: **patch** bump when no template or values changed since the last tag, **minor** when they did (a values-contract change). Check with `git diff vPREV..origin/main --stat -- helm/vtop/templates helm/vtop/values.yaml helm/vtop/ci`. Add the matching comment line above `version:` (0.5.1 for 0.8.0: "no template or values change — the bump carries appVersion 0.8.0"). Nothing in CI ties `appVersion` to `Cargo.toml`, so review it by eye. |
 | `docs/ROADMAP.md` | A section for the release (below), and the forward section renamed to the next release. |
 | `CITATION.cff` | `version` and `date-released` (the day the tag is pushed, as `YYYY-MM-DD`; v0.8.0 is `2026-11-12`). If the tag goes out on another day, fix the date in a follow-up PR; the tag does not move. |
@@ -121,7 +121,7 @@ Also: the image's `latest` tag moved (only for a non-pre-release), `helm/vtop/Ch
 ## Checklist
 
 - [ ] Milestone empty or deliberately moved; the bug-only rule respected.
-- [ ] Bump PR touches only Cargo.toml (11 edits), Cargo.lock (12 `vtop-*` entries), Chart.yaml, ROADMAP.md, CITATION.cff.
+- [ ] Bump PR touches only Cargo.toml (12 edits), Cargo.lock (13 `vtop-*` entries), Chart.yaml, ROADMAP.md, CITATION.cff.
 - [ ] Chart version bump matches whether templates or values changed.
 - [ ] ROADMAP: upgrade order, one-way changes with reasons, silently ignored keys, known open, no downgrade.
 - [ ] CI green on the exact head; head contains current `main`; merged by REST with `sha` pinned.
