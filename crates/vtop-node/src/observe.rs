@@ -3062,14 +3062,118 @@ mod tests {
         );
     }
 
+    fn local_produce(broker: &LocalBroker, producer: u128) -> vtop_protocol::WireFrame {
+        broker.handle(
+            vtop_protocol::Role::Producer,
+            vtop_protocol::WireFrame {
+                request_id: 1,
+                stream_id: 1,
+                message: vtop_protocol::Message::ProduceRequest(vtop_protocol::ProduceRequest {
+                    range: test_range(),
+                    fencing_epoch: 4,
+                    producer_id: Uuid::from_u128(producer),
+                    producer_epoch: 1,
+                    first_sequence: 0,
+                    durability: vtop_protocol::Durability::LocalFsync,
+                    records: vec![vtop_protocol::ProduceRecord {
+                        timestamp_millis: 1,
+                        key: b"k".to_vec(),
+                        value: b"v".to_vec(),
+                    }],
+                }),
+            },
+        )
+    }
+
+    /// The value of the one sample of `series` (name plus labels, exactly
+    /// as the text format prints it), or `None` when it is absent.
+    fn sample(text: &str, series: &str) -> Option<f64> {
+        text.lines()
+            .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '))
+            .map(|value| value.parse().unwrap())
+    }
+
+    /// Where a produce's time goes (#752): the leader's local fsync, the
+    /// replication round and the commit, each its own total, so the 6 to
+    /// 7 ms a request costs can be split before the path is changed. All
+    /// three series exist from the first scrape; a LocalFsync produce on a
+    /// standalone broker spends time in the first only.
+    #[test]
+    fn a_leader_exports_where_its_produce_time_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Arc::new(open_broker(dir.path()));
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                BrokerCollector::new(Arc::clone(&broker), None, Vec::new()).unwrap(),
+            ))
+            .unwrap();
+        let phase = |name: &str| format!("vtop_broker_produce_phase_seconds_total{{phase=\"{name}\"}}");
+
+        let before = scrape(&registry);
+        for name in ["local_fsync", "replicate", "commit"] {
+            assert_eq!(
+                sample(&before, &phase(name)),
+                Some(0.0),
+                "every phase must be exported from the start, at zero: {before}"
+            );
+        }
+        let response = local_produce(&broker, 0xB1);
+        assert!(
+            matches!(response.message, vtop_protocol::Message::ProduceResponse(_)),
+            "{response:?}"
+        );
+        let after = scrape(&registry);
+        assert!(
+            sample(&after, &phase("local_fsync")).unwrap() > 0.0,
+            "a produce fsyncs, and that time must be counted: {after}"
+        );
+        assert_eq!(sample(&after, &phase("replicate")), Some(0.0), "{after}");
+        assert_eq!(sample(&after, &phase("commit")), Some(0.0), "{after}");
+    }
+
+    /// Whether this broker batches its fsyncs is itself exported (#752), so
+    /// a dashboard reading the group-commit series can tell "no groups
+    /// sealed" from "group commit is off".
+    #[test]
+    fn a_leader_exports_whether_group_commit_is_on() {
+        let off_dir = tempfile::tempdir().unwrap();
+        let off = Arc::new(open_broker(off_dir.path()));
+        let on_dir = tempfile::tempdir().unwrap();
+        let on = Arc::new(
+            open_broker(on_dir.path())
+                .with_group_commit(vtop_broker::group_commit::GroupCommitConfig {
+                    max_delay: std::time::Duration::ZERO,
+                    ..Default::default()
+                })
+                .unwrap(),
+        );
+        for (broker, expected) in [(off, 0.0), (on, 1.0)] {
+            let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+            registry
+                .register(Box::new(
+                    BrokerCollector::new(broker, None, Vec::new()).unwrap(),
+                ))
+                .unwrap();
+            let text = scrape(&registry);
+            assert_eq!(
+                sample(&text, "vtop_broker_group_commit_enabled"),
+                Some(expected),
+                "{text}"
+            );
+        }
+    }
+
     /// Cardinality guard, mirroring the archive engine's contract test: an
     /// unbounded label would grow the TSDB without limit.
     #[test]
     fn every_node_label_is_from_a_bounded_set() {
         // "signal" (traces, metrics) labels the OpenTelemetry exporter's
-        // own counters (#683); its "reason" is already here.
-        const BOUNDED: [&str; 9] = [
+        // own counters (#683); its "reason" is already here. "phase" has
+        // three values, the produce path's (#752).
+        const BOUNDED: [&str; 10] = [
             "role", "node_id", "state", "reason", "scope", "topic", "range", "follower", "signal",
+            "phase",
         ];
         let observability = NodeObservability::new("data", "abc").unwrap();
         let report = RecoveryReport {
@@ -3081,6 +3185,13 @@ mod tests {
         observability
             .register(Box::new(
                 SegmentRecoveryCollector::new(Some(&report)).unwrap(),
+            ))
+            .unwrap();
+        // A leader's own series too, the produce phases among them.
+        let dir = tempfile::tempdir().unwrap();
+        observability
+            .register(Box::new(
+                BrokerCollector::new(Arc::new(open_broker(dir.path())), None, Vec::new()).unwrap(),
             ))
             .unwrap();
         let text = scrape(&observability.registry);
