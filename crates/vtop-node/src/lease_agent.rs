@@ -112,6 +112,13 @@ pub trait QuorumProbe: Send + Sync {
     fn sealed_prefix_end(&self) -> Option<u64> {
         None
     }
+    /// Make the candidate's own log the range's history, after metadata
+    /// recorded a promotion made under an operator's attestation (#636).
+    /// `Ok(true)` when a history was written, `Ok(false)` when the replica
+    /// already had one; an error when it could not be written.
+    fn adopt_attested_history(&self, _fencing_epoch: u64) -> Result<bool, String> {
+        Err("this probe cannot write the candidate's epoch history".to_owned())
+    }
 }
 
 /// Probes over the replication plane, one RPC per follower.
@@ -167,6 +174,11 @@ pub trait CandidateLocalView: Send + Sync {
     fn fence_for_probe(&self, _fencing_epoch: u64) -> Result<u64, String> {
         Ok(self.local_committed_offset())
     }
+    /// Make this replica's log the range's history after an attested
+    /// promotion was recorded (#636). The default writes nothing and says so.
+    fn adopt_attested_history(&self, _fencing_epoch: u64) -> Result<bool, String> {
+        Err("this view cannot write an epoch history".to_owned())
+    }
 }
 
 impl CandidateLocalView for LocalBroker {
@@ -187,6 +199,10 @@ impl CandidateLocalView for LocalBroker {
         self.sealed_segment_handles()
             .last()
             .map(|handle| handle.next_offset)
+    }
+
+    fn adopt_attested_history(&self, fencing_epoch: u64) -> Result<bool, String> {
+        LocalBroker::adopt_attested_history(self, fencing_epoch).map_err(|error| error.to_string())
     }
 }
 
@@ -223,6 +239,11 @@ impl CandidateLocalView for vtop_broker::replication::InProcessFollower {
         // grant was superseded, and the probe abstains.
         self.fence_locally(fencing_epoch)
             .map_err(|(code, reason)| format!("{code:?}: {reason}"))
+    }
+
+    fn adopt_attested_history(&self, fencing_epoch: u64) -> Result<bool, String> {
+        vtop_broker::replication::InProcessFollower::adopt_attested_history(self, fencing_epoch)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -316,6 +337,10 @@ impl QuorumProbe for ReplicaPlaneProbe {
 
     fn sealed_prefix_end(&self) -> Option<u64> {
         self.view.sealed_prefix_end()
+    }
+
+    fn adopt_attested_history(&self, fencing_epoch: u64) -> Result<bool, String> {
+        self.view.adopt_attested_history(fencing_epoch)
     }
 }
 
@@ -1159,6 +1184,39 @@ impl TransitionReporter for AdminTransitionReporter {
                     command = report(outcome.without_lineage());
                     continue;
                 }
+                // THE OVERRIDE'S PAYLOADS ARE REFUSED BELOW LEVEL 8 (#636),
+                // before replication. The lineage-unproven refusal goes
+                // again as the quorum shortfall it was recorded as before
+                // the reason existed. An attested promotion has no older
+                // form, so it is refused outright: it is never recorded,
+                // and so never exposed.
+                Ok(Err(error)) if vtop_meta::transport::refuses_promote_unproven(&error) => {
+                    let refusal = matches!(
+                        &command,
+                        MetadataCommand::ReportPromotionOutcome {
+                            outcome: vtop_meta::PromotionOutcome::Refused {
+                                reason: vtop_meta::PromotionRefusal::LineageUnproven,
+                            },
+                            ..
+                        }
+                    );
+                    if !refusal {
+                        return Err(ReportFailure::Refused(format!(
+                            "metadata cannot record a promotion made under an attestation \
+                             ({error}); the transition stays as it was"
+                        )));
+                    }
+                    tracing::warn!(
+                        range = %self.range_uuid,
+                        fencing_epoch,
+                        %error,
+                        "metadata does not record the lineage-unproven refusal reason yet \
+                         (feature level below {}); recording it as a quorum shortfall",
+                        vtop_meta::PROMOTE_UNPROVEN_FEATURE_LEVEL
+                    );
+                    command = report(outcome.without_unproven_refusal());
+                    continue;
+                }
                 Ok(Ok(response)) => match response.response {
                     MetadataResponse::TransitionRecorded { .. } => {
                         tracing::info!(
@@ -1191,6 +1249,113 @@ impl TransitionReporter for AdminTransitionReporter {
         Err(ReportFailure::Unanswered(format!(
             "{last} (after 5 attempts)"
         )))
+    }
+}
+
+/// Promotion refusals by reason, and promotions made under an operator's
+/// attestation, as this data node counted them (#636): the observable that
+/// tells a range refused for want of provable lineage from one refused for
+/// want of replicas, without a wire change. Shared between a range's lease
+/// agent and its metrics collector.
+#[derive(Debug, Default)]
+pub struct PromotionRefusals {
+    by_reason: [std::sync::atomic::AtomicU64; 5],
+    attested: std::sync::atomic::AtomicU64,
+}
+
+impl PromotionRefusals {
+    /// Every reason, in the order [`PromotionRefusals::snapshot`] reports.
+    pub const REASONS: [vtop_meta::PromotionRefusal; 5] = [
+        vtop_meta::PromotionRefusal::QuorumUnavailable,
+        vtop_meta::PromotionRefusal::LeaderBehind,
+        vtop_meta::PromotionRefusal::CandidateBehindVoters,
+        vtop_meta::PromotionRefusal::BelowPublished,
+        vtop_meta::PromotionRefusal::LineageUnproven,
+    ];
+
+    fn slot(reason: vtop_meta::PromotionRefusal) -> usize {
+        Self::REASONS
+            .iter()
+            .position(|known| *known == reason)
+            .expect("every reason is listed")
+    }
+
+    pub fn record(&self, reason: vtop_meta::PromotionRefusal) {
+        self.by_reason[Self::slot(reason)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn record_attested(&self) {
+        self.attested
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Each reason with how many refusals it has caused.
+    pub fn snapshot(&self) -> Vec<(vtop_meta::PromotionRefusal, u64)> {
+        Self::REASONS
+            .iter()
+            .map(|reason| {
+                (
+                    *reason,
+                    self.by_reason[Self::slot(*reason)].load(std::sync::atomic::Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
+    /// Promotions this node made under an operator's attestation.
+    pub fn attested(&self) -> u64 {
+        self.attested.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// What a verification found when it read the range's attestation (#636).
+enum Attested {
+    /// None live, or none readable.
+    None,
+    /// A live attestation names this node.
+    Mine(vtop_meta::PromotionAttestation),
+    /// A live attestation names another replica.
+    Elsewhere,
+}
+
+/// Where a verification reads the range's live promotion attestation from
+/// (#636). Read only when a quorum answered but could not prove its lineage:
+/// the one case the attestation can change.
+#[async_trait::async_trait]
+trait AttestationSource: Send + Sync {
+    /// The live attestation, if any. An error is never "none" to the
+    /// caller's safety - the caller counts no Unknown answer either way - but
+    /// it is logged differently.
+    async fn read(&self) -> Result<Option<vtop_meta::PromotionAttestation>, String>;
+}
+
+/// The attestation from metadata, over the admin plane, within the round's
+/// budget like every other call a promotion makes.
+struct AdminAttestationSource {
+    admin: Arc<AdminClient>,
+    topic_uuid: Uuid,
+    range_uuid: Uuid,
+    round: RoundClock,
+    rpc_deadline: Duration,
+}
+
+#[async_trait::async_trait]
+impl AttestationSource for AdminAttestationSource {
+    async fn read(&self) -> Result<Option<vtop_meta::PromotionAttestation>, String> {
+        let budget = self.round.budget(self.rpc_deadline);
+        match tokio::time::timeout(
+            budget,
+            self.admin
+                .read_promotion_attestation(self.topic_uuid, self.range_uuid),
+        )
+        .await
+        {
+            Ok(Ok(response)) => Ok(response.attestation),
+            Ok(Err(error)) => Err(format!("read promotion attestation: {error}")),
+            Err(_) => Err(format!(
+                "read promotion attestation: no answer within {budget:?}"
+            )),
+        }
     }
 }
 
@@ -1253,9 +1418,122 @@ struct Promoter {
     /// verification (#553); `None` when none was ever recorded, and then the
     /// configured set is counted as it always was.
     recorded_replica_set: Option<Vec<Uuid>>,
+    /// Where the range's live promotion attestation is read (#636); `None`
+    /// reads as no attestation, so no Unknown answer is ever counted.
+    attestations: Option<Arc<dyn AttestationSource>>,
+    /// Refusals by reason and attested promotions, for the metrics (#636).
+    refusals: Arc<PromotionRefusals>,
 }
 
 impl Promoter {
+    /// The range's live attestation (#636): `Mine` only when it names THIS
+    /// node. Every failure to read is `None`: the override is the one thing
+    /// here that must fail closed, since without it the Unknown answers
+    /// simply stay uncounted, which is #607's rule.
+    async fn read_attestation(&self, fencing_epoch: u64) -> Attested {
+        let Some(source) = self.attestations.clone() else {
+            return Attested::None;
+        };
+        match source.read().await {
+            Ok(Some(attestation)) if attestation.replica_node_uuid == self.node_uuid => {
+                Attested::Mine(attestation)
+            }
+            Ok(Some(attestation)) => {
+                tracing::warn!(
+                    range = %self.range_uuid,
+                    fencing_epoch,
+                    attestation = %attestation.attestation_id,
+                    attested_replica = %attestation.replica_node_uuid,
+                    operator = %attestation.operator,
+                    "an operator attested another replica's log for this range (#636); this \
+                     node counts no answer of unproven lineage, and stands aside for it"
+                );
+                Attested::Elsewhere
+            }
+            Ok(None) => Attested::None,
+            Err(error) => {
+                tracing::warn!(
+                    range = %self.range_uuid,
+                    fencing_epoch,
+                    %error,
+                    "the range's promotion attestation could not be read; counting no answer \
+                     of unproven lineage this round (#636)"
+                );
+                Attested::None
+            }
+        }
+    }
+
+    /// What an attested promotion owes once metadata has recorded it, on
+    /// whichever path the report landed (#636, #656 review): the count
+    /// operators alert on, and the history that makes the override recover
+    /// anything. The replica's log becomes the range's history, so it can
+    /// prove its lineage at the next failover and repair can install it on
+    /// the others. Only after the record: before it, the attestation may not
+    /// be this promotion's to use. A failure to write is logged, not fatal -
+    /// the promotion stands as metadata recorded it - but it leaves the range
+    /// where it was for the next failover, and says so.
+    fn after_attested_promotion(&self, fencing_epoch: u64) {
+        self.refusals.record_attested();
+        let written = match &self.probe {
+            Some(probe) => probe.adopt_attested_history(fencing_epoch),
+            None => Err("a standalone range has no quorum to have counted".to_owned()),
+        };
+        match written {
+            Ok(true) => tracing::warn!(
+                range = %self.range_uuid,
+                fencing_epoch,
+                "attested promotion recorded: this replica's whole log is now the range's \
+                 history under epoch {fencing_epoch}; repair the other replicas from it"
+            ),
+            Ok(false) => tracing::info!(
+                range = %self.range_uuid,
+                fencing_epoch,
+                "attested promotion recorded; this replica already had an epoch history"
+            ),
+            Err(error) => tracing::error!(
+                range = %self.range_uuid,
+                fencing_epoch,
+                %error,
+                "attested promotion recorded, but this replica's epoch history could not be \
+                 written: it still cannot prove its lineage, repair from it installs none, and \
+                 the next failover will refuse again"
+            ),
+        }
+    }
+
+    /// The step after the record for an attested promotion at `epoch` whose
+    /// answer was lost (#636 review): write the history it should have
+    /// written then, and count the promotion if it was not counted. Counted
+    /// only when a history is written, so a node that already wrote one is
+    /// not counted twice.
+    fn recover_attested_history(&self, epoch: u64) {
+        let Some(probe) = &self.probe else {
+            return;
+        };
+        match probe.adopt_attested_history(epoch) {
+            Ok(true) => {
+                self.refusals.record_attested();
+                tracing::warn!(
+                    range = %self.range_uuid,
+                    attested_epoch = epoch,
+                    "metadata recorded an attested promotion of this node at epoch {epoch} whose \
+                     answer was lost; this replica's whole log is now the range's history under \
+                     that epoch. Repair the other replicas from it"
+                );
+            }
+            Ok(false) => {}
+            Err(error) => tracing::error!(
+                range = %self.range_uuid,
+                attested_epoch = epoch,
+                %error,
+                "metadata recorded an attested promotion of this node, but its epoch history \
+                 could not be written: it still cannot prove its lineage, and repair from it \
+                 installs none"
+            ),
+        }
+    }
+
     /// Run `call` within what is left of the current round; `None` if the
     /// round's budget ran out first. Outside a round, unbounded.
     async fn within_round<T>(&self, call: impl std::future::Future<Output = T>) -> Option<T> {
@@ -1294,6 +1572,9 @@ impl Promoter {
                     });
                 match answer {
                     Ok(()) => {
+                        if pending.outcome.attestation().is_some() {
+                            self.after_attested_promotion(fencing_epoch);
+                        }
                         self.publisher
                             .promote(fencing_epoch, pending.committed_offset);
                         self.verified_epoch = Some(fencing_epoch);
@@ -1412,23 +1693,124 @@ impl Promoter {
                         }
                     }
                 }
-                match crate::promotion::establish(
+                let mut verdict = crate::promotion::establish(
                     &probes,
                     probe.replication_factor(),
                     self.node_uuid,
                     self.published_floor,
-                ) {
+                );
+                // THE OPERATOR'S OVERRIDE (#636), and nothing else, counts
+                // an Unknown answer - and only for the replica a live
+                // attestation names. Read only when lineage is all that is
+                // missing. Metadata re-checks the attestation when the
+                // outcome is reported, and uses it up in the same apply, so
+                // a stale read here cannot make it count twice: that report
+                // is refused, and an unreported boundary is never exposed.
+                let mut attestation = None;
+                let mut attested_elsewhere = false;
+                if matches!(verdict, crate::promotion::Promotion::LineageUnproven { .. }) {
+                    let read = self.read_attestation(fencing_epoch).await;
+                    attested_elsewhere = matches!(read, Attested::Elsewhere);
+                    if let Attested::Mine(live) = read {
+                        verdict = crate::promotion::establish_under_attestation(
+                            &probes,
+                            probe.replication_factor(),
+                            self.node_uuid,
+                            self.published_floor,
+                        );
+                        if !matches!(verdict, crate::promotion::Promotion::Established { .. }) {
+                            tracing::warn!(
+                                range = %self.range_uuid,
+                                fencing_epoch,
+                                attestation = %live.attestation_id,
+                                ?verdict,
+                                "an operator's attestation names this node, but even counting \
+                                 answers of unproven lineage the promotion is refused; the \
+                                 attestation stays unused"
+                            );
+                        }
+                        attestation = Some(live);
+                    }
+                }
+                // Whether this candidate can prove NO answer, its own
+                // included (#577), or holds nothing beside a replica holding
+                // records it cannot judge (#612 Q3): eligibility verdicts,
+                // for whichever refusal arm below meets them.
+                let candidate_unproven = probes.iter().any(|answer| {
+                    answer.node_id == self.node_uuid
+                        && answer.local_committed_offset.is_some()
+                        && !answer.lineage.is_provable()
+                });
+                // AN ATTESTED PROMOTION WHOSE ANSWER WAS LOST (#636 review).
+                // Metadata recorded this node's attested promotion at an
+                // earlier epoch and used the attestation up, but the answer
+                // never arrived and that epoch ended before a retry landed,
+                // so the step after the record never ran: this node still
+                // has no history, and repair from it installs none. The
+                // record is in the chain the floor read just scanned; write
+                // the history now. Only for this node, only when that is the
+                // NEWEST established promotion (no one has led since), and
+                // only into an empty journal (`adopt_attested_history`
+                // leaves a history alone). Nothing more is counted toward
+                // this round's quorum: the others still cannot prove their
+                // lineage until they are repaired from this replica.
+                if candidate_unproven && attestation.is_none() {
+                    if let Some(recorded) = self
+                        .floor
+                        .as_ref()
+                        .and_then(|source| source.newest_established(fencing_epoch))
+                    {
+                        if recorded.attested
+                            && recorded.holder == self.node_uuid
+                            && recorded.epoch < fencing_epoch
+                        {
+                            self.recover_attested_history(recorded.epoch);
+                        }
+                    }
+                }
+                let candidate_empty_behind_unproven = probes.iter().any(|answer| {
+                    answer.node_id == self.node_uuid && answer.local_committed_offset == Some(0)
+                }) && probes.iter().any(|answer| {
+                    answer.node_id != self.node_uuid
+                        && !answer.lineage.is_provable()
+                        && answer
+                            .local_committed_offset
+                            .is_some_and(|offset| offset > 0)
+                });
+                let candidate_unproven = candidate_unproven || candidate_empty_behind_unproven;
+                match verdict {
                     crate::promotion::Promotion::Established {
                         committed_offset,
                         answered,
                         unproven,
                     } => {
+                        if let Some(attestation) = &attestation {
+                            tracing::warn!(
+                                range = %self.range_uuid,
+                                fencing_epoch,
+                                committed_offset,
+                                attestation = %attestation.attestation_id,
+                                operator = %attestation.operator,
+                                attested_at_ms = attestation.attested_at_ms,
+                                counted_unknown_lineage = probes
+                                    .iter()
+                                    .filter(|answer| answer.local_committed_offset.is_some()
+                                        && !answer.lineage.is_provable())
+                                    .count(),
+                                "UNPROVEN PROMOTION under an operator's attestation (#636): \
+                                 answers whose lineage could not be proven were counted, and \
+                                 this node's log becomes the range's history; records it does \
+                                 not hold may be lost. Repair the other replicas from this one \
+                                 once it serves"
+                            );
+                        }
                         tracing::info!(
                             range = %self.range_uuid,
                             fencing_epoch,
                             committed_offset,
                             replicas = answered.len(),
                             uncounted_unknown_lineage = unproven.len(),
+                            attested = attestation.is_some(),
                             "verified promotion: committed boundary established by quorum"
                         );
                         // The evidence, kept rather than discarded (#240
@@ -1487,8 +1869,55 @@ impl Promoter {
                                 .filter(|offset| **offset <= candidate_offset)
                                 .count() as u32,
                             required: crate::promotion::majority(probe.replication_factor()) as u32,
+                            attestation: attestation.clone(),
                         });
                         Some(committed_offset)
+                    }
+                    crate::promotion::Promotion::LineageUnproven {
+                        answered,
+                        required,
+                        unproven,
+                    } => {
+                        // ENOUGH REPLICAS ANSWERED; TOO FEW COULD PROVE THEIR
+                        // LINEAGE (#577, #636). Told apart from a shortfall
+                        // in the log, the metric and the transition record,
+                        // because the remedies differ: more time does not
+                        // help here. What follows is the shortfall's
+                        // handling otherwise, unchanged: a candidate that
+                        // can prove no answer, or holds nothing beside a
+                        // replica holding records, stands aside; any other
+                        // keeps the lease and retries.
+                        tracing::warn!(
+                            range = %self.range_uuid,
+                            fencing_epoch,
+                            reason = vtop_meta::PromotionRefusal::LineageUnproven.as_str(),
+                            answered,
+                            required,
+                            unproven,
+                            candidate_unproven,
+                            "refusing promotion: enough replicas answered, but too few with a \
+                             lineage this candidate could prove (#577); answers whose epoch \
+                             history could not be compared are not counted, whatever their \
+                             offsets. A replica holding records with no epoch history can be \
+                             repaired (`vtopctl node repair`) from a replica that has one. If NO \
+                             replica of the range has epoch history, restore the range from \
+                             backup; failing that, the last resort is `vtopctl node \
+                             promote-unproven`, which loses every record the replica it names \
+                             does not hold (docs/PRODUCTION_HA.md)"
+                        );
+                        self.evidence = Some(vtop_meta::PromotionOutcome::Refused {
+                            reason: vtop_meta::PromotionRefusal::LineageUnproven,
+                        });
+                        // The operator named another replica's log: let that
+                        // one win the range rather than retry against it.
+                        if candidate_unproven || attested_elsewhere {
+                            self.stand_aside = true;
+                        } else {
+                            self.quorum_miss = true;
+                        }
+                        self.report_refusal(fencing_epoch).await;
+                        self.suspended(fencing_epoch);
+                        return false;
                     }
                     crate::promotion::Promotion::QuorumUnavailable {
                         answered,
@@ -1499,62 +1928,27 @@ impl Promoter {
                         // prove ANY answer, its own included (#577): no
                         // retry at this node changes that, while a replica
                         // that has a history can promote. An eligibility
-                        // verdict, so it stands aside like the others.
-                        let candidate_unproven = probes.iter().any(|answer| {
-                            answer.node_id == self.node_uuid
-                                && answer.local_committed_offset.is_some()
-                                && !answer.lineage.is_provable()
-                        });
-                        // A candidate that holds NOTHING cannot judge a
-                        // replica that holds records (#612 Q3): with no
-                        // history of its own, every such answer is Unknown.
-                        // Before #607 this round was LeaderBehind and the
-                        // candidate stood aside. Without that, it held the
-                        // lease through the quorum-miss budget and could
-                        // re-win with no hold-off, keeping the replica that
-                        // holds the records off the range. The Unknown
-                        // answers are not counted here either. They only
-                        // establish that a replica better placed to lead
-                        // exists.
-                        let candidate_empty_behind_unproven = probes.iter().any(|answer| {
-                            answer.node_id == self.node_uuid
-                                && answer.local_committed_offset == Some(0)
-                        }) && probes.iter().any(|answer| {
-                            answer.node_id != self.node_uuid
-                                && !answer.lineage.is_provable()
-                                && answer
-                                    .local_committed_offset
-                                    .is_some_and(|offset| offset > 0)
-                        });
-                        let candidate_unproven =
-                            candidate_unproven || candidate_empty_behind_unproven;
-                        if unproven > 0 {
-                            tracing::warn!(
-                                range = %self.range_uuid,
-                                fencing_epoch,
-                                answered,
-                                required,
-                                unproven,
-                                candidate_unproven,
-                                "refusing promotion: too few replicas answered with a lineage \
-                                 this candidate could prove (#577); answers whose epoch \
-                                 history could not be compared are not counted, whatever \
-                                 their offsets. A replica holding records with no epoch \
-                                 history can be repaired (`vtopctl node repair`) only from a \
-                                 replica that has one. If NO replica of the range has epoch \
-                                 history, repair cannot restore it and the range cannot \
-                                 promote: there is no in-product remedy yet (#612)"
-                            );
-                        } else {
-                            tracing::warn!(
-                                range = %self.range_uuid,
-                                fencing_epoch,
-                                answered,
-                                required,
-                                "refusing promotion: too few replicas could confirm the \
-                                 committed boundary"
-                            );
-                        }
+                        // verdict, so it stands aside like the others. And
+                        // a candidate that holds NOTHING cannot judge a
+                        // replica that holds records (#612 Q3): before #607
+                        // that round was LeaderBehind and the candidate
+                        // stood aside; without that, it held the lease
+                        // through the quorum-miss budget and could re-win
+                        // with no hold-off, keeping the replica that holds
+                        // the records off the range. The Unknown answers are
+                        // not counted here either. They only establish that
+                        // a replica better placed to lead exists.
+                        tracing::warn!(
+                            range = %self.range_uuid,
+                            fencing_epoch,
+                            reason = vtop_meta::PromotionRefusal::QuorumUnavailable.as_str(),
+                            answered,
+                            required,
+                            unproven,
+                            candidate_unproven,
+                            "refusing promotion: too few replicas could confirm the committed \
+                             boundary"
+                        );
                         if candidate_unproven {
                             self.stand_aside = true;
                             self.evidence = Some(vtop_meta::PromotionOutcome::Refused {
@@ -1681,6 +2075,7 @@ impl Promoter {
                 quorum: Vec::new(),
                 votes: 0,
                 required: 0,
+                attestation: None,
             });
         }
         // PERSIST BEFORE EXPOSE (#449, review): the boundary goes into the
@@ -1688,7 +2083,9 @@ impl Promoter {
         // before any client can observe it. A report that does not land is
         // not a boundary nobody will know about: the epoch is held still and
         // the next round verifies again.
+        let mut attested = false;
         if let Some(outcome) = self.evidence.take() {
+            attested = outcome.attestation().is_some();
             let request_id = Uuid::new_v4();
             let reported = self
                 .within_round(
@@ -1724,6 +2121,9 @@ impl Promoter {
                 return false;
             }
         }
+        if attested {
+            self.after_attested_promotion(fencing_epoch);
+        }
         self.publisher.promote(fencing_epoch, committed_offset);
         self.verified_epoch = Some(fencing_epoch);
         tracing::info!(range = %self.range_uuid, fencing_epoch, "range lease held");
@@ -1733,6 +2133,9 @@ impl Promoter {
     /// A refusal is recorded too, best effort: it is evidence, not a floor,
     /// and a report that fails must not change the verdict.
     async fn report_refusal(&mut self, fencing_epoch: u64) {
+        if let Some(vtop_meta::PromotionOutcome::Refused { reason }) = &self.evidence {
+            self.refusals.record(*reason);
+        }
         if let Some(outcome) = self.evidence.take() {
             let reported = self
                 .within_round(self.reporter.report(fencing_epoch, outcome, Uuid::new_v4()))
@@ -1858,6 +2261,9 @@ struct FloorScan {
     next_from: u64,
     /// The highest Established boundary in the pages read so far.
     floor: Option<u64>,
+    /// The newest Established promotion in the pages read so far (#636
+    /// review).
+    newest: Option<EstablishedPromotion>,
     complete: bool,
     /// The round its last page was read in; a completed scan is reused in
     /// that round and the next, no later.
@@ -1870,6 +2276,23 @@ trait FloorSource: Send + Sync {
     /// The highest boundary any earlier promotion of the range published;
     /// `None` when none has.
     async fn read(&self, fencing_epoch: u64) -> Result<Option<u64>, String>;
+
+    /// The newest Established promotion in the chain the last successful
+    /// `read` for `fencing_epoch` scanned (#636 review); `None` when it held
+    /// none, no such read completed, or this source does not say.
+    fn newest_established(&self, _fencing_epoch: u64) -> Option<EstablishedPromotion> {
+        None
+    }
+}
+
+/// An Established promotion as the transition chain records it (#636
+/// review): its epoch, its holder, and whether it was made under an
+/// attestation naming that holder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EstablishedPromotion {
+    epoch: u64,
+    holder: Uuid,
+    attested: bool,
 }
 
 /// The floor from metadata's transition chain, read over the admin plane.
@@ -1913,6 +2336,7 @@ impl FloorSource for AdminFloorSource {
                 for_epoch: fencing_epoch,
                 next_from: 1,
                 floor: None,
+                newest: None,
                 complete: false,
                 completed_in_round: None,
             },
@@ -1952,6 +2376,7 @@ impl FloorSource for AdminFloorSource {
             };
             if !page.found {
                 scan.floor = None;
+                scan.newest = None;
                 scan.complete = true;
                 scan.completed_in_round = Some(self.round.number());
                 break;
@@ -1968,6 +2393,21 @@ impl FloorSource for AdminFloorSource {
                 {
                     scan.floor = Some(scan.floor.map_or(*boundary, |seen| seen.max(*boundary)));
                 }
+                if let vtop_meta::TransitionOutcome::Reported {
+                    outcome: established @ vtop_meta::PromotionOutcome::Established { .. },
+                    ..
+                } = &view.outcome
+                {
+                    // Pages run in epoch order, so the last one seen is the
+                    // newest.
+                    scan.newest = Some(EstablishedPromotion {
+                        epoch: view.epoch_to,
+                        holder: view.holder_to,
+                        attested: established
+                            .attestation()
+                            .is_some_and(|used| used.replica_node_uuid == view.holder_to),
+                    });
+                }
             }
             match page.transitions.last() {
                 Some(last) if page.transitions.len() == usize::from(PAGE) => {
@@ -1982,6 +2422,15 @@ impl FloorSource for AdminFloorSource {
         let floor = scan.floor;
         keep(scan);
         Ok(floor)
+    }
+
+    fn newest_established(&self, fencing_epoch: u64) -> Option<EstablishedPromotion> {
+        self.scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|scan| scan.complete && scan.for_epoch == fencing_epoch)
+            .and_then(|scan| scan.newest)
     }
 }
 
@@ -2474,6 +2923,14 @@ impl LeaseAgent {
                 round: round_clock.clone(),
                 unanswered: None,
                 recorded_replica_set: None,
+                attestations: Some(Arc::new(AdminAttestationSource {
+                    admin: Arc::clone(&admin),
+                    topic_uuid,
+                    range_uuid,
+                    round: round_clock.clone(),
+                    rpc_deadline: config.renew_interval,
+                })),
+                refusals: Arc::new(PromotionRefusals::default()),
             },
             state: LeaseState::NotHeld,
             ready: None,
@@ -2488,6 +2945,14 @@ impl LeaseAgent {
             campaign_hold_off_rounds: 0,
             quorum_miss_hold: None,
         })
+    }
+
+    /// Count this agent's promotion refusals by reason, and its promotions
+    /// under an operator's attestation, into `refusals` (#636) - the same
+    /// counters the node's metrics collector reads.
+    pub fn with_refusal_counters(mut self, refusals: Arc<PromotionRefusals>) -> Self {
+        self.promoter.refusals = refusals;
+        self
     }
 
     /// This node's own view, so a STANDALONE promotion's transition record
@@ -4237,6 +4702,7 @@ mod tests {
                 quorum: Vec::new(),
                 votes: 0,
                 required: 0,
+                attestation: None,
             }),
             "a standalone promotion is established with nothing to recompute, not left Pending"
         );
@@ -4322,6 +4788,8 @@ mod tests {
             round: RoundClock::default(),
             unanswered: None,
             recorded_replica_set: None,
+            attestations: None,
+            refusals: Arc::new(PromotionRefusals::default()),
         }
     }
 
@@ -4409,6 +4877,7 @@ mod tests {
                                 quorum: Vec::new(),
                                 votes: 0,
                                 required: 0,
+                                attestation: None,
                             },
                             reported_at_ms: 0,
                             reported_apply_index: epoch,
@@ -4572,6 +5041,7 @@ mod tests {
             ],
             votes: 2,
             required: 2,
+            attestation: None,
         }
     }
 
@@ -4610,6 +5080,56 @@ mod tests {
                 "refused before replication, so the same request id is free"
             );
         }
+    }
+
+    /// #636: a tier below the override's level records the lineage-unproven
+    /// refusal as the quorum shortfall it was recorded as before - same
+    /// request, sent again - and refuses an attested promotion outright,
+    /// which has no older form: unrecorded, it is never exposed.
+    #[tokio::test]
+    async fn an_old_level_tier_records_the_lineage_refusal_as_a_shortfall_and_no_override() {
+        let tier = || ReportingTier {
+            level: vtop_meta::PROMOTE_UNPROVEN_FEATURE_LEVEL - 1,
+            predates_levels: false,
+            proposals: std::sync::Mutex::new(Vec::new()),
+        };
+        let (result, proposals) = report_to(
+            tier(),
+            vtop_meta::PromotionOutcome::Refused {
+                reason: vtop_meta::PromotionRefusal::LineageUnproven,
+            },
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(proposals.len(), 2, "{proposals:?}");
+        let (first_id, _) = reported_outcome(&proposals[0]);
+        let (second_id, second) = reported_outcome(&proposals[1]);
+        assert_eq!(
+            second,
+            vtop_meta::PromotionOutcome::Refused {
+                reason: vtop_meta::PromotionRefusal::QuorumUnavailable,
+            }
+        );
+        assert_eq!(first_id, second_id);
+
+        let attested = vtop_meta::PromotionOutcome::Established {
+            boundary_offset: Some(100),
+            sealed_prefix_end: None,
+            quorum: vec![vtop_meta::QuorumAnswer {
+                node_uuid: Uuid::from_u128(1),
+                offset: 100,
+                lineage: Some(vtop_meta::AnswerLineage::Unknown),
+            }],
+            votes: 1,
+            required: 1,
+            attestation: Some(attestation_naming(1)),
+        };
+        let (result, proposals) = report_to(tier(), attested).await;
+        assert!(
+            matches!(result, Err(ReportFailure::Refused(_))),
+            "{result:?}"
+        );
+        assert_eq!(proposals.len(), 1, "no older form is tried: {proposals:?}");
     }
 
     /// #577: at the verdicts' level the report is recorded as it was made,
@@ -4689,6 +5209,11 @@ mod tests {
             "three pages cannot fit one round: {first:?}"
         );
         let after_first = handler.asked.lock().unwrap().len();
+        assert_eq!(
+            source.newest_established(9),
+            None,
+            "an unfinished scan names no newest promotion (#636 review)"
+        );
 
         let second = {
             let _round = round.open(deadline);
@@ -4706,6 +5231,20 @@ mod tests {
             "the second round resumes at the page the first could not finish: {resumed:?}"
         );
         assert!(!resumed.contains(&1), "{resumed:?}");
+        assert_eq!(
+            source.newest_established(9),
+            Some(EstablishedPromotion {
+                epoch: 600,
+                holder: Uuid::from_u128(1),
+                attested: false,
+            }),
+            "the finished scan names epoch 600's promotion, the newest established"
+        );
+        assert_eq!(
+            source.newest_established(10),
+            None,
+            "a scan read for another epoch says nothing about this one"
+        );
 
         // Complete: reused within one round, so a scan that took the whole
         // round can still be verified in the next...
@@ -4865,6 +5404,8 @@ mod tests {
         /// at the wrong epoch would fence nothing that matters, so the value
         /// reaching this trait is worth asserting rather than assuming.
         fenced_at: std::sync::Mutex<Vec<u64>>,
+        /// Every epoch an attested history was written at (#636).
+        adopted: std::sync::Mutex<Vec<u64>>,
     }
 
     #[async_trait::async_trait]
@@ -4880,6 +5421,10 @@ mod tests {
         fn members(&self) -> Option<Vec<Uuid>> {
             self.members.clone()
         }
+        fn adopt_attested_history(&self, fencing_epoch: u64) -> Result<bool, String> {
+            self.adopted.lock().unwrap().push(fencing_epoch);
+            Ok(true)
+        }
     }
 
     fn fixed(probes: Vec<crate::promotion::ReplicaProbe>, factor: usize) -> Arc<FixedProbe> {
@@ -4889,6 +5434,7 @@ mod tests {
             members: None,
             calls: std::sync::atomic::AtomicUsize::new(0),
             fenced_at: std::sync::Mutex::new(Vec::new()),
+            adopted: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -4903,6 +5449,7 @@ mod tests {
             members: Some(members.iter().copied().map(Uuid::from_u128).collect()),
             calls: std::sync::atomic::AtomicUsize::new(0),
             fenced_at: std::sync::Mutex::new(Vec::new()),
+            adopted: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -5752,10 +6299,10 @@ mod tests {
         assert!(
             matches!(
                 promotion,
-                crate::promotion::Promotion::QuorumUnavailable { .. }
+                crate::promotion::Promotion::LineageUnproven { .. }
             ),
-            "an Unknown-lineage replica completed the majority by its offset alone: \
-             {promotion:?}"
+            "an Unknown-lineage replica completed the majority by its offset alone, or the \
+             refusal did not name lineage (#636): {promotion:?}"
         );
     }
 
@@ -6158,7 +6705,7 @@ mod tests {
         );
         assert_eq!(
             crate::promotion::establish(&probes, 3, Uuid::from_u128(1), None),
-            crate::promotion::Promotion::QuorumUnavailable {
+            crate::promotion::Promotion::LineageUnproven {
                 answered: 1,
                 required: 2,
                 unproven: 1,
@@ -6222,10 +6769,380 @@ mod tests {
         );
     }
 
+    /// An attestation source that answers with what it was given (#636).
+    struct FixedAttestation(Result<Option<vtop_meta::PromotionAttestation>, String>);
+
+    #[async_trait::async_trait]
+    impl AttestationSource for FixedAttestation {
+        async fn read(&self) -> Result<Option<vtop_meta::PromotionAttestation>, String> {
+            self.0.clone()
+        }
+    }
+
+    fn attestation_naming(node: u128) -> vtop_meta::PromotionAttestation {
+        vtop_meta::PromotionAttestation {
+            attestation_id: Uuid::from_u128(0x636),
+            replica_node_uuid: Uuid::from_u128(node),
+            operator: "oncall".to_owned(),
+            attested_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    /// The #607 shape: every replica holds 100 records and none has epoch
+    /// history, so every answer is Unknown.
+    fn history_less() -> Arc<FixedProbe> {
+        fixed(
+            vec![
+                at_with(1, 100, vtop_meta::AnswerLineage::Unknown),
+                at_with(2, 100, vtop_meta::AnswerLineage::Unknown),
+                at_with(3, 100, vtop_meta::AnswerLineage::Unknown),
+            ],
+            3,
+        )
+    }
+
+    fn refused_for(promoter: &Promoter, reason: vtop_meta::PromotionRefusal) -> u64 {
+        promoter
+            .refusals
+            .snapshot()
+            .into_iter()
+            .find(|(counted, _)| *counted == reason)
+            .map_or(0, |(_, total)| total)
+    }
+
+    /// #636, the safety half: WITHOUT an attestation naming this node,
+    /// #607's rule holds exactly - a range whose answers are all Unknown
+    /// does not promote, however many answered - whether metadata holds no
+    /// attestation, one naming another replica, or cannot be read. The
+    /// refusal now says why: lineage, not a shortfall, in the record and the
+    /// metric alike.
+    #[tokio::test]
+    async fn without_an_attestation_naming_it_a_history_less_range_never_promotes() {
+        for (case, source) in [
+            ("no attestation source", None),
+            (
+                "no attestation recorded",
+                Some(Arc::new(FixedAttestation(Ok(None))) as Arc<dyn AttestationSource>),
+            ),
+            (
+                "an attestation naming another replica",
+                Some(Arc::new(FixedAttestation(Ok(Some(attestation_naming(2))))) as _),
+            ),
+            (
+                "an attestation that cannot be read",
+                Some(Arc::new(FixedAttestation(Err("metadata unreachable".to_owned()))) as _),
+            ),
+        ] {
+            let recorder = Arc::new(Recorder::default());
+            let mut candidate = promoter(Arc::clone(&recorder), Some(history_less()));
+            candidate.attestations = source;
+            assert!(!candidate.ensure(7).await, "{case}: promoted");
+            assert!(
+                recorder.promoted.lock().unwrap().is_empty(),
+                "{case}: a boundary was exposed"
+            );
+            assert_eq!(
+                recorder.last_reported(),
+                Some(vtop_meta::PromotionOutcome::Refused {
+                    reason: vtop_meta::PromotionRefusal::LineageUnproven,
+                }),
+                "{case}: the refusal must name lineage, not a quorum shortfall"
+            );
+            assert!(candidate.take_stand_aside(), "{case}");
+            assert_eq!(
+                refused_for(&candidate, vtop_meta::PromotionRefusal::LineageUnproven),
+                1,
+                "{case}"
+            );
+            assert_eq!(
+                refused_for(&candidate, vtop_meta::PromotionRefusal::QuorumUnavailable),
+                0,
+                "{case}"
+            );
+            assert_eq!(candidate.refusals.attested(), 0, "{case}");
+        }
+    }
+
+    /// #636: an attestation naming another replica makes even a candidate
+    /// that HAS history, and so would otherwise hold the lease and retry,
+    /// stand aside: the operator chose the other replica's log.
+    #[tokio::test]
+    async fn an_attestation_naming_another_replica_makes_a_candidate_stand_aside() {
+        let probes = || {
+            fixed(
+                vec![
+                    at(1, Some(100)),
+                    at_with(2, 100, vtop_meta::AnswerLineage::Unknown),
+                    at(3, None),
+                ],
+                3,
+            )
+        };
+        let mut retrying = promoter(Arc::new(Recorder::default()), Some(probes()));
+        assert!(!retrying.ensure(7).await);
+        assert!(
+            retrying.take_quorum_miss(),
+            "no attestation: a retryable miss"
+        );
+        let mut deferring = promoter(Arc::new(Recorder::default()), Some(probes()));
+        deferring.attestations = Some(Arc::new(FixedAttestation(Ok(Some(attestation_naming(2))))));
+        assert!(!deferring.ensure(7).await);
+        assert!(deferring.take_stand_aside());
+        assert!(!deferring.take_quorum_miss());
+    }
+
+    /// #636, the override: with a live attestation naming THIS node, the
+    /// history-less range promotes, counting the Unknown answers - and the
+    /// report carries the attestation and every verdict, so the record shows
+    /// what was counted on the operator's word.
+    #[tokio::test]
+    async fn an_attestation_naming_the_candidate_lets_it_promote_and_is_reported() {
+        let recorder = Arc::new(Recorder::default());
+        let mut candidate = promoter(Arc::clone(&recorder), Some(history_less()));
+        candidate.attestations = Some(Arc::new(FixedAttestation(Ok(Some(attestation_naming(1))))));
+        assert!(candidate.ensure(7).await);
+        assert_eq!(*recorder.promoted.lock().unwrap(), vec![(7, Some(100))]);
+        let Some(vtop_meta::PromotionOutcome::Established {
+            boundary_offset,
+            quorum,
+            votes,
+            required,
+            attestation,
+            ..
+        }) = recorder.last_reported()
+        else {
+            panic!("{:?}", recorder.last_reported())
+        };
+        assert_eq!(boundary_offset, Some(100));
+        assert_eq!((votes, required), (3, 2));
+        assert_eq!(attestation, Some(attestation_naming(1)));
+        assert!(quorum
+            .iter()
+            .all(|answer| answer.lineage == Some(vtop_meta::AnswerLineage::Unknown)));
+        assert_eq!(candidate.refusals.attested(), 1);
+    }
+
+    /// #656 review: an attested promotion makes the candidate's log the
+    /// range's history - written once metadata recorded the promotion, and
+    /// only then - so the replica can prove its lineage at the next failover
+    /// and repair can install it on the others. A promotion that proved its
+    /// lineage writes nothing.
+    #[tokio::test]
+    async fn an_attested_promotion_writes_the_candidates_history() {
+        let probe = history_less();
+        let mut candidate = promoter(
+            Arc::new(Recorder::default()),
+            Some(Arc::clone(&probe) as Arc<dyn QuorumProbe>),
+        );
+        candidate.attestations = Some(Arc::new(FixedAttestation(Ok(Some(attestation_naming(1))))));
+        assert!(candidate.ensure(7).await);
+        assert_eq!(*probe.adopted.lock().unwrap(), vec![7]);
+
+        let proven = fixed(vec![at(1, Some(100)), at(2, Some(100)), at(3, None)], 3);
+        let mut ordinary = promoter(
+            Arc::new(Recorder::default()),
+            Some(Arc::clone(&proven) as Arc<dyn QuorumProbe>),
+        );
+        assert!(ordinary.ensure(7).await);
+        assert!(proven.adopted.lock().unwrap().is_empty());
+
+        // Refused by metadata: nothing is written.
+        let refused_probe = history_less();
+        let mut refused = promoter_with(
+            Arc::new(Recorder::default()) as Arc<dyn LeasePublisher>,
+            Arc::new(RefusesEstablished(Recorder::default())) as Arc<dyn TransitionReporter>,
+            Some(Arc::clone(&refused_probe) as Arc<dyn QuorumProbe>),
+        );
+        refused.attestations = Some(Arc::new(FixedAttestation(Ok(Some(attestation_naming(1))))));
+        assert!(!refused.ensure(7).await);
+        assert!(refused_probe.adopted.lock().unwrap().is_empty());
+    }
+
+    /// #656 review: an attested report whose answer was lost and whose retry
+    /// recorded it is an attested promotion like any other - counted in the
+    /// metric operators alert on, and the history written.
+    #[tokio::test]
+    async fn an_attested_promotion_recorded_on_retry_is_counted_and_written() {
+        let recorder = Arc::new(Recorder::default());
+        let probe = history_less();
+        let mut candidate = promoter(
+            Arc::clone(&recorder),
+            Some(Arc::clone(&probe) as Arc<dyn QuorumProbe>),
+        );
+        candidate.attestations = Some(Arc::new(FixedAttestation(Ok(Some(attestation_naming(1))))));
+        recorder
+            .refuse_reports
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !candidate.ensure(7).await,
+            "an unanswered report is never exposed"
+        );
+        assert_eq!(candidate.refusals.attested(), 0);
+        assert!(probe.adopted.lock().unwrap().is_empty());
+        recorder
+            .refuse_reports
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(candidate.ensure(7).await, "the retried report was recorded");
+        assert_eq!(
+            candidate.refusals.attested(),
+            1,
+            "an attested promotion recorded on retry was not counted"
+        );
+        assert_eq!(*probe.adopted.lock().unwrap(), vec![7]);
+    }
+
+    /// A floor source over a chain whose newest Established promotion is
+    /// `newest` (#636 review).
+    struct ChainFloor(Option<EstablishedPromotion>);
+
+    #[async_trait::async_trait]
+    impl FloorSource for ChainFloor {
+        async fn read(&self, _fencing_epoch: u64) -> Result<Option<u64>, String> {
+            Ok(None)
+        }
+
+        fn newest_established(&self, _fencing_epoch: u64) -> Option<EstablishedPromotion> {
+            self.0
+        }
+    }
+
+    /// #656 review: metadata recorded this node's attested promotion at 7
+    /// (the attestation is used up), but the answer was lost and the epoch
+    /// moved on before a retry landed, so the post-record step never ran:
+    /// no history was written and nothing was counted. The next
+    /// verification finds the record in the transition chain and writes the
+    /// history then, so repair can install it on the others. It does not
+    /// promote on it: the other replicas still cannot prove their lineage.
+    /// Nothing is written for a newest promotion that was not attested, was
+    /// another node's, or is the epoch being verified.
+    #[tokio::test]
+    async fn an_attested_promotion_whose_answer_was_lost_still_writes_the_history() {
+        let attested_here = EstablishedPromotion {
+            epoch: 7,
+            holder: Uuid::from_u128(1),
+            attested: true,
+        };
+        let probe = history_less();
+        let mut candidate = promoter(
+            Arc::new(Recorder::default()),
+            Some(Arc::clone(&probe) as Arc<dyn QuorumProbe>),
+        );
+        candidate.attestations = Some(Arc::new(FixedAttestation(Ok(None))));
+        candidate.floor = Some(Arc::new(ChainFloor(Some(attested_here))));
+        assert!(
+            !candidate.ensure(8).await,
+            "the others' lineage is still unproven"
+        );
+        assert_eq!(
+            *probe.adopted.lock().unwrap(),
+            vec![7],
+            "the recorded attested promotion's history was not written"
+        );
+        assert_eq!(candidate.refusals.attested(), 1);
+
+        for (case, newest, epoch) in [
+            (
+                "not attested",
+                EstablishedPromotion {
+                    attested: false,
+                    ..attested_here
+                },
+                8,
+            ),
+            (
+                "another node's",
+                EstablishedPromotion {
+                    holder: Uuid::from_u128(2),
+                    ..attested_here
+                },
+                8,
+            ),
+            ("the epoch being verified", attested_here, 7),
+        ] {
+            let probe = history_less();
+            let mut candidate = promoter(
+                Arc::new(Recorder::default()),
+                Some(Arc::clone(&probe) as Arc<dyn QuorumProbe>),
+            );
+            candidate.attestations = Some(Arc::new(FixedAttestation(Ok(None))));
+            candidate.floor = Some(Arc::new(ChainFloor(Some(newest))));
+            assert!(!candidate.ensure(epoch).await, "{case}");
+            assert!(probe.adopted.lock().unwrap().is_empty(), "{case}");
+            assert_eq!(candidate.refusals.attested(), 0, "{case}");
+        }
+
+        // A candidate that can prove its own lineage has a history already.
+        let proven_self = fixed(
+            vec![
+                at(1, Some(100)),
+                at_with(2, 100, vtop_meta::AnswerLineage::Unknown),
+                at_with(3, 100, vtop_meta::AnswerLineage::Unknown),
+            ],
+            3,
+        );
+        let mut candidate = promoter(
+            Arc::new(Recorder::default()),
+            Some(Arc::clone(&proven_self) as Arc<dyn QuorumProbe>),
+        );
+        candidate.floor = Some(Arc::new(ChainFloor(Some(attested_here))));
+        assert!(!candidate.ensure(8).await);
+        assert!(proven_self.adopted.lock().unwrap().is_empty());
+    }
+
+    /// A reporter that refuses every Established report, as metadata does an
+    /// attested one whose attestation is no longer live (#636).
+    struct RefusesEstablished(Recorder);
+
+    #[async_trait::async_trait]
+    impl TransitionReporter for RefusesEstablished {
+        async fn report(
+            &self,
+            fencing_epoch: u64,
+            outcome: vtop_meta::PromotionOutcome,
+            request_id: Uuid,
+        ) -> Result<(), ReportFailure> {
+            if matches!(outcome, vtop_meta::PromotionOutcome::Established { .. }) {
+                self.0
+                    .reported
+                    .lock()
+                    .unwrap()
+                    .push((fencing_epoch, outcome));
+                return Err(ReportFailure::Refused(
+                    "attestation is not the range's live attestation (test)".to_owned(),
+                ));
+            }
+            self.0.report(fencing_epoch, outcome, request_id).await
+        }
+    }
+
+    /// #636: the attestation a candidate read can be used up by the time it
+    /// reports (metadata checks and consumes it in one apply). That report is
+    /// refused, and the boundary it carried is never exposed.
+    #[tokio::test]
+    async fn an_attested_promotion_metadata_refuses_is_never_exposed() {
+        let publisher = Arc::new(Recorder::default());
+        let reporter = Arc::new(RefusesEstablished(Recorder::default()));
+        let mut candidate = promoter_with(
+            Arc::clone(&publisher) as Arc<dyn LeasePublisher>,
+            Arc::clone(&reporter) as Arc<dyn TransitionReporter>,
+            Some(history_less()),
+        );
+        candidate.attestations = Some(Arc::new(FixedAttestation(Ok(Some(attestation_naming(1))))));
+        assert!(!candidate.ensure(7).await);
+        assert!(publisher.promoted.lock().unwrap().is_empty());
+        assert_eq!(
+            reporter.0.reported_count(),
+            1,
+            "the attested report was sent"
+        );
+        assert_eq!(candidate.refusals.attested(), 0);
+    }
+
     /// #577: an Unknown answer that would have completed the quorum leaves a
     /// quorum MISS (retryable: the replica can be repaired or the missing one
     /// return) - unless the unknown one is the CANDIDATE, which can prove no
-    /// one's lineage and so stands aside for a replica that can.
+    /// one's lineage and so stands aside for a replica that can. Since #636
+    /// it is recorded as what it is: lineage unproven.
     #[tokio::test]
     async fn an_unproven_quorum_is_a_miss_and_an_unproven_candidate_stands_aside() {
         let recorder = Arc::new(Recorder::default());
@@ -6246,7 +7163,7 @@ mod tests {
         assert_eq!(
             recorder.last_reported(),
             Some(vtop_meta::PromotionOutcome::Refused {
-                reason: vtop_meta::PromotionRefusal::QuorumUnavailable,
+                reason: vtop_meta::PromotionRefusal::LineageUnproven,
             })
         );
 
@@ -6302,9 +7219,9 @@ mod tests {
         assert_eq!(
             recorder.last_reported(),
             Some(vtop_meta::PromotionOutcome::Refused {
-                reason: vtop_meta::PromotionRefusal::QuorumUnavailable,
+                reason: vtop_meta::PromotionRefusal::LineageUnproven,
             }),
-            "still recorded as the quorum miss it is: nothing Unknown was counted"
+            "recorded as the lineage refusal it is (#636): nothing Unknown was counted"
         );
 
         // A candidate that holds records is not affected: an unprovable

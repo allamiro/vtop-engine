@@ -101,6 +101,11 @@ pub const KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP: u16 = 30;
 /// then refuse to judge: the state machine still judges the raise itself.
 pub const MAX_CLUSTER_VERSION_NODES: usize = 4096;
 
+// A range's live promotion attestation (#636): what a candidate whose quorum
+// cannot prove its lineage checks before it counts an Unknown answer.
+pub const KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ: u16 = 31;
+pub const KIND_ADMIN_READ_PROMOTION_ATTESTATION_RESP: u16 = 32;
+
 /// The most transition records one read returns; a longer chain is paged
 /// with `from_epoch`.
 pub const MAX_TRANSITIONS_PER_READ: usize = 256;
@@ -1213,6 +1218,77 @@ impl AdminReadRangeReplicaSetRequest {
         };
         reader.finish()?;
         Ok(request)
+    }
+}
+
+/// Which range's live promotion attestation to read (#636).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminReadPromotionAttestationRequest {
+    pub topic_uuid: Uuid,
+    pub range_uuid: Uuid,
+}
+
+impl AdminReadPromotionAttestationRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_uuid(&mut out, self.topic_uuid);
+        put_uuid(&mut out, self.range_uuid);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let request = Self {
+            topic_uuid: reader.uuid("topic uuid")?,
+            range_uuid: reader.uuid("range uuid")?,
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+}
+
+/// Whether the range exists, its live promotion attestation if an operator
+/// recorded one no promotion has used yet (#636), and the applied index the
+/// read was served at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminReadPromotionAttestationResponse {
+    pub range_found: bool,
+    pub attestation: Option<crate::command::PromotionAttestation>,
+    pub read_at_applied_index: u64,
+}
+
+impl AdminReadPromotionAttestationResponse {
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut out = Vec::new();
+        put_u8(&mut out, u8::from(self.range_found));
+        match &self.attestation {
+            None => put_u8(&mut out, 0),
+            Some(attestation) => {
+                put_u8(&mut out, 1);
+                attestation.encode_into(&mut out)?;
+            }
+        }
+        put_u64(&mut out, self.read_at_applied_index);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let range_found = reader.flag("range found")?;
+        let attestation = if reader.flag("attestation presence")? {
+            Some(crate::command::PromotionAttestation::decode_from(
+                &mut reader,
+            )?)
+        } else {
+            None
+        };
+        let response = Self {
+            range_found,
+            attestation,
+            read_at_applied_index: reader.u64("read-at applied index")?,
+        };
+        reader.finish()?;
+        Ok(response)
     }
 }
 
@@ -2446,6 +2522,7 @@ mod tests {
                     }],
                     votes: 1,
                     required: 1,
+                    attestation: None,
                 },
                 reported_at_ms: 2_500,
                 reported_apply_index: 12,
@@ -2588,6 +2665,50 @@ mod tests {
             AdminReadClusterVersionsResponse::decode(&forged),
             Err(CodecError::BoundExceeded { .. })
         ));
+    }
+
+    /// #636: the attestation read round-trips its request and both shapes
+    /// of its answer, and refuses a bad presence flag and trailing bytes.
+    #[test]
+    fn promotion_attestation_read_round_trips() {
+        let request = AdminReadPromotionAttestationRequest {
+            topic_uuid: Uuid::from_u128(0x20),
+            range_uuid: Uuid::from_u128(0x21),
+        };
+        assert_eq!(
+            AdminReadPromotionAttestationRequest::decode(&request.encode()).unwrap(),
+            request
+        );
+        let none = AdminReadPromotionAttestationResponse {
+            range_found: true,
+            attestation: None,
+            read_at_applied_index: 9,
+        };
+        assert_eq!(
+            AdminReadPromotionAttestationResponse::decode(&none.encode().unwrap()).unwrap(),
+            none
+        );
+        let live = AdminReadPromotionAttestationResponse {
+            range_found: true,
+            attestation: Some(crate::command::PromotionAttestation {
+                attestation_id: Uuid::from_u128(0x636),
+                replica_node_uuid: Uuid::from_u128(0x10),
+                operator: "oncall".to_owned(),
+                attested_at_ms: 1_700_000_000_000,
+            }),
+            read_at_applied_index: 10,
+        };
+        let bytes = live.encode().unwrap();
+        assert_eq!(
+            AdminReadPromotionAttestationResponse::decode(&bytes).unwrap(),
+            live
+        );
+        let mut bad_flag = none.encode().unwrap();
+        bad_flag[1] = 7;
+        assert!(AdminReadPromotionAttestationResponse::decode(&bad_flag).is_err());
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(AdminReadPromotionAttestationResponse::decode(&trailing).is_err());
     }
 
     #[test]

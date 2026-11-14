@@ -439,3 +439,63 @@ fn an_epoch_recorded_at_the_tail_is_not_mistaken_for_an_interrupted_truncation()
         "a start at the tail is a grant not yet used, not a claim past the end"
     );
 }
+
+/// #656 review: a follower holding records with no epoch history - the
+/// replica an attested promotion recovers - is seeded with the attested
+/// epoch from offset 0, durably; a second call finds the history and leaves
+/// it alone.
+#[test]
+fn an_attested_history_is_seeded_on_a_follower_with_records_and_no_history() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    let segment = open_segment(&dir, &range);
+    let epochs = ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+    let meta = MetaFencingEpoch::new(OLD_EPOCH);
+    let node = Arc::new(
+        InProcessFollower::new(
+            FOLLOWER,
+            segment,
+            epochs,
+            range.clone(),
+            OLD_EPOCH,
+            meta.clone(),
+            ClusterCommittedOffset::new(0),
+        )
+        .unwrap(),
+    );
+    let f = Follower {
+        _dir: dir,
+        range,
+        node,
+        cluster_committed: ClusterCommittedOffset::new(0),
+        meta,
+    };
+    // Records first, the journal after: a log whose records predate its
+    // epoch history.
+    replicate(&f, OLD_EPOCH, OLD_LEADER, 0, 5);
+    f.node.set_fencing_epoch_journal(
+        FencingEpochJournal::open(f._dir.path().join("fencing-epochs")).unwrap(),
+    );
+    assert!(f.node.epoch_starts().is_empty(), "precondition: no history");
+    f.grant(NEW_EPOCH);
+    assert!(
+        f.node.epoch_starts().is_empty(),
+        "adoption at the tail writes none"
+    );
+
+    assert!(f.node.adopt_attested_history(NEW_EPOCH).unwrap());
+    let seeded = vec![EpochStart {
+        epoch: NEW_EPOCH,
+        start_offset: 0,
+    }];
+    assert_eq!(f.node.epoch_starts(), seeded);
+    assert!(!f.node.adopt_attested_history(NEW_EPOCH).unwrap());
+    assert_eq!(f.node.epoch_starts(), seeded);
+    assert_eq!(
+        FencingEpochJournal::open(f._dir.path().join("fencing-epochs"))
+            .unwrap()
+            .entries(),
+        seeded.as_slice(),
+        "the seed did not survive a reopen"
+    );
+}

@@ -1343,10 +1343,15 @@ Short procedures now; expand into a full ops runbook before go-live.
     a replica that disputes nothing). Every candidate holding records is Unknown to itself and
     stands aside, and a candidate holding none stands aside for them, so
     the range goes unled. (A fresh, empty range is not affected: a
-    candidate at 0 disputes nothing and promotes.) The transition record shows
-    `Refused{QuorumUnavailable}`, the same as an ordinary missing quorum;
-    the data node's warning names the lineage cause. There is no
-    in-product remedy yet.
+    candidate at 0 disputes nothing and promotes.) The refusal says so
+    (#636): the data node logs `reason="lineage_unproven"` and counts it in
+    `vtop_broker_promotion_refusals_total{reason="lineage_unproven"}`, and at
+    feature level 8 the transition record shows `Refused{LineageUnproven}`
+    (below 8 it shows `Refused{QuorumUnavailable}`, as before). Alert on that
+    series: unlike `quorum_unavailable`, waiting does not clear it. The
+    remedies, in order: restore the range from backup; failing that, the
+    last-resort override below ("Promote a range whose lineage cannot be
+    proven").
   - **A replica whose only dispute with the candidate is below its retained
     base is not counted.** The replica itself finds the retained records in
     agreement (#408), but the candidate cannot see its base, so the answer
@@ -1411,6 +1416,75 @@ Short procedures now; expand into a full ops runbook before go-live.
   from the record leaves that node unable to lead.
 - **Restore from DB backup:** restore Postgres PITR → verify object store →
   start the engine (recovery scan re-reconciles) → run the divergence checker.
+- **Promote a range whose lineage cannot be proven (#636) - LAST RESORT,
+  only after restore from backup is ruled out.** A range that holds records
+  while none of its replicas has epoch history refuses every promotion with
+  `lineage_unproven` (see the #577 costs above), by design: an answer whose
+  history cannot be compared is a count of records whatever wrote them, and
+  counting it could expose another leadership's records or drop
+  acknowledged ones. The override is an explicit, audited, single-use
+  statement by an operator - the spirit of an unclean leader election, but
+  never automatic, never a configuration default, and never more than one
+  promotion:
+
+  ```bash
+  vtopctl node promote-unproven --meta-config meta-admin.yaml \
+    --topic <topic-uuid> --range <range-uuid> --replica <node-uuid> \
+    --operator "$USER" --i-accept-data-loss
+  ```
+
+  It records an attestation in metadata naming the replica whose log becomes
+  the range's history, the operator, and the time. Only that replica, at its
+  next promotion, counts the answers whose lineage is Unknown; metadata
+  accepts that promotion's report only while the attestation is live and
+  names its holder, records the attestation in the transition (`vtopctl
+  meta transitions` lists it as `ATTESTED` with operator and time, and
+  counts it under `attested`), and removes it in the same step, so a second
+  promotion needs a new attestation. A newer attestation replaces an unused
+  one; a promotion that proves its lineage without one retires it.
+  Everything else is still checked: the named replica must hold the
+  boundary the answers prove, a majority must be at or below it (otherwise
+  the refusal names the replica that holds more - attest that one instead),
+  and a published watermark still never regresses. Other replicas stand
+  aside for the named one.
+
+  **What it can lose.** Every record the named replica does not hold. That
+  includes records only other replicas hold above its tail, and records
+  other replicas hold at the SAME offsets with different content (an
+  offset is a count, not an identity, and without epoch history nothing
+  tells them apart). Records a producer was told were acknowledged can be
+  among them. Once metadata records the promotion, the promoted replica's
+  whole log becomes its epoch history, under the promotion's epoch, so it can
+  prove its lineage at the next failover. If metadata recorded it but the
+  answer was lost and that epoch ended first, the replica writes the history
+  at its next verification instead, once it finds the record as the newest
+  established promotion in the transition chain (the log says "answer was
+  lost"); it does not serve on it, since the others still cannot prove their
+  lineage. Repair every other replica from it
+  so none keeps records that history does not contain, one stopped replica
+  at a time:
+
+  ```bash
+  # stop the replica's data node first; repair refuses a live range
+  vtopctl node repair --config node-client.yaml \
+    --from <promoted replica> --into <the stopped replica's data dir> \
+    --fencing-epoch <the range's current epoch> --seal-tail
+  # then start the replica again
+  ```
+
+  (`--fencing-epoch` is the epoch metadata granted the promoted replica:
+  `vtopctl meta transitions` shows it as the last `ATTESTED` line.) Expect
+  `vtop_broker_promotions_attested_total` to have moved by one on the
+  promoted replica's data node (it is a per-process counter, so a restart
+  before the history was written counts it when it is), and alert on
+  any increase.
+
+  Needs metadata feature level 8: upgrade every metadata voter and every
+  data node, then `vtopctl meta enable-features --level 8`. Level 8 sits
+  above the data-node capability gate (level 7, #634), so the raise is
+  refused, naming the nodes, until every live range member reports it
+  supports 8 (`vtopctl meta node-versions`). Below level 8 the override is
+  refused before anything is recorded, and says so.
 - **Reconcile state store vs object storage:** list `SOURCE_COMMITTED` rows and
   confirm each object+manifest exists; flag orphan objects (no row) and missing
   objects (row but no object) for remediation.

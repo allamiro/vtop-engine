@@ -1845,6 +1845,72 @@ impl Collector for ServerCollector {
 }
 
 // ---------------------------------------------------------------------------
+// Promotion
+// ---------------------------------------------------------------------------
+
+/// Why this node's promotions of its range were refused, by reason, and how
+/// many it made under an operator's attestation (#636).
+///
+/// `reason="lineage_unproven"` is the one to alert on: enough replicas
+/// answered, too few could prove their lineage, and waiting will not change
+/// that - unlike `quorum_unavailable`, which more replicas coming back
+/// cures. `vtop_broker_promotions_attested_total` should be zero for the
+/// life of a cluster; each increment is a promotion that may have lost
+/// records, made because an operator said so.
+pub struct PromotionRefusalCollector {
+    counts: Arc<crate::lease_agent::PromotionRefusals>,
+    range_labels: [String; 2],
+    refusals: CounterFamily,
+    attested: CounterFamily,
+}
+
+impl PromotionRefusalCollector {
+    pub fn new(
+        counts: Arc<crate::lease_agent::PromotionRefusals>,
+        range: &vtop_protocol::RangeIdentity,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            counts,
+            range_labels: [range.topic.clone(), range.range_id.to_string()],
+            refusals: CounterFamily::new(
+                "broker_promotion_refusals_total",
+                "Promotions of this range this node refused, by reason; lineage_unproven is a \
+                 quorum that answered without provable lineage, which waiting does not cure",
+                &["topic", "range", "reason"],
+            )?,
+            attested: CounterFamily::new(
+                "broker_promotions_attested_total",
+                "Promotions this node made under an operator's attestation, counting answers \
+                 of unproven lineage (vtopctl node promote-unproven); each may have lost records",
+                &["topic", "range"],
+            )?,
+        })
+    }
+}
+
+impl Collector for PromotionRefusalCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        vec![&self.refusals.desc, &self.attested.desc]
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let [topic, range] = &self.range_labels;
+        let by_reason = self.counts.snapshot();
+        vec![
+            self.refusals
+                .family(by_reason.iter().map(|(reason, total)| {
+                    (
+                        vec![topic.as_str(), range.as_str(), reason.as_str()],
+                        *total,
+                    )
+                })),
+            self.attested
+                .family([(vec![topic.as_str(), range.as_str()], self.counts.attested())]),
+        ]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Integrity
 // ---------------------------------------------------------------------------
 
@@ -2755,6 +2821,57 @@ mod tests {
         assert!(
             text.contains(r#"vtop_broker_request_duration_seconds_sum{kind="produce"}"#),
             "without _sum an average is unanswerable: {text}"
+        );
+    }
+
+    /// #636: a promotion refused for want of provable lineage is counted
+    /// apart from one refused for want of replicas, and every reason is
+    /// exported from the first scrape, at zero, so an alert on it has a
+    /// series to watch before the first refusal.
+    #[test]
+    fn promotion_refusals_are_counted_by_reason() {
+        let counts = Arc::new(crate::lease_agent::PromotionRefusals::default());
+        let range = vtop_protocol::RangeIdentity {
+            topic: "events".to_owned(),
+            topic_epoch: 1,
+            range_id: Uuid::from_u128(21),
+            range_generation: 0,
+        };
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                PromotionRefusalCollector::new(Arc::clone(&counts), &range).unwrap(),
+            ))
+            .unwrap();
+        let series = |reason: &str| {
+            format!(
+                "vtop_broker_promotion_refusals_total{{topic=\"events\",range=\"{}\",reason=\"{reason}\"}}",
+                range.range_id
+            )
+        };
+        let text = scrape(&registry);
+        for reason in ["quorum_unavailable", "lineage_unproven", "leader_behind"] {
+            assert!(text.contains(&format!("{} 0", series(reason))), "{text}");
+        }
+        counts.record(vtop_meta::PromotionRefusal::LineageUnproven);
+        counts.record(vtop_meta::PromotionRefusal::LineageUnproven);
+        counts.record(vtop_meta::PromotionRefusal::QuorumUnavailable);
+        counts.record_attested();
+        let text = scrape(&registry);
+        assert!(
+            text.contains(&format!("{} 2", series("lineage_unproven"))),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{} 1", series("quorum_unavailable"))),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "vtop_broker_promotions_attested_total{{topic=\"events\",range=\"{}\"}} 1",
+                range.range_id
+            )),
+            "{text}"
         );
     }
 
