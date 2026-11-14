@@ -138,9 +138,10 @@ transfer engine, **without weakening the core guarantee**:
 - **Replay safety** — a crash at any stage is recoverable with **no data loss**.
 - **Delivery semantics (accurate):** today the system is **at-least-once**. A
   replay of the same bytes reuses the stored object (content-addressed keys,
-  #626); a replay with other batch boundaries, a later seal-time hour for a
-  row from before v0.10.0, no checksum or a command backend can still leave a
-  duplicate object (§2.5, §7).
+  #626), and a file or spool replay is rebuilt as first cut (v0.10.0); a Kafka
+  replay over a grown partition, a replay that could not be rebuilt as cut,
+  a later seal-time hour for a row from before v0.10.0, no checksum or a
+  command backend can still leave a duplicate object (§2.5, §7).
   Protocol §15.1's deterministic naming MUST is narrowed by #626, not closed.
 
 ### 2.3 Non-goals
@@ -1266,7 +1267,7 @@ Invariant preserved: source progress is NEVER advanced for unverified data.
 | Failure | Behavior | Why it's safe |
 |---|---|---|
 | Engine crash mid-batch | `recover()`: pre-VERIFIED → replay from last committed source position; VERIFIED-but-not-committed → retry commit | Progress never advanced for unverified data |
-| Replay after crash | **Today (#626):** same bytes → same key, existing verified object = success; other boundaries or partition hour → second object (no loss) | At-least-once; idempotent for a replay of the same bytes |
+| Replay after crash | **Today (#626):** same bytes → same key, existing verified object = success; file and spool replays rebuilt as first cut and sealed at the recorded instant (v0.10.0); a Kafka replay over a grown partition, a bound refused or too large, or a row from before v0.10.0 → second object (no loss) | At-least-once; idempotent for a replay of the same bytes |
 | State store unavailable | Cannot transition → stops committing (fails safe) | No commit-before-verify possible |
 | Kafka rebalance (fleet) | Revoked partitions: finish/abandon in-flight, no commit; reassigned replica resumes from committed offset | Offsets commit only post-verify |
 | File-owner replica dies (Tier 3) | Lease expires; another replica resumes from stored byte cursor | Cursor in shared durable store |
@@ -1947,8 +1948,9 @@ proven by a scenario that drives real processes, not only by unit coverage.
   yet enable the feature).
 - **Two current-behavior caveats the design must still fix for fleet HA:**
   (a) object keys are **deterministic only for the same bytes** (#626) → a replay
-  with other boundaries still makes **duplicates**; reproducible boundaries
-  (the rest of Phase 4) close it, and protocol §15.1 stays narrowed until then.
+  with other boundaries still makes **duplicates**; file and spool replays
+  reproduce their boundaries since v0.10.0, Kafka's are the rest of #626, and
+  protocol §15.1 stays narrowed until then.
   (b) the engine is **single-instance by design** until Kafka consumer-group
   fleet mode and multi-writer recovery land (Phase 5).
 - **VERIFIED is defined precisely (§4); strong content-derived verification is
