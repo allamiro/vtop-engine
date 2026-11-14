@@ -30,7 +30,7 @@ from typing import Any
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from kafka_compare import perftool, schema, stats  # noqa: E402
+from kafka_compare import perftool, plan, schema, stats  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(HERE))
 KAFKA_IMAGE = "apache/kafka:4.3.2@sha256:852a0d49fc4e656b022e7f23785411802c9a088c78a7c5e39f33969de9c227a7"
@@ -346,7 +346,8 @@ def base_row(ctx: dict, system: str, mode: str, size: int, rep: int) -> dict[str
         "run_id": ctx["run_id"], "env_fingerprint": ctx["fingerprint"],
         "vtop_commit": ctx["env"]["comparable"]["vtop_commit"], "kafka_image": KAFKA_IMAGE,
         "client": client_name(), "profile": PROFILE, "system": system, "mode": mode,
-        "record_size": size, "partitions": 1, "producers": 1, "acks": "all", "repetition": rep,
+        "record_size": size, "partitions": 1, "producers": 1, "compression": "none", "acks": "all",
+        "repetition": rep, "load_basis": "kafka" if mode == "fixed_rate" else "",
         "started_at": utc_now(),
     }
 
@@ -359,7 +360,7 @@ def producer_row(row: dict, result: perftool.ProducerResult | None, note: str, w
     row.update(status="ok", records=result.records, records_per_sec=result.records_per_sec,
                mib_per_sec=result.mib_per_sec, lat_avg_ms=result.lat_avg_ms, lat_max_ms=result.lat_max_ms,
                lat_p50_ms=result.lat_p50_ms, lat_p95_ms=result.lat_p95_ms, lat_p99_ms=result.lat_p99_ms,
-               lat_p999_ms=result.lat_p999_ms, note=note)
+               lat_p999_ms=result.lat_p999_ms, lat_basis="single", note=note)
     return row
 
 
@@ -604,6 +605,51 @@ def check_args(args: argparse.Namespace) -> tuple[list[int], dict[int, int]]:
     return sizes, sat_records
 
 
+def build_matrix(args: argparse.Namespace, sizes: list[int], sat_records: dict[int, int]) -> dict[str, Any]:
+    """The matrix this invocation runs, as environment.json records it. The
+    schema-2 axes say what the phase-1 shape does: one compression, one
+    profile, Kafka-relative rates."""
+    load_pcts = list(stats.LOAD_FRACTIONS)
+    return {"record_sizes": sizes, "partitions": [1], "producers": [1], "compressions": ["none"],
+            "acks": ["all"], "profile": PROFILE, "profiles": [PROFILE], "repetitions": args.reps,
+            "load_pcts": load_pcts, "load_bases": {"kafka": load_pcts}, "consume": not args.no_consume,
+            "sat_records": {str(k): v for k, v in sat_records.items()},
+            "fixed_seconds": args.fixed_seconds, "warmup_fraction": 0.2, "smoke_records": args.smoke_records}
+
+
+def check_plan(matrix: dict[str, Any], max_hours: float) -> float:
+    """The projected hours, or a refusal before any Docker work."""
+    if not math.isfinite(max_hours) or max_hours <= 0:
+        raise SystemExit(f"--max-hours {max_hours}: must be a positive, finite number of hours")
+    try:
+        plan.check_matrix(matrix)
+        return plan.check_budget(matrix, max_hours)
+    except plan.PlanRefused as exc:
+        raise SystemExit(f"refused before any Docker work: {exc}") from None
+
+
+def check(run_dir: str) -> int:
+    """`--check`: what a run directory still lacks. 0 when every expected row
+    is there once and nothing else is; 2 otherwise, listing the missing keys."""
+    try:
+        found = schema.check_run(run_dir)
+    except schema.ReportRefused as exc:
+        print(f"check refused: {exc}", file=sys.stderr)
+        return 2
+    if found.duplicates or found.extra:
+        print(f"{len(found.duplicates)} duplicated and {len(found.extra)} unexpected row keys, "
+              f"first {(found.duplicates + found.extra)[:3]}", file=sys.stderr)
+        return 2
+    present = len(found.expected) - len(found.missing)
+    print(f"{run_dir}: {present} of {len(found.expected)} expected rows present")
+    if found.missing:
+        print(f"missing {len(found.missing)} (key {', '.join(schema.KEY)}):", file=sys.stderr)
+        for key in found.missing:
+            print("  " + " ".join(str(part) if part != "" else "-" for part in key), file=sys.stderr)
+        return 2
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--run-id", default=None)
@@ -616,9 +662,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sat-timeout", type=float, default=1800.0, help="seconds before a run is failed")
     parser.add_argument("--no-consume", action="store_true")
     parser.add_argument("--rebuild", action="store_true", help="rebuild the vtop image even if it exists")
+    parser.add_argument("--max-hours", type=float, default=30.0,
+                        help="refuse a matrix projected to take longer, before any Docker work")
+    parser.add_argument("--check", metavar="RUN_DIR", default=None,
+                        help="report which rows a run still lacks; exit 0 when complete, 2 otherwise")
     args = parser.parse_args(argv)
 
+    if args.check is not None:
+        return check(args.check)
     sizes, sat_records = check_args(args)
+    matrix = build_matrix(args, sizes, sat_records)
+    hours = check_plan(matrix, args.max_hours)
+    log(f"{len(schema.expected_keys(matrix))} result rows, projected {hours:.1f} h (--max-hours {args.max_hours:g})")
     if args.reps < 3:
         log(f"warning: {args.reps} repetitions is below #595 rule 7's minimum of 3")
     limits = check_equal_limits()
@@ -634,10 +689,6 @@ def main(argv: list[str] | None = None) -> int:
     if os.path.exists(run_dir):
         raise SystemExit(f"{run_dir} exists; runs never overwrite each other")
     os.makedirs(run_dir)
-    matrix = {"record_sizes": sizes, "partitions": [1], "producers": [1], "acks": ["all"], "profile": PROFILE,
-              "repetitions": args.reps, "load_pcts": list(stats.LOAD_FRACTIONS), "consume": not args.no_consume,
-              "sat_records": {str(k): v for k, v in sat_records.items()},
-              "fixed_seconds": args.fixed_seconds, "warmup_fraction": 0.2, "smoke_records": args.smoke_records}
     env = capture_environment(run_id, matrix, vtop_image, limits)
     ctx = {"run_id": run_id, "run_dir": run_dir, "csv": os.path.join(run_dir, "results.csv"), "env": env,
            "fingerprint": schema.fingerprint(env), "vtop_image": vtop_image, "reps": args.reps,

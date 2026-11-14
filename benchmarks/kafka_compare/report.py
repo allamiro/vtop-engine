@@ -661,8 +661,31 @@ KNOWN_GAPS_FIXED = """\
 # ----------------------------------------------------------------------------- main
 
 
+# The dimensions this report draws one value of. A run with several needs the
+# grouped charts the #600 generator draws; until then it is refused by name
+# rather than having its cells pooled into one median.
+SINGLE_VALUED = ("partitions", "producers", "compression", "acks", "profile")
+
+
+def check_drawable(rows: list[dict[str, str]]) -> None:
+    """Refuse a run whose rows vary along a dimension this report does not draw (#596)."""
+    for column in SINGLE_VALUED:
+        values = sorted({row[column] for row in rows})
+        if len(values) > 1:
+            raise schema.ReportRefused(
+                f"the run has {len(values)} values of {column} ({', '.join(values)}); this report draws one "
+                "value of each and would pool them into one median, so it is refused until the grouped "
+                "charts draw that dimension (#600)")
+    bases = sorted({row["load_basis"] for row in rows if row["mode"] == "fixed_rate"})
+    if len(bases) > 1 or any(b != "kafka" for b in bases):
+        raise schema.ReportRefused(
+            f"the run's fixed-rate rows use load bases {bases}; this report draws Kafka-relative rates "
+            "only (#600)")
+
+
 def build(run_dir: str, img_dir: str, doc_path: str) -> list[str]:
     run = schema.load_run(run_dir)  # raises ReportRefused before anything is written
+    check_drawable(run.rows)
     plt = _setup_matplotlib()
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(doc_path)), exist_ok=True)

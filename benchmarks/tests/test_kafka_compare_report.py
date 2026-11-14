@@ -3,6 +3,10 @@
 A missing, partial or mixed-environment run must refuse - exit non-zero with
 the reason - and write nothing, rather than draw a chart with holes. A cell
 that could not run is a ROW saying so, and that is not a hole.
+
+The runs here are written in schema 1, the layout of the committed phase-1
+run, so every refusal below is also a test that schema 1 still loads and is
+still judged (#596). Schema 2 has its own file, test_kafka_compare_schema_v2.py.
 """
 import copy
 import csv
@@ -43,7 +47,8 @@ def complete_rows(env):
     """One plausible row for every key a complete run of MATRIX writes."""
     fp = schema.fingerprint(env)
     rows = []
-    for (system, mode, size, partitions, producers, rep, pct) in sorted(schema.expected_keys(env["matrix"])):
+    for (system, mode, size, partitions, producers, _compression, _acks, _profile, rep, _basis,
+         pct) in sorted(schema.expected_keys(env["matrix"])):
         base = 300000.0 if system == "kafka" else 30000.0
         rate = base / (1 if size == 100 else 10) * (1 + rep / 100)
         row = {
@@ -70,9 +75,9 @@ def write_run(directory, env, rows):
     with open(os.path.join(directory, "environment.json"), "w") as handle:
         json.dump(env, handle)
     path = os.path.join(directory, "results.csv")
-    schema.write_header(path)
+    schema.write_header(path, schema.COLUMNS_V1)
     for row in rows:
-        schema.append_row(path, row)
+        schema.append_row(path, row, schema.COLUMNS_V1)
     return directory
 
 
@@ -89,7 +94,7 @@ def rewrite(run_dir, mutate):
         rows = list(csv.DictReader(handle))
     rows = mutate(rows)
     with open(path, "w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=schema.COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=schema.COLUMNS_V1)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -451,3 +456,32 @@ def test_report_marks_a_failed_repetition_in_the_tables(run_dir, tmp_path):
     text = doc.read_text()
     assert "[2/3 reps ok]" in text
     assert "- 100 B records, Apache Kafka: sustained 2 of 3 offered rates in every repetition (50%, 75%)." in text
+
+
+def test_the_committed_schema_1_run_regenerates_byte_for_byte(tmp_path):
+    """#596: schema 2 reads the committed phase-1 run (schema 1) as schema 2,
+    and its page and SVGs come out exactly as committed. The run is copied
+    into the same layout under tmp_path, so the page's relative links are
+    the same text."""
+    pytest.importorskip("matplotlib")
+    import shutil
+
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    run_id = "20261109T232328Z"
+    source = os.path.join(repo, "benchmarks", "kafka_compare", "results", run_id)
+    run_dir = tmp_path / "benchmarks" / "kafka_compare" / "results" / run_id
+    run_dir.mkdir(parents=True)
+    for name in ("environment.json", "results.csv"):
+        shutil.copy(os.path.join(source, name), run_dir / name)
+    docs = tmp_path / "docs" / "benchmarks"
+    written = report.build(str(run_dir), str(docs / "img"), str(docs / "kafka-comparison.md"))
+    committed = os.path.join(repo, "docs", "benchmarks")
+    compared = 0
+    for path in written:
+        if not path.endswith((".md", ".svg")):
+            continue  # PNG bytes differ across zlib builds; regenerate.py judges their pixels
+        relative = os.path.relpath(path, str(docs))
+        with open(path, "rb") as new, open(os.path.join(committed, relative), "rb") as old:
+            assert new.read() == old.read(), f"{relative} differs from the committed file"
+        compared += 1
+    assert compared >= 4
