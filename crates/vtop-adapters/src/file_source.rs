@@ -8,7 +8,7 @@
 //! `DeleteCandidate`).
 
 use crate::base::{
-    AdapterReadReport, DiscoveredSource, ReadResult, SourceAdapter, SourceReadOutcome,
+    AdapterReadReport, DiscoveredSource, ReadResult, ReplayRange, SourceAdapter, SourceReadOutcome,
 };
 use crate::continuity::{self, Discontinuity, Observed};
 use crate::rotated::{self, HeldFile, Replay, RotatedFile};
@@ -760,6 +760,39 @@ pub struct FileSource {
     /// descriptor had to refuse, for the engine to count
     /// ([`Self::take_refused_rereads`]).
     refused_rereads: Vec<String>,
+    /// Per path, the ends of the windows handed back to be rebuilt exactly
+    /// (#626, [`SourceAdapter::bound_replays`]): a read stops at the next one
+    /// above its start, so the window it rebuilds ends where the failed
+    /// attempt's did. Keyed by the end, with the inode and start the window
+    /// was read at.
+    cuts: HashMap<String, std::collections::BTreeMap<u64, Cut>>,
+    /// Paths whose read this pass stopped at a cut, to be read on in the same
+    /// pass from the cut (the next window).
+    reached_cut: Vec<String>,
+    /// Windows a read could not rebuild as cut (a line crossed the recorded
+    /// end, or the file was found replaced), for the engine to count
+    /// ([`Self::take_refused_cuts`]).
+    refused_cuts: Vec<RefusedCut>,
+}
+
+/// A recorded window's end that reads stop at (#626).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cut {
+    start: u64,
+    inode: Option<u64>,
+}
+
+/// How many cuts one path keeps; the lowest is dropped beyond it.
+const MAX_CUTS_PER_PATH: usize = 1024;
+
+/// A window a read could not rebuild as cut (#626).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedCut {
+    pub path: String,
+    pub start: u64,
+    pub end: u64,
+    /// Why, for the operator.
+    pub reason: &'static str,
 }
 
 /// What recovery knows is already archived of one file at a path (#621): the
@@ -801,6 +834,9 @@ impl FileSource {
             max_held: rotated::MAX_HELD_FILES,
             hold_for: rotated::HOLD_FOR,
             refused_rereads: Vec::new(),
+            cuts: HashMap::new(),
+            reached_cut: Vec::new(),
+            refused_cuts: Vec::new(),
             delete_quiet: DEFAULT_DELETE_QUIET,
             #[cfg(test)]
             before_delete: None,
@@ -1460,7 +1496,9 @@ impl FileSource {
             discontinuity,
             descriptor,
             start_tail,
+            cut,
         } = slice;
+        self.settle_cut(path, cut);
         let cursor = self.cursors.entry(path.to_string()).or_default();
         let read_byte_before = cursor.read_byte;
         if let Some(why) = discontinuity {
@@ -1877,6 +1915,9 @@ impl FileSource {
             whole_file,
             identity.file_size,
             None,
+            // A rotated file's re-read is not stopped at a recorded end: it
+            // reads what is left of the old file, as before (#626).
+            None,
         )
         .await?;
         slice.identity.content = content;
@@ -2049,6 +2090,105 @@ impl FileSource {
         std::mem::take(&mut self.refused_rereads)
     }
 
+    /// The windows a read could not rebuild as cut since the last call
+    /// (#626): the engine counts each and reads on as before.
+    pub fn take_refused_cuts(&mut self) -> Vec<RefusedCut> {
+        std::mem::take(&mut self.refused_cuts)
+    }
+
+    /// The recorded end the next read of `path` from `start` stops at, and
+    /// the inode it was recorded for. Cuts at or below `start` are behind the
+    /// read and are forgotten.
+    fn next_cut(&mut self, path: &str, start: u64) -> Option<(u64, Option<u64>)> {
+        let cuts = self.cuts.get_mut(path)?;
+        while cuts.first_key_value().is_some_and(|(end, _)| *end <= start) {
+            cuts.pop_first();
+        }
+        let next = cuts.first_key_value().map(|(end, cut)| (*end, cut.inode));
+        if cuts.is_empty() {
+            self.cuts.remove(path);
+        }
+        next
+    }
+
+    /// Fold what became of a read's cut into the adapter (#626).
+    fn settle_cut(&mut self, path: &str, cut: CutOutcome) {
+        let mut take = |end: u64| {
+            let cuts = self.cuts.get_mut(path)?;
+            let taken = cuts.remove(&end);
+            if cuts.is_empty() {
+                self.cuts.remove(path);
+            }
+            taken
+        };
+        match cut {
+            CutOutcome::None => {}
+            CutOutcome::Reached(end) => {
+                if take(end).is_some() {
+                    self.reached_cut.push(path.to_string());
+                }
+            }
+            CutOutcome::Refused(end, reason) => {
+                if let Some(cut) = take(end) {
+                    self.refused_cuts.push(RefusedCut {
+                        path: path.to_string(),
+                        start: cut.start,
+                        end,
+                        reason,
+                    });
+                }
+            }
+        }
+    }
+
+    /// After a read of `path` stopped at a cut, read on from it in the same
+    /// pass, within what is left of the budgets (#626): the bytes after a
+    /// rebuilt window are the next window, and leaving them to the next pass
+    /// would slow every replay by a pass.
+    async fn read_on_after_cuts(
+        &mut self,
+        path: &str,
+        reads: &mut Vec<ReadResult>,
+        max_records: usize,
+        max_bytes: usize,
+    ) {
+        // A bound on the extra reads of one pass: each stops at a cut or at
+        // the budget, and the cuts of one path are bounded too.
+        for _ in 0..16 {
+            let Some(i) = self.reached_cut.iter().position(|p| p == path) else {
+                return;
+            };
+            self.reached_cut.swap_remove(i);
+            let records: usize = reads.iter().map(|r| r.records.len()).sum();
+            let bytes: usize = reads
+                .iter()
+                .flat_map(|r| r.records.iter())
+                .map(|r| r.len() + 1)
+                .sum();
+            if records >= max_records || bytes >= max_bytes {
+                return;
+            }
+            let job = self.read_job(path);
+            let start = job.start;
+            let (outcome, drained) = Self::run_job(
+                job,
+                max_records - records,
+                max_bytes - bytes,
+                self.whole_file,
+            )
+            .await;
+            match self.apply_outcome(path, start, outcome, drained) {
+                Ok(more) => reads.extend(more.into_iter().filter(|r| !r.is_empty())),
+                Err(error) => {
+                    // The window before the cut is already read; this read is
+                    // the next pass's to retry.
+                    tracing::debug!(path, error = %error, "read after a cut failed; retried next pass");
+                    return;
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     fn with_hold_limits(mut self, max_held: usize, hold_for: Duration) -> Self {
         self.max_held = max_held;
@@ -2092,6 +2232,7 @@ impl FileSource {
                 start: start.max(held.committed),
             })
         });
+        let cut = self.next_cut(path, start);
         let held = self.held.get(path);
         ReadJob {
             path: path.to_string(),
@@ -2100,6 +2241,7 @@ impl FileSource {
             held_inode: held.map(|held| held.inode),
             rotated,
             rewound,
+            cut,
         }
     }
 
@@ -2157,6 +2299,7 @@ impl FileSource {
                         whole_file,
                         last_seen,
                         job.held_inode,
+                        job.cut,
                     )
                     .await,
                 )
@@ -2225,6 +2368,10 @@ impl FileSource {
     /// `held_inode` is the file the adapter already holds a descriptor on for
     /// this path (#621); a read of any other file hands back a duplicate of
     /// its own descriptor for the adapter to keep.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the read is pure over the cursor snapshot; each argument is a part of it"
+    )]
     async fn read_slice(
         path: String,
         start: u64,
@@ -2233,6 +2380,7 @@ impl FileSource {
         whole_file: bool,
         last_seen: Option<Observed>,
         held_inode: Option<u64>,
+        cut: Option<(u64, Option<u64>)>,
     ) -> Result<SliceRead, SliceError> {
         // Read AND fingerprint through one open descriptor: a rotation between
         // "read the bytes" and "stat the path" would otherwise mix the old
@@ -2311,6 +2459,14 @@ impl FileSource {
                 }
             },
         };
+        // A cut applies only to the file the window was read from, at the
+        // position the cursor holds (#626): a read that restarted on another
+        // file, or a file at another inode, reads as before, and the window is
+        // reported as one that cannot be rebuilt as cut.
+        let cut_refused = cut.filter(|(_, inode)| {
+            discontinuity.is_some() || (inode.is_some() && *inode != opened.inode)
+        });
+        let cut = cut.filter(|_| cut_refused.is_none()).map(|(end, _)| end);
         Self::read_opened(
             file,
             &path,
@@ -2320,8 +2476,15 @@ impl FileSource {
             whole_file,
             opened.file_size,
             discontinuity,
+            cut,
         )
         .await
+        .map(|mut slice| {
+            if let Some((end, _)) = cut_refused {
+                slice.cut = CutOutcome::Refused(end, "the file under the range was replaced");
+            }
+            slice
+        })
         .map(|mut slice| {
             // The size and mtime are the descriptor's after the read; the
             // content is what it held at open, which an append cannot change.
@@ -2350,6 +2513,7 @@ impl FileSource {
         whole_file: bool,
         fsize: u64,
         discontinuity: Option<Discontinuity>,
+        cut: Option<u64>,
     ) -> Result<SliceRead, VtopError> {
         // Whole-file mode: read the entire remaining file as one opaque record.
         // Used for binary / already-compressed source files with no line
@@ -2381,6 +2545,15 @@ impl FileSource {
                 vec![data]
             };
             let identity = Self::identity_of(&file.metadata().await?);
+            // A whole file is one record: it cannot stop inside a file, so a
+            // recorded window of it is not rebuilt as cut (#626).
+            let cut = match cut {
+                Some(c) if c != end => {
+                    CutOutcome::Refused(c, "a whole-file record cannot stop at the recorded end")
+                }
+                Some(c) => CutOutcome::Reached(c),
+                None => CutOutcome::None,
+            };
             return Ok(SliceRead {
                 records,
                 start,
@@ -2390,6 +2563,7 @@ impl FileSource {
                 discontinuity,
                 descriptor: None,
                 start_tail: None,
+                cut,
             });
         }
 
@@ -2406,8 +2580,16 @@ impl FileSource {
         let mut records = Vec::new();
         let mut bytes_read: u64 = 0;
         let mut pos = start;
+        let mut cut_outcome = CutOutcome::None;
 
         loop {
+            // A window handed back to be rebuilt exactly ends where the
+            // failed attempt's did (#626); the bytes after it are the next
+            // window's.
+            if let Some(c) = cut.filter(|c| pos >= *c) {
+                cut_outcome = CutOutcome::Reached(c);
+                break;
+            }
             if records.len() >= max_records || bytes_read as usize >= max_bytes {
                 break;
             }
@@ -2440,6 +2622,14 @@ impl FileSource {
             if !line.ends_with(b"\n") {
                 break;
             }
+            // A line that crosses the recorded end: the bytes are not the
+            // ones the window was cut from. The line is left for the next
+            // read, which reads on as before.
+            if let Some(c) = cut.filter(|c| pos + n as u64 > *c) {
+                cut_outcome =
+                    CutOutcome::Refused(c, "a line crosses the recorded end of the range");
+                break;
+            }
             pos += n as u64;
             bytes_read += n as u64;
             // Strip trailing newline for the stored record.
@@ -2451,6 +2641,11 @@ impl FileSource {
         // fstat on the descriptor we READ from — the same file even if the
         // path was rotated away mid-read (#65).
         let identity = Self::identity_of(&reader.get_ref().get_ref().metadata().await?);
+        if let (CutOutcome::None, Some(c)) = (&cut_outcome, cut) {
+            if pos == c {
+                cut_outcome = CutOutcome::Reached(c);
+            }
+        }
         Ok(SliceRead {
             records,
             start,
@@ -2460,6 +2655,7 @@ impl FileSource {
             discontinuity,
             descriptor: None,
             start_tail: None,
+            cut: cut_outcome,
         })
     }
 }
@@ -2807,8 +3003,20 @@ impl SliceError {
     }
 }
 
+/// What became of the cut a read was given (#626).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CutOutcome {
+    None,
+    /// The read stopped exactly at this recorded end.
+    Reached(u64),
+    /// The read could not stop at this recorded end, for this reason.
+    Refused(u64, &'static str),
+}
+
 /// What a completed read hands back.
 struct SliceRead {
+    /// What became of the cut the read was given.
+    cut: CutOutcome,
     records: Vec<Vec<u8>>,
     /// The byte the read STARTED at. Normally the cursor's read position; byte
     /// 0 when the file under the cursor was rotated or truncated (#558), so
@@ -2856,6 +3064,8 @@ struct ReadJob {
     /// The descriptor held on the file the cursor was rewound into: if that
     /// file has left the path, the rewound range is read from it (#621).
     rewound: Option<RotatedRead>,
+    /// The recorded end the read stops at (#626), and the inode it belongs to.
+    cut: Option<(u64, Option<u64>)>,
 }
 
 enum PassOutcome {
@@ -3074,10 +3284,14 @@ impl SourceAdapter for FileSource {
         // skipped without an open (see `run_job`). The marker still reports
         // the cursor where it stands, so a skipped file is indistinguishable
         // from one that was read and had nothing to give — which is what it is.
+        self.reached_cut.clear();
         let job = self.read_job(&path);
         let start = job.start;
         let (outcome, drained) = Self::run_job(job, max_records, max_bytes, self.whole_file).await;
-        self.apply_outcome(&path, start, outcome, drained)
+        let mut reads = self.apply_outcome(&path, start, outcome, drained)?;
+        self.read_on_after_cuts(&path, &mut reads, max_records, max_bytes)
+            .await;
+        Ok(reads)
     }
 
     /// Read every file CONCURRENTLY (#96 B2). Each file's read is independent
@@ -3140,6 +3354,7 @@ impl SourceAdapter for FileSource {
                 deleted.insert(i);
             }
         }
+        self.reached_cut.clear();
         let jobs: Vec<(usize, ReadJob)> = sources
             .iter()
             .enumerate()
@@ -3198,7 +3413,11 @@ impl SourceAdapter for FileSource {
         // holds, so the caller sees one outcome per source however the cycle
         // got there.
         for (source_index, path, start, outcome, drained) in results {
-            let result = self.apply_outcome(&path, start, outcome, drained);
+            let mut result = self.apply_outcome(&path, start, outcome, drained);
+            if let Ok(reads) = &mut result {
+                self.read_on_after_cuts(&path, reads, max_records, max_bytes)
+                    .await;
+            }
             match &result {
                 Ok(reads) => any_records |= reads.iter().any(|read| !read.is_empty()),
                 Err(_) => any_failed = true,
@@ -3761,6 +3980,48 @@ impl SourceAdapter for FileSource {
             },
         );
         proven.then(|| i128::from(c.committed_byte))
+    }
+
+    /// Record each range's end as a cut its re-read stops at (#626). Not in
+    /// whole-file mode, where a record is a whole file and cannot stop
+    /// inside one.
+    fn bound_replays(&mut self, ranges: &[ReplayRange]) -> Vec<bool> {
+        ranges
+            .iter()
+            .map(|range| {
+                let (
+                    ProgressMarker::File {
+                        path,
+                        inode,
+                        start_byte,
+                        ..
+                    },
+                    ProgressMarker::File {
+                        path: end_path,
+                        end_byte,
+                        ..
+                    },
+                ) = (&range.start, &range.end)
+                else {
+                    return false;
+                };
+                if self.whole_file || path != end_path || end_byte <= start_byte {
+                    return false;
+                }
+                let cuts = self.cuts.entry(path.clone()).or_default();
+                cuts.insert(
+                    *end_byte,
+                    Cut {
+                        start: *start_byte,
+                        inode: *inode,
+                    },
+                );
+                if cuts.len() > MAX_CUTS_PER_PATH {
+                    cuts.pop_first();
+                }
+                true
+            })
+            .collect()
     }
 
     fn source_type(&self) -> SourceType {
@@ -4812,6 +5073,111 @@ mod tests {
             "a marker of another source type is refused"
         );
         assert!(results[2].is_ok(), "and does not stop the one after it");
+    }
+
+    /// #626: a re-read bounded to a recorded range stops at its end, and
+    /// what follows is read on in the same pass as its own read: the window
+    /// the engine rebuilds ends where the failed one did, and the bytes after
+    /// it are the next window.
+    #[tokio::test]
+    async fn a_bounded_re_read_stops_at_the_recorded_end_and_reads_on_after_it() {
+        let mut f = write_log(&["a1", "a2", "a3"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(lines(&first), ["a1", "a2", "a3"]);
+        writeln!(f, "b1").unwrap();
+        f.flush().unwrap();
+        fs.replay_from_marker(&first[0].progress_start)
+            .await
+            .unwrap();
+        let range = ReplayRange {
+            start: first[0].progress_start.clone(),
+            end: first[0].progress_end.clone(),
+        };
+        assert_eq!(fs.bound_replays(&[range]), [true]);
+        let again = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.len(),
+            2,
+            "the rebuilt window, then what follows: {again:?}"
+        );
+        assert_eq!(lines(&again[..1]), ["a1", "a2", "a3"]);
+        assert_eq!(lines(&again[1..]), ["b1"]);
+        let (ProgressMarker::File { end_byte: cut, .. }, ProgressMarker::File { start_byte, .. }) =
+            (&again[0].progress_end, &again[1].progress_start)
+        else {
+            panic!("file markers");
+        };
+        assert_eq!((*cut, *start_byte), (9, 9));
+        assert!(fs.take_refused_cuts().is_empty());
+    }
+
+    /// #626: a line that crosses the recorded end means the bytes are not the
+    /// ones the window was cut from. The read stops before that line, the
+    /// bound is reported refused, and the next read reads on as before.
+    #[tokio::test]
+    async fn a_line_crossing_the_recorded_end_refuses_the_bound() {
+        let f = write_log(&["first", "second"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.replay_from_marker(&first[0].progress_start)
+            .await
+            .unwrap();
+        let mut end = first[0].progress_end.clone();
+        if let ProgressMarker::File { end_byte, .. } = &mut end {
+            *end_byte = 8; // inside "second\n"
+        }
+        let range = ReplayRange {
+            start: first[0].progress_start.clone(),
+            end,
+        };
+        assert_eq!(fs.bound_replays(&[range]), [true]);
+        let short = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(lines(&short), ["first"], "stopped before the crossing line");
+        let refused = fs.take_refused_cuts();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!((refused[0].start, refused[0].end), (0, 8));
+        assert!(refused[0].reason.contains("crosses the recorded end"));
+        let rest = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(lines(&rest), ["second"], "read on as before");
+    }
+
+    /// #626: whole-file mode cannot stop inside a file, so it bounds nothing.
+    #[test]
+    fn whole_file_mode_bounds_no_replay() {
+        let mut fs = FileSource::with_mode(vec![], TelemetryFormat::Raw, false, true);
+        let marker = |start: u64, end: u64| ProgressMarker::File {
+            path: "/x".into(),
+            inode: None,
+            start_byte: start,
+            end_byte: end,
+            file_size: end,
+            mtime: String::new(),
+            content_fingerprint: None,
+            tail_fingerprint: None,
+        };
+        let range = ReplayRange {
+            start: marker(0, 0),
+            end: marker(0, 10),
+        };
+        assert_eq!(fs.bound_replays(&[range]), [false]);
     }
 
     #[tokio::test]

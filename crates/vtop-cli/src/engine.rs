@@ -1779,6 +1779,11 @@ struct PendingBuffer {
     /// Record framing for this source (whole-file/binary = verbatim). All reads
     /// for a given source share the same framing.
     verbatim: bool,
+    /// The recorded end of the window this buffer rebuilds (#626), when its
+    /// first read started where a window handed back started and the source
+    /// bounds the re-read there. Until the buffer reaches it, no threshold,
+    /// age or forced flush seals it; at it, it is sealed at once.
+    rebuild_end: Option<i128>,
 }
 
 impl PendingBuffer {
@@ -1797,7 +1802,24 @@ impl PendingBuffer {
             first_timestamp: None,
             last_timestamp: None,
             verbatim: false,
+            rebuild_end: None,
         }
+    }
+
+    /// Where the buffered window ends now, if it holds anything.
+    fn end_position(&self) -> Option<i128> {
+        self.latest_end.as_ref().map(end_position)
+    }
+
+    /// Whether the buffer holds a rebuilt window that has reached its
+    /// recorded end (#626).
+    fn rebuild_complete(&self) -> bool {
+        self.rebuild_end.is_some() && self.rebuild_end == self.end_position()
+    }
+
+    /// Whether the buffer holds a rebuilt window short of its recorded end.
+    fn rebuilding(&self) -> bool {
+        self.rebuild_end.is_some() && !self.rebuild_complete() && !self.is_empty()
     }
 
     fn is_empty(&self) -> bool {
@@ -1865,6 +1887,14 @@ impl PendingBuffer {
         self.last_timestamp =
             vtop_core::event_time::latest(self.last_timestamp.take(), read.last_timestamp);
         self.latest_end = Some(read.progress_end);
+        if self
+            .rebuild_end
+            .is_some_and(|end| self.end_position() > Some(end))
+        {
+            // The source read past the recorded end, which a bounded read
+            // never does: the window is no longer the recorded one.
+            self.rebuild_end = None;
+        }
     }
 
     /// Whether an accumulated buffer has tripped a sealing threshold
@@ -1876,6 +1906,7 @@ impl PendingBuffer {
     /// Drain the buffer into a single [`ReadResult`] spanning the whole window,
     /// resetting the underlying batcher for reuse. Returns `None` if empty.
     fn drain(&mut self) -> Option<ReadResult> {
+        self.rebuild_end = None;
         let end = self.latest_end.take()?;
         let batch = self.batcher.seal(end).ok()?;
         Some(ReadResult {
@@ -2904,6 +2935,8 @@ impl Engine {
         // Buffers sealed early because the next read did not continue them
         // (a rotated or truncated file): flushed this cycle, below.
         let mut discontinued: Vec<PendingBuffer> = Vec::new();
+        // Rebuilt windows a read carried past their recorded end (#626).
+        let mut overshot: Vec<(ProgressMarker, i128)> = Vec::new();
         let read_started = Instant::now();
         match adapter
             .read_all_batch_candidates(
@@ -3035,10 +3068,32 @@ impl Engine {
                                 discontinued.push(old);
                             }
                         }
-                        self.pending
+                        // A rebuilt window that has reached its recorded end
+                        // is sealed before the next read joins it (#626):
+                        // the bytes after it are the next window.
+                        if self
+                            .pending
+                            .get(&key)
+                            .is_some_and(PendingBuffer::rebuild_complete)
+                        {
+                            if let Some(done) = self.pending.remove(&key) {
+                                discontinued.push(done);
+                            }
+                        }
+                        let bounded_end = self.recorded.bounded_end(&read.progress_start);
+                        let buf = self
+                            .pending
                             .entry(key)
-                            .or_insert_with(|| PendingBuffer::new(&tenant, buf_source, limits))
-                            .append(read);
+                            .or_insert_with(|| PendingBuffer::new(&tenant, buf_source, limits));
+                        if buf.is_empty() {
+                            buf.rebuild_end = bounded_end;
+                        }
+                        let held = buf.rebuild_end;
+                        let window_start = read.progress_start.clone();
+                        buf.append(read);
+                        if held.is_some() && buf.rebuild_end.is_none() {
+                            overshot.push((window_start, held.unwrap_or_default()));
+                        }
                     }
                 }
             }
@@ -3053,6 +3108,7 @@ impl Engine {
                 self.count_refused_replay_of(source_type, &path);
             }
         }
+        self.settle_refused_cuts(adapter, source_type, overshot);
 
         let read_phase_ms = cycle_started.elapsed().as_millis() as u64;
         // Logged once per cycle per source type. The ratio that matters is
@@ -3092,6 +3148,16 @@ impl Engine {
         let mut flush_keys: Vec<(SourceType, String)> = Vec::new();
         for (key, buf) in self.pending.iter() {
             if &buf.source.source_type != source_type || buf.is_empty() {
+                continue;
+            }
+            // A window being rebuilt is sealed at its recorded end and only
+            // there (#626): not by a threshold, its age, or a forced flush,
+            // each of which would cut it short and name another object.
+            if buf.rebuild_complete() {
+                flush_keys.push(key.clone());
+                continue;
+            }
+            if buf.rebuilding() {
                 continue;
             }
             if let Some(reason) = buf.should_seal(now) {
@@ -3179,6 +3245,8 @@ impl Engine {
                         sealed_at: Some(sealed_at),
                         digest: rebuild.as_ref().and_then(|w| w.digest.clone()),
                         batch_id: None,
+                        record_count: Some(read.records.len() as u64),
+                        bounded: false,
                     });
                     async move {
                         let step = pipeline
@@ -3247,6 +3315,7 @@ impl Engine {
         let mut outcomes = Vec::new();
         let mut first_err: Option<VtopError> = None;
         let mut rewinds: Vec<ProgressMarker> = Vec::new();
+        let mut handed_back: Vec<RecordedWindow> = Vec::new();
         for (_, mut window, step) in verified {
             let started_at = window.start.clone();
             match step {
@@ -3264,6 +3333,7 @@ impl Engine {
                             }
                         }
                         window.batch_id = Some(outcome.batch_id.clone());
+                        handed_back.push((*window).clone());
                         self.recorded.remember(*window);
                     }
                     outcomes.push(outcome);
@@ -3311,6 +3381,7 @@ impl Engine {
                     // commit — the range is never archived (#627).
                     rewinds.push(started_at);
                     // Remembered from memory: the ledger may hold no row.
+                    handed_back.push((*window).clone());
                     self.recorded.remember(*window);
                     first_err.get_or_insert(e);
                 }
@@ -3346,10 +3417,157 @@ impl Engine {
                 }
             }
         }
+        // Each handed-back window is re-read up to where it ended, where the
+        // source can stop there (#626).
+        self.bound_windows(adapter, handed_back);
         if let Some(e) = first_err {
             return Err(e);
         }
         Ok(outcomes)
+    }
+
+    /// The tenant and format a replay of `source_name` is counted under: the
+    /// stream's, when one is configured for it, else the engine's tenant and
+    /// the adapter's format.
+    fn replay_labels(&self, source_type: &SourceType, source_name: &str) -> (String, &'static str) {
+        let tenant = tenant_for_source(&self.streams, &self.config.engine.tenant, source_name);
+        let format = match self.streams.lookup(source_name) {
+            Some(stream) => stream.format.extension(),
+            None => default_format_for(&self.streams, source_type.clone()).extension(),
+        };
+        (tenant, format)
+    }
+
+    /// Ask `adapter` to stop the re-read of each handed-back window at its
+    /// recorded end (#626), and record which it bounds. A window over
+    /// [`crate::rebuild::REBUILD_CAP_FACTOR`] times the current limits is
+    /// not offered: holding it whole could need that much memory.
+    fn bound_windows(&mut self, adapter: &mut dyn SourceAdapter, windows: Vec<RecordedWindow>) {
+        let limits = (
+            self.config.batching.max_records,
+            self.config.batching.max_bytes,
+        );
+        let cap = crate::rebuild::REBUILD_CAP_FACTOR;
+        let mut offered = Vec::new();
+        for window in windows {
+            let records_over = window
+                .record_count
+                .is_some_and(|n| n > cap.saturating_mul(limits.0 as u64));
+            let bytes_over = window
+                .span_bytes()
+                .is_some_and(|n| n > cap.saturating_mul(limits.1 as u64));
+            if records_over || bytes_over {
+                let (tenant, format) = self.replay_labels(&adapter.source_type(), window.source());
+                crate::rebuild::note_too_large(
+                    &window,
+                    limits,
+                    [tenant.as_str(), adapter.source_type().as_str(), format],
+                );
+                self.recorded.set_bounded(&window.start, false);
+                continue;
+            }
+            offered.push(window);
+        }
+        if offered.is_empty() {
+            return;
+        }
+        let ranges: Vec<vtop_adapters::ReplayRange> = offered
+            .iter()
+            .map(|w| vtop_adapters::ReplayRange {
+                start: w.start.clone(),
+                end: w.end.clone(),
+            })
+            .collect();
+        for (window, bounded) in offered.iter().zip(adapter.bound_replays(&ranges)) {
+            self.recorded.set_bounded(&window.start, bounded);
+        }
+    }
+
+    /// Stop holding the rebuilt windows whose re-read could not stop at their
+    /// recorded end (#626): those the source reported (a line crossing the
+    /// end, a replaced file) and those a read carried past it. Each is
+    /// counted `refused` and read on as before.
+    fn settle_refused_cuts(
+        &mut self,
+        adapter: &mut dyn SourceAdapter,
+        source_type: &SourceType,
+        overshot: Vec<(ProgressMarker, i128)>,
+    ) {
+        let any = adapter.as_any_mut();
+        let mut refused: Vec<vtop_adapters::file_source::RefusedCut> = Vec::new();
+        if let Some(files) = any.downcast_mut::<FileSource>() {
+            refused.extend(files.take_refused_cuts());
+        } else if let Some(spools) = any.downcast_mut::<SyslogSpoolSource>() {
+            refused.extend(spools.take_refused_cuts());
+        }
+        let mut gone: Vec<(String, u64, u64, String)> = refused
+            .into_iter()
+            .map(|cut| (cut.path, cut.start, cut.end, cut.reason.to_owned()))
+            .collect();
+        for (start, end) in overshot {
+            let source = match &start {
+                ProgressMarker::Kafka { topic, .. } => topic.clone(),
+                ProgressMarker::File { path, .. } | ProgressMarker::SyslogSpool { path, .. } => {
+                    path.clone()
+                }
+            };
+            let from = u64::try_from(start_position(&start)).unwrap_or_default();
+            let to = u64::try_from(end).unwrap_or_default();
+            gone.push((
+                source,
+                from,
+                to,
+                "the source read past the recorded end".to_owned(),
+            ));
+        }
+        for (source, start, end, why) in gone {
+            for buf in self.pending.values_mut() {
+                if buf.source.source_name == source && buf.rebuild_end == Some(i128::from(end)) {
+                    buf.rebuild_end = None;
+                }
+            }
+            if let Some(window) = self.recorded.unbind(&source, start, end) {
+                let (tenant, format) = self.replay_labels(source_type, &source);
+                let suppressed = self.key_notices.admit("replay_bound_refused", &source);
+                crate::rebuild::note_refused(
+                    &window,
+                    &why,
+                    [tenant.as_str(), source_type.as_str(), format],
+                    suppressed,
+                );
+            }
+        }
+    }
+
+    /// Drop the windows still being rebuilt when the engine stops (#626): the
+    /// shutdown flush does not seal them short of their recorded end, which
+    /// would write an object the next start duplicates. Their ranges were
+    /// never committed, so the next start reads them again.
+    fn drop_unfinished_rebuilds(&mut self) {
+        let keys: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, buf)| buf.rebuilding())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            let Some(buf) = self.pending.remove(&key) else {
+                continue;
+            };
+            let range = buf
+                .batcher
+                .first_marker()
+                .zip(buf.latest_end.as_ref())
+                .map(|(first, last)| ProgressMarker::spanning(first, last).range_token())
+                .unwrap_or_default();
+            let (tenant, format) =
+                self.replay_labels(&buf.source.source_type, &buf.source.source_name);
+            crate::rebuild::note_dropped_at_stop(
+                &buf.source.source_name,
+                &range,
+                [tenant.as_str(), buf.source.source_type.as_str(), format],
+            );
+        }
     }
 
     /// Whether a batch the ledger calls VERIFIED still checks out against the
@@ -3552,6 +3770,9 @@ impl Engine {
         // VERIFIED rows that still check out against storage. Their source
         // commits wait until every replay decision is known (see below).
         let mut verified: Vec<(BatchRecord, Recheck)> = Vec::new();
+        // The windows handed back, to be re-read up to where each ended
+        // (#626), once every rewind has been applied.
+        let mut scanned: Vec<RecordedWindow> = Vec::new();
         for rec in incomplete {
             let action = next_recovery_action(rec.state);
             tracing::info!(batch_id = %rec.batch_id, state = %rec.state, ?action, "recovery_scan");
@@ -3641,6 +3862,7 @@ impl Engine {
                             continue;
                         }
                         rewinds.add(&rec.progress_start);
+                        scanned.push(RecordedWindow::from_row(&rec));
                         self.recorded.remember(RecordedWindow::from_row(&rec));
                         // Dashboards must see this refusal path like any other
                         // replay (#123 review).
@@ -3766,6 +3988,7 @@ impl Engine {
                     rewinds.add(&rec.progress_start);
                     // What the range was, read back from its row (#626): its
                     // re-read is sealed at the instant this row recorded.
+                    scanned.push(RecordedWindow::from_row(&rec));
                     self.recorded.remember(RecordedWindow::from_row(&rec));
                     if let Some(mx) = telemetry::metrics() {
                         // Replay is safe by design, but a sustained rate means
@@ -3899,6 +4122,24 @@ impl Engine {
                     summary.still_pending += 1;
                 }
             }
+        }
+        // Each re-read stops at the end of the window it rebuilds, where the
+        // source can stop there (#626). After the rewinds, so a window is
+        // bounded from where its re-read really starts.
+        let mut types: Vec<SourceType> = scanned.iter().map(|w| w.start.source_type()).collect();
+        types.sort_by_key(|t| t.as_str());
+        types.dedup();
+        for source_type in types {
+            let Some(mut adapter) = self.adapters.remove(&source_type) else {
+                continue;
+            };
+            let windows = scanned
+                .iter()
+                .filter(|w| w.start.source_type() == source_type)
+                .cloned()
+                .collect();
+            self.bound_windows(adapter.as_mut(), windows);
+            self.adapters.insert(source_type, adapter);
         }
         recovery_span.record("committed", summary.committed);
         recovery_span.record("replay_required", summary.replay_required);
@@ -4489,6 +4730,7 @@ impl Engine {
                     }
                 }
             }
+            self.drop_unfinished_rebuilds();
             match first_failure {
                 None => Ok(()),
                 Some(cause) => Err(cause),
@@ -6131,37 +6373,21 @@ mod tests {
             writeln!(f, "line 2").unwrap();
         }
         let second = engine.run_source(SourceType::File, true).await.unwrap();
-        assert!(second[0].committed, "the retry commits");
+        assert!(
+            !second.is_empty() && second.iter().all(|o| o.committed),
+            "the retry commits: {second:?}"
+        );
 
-        let committed: Vec<_> = engine
-            .store
-            .list_batches()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|b| b.state == BatchState::SourceCommitted)
-            .collect();
-        assert_eq!(committed.len(), 1, "one batch committed: {committed:?}");
-        let ProgressMarker::File { start_byte, .. } = &committed[0].progress_start else {
-            panic!("a file batch carries a file marker");
-        };
+        // The failed range [0, 7) was handed back, not skipped, and rebuilt
+        // as first cut (#626): line 1 alone, then line 2 as the next window.
+        // Both lines are archived, the ranges tile to the end of the file.
+        use std::os::unix::fs::MetadataExt;
+        let len = std::fs::metadata(&input).unwrap().len();
+        let inode = std::fs::metadata(&input).unwrap().ino();
         assert_eq!(
-            *start_byte, 0,
-            "the committed batch must start at byte 0: the failed range [0, 7) was \
-             handed back, not skipped"
-        );
-        assert_eq!(
-            committed[0].record_count,
-            Some(2),
-            "both lines are archived"
-        );
-        let ProgressMarker::File { end_byte: tail, .. } = &committed[0].progress_end else {
-            panic!("a file batch carries a file marker");
-        };
-        assert_eq!(
-            *tail,
-            std::fs::metadata(&input).unwrap().len(),
-            "and the batch ends at the end of the file"
+            committed_file_ranges(&engine).await,
+            vec![(Some(inode), 0, 7, Some(1)), (Some(inode), 7, len, Some(1))],
+            "the failed range is archived as first cut, and nothing is skipped"
         );
     }
 
@@ -6887,14 +7113,16 @@ mod tests {
     }
 
     /// #627, end to end: the FAILED write of a batch that failed after its
-    /// object landed fails too. The range is handed back anyway, so the cost
-    /// is the one object the failed attempt left in the store, never a gap;
-    /// and the stale row the restart then finds re-reads nothing: its source
-    /// has committed past it, so recovery retires it as SUPERSEDED (#567)
-    /// instead of planning a rewind the committed point would clamp to
-    /// nothing.
+    /// object landed fails too. The range is handed back anyway, and since
+    /// #626 it is rebuilt as first cut from memory, so it resolves to the
+    /// object the failed attempt left: no duplicate, never a gap. (Before, the
+    /// re-read ran to the new end of the file, and line 1 was archived a
+    /// second time with line 2.) The stale row the restart then finds
+    /// re-reads nothing: its source has committed past it, so recovery
+    /// retires it as SUPERSEDED (#567) instead of planning a rewind the
+    /// committed point would clamp to nothing.
     #[tokio::test]
-    async fn a_failed_failed_write_costs_one_duplicate_object_and_no_gap() {
+    async fn a_failed_failed_write_costs_no_duplicate_object_and_no_gap() {
         let _serial = THROTTLE_TESTS.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.log");
@@ -6926,15 +7154,28 @@ mod tests {
         let orphan = stale.object_uri.clone().expect("the object was recorded");
         assert!(mock.contains(&orphan), "the failed attempt's object landed");
 
+        let n = std::fs::metadata(&input).unwrap().len();
         append_line(&input, "line 2");
         let second = engine.run_source(SourceType::File, true).await.unwrap();
-        assert!(second[0].committed);
+        assert!(second.iter().all(|o| o.committed), "{second:?}");
         let len = std::fs::metadata(&input).unwrap().len();
         assert_eq!(
             archived_ranges(&engine).await,
-            vec![(0, len)],
-            "line 1 is archived again, with line 2: the duplicate"
+            vec![(0, n), (n, len)],
+            "line 1 is rebuilt as first cut, then line 2: no byte twice"
         );
+        assert_eq!(
+            second[0].object_uri.as_deref(),
+            Some(orphan.as_str()),
+            "the rebuilt range resolves to the object the failed attempt left"
+        );
+        assert_eq!(mock.version_count(&orphan), 1, "and does not put it again");
+        let objects = mock
+            .object_uris()
+            .into_iter()
+            .filter(|uri| !uri.ends_with(".manifest.json"))
+            .count();
+        assert_eq!(objects, 2, "one object per range, no duplicate");
         drop(engine);
 
         // The restart finds the stale row below the committed point and
@@ -6957,7 +7198,7 @@ mod tests {
         assert_eq!(row.state, BatchState::Superseded);
         let after = restarted.run_source(SourceType::File, true).await.unwrap();
         assert!(after.is_empty(), "nothing is re-archived: {after:?}");
-        assert_eq!(archived_ranges(&restarted).await, vec![(0, len)]);
+        assert_eq!(archived_ranges(&restarted).await, vec![(0, n), (n, len)]);
     }
 
     /// A seal instant for [`Engine::set_seal_clock`].
@@ -7030,6 +7271,132 @@ mod tests {
             .filter(|uri| !uri.ends_with(".manifest.json"))
             .collect();
         assert_eq!(objects, put, "no second object");
+    }
+
+    /// The count of `result` on `vtop_replay_rebuilds_total` for file
+    /// batches of `tenant`.
+    fn rebuilds(tenant: &str, result: &str) -> u64 {
+        telemetry::init()
+            .unwrap()
+            .replay_rebuilds_total
+            .with_label_values(&[tenant, "file", "raw", result])
+            .get()
+    }
+
+    /// #626: a window sealed by its age fails after its object landed; the
+    /// file grows. The re-read is sealed at the recorded end, not by its age,
+    /// so it resolves to the failed attempt's object, and the appended line
+    /// is the next window, sealed by its own age in the same cycle.
+    #[tokio::test]
+    async fn a_window_sealed_by_age_is_rebuilt_as_first_cut() {
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\nline 2\n").unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 0;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let mock = Arc::new(vtop_upload::MockBackend::new().with_throttled_manifest_puts(1));
+        engine.backend = mock.clone();
+        let first = engine.run_source(SourceType::File, false).await.unwrap();
+        assert_eq!(first.len(), 1, "sealed by its age: {first:?}");
+        assert_eq!(first[0].final_state, BatchState::Failed);
+        let orphan = engine
+            .store
+            .get_batch(&first[0].batch_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .object_uri
+            .unwrap();
+        let n = std::fs::metadata(&input).unwrap().len();
+        append_line(&input, "line 3");
+        let second = engine.run_source(SourceType::File, false).await.unwrap();
+        assert_eq!(second.len(), 2, "{second:?}");
+        assert!(second.iter().all(|o| o.committed), "{second:?}");
+        assert_eq!(second[0].object_uri.as_deref(), Some(orphan.as_str()));
+        assert_eq!(mock.version_count(&orphan), 1);
+        let len = std::fs::metadata(&input).unwrap().len();
+        assert_eq!(archived_ranges(&engine).await, vec![(0, n), (n, len)]);
+    }
+
+    /// #626: the engine stops in the middle of a rebuild (it needs two passes
+    /// and has read one). The partial window is dropped, not flushed: a flush
+    /// would name another object, which the next start would duplicate. It is
+    /// counted `dropped_at_stop`, and the restart rebuilds the window whole,
+    /// resolving to the failed attempt's object, with nothing lost.
+    #[tokio::test]
+    async fn a_stop_inside_a_rebuild_drops_the_partial_window_and_the_restart_rebuilds_it() {
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        let lines: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&input, lines).unwrap();
+        let store = format!("sqlite://{}", dir.path().join("state.db").display());
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            &store,
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.engine.tenant = "stop-626".into();
+        cfg.batching.max_batch_age_seconds = 3_600;
+        cfg.batching.max_records = 20;
+        let mock = Arc::new(vtop_upload::MockBackend::new().with_throttled_manifest_puts(1));
+        let orphan = {
+            let mut engine = Engine::new(cfg.clone(), StreamsConfig { streams: vec![] })
+                .await
+                .unwrap();
+            engine.backend = mock.clone();
+            let first = engine.run_source(SourceType::File, true).await.unwrap();
+            assert_eq!(first[0].final_state, BatchState::Failed);
+            let orphan = engine
+                .store
+                .get_batch(&first[0].batch_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .object_uri
+                .unwrap();
+            engine.config.batching.max_records = 10;
+            let half = engine.run_source(SourceType::File, true).await.unwrap();
+            assert!(half.is_empty(), "half the window is held: {half:?}");
+            let before = rebuilds("stop-626", "dropped_at_stop");
+            // The stop path: what `run_until` does after its shutdown flush.
+            engine.drop_unfinished_rebuilds();
+            assert_eq!(rebuilds("stop-626", "dropped_at_stop"), before + 1);
+            assert!(
+                engine.pending.is_empty(),
+                "nothing partial is left to flush"
+            );
+            orphan
+        };
+        cfg.batching.max_records = 10;
+        let mut restarted = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        restarted.backend = mock.clone();
+        restarted.recover().await.unwrap();
+        let mut committed = Vec::new();
+        for _ in 0..3 {
+            committed.extend(restarted.run_source(SourceType::File, true).await.unwrap());
+        }
+        assert_eq!(committed.len(), 1, "{committed:?}");
+        assert_eq!(committed[0].object_uri.as_deref(), Some(orphan.as_str()));
+        assert_eq!(mock.version_count(&orphan), 1);
+        let len = std::fs::metadata(&input).unwrap().len();
+        assert_eq!(
+            archived_ranges(&restarted).await,
+            vec![(0, len)],
+            "nothing lost"
+        );
     }
 
     /// Delegates to the real adapter but never rewinds: the running engine as
