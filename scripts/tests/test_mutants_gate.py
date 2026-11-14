@@ -45,8 +45,15 @@ def baseline(summary="Success"):
     return {"scenario": "Baseline", "summary": summary, "log_path": "log", "phase_results": []}
 
 
-def outcomes(*entries):
-    return {"outcomes": list(entries), "cargo_mutants_version": "27.1.0"}
+def outcomes(*entries, finished=True):
+    # cargo-mutants rewrites outcomes.json as the run goes and sets
+    # `end_time` only when the whole campaign has finished.
+    return {
+        "outcomes": list(entries),
+        "cargo_mutants_version": "27.1.0",
+        "start_time": "2026-11-14T10:00:00Z",
+        "end_time": "2026-11-14T10:09:00Z" if finished else None,
+    }
 
 
 class GateRun:
@@ -177,6 +184,19 @@ class RefusalTest(unittest.TestCase):
         )
         self.assertEqual(run.code, 2, run.out)
         self.assertIn(REPLAY, run.out)
+
+    def test_an_unfinished_run_is_refused(self):
+        # Review of #766: a run that died after one caught mutant per file
+        # leaves a partial outcomes.json with no end_time; scoring it would
+        # pass on mutants that were never tested.
+        partial = outcomes(
+            baseline(), mutant(STATE, 1, "CaughtMutant"), mutant(REPLAY, 2, "CaughtMutant"), finished=False
+        )
+        run = GateRun(partial, "--min-score", "0.9", "--expect-file", STATE, "--expect-file", REPLAY)
+        self.assertEqual(run.code, 2, run.out)
+        self.assertIn("did not finish", run.out)
+        del partial["end_time"]
+        self.assertEqual(GateRun(partial, "--min-score", "0.9").code, 2)
 
     def test_a_threshold_outside_zero_to_one_is_refused(self):
         run = GateRun(outcomes(baseline(), mutant(STATE, 1, "CaughtMutant")), "--min-score", "90")

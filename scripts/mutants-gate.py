@@ -17,8 +17,8 @@ job's step summary).
 Exit codes:
   0  the score is at or above --min-score (or --report-only)
   1  the score is below --min-score
-  2  the run is not evidence: the file is missing or not JSON, the baseline
-     failed, a mutant has an outcome this script does not classify, there
+  2  the run is not evidence: the file is missing or not JSON, the run did
+     not finish (no `end_time`), the baseline failed, a mutant has an outcome this script does not classify, there
      are no viable mutants, or a file named by --expect-file has none
 
 Usage:
@@ -60,6 +60,12 @@ def tally(document):
     entries = document.get("outcomes") if isinstance(document, dict) else None
     if not isinstance(entries, list):
         raise NotEvidence("outcomes.json has no `outcomes` list")
+    # cargo-mutants rewrites outcomes.json as the run goes and sets end_time
+    # only when the campaign finishes: a run that died part-way leaves the
+    # mutants it reached, and scoring those would pass on the ones it never
+    # tested (review of #766).
+    if not document.get("end_time"):
+        raise NotEvidence("the cargo-mutants run did not finish (no end_time in outcomes.json)")
     files = collections.OrderedDict()
     survivors = []
     for entry in entries:
