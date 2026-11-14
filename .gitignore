@@ -24,3 +24,6 @@
 # cargo-mutants output
 mutants.out/
 mutants.out.old/
+
+# mkdocs build output (`mkdocs build` writes site/ by default)
+/site/
