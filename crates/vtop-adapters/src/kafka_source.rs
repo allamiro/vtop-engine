@@ -1692,26 +1692,54 @@ impl KafkaSource {
     /// round trip here is multiplied by the topic count: with 28 topics it made
     /// each cycle take minutes and looked exactly like a hang.
     fn partitions_for(&mut self, topic: &str) -> Result<Vec<i32>, VtopError> {
-        if let Some((ids, at)) = self.partitions.get(topic) {
-            if at.elapsed() < PARTITION_CACHE_TTL {
-                return Ok(ids.clone());
-            }
-        }
-        let ids: Vec<i32> = {
-            let consumer = self.consumer()?;
+        self.consumer()?;
+        let consumer = self.consumer.as_ref().expect("consumer built above");
+        cached_partition_ids(&mut self.partitions, topic, Instant::now(), |topic| {
             let md = consumer
                 .fetch_metadata(Some(topic), Duration::from_secs(10))
                 .map_err(|e| VtopError::Source(format!("fetch_metadata {topic}: {e}")))?;
-            md.topics()
+            Ok(md
+                .topics()
                 .iter()
                 .find(|t| t.name() == topic)
                 .map(|t| t.partitions().iter().map(|p| p.id()).collect())
-                .unwrap_or_default()
-        };
-        self.partitions
-            .insert(topic.to_string(), (ids.clone(), Instant::now()));
-        Ok(ids)
+                .unwrap_or_default())
+        })
     }
+}
+
+/// Partition ids for `topic` from `cache` while the entry is younger than
+/// `PARTITION_CACHE_TTL`, else from `lookup` (a metadata request).
+///
+/// An answer that lists NO partitions is returned but never cached (#675).
+/// A broker answers that way for a topic it does not know yet - one created
+/// moments before, whose metadata the broker has not applied - as well as for
+/// one just deleted. Cached, the topic was left out of every assignment for
+/// the whole TTL, five minutes: none of its records were read, and the stall
+/// check never saw it, since it watches assigned partitions only. Under
+/// `latest`, the assign that finally came resolved at the end of the log and
+/// skipped everything written in between. The live-broker failure in #675
+/// has exactly this signature, on a topic created just before the adapter's
+/// first pass. Asking again on the next pass costs one metadata round trip
+/// per partitionless topic; a topic the broker lists is cached as before.
+fn cached_partition_ids(
+    cache: &mut HashMap<String, (Vec<i32>, Instant)>,
+    topic: &str,
+    now: Instant,
+    lookup: impl FnOnce(&str) -> Result<Vec<i32>, VtopError>,
+) -> Result<Vec<i32>, VtopError> {
+    if let Some((ids, at)) = cache.get(topic) {
+        if now.saturating_duration_since(*at) < PARTITION_CACHE_TTL {
+            return Ok(ids.clone());
+        }
+    }
+    let ids = lookup(topic)?;
+    if ids.is_empty() {
+        cache.remove(topic);
+    } else {
+        cache.insert(topic.to_string(), (ids.clone(), now));
+    }
+    Ok(ids)
 }
 
 #[async_trait]
@@ -3240,6 +3268,37 @@ mod tests {
         src.prune_partition_cache(&["live".to_string()]);
         assert!(src.partitions.contains_key("live"), "live topic kept");
         assert!(!src.partitions.contains_key("dead"), "dead topic dropped");
+    }
+
+    /// #675: a metadata answer that lists no partitions - a topic the broker
+    /// does not know yet, moments after it was created - is not cached. The
+    /// next pass asks again and gets the partitions; before the fix the empty
+    /// answer was served from the cache for `PARTITION_CACHE_TTL`, so the
+    /// second lookup below was never made and the topic stayed unassigned for
+    /// five minutes. A list that names partitions is cached as before.
+    #[test]
+    fn a_topic_listed_without_partitions_is_asked_again_on_the_next_pass() {
+        let mut cache = HashMap::new();
+        let mut asked = 0;
+        let mut answers = [Vec::new(), vec![0]].into_iter();
+        let mut lookup = |_: &str| {
+            asked += 1;
+            Ok(answers.next().expect("asked at most twice"))
+        };
+        let t0 = Instant::now();
+        let first = cached_partition_ids(&mut cache, "t", t0, &mut lookup).unwrap();
+        assert!(first.is_empty(), "the broker did not know the topic yet");
+        let second = cached_partition_ids(&mut cache, "t", t0 + PASS, &mut lookup).unwrap();
+        assert_eq!(second, vec![0], "the next pass asks again");
+        let third = cached_partition_ids(&mut cache, "t", t0 + PASS * 2, &mut lookup).unwrap();
+        assert_eq!(third, vec![0]);
+        assert_eq!(asked, 2, "a list with partitions is served from the cache");
+
+        // Once the entry is stale, a topic the broker no longer lists (deleted)
+        // is dropped from the cache, not served from it.
+        let stale = t0 + PARTITION_CACHE_TTL + PASS;
+        let gone = cached_partition_ids(&mut cache, "t", stale, |_| Ok(Vec::new())).unwrap();
+        assert!(gone.is_empty() && !cache.contains_key("t"));
     }
 
     /// The report carries one entry per topic (#361): the topic names the

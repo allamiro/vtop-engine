@@ -553,25 +553,27 @@ impl Drop for TopicCleanup {
     }
 }
 
-/// A NEW single-partition topic holding `records` records at offsets
-/// `0..records`, so every offset a test names is exact. The topic is deleted
-/// when the returned guard is dropped.
-async fn fresh_topic(tag: &str, records: usize) -> (String, TopicCleanup) {
-    use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
-    use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
-
+/// A unique topic name for `tag`; the topic itself is not created.
+fn fresh_topic_name(tag: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let topic = format!("it_{tag}_{nanos}");
+    format!("it_{tag}_{nanos}")
+}
+
+/// Create the single-partition topic `topic`; it is deleted when the
+/// returned guard is dropped.
+async fn create_topic(topic: &str) -> TopicCleanup {
+    use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+
     let admin: AdminClient<_> = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-admin"))
         .unwrap()
         .create()
         .expect("admin client");
     admin
         .create_topics(
-            &[NewTopic::new(&topic, 1, TopicReplication::Fixed(1))],
+            &[NewTopic::new(topic, 1, TopicReplication::Fixed(1))],
             &AdminOptions::new(),
         )
         .await
@@ -579,7 +581,17 @@ async fn fresh_topic(tag: &str, records: usize) -> (String, TopicCleanup) {
         .pop()
         .expect("one topic result")
         .expect("topic creation failed");
-    let cleanup = TopicCleanup(topic.clone());
+    TopicCleanup(topic.to_string())
+}
+
+/// A NEW single-partition topic holding `records` records at offsets
+/// `0..records`, so every offset a test names is exact. The topic is deleted
+/// when the returned guard is dropped.
+async fn fresh_topic(tag: &str, records: usize) -> (String, TopicCleanup) {
+    use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+
+    let topic = fresh_topic_name(tag);
+    let cleanup = create_topic(&topic).await;
     let producer: BaseProducer = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-producer"))
         .unwrap()
         .create()
@@ -1538,9 +1550,48 @@ async fn recovering_one_partition_does_not_move_another_that_started_at_the_end(
         adapter.stall_recoveries()
     );
     assert_eq!(
-        quiet_read, 3,
+        quiet_read,
+        3,
         "recovering another partition skipped records written to one that started at \
-         the end of the log"
+         the end of the log, or it was never read (within 30s of the recovery; stall \
+         recoveries: {})",
+        adapter.stall_recoveries()
+    );
+}
+
+/// #675: the first metadata answer for a topic can list no partitions - the
+/// broker has not applied a topic created moments before. The adapter cached
+/// that answer for five minutes, so the topic was in no assignment and none of
+/// its records were read; the stall check, which watches assigned partitions,
+/// never saw it. That is the CI failure of the stall-isolation test above:
+/// its quiet topic, created last, read 0 of 3 for the whole 30s while the
+/// victim recovered. Here the first pass asks before the topic exists, which
+/// gets that answer every time.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_topic_the_broker_did_not_list_at_the_first_pass_is_read_once_it_does() {
+    let (busy, _busy_cleanup) = fresh_topic("late_busy", 0).await;
+    let late = fresh_topic_name("late");
+    let group = unique_group("late-topic");
+    let mut adapter =
+        KafkaSource::new(kafka_cfg(&bootstrap(), &group), TelemetryFormat::Cef).unwrap();
+    let sources = vec![kafka_source(&busy), kafka_source(&late)];
+
+    let first = read_pass(&mut adapter, &sources).await;
+    assert_eq!(first[1], 0, "precondition: the topic does not exist yet");
+    let _late_cleanup = create_topic(&late).await;
+    produce(&late, 3);
+
+    let started = std::time::Instant::now();
+    let mut late_read = 0;
+    while late_read < 3 && started.elapsed() < std::time::Duration::from_secs(20) {
+        late_read += read_pass(&mut adapter, &sources).await[1];
+    }
+    assert_eq!(
+        late_read,
+        3,
+        "a topic the broker did not list at the first pass was not read within {:?}",
+        started.elapsed()
     );
 }
 
