@@ -509,24 +509,32 @@ impl<'a> Pipeline<'a> {
             format.clone(),
             compressed.compression,
         );
-        let derived_object_uri = object_checksum
-            .as_deref()
-            .filter(|_| self.backend.reports_absent_objects())
-            .map(|digest| {
-                partitioning::object_uri(
-                    &bucket,
-                    &self.config.upload.prefix,
-                    &resolved_prefix,
-                    &vtop_core::batch::build_object_name(
-                        &self.config.engine.name,
-                        &source.source_name,
-                        &window,
-                        digest,
-                    ),
-                    format.clone(),
-                    compressed.compression,
-                )
-            });
+        let derived_object_uri: Result<String, String> = match object_checksum.as_deref() {
+            None => Err(
+                "checksums are disabled (checksum.algorithm: none), so the object cannot be \
+                 named by its content; enable a checksum so a replay of this range reuses it"
+                    .to_string(),
+            ),
+            Some(_) if !self.backend.reports_absent_objects() => Err(format!(
+                "backend {} cannot tell a missing key from a refused request, so a derived key \
+                 could be written over; use the s3_native or localfs backend so a replay of \
+                 this range reuses it",
+                self.backend.backend_name()
+            )),
+            Some(digest) => Ok(partitioning::object_uri(
+                &bucket,
+                &self.config.upload.prefix,
+                &resolved_prefix,
+                &vtop_core::batch::build_object_name(
+                    &self.config.engine.name,
+                    &source.source_name,
+                    &window,
+                    digest,
+                ),
+                format.clone(),
+                compressed.compression,
+            )),
+        };
         let manifest_uri = partitioning::manifest_uri(
             &bucket,
             &self.config.upload.prefix,
@@ -623,9 +631,26 @@ impl<'a> Pipeline<'a> {
             source.source_type.as_str(),
             format.extension(),
         ];
+        // Every outcome is logged for the operator with what happened, what
+        // the engine did and what to do, and the batch id, keys and range as
+        // fields (#626).
+        let range = window.range_token();
+        let source_name = source.source_name.as_str();
         let (object_uri, reused) = match derived_object_uri {
-            None => (attempt_object_uri, false),
-            Some(derived) => match probe_object_key(
+            Err(why) => {
+                tracing::info!(
+                    event = "object_key_per_attempt",
+                    batch_id,
+                    source = source_name,
+                    range,
+                    key = %attempt_object_uri,
+                    reason = %why,
+                    "range {range} of {source_name} is written under its per-attempt key \
+                     {attempt_object_uri}: {why}; a replay of this range will write another object"
+                );
+                (attempt_object_uri, false)
+            }
+            Ok(derived) => match probe_object_key(
                 self.backend.as_ref(),
                 &derived,
                 compressed.size_bytes,
@@ -636,25 +661,77 @@ impl<'a> Pipeline<'a> {
             )
             .await
             {
-                Ok(KeyProbe::Free) => (derived, false),
-                Ok(KeyProbe::Holds) => (derived, true),
-                Ok(KeyProbe::Unusable(why)) => {
-                    tracing::warn!(
+                Ok(KeyProbe::Free) => {
+                    tracing::info!(
+                        event = "object_key_derived",
                         batch_id,
-                        derived = %derived,
-                        uri = %attempt_object_uri,
+                        source = source_name,
+                        range,
+                        key = %derived,
+                        "no object for range {range} of {source_name} is stored yet; uploading it \
+                         under its derived key {derived}"
+                    );
+                    (derived, false)
+                }
+                Ok(KeyProbe::Holds) => {
+                    tracing::info!(
+                        event = "object_key_reused",
+                        batch_id,
+                        source = source_name,
+                        range,
+                        key = %derived,
+                        "object for range {range} of {source_name} already archived and verified; \
+                         reusing key {derived}, no upload"
+                    );
+                    (derived, true)
+                }
+                Ok(probe) => {
+                    let (what, todo) = match &probe {
+                        KeyProbe::Differs(_) => (
+                            "exists but its bytes differ from this batch",
+                            "nothing is lost; run `vtopctl scrub` to see whether a committed \
+                             batch names the damaged object",
+                        ),
+                        KeyProbe::SizeOnly(_) => (
+                            "exists but the backend could confirm only its size",
+                            "use a backend and checksum that verify stored content so a replay \
+                             can reuse it",
+                        ),
+                        _ => (
+                            "could not be checked",
+                            "check the store's permissions: without list permission S3 answers \
+                             a missing key with 403, not 404",
+                        ),
+                    };
+                    let why = probe.reason();
+                    tracing::warn!(
+                        event = "object_key_fallback",
+                        batch_id,
+                        source = source_name,
+                        range,
+                        key = %derived,
+                        fallback_key = %attempt_object_uri,
                         reason = %why,
-                        "object_key_fallback: the derived key is not usable, so the batch \
-                         is written under its attempt key"
+                        "object at {derived} {what} ({why}); writing range {range} of \
+                         {source_name} under {attempt_object_uri} instead of overwriting it; {todo}"
                     );
                     (attempt_object_uri, false)
                 }
-                Err(e) => fail!(format!("object key probe failed: {e}")),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "object_key_probe_throttled",
+                        batch_id,
+                        source = source_name,
+                        range,
+                        key = %derived,
+                        error = %e,
+                        "the store throttled the check of {derived}; nothing was written, the \
+                         batch fails and range {range} of {source_name} is handed back for retry"
+                    );
+                    fail!(format!("object key probe of {derived} failed: {e}"))
+                }
             },
         };
-        if reused {
-            tracing::info!(batch_id, uri = %object_uri, "object_reused");
-        }
         metrics.object_reused = reused;
 
         // ONE PUT, OR RESUMABLE MULTIPART above the threshold (#482). The
@@ -1310,9 +1387,21 @@ enum KeyProbe {
     /// An object is there and verified strongly against the batch's size and
     /// digest: these bytes are already stored, reuse it.
     Holds,
-    /// Something is there that does not verify, verified only by size, or
-    /// the store's answer was not a clear "absent": never write over it.
-    Unusable(String),
+    /// An object is there and does not verify against this batch.
+    Differs(String),
+    /// An object is there and the backend could confirm only its size.
+    SizeOnly(String),
+    /// The store's answer was not a clear "absent" or a verification.
+    Unknown(String),
+}
+
+impl KeyProbe {
+    fn reason(&self) -> &str {
+        match self {
+            KeyProbe::Free | KeyProbe::Holds => "",
+            KeyProbe::Differs(why) | KeyProbe::SizeOnly(why) | KeyProbe::Unknown(why) => why,
+        }
+    }
 }
 
 /// Look at a derived object key before writing to it (#626). A throttle is
@@ -1340,7 +1429,7 @@ async fn probe_object_key(
         Ok(_) => {}
         Err(VtopError::NotFound(_)) => return Ok(KeyProbe::Free),
         Err(e) if e.is_upload_throttle() => return Err(e),
-        Err(e) => return Ok(KeyProbe::Unusable(format!("the probe failed: {e}"))),
+        Err(e) => return Ok(KeyProbe::Unknown(format!("the probe failed: {e}"))),
     }
     match note_store_request(
         backend.verify_object(uri, size, checksum).await,
@@ -1350,16 +1439,10 @@ async fn probe_object_key(
         throttles,
     ) {
         Ok(v) if v.passed && !v.backend_limited => Ok(KeyProbe::Holds),
-        Ok(v) if v.passed => Ok(KeyProbe::Unusable(format!(
-            "an object is there and only its size could be confirmed: {}",
-            v.message
-        ))),
-        Ok(v) => Ok(KeyProbe::Unusable(format!(
-            "an object is there and does not verify against this batch: {}",
-            v.message
-        ))),
+        Ok(v) if v.passed => Ok(KeyProbe::SizeOnly(v.message)),
+        Ok(v) => Ok(KeyProbe::Differs(v.message)),
         Err(e) if e.is_upload_throttle() => Err(e),
-        Err(e) => Ok(KeyProbe::Unusable(format!(
+        Err(e) => Ok(KeyProbe::Unknown(format!(
             "an object is there and could not be verified: {e}"
         ))),
     }
@@ -8723,14 +8806,14 @@ mod tests {
         assert_eq!(probe(strong.clone()).await, KeyProbe::Holds);
         strong.corrupt(uri);
         assert!(
-            matches!(probe(strong.clone()).await, KeyProbe::Unusable(why) if why.contains("does not verify")),
+            matches!(probe(strong.clone()).await, KeyProbe::Differs(_)),
             "damaged bytes are neither reused nor written over"
         );
 
         let limited = Arc::new(vtop_upload::MockBackend::limited());
         limited.put_object(&path, uri, ck()).await.unwrap();
         assert!(
-            matches!(probe(limited).await, KeyProbe::Unusable(why) if why.contains("only its size")),
+            matches!(probe(limited).await, KeyProbe::SizeOnly(_)),
             "a size-only pass does not prove the bytes are this batch's"
         );
         assert_eq!(throttles.load(Ordering::Relaxed), 0);
@@ -8741,7 +8824,7 @@ mod tests {
             vtop_upload::MockBackend::new().with_head_fault(vtop_upload::HeadFault::Refused),
         );
         assert!(
-            matches!(probe(refused).await, KeyProbe::Unusable(why) if why.contains("403")),
+            matches!(probe(refused).await, KeyProbe::Unknown(why) if why.contains("403")),
             "a refused probe falls back to the attempt key"
         );
 

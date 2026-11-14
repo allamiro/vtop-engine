@@ -52,6 +52,8 @@ rdkafka = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# s3_native_object_keys (#626) counts stored object versions on a live store.
+aws-sdk-s3 = { workspace = true }
 
 # Integration tests live in the repo-root tests/ directory and are compiled as
 # integration tests of this package.

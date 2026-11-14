@@ -760,7 +760,7 @@ tests/integration_file_to_minio.rs
 > [!NOTE]
 > The manifest is written at `MANIFEST_UPLOADED`, before storage-side verification.
 >
-> The object is named by its engine, source, range and content digest (`vtop-<engine>-<source>-<range>[-i<inode>]-<digest>`), so a replay that produces the same bytes resolves to the object already stored, and is never written over an object that does not verify (#626). The manifest is named by the per-attempt `batch_id`, whose trailing token is a random suffix. A replay with different batch boundaries (a source that grew since), a later seal-time hour, no checksum, or a command backend (`awscli`, `minio`, `s3cmd`) still writes a second object: see [docs/ARCHITECTURE.md §13](docs/ARCHITECTURE.md) and the deterministic-naming rule of [docs/VTOP_PROTOCOL_DRAFT.md §15.1](docs/VTOP_PROTOCOL_DRAFT.md#151-object-key).
+> The object is named by its source, range and content digest, plus the engine and inode for a file or spool range (`vtop-[<engine>-]<source>-<range>[-i<inode>]-<digest>`), so a replay that produces the same bytes resolves to the object already stored, and is never written over an object that does not verify (#626). The manifest is named by the per-attempt `batch_id`, whose trailing token is a random suffix. A replay with different batch boundaries (a source that grew since), a later seal-time hour, no checksum, or a command backend (`awscli`, `minio`, `s3cmd`) still writes a second object: see [docs/ARCHITECTURE.md §13](docs/ARCHITECTURE.md) and the deterministic-naming rule of [docs/VTOP_PROTOCOL_DRAFT.md §15.1](docs/VTOP_PROTOCOL_DRAFT.md#151-object-key).
 >
 > The authoritative post-verification state lives in the state store and can be queried with `vtopctl status` or `vtopctl list-batches --json`.
 

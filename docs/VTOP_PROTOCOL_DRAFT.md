@@ -533,7 +533,8 @@ s3://{bucket}/{prefix}/tenant={tenant}/source={source}/format={format}/year={yyy
 - The naming scheme **MUST** be deterministic so that replay produces the same object key for the same batch.
 
 *Implementation note (reference engine, #626).* The object's file name is not
-the `batch_id` but `vtop-{engine}-{source}-{range}[-i{inode}]-{digest}`, where
+the `batch_id` but `vtop-[{engine}-]{source}-{range}[-i{inode}]-{digest}` (the
+engine and inode only for file and spool ranges), where
 `digest` is the first 32 hex digits of the object checksum: the same bytes of the same range
 give the same key, and an object already at the key is reused only after it
 verifies against the batch's full digest. The manifest keeps

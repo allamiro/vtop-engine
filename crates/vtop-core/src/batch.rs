@@ -272,16 +272,21 @@ pub fn build_batch_id(source_name: &str, range: &ProgressMarker) -> String {
 /// batch's full digest first.
 pub const OBJECT_NAME_DIGEST_HEX: usize = 32;
 
-/// The name of the object that holds a batch's bytes (#626):
-/// `vtop-<engine>-<source>-<range>[-i<inode>]-<digest>`, where `digest` is the
-/// first [`OBJECT_NAME_DIGEST_HEX`] hex digits of the object's checksum and
-/// the inode is that of the file or spool file the range was read from.
+/// The name of the object that holds a batch's bytes (#626), where `digest`
+/// is the first [`OBJECT_NAME_DIGEST_HEX`] hex digits of the object's
+/// checksum:
 ///
-/// The engine name and the inode keep an object to ONE engine's attempts at
-/// ONE unit's range (review): readers may dedupe on the object URI, so two
-/// engines that archive byte-identical windows of their own files, or a new
-/// file at a path that holds the same bytes as the old one, must not share an
-/// object. Engine names must already be unique per instance.
+/// - a file or spool range: `vtop-<engine>-<source>-<range>[-i<inode>]-<digest>`;
+/// - a Kafka range: `vtop-<source>-<range>-<digest>`.
+///
+/// An object is shared only by attempts at ONE unit's range (review): readers
+/// may dedupe on the object URI. A file or spool file is a unit of one host,
+/// so its name carries the engine (engine names are unique per instance) and
+/// the inode: two engines archiving byte-identical windows of their own
+/// files, or a new file at a path holding the old file's bytes, get separate
+/// objects. A Kafka topic-partition is one unit wherever it is read, so its
+/// name carries no engine: an engine that takes over another's replay (two
+/// engines sharing a ledger) finds the object the first one stored.
 ///
 /// Derived from what the object IS, not from the attempt that wrote it: a
 /// replay that reads the same range of the same source and compresses it to
@@ -298,16 +303,13 @@ pub fn build_object_name(
     range: &ProgressMarker,
     digest_hex: &str,
 ) -> String {
-    let safe_engine = sanitize_token(engine_name);
     let safe_source = sanitize_token(source_name);
-    let unit = match range {
-        ProgressMarker::File {
-            inode: Some(inode), ..
-        }
-        | ProgressMarker::SyslogSpool {
-            inode: Some(inode), ..
-        } => format!("-i{inode}"),
-        _ => String::new(),
+    let (host, unit) = match range {
+        ProgressMarker::File { inode, .. } | ProgressMarker::SyslogSpool { inode, .. } => (
+            format!("{}-", sanitize_token(engine_name)),
+            inode.map(|inode| format!("-i{inode}")).unwrap_or_default(),
+        ),
+        ProgressMarker::Kafka { .. } => (String::new(), String::new()),
     };
     let range = range.range_token();
     let digest: String = digest_hex
@@ -316,7 +318,7 @@ pub fn build_object_name(
         .take(OBJECT_NAME_DIGEST_HEX)
         .map(|c| c.to_ascii_lowercase())
         .collect();
-    format!("vtop-{safe_engine}-{safe_source}-{range}{unit}-{digest}")
+    format!("vtop-{host}{safe_source}-{range}{unit}-{digest}")
 }
 
 /// Replace characters that are unsafe in object keys / file names.
@@ -356,10 +358,7 @@ mod tests {
             name("eng-1", "app.events", &range, &digest),
             "no clock and no randomness in the name"
         );
-        assert_eq!(
-            a,
-            format!("vtop-eng-1-app_events-p0-100-249-{}", "ab".repeat(16))
-        );
+        assert_eq!(a, format!("vtop-app_events-p0-100-249-{}", "ab".repeat(16)));
         for (other, why) in [
             (
                 name("eng-1", "app.events", &range, &"cd".repeat(32)),
@@ -370,13 +369,14 @@ mod tests {
                 "another range",
             ),
             (name("eng-1", "other", &range, &digest), "another source"),
-            (
-                name("eng-2", "app.events", &range, &digest),
-                "another engine",
-            ),
         ] {
             assert_ne!(a, other, "{why}, another name");
         }
+        assert_eq!(
+            a,
+            name("eng-2", "app.events", &range, &digest),
+            "a Kafka partition is one unit wherever it is read: no engine in the name"
+        );
         let file = |inode| ProgressMarker::File {
             path: "/var/log/app.log".into(),
             inode,
@@ -392,7 +392,13 @@ mod tests {
             name("e", "/var/log/app.log", &file(Some(2)), &digest),
             "another file at the path, another name"
         );
-        assert!(name("e", "/var/log/app.log", &file(Some(7)), &digest).contains("-b0-10-i7-"));
+        assert_ne!(
+            name("e1", "/var/log/app.log", &file(Some(1)), &digest),
+            name("e2", "/var/log/app.log", &file(Some(1)), &digest),
+            "a file is one host's unit: another engine, another name"
+        );
+        assert!(name("e", "/var/log/app.log", &file(Some(7)), &digest)
+            .starts_with("vtop-e-_var_log_app_log-b0-10-i7-"));
         // Two attempts at the same range are still two batch ids.
         assert_ne!(
             build_batch_id("app.events", &range),
