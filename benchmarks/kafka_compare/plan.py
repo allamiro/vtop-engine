@@ -202,9 +202,10 @@ SLOWEST_BYTES_PER_SECOND = 2 * 1024 * 1024
 def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = None) -> float:
     """Wall time of the whole matrix, both systems, every profile run.
 
-    A VTOP cell whose configuration is the same under two profiles runs once
-    and its rows are recorded under both (`same_config_as`), when
-    `matrix.vtop_profiles_share_config` says so.
+    A VTOP cell whose configuration is the same under two profiles
+    (`matrix.vtop_profiles_share_config`) brings its cluster up and makes its
+    unrated runs once, recorded under both (`same_config_as`); its
+    fixed-rate runs are made per profile.
     """
     t = {**DEFAULT_TIMING, **(timing or {})}
     # A fixed-rate run lasts the matrix's own target (review): charging a
@@ -214,18 +215,24 @@ def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = 
     fixed = sum(len(p) for p in a.load_bases.values())
     sat_records = {int(k): int(v) for k, v in (matrix.get("sat_records") or {}).items()}
     total = 0.0
+    profiles = len(a.profiles)
     for cell in a.cells:
         sized = {mode: t[mode] for mode in ("saturation", "consume")}
         if cell.record_size in sat_records:
             moved = sat_records[cell.record_size] * cell.record_size / SLOWEST_BYTES_PER_SECOND
             sized = {mode: max(seconds, moved) for mode, seconds in sized.items()}
-        per_rep = 0.0
-        for mode in cell.modes:
-            per_rep += sized.get(mode, t[mode]) * (fixed if mode == "fixed_rate" else 1)
-        one = t["bring_up"] + t["warm_up"] + a.repetitions * per_rep
-        kafka_runs = len(a.profiles)
-        vtop_runs = 1 if matrix.get("vtop_profiles_share_config") else len(a.profiles)
-        total += one * (kafka_runs + vtop_runs)
+        shared = sum(sized.get(m, t[m]) for m in cell.modes if m != "fixed_rate")
+        rated = t["fixed_rate"] * fixed if "fixed_rate" in cell.modes else 0.0
+        one = t["bring_up"] + t["warm_up"] + a.repetitions * (shared + rated)
+        # Kafka runs every profile in full. VTOP, when its configuration is
+        # the same under all of them, brings its cluster up once and makes
+        # its unrated runs once, but its fixed-rate runs once per profile:
+        # their rates are a share of that profile's Kafka saturation.
+        if matrix.get("vtop_profiles_share_config"):
+            vtop = one + (profiles - 1) * a.repetitions * rated
+        else:
+            vtop = one * profiles
+        total += one * profiles + vtop
     return total
 
 
