@@ -294,3 +294,17 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "xy");
     }
 }
+
+/// Off Linux there is no lease, so a writer that holds the file open cannot
+/// be ruled out, and nothing is ever proven: the delete is refused (#619).
+/// Built and run only off Linux, so not in CI, which runs on Linux.
+#[cfg(all(test, not(target_os = "linux")))]
+mod elsewhere {
+    use super::*;
+
+    #[test]
+    fn off_linux_no_file_is_ever_proven_unheld() {
+        let file = tempfile::tempfile().unwrap();
+        assert!(matches!(take(&file), Sole::Unknown(_)));
+    }
+}

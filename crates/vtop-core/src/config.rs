@@ -475,6 +475,13 @@ pub struct FileSourceConfig {
     /// fully archived file is KEPT, with a warning naming the reason, unless
     /// `delete_without_open_check` is set. On a platform without inode
     /// numbers no file is ever deleted.
+    ///
+    /// Also KEPT, each with a message saying why and what to do: a file whose
+    /// mtime or ctime changed after the commit (a touch cannot be told from a
+    /// same-length rewrite between its first and last pages); a configured
+    /// path that is a symbolic link; and a file that cannot be renamed aside
+    /// within its own directory (`EXDEV` for a bind-mounted single file,
+    /// `EACCES` for a directory the engine cannot write).
     #[serde(default)]
     pub delete_after_commit: bool,
     /// How long, in seconds, a fully archived file must stay unwritten before
