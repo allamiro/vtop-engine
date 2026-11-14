@@ -159,7 +159,7 @@ fn map_sqlx(e: sqlx::Error) -> VtopError {
     VtopError::State(redact_postgres_urls(&e.to_string()))
 }
 
-/// A `(path, inode, end_byte, file_size, content, tail)` row of a cursor
+/// A `(path, inode, end_byte, file_size, content, tail, mtime, ctime)` row of a cursor
 /// query. The inode is read as text and parsed here so a u64 above i64::MAX
 /// stays exact; a malformed stored fingerprint reads as unknown (#620).
 fn committed_cursor_of(r: &sqlx::postgres::PgRow) -> Option<CommittedCursor> {
@@ -170,6 +170,7 @@ fn committed_cursor_of(r: &sqlx::postgres::PgRow) -> Option<CommittedCursor> {
     let content: Option<String> = r.get("content");
     let mtime: Option<String> = r.get("mtime");
     let tail: Option<String> = r.get("tail");
+    let ctime: Option<String> = r.get("ctime");
     Some(CommittedCursor {
         path: path?,
         inode: inode.and_then(|i| i.parse().ok()),
@@ -182,6 +183,7 @@ fn committed_cursor_of(r: &sqlx::postgres::PgRow) -> Option<CommittedCursor> {
         tail_fingerprint: tail
             .as_deref()
             .and_then(crate::models::parse_content_fingerprint),
+        observed_ctime: ctime.filter(|c| vtop_core::types::plausible_timestamp(c)),
     })
 }
 
@@ -775,14 +777,15 @@ impl StateStore for PgStateStore {
                         progress_end_json::jsonb ->> 'content_fingerprint' AS content, \
                         progress_end_json::jsonb ->> 'tail_fingerprint' AS tail, \
                         progress_end_json::jsonb ->> 'mtime' AS mtime, \
+                        progress_end_json::jsonb ->> 'ctime' AS ctime, \
                         created_at, batch_id \
                  FROM batches WHERE state = $1 AND source_type = $2 \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ROW_NUMBER() OVER ( \
+                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime, ROW_NUMBER() OVER ( \
                             PARTITION BY path ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest WHERE rn = 1",
+             SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime FROM latest WHERE rn = 1",
         )
         .bind(BatchState::SourceCommitted.as_str())
         .bind(source_type.as_str())
@@ -807,15 +810,16 @@ impl StateStore for PgStateStore {
                         progress_end_json::jsonb ->> 'content_fingerprint' AS content, \
                         progress_end_json::jsonb ->> 'tail_fingerprint' AS tail, \
                         progress_end_json::jsonb ->> 'mtime' AS mtime, \
+                        progress_end_json::jsonb ->> 'ctime' AS ctime, \
                         created_at, batch_id \
                  FROM batches WHERE state = $1 AND source_type = $2 \
              ), latest AS ( \
-                 SELECT path, inode, end_byte, file_size, content, tail, mtime, \
+                 SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime, \
                         created_at, batch_id, ROW_NUMBER() OVER ( \
                             PARTITION BY path, inode ORDER BY created_at DESC, batch_id DESC) AS rn \
                  FROM committed \
              ) \
-             SELECT path, inode, end_byte, file_size, content, tail, mtime FROM latest \
+             SELECT path, inode, end_byte, file_size, content, tail, mtime, ctime FROM latest \
              WHERE rn = 1 ORDER BY path, created_at DESC, batch_id DESC",
         )
         .bind(BatchState::SourceCommitted.as_str())
