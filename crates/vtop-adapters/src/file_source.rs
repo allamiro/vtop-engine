@@ -7713,10 +7713,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.log").to_string_lossy().into_owned();
         std::fs::write(&path, "one\ntwo\n").unwrap();
-        // Off explicitly: this crate's tests turn it on off Linux.
-        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
-            .with_delete_quiet_period(Duration::ZERO)
-            .with_delete_without_open_check(false);
+        // On Linux this is the constructor's default, so the test pins it.
+        // Off Linux this crate's tests turn the opt-in on, so it is turned
+        // off here.
+        let fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        #[cfg(not(target_os = "linux"))]
+        let fs = fs.with_delete_without_open_check(false);
+        let mut fs = fs;
         fs.no_open_check = true;
         let refusals_before = decisions("no_open_check");
         let read = fs
@@ -7764,14 +7768,17 @@ mod tests {
         );
     }
 
-    /// #619, macOS and every platform but Linux: there is no write lease, so
-    /// nothing can prove that no process holds a file open, and with the
+    /// #619, macOS and every Unix but Linux: the engine has no write-lease
+    /// check there, so nothing can prove that no process holds a file open, and with the
     /// default configuration a fully archived file is KEPT, said and
     /// counted. Unlike the test above, no seam: this is the platform's own
     /// answer (`write_lease::take`), which no CI job ran before the macOS
     /// job. With `delete_without_open_check` the file is deleted on the
     /// quiet period alone.
-    #[cfg(not(target_os = "linux"))]
+    ///
+    /// Unix only: on Windows a file has no inode number, so a delete is
+    /// never provable and the refusal is a different one.
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[tokio::test]
     async fn without_a_lease_a_delete_is_refused_unless_configured() {
         let dir = tempfile::tempdir().unwrap();
@@ -7821,6 +7828,14 @@ mod tests {
         assert!(
             !std::path::Path::new(&path).exists(),
             "with delete_without_open_check the file is deleted on the quiet period alone"
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "the delete left {left:?} behind: moved aside and never unlinked"
         );
     }
 
