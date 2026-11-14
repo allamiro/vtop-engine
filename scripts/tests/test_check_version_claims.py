@@ -4,7 +4,7 @@ Each case builds a small repository tree in a temporary directory with every
 version claim the check reads, makes one of them stale, and runs the script
 on it as CI does. The last case runs the script on this checkout.
 
-Run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+Run: python3 -m unittest discover -s scripts/tests -p 'test_check_version_claims.py'
 """
 
 import pathlib
