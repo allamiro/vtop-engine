@@ -177,11 +177,15 @@ PID_LINE="$(grep -o 'Acquired PID{Id:[0-9]*,Epoch:[0-9]*}' "$PLOG" || true)"
 [[ "$(printf '%s\n' "$PID_LINE" | grep -c 'Acquired')" -eq 1 ]] \
   || fail "the producer did not acquire exactly one producer id: '${PID_LINE:-none}'"
 PID_TAG="${PID_LINE#Acquired }"
+# One awk pass over the whole log per partition, not `grep | grep -q`: a
+# grep that stops at its first match can SIGPIPE the one feeding it, which
+# pipefail would report as a failed check (review).
 for part in 0 1; do
-  grep -F "$TOPIC [$part]: Produce MessageSet" "$PLOG" | grep -qF "$PID_TAG" \
-    || fail "partition $part was not written under the producer's id $PID_TAG: $(grep -m 1 -F "$TOPIC [$part]: Produce MessageSet" "$PLOG" || echo 'no produce line')"
-  ! grep -F "$TOPIC [$part]: Produce MessageSet" "$PLOG" | grep -vqF "$PID_TAG" \
-    || fail "partition $part saw a batch under another producer id"
+  read -r batches carrying <<<"$(awk -v p="$TOPIC [$part]: Produce MessageSet" -v id="$PID_TAG" \
+    'index($0, p) { n++; if (index($0, id)) k++ } END { print n + 0, k + 0 }' "$PLOG")"
+  [[ "$batches" -gt 0 ]] || fail "librdkafka logged no batch for partition $part"
+  [[ "$carrying" -eq "$batches" ]] \
+    || fail "partition $part: $carrying of $batches batches carry the producer id $PID_TAG"
 done
 log "one idempotent producer ($PID_TAG) wrote $RECORDS records: $W0 to partition 0, $W1 to partition 1"
 
@@ -210,7 +214,9 @@ for part in 0 1; do
   count="$(awk -v p="$part" '$1 == p' "$OUT" | wc -l | tr -d ' ')"
   want="$W0"; [[ "$part" == 1 ]] && want="$W1"
   [[ "$count" -eq "$want" ]] || fail "partition $part read $count records, its watermark is $want"
-  awk -v p="$part" '$1 == p { n = substr($2, 2, 6) + 0; if (n <= last) { print "out of order at " $2; exit 1 } last = n }' "$OUT" \
+  # The record number is everything between the key's leading `k` and the
+  # colon, whatever its width (review: a fixed six digits misread k1000000).
+  awk -v p="$part" '$1 == p { n = substr($2, 2, index($2, ":") - 2) + 0; if (n <= last) { print "out of order at " $2; exit 1 } last = n }' "$OUT" \
     || fail "partition $part was not read in produced order"
 done
 log "the group read both partitions: exactly the $RECORDS records produced, each once, each partition in produced order"
