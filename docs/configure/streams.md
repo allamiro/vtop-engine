@@ -25,6 +25,8 @@ streams:
 ```
 
 This is an excerpt of [`examples/streams.yaml`](../../examples/streams.yaml).
+Why the checksum matters, and how verification uses it, is on
+[How it works](../concepts/how-it-works.md).
 
 ## Keys
 
@@ -61,40 +63,5 @@ The algorithm decides how the stored copy is verified. With the native S3
 backend, `sha256` uses the store's own checksum when it kept one and reads the
 object back otherwise; `blake3` always reads it back; `none` checks size only.
 
-## Check what each stream runs with
-
-```bash
-vtopctl validate --config config.yaml --print-effective
-```
-
-It contacts no service and resolves no secret. For each stream, and for the
-`default` block that unmapped sources get, it prints every effective setting
-with its origin: `stream`, `global` or `built-in default`. Against the example
-files, one stream reads:
-
-```text
-stream /data/input/auth.cef.log:
-  batching.max_age: 60 (global)
-  batching.max_bytes: 104857600 (global)
-  batching.max_concurrent_batches: 8 (global)
-  batching.max_records: 10000 (global)
-  checksum.algorithm: blake3 (stream)
-  format: cef (stream)
-  manifest_mac: disabled (built-in default)
-  path_template: tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/ (global)
-  resolved_upload_width: 8 (global)
-  retention_class: standard (stream)
-  s3_source_name: auth (stream)
-  source_name: /data/input/auth.cef.log (stream)
-  source_type: file (stream)
-  tenant: default (stream)
-  upload.backend: s3_native (global)
-  upload.prefix: "" (global)
-  upload.require_object_versioning: false (built-in default)
-  upload.require_strong_verification: true (global)
-  verification_method: read_back (stream)
-```
-
-`verification_method` is how the stored copy will be checked:
-`store_checksum`, `read_back` or `size_only`. Add `--json` for the same data
-as JSON, with `effective_version: 1`, `status` and `warnings` beside it.
+To see what each stream ends up running with, use
+[`--print-effective`](print-effective.md).

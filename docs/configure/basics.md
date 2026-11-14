@@ -1,6 +1,8 @@
-# Configure
+# Config basics
 
-The archive engine reads two files and the environment.
+The archive engine reads two files and the environment. What the engine,
+the ledger and the object store each do is on
+[Architecture](../concepts/architecture.md).
 
 | Input | What it holds | Reference |
 |---|---|---|
@@ -24,7 +26,7 @@ such as `upload.require_strong_verification: false`, is printed as a warning
 and still passes.
 
 Add `--print-effective` to see what each stream runs with and where each value
-came from; see [Streams](streams.md#check-what-each-stream-runs-with).
+came from; see [Effective settings](print-effective.md).
 
 ## Secrets
 

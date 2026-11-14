@@ -191,4 +191,4 @@ unknown placeholder resolves to nothing.
 ## Environment variables
 
 Secrets and deployment overrides come from the environment; the list is on
-[Configure](index.md#environment-variables).
+[Config basics](basics.md#environment-variables).
