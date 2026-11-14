@@ -1354,6 +1354,10 @@ jobs:
           - server: minio
             gating: true
             timeout: 30
+          # Second wave: Scality's metadata and data server. amd64 only.
+          - server: cloudserver
+            gating: false
+            timeout: 20
     env:
       RESULTS: ${{ github.workspace }}/s3-compat-out/results-${{ matrix.server }}.jsonl
     steps:
