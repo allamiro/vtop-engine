@@ -122,15 +122,17 @@ impl SecretFile {
 }
 
 /// The SQLite ledger at `database` and the two files SQLite keeps beside it
-/// in WAL mode.
+/// in WAL mode. SQLite resolves a symlinked database before naming those
+/// two, so they are looked for beside the file the link names.
 pub fn sqlite_files(database: &Path) -> Vec<SecretFile> {
+    let resolved = std::fs::canonicalize(database).unwrap_or_else(|_| database.to_path_buf());
     let mut files = vec![SecretFile::new(
         SecretFileKind::StateStoreDatabase,
         "the state-store database",
         database,
     )];
     for suffix in ["-wal", "-shm"] {
-        let mut name = database.as_os_str().to_owned();
+        let mut name = resolved.as_os_str().to_owned();
         name.push(suffix);
         files.push(SecretFile::new(
             SecretFileKind::StateStoreDatabase,
@@ -820,6 +822,34 @@ mod tests {
         // A file that does not exist is left to whoever reads it.
         let missing = SecretFile::new(ManifestKey, "k", root.path().join("absent"));
         assert_eq!(inspect(&missing, &strict), Ok(None));
+    }
+
+    /// Review: SQLite keeps `-wal` and `-shm` beside the file a symlinked
+    /// database names, so they are checked there, not beside the link.
+    #[cfg(unix)]
+    #[test]
+    fn the_wal_of_a_symlinked_ledger_is_checked_beside_its_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let open = root.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let real = open.join("real.db");
+        std::fs::write(&real, "").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let wal = open.join("real.db-wal");
+        std::fs::write(&wal, "").unwrap();
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = root.path().join("state.db");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let report = inspect_all(&sqlite_files(&link), &SecretPolicy::strict());
+        let refused: Vec<_> = report
+            .refusals
+            .iter()
+            .map(|r| r.file.path.clone())
+            .collect();
+        assert_eq!(refused, [wal.canonicalize().unwrap()], "{report:?}");
     }
 
     /// The Kubernetes layout, built for real: a `0440` file in a `..data`

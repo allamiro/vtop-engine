@@ -493,6 +493,9 @@ async fn open_store(
 ) -> Result<(Box<dyn StateStore>, ManifestKeyring), VtopError> {
     let cfg = vtop_core::config::VtopConfig::from_path(config)?;
     cfg.validate()?;
+    // Before any file is read: a key, secret or ledger file accepted under
+    // the override is recorded in the audit file as well as the log (#733).
+    init_sink(&cfg.secret_policy())?;
     let keyring = if with_keyring {
         cfg.resolve_manifest_keyring()?
     } else {

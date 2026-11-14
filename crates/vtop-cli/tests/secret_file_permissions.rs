@@ -374,3 +374,38 @@ fn a_new_ledger_and_a_new_audit_file_are_owner_only() {
     let out = vtopctl(&["process-once", "--source", "file"], &config, None);
     assert!(out.status.success(), "{}", text(&out.stderr));
 }
+
+/// `vtopctl audit list` opens the ledger like any other command: under the
+/// override, a ledger other users can read is announced on its stderr and
+/// leaves an audit record there, rather than being accepted silently.
+#[test]
+fn audit_list_announces_an_override_like_any_other_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("q4");
+    write_mode(&key, KEY_HEX, 0o400);
+    let db = open_dir(dir.path()).join("state.db");
+    let config = write_config(dir.path(), &key, &db, true);
+    let out = vtopctl(&["migrate"], &config, None);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    chmod(&db, 0o644);
+    let audit = dir.path().join("audit.jsonl");
+    let out = vtopctl(&["audit", "list"], &config, Some(&audit));
+    let stderr = text(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let announced: Vec<_> = stderr
+        .lines()
+        .filter(|l| l.contains("Accepted because security.allow_loose_secret_permissions"))
+        .collect();
+    assert_eq!(announced.len(), 1, "{stderr}");
+    assert!(announced[0].contains(&db.display().to_string()), "{stderr}");
+    assert!(
+        stderr.contains("security.override"),
+        "no audit record on the log stream:\n{stderr}"
+    );
+    let recorded = std::fs::read_to_string(&audit).unwrap_or_default();
+    assert!(
+        recorded.contains("\"action\":\"security.override\"")
+            && recorded.contains(&db.display().to_string()),
+        "no record in VTOP_AUDIT_LOG: {recorded}"
+    );
+}

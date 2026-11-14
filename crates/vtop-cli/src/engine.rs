@@ -2262,7 +2262,7 @@ pub(crate) fn check_sqlite_files(
     config: &VtopConfig,
     state_store: &vtop_core::config::ResolvedStateStore,
 ) -> Result<(), VtopError> {
-    match vtop_core::config::sqlite_database_file(state_store.expose_secret()) {
+    match vtop_core::config::sqlite_ledger_file(state_store.expose_secret()) {
         Some(database) => vtop_core::secret_file::enforce_all(
             &vtop_core::secret_file::sqlite_files(&database),
             &config.secret_policy(),

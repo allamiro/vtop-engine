@@ -446,6 +446,10 @@ pub async fn dispatch(cli: Cli) -> i32 {
         return crate::segment_tools::run(command, cli.json);
     }
     if let Command::Audit { command } = cli.command {
+        // A log stream (WARN and above unless --log-level says otherwise),
+        // so a secret file accepted under the override while the ledger is
+        // opened is announced here too (#733).
+        vtop_observe::logging::init(cli.log_level.as_deref().unwrap_or("warn"), cli.json);
         return crate::audit::run(command, cli.json).await;
     }
     // The cluster and node clients write audit records of the commands they

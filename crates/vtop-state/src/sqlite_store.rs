@@ -240,8 +240,8 @@ impl SqliteStateStore {
     pub async fn connect(conn_str: &str) -> Result<Self, VtopError> {
         let opts = parse_sqlite_opts(conn_str)?;
         let in_memory = is_in_memory(conn_str);
-        if !in_memory {
-            create_owner_only(opts.get_filename());
+        if let Some(file) = vtop_core::config::sqlite_ledger_file(conn_str) {
+            create_owner_only(&file);
         }
         // A file is migrated on a connection of its own, closed before the
         // pools that serve requests open (#664). Migrating through the pool,
@@ -1220,6 +1220,21 @@ mod tests {
             .unwrap();
         let mode = std::fs::metadata(&old).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644, "an existing file's mode was changed");
+
+        // A `file:` URI is created owner-only at the path it names, and no
+        // file named after the URI text appears in the working directory.
+        let uri = dir.path().join("uri.db");
+        SqliteStateStore::connect(&format!("sqlite:file:{}?cache=private", uri.display()))
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&uri).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{} was created {mode:04o}", uri.display());
+        let stray = std::fs::read_dir(".")
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("file:"))
+            .count();
+        assert_eq!(stray, 0, "a file named after the URI text was created");
     }
 
     /// #557: two handles on one database file stand for two engines.

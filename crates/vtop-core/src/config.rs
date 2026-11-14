@@ -472,9 +472,72 @@ impl Serialize for StateStoreConfig {
     }
 }
 
+/// The file SQLite opens for a state-store connection string, or `None` for
+/// PostgreSQL and an in-memory database: the name the SQLite store hands
+/// SQLite, read as SQLite reads it (#733). The store strips `sqlite://` or
+/// `sqlite:` and passes the rest as the filename with URI handling on, so a
+/// name starting `file:` is a URI (its path, percent-decoded; `mode=memory`
+/// is in memory), and any other name is a literal path, a `?` included. The
+/// permission checks and the store's owner-only creation both use this, so
+/// they always name the file SQLite opens.
+pub fn sqlite_ledger_file(conn: &str) -> Option<std::path::PathBuf> {
+    if is_postgres_url(conn) || conn == "sqlite::memory:" || conn == ":memory:" {
+        return None;
+    }
+    let name = conn
+        .strip_prefix("sqlite://")
+        .or_else(|| conn.strip_prefix("sqlite:"))
+        .unwrap_or(conn);
+    let Some(uri) = name.strip_prefix("file:") else {
+        return (!name.is_empty() && name != ":memory:").then(|| std::path::PathBuf::from(name));
+    };
+    let uri = uri.split('#').next().unwrap_or_default();
+    let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
+    if query
+        .split('&')
+        .any(|parameter| parameter.eq_ignore_ascii_case("mode=memory"))
+    {
+        return None;
+    }
+    // `file:///abs` and `file://localhost/abs` name `/abs`; `file:rel` is
+    // relative. SQLite refuses any other authority.
+    let path = match path.strip_prefix("//") {
+        Some(rest) => {
+            let slash = rest.find('/').unwrap_or(rest.len());
+            &rest[slash..]
+        }
+        None => path,
+    };
+    let path = percent_decode(path)?;
+    (!path.is_empty() && path != ":memory:").then(|| std::path::PathBuf::from(path))
+}
+
+/// `%XX` escapes as SQLite decodes them in a URI path; `None` for invalid
+/// UTF-8 after decoding.
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (bytes[i], bytes.get(i + 1), bytes.get(i + 2)) {
+            (b'%', Some(&h), Some(&l)) if hex(h).is_some() && hex(l).is_some() => {
+                out.push((hex(h)? * 16 + hex(l)?) as u8);
+                i += 3;
+            }
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// The database file a SQLite connection string names, or `None` for
 /// PostgreSQL and an in-memory database. Accepts `sqlite://path`,
-/// `sqlite:path` and a bare path, as the state store does.
+/// `sqlite:path` and a bare path, as the state store does. Used to place
+/// prune digests; the permission checks use [`sqlite_ledger_file`].
 pub fn sqlite_database_file(conn: &str) -> Option<std::path::PathBuf> {
     let conn = conn.trim();
     if is_postgres_url(conn) {
@@ -1599,7 +1662,7 @@ impl VtopConfig {
                 ));
             }
             StateStoreConfig::Inline(value) => {
-                if let Some(database) = sqlite_database_file(value) {
+                if let Some(database) = sqlite_ledger_file(value) {
                     files.extend(crate::secret_file::sqlite_files(&database));
                 }
             }
@@ -3462,6 +3525,38 @@ upload:
             file: path.to_string_lossy().into_owned(),
         });
         assert_eq!(cfg.resolve_state_store().unwrap().expose_secret(), url);
+    }
+
+    /// #733 (review): the ledger file is the one SQLite opens. The store
+    /// hands SQLite the name after the scheme with URI handling on, so a `?`
+    /// in a plain name is part of the file name, and only a `file:` name is
+    /// a URI.
+    #[test]
+    fn sqlite_ledger_file_names_the_file_sqlite_opens() {
+        use std::path::PathBuf;
+        let some = |p: &str| Some(PathBuf::from(p));
+        for (conn, want) in [
+            ("sqlite:///data/state.db", some("/data/state.db")),
+            ("sqlite:state.db", some("state.db")),
+            ("/data/state.db", some("/data/state.db")),
+            (
+                "sqlite:///data/state.db?mode=memory",
+                some("/data/state.db?mode=memory"),
+            ),
+            (
+                "sqlite:file:///data/a%20b.db?cache=shared",
+                some("/data/a b.db"),
+            ),
+            ("sqlite:file://localhost/data/x.db", some("/data/x.db")),
+            ("sqlite:file:rel.db#frag", some("rel.db")),
+            ("sqlite:file:state.db?cache=shared&mode=memory", None),
+            ("sqlite::memory:", None),
+            (":memory:", None),
+            ("sqlite://:memory:", None),
+            ("postgres://u@h/db", None),
+        ] {
+            assert_eq!(sqlite_ledger_file(conn), want, "{conn}");
+        }
     }
 
     /// #733: `security` defaults off, and a misspelt key in it is refused.
