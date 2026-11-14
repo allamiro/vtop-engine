@@ -139,7 +139,9 @@ macro_rules! prune_committed_sql {
 macro_rules! prune_candidates_sql {
     () => {
         concat!(
-            "SELECT * FROM batches WHERE batch_id IN ( \
+            "SELECT ",
+            batch_columns!(),
+            " FROM batches WHERE batch_id IN ( \
                 SELECT b.batch_id FROM batches b WHERE ",
             prune_predicate_sql!(),
             " LIMIT ?3 ) ORDER BY created_at, batch_id"
@@ -210,13 +212,13 @@ impl SqliteStateStore {
         // A file is migrated on a connection of its own, closed before the
         // pools that serve requests open (#664). Migrating through the pool,
         // a statement at a time, could leave a pool connection that opened
-        // before an `ALTER TABLE ... ADD COLUMN` ran: its `SELECT *` and
-        // `RETURNING *` were prepared against the old column list, SQLite
-        // re-prepared them with the new column, and sqlx's worker panicked on
-        // the column it did not expect. The first recovery claim on an
-        // upgraded file returned no rows at all
-        // (`sqlite_upgrades_a_database_that_predates_the_verification_class`). An in-memory database is new, so its
-        // `ALTER`s add nothing, and it lives only as long as its pool.
+        // before an `ALTER TABLE ... ADD COLUMN` ran, holding statements
+        // prepared against the old column list; with `SELECT *` the first
+        // recovery claim on an upgraded file returned no rows (see
+        // `batch_columns!` for why reads now name their columns, which also
+        // covers a column another process adds). An in-memory database is
+        // new, so its `ALTER`s add nothing, and it lives only as long as its
+        // pool.
         if !in_memory {
             let mut conn = sqlx::ConnectOptions::connect(&opts)
                 .await
@@ -450,11 +452,15 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn get_batch(&self, batch_id: &str) -> Result<Option<BatchRecord>, VtopError> {
-        let row = sqlx::query("SELECT * FROM batches WHERE batch_id = ?")
-            .bind(batch_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            batch_columns!(),
+            " FROM batches WHERE batch_id = ?"
+        ))
+        .bind(batch_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         row.map(row_to_record).transpose()
     }
 
@@ -501,8 +507,15 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
-        self.query_records("SELECT * FROM batches ORDER BY created_at DESC", None)
-            .await
+        self.query_records(
+            concat!(
+                "SELECT ",
+                batch_columns!(),
+                " FROM batches ORDER BY created_at DESC"
+            ),
+            None,
+        )
+        .await
     }
 
     async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError> {
@@ -545,13 +558,14 @@ impl StateStore for SqliteStateStore {
         // fence (review of #569). A row in either terminal state is never
         // claimed. Before SUPERSEDED existed (#567), a range it now retires
         // was claimed, rewritten and re-planned at every restart.
-        let claimed = sqlx::query(
+        let claimed = sqlx::query(concat!(
             "UPDATE batches SET owner = ?1, lease_expires_at = ?2, updated_at = ?3, \
                     claim_gen = claim_gen + 1 \
              WHERE state NOT IN (?4, ?5) \
                AND (owner IS NULL OR owner = ?1 OR lease_expires_at IS NULL OR lease_expires_at <= ?3) \
-             RETURNING *",
-        )
+             RETURNING ",
+            batch_columns!()
+        ))
         .bind(owner)
         .bind(lease_until)
         .bind(now)
@@ -688,19 +702,26 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn list_incomplete_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
-        let rows =
-            sqlx::query("SELECT * FROM batches WHERE state NOT IN (?, ?) ORDER BY created_at ASC")
-                .bind(BatchState::SourceCommitted.as_str())
-                .bind(BatchState::Superseded.as_str())
-                .fetch_all(&self.pool)
-                .await
-                .map_err(map_sqlx)?;
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            batch_columns!(),
+            " FROM batches WHERE state NOT IN (?, ?) ORDER BY created_at ASC"
+        ))
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(BatchState::Superseded.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         rows.into_iter().map(row_to_record).collect()
     }
 
     async fn list_failed_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
         self.query_records(
-            "SELECT * FROM batches WHERE state = ? ORDER BY created_at ASC",
+            concat!(
+                "SELECT ",
+                batch_columns!(),
+                " FROM batches WHERE state = ? ORDER BY created_at ASC"
+            ),
             Some(BatchState::Failed.as_str().to_string()),
         )
         .await
@@ -1205,6 +1226,26 @@ mod tests {
         );
         // Reopening is idempotent: the column is added once.
         SqliteStateStore::connect(&url).await.unwrap();
+    }
+
+    /// Review of #664: a store that is open while another connection adds a
+    /// column - a newer release opening the same file - keeps reading whole
+    /// rows.
+    #[tokio::test]
+    async fn sqlite_reads_whole_rows_after_another_connection_adds_a_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("later.db").display());
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        test_battery::seed_rows_for_every_read_path(&store).await;
+        test_battery::every_read_path_returns_whole_rows(&store).await;
+        let mut other = sqlx::ConnectOptions::connect(&parse_sqlite_opts(&url).unwrap())
+            .await
+            .unwrap();
+        sqlx::raw_sql("ALTER TABLE batches ADD COLUMN vtop_test_later TEXT")
+            .execute(&mut other)
+            .await
+            .unwrap();
+        test_battery::every_read_path_returns_whole_rows(&store).await;
     }
 
     /// A value this build does not know - written by a newer release - reads

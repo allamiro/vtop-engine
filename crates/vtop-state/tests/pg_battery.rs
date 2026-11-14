@@ -371,6 +371,22 @@ $fn$ LANGUAGE plpgsql;",
     let restarted = PgStateStore::connect(&runtime_conn).await.unwrap();
     test_battery::verification_class_after_restart(&restarted).await;
 
+    // ---- 2d. Review of #664: `vtopctl migrate` adding a column while an
+    // engine runs. The runtime store's statements are prepared and cached
+    // per connection; the migration identity adds a column; the same store
+    // must keep reading whole rows. The column is dropped again after.
+    test_battery::seed_rows_for_every_read_path(&store).await;
+    test_battery::every_read_path_returns_whole_rows(&store).await;
+    maintenance
+        .execute_raw("ALTER TABLE batches ADD COLUMN vtop_test_later TEXT")
+        .await
+        .unwrap();
+    test_battery::every_read_path_returns_whole_rows(&store).await;
+    maintenance
+        .execute_raw("ALTER TABLE batches DROP COLUMN vtop_test_later")
+        .await
+        .unwrap();
+
     // ---- 3. Defense in depth: the DB trigger rejects a bypass ----
     // Write straight to the table (skipping update_batch_state's guard) to force
     // the illegal commit-before-verify the trigger exists to catch.

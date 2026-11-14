@@ -2375,7 +2375,8 @@ async fn a_held_back_verified_range_is_settled_without_a_restart_and_without_mov
 /// engine's tenant, so the counter below moves for the settle alone.
 #[tokio::test]
 async fn a_held_back_size_only_row_counts_its_size_only_acceptance_when_it_settles() {
-    let moved = held_back_row_settles("tenant-624-settled-size-only", None).await;
+    let moved =
+        held_back_row_settles("tenant-624-settled-size-only", StoredBy::SizeOnly, None).await;
     assert_eq!(moved, 1);
 }
 
@@ -2385,23 +2386,32 @@ async fn a_held_back_size_only_row_counts_its_size_only_acceptance_when_it_settl
 /// size; verified strongly, it is not counted as size-only when it settles.
 #[tokio::test]
 async fn a_held_back_row_verified_strong_is_not_counted_size_only_when_it_settles() {
-    let moved =
-        held_back_row_settles("tenant-664-settled-strong", Some(VerificationClass::Strong)).await;
+    let moved = held_back_row_settles(
+        "tenant-664-settled-strong",
+        StoredBy::SizeOnly,
+        Some(VerificationClass::Strong),
+    )
+    .await;
     assert_eq!(
         moved, 0,
         "b-held was verified strongly; settling it must not count a size-only commit"
     );
 }
 
-/// And verified size-only, it is.
+/// And verified size-only, it is, though its re-check finds a digest match
+/// (review of #664: with a size-only re-check this passed before the fix too).
 #[tokio::test]
 async fn a_held_back_row_verified_size_only_is_counted_size_only_when_it_settles() {
     let moved = held_back_row_settles(
         "tenant-664-settled-size-only",
+        StoredBy::Digest,
         Some(VerificationClass::SizeOnly),
     )
     .await;
-    assert_eq!(moved, 1);
+    assert_eq!(
+        moved, 1,
+        "b-held was verified size-only; settling it must count one size-only commit"
+    );
 }
 
 /// The ledger and passes of the settle tests above: `b-held`, verified with
@@ -2409,7 +2419,11 @@ async fn a_held_back_row_verified_size_only_is_counted_size_only_when_it_settles
 /// is held back by recovery and settled by the next pass. Asserts nothing is
 /// counted at the hold and nothing after the settle, and returns how far
 /// the settle moved the size-only counter of `row_tenant`.
-async fn held_back_row_settles(row_tenant: &str, class: Option<VerificationClass>) -> u64 {
+async fn held_back_row_settles(
+    row_tenant: &str,
+    stored: StoredBy,
+    class: Option<VerificationClass>,
+) -> u64 {
     let dir = tempfile::tempdir().unwrap();
     let work = dir.path().join("work");
     let input = dir.path().join("in.log");
@@ -2430,7 +2444,14 @@ async fn held_back_row_settles(row_tenant: &str, class: Option<VerificationClass
     };
     let object_uri = "s3://telemetry-data/x/b-held.raw.gz";
     let manifest_uri = "s3://telemetry-data/x/b-held.manifest.json";
-    // Checksums disabled, and a backend that can only confirm size.
+    // Checksums disabled, and a backend that can only confirm size - or a
+    // SHA-256 the mock backend checks the stored bytes against.
+    let object_bytes = b"fourteen-bytes";
+    let digest = vtop_core::checksum::sha256_bytes(object_bytes);
+    let (algorithm, checksum) = match stored {
+        StoredBy::SizeOnly => ("none", ""),
+        StoredBy::Digest => ("sha256", digest.as_str()),
+    };
     let (manifest, manifest_path) = write_recovery_manifest(
         &work,
         "b-held",
@@ -2439,8 +2460,8 @@ async fn held_back_row_settles(row_tenant: &str, class: Option<VerificationClass
         object_uri,
         manifest_uri,
         14,
-        "none",
-        "",
+        algorithm,
+        checksum,
     );
     let row = |id: &str, start: u64, end: u64, at: &str| BatchRecord {
         batch_id: id.into(),
@@ -2471,7 +2492,7 @@ async fn held_back_row_settles(row_tenant: &str, class: Option<VerificationClass
         let mut held = row("b-held", 7, 14, "2026-01-01T00:00:01Z");
         held.object_uri = Some(object_uri.into());
         held.manifest_uri = Some(manifest_uri.into());
-        held.object_sha256 = Some(String::new());
+        held.object_sha256 = Some(checksum.to_owned());
         held.manifest_sha256 = Some(manifest.manifest.sha256.clone());
         held.object_size_bytes = Some(14);
         store.save_batch_state(&held).await.unwrap();
@@ -2502,17 +2523,29 @@ async fn held_back_row_settles(row_tenant: &str, class: Option<VerificationClass
     let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
         .await
         .unwrap();
-    engine.backend = std::sync::Arc::new(vtop_upload::MockBackend::limited());
+    let (object_checksum, manifest_checksum) = match stored {
+        StoredBy::SizeOnly => {
+            engine.backend = std::sync::Arc::new(vtop_upload::MockBackend::limited());
+            (None, None)
+        }
+        StoredBy::Digest => (
+            Some(vtop_upload::ObjectChecksum::new("sha256", &digest)),
+            Some(vtop_upload::ObjectChecksum::new(
+                "sha256",
+                &manifest.manifest.sha256,
+            )),
+        ),
+    };
     let staged = dir.path().join("staged");
-    std::fs::write(&staged, b"fourteen-bytes").unwrap();
+    std::fs::write(&staged, object_bytes).unwrap();
     engine
         .backend
-        .put_object(&staged, object_uri, None)
+        .put_object(&staged, object_uri, object_checksum)
         .await
         .unwrap();
     engine
         .backend
-        .put_manifest(&manifest_path, manifest_uri, None)
+        .put_manifest(&manifest_path, manifest_uri, manifest_checksum)
         .await
         .unwrap();
 
@@ -2525,7 +2558,7 @@ async fn held_back_row_settles(row_tenant: &str, class: Option<VerificationClass
             summary.replay_required
         ),
         (0, 1, 1),
-        "b-held passes its size-only re-check and is held back: {summary:?}"
+        "b-held passes its re-check ({stored:?}) and is held back: {summary:?}"
     );
     assert_eq!(
         size_only_count(row_tenant) - before,

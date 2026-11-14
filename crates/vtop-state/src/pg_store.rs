@@ -312,14 +312,12 @@ impl PgStateStore {
     async fn check_schema(&self) -> Result<(), VtopError> {
         // Listing every runtime column makes an old/partial schema fail during
         // startup instead of halfway through a batch. This is a SELECT only.
-        sqlx::query(
-            "SELECT batch_id, tenant, source_type, source_name, format, state, \
-                    progress_start_json, progress_end_json, object_uri, manifest_uri, \
-                    object_sha256, manifest_sha256, manifest_version_id, object_size_bytes, record_count, \
-                    error_message, owner, lease_expires_at, created_at, updated_at, claim_gen, \
-                    verification_class \
-             FROM batches WHERE FALSE",
-        )
+        // The list every whole-row read names (`batch_columns!`).
+        sqlx::query(concat!(
+            "SELECT ",
+            batch_columns!(),
+            " FROM batches WHERE FALSE"
+        ))
         .fetch_optional(&self.pool)
         .await
         .map_err(map_schema_check)?;
@@ -536,17 +534,28 @@ impl StateStore for PgStateStore {
     }
 
     async fn get_batch(&self, batch_id: &str) -> Result<Option<BatchRecord>, VtopError> {
-        let row = sqlx::query("SELECT * FROM batches WHERE batch_id = $1")
-            .bind(batch_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            batch_columns!(),
+            " FROM batches WHERE batch_id = $1"
+        ))
+        .bind(batch_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         row.map(row_to_record).transpose()
     }
 
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
-        self.query_records("SELECT * FROM batches ORDER BY created_at DESC", None)
-            .await
+        self.query_records(
+            concat!(
+                "SELECT ",
+                batch_columns!(),
+                " FROM batches ORDER BY created_at DESC"
+            ),
+            None,
+        )
+        .await
     }
 
     async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError> {
@@ -586,13 +595,14 @@ impl StateStore for PgStateStore {
         // RETURNING gives exactly the rows THIS statement claimed, with the
         // generation it set (see the SQLite implementation and #557).
         let claimed = with_retry(|| {
-            sqlx::query(
+            sqlx::query(concat!(
                 "UPDATE batches SET owner = $1, lease_expires_at = $2, updated_at = $3, \
                         claim_gen = claim_gen + 1 \
                  WHERE state NOT IN ($4, $5) \
                    AND (owner IS NULL OR owner = $1 OR lease_expires_at IS NULL OR lease_expires_at <= $3) \
-                 RETURNING *",
-            )
+                 RETURNING ",
+                batch_columns!()
+            ))
             .bind(owner)
             .bind(lease_until)
             .bind(now)
@@ -752,9 +762,11 @@ impl StateStore for PgStateStore {
     }
 
     async fn list_incomplete_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
-        let rows = sqlx::query(
-            "SELECT * FROM batches WHERE state NOT IN ($1, $2) ORDER BY created_at ASC",
-        )
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            batch_columns!(),
+            " FROM batches WHERE state NOT IN ($1, $2) ORDER BY created_at ASC"
+        ))
         .bind(BatchState::SourceCommitted.as_str())
         .bind(BatchState::Superseded.as_str())
         .fetch_all(&self.pool)
@@ -765,7 +777,11 @@ impl StateStore for PgStateStore {
 
     async fn list_failed_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
         self.query_records(
-            "SELECT * FROM batches WHERE state = $1 ORDER BY created_at ASC",
+            concat!(
+                "SELECT ",
+                batch_columns!(),
+                " FROM batches WHERE state = $1 ORDER BY created_at ASC"
+            ),
             Some(BatchState::Failed.as_str().to_string()),
         )
         .await
@@ -838,7 +854,9 @@ impl StateStore for PgStateStore {
     ) -> Result<Vec<BatchRecord>, VtopError> {
         let rows = with_retry(|| {
             sqlx::query(concat!(
-                "SELECT * FROM batches WHERE batch_id IN ( \
+                "SELECT ",
+                batch_columns!(),
+                " FROM batches WHERE batch_id IN ( \
                     SELECT b.batch_id FROM batches b WHERE ",
                 pg_prune_predicate_sql!(),
                 " LIMIT $3 ) ORDER BY created_at, batch_id"

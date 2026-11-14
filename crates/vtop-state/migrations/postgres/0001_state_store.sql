@@ -49,11 +49,18 @@ ALTER TABLE batches ADD COLUMN IF NOT EXISTS claim_gen BIGINT NOT NULL DEFAULT 0
 -- (PgStateStore::check_schema), so engines of this release refuse a schema
 -- without it and ask for `vtopctl migrate`.
 --
--- Older engines are unaffected: they read rows by column name, insert by an
--- explicit column list, and never write it, so a row an older engine
--- verifies keeps NULL. The class decides only which counter a recovered
--- commit is counted in; whether the row commits is still decided by the
--- re-check, in every release. No marker bump: see the marker note below.
+-- Older engines keep working on the column once their connections are new:
+-- they map rows by column name, insert by an explicit column list, and never
+-- write it, so a row an older engine verifies keeps NULL. But engines before
+-- #664 read rows with `SELECT *` / `RETURNING *` through statements cached
+-- per connection, and after this ALTER Postgres refuses those ("cached plan
+-- must not change result type") until the connection is replaced: restart
+-- every older engine right after this migration (or drain them first).
+-- Engines of this release name their columns, so a column a later migration
+-- adds does not affect them. The class decides only which counter a
+-- recovered commit is counted in; whether the row commits is still decided
+-- by the re-check, in every release. No marker bump: see the marker note
+-- below.
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS verification_class TEXT;
 
 -- SUPERSEDED (#567): the terminal state of a handed-back range its source has

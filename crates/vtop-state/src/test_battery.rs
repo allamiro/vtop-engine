@@ -298,6 +298,76 @@ pub async fn run_prune_battery(store: &dyn StateStore) {
     superseded_rows_are_pruned_like_committed_history(store).await;
 }
 
+/// Rows for [`every_read_path_returns_whole_rows`]: one VERIFIED with a class,
+/// one FAILED. Call once, on a store no other battery claims from afterwards.
+pub async fn seed_rows_for_every_read_path(store: &dyn StateStore) {
+    store
+        .save_batch_state(&sample_record("reads-verified"))
+        .await
+        .unwrap();
+    for st in &LEGAL_WALK[..5] {
+        store
+            .update_batch_state("reads-verified", *st, &BatchPatch::default())
+            .await
+            .unwrap();
+    }
+    store
+        .mark_verified("reads-verified", VerificationClass::SizeOnly)
+        .await
+        .unwrap();
+    store
+        .save_batch_state(&sample_record("reads-failed"))
+        .await
+        .unwrap();
+    store
+        .mark_failed("reads-failed", "upload failed")
+        .await
+        .unwrap();
+}
+
+/// Every read that returns whole rows returns the rows
+/// [`seed_rows_for_every_read_path`] wrote, class included. Run it, have
+/// ANOTHER connection add a column to `batches` (as `vtopctl migrate`, or a
+/// newer release opening a SQLite file, does while this one runs), and run it
+/// again on the same store (review of #664): a statement that reads `*` was
+/// prepared against the old column list, and failed on the new one - on
+/// Postgres "cached plan must not change result type" until the connection
+/// was replaced, on SQLite a panic in the driver and an empty answer.
+pub async fn every_read_path_returns_whole_rows(store: &dyn StateStore) {
+    const NOW: &str = "2080-01-01T00:00:00+00:00";
+    const LEASE: &str = "2080-01-01T00:05:00+00:00";
+    let class = Some(VerificationClass::SizeOnly);
+    let got = store.get_batch("reads-verified").await.unwrap().unwrap();
+    assert_eq!(
+        (got.state, got.verification_class),
+        (BatchState::Verified, class)
+    );
+    let has = |rows: &[BatchRecord], id: &str| rows.iter().any(|row| row.batch_id == id);
+    let all = store.list_batches().await.unwrap();
+    assert!(
+        has(&all, "reads-verified") && has(&all, "reads-failed"),
+        "list_batches: {all:?}"
+    );
+    let incomplete = store.list_incomplete_batches().await.unwrap();
+    assert!(has(&incomplete, "reads-verified"), "{incomplete:?}");
+    let failed = store.list_failed_batches().await.unwrap();
+    assert!(has(&failed, "reads-failed"), "{failed:?}");
+    let claimed = store
+        .claim_incomplete_batches("engine-reads", NOW, LEASE)
+        .await
+        .unwrap();
+    let row = claimed
+        .iter()
+        .find(|row| row.batch_id == "reads-verified")
+        .unwrap_or_else(|| panic!("the claim did not return reads-verified: {claimed:?}"));
+    assert_eq!(row.verification_class, class);
+    // Nothing is old enough to prune; the statement must still run.
+    store
+        .prune_candidates("2000-01-01T00:00:00+00:00", 10)
+        .await
+        .unwrap();
+}
+
 /// The verified rows [`verification_class_before_restart`] leaves, and the
 /// class each was verified with: `None` is a legacy row, VERIFIED through
 /// `update_batch_state` with no class, as every release before #664 wrote it.

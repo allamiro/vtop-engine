@@ -6,6 +6,27 @@
 //! progress for unverified data. SQLite is the built-in backend; the engine
 //! depends only on the trait.
 
+/// Every column a whole-row read returns, by name: `SELECT` and `RETURNING`
+/// name them rather than `*` (review of #664). A statement is prepared once
+/// per connection and reused, and a `*` in it is the column list of the
+/// moment it was prepared: once another connection added a column - `vtopctl
+/// migrate`, or a newer release opening the same SQLite file, while this
+/// engine runs - Postgres refused it ("cached plan must not change result
+/// type") until the connection was replaced, and SQLite re-prepared it with
+/// one column more than the driver expected, which panicked. A column added
+/// later is not named here, so it changes nothing this release reads.
+/// `PgStateStore::check_schema` names the same list, so startup refuses a
+/// schema that lacks one.
+macro_rules! batch_columns {
+    () => {
+        "batch_id, tenant, source_type, source_name, format, state, \
+         progress_start_json, progress_end_json, object_uri, manifest_uri, \
+         object_sha256, manifest_sha256, manifest_version_id, object_size_bytes, \
+         verification_class, record_count, error_message, owner, lease_expires_at, \
+         created_at, updated_at, claim_gen"
+    };
+}
+
 pub mod deadline;
 mod fence;
 pub mod models;

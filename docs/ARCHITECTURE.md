@@ -718,9 +718,17 @@ A table change, unlike the two notes above: one new column on both backends,
 - The serialized record (a prune digest row) carries `verification_class`
   only when it is known, so a legacy row serializes as before; a value the
   reader does not know reads as unknown rather than failing the digest.
-- An older binary ignores the column on both backends: it reads rows by
+- An older binary ignores the column on both backends: it maps rows by
   column name, inserts by an explicit column list, and never writes it. A row
   it verifies has no class, and is counted by the re-check, as it always was.
+  One caveat: releases before #664 read `SELECT *` / `RETURNING *` through
+  statements cached per connection, and a connection open while the column
+  is added fails those reads until it is replaced (PostgreSQL: `cached plan
+  must not change result type`; SQLite: the driver panics on the extra
+  column). Restart older PostgreSQL engines right after `vtopctl migrate`,
+  and stop any other process on a SQLite file before a newer release first
+  opens it. This release names every column it reads (`batch_columns!` in
+  vtop-state), so a column a later release adds does not affect it.
 
 ---
 

@@ -123,12 +123,20 @@ migration job per database; engine replicas should start only after it succeeds.
   `verification_class` column (`ADD COLUMN IF NOT EXISTS`, no default, no
   rewrite of existing rows). Engines of that release name the column at
   startup and refuse a schema without it, asking for `vtopctl migrate`; run
-  it before rolling them out, as above. Older engines keep running on the
-  migrated schema, before and after an upgraded engine has written a class:
-  they never name the column, a row they verify keeps NULL, and NULL is read
-  as unknown and counted as before. The class decides only which counter a
-  recovered commit is counted in, never whether a row commits, so an older
-  engine ignoring it misreads nothing. The schema marker is not bumped (see
+  it before rolling them out, as above. **Restart every older engine right
+  after the migration** (or drain them before it): engines before #664 read
+  rows with `SELECT *` and `RETURNING *` through statements each connection
+  caches, and once the column exists PostgreSQL refuses those with `cached
+  plan must not change result type` until the connection is replaced -
+  failing that engine's ledger reads and writes meanwhile, which fails
+  batches into replay (the commit rule is not affected). Restarted, an older
+  engine runs on the migrated schema, before and after an upgraded engine
+  has written a class: it never names the column, a row it verifies keeps
+  NULL, and NULL is read as unknown and counted as before. The class decides
+  only which counter a recovered commit is counted in, never whether a row
+  commits, so an older engine ignoring it misreads nothing. Engines of this
+  release name every column they read, so a column a later migration adds
+  does not affect them while they run. The schema marker is not bumped (see
   below). A rollback may keep the column; do not drop it while any engine of
   that release can reach the database.
 - Changes to the JSON inside ledger rows need no migration step. The content
