@@ -48,6 +48,10 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://alloy:4318}
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-vtop-engine}
       OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-false}
+      # Traces only: Alloy already scrapes the engine's /metrics into Mimir,
+      # and the same series sent again over OTLP would be counted twice by
+      # every dashboard that sums them.
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-none}
 
   # --- MinIO: enable public metrics scraping (LAB ONLY) ---------------------
   # MinIO metrics are made public in the BASE docker-compose.yml (so the

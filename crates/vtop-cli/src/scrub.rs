@@ -34,6 +34,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
+use tracing::Instrument;
 use vtop_core::errors::VtopError;
 use vtop_core::manifest::{ManifestMacKey, ParsedManifest, MAX_MANIFEST_BYTES};
 use vtop_core::state_machine::BatchState;
@@ -924,7 +925,9 @@ pub async fn scrub_held(
                 // Opened after the pacer, so the span times the check and not
                 // the wait for its turn (#683).
                 let span = crate::spans::scrub_check(&row.record, row.origin.as_str());
-                let check = scrub_one(backend, mac_key, &row.record).await;
+                let check = scrub_one(backend, mac_key, &row.record)
+                    .instrument(span.clone())
+                    .await;
                 span.record("result", check.result.as_str());
                 span.record(
                     "otel.status_code",

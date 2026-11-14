@@ -147,7 +147,18 @@ fn unbounded_identifiers_are_never_labels() {
 fn every_exported_label_is_from_a_bounded_set() {
     // "le" is Prometheus's own histogram bucket label. It is bounded by the
     // bucket list defined in telemetry.rs, not free-form, so it is legitimate.
-    const BOUNDED: [&str; 6] = ["tenant", "source_type", "format", "state", "stage", "le"];
+    // "reason" and "signal" label the OpenTelemetry exporter's own counters
+    // (#683): three drop reasons and two signals, fixed in vtop-observe.
+    const BOUNDED: [&str; 8] = [
+        "tenant",
+        "source_type",
+        "format",
+        "state",
+        "stage",
+        "le",
+        "reason",
+        "signal",
+    ];
     let text = populated();
     let mut seen = std::collections::BTreeSet::new();
     for line in text.lines().filter(|l| !l.starts_with('#')) {

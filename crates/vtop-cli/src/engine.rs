@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use futures::StreamExt;
+use tracing::Instrument;
 use vtop_adapters::base::{DiscoveredSource, ReadResult, SourceAdapter};
 use vtop_adapters::file_source::ArchivedEnd;
 #[cfg(feature = "kafka")]
@@ -213,15 +214,31 @@ impl<'a> Pipeline<'a> {
                 metrics: None,
             }));
         }
-
-        let started = Instant::now();
         // The batch's span (#683), opened before anything can fail so that a
-        // batch failing at any step is a trace with an error, not a gap.
-        let mut trace = BatchTrace::start(
+        // batch failing at any step is a trace with an error, not a gap. It is
+        // current while this batch's future is polled, and only then, so the
+        // batch's log lines carry its trace id.
+        let trace = BatchTrace::start(
             source.source_type.as_str(),
             &source.source_name,
             read.records.len(),
         );
+        let span = trace.span().clone();
+        self.verify_traced(trace, source, read, stream, sealed_at)
+            .instrument(span)
+            .await
+    }
+
+    /// [`Pipeline::process_until_verified`] inside its batch's span.
+    async fn verify_traced(
+        &self,
+        mut trace: BatchTrace,
+        source: &DiscoveredSource,
+        read: ReadResult,
+        stream: Option<&StreamConfig>,
+        sealed_at: chrono::DateTime<Utc>,
+    ) -> Result<VerifyStep, VtopError> {
+        let started = Instant::now();
 
         let tenant = stream
             .map(|s| s.tenant.clone())
@@ -330,9 +347,9 @@ impl<'a> Pipeline<'a> {
         macro_rules! fail {
             ($msg:expr) => {{
                 let m: String = $msg;
-                // The span records where it failed, never the message: a
-                // backend error can quote the URL it failed on.
-                trace.fail("failed");
+                // The message goes on the span redacted: a backend error can
+                // quote the signed URL it failed on.
+                trace.fail_with("failed", &m);
                 self.store.mark_failed(&batch_id, &m).await?;
                 let replay_recorded = match self
                     .store
@@ -1003,6 +1020,16 @@ impl<'a> Pipeline<'a> {
         adapter: &mut dyn SourceAdapter,
         v: VerifiedBatch,
     ) -> Result<BatchOutcome, VtopError> {
+        let span = v.trace.span().clone();
+        self.commit_traced(adapter, v).instrument(span).await
+    }
+
+    /// [`Pipeline::commit_verified`] inside its batch's span.
+    async fn commit_traced(
+        &self,
+        adapter: &mut dyn SourceAdapter,
+        v: VerifiedBatch,
+    ) -> Result<BatchOutcome, VtopError> {
         let VerifiedBatch {
             batch_id,
             object_uri,
@@ -1024,7 +1051,7 @@ impl<'a> Pipeline<'a> {
             // Verified but commit failed: leave as VERIFIED so recovery retries
             // the commit. NEVER lose the verified object.
             tracing::error!(batch_id, error = %e, "source_commit_failed (will retry on recovery)");
-            trace.fail("commit_failed");
+            trace.fail_with("commit_failed", &e.to_string());
             metrics.finalize(started.elapsed().as_millis() as u64);
             return Ok(BatchOutcome {
                 batch_id,

@@ -61,9 +61,19 @@ pub async fn maybe_start() -> Option<SocketAddr> {
     // And the TLS half (review): a misconfigured pair disables the endpoint,
     // which must be known before the registry exists for the same reason.
     let tls = vtop_observe::tls_from_env_or_disabled()?;
-    if let Err(e) = telemetry::init() {
-        tracing::error!(error = %e, "metrics registry failed to initialize; endpoint disabled");
-        return None;
+    match telemetry::init() {
+        Ok(m) => {
+            // The OpenTelemetry exporter's counters (#683) are served here
+            // too, so a broken collector shows on the scrape; they read 0 with
+            // export off.
+            if let Err(e) = vtop_observe::otel::register_registry(&m.registry) {
+                tracing::warn!(error = %e, "OpenTelemetry counters could not be registered");
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "metrics registry failed to initialize; endpoint disabled");
+            return None;
+        }
     }
     vtop_observe::start_lenient(addr, Arc::new(EngineMetrics), tls).await
 }

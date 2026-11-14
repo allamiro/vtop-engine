@@ -15,7 +15,7 @@ name = "vtopctl"
 path = "src/main.rs"
 
 [features]
-default = ["kafka", "otel"]
+default = ["kafka"]
 # Kafka is a compatibility/source adapter, not a native broker dependency.
 kafka = ["vtop-adapters/kafka", "dep:rdkafka"]
 # Opt-in Kerberos (SASL GSSAPI) for the Kafka source; see vtop-adapters.
@@ -23,20 +23,6 @@ kafka-gssapi = ["kafka", "vtop-adapters/kafka-gssapi"]
 # Keep PostgreSQL optional in the CLI while providing a discoverable feature
 # for production builds and the separate `vtopctl migrate` deployment step.
 postgres = ["vtop-state/postgres"]
-# OTLP trace export (#683). Default, so the shipped binary and image export
-# once an operator sets OTEL_EXPORTER_OTLP_ENDPOINT; until one is set there is
-# no exporter and no export thread. A build that must not carry the egress
-# code at all drops it: `--no-default-features --features kafka`.
-otel = [
-    "dep:opentelemetry",
-    "dep:opentelemetry_sdk",
-    "dep:opentelemetry-otlp",
-    "dep:opentelemetry-http",
-    "dep:tracing-opentelemetry",
-    "dep:hyper-rustls",
-    "dep:hyper-util",
-    "dep:rustls",
-]
 
 [dependencies]
 blake3 = { workspace = true }
@@ -63,18 +49,11 @@ async-trait = { workspace = true }
 uuid = { workspace = true }
 rustix = { workspace = true }
 rdkafka = { workspace = true, optional = true }
-opentelemetry = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true }
-opentelemetry-http = { workspace = true, optional = true }
-tracing-opentelemetry = { workspace = true, optional = true }
-hyper-rustls = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true, features = ["client-legacy"] }
-rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 # The in-memory span exporter the trace tests assert against (#683).
+opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 # Integration tests live in the repo-root tests/ directory and are compiled as

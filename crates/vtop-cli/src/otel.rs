@@ -1,336 +1,53 @@
-//! OTLP trace export for the batch lifecycle (#683). Off by default.
+//! The engine's binding of `vtop_observe::otel` (#683).
 //!
-//! Export is on only when `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or
-//! `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Unset, nothing in this module runs
-//! past reading those two variables: no exporter, no export thread, and the
-//! subscriber is exactly the one `vtop_observe::logging::init` installs. The
-//! spans themselves (`crate::spans`) sit at DEBUG, so the default log filter
-//! turns them away at the callsite and they cost nothing either.
-//!
-//! The transport is OTLP over HTTP with protobuf bodies, the protocol the
-//! OpenTelemetry spec makes the default. It needs only an HTTP client, and
-//! this one is the hyper 1 + hyper-rustls stack the aws-sdk already puts in
-//! the binary; the gRPC transport would have added tonic and its stack.
-//! TLS uses rustls's `ring` provider, like every other client here, with the
-//! system's root certificates (`SSL_CERT_FILE` and `SSL_CERT_DIR` name other
-//! ones). There is no proxy support.
-//!
-//! The standard variables the exporter honours are listed in
-//! observability/README.md. Two are refused rather than ignored: a protocol
-//! other than `http/protobuf` (sending protobuf to a gRPC port would fail on
-//! every export), and `OTEL_SDK_DISABLED=true`, which turns export off.
-//!
-//! A failure to set export up is logged and never fatal: telemetry must not
-//! stop the engine archiving. The same goes for shutdown, which flushes
-//! within [`SHUTDOWN_FLUSH_DEADLINE`] and then lets the process exit whatever
-//! the collector is doing.
+//! The export itself (settings, the span queue, the OTLP exporters, the
+//! metrics bridge and the messages) lives in `vtop-observe`, shared with
+//! `vtop-node`. What is specific to the engine: its service name, its
+//! instance id (the engine's name), its metric registry, and the spans of
+//! the batch lifecycle (`crate::spans`), which the tests below pin down.
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use vtop_core::errors::VtopError;
+use vtop_core::telemetry;
+use vtop_observe::otel::{self, Process};
 
-use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
-use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::trace::SdkTracerProvider;
-use opentelemetry_sdk::Resource;
-use tracing::{Metadata, Subscriber};
-use tracing_subscriber::filter::filter_fn;
-use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::Layer;
+/// The engine's default `service.name`.
+pub const SERVICE_NAME: &str = "vtop-engine";
 
-/// The base endpoint; the exporter appends `/v1/traces`.
-pub const ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
-/// The traces endpoint, used as given. Wins over [`ENDPOINT_ENV`].
-pub const TRACES_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
-/// The `service.name` resource attribute.
-pub const SERVICE_NAME_ENV: &str = "OTEL_SERVICE_NAME";
-/// The service name when [`SERVICE_NAME_ENV`] is unset.
-pub const DEFAULT_SERVICE_NAME: &str = "vtop-engine";
-/// The only protocol accepted.
-pub const PROTOCOL: &str = "http/protobuf";
-
-/// The longest a stop waits for the last spans to reach the collector. Kept
-/// well inside the shortest common termination grace (`docker stop`'s 10 s),
-/// which the engine's own shutdown flush draws on first: losing the last few
-/// spans to an unreachable collector costs a gap in a trace, and a process
-/// that outlives its grace is killed mid-way through whatever it was doing.
-pub const SHUTDOWN_FLUSH_DEADLINE: Duration = Duration::from_secs(5);
-
-/// The per-request timeout when neither timeout variable is set (the spec's
-/// default).
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// What the environment asks for.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Settings {
-    /// No endpoint, or `OTEL_SDK_DISABLED=true`: export is off.
-    Off,
-    /// Export is asked for but cannot be done as asked; the reason is logged.
-    Refused(String),
-    /// Export to `endpoint` (the URL as configured, never logged whole).
-    On {
-        endpoint: String,
-        service_name: String,
-        timeout: Duration,
-    },
-}
-
-/// Read the settings through `env`, which is `std::env::var` in the binary and
-/// a map in the tests (environment variables are process-wide, so tests that
-/// set them would race each other).
-pub fn settings_from(env: impl Fn(&str) -> Option<String>) -> Settings {
-    let set = |name: &str| {
-        env(name)
-            .map(|v| v.trim().to_owned())
-            .filter(|v| !v.is_empty())
-    };
-    let Some(endpoint) = set(TRACES_ENDPOINT_ENV).or_else(|| set(ENDPOINT_ENV)) else {
-        return Settings::Off;
-    };
-    if set("OTEL_SDK_DISABLED").is_some_and(|v| v.eq_ignore_ascii_case("true")) {
-        return Settings::Off;
-    }
-    for var in [
-        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
-        "OTEL_EXPORTER_OTLP_PROTOCOL",
-    ] {
-        if let Some(protocol) = set(var) {
-            if protocol != PROTOCOL {
-                return Settings::Refused(format!(
-                    "{var}={protocol} is not supported; this build exports {PROTOCOL} only"
-                ));
-            }
-            break;
-        }
-    }
-    if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
-        return Settings::Refused(format!(
-            "the OTLP endpoint must be an http:// or https:// URL (host: {})",
-            endpoint_host(&endpoint)
-        ));
-    }
-    let timeout = [
-        "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
-        "OTEL_EXPORTER_OTLP_TIMEOUT",
-    ]
-    .into_iter()
-    .find_map(|var| set(var).and_then(|ms| ms.parse::<u64>().ok()))
-    .map_or(DEFAULT_TIMEOUT, Duration::from_millis);
-    Settings::On {
-        endpoint,
-        service_name: set(SERVICE_NAME_ENV).unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_owned()),
-        timeout,
-    }
-}
-
-/// The host and port of an endpoint URL, for a log line. Everything that can
-/// hold a secret is dropped: the user-info before `@`, the path, the query
-/// string and the fragment.
-pub fn endpoint_host(url: &str) -> String {
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host)
-        .to_owned()
-}
-
-/// Which spans are exported: the engine's own, and nothing else. Library
-/// spans are not ours to vouch for (an HTTP client's can carry a request URL
-/// with its query string), and log events are not exported at all; the spans
-/// carry only the attributes `crate::spans` chooses.
-pub fn exported(meta: &Metadata<'_>) -> bool {
-    meta.is_span() && meta.target().starts_with("vtop_")
-}
-
-/// The tracing layer that hands the engine's spans to `provider`. The binary
-/// and the tests build it here, so the tests exercise the filter and the
-/// attribute choices the binary ships.
-pub fn layer<S>(provider: &SdkTracerProvider) -> impl Layer<S> + Send + Sync
-where
-    S: Subscriber + for<'a> LookupSpan<'a> + Send + Sync,
-{
-    tracing_opentelemetry::layer()
-        .with_tracer(provider.tracer("vtop-engine"))
-        // Source location, thread and target attributes describe the build,
-        // not the batch. Busy/idle time is meaningless for spans that are
-        // never entered (see `crate::spans`), so it is not recorded either.
-        .with_location(false)
-        .with_threads(false)
-        .with_target(false)
-        .with_tracked_inactivity(false)
-        .with_filter(filter_fn(exported))
-}
-
-/// The provider an installed exporter flushes through at shutdown. A
-/// `Mutex<Option<_>>` so [`shutdown`] can take it exactly once.
-static PROVIDER: Mutex<Option<SdkTracerProvider>> = Mutex::new(None);
-
-/// What [`init_tracing`] did, for its caller to report once logging is up.
-enum Installed {
-    Off,
-    Refused(String),
-    On { host: String, service_name: String },
-    Failed(String),
-}
-
-/// Install logging, with the trace exporter beside it when the environment
-/// asks for one. `crate::commands::init_tracing` calls this.
-pub fn init_tracing(level: &str, json: bool) {
-    let installed = match settings_from(|name| std::env::var(name).ok()) {
-        Settings::Off => Installed::Off,
-        Settings::Refused(why) => Installed::Refused(why),
-        Settings::On {
-            endpoint,
-            service_name,
-            timeout,
-        } => match build_provider(&service_name, timeout) {
-            Ok(provider) => {
-                if vtop_observe::logging::init_with_layer(level, json, layer(&provider)) {
-                    *PROVIDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(provider);
-                    Installed::On {
-                        host: endpoint_host(&endpoint),
-                        service_name,
-                    }
-                } else {
-                    // A subscriber was already in place, so the layer went
-                    // unused: release the export thread now.
-                    let _ = provider.shutdown_with_timeout(SHUTDOWN_FLUSH_DEADLINE);
-                    return;
+/// Install logging and, when the environment asks for it, OpenTelemetry
+/// export. A setting that cannot be honoured is a startup error naming the
+/// variable.
+pub fn init_tracing(level: &str, json: bool, instance: Option<&str>) -> Result<(), VtopError> {
+    otel::init(
+        level,
+        json,
+        Process {
+            service: SERVICE_NAME,
+            instance,
+        },
+    )
+    .map_err(|e| VtopError::Config(format!("OpenTelemetry: {e}")))?;
+    if otel::metrics_running() {
+        // The metrics export reads the engine's registry, which otherwise
+        // exists only when `/metrics` is served.
+        match telemetry::init() {
+            Ok(m) => {
+                if let Err(e) = otel::register_registry(&m.registry) {
+                    tracing::warn!(error = %e, "OpenTelemetry counters could not be registered");
                 }
             }
-            Err(why) => Installed::Failed(why),
-        },
-    };
-    match installed {
-        Installed::On { host, service_name } => tracing::info!(
-            endpoint_host = %host,
-            service_name = %service_name,
-            protocol = PROTOCOL,
-            "OTLP trace export enabled"
-        ),
-        Installed::Off => vtop_observe::logging::init(level, json),
-        Installed::Refused(why) => {
-            vtop_observe::logging::init(level, json);
-            tracing::warn!(reason = %why, "OTLP trace export not enabled");
-        }
-        Installed::Failed(why) => {
-            vtop_observe::logging::init(level, json);
-            tracing::error!(error = %why, "OTLP trace export could not be set up; continuing without it");
+            Err(e) => tracing::error!(
+                error = %e,
+                "metrics registry failed to initialize; OpenTelemetry metrics will be empty"
+            ),
         }
     }
+    Ok(())
 }
 
-/// Build the exporter and the provider that batches spans into it. The
-/// endpoint, headers and compression are read from the standard variables by
-/// the exporter itself.
-fn build_provider(service_name: &str, timeout: Duration) -> Result<SdkTracerProvider, String> {
-    let runtime = tokio::runtime::Handle::try_current()
-        .map_err(|_| "no async runtime to send exports on".to_owned())?;
-    let client = OnRuntime::new(timeout, runtime)?;
-    let exporter = SpanExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .with_http_client(client)
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resource = Resource::builder()
-        .with_service_name(service_name.to_owned())
-        .with_attribute(opentelemetry::KeyValue::new(
-            "service.version",
-            env!("CARGO_PKG_VERSION"),
-        ))
-        .build();
-    Ok(SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(resource)
-        .build())
-}
-
-/// Flush what is queued and stop the exporter, waiting at most
-/// [`SHUTDOWN_FLUSH_DEADLINE`]. A no-op when export is off.
-///
-/// The SDK's shutdown blocks its caller until the export thread answers, so
-/// it runs on the blocking pool: on an async worker it would stall the very
-/// runtime the export's HTTP request is spawned on. The outer timeout is a
-/// second bound in case the SDK's own is ever not honoured; if it fires, the
-/// blocking task is left behind and the process exits without it.
+/// Flush and stop export before the process exits (bounded; see
+/// [`otel::SHUTDOWN_FLUSH_DEADLINE`]). A no-op when export is off.
 pub async fn shutdown() {
-    let Some(provider) = PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).take() else {
-        return;
-    };
-    let flush = tokio::task::spawn_blocking(move || {
-        provider.shutdown_with_timeout(SHUTDOWN_FLUSH_DEADLINE)
-    });
-    match tokio::time::timeout(SHUTDOWN_FLUSH_DEADLINE + Duration::from_secs(1), flush).await {
-        Ok(Ok(Ok(()))) => tracing::debug!("OTLP trace export flushed"),
-        Ok(Ok(Err(e))) => tracing::warn!(error = %e, "OTLP trace export did not flush cleanly"),
-        Ok(Err(e)) => tracing::warn!(error = %e, "OTLP trace export flush task failed"),
-        Err(_) => tracing::warn!(
-            deadline_secs = SHUTDOWN_FLUSH_DEADLINE.as_secs(),
-            "OTLP trace export did not flush within its deadline; exiting without it"
-        ),
-    }
-}
-
-/// Whether an exporter is installed in this process.
-pub fn installed() -> bool {
-    PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).is_some()
-}
-
-type Connector = hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>;
-
-/// The hyper client, with each request spawned on the engine's runtime.
-///
-/// The SDK exports from its own thread, which has no Tokio runtime, and
-/// hyper's client needs one to drive its connections. Spawning onto the
-/// runtime captured at start-up and awaiting the join handle (which any
-/// executor can await) keeps the request on Tokio and the export thread
-/// blocked only on the result.
-#[derive(Debug, Clone)]
-struct OnRuntime {
-    client: opentelemetry_http::hyper::HyperClient<Connector>,
-    runtime: tokio::runtime::Handle,
-}
-
-impl OnRuntime {
-    fn new(timeout: Duration, runtime: tokio::runtime::Handle) -> Result<Self, String> {
-        use hyper_rustls::ConfigBuilderExt;
-        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?;
-        // No system roots is not fatal: a plain http:// collector (the usual
-        // in-cluster or sidecar shape) needs none, and an https:// one then
-        // fails its export with a certificate error that says why.
-        let tls = match builder.clone().with_native_roots() {
-            Ok(builder) => builder.with_no_client_auth(),
-            Err(_) => builder
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth(),
-        };
-        let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls)
-            .https_or_http()
-            .enable_http1()
-            .build();
-        Ok(Self {
-            client: opentelemetry_http::hyper::HyperClient::new(connector, timeout, None),
-            runtime,
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl HttpClient for OnRuntime {
-    async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-        let client = self.client.clone();
-        self.runtime
-            .spawn(async move { client.send_bytes(request).await })
-            .await
-            .map_err(|e| Box::new(e) as HttpError)?
-    }
+    otel::shutdown().await;
 }
 
 #[cfg(test)]
@@ -339,11 +56,15 @@ mod tests {
     use crate::engine::Engine;
     use crate::testkit::file_config;
     use opentelemetry::trace::{SpanId, Status};
-    use opentelemetry_sdk::trace::{InMemorySpanExporter, SpanData};
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Layer;
     use vtop_core::config::StreamsConfig;
     use vtop_core::types::SourceType;
+    use vtop_observe::otel::{ExportQueue, QueueSettings, Sampler, Settings};
 
     /// What a span exported for one batch must never carry: the records.
     const RECORD: &str = "do-not-export-me";
@@ -368,7 +89,7 @@ mod tests {
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry().with(layer(&provider));
+        let subscriber = tracing_subscriber::registry().with(otel::layer(&provider));
         let guard = tracing::subscriber::set_default(subscriber);
         (provider, exporter, guard)
     }
@@ -425,81 +146,113 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn without_an_endpoint_export_is_off() {
-        assert_eq!(settings_from(env(&[])), Settings::Off);
-        assert_eq!(
-            settings_from(env(&[(ENDPOINT_ENV, "  ")])),
-            Settings::Off,
-            "a blank endpoint is no endpoint"
-        );
-        assert_eq!(
-            settings_from(env(&[
-                (ENDPOINT_ENV, "http://collector:4318"),
-                ("OTEL_SDK_DISABLED", "TRUE")
-            ])),
-            Settings::Off
-        );
+    /// What a collector does with each request.
+    #[derive(Clone, Copy)]
+    enum Collector {
+        /// Answers 200 at once and records the request.
+        Answers,
+        /// Accepts the connection and never answers.
+        Hangs,
     }
 
-    #[test]
-    fn an_endpoint_turns_export_on_with_the_standard_names() {
-        assert_eq!(
-            settings_from(env(&[(ENDPOINT_ENV, "http://collector:4318")])),
-            Settings::On {
-                endpoint: "http://collector:4318".into(),
-                service_name: DEFAULT_SERVICE_NAME.into(),
-                timeout: DEFAULT_TIMEOUT,
+    /// A local collector; returns its base URL and the (request line, body)
+    /// of every request it answered.
+    async fn collector(
+        mode: Collector,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<(String, Vec<u8>)>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    loop {
+                        let mut chunk = [0u8; 8192];
+                        let head_end = loop {
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break i + 4;
+                            }
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                        let length = head
+                            .lines()
+                            .find_map(|l| {
+                                let (name, value) = l.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        while buf.len() < head_end + length {
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        if let Collector::Hangs = mode {
+                            std::future::pending::<()>().await;
+                        }
+                        let line = head.lines().next().unwrap_or_default().to_owned();
+                        let _ = tx.send((line, buf[head_end..head_end + length].to_vec()));
+                        buf.drain(..head_end + length);
+                        let reply = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+                        if socket.write_all(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
             }
-        );
-        assert_eq!(
-            settings_from(env(&[
-                (ENDPOINT_ENV, "http://collector:4318"),
-                (TRACES_ENDPOINT_ENV, "https://traces:4318/v1/traces"),
-                (SERVICE_NAME_ENV, "archive-eu"),
-                ("OTEL_EXPORTER_OTLP_TIMEOUT", "2500"),
-                ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
-            ])),
-            Settings::On {
-                endpoint: "https://traces:4318/v1/traces".into(),
-                service_name: "archive-eu".into(),
-                timeout: Duration::from_millis(2500),
-            },
-            "the traces endpoint wins over the base one"
-        );
+        });
+        (base, rx)
     }
 
-    #[test]
-    fn a_protocol_or_scheme_this_build_cannot_send_is_refused() {
-        for (var, value) in [
-            ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
-            ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/json"),
-        ] {
-            assert!(
-                matches!(
-                    settings_from(env(&[(ENDPOINT_ENV, "http://c:4317"), (var, value)])),
-                    Settings::Refused(_)
-                ),
-                "{var}={value}"
-            );
-        }
-        let refused = settings_from(env(&[(ENDPOINT_ENV, "collector:4318?token=s3cret")]));
-        let Settings::Refused(why) = refused else {
-            panic!("a URL with no scheme was accepted: {refused:?}");
-        };
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Run `batches` batches (one file each) through an engine whose spans go
+    /// to `provider`, and return how long the batch path took.
+    async fn run_batches(provider: &SdkTracerProvider, batches: usize) -> Duration {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<String> = (0..batches)
+            .map(|i| {
+                let path = dir.path().join(format!("f{i}.log"));
+                std::fs::write(&path, format!("{RECORD} {i}\n")).unwrap();
+                path.to_string_lossy().into_owned()
+            })
+            .collect();
+        let cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            paths,
+            "mock",
+        );
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let subscriber = tracing_subscriber::registry().with(otel::layer(provider));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let started = std::time::Instant::now();
+        let outcomes = engine.process_once(SourceType::File).await.unwrap();
+        let took = started.elapsed();
+        assert_eq!(outcomes.len(), batches);
         assert!(
-            !why.contains("s3cret"),
-            "the reason quotes the query: {why}"
+            outcomes.iter().all(|o| o.committed),
+            "a batch did not commit while traces were being exported"
         );
-    }
-
-    #[test]
-    fn the_logged_endpoint_drops_user_info_path_and_query() {
-        assert_eq!(
-            endpoint_host("https://user:pa55@otel.example:4318/v1/traces?sig=abc#x"),
-            "otel.example:4318"
-        );
-        assert_eq!(endpoint_host("http://alloy:4318"), "alloy:4318");
+        took
     }
 
     #[test]
@@ -686,6 +439,282 @@ mod tests {
         assert_nothing_leaked(&spans);
     }
 
+    /// A batch whose trace is dropped before it reaches an outcome (an error
+    /// returned through `?`, or a flush abandoned mid-batch) is exported as
+    /// `incomplete` with an error status, the open step included.
+    #[test]
+    fn a_batch_dropped_mid_step_is_incomplete_and_an_error() {
+        let (provider, exporter, guard) = capture();
+        {
+            let mut trace = crate::spans::BatchTrace::start("file", "app", 1);
+            trace.begin(crate::spans::Stage::UploadObject);
+        }
+        drop(guard);
+        let spans = finished(&provider, &exporter);
+        let batch = named(&spans, "batch")[0];
+        assert_eq!(attr(batch, "result").as_deref(), Some("incomplete"));
+        assert_eq!(
+            attr(batch, "failed_stage").as_deref(),
+            Some("upload_object")
+        );
+        assert!(matches!(batch.status, Status::Error { .. }));
+        assert!(matches!(
+            named(&spans, "upload_object")[0].status,
+            Status::Error { .. }
+        ));
+    }
+
+    /// #683: a failed batch's span carries the error, with its secrets taken
+    /// out: a presigned URL is cut to its host and a MAC to `<hex>`.
+    #[test]
+    fn a_failed_batch_carries_its_error_redacted() {
+        let (provider, exporter, guard) = capture();
+        {
+            let mut trace = crate::spans::BatchTrace::start("file", "app", 1);
+            trace.begin(crate::spans::Stage::Verify);
+            trace.fail_with(
+                "failed",
+                "object verification failed: GET https://u:pw@bucket.s3.example/o?X-Amz-Signature=abc \
+                 mac 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            );
+        }
+        drop(guard);
+        let spans = finished(&provider, &exporter);
+        for span in [named(&spans, "batch")[0], named(&spans, "verify")[0]] {
+            let Status::Error { description } = &span.status else {
+                panic!("{} is not an error: {:?}", span.name, span.status);
+            };
+            assert_eq!(
+                description, "object verification failed: GET https://bucket.s3.example mac <hex>",
+                "{}",
+                span.name
+            );
+        }
+    }
+
+    /// Both OTLP endpoint variables, end to end through the real exporter:
+    /// the base URL posts to `/v1/traces`, the traces URL to exactly its own
+    /// path, each as protobuf carrying the batch and never its records.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn both_endpoint_variables_reach_the_collector() {
+        let (base, mut requests) = collector(Collector::Answers).await;
+        let traces_url = format!("{base}/custom/traces");
+        for (vars, path) in [
+            (
+                vec![
+                    (otel::ENDPOINT_ENV, base.as_str()),
+                    ("OTEL_METRICS_EXPORTER", "none"),
+                ],
+                "/v1/traces",
+            ),
+            (
+                vec![(otel::TRACES_ENDPOINT_ENV, traces_url.as_str())],
+                "/custom/traces",
+            ),
+        ] {
+            let provider = provider_for(&vars);
+            run_batches(&provider, 1).await;
+            otel::flush_unless(provider, std::future::pending()).await;
+            let (line, body) = tokio::time::timeout(Duration::from_secs(2), requests.recv())
+                .await
+                .expect("no export reached the collector")
+                .unwrap();
+            assert_eq!(line, format!("POST {path} HTTP/1.1"), "{vars:?}");
+            assert!(contains(&body, b"upload_manifest"), "{vars:?}");
+            assert!(contains(&body, SERVICE_NAME.as_bytes()), "{vars:?}");
+            assert!(contains(&body, b"service.instance.id"), "{vars:?}");
+            assert!(
+                !contains(&body, RECORD.as_bytes()),
+                "record content exported"
+            );
+        }
+    }
+
+    fn provider_for(vars: &[(&str, &str)]) -> SdkTracerProvider {
+        let Ok(Settings::On(export)) = otel::settings_from(env(vars), SERVICE_NAME) else {
+            panic!("export is not on for {vars:?}");
+        };
+        otel::build_tracer_provider_for(
+            &export,
+            Process {
+                service: SERVICE_NAME,
+                instance: Some("vtop-test"),
+            },
+        )
+        .unwrap()
+    }
+
+    /// An endpoint nobody listens on: every export fails, the engine keeps
+    /// archiving at its usual pace, and shutdown does not wait on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_collector_never_stops_the_batch_path() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let provider = provider_for(&[
+            (otel::ENDPOINT_ENV, url.as_str()),
+            ("OTEL_EXPORTER_OTLP_TIMEOUT", "2000"),
+        ]);
+        let took = run_batches(&provider, 5).await;
+        assert!(took < Duration::from_secs(5), "5 batches took {took:?}");
+        let started = std::time::Instant::now();
+        otel::flush_unless(provider, std::future::pending()).await;
+        assert!(
+            started.elapsed() < otel::SHUTDOWN_FLUSH_DEADLINE + Duration::from_secs(2),
+            "shutdown waited {:?} on a collector that refuses connections",
+            started.elapsed()
+        );
+    }
+
+    /// A collector that accepts and never answers (the slowest there is):
+    /// batches are not held up, and the flush gives up at its deadline even
+    /// though each request's own timeout is longer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_collector_never_stops_the_batch_path_or_the_exit() {
+        let (base, _requests) = collector(Collector::Hangs).await;
+        let provider = provider_for(&[
+            (otel::ENDPOINT_ENV, base.as_str()),
+            ("OTEL_EXPORTER_OTLP_TIMEOUT", "60000"),
+        ]);
+        let took = run_batches(&provider, 5).await;
+        assert!(took < Duration::from_secs(5), "5 batches took {took:?}");
+        let started = std::time::Instant::now();
+        otel::flush_unless(provider, std::future::pending()).await;
+        let waited = started.elapsed();
+        assert!(
+            waited < otel::SHUTDOWN_FLUSH_DEADLINE + Duration::from_secs(2),
+            "shutdown waited {waited:?}; the deadline is {:?}",
+            otel::SHUTDOWN_FLUSH_DEADLINE
+        );
+    }
+
+    /// An exporter held shut until the test opens it, counting what it is
+    /// finally given.
+    #[derive(Debug, Clone, Default)]
+    struct Gate {
+        open: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        exported: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Gate {
+        fn release(&self) {
+            *self.open.0.lock().unwrap() = true;
+            self.open.1.notify_all();
+        }
+    }
+
+    impl opentelemetry_sdk::trace::SpanExporter for Gate {
+        async fn export(&self, batch: Vec<SpanData>) -> opentelemetry_sdk::error::OTelSdkResult {
+            let (lock, cvar) = &*self.open;
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                open = cvar.wait(open).unwrap();
+            }
+            self.exported
+                .fetch_add(batch.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A buffer a test's log output goes to.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// A collector slower than the engine: spans past the queue's capacity are
+    /// dropped and counted, never held or waited for, with one warning that
+    /// names the cure. This is the queue the binary installs, with
+    /// `OTEL_BSP_MAX_QUEUE_SIZE` / `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` small so
+    /// the bound is visible.
+    #[test]
+    fn a_slow_collector_costs_spans_never_memory_or_time() {
+        const QUEUE: usize = 16;
+        const BATCH: usize = 4;
+        const SPANS: usize = 10_000;
+        let gate = Gate::default();
+        let queue = ExportQueue::new(
+            gate.clone(),
+            QueueSettings {
+                max_queue: QUEUE,
+                max_batch: BATCH,
+                schedule_delay: Duration::from_secs(5),
+            },
+        );
+        let probe = queue.probe();
+        let provider = otel::tracer_provider(queue, Sampler::ParentBasedAlwaysOn, &[]);
+        let dropped_before = otel::stats::stats()
+            .spans_dropped
+            .with_label_values(&["queue_full"])
+            .get();
+        let logs = Logs::default();
+        let started = std::time::Instant::now();
+        {
+            let writer = logs.clone();
+            let subscriber = tracing_subscriber::registry()
+                .with(otel::layer(&provider))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(move || writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing::level_filters::LevelFilter::INFO),
+                );
+            let _guard = tracing::subscriber::set_default(subscriber);
+            for _ in 0..SPANS {
+                tracing::debug_span!(target: "vtop_cli::engine", "batch").in_scope(|| {});
+                assert!(probe.pending() <= QUEUE, "the queue grew past its capacity");
+            }
+        }
+        let took = started.elapsed();
+        gate.release();
+        provider.shutdown().unwrap();
+        let exported = gate.exported.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            exported > 0,
+            "nothing was exported once the collector caught up"
+        );
+        assert!(
+            exported <= QUEUE,
+            "{exported} of {SPANS} spans were kept for a collector that was not answering; \
+             the queue holds {QUEUE}"
+        );
+        let dropped = otel::stats::stats()
+            .spans_dropped
+            .with_label_values(&["queue_full"])
+            .get()
+            - dropped_before;
+        assert!(
+            dropped >= (SPANS - QUEUE) as u64,
+            "only {dropped} drops were counted"
+        );
+        assert!(
+            took < Duration::from_secs(5),
+            "{SPANS} spans took {took:?} to create against a stalled collector"
+        );
+        let text = logs.text();
+        assert_eq!(
+            text.matches("OpenTelemetry export queue full").count(),
+            1,
+            "the warning is rate-limited to one: {text}"
+        );
+        assert!(text.contains("batches are unaffected"), "{text}");
+        assert!(text.contains("OTEL_BSP_MAX_QUEUE_SIZE"), "{text}");
+    }
+
     /// An exporter that never answers: the collector is down and the request
     /// hangs.
     #[derive(Debug)]
@@ -697,32 +726,50 @@ mod tests {
         }
     }
 
+    fn stuck_provider_with_a_span() -> SdkTracerProvider {
+        let queue = ExportQueue::new(
+            Stuck,
+            QueueSettings {
+                max_queue: 16,
+                max_batch: 1,
+                schedule_delay: Duration::from_millis(10),
+            },
+        );
+        let provider = otel::tracer_provider(queue, Sampler::AlwaysOn, &[]);
+        let subscriber = tracing_subscriber::registry().with(otel::layer(&provider));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::debug_span!(target: "vtop_cli::engine", "queued").in_scope(|| {});
+        tracing::debug_span!(target: "vtop_cli::engine", "queued").in_scope(|| {});
+        provider
+    }
+
     /// #683: a stop never waits on the collector for longer than the flush
     /// deadline, however the export hangs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_gives_up_on_a_hung_collector_at_its_deadline() {
-        let provider = SdkTracerProvider::builder()
-            .with_batch_exporter(Stuck)
-            .build();
-        {
-            let subscriber = tracing_subscriber::registry().with(layer(&provider));
-            let _guard = tracing::subscriber::set_default(subscriber);
-            tracing::debug_span!(target: "vtop_cli::engine", "queued").in_scope(|| {});
-        }
-        *PROVIDER.lock().unwrap() = Some(provider);
-        assert!(installed());
+        let provider = stuck_provider_with_a_span();
         let started = std::time::Instant::now();
-        shutdown().await;
+        otel::flush_unless(provider, std::future::pending()).await;
         let waited = started.elapsed();
         assert!(
-            waited < SHUTDOWN_FLUSH_DEADLINE + Duration::from_secs(2),
-            "shutdown waited {waited:?} on a collector that never answers; the deadline is \
-             {SHUTDOWN_FLUSH_DEADLINE:?}"
+            waited < otel::SHUTDOWN_FLUSH_DEADLINE + Duration::from_secs(2),
+            "shutdown waited {waited:?} on a collector that never answers; the deadline is {:?}",
+            otel::SHUTDOWN_FLUSH_DEADLINE
         );
-        assert!(!installed(), "shutdown releases the exporter");
-        // A second stop has nothing left to flush and returns at once.
+    }
+
+    /// Review of #693: a stop signal during the flush ends the wait at once.
+    /// After a second signal has abandoned the engine's own flush, the
+    /// operator must not be held by a collector that never answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_signal_cuts_the_flush_short() {
+        let provider = stuck_provider_with_a_span();
         let started = std::time::Instant::now();
-        shutdown().await;
-        assert!(started.elapsed() < Duration::from_secs(1));
+        otel::flush_unless(provider, async {}).await;
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(1),
+            "a stop signal was pending and the flush still waited {waited:?}"
+        );
     }
 }

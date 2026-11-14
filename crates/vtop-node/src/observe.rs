@@ -133,6 +133,11 @@ impl NodeObservability {
         registry
             .register(Box::new(info))
             .map_err(|error| format!("register node_info: {error}"))?;
+        // The OpenTelemetry exporter's own counters, and the registry its
+        // metrics export reads (#683). Registered whether export is on or not,
+        // so the series read 0 rather than being absent.
+        vtop_observe::otel::register_registry(&registry)
+            .map_err(|error| format!("register OpenTelemetry counters: {error}"))?;
         Ok(Self {
             registry,
             gate: ReadinessGate::starting("node is still starting"),
@@ -2941,8 +2946,10 @@ mod tests {
     /// unbounded label would grow the TSDB without limit.
     #[test]
     fn every_node_label_is_from_a_bounded_set() {
-        const BOUNDED: [&str; 8] = [
-            "role", "node_id", "state", "reason", "scope", "topic", "range", "follower",
+        // "signal" (traces, metrics) labels the OpenTelemetry exporter's
+        // own counters (#683); its "reason" is already here.
+        const BOUNDED: [&str; 9] = [
+            "role", "node_id", "state", "reason", "scope", "topic", "range", "follower", "signal",
         ];
         let observability = NodeObservability::new("data", "abc").unwrap();
         let report = RecoveryReport {

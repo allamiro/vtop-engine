@@ -10,7 +10,6 @@ pub mod engine;
 pub mod meta_tools;
 pub mod metrics_server;
 pub mod node_tools;
-#[cfg(feature = "otel")]
 pub mod otel;
 pub mod scrub;
 pub mod segment_tools;

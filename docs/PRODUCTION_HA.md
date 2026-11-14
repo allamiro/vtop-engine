@@ -82,8 +82,9 @@ As of **August 2026** (repo at v0.3.0):
   on SQLite; `vtopctl prune-ledger` under a maintenance identity on
   PostgreSQL (#128, part of Phase 8).
 - Prometheus metrics + readiness endpoint, opt-in via `VTOP_METRICS_ADDR`
-  (`vtop-observe`); structured per-stage events; OTLP trace export of each
-  batch's lifecycle, opt-in via `OTEL_EXPORTER_OTLP_ENDPOINT` (#683);
+  (`vtop-observe`); structured per-stage events; OpenTelemetry export (traces
+  of each batch's lifecycle, the metrics over OTLP, trace ids in the JSON
+  logs), built in and idle until `OTEL_EXPORTER_OTLP_ENDPOINT` is set (#683);
   Grafana/Loki/Mimir/Tempo/Alloy compose stack and generated dashboards in
   `observability/` (part of Phase 6).
 - Single-instance safety: exclusive work-dir lock at startup (#66) so the
@@ -1086,8 +1087,8 @@ path needed by the distributed options is already implemented (§6.3).
 | `VTOP_METRICS_ADDR` | opt-in Prometheus metrics + readiness endpoint (e.g. `0.0.0.0:9090`); nothing listens unless set |
 | `VTOP_METRICS_TLS_CERT` / `VTOP_METRICS_TLS_KEY` | serve the metrics endpoint over TLS 1.3 (#294): both or neither — half a pair disables the endpoint rather than serving it plaintext |
 | `VTOP_METRICS_TLS_CLIENT_CA` | with the pair above, make the endpoint mutual: only scrapers presenting a certificate under this CA are served |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | opt-in OTLP/HTTP trace export (#683); nothing is exported, and no exporter exists, unless one is set. The other standard `OTEL_*` variables are listed in [observability/README.md](../observability/README.md#traces) |
-| `OTEL_SERVICE_NAME` | the traces' `service.name` (default `vtop-engine`) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` (or `..._TRACES_ENDPOINT` / `..._METRICS_ENDPOINT`) | OpenTelemetry export over OTLP/HTTP (#683): traces, and the `/metrics` series. Nothing is exported, and no exporter exists, unless one is set. Every standard `OTEL_*` variable honoured, with its default, is listed in [observability/README.md](../observability/README.md#opentelemetry); one set to something unsupported stops the process at startup |
+| `OTEL_SERVICE_NAME` | `service.name` (default `vtop-engine`; `vtop-node` for the nodes) |
 | `OTEL_EXPORTER_OTLP_HEADERS` | collector request headers, e.g. an auth token; a secret |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | S3 credentials |
 | `AWS_REGION` | S3 region |
@@ -1103,7 +1104,6 @@ path needed by the distributed options is already implemented (§6.3).
 | `VTOP_PG_STATEMENT_TIMEOUT_MS` | guard stuck statements |
 | `VTOP_OBJECT_KEY_MODE` | `legacy` \| `deterministic` \| `content-addressed` |
 | `VTOP_KAFKA_GROUP_MODE` | `assign` (single-node) \| `subscribe` (fleet) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry collector |
 | `VTOP_INSTANCE_ID` | stable replica identity (group member / lease owner) |
 | `VTOP_ETCD_ENDPOINTS` | etcd/Consul endpoints for leases |
 | `VTOP_LEASE_TTL_SECONDS` | source-ownership lease TTL |
@@ -1120,11 +1120,14 @@ path needed by the distributed options is already implemented (§6.3).
   (`crates/vtop-observe`, served by `vtopctl`), including a readiness probe.
 - **Structured per-stage events** — one logical span per batch with child
   events per pipeline stage.
-- **OTLP trace export** (#683) — opt-in via `OTEL_EXPORTER_OTLP_ENDPOINT`: a
-  `batch` span with a child per step (seal, compress, checksum, upload_object,
-  upload_manifest, verify, commit), a span per recovery decision and per scrub
-  check; HTTP/protobuf; flushed within 5 s at shutdown. See the
-  [observability README](../observability/README.md#traces).
+- **OpenTelemetry export** (#683) — built into `vtopctl` and `vtop-node`, idle
+  until `OTEL_EXPORTER_OTLP_ENDPOINT` is set: a `batch` span with a child per
+  step (seal, compress, checksum, upload_object, upload_manifest, verify,
+  commit), a span per recovery decision and per scrub check, the `/metrics`
+  series over OTLP, trace ids in the JSON log lines, and the exporter's own
+  counters on `/metrics`; HTTP/protobuf; a bounded queue, so the data path
+  never waits on the collector; flushed within 5 s at shutdown. See the
+  [observability README](../observability/README.md#opentelemetry).
 - **Dashboard tooling** — the `observability/` directory carries a
   Grafana/Loki/Mimir/Tempo/Alloy compose stack
   (`docker-compose.observability.yml`) and generated dashboards for the

@@ -7,20 +7,22 @@
 //! The OTLP layer (`crate::otel`) accepts them whatever the log level, and it
 //! is only installed when an endpoint is configured.
 //!
-//! None of them is ever entered. Each is created with an explicit parent (a
-//! batch, recovery and a scrub check are roots) and closed by dropping it. A
-//! span entered in an `async fn` stays entered across every `.await`, and the
-//! verify phase polls many batches' futures on one task (`buffer_unordered`):
-//! whatever another batch logged or opened while this one was suspended would
-//! be filed under the wrong batch.
+//! Each is created with an explicit parent (a batch, recovery and a scrub
+//! check are roots) and closed by dropping it. A batch's span is entered only
+//! through `Instrument` on that batch's own futures, so it is current exactly
+//! while one of them is being polled: never across an `.await` with a guard,
+//! which in the verify phase (many batches' futures polled on one task by
+//! `buffer_unordered`) would file one batch's log lines under another. The
+//! step spans and recovery's spans are never entered.
 //!
 //! What may be an attribute: identifiers (batch id, source type and name,
 //! tenant), counts, sizes, algorithm and method names, and the outcome. What
 //! may not: record content, credentials, keys, and URLs, whose query strings
-//! can carry signatures. That is why no URI and no error message is recorded
-//! here (a backend error can quote the request it failed on); the failed
-//! stage and the outcome say where to look, and the logs, keyed by the same
-//! `batch_id`, carry the detail. Log events are not exported at all.
+//! can carry signatures. No URI is recorded. A failed batch's error message
+//! becomes its span status only after `vtop_observe::otel::redact` has cut
+//! every URL to its host and removed MACs, digests and key ids. Log events
+//! are not exported at all; the JSON log lines carry the trace and span ids
+//! instead, so a trace leads to its lines in Loki.
 
 use tracing::field::Empty;
 use tracing::Span;
@@ -57,27 +59,30 @@ impl Stage {
         // callsite. The batch is named as the parent explicitly, so a stage
         // never depends on what happens to be entered on this thread.
         match self {
-            Stage::Seal => tracing::debug_span!(parent: batch, "seal", otel.status_code = Empty),
+            Stage::Seal => {
+                tracing::debug_span!(parent: batch, "seal", otel.status_code = Empty, otel.status_description = Empty)
+            }
             Stage::Compress => {
-                tracing::debug_span!(parent: batch, "compress", otel.status_code = Empty)
+                tracing::debug_span!(parent: batch, "compress", otel.status_code = Empty, otel.status_description = Empty)
             }
             Stage::Checksum => {
-                tracing::debug_span!(parent: batch, "checksum", otel.status_code = Empty)
+                tracing::debug_span!(parent: batch, "checksum", otel.status_code = Empty, otel.status_description = Empty)
             }
             Stage::UploadObject => tracing::debug_span!(
                 parent: batch,
                 "upload_object",
                 multipart = Empty,
-                otel.status_code = Empty
+                otel.status_code = Empty,
+                otel.status_description = Empty
             ),
             Stage::UploadManifest => {
-                tracing::debug_span!(parent: batch, "upload_manifest", otel.status_code = Empty)
+                tracing::debug_span!(parent: batch, "upload_manifest", otel.status_code = Empty, otel.status_description = Empty)
             }
             Stage::Verify => {
-                tracing::debug_span!(parent: batch, "verify", otel.status_code = Empty)
+                tracing::debug_span!(parent: batch, "verify", otel.status_code = Empty, otel.status_description = Empty)
             }
             Stage::Commit => {
-                tracing::debug_span!(parent: batch, "commit", otel.status_code = Empty)
+                tracing::debug_span!(parent: batch, "commit", otel.status_code = Empty, otel.status_description = Empty)
             }
         }
     }
@@ -119,12 +124,34 @@ impl BatchTrace {
             result = Empty,
             failed_stage = Empty,
             otel.status_code = Empty,
+            otel.status_description = Empty,
         );
         Self {
             stage: None,
             batch,
             settled: false,
         }
+    }
+
+    /// The batch span, for `Instrument` on the batch's futures.
+    pub(crate) fn span(&self) -> &Span {
+        &self.batch
+    }
+
+    /// [`BatchTrace::fail`] with the error, redacted, as the status
+    /// description of both spans.
+    pub(crate) fn fail_with(&mut self, result: &'static str, error: &str) {
+        // The description sets the error status by itself; recording
+        // `otel.status_code` after it would replace it with an empty one.
+        let description = vtop_observe::otel::redact(error);
+        if let Some((stage, span)) = self.stage.take() {
+            span.record("otel.status_description", description.as_str());
+            self.batch.record("failed_stage", stage.as_str());
+        }
+        self.batch.record("result", result);
+        self.batch
+            .record("otel.status_description", description.as_str());
+        self.settled = true;
     }
 
     /// Record one of the batch span's declared attributes.
