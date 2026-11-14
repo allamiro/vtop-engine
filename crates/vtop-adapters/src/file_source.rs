@@ -815,7 +815,16 @@ impl FileSource {
             #[cfg(test)]
             notices: Vec::new(),
             warned_leftovers: std::sync::Mutex::new(std::collections::HashSet::new()),
-            delete_without_open_check: false,
+            // Off by default. Except in this crate's own tests off Linux
+            // (#619): no platform but Linux has a check that no process holds
+            // a file open, so there every delete is refused unless the
+            // operator sets `delete_without_open_check` - and the tests that
+            // prove what a delete does would prove nothing but the refusal.
+            // Those tests run on macOS in CI with the opt-in, the only way a
+            // delete happens there. The tests that need the check run on
+            // Linux only, and the refusal itself is pinned by tests that turn
+            // the opt-in off.
+            delete_without_open_check: cfg!(all(test, not(target_os = "linux"))),
         }
     }
 
@@ -7503,7 +7512,11 @@ mod tests {
     /// and the file was deleted; the writer's next line went into the unlinked
     /// inode, which nothing reads. How long a file has been quiet cannot say
     /// whether a process still holds it open.
-    #[cfg(unix)]
+    ///
+    /// Linux only: the proof is a write lease, and off Linux the delete is
+    /// either refused or, with `delete_without_open_check`, made on the
+    /// quiet period alone, which loses the line by the operator's choice.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_writer_silent_for_longer_than_the_quiet_period_keeps_the_file_it_holds_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -7538,7 +7551,6 @@ mod tests {
             "deleted while a writer still held it open; \"three\" went into an unlinked \
              inode that nothing will read"
         );
-        #[cfg(target_os = "linux")]
         assert!(
             notice(&fs, &format!("not deleting {path}: it is open elsewhere")),
             "kept without saying why: {:?}",
@@ -7561,9 +7573,9 @@ mod tests {
     /// unlink took the write with it. The seam writes exactly there, through
     /// the writer's own descriptor, if the delete gets that far - on the
     /// delete before #619 was finished it did. Now the writer's open
-    /// descriptor stops it at the lease (or, off Linux, the delete is refused),
-    /// and the writer writes after the delete instead.
-    #[cfg(unix)]
+    /// descriptor stops it at the lease, and the writer writes after the
+    /// delete instead. Linux only, for the reason the test above gives.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_write_between_the_final_check_and_the_unlink_is_not_lost() {
         let dir = tempfile::tempdir().unwrap();
@@ -7701,8 +7713,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.log").to_string_lossy().into_owned();
         std::fs::write(&path, "one\ntwo\n").unwrap();
+        // Off explicitly: this crate's tests turn it on off Linux.
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
-            .with_delete_quiet_period(Duration::ZERO);
+            .with_delete_quiet_period(Duration::ZERO)
+            .with_delete_without_open_check(false);
         fs.no_open_check = true;
         let refusals_before = decisions("no_open_check");
         let read = fs
@@ -7747,6 +7761,66 @@ mod tests {
         assert!(
             !std::path::Path::new(&path).exists(),
             "with delete_without_open_check the operator chose the quiet period alone"
+        );
+    }
+
+    /// #619, macOS and every platform but Linux: there is no write lease, so
+    /// nothing can prove that no process holds a file open, and with the
+    /// default configuration a fully archived file is KEPT, said and
+    /// counted. Unlike the test above, no seam: this is the platform's own
+    /// answer (`write_lease::take`), which no CI job ran before the macOS
+    /// job. With `delete_without_open_check` the file is deleted on the
+    /// quiet period alone.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn without_a_lease_a_delete_is_refused_unless_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        // The production default; this crate's tests turn it on off Linux.
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO)
+            .with_delete_without_open_check(false);
+        let refusals_before = decisions("no_open_check");
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("one\ntwo\n"),
+            "deleted with no way to tell whether a writer holds it open, and the operator \
+             did not choose the quiet period alone"
+        );
+        assert!(
+            decisions("no_open_check") > refusals_before,
+            "the refusal was not counted under no_open_check"
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "not deleting {path}: the engine cannot check that no process holds it \
+                     open (this platform has no check"
+                )
+            ) && notice(&fs, "it is KEPT")
+                && notice(&fs, "delete_without_open_check: true"),
+            "refused without saying what happened, what the engine did and what to do: {:?}",
+            fs.notices
+        );
+
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO)
+            .with_delete_without_open_check(true);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "with delete_without_open_check the file is deleted on the quiet period alone"
         );
     }
 
