@@ -67,6 +67,9 @@ fn populated() -> String {
             .observe(0.01);
     }
     m.inflight_batches.set(2);
+    m.file_delete_decisions_total
+        .with_label_values(&["no_open_check"])
+        .inc();
     m.encode().expect("encode must succeed")
 }
 
@@ -109,6 +112,8 @@ fn expected_labels_are_present() {
         r#"format="cef""#,
         r#"state="verified""#,
         r#"stage="compress""#,
+        // #619: why delete_after_commit kept a file, a fixed set.
+        r#"vtop_file_delete_decisions_total{outcome="no_open_check"}"#,
     ] {
         assert!(text.contains(l), "missing label {l}");
     }
@@ -147,7 +152,17 @@ fn unbounded_identifiers_are_never_labels() {
 fn every_exported_label_is_from_a_bounded_set() {
     // "le" is Prometheus's own histogram bucket label. It is bounded by the
     // bucket list defined in telemetry.rs, not free-form, so it is legitimate.
-    const BOUNDED: [&str; 6] = ["tenant", "source_type", "format", "state", "stage", "le"];
+    // "outcome" is `vtop_file_delete_decisions_total`'s, from a fixed list in
+    // file_source.rs (#619), never the path.
+    const BOUNDED: [&str; 7] = [
+        "tenant",
+        "source_type",
+        "format",
+        "state",
+        "stage",
+        "le",
+        "outcome",
+    ];
     let text = populated();
     let mut seen = std::collections::BTreeSet::new();
     for line in text.lines().filter(|l| !l.starts_with('#')) {

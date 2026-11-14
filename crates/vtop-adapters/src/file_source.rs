@@ -154,6 +154,20 @@ enum Kept {
 }
 
 impl Kept {
+    /// The `outcome` label of `vtop_file_delete_decisions_total`.
+    fn outcome(&self) -> &'static str {
+        match self {
+            Kept::Grew { .. } => "appended",
+            Kept::Shrank { .. } => "shorter",
+            Kept::OtherFile { .. } => "other_file",
+            Kept::Rewritten => "rewritten",
+            Kept::Unprovable => "unprovable",
+            Kept::MetadataMoved => "metadata_changed",
+            Kept::Gone => "gone",
+            Kept::Symlink => "symlink",
+        }
+    }
+
     /// What happened, what the engine does, and what to do, for `path`.
     fn message(&self, path: &str, archived: u64) -> (tracing::Level, String) {
         use tracing::Level;
@@ -600,6 +614,7 @@ impl DeleteJob {
                                  is not archived - check what opened it",
                                 path.display()
                             );
+                            count_delete_decision("opened_at_unlink");
                         }
                         DeleteAttempt::Deleted
                     }
@@ -624,6 +639,17 @@ impl DeleteJob {
 /// new file. With writers opening, appending and closing in a tight loop, 20
 /// and 50 ms both lost nothing where no grace lost lines.
 const DELETE_GRACE: Duration = Duration::from_millis(50);
+
+/// Count one `delete_after_commit` decision (#619) in
+/// `vtop_file_delete_decisions_total{outcome}`, when metrics are on.
+fn count_delete_decision(outcome: &'static str) {
+    if let Some(metrics) = vtop_core::telemetry::metrics() {
+        metrics
+            .file_delete_decisions_total
+            .with_label_values(&[outcome])
+            .inc();
+    }
+}
 
 /// Whether two descriptors are on the same file (device and inode).
 fn same_file(a: &std::fs::File, b: &std::fs::File) -> bool {
@@ -964,6 +990,7 @@ impl FileSource {
                      or a rewrite while the engine was down); it is KEPT - remove it by hand once \
                      you know it holds nothing new"
                 );
+                count_delete_decision("metadata_changed");
             }
             return;
         }
@@ -1021,6 +1048,7 @@ impl FileSource {
     /// skip. Tests read the same text back from `notices`.
     fn notify(
         &mut self,
+        outcome: &'static str,
         level: tracing::Level,
         path: &str,
         inode: Option<u64>,
@@ -1039,6 +1067,7 @@ impl FileSource {
             }
             _ => tracing::debug!(path, inode, archived_bytes = archived, "{message}"),
         }
+        count_delete_decision(outcome);
         #[cfg(test)]
         self.notices.push(message);
     }
@@ -1087,6 +1116,7 @@ impl FileSource {
                 self.cursors.remove(path);
                 self.held.remove(path);
                 self.notify(
+                    "deleted",
                     tracing::Level::INFO,
                     path,
                     inode,
@@ -1107,7 +1137,7 @@ impl FileSource {
                     c.delete_candidate = None;
                 }
                 let (level, message) = why.message(path, archived);
-                self.notify(level, path, inode, archived, message);
+                self.notify(why.outcome(), level, path, inode, archived, message);
                 false
             }
             DeleteAttempt::Open { during, ctime } => {
@@ -1135,6 +1165,7 @@ impl FileSource {
                      this engine - so a writer may still append to it"
                 };
                 self.notify(
+                    "open",
                     level,
                     path,
                     inode,
@@ -1156,6 +1187,7 @@ impl FileSource {
                     c.delete_candidate = None;
                 }
                 self.notify(
+                    "no_open_check",
                     tracing::Level::WARN,
                     path,
                     inode,
@@ -1185,6 +1217,7 @@ impl FileSource {
                     c.since = Instant::now();
                 }
                 self.notify(
+                    "rename_refused",
                     level,
                     path,
                     inode,
@@ -1215,6 +1248,7 @@ impl FileSource {
                     c.ctime = ctime;
                 }
                 self.notify(
+                    "failed",
                     level,
                     path,
                     inode,
@@ -2962,6 +2996,9 @@ impl SourceAdapter for FileSource {
                             md.len()
                         );
                     }
+                    if first {
+                        count_delete_decision("leftover_archived");
+                    }
                     out.push(DiscoveredSource {
                         source_type: SourceType::File,
                         source_name: name,
@@ -3357,6 +3394,7 @@ impl SourceAdapter for FileSource {
             };
             match verdict {
                 None => self.notify(
+                    "stale_commit",
                     tracing::Level::INFO,
                     path,
                     *marker_inode,
@@ -3379,7 +3417,7 @@ impl SourceAdapter for FileSource {
                 ),
                 Some(Compared::Kept(why)) => {
                     let (level, message) = why.message(path, archived);
-                    self.notify(level, path, *marker_inode, archived, message);
+                    self.notify(why.outcome(), level, path, *marker_inode, archived, message);
                 }
                 Some(Compared::Unchanged) => {
                     // Fully archived - but a file the engine has caught up
@@ -3686,6 +3724,16 @@ mod tests {
         }
         f.flush().unwrap();
         f
+    }
+
+    /// How many `delete_after_commit` decisions with `outcome` were counted.
+    /// The registry is process-wide, so tests compare before and after.
+    fn decisions(outcome: &str) -> u64 {
+        vtop_core::telemetry::init()
+            .expect("metrics register")
+            .file_delete_decisions_total
+            .with_label_values(&[outcome])
+            .get()
     }
 
     /// Whether a delete decision said `needle` to the operator (#619).
@@ -7555,11 +7603,16 @@ mod tests {
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
             .with_delete_quiet_period(Duration::ZERO);
         fs.no_open_check = true;
+        let refusals_before = decisions("no_open_check");
         let read = fs
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
             .await
             .unwrap();
         fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert!(
+            decisions("no_open_check") > refusals_before,
+            "a refusal must be counted, so an alert can catch it without parsing logs"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).ok().as_deref(),
             Some("one\ntwo\n"),
