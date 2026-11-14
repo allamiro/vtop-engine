@@ -127,6 +127,13 @@ def check_matrix(matrix: dict[str, Any]) -> None:
     if "acks" in matrix and any(a not in ACKS for a in matrix["acks"]):
         raise PlanRefused(f"matrix.acks is {matrix['acks']!r}; acknowledgement modes are {list(ACKS)}")
     bases = matrix.get("load_bases")
+    if isinstance(bases, dict) and "kafka" in bases and "load_pcts" in matrix \
+            and list(bases["kafka"]) != list(matrix["load_pcts"]):
+        # The report draws the Kafka-relative rows by `load_pcts`; two lists
+        # that disagree would leave measured rows out of it, or show cells
+        # that were never owed (review).
+        raise PlanRefused(f"matrix.load_bases.kafka {bases['kafka']!r} differs from matrix.load_pcts "
+                          f"{matrix['load_pcts']!r}; they name the same rates")
     if bases is not None:
         if not isinstance(bases, dict) or not bases or any(b not in LOAD_BASES for b in bases):
             raise PlanRefused(f"matrix.load_bases is {bases!r}, not a map from {list(LOAD_BASES)} to load percentages")
@@ -159,7 +166,7 @@ DEFAULT_TIMING = {
     "bring_up": 90.0,        # cluster up, smoke read-back, cluster down
     "warm_up": 30.0,         # the unrecorded warm-up run
     "saturation": 25.0,      # one duration-targeted saturation run
-    "fixed_rate": 30.0,      # one fixed-rate run
+    "fixed_rate": 10.0,      # one fixed-rate run's overhead; its duration is matrix.fixed_seconds
     "consume": 20.0,
     "e2e": 40.0,
 }
@@ -173,6 +180,9 @@ def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = 
     `matrix.vtop_profiles_share_config` says so.
     """
     t = {**DEFAULT_TIMING, **(timing or {})}
+    # A fixed-rate run lasts the matrix's own target (review): charging a
+    # constant would let a long --fixed-seconds pass the budget unseen.
+    t["fixed_rate"] += float(matrix.get("fixed_seconds", 30.0))
     a = axes(matrix)
     fixed = sum(len(p) for p in a.load_bases.values())
     total = 0.0

@@ -406,3 +406,23 @@ def test_the_report_refuses_common_basis_rates_it_does_not_draw(tmp_path):
 
 def test_the_report_draws_the_phase_1_run():
     report.check_drawable(schema.load_run(PHASE_1).rows)
+
+
+def test_the_projection_charges_each_fixed_rate_run_its_configured_duration():
+    """Review: --fixed-seconds 7200 on the default matrix is days of
+    fixed-rate runs, and must not pass a 30-hour budget."""
+    short = {**SMALL, "fixed_seconds": 30}
+    long = {**SMALL, "fixed_seconds": 7200}
+    fixed_runs = 2 * 2 * 2 * 3 * 4  # cells x profiles x systems x reps x rates, VTOP once per profile pair
+    assert plan.projected_seconds(long) - plan.projected_seconds(short) == pytest.approx(
+        fixed_runs * 3 / 4 * (7200 - 30))
+    with pytest.raises(plan.PlanRefused, match="over --max-hours 30"):
+        plan.check_budget(long, 30)
+
+
+def test_kafka_rates_must_be_the_load_pcts_the_report_draws():
+    """Review: the report draws Kafka-relative rows by load_pcts, so a
+    load_bases.kafka list that differs is refused, not half drawn."""
+    with pytest.raises(plan.PlanRefused, match="differs from matrix.load_pcts"):
+        plan.check_matrix({**SMALL, "load_bases": {"kafka": [25, 50, 75, 90]}})
+    plan.check_matrix({**SMALL, "load_bases": {"kafka": [25, 50, 75], "common": [90]}})
