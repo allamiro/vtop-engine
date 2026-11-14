@@ -2085,7 +2085,12 @@ impl Gateway {
             let owned = records.to_vec();
             let left = *budget;
             match tokio::task::spawn_blocking(move || split_batches(&owned, left)).await {
-                Ok(decoded) => decoded?,
+                // A refused compressed field may have decompressed up to
+                // what was left before it failed, and how much is not
+                // returned. The rest of the request gets no more (review):
+                // otherwise each repeated entry of a bad request could cost
+                // a full budget again.
+                Ok(decoded) => decoded.inspect_err(|_| *budget = 0)?,
                 Err(error) if error.is_panic() => {
                     tracing::error!(
                         topic,
@@ -7056,6 +7061,51 @@ mod tests {
         }
         let too_large = ErrorCode::MessageTooLarge.as_i16();
         assert_eq!(codes, vec![0, 0, too_large, too_large]);
+    }
+
+    /// A compressed entry that fails (here, one that expands past the whole
+    /// budget) spends what is left of the request's budget (review): the
+    /// entries after it are refused without decompressing anything, so a
+    /// request of repeated failing entries costs one budget, not one each.
+    #[tokio::test]
+    async fn a_failed_compressed_entry_spends_the_rest_of_the_request_budget() {
+        let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        let zeros = vec![0_u8; crate::wire::MAX_FIELD_BYTES + 4096];
+        let plain = batch_bytes(&["a"], false);
+        let bomb = crate::records::tests::with_records_section(
+            crate::codec::ZSTD,
+            &plain,
+            &zstd::encode_all(&zeros[..], 19).unwrap(),
+        );
+        let small = compressed_batch_bytes(crate::codec::ZSTD, &batch_bytes(&["b"], false));
+        let mut body = Encoder::new();
+        body.nullable_string(None);
+        body.i16(-1);
+        body.i32(30_000);
+        body.array_len(1);
+        body.string("events");
+        body.array_len(3);
+        for records in [&bomb, &bomb, &small] {
+            body.i32(0);
+            body.nullable_bytes(Some(records));
+        }
+        let reply = call(addr, 0, 8, 1, body.as_slice()).await.unwrap();
+        let mut d = Decoder::new(&reply);
+        d.array_len("topics").unwrap();
+        d.string("topic").unwrap();
+        d.array_len("partitions").unwrap();
+        let mut codes = Vec::new();
+        for _ in 0..3 {
+            d.i32("index").unwrap();
+            codes.push(d.i16("error").unwrap());
+            d.i64("base_offset").unwrap();
+            d.i64("log_append_time").unwrap();
+            d.i64("log_start_offset").unwrap();
+            d.array_len("record_errors").unwrap();
+            d.nullable_string("error_message").unwrap();
+        }
+        let too_large = ErrorCode::MessageTooLarge.as_i16();
+        assert_eq!(codes, vec![too_large, too_large, too_large]);
     }
 
     #[tokio::test]
