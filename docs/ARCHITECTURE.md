@@ -937,8 +937,10 @@ upload through a persisted multipart session when the backend advertises
   (1 s doubling to at most 30 s); after the first part fails for good no new
   part starts, and the requests already on the wire are waited for and kept.
   Every request and every throttle is reported to the caller, so the engine's
-  width controller still sees throttles the retries absorbed. A session the
-  store no longer holds (`NoSuchUpload`) is restarted once with a new upload.
+  width controller still sees throttles the retries absorbed. An upload the
+  store cannot continue (`NoSuchUpload`, or `InvalidPart` / `InvalidPartOrder`
+  on complete) is aborted where it still exists and restarted once with a new
+  upload; a second failure in the same call keeps nothing.
 - **The telemetry path resumes across replays (#668).** When a batch's upload
   fails, the engine keeps the session if the object is under its derived key
   (#626): the replay of the same bytes names the same key and session and

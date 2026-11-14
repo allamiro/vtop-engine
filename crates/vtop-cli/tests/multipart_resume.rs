@@ -400,3 +400,28 @@ async fn a_resumed_object_that_does_not_read_back_is_never_committed() {
         "{rows:?}"
     );
 }
+
+/// The store refuses the complete on both of an attempt's uploads (#668,
+/// review): the batch fails, and nothing is kept that every replay would
+/// complete into the same refusal. The replay starts afresh and commits.
+#[tokio::test]
+async fn a_complete_the_store_keeps_refusing_is_not_kept_for_the_replay() {
+    let _serial = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_records(&input, "refused");
+    let backend = Arc::new(MockBackend::new().with_complete_faults(2));
+    let mut engine = engine(config(dir.path(), &input), &backend).await;
+
+    let first = engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(first[0].final_state, BatchState::Failed, "{first:?}");
+    assert!(sessions(dir.path()).is_empty(), "no session is kept");
+    assert_eq!(
+        backend.pending_multipart_count(),
+        0,
+        "no upload is left billed"
+    );
+
+    let second = engine.process_once(SourceType::File).await.unwrap();
+    assert!(second.iter().all(|o| o.committed), "{second:?}");
+}

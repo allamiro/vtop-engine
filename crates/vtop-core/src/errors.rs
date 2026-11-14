@@ -47,11 +47,13 @@ pub enum VtopError {
     /// for an operator now and for a concurrency controller later.
     #[error("upload backend throttled: {0}")]
     UploadThrottled(String),
-    /// The store no longer holds a multipart upload the client is writing to
+    /// The store cannot continue a multipart upload the client is writing to
     /// (#668): S3's `NoSuchUpload`, after the upload was aborted (a lifecycle
-    /// rule, another process's sweep) or completed by an earlier attempt.
-    /// Kept apart from `Upload` because the answer is not a retry of the
-    /// same request, which would fail the same way, but a new upload.
+    /// rule, another process's sweep) or completed by an earlier attempt; or
+    /// `InvalidPart` / `InvalidPartOrder` on complete, where a part the store
+    /// holds is not the one the client recorded. Kept apart from `Upload`
+    /// because the answer is not a retry of the same request, which would
+    /// fail the same way, but a new upload.
     #[error("upload session no longer exists at the store: {0}")]
     UploadSessionGone(String),
 

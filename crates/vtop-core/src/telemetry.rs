@@ -255,9 +255,10 @@ pub struct Metrics {
     pub kafka_partition_events_total: IntCounterVec,
 
     /// Multipart parts by `result` (#668), the bounded set
-    /// [`MULTIPART_PART_RESULTS`]. Per upload call a part counts `uploaded`
-    /// or `reused` once, `failed` once if its last attempt failed, and
-    /// `retried` once per attempt after its first.
+    /// [`MULTIPART_PART_RESULTS`]. Per upload a part counts `uploaded` or
+    /// `reused` once, `failed` once if its last attempt failed, and `retried`
+    /// once per attempt after its first. A call that restarts on a new upload
+    /// counts the parts it sent to both, since both crossed the link.
     pub multipart_parts_total: IntCounterVec,
     /// Multipart sessions by `outcome` (#668), the bounded set
     /// [`MULTIPART_SESSION_OUTCOMES`]: `kept_after_failure` growing while
@@ -401,7 +402,7 @@ impl Metrics {
         )?;
         let multipart_parts_total = cv(
             "multipart_parts_total",
-            "Multipart parts by result (#668): uploaded (sent in this upload call), reused (kept from an earlier call and not sent again), retried (one per extra attempt at a part), failed (the part's last attempt in the call failed); the object path is in the log line",
+            "Multipart parts by result (#668): uploaded (sent in this upload call; after a restart, to each upload), reused (kept from an earlier call and not sent again), retried (one per extra attempt at a part), failed (the part's last attempt in the call failed); the object path is in the log line",
             vec!["result"],
         )?;
         let multipart_sessions_total = cv(

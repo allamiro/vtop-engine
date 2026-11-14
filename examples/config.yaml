@@ -190,8 +190,8 @@ upload:
   # Multipart (objects of at least multipart_threshold_bytes). A failed part is
   # sent again alone, up to multipart_part_attempts requests with a backoff of
   # 1 s doubling to 30 s; the parts that completed are kept, and if the batch
-  # still fails its session is kept for the replay of the same bytes, which
-  # sends only the missing parts (#668). Sessions nobody resumes are aborted
+  # still fails under its content-derived object key its session is kept for
+  # the replay of the same bytes, which sends only the missing parts (#668). Sessions nobody resumes are aborted
   # once older than multipart_abandon_after_secs. Incomplete parts are billed:
   # add an AbortIncompleteMultipartUpload lifecycle rule with a longer window
   # (docs/PRODUCTION_HA.md section 7.6).

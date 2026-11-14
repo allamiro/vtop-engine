@@ -94,6 +94,13 @@ pub struct MockBackend {
     /// When true, abort_multipart_upload fails — so the sweep's
     /// keep-session-on-failed-abort path is testable (#482).
     fail_abort: bool,
+    /// When true, abort_multipart_upload never answers: a store that has
+    /// stopped responding (#668, review), so a test can show a sweep does not
+    /// hold up a stop.
+    hang_abort: bool,
+    /// How many upcoming completes answer `InvalidPart` and leave the upload
+    /// pending, as S3 does when a part it holds is not the one named (#668).
+    complete_faults: AtomicUsize,
     /// When set, every `head_object` fails this way instead of answering
     /// (#626): a refusal that says nothing about the key, or a throttle.
     head_fault: Option<HeadFault>,
@@ -149,6 +156,19 @@ impl MockBackend {
         self
     }
 
+    /// Every abort_multipart_upload waits for ever (#668).
+    pub fn with_hanging_abort(mut self) -> Self {
+        self.hang_abort = true;
+        self
+    }
+
+    /// The next `times` completes answer `InvalidPart` and leave the upload
+    /// and its parts at the store (#668).
+    pub fn with_complete_faults(self, times: usize) -> Self {
+        self.complete_faults.store(times, Ordering::SeqCst);
+        self
+    }
+
     /// Every `head_object` fails with `fault` (#626).
     pub fn with_head_fault(mut self, fault: HeadFault) -> Self {
         self.head_fault = Some(fault);
@@ -167,6 +187,8 @@ impl MockBackend {
             s3_checksum_semantics: false,
             min_part_size: 0,
             fail_abort: false,
+            hang_abort: false,
+            complete_faults: AtomicUsize::new(0),
             head_fault: None,
             part_faults: Mutex::new(HashMap::new()),
             part_sends: Mutex::new(HashMap::new()),
@@ -762,21 +784,41 @@ impl UploadBackend for MockBackend {
         parts: &[UploadedPart],
     ) -> Result<StoredObject, VtopError> {
         let mut map = self.multiparts.lock().unwrap();
+        let key = (object_uri.to_owned(), upload_id.to_owned());
         let pending = map
-            .remove(&(object_uri.to_owned(), upload_id.to_owned()))
+            .get(&key)
             .ok_or_else(|| no_such_upload(object_uri, upload_id))?;
+        // A complete S3 refuses leaves the upload and its parts in place
+        // (#668, review): only a successful one removes it.
+        let invalid_part = |n: u32| {
+            VtopError::UploadSessionGone(format!(
+                "mock complete_multipart_upload {object_uri}: InvalidPart (http 400): part {n} \
+                 of upload {upload_id} is not the part named"
+            ))
+        };
+        let mut left = self.complete_faults.load(Ordering::SeqCst);
+        while left > 0 {
+            match self.complete_faults.compare_exchange_weak(
+                left,
+                left - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Err(invalid_part(1)),
+                Err(observed) => left = observed,
+            }
+        }
         let mut body = Vec::new();
         let mut ordered = parts.to_vec();
         ordered.sort_by_key(|p| p.part_number);
         for part in &ordered {
-            let bytes = pending.parts.get(&part.part_number).ok_or_else(|| {
-                VtopError::Upload(format!(
-                    "mock: missing part {} for multipart {upload_id}",
-                    part.part_number
-                ))
-            })?;
+            let bytes = pending
+                .parts
+                .get(&part.part_number)
+                .ok_or_else(|| invalid_part(part.part_number))?;
             body.extend_from_slice(bytes);
         }
+        map.remove(&key);
         // A multipart completion records NO service SHA-256 (#482): S3
         // returns a composite with a part-count suffix, which the real
         // head-decoding rejects — this None IS that composite, as the
@@ -794,6 +836,9 @@ impl UploadBackend for MockBackend {
     ) -> Result<(), VtopError> {
         if self.fail_abort {
             return Err(VtopError::Upload("mock: forced abort failure".into()));
+        }
+        if self.hang_abort {
+            std::future::pending::<()>().await;
         }
         self.multiparts
             .lock()

@@ -945,11 +945,16 @@ where
         || code.as_deref().is_some_and(crate::base::is_throttle_code);
     if throttled {
         VtopError::UploadThrottled(detail)
-    } else if code.as_deref() == Some("NoSuchUpload") {
-        // The multipart upload this request names is gone (#668): aborted by
-        // a lifecycle rule or a sweep, or completed by an earlier attempt.
-        // Sending the same request again fails the same way, so the caller
-        // must start a new upload rather than retry this one.
+    } else if matches!(
+        code.as_deref(),
+        Some("NoSuchUpload" | "InvalidPart" | "InvalidPartOrder")
+    ) {
+        // The multipart upload this request names cannot be continued
+        // (#668): it is gone (aborted by a lifecycle rule or a sweep, or
+        // completed by an earlier attempt), or the store refuses to complete
+        // it because a part it holds is not the one named, which leaves the
+        // upload in place. Sending the same request again fails the same way
+        // on every replay, so the caller must start a new upload.
         VtopError::UploadSessionGone(detail)
     } else {
         VtopError::Upload(detail)
@@ -3177,10 +3182,25 @@ mod throttle_classification {
         );
         assert!(error.to_string().contains("NoSuchUpload"), "{error}");
         assert!(error.to_string().contains("s3://b/k#2"), "{error}");
+        // A complete S3 refuses because a part it holds is not the one named
+        // leaves the upload in place, and completing again fails the same
+        // way (review): it too needs a new upload, not a retry.
+        for code in ["InvalidPart", "InvalidPartOrder"] {
+            let error = sdk_failure(
+                "complete_multipart_upload",
+                "s3://b/k",
+                service_error(400, Some(code)),
+            );
+            assert!(
+                matches!(error, VtopError::UploadSessionGone(_)),
+                "{code} must start a new upload: {error:?}"
+            );
+        }
         for (status, code) in [
             (404, Some("NoSuchKey")),
             (404, None),
-            (400, Some("InvalidPart")),
+            (400, Some("EntityTooSmall")),
+            (500, Some("InternalError")),
         ] {
             let error = sdk_failure("upload_part", "s3://b/k", service_error(status, code));
             assert!(

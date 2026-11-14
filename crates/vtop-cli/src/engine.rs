@@ -295,7 +295,7 @@ impl<'a> Pipeline<'a> {
                 batch_id,
                 key = object_uri,
                 reason = why,
-                error = %abort_err,
+                error = %multipart::redact_urls(&abort_err.to_string()),
                 "could not abort the failed multipart upload of {object_uri} ({}); the \
                  abandoned-session sweep aborts it after upload.multipart_abandon_after_secs \
                  ({abandon} s); nothing to do unless this repeats",
@@ -3882,14 +3882,21 @@ impl Engine {
             // Abandoned multipart sessions are reclaimed while the engine
             // runs, busy or idle (#668): a failed upload keeps its session
             // for the replay, and one no replay resumes must not wait for a
-            // restart to be aborted. Cheap when not due; when due it can
-            // spend a request deadline per session, so a pending stop is
-            // taken first.
+            // restart to be aborted. Cheap when not due. When due it can
+            // spend a request deadline per session against a store that does
+            // not answer, so a stop, pending or arriving, wins the race.
+            // Dropping the sweep half-way is safe: a session file is deleted
+            // only after its upload's abort succeeded, so an interrupted one
+            // is simply there for the next sweep.
             if self.multipart_sweep_due() {
                 if let Some(cause) = shutdown.pending_request() {
                     break 'run cause;
                 }
-                self.sweep_abandoned_multipart().await;
+                tokio::select! {
+                    biased;
+                    cause = shutdown.next_request() => break 'run cause,
+                    _ = self.sweep_abandoned_multipart() => {}
+                }
             }
             // Failing cycle: wait, growing with the streak (the failed range is
             // read again, so a tight loop would hammer a store that is down).
@@ -9604,5 +9611,82 @@ mod tests {
             "the next sweep waits for the interval"
         );
         assert_eq!(swept.get() - swept_before, 1);
+    }
+
+    /// A stop that arrives while the abandoned-session sweep is waiting on a
+    /// store that does not answer ends the run at once (#668, review): each
+    /// abort would otherwise wait out its request deadline, and a pod's
+    /// termination grace period could expire mid-sweep. Dropping the sweep is
+    /// safe: a session is deleted only after its abort succeeded.
+    #[tokio::test]
+    async fn a_stop_during_a_sweep_against_a_silent_store_is_not_held_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let input = dir.path().join("idle.log");
+        std::fs::write(&input, "").unwrap();
+        let mut cfg = file_config(
+            work.to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.idle_poll_interval_ms = 20;
+        let mut engine = Engine::new(cfg.clone(), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+
+        // An aged session, left by an upload to a store that then went silent.
+        let failing = vtop_upload::MockBackend::new().with_part_fault(
+            1,
+            vtop_upload::PartFault::Reset,
+            usize::MAX,
+        );
+        let mut mp_cfg = MultipartUploadConfig::from_upload(&cfg.upload, work.clone());
+        mp_cfg.part_size_bytes = 1_000;
+        mp_cfg.part_attempts = 1;
+        let data = vec![7_u8; 3_000];
+        let file = dir.path().join("object");
+        std::fs::write(&file, &data).unwrap();
+        let digest = vtop_core::checksum::sha256_bytes(&data);
+        let fence = MultipartFence {
+            expected_segment_generation: 0,
+            fencing_epoch: 0,
+            content_digest_hex: digest.clone(),
+            content_digest_algorithm: "sha256".into(),
+            byte_length: 3_000,
+        };
+        let uri = "s3://telemetry-data/silent.raw";
+        multipart::upload_resumable(
+            &failing,
+            &mp_cfg,
+            &file,
+            uri,
+            Some(ObjectChecksum::new("sha256", &digest)),
+            fence.clone(),
+        )
+        .await
+        .expect_err("part 1 fails");
+        let path = work.join(multipart::session_file_name(uri, &fence));
+        let mut session = multipart::load_session(&path).unwrap();
+        session.updated_at_unix_secs = 1;
+        multipart::save_session(&path, &session).unwrap();
+        engine.backend = Arc::new(vtop_upload::MockBackend::new().with_hanging_abort());
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stop = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            tx.send("SIGTERM").unwrap();
+        };
+        let run = tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.run_until(ChannelShutdown(rx)),
+        );
+        let (ran, ()) = tokio::join!(run, stop);
+        ran.expect("the stop must not wait for the silent store's abort")
+            .unwrap();
+        assert!(
+            path.exists(),
+            "the session whose abort never answered is kept for the next sweep"
+        );
     }
 }

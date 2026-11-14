@@ -276,8 +276,11 @@ async fn verifies(backend: &S3NativeBackend, uri: &str, data: &[u8], digest: &st
     v.passed && !v.backend_limited
 }
 
-/// The connection is closed once on the request for part 2: that request
-/// alone is sent again, and the object completes and reads back.
+/// The connection is closed on the first three requests for part 2: the SDK's
+/// own three attempts at that request all fail, so it is the upload's
+/// per-part retry (#668) that sends part 2 a fourth time. Before #668 the
+/// upload failed there. Only part 2 is sent again, and the object completes
+/// and reads back.
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint and credentials"]
 async fn live_a_part_whose_connection_is_reset_is_sent_again_alone() {
@@ -290,7 +293,7 @@ async fn live_a_part_whose_connection_is_reset_is_sent_again_alone() {
     let (path, data, digest) = object(dir.path(), 1);
     let uri = format!("s3://{}/{}", bucket(), unique_key("reset-once"));
 
-    forwarder.refuse.store(1, Ordering::SeqCst);
+    forwarder.refuse.store(3, Ordering::SeqCst);
     let mut report = MultipartReport::default();
     upload_resumable_with_report(
         &backend,
@@ -302,12 +305,16 @@ async fn live_a_part_whose_connection_is_reset_is_sent_again_alone() {
         &mut report,
     )
     .await
-    .expect("one reset request is retried, not the end of the upload");
+    .expect("a part whose request failed every SDK attempt is retried, not the end of the upload");
 
     assert_eq!(
         [forwarder.sent(1), forwarder.sent(2), forwarder.sent(3)],
-        [1, 2, 1],
+        [1, 4, 1],
         "only part 2's request was repeated: {report:?}"
+    );
+    assert_eq!(
+        report.part_retries, 1,
+        "the fourth request was the upload's own retry of the part: {report:?}"
     );
     assert!(verifies(&backend, &uri, &data, &digest).await);
     backend.delete_object(&uri).await.unwrap();

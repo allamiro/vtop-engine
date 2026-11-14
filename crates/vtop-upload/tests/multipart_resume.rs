@@ -28,8 +28,8 @@ use vtop_core::config::UploadConfig;
 use vtop_core::errors::VtopError;
 use vtop_upload::multipart::{load_session, session_file_name};
 use vtop_upload::{
-    upload_resumable, MockBackend, MultipartFence, MultipartUploadConfig, ObjectChecksum,
-    PartFault, UploadBackend,
+    upload_resumable, upload_resumable_with_report, MockBackend, MultipartFence, MultipartReport,
+    MultipartUploadConfig, ObjectChecksum, PartFault, UploadBackend,
 };
 
 const PART: usize = 1_000;
@@ -324,9 +324,11 @@ async fn a_throttled_part_is_retried_after_a_pause() {
         .await
         .unwrap();
     assert_eq!(backend.part_sends(2), 2);
+    // The paused clock moves only by the wait: more than nothing (a retry
+    // with no pause would leave it at zero), at most the 1 s base.
     assert!(
-        started.elapsed() <= Duration::from_secs(1),
-        "the first retry waits at most the 1 s base: {:?}",
+        started.elapsed() > Duration::ZERO && started.elapsed() <= Duration::from_secs(1),
+        "the first retry waits within (0, 1 s]: {:?}",
         started.elapsed()
     );
     assert!(verifies(&backend, uri, &data).await);
@@ -385,9 +387,13 @@ async fn a_session_lost_twice_in_one_call_is_an_error() {
     );
 }
 
-/// The whole-object read-back still gates a resumed object: a part the
-/// store damaged after acknowledging it completes into an object that fails
-/// verification, so the engine can never commit it. ETags are not evidence.
+/// What a resumed upload does NOT check: it trusts the parts the store
+/// acknowledged (ETags are not evidence) and returns Ok for an object
+/// assembled from a part the store damaged afterwards. The whole-object
+/// read-back after it is what catches that; here the backend's own
+/// `verify_object` stands in for it. The engine test
+/// `a_resumed_object_that_does_not_read_back_is_never_committed` is the
+/// gate itself: such a batch is never committed.
 #[tokio::test(start_paused = true)]
 async fn a_resumed_object_whose_stored_part_was_damaged_fails_the_read_back() {
     let dir = tempfile::tempdir().unwrap();
@@ -409,5 +415,91 @@ async fn a_resumed_object_whose_stored_part_was_damaged_fails_the_read_back() {
     assert!(
         !verifies(&backend, uri, &data).await,
         "the read-back must catch the damaged part"
+    );
+}
+
+/// The store refuses the complete with `InvalidPart` (a part it holds is not
+/// the one the session recorded) and keeps the upload. Completing again would
+/// fail the same way on every replay, so the call aborts that upload and
+/// starts one new one (#668, review).
+#[tokio::test(start_paused = true)]
+async fn a_complete_the_store_refuses_starts_one_new_upload_and_aborts_the_old() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = three_parts(12);
+    let path = write(dir.path(), "batch.raw", &data);
+    let backend = MockBackend::new().with_complete_faults(1);
+    let uri = "s3://b/invalid-part.raw";
+
+    upload(&backend, &config(dir.path(), 3, 3), &path, uri, &data)
+        .await
+        .expect("one refused complete is restarted");
+    assert_eq!(
+        backend.part_sends_total(),
+        6,
+        "every part went to the refused upload and again to the new one"
+    );
+    assert!(
+        !backend.has_pending_multipart(uri, "mpu-1"),
+        "the refused upload was aborted, not left billed at the store"
+    );
+    assert_eq!(backend.pending_multipart_count(), 0);
+    assert!(verifies(&backend, uri, &data).await);
+}
+
+/// Refused twice in one call: nothing is left that a replay could resume
+/// into the same refusal. The session is gone and so are both uploads, and
+/// the next call starts afresh.
+#[tokio::test(start_paused = true)]
+async fn a_complete_refused_twice_leaves_nothing_to_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = three_parts(13);
+    let path = write(dir.path(), "batch.raw", &data);
+    let backend = MockBackend::new().with_complete_faults(2);
+    let uri = "s3://b/invalid-part-twice.raw";
+    let cfg = config(dir.path(), 3, 3);
+    let (digest, fence) = fence_for(&data);
+    let mut report = MultipartReport::default();
+
+    let err = upload_resumable_with_report(
+        &backend,
+        &cfg,
+        &path,
+        uri,
+        Some(ObjectChecksum::new("sha256", &digest)),
+        fence.clone(),
+        &mut report,
+    )
+    .await
+    .expect_err("a second refusal ends the call");
+    assert!(err.to_string().contains("InvalidPart"), "{err}");
+    assert!(!report.session_left, "{report:?}");
+    assert!(!dir.path().join(session_file_name(uri, &fence)).exists());
+    assert_eq!(backend.pending_multipart_count(), 0, "both uploads aborted");
+
+    upload(&backend, &cfg, &path, uri, &data).await.unwrap();
+    assert!(verifies(&backend, uri, &data).await);
+}
+
+/// A session file that cannot be read (a torn write before the session was
+/// synced, or a hand edit) does not block the object: a new upload takes
+/// its place and completes.
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_session_file_is_replaced_by_a_new_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = three_parts(14);
+    let path = write(dir.path(), "batch.raw", &data);
+    let backend = MockBackend::new();
+    let uri = "s3://b/unreadable.raw";
+    let (_, fence) = fence_for(&data);
+    let session = dir.path().join(session_file_name(uri, &fence));
+    std::fs::write(&session, b"").unwrap();
+
+    upload(&backend, &config(dir.path(), 3, 3), &path, uri, &data)
+        .await
+        .unwrap();
+    assert!(verifies(&backend, uri, &data).await);
+    assert!(
+        !session.exists(),
+        "the replacement completed and was removed"
     );
 }

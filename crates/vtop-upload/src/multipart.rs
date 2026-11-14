@@ -96,7 +96,9 @@ pub struct MultipartReport {
     pub parts_reused: u32,
     /// Their bytes: what resuming saved.
     pub bytes_reused: u64,
-    /// Parts this call sent successfully.
+    /// Parts this call sent successfully. After a restart this includes the
+    /// parts sent to the upload the store could not continue: they crossed
+    /// the link too.
     pub parts_uploaded: u32,
     /// Extra attempts at a part, beyond its first.
     pub part_retries: u32,
@@ -106,7 +108,8 @@ pub struct MultipartReport {
     pub requests: u32,
     /// Of those, the ones the store answered with a throttle.
     pub throttled_requests: u32,
-    /// An in-progress session an earlier call left was adopted.
+    /// An in-progress session an earlier call left was adopted (it stays
+    /// true if that upload is then restarted).
     pub resumed: bool,
     /// The store no longer held the upload and a new one was started.
     pub restarted: bool,
@@ -275,7 +278,18 @@ pub fn save_session(path: &Path, session: &MultipartSession) -> Result<(), VtopE
     let bytes = serde_json::to_vec_pretty(session)
         .map_err(|e| VtopError::Upload(format!("encoding multipart session: {e}")))?;
     let tmp = path.with_extension("multipart.json.tmp");
-    std::fs::write(&tmp, &bytes).map_err(|e| {
+    // The session is the only record of the upload id, and since #668 it is
+    // relied on across crashes, so it is made durable the way the repo's
+    // other published files are: the data synced before the rename, so the
+    // name never points at unwritten bytes, and the directory after it, so
+    // the rename itself survives.
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()
+    };
+    write().map_err(|e| {
         VtopError::Upload(format!("writing multipart session {}: {e}", tmp.display()))
     })?;
     std::fs::rename(&tmp, path).map_err(|e| {
@@ -284,6 +298,17 @@ pub fn save_session(path: &Path, session: &MultipartSession) -> Result<(), VtopE
             path.display()
         ))
     })?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| {
+                VtopError::Upload(format!(
+                    "syncing multipart state dir {}: {e}",
+                    parent.display()
+                ))
+            })?;
+    }
     Ok(())
 }
 
@@ -433,32 +458,36 @@ pub async fn upload_resumable_with_report(
         path: &path,
     };
     match call.run(report).await {
-        // The store no longer holds the upload (#668): S3's NoSuchUpload,
-        // after a lifecycle rule or a sweep aborted it, or an earlier attempt
-        // completed it. The same request would fail the same way, so the
-        // session is dropped and the object starts again under a new upload,
-        // once. A second loss in the same call is an error, not a loop.
+        // The store cannot continue the upload (#668): S3's NoSuchUpload,
+        // after a lifecycle rule or a sweep aborted it or an earlier attempt
+        // completed it, or InvalidPart on complete, where the upload is still
+        // there. The same request would fail the same way on every replay,
+        // so the upload is aborted (best effort; a gone one needs nothing),
+        // the session dropped, and the object started again under a new
+        // upload, once. A second failure in the same call is an error with
+        // nothing kept, not a loop.
         Err(VtopError::UploadSessionGone(cause)) => {
             let cause = redact_urls(&cause);
             tracing::warn!(
                 event = "multipart_session_restarted",
                 key = object_uri,
                 error = %cause,
-                "the store no longer has the multipart upload for {object_uri} ({cause}); \
-                 starting a new upload and sending every part to it; no data is affected, \
-                 nothing to do"
+                "the store cannot continue the multipart upload for {object_uri} ({cause}); \
+                 abandoning it and starting a new upload that every part is sent to; no data \
+                 is affected, nothing to do"
             );
-            delete_session(&path)?;
+            abort_and_forget(backend, &path, report).await?;
             report.restarted = true;
             report.session_left = false;
             match call.run(report).await {
                 Err(VtopError::UploadSessionGone(again)) => {
-                    delete_session(&path)?;
+                    abort_and_forget(backend, &path, report).await?;
                     report.session_left = false;
                     report.parts_kept = 0;
                     Err(VtopError::Upload(format!(
-                        "the store lost the multipart upload for {object_uri} again after a \
-                         restart ({}); nothing is kept, and the next attempt starts a new upload",
+                        "the store refused the multipart upload for {object_uri} again after a \
+                         restart ({}); both uploads were abandoned and nothing is kept, and the \
+                         next attempt starts a new upload",
                         redact_urls(&again)
                     )))
                 }
@@ -467,6 +496,41 @@ pub async fn upload_resumable_with_report(
         }
         other => other,
     }
+}
+
+/// Abort the upload a session names, best effort, and delete the session
+/// (#668). Used when the store cannot continue it: a gone upload answers the
+/// abort with NoSuchUpload, which is what was wanted; any other failure
+/// leaves parts a bucket lifecycle rule reclaims.
+async fn abort_and_forget(
+    backend: &dyn UploadBackend,
+    path: &Path,
+    report: &mut MultipartReport,
+) -> Result<(), VtopError> {
+    if let Ok(session) = load_session(path) {
+        if session.phase == MultipartSessionPhase::InProgress {
+            let aborted = backend
+                .abort_multipart_upload(&session.object_uri, &session.upload_id)
+                .await;
+            report.count(&aborted);
+            if let Err(e) = aborted {
+                if !matches!(e, VtopError::UploadSessionGone(_)) {
+                    tracing::warn!(
+                        event = "multipart_abort_failed",
+                        key = %session.object_uri,
+                        error = %redact_urls(&e.to_string()),
+                        "could not abort the multipart upload for {} that the store cannot \
+                         continue ({}); its parts stay at the store until a bucket lifecycle \
+                         rule (AbortIncompleteMultipartUpload) removes them; add one if the \
+                         bucket has none",
+                        session.object_uri,
+                        redact_urls(&e.to_string())
+                    );
+                }
+            }
+        }
+    }
+    delete_session(path)
 }
 
 /// One pass at an upload: load or create its session, send what is missing,
@@ -521,7 +585,23 @@ impl SessionCall<'_> {
                     existing
                 }
             }
-            Err(_) => self.create(report).await?,
+            Err(e) => {
+                if path.exists() {
+                    // A session file that cannot be read names an upload
+                    // nothing else records; it is replaced, and the upload's
+                    // parts are left to a bucket lifecycle rule.
+                    tracing::warn!(
+                        event = "multipart_session_unreadable",
+                        key = object_uri,
+                        error = %e,
+                        "the multipart session file for {object_uri} could not be read ({e}); \
+                         starting a new upload in its place; the parts of the upload it named \
+                         are reclaimed only by a bucket lifecycle rule \
+                         (AbortIncompleteMultipartUpload); nothing else to do"
+                    );
+                }
+                self.create(report).await?
+            }
         };
 
         // The session is identified by its content, not by where the bytes
@@ -1176,7 +1256,17 @@ pub async fn cleanup_abandoned(
         }
         let session = match load_session(&path) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    event = "multipart_session_unreadable",
+                    path = %path.display(),
+                    error = %e,
+                    "an unreadable multipart session file was skipped by the sweep ({e}); \
+                     the upload it named, if any, is reclaimed only by a bucket lifecycle rule \
+                     (AbortIncompleteMultipartUpload); remove the file once the bucket has one"
+                );
+                continue;
+            }
         };
         let age = now.saturating_sub(session.updated_at_unix_secs);
         if age < cfg.abandon_after_secs {
@@ -1201,12 +1291,15 @@ pub async fn cleanup_abandoned(
                     other => Err(other),
                 })
             {
+                let cause = redact_urls(&e.to_string());
                 tracing::warn!(
-                    object = %session.object_uri,
-                    upload_id = %session.upload_id,
-                    error = %e,
-                    "abandoned multipart abort failed; keeping the session for the \
-                     next sweep so the remote upload is not orphaned"
+                    event = "multipart_abort_failed",
+                    key = %session.object_uri,
+                    error = %cause,
+                    "could not abort the abandoned multipart upload for {} ({cause}); the \
+                     session is kept so the next sweep tries again and the upload is not \
+                     orphaned; nothing to do unless this repeats, then check the store",
+                    session.object_uri
                 );
                 continue;
             }
@@ -1923,8 +2016,12 @@ mod tests {
         result.expect_err("part 1 never succeeds");
         assert_eq!(backend.part_sends(1), 5);
         assert_eq!(report.part_retries, 4);
+        // The paused clock moves only by the waits: more than nothing (four
+        // retries with no pause would leave it at zero), at most the sum of
+        // their ceilings.
         assert!(
-            started.elapsed() <= Duration::from_secs(1 + 2 + 4 + 8),
+            started.elapsed() > Duration::ZERO
+                && started.elapsed() <= Duration::from_secs(1 + 2 + 4 + 8),
             "four waits, each under its ceiling: {:?}",
             started.elapsed()
         );
