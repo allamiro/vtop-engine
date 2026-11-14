@@ -667,8 +667,21 @@ KNOWN_GAPS_FIXED = """\
 SINGLE_VALUED = ("partitions", "producers", "compression", "acks", "profile")
 
 
-def check_drawable(rows: list[dict[str, str]]) -> None:
-    """Refuse a run whose rows vary along a dimension this report does not draw (#596)."""
+def check_drawable(rows: list[dict[str, str]], environment: dict[str, Any]) -> None:
+    """Refuse a run this report would pool or mislabel (#596): one that varies
+    along a dimension it does not draw, or holds a value its text does not
+    say (it writes "no compression", `acks=all` and the environment's
+    profile), or rows it does not draw at all."""
+    profile = environment["comparable"].get("profile")
+    for column, said in (("compression", "none"), ("acks", "all"), ("profile", profile)):
+        values = sorted({row[column] for row in rows})
+        if values != [said]:
+            raise schema.ReportRefused(
+                f"the run's {column} is {', '.join(values)}; this report's text says {column} {said} and "
+                "draws nothing else until the grouped charts do (#600)")
+    if any(row["mode"] == "e2e" for row in rows):
+        raise schema.ReportRefused("the run has end-to-end latency rows, which this report does not draw yet "
+                                   "(#600); refused rather than left out")
     for column in SINGLE_VALUED:
         values = sorted({row[column] for row in rows})
         if len(values) > 1:
@@ -685,7 +698,7 @@ def check_drawable(rows: list[dict[str, str]]) -> None:
 
 def build(run_dir: str, img_dir: str, doc_path: str) -> list[str]:
     run = schema.load_run(run_dir)  # raises ReportRefused before anything is written
-    check_drawable(run.rows)
+    check_drawable(run.rows, run.environment)
     plt = _setup_matplotlib()
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(doc_path)), exist_ok=True)

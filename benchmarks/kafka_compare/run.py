@@ -786,6 +786,8 @@ def check(run_dir: str) -> int:
     is there once and nothing else is; 2 otherwise, listing the missing keys."""
     try:
         found = schema.check_run(run_dir)
+        with open(os.path.join(run_dir, "environment.json")) as handle:
+            state = json.load(handle).get("run_state")
     except schema.ReportRefused as exc:
         print(f"check refused: {exc}", file=sys.stderr)
         return 2
@@ -794,7 +796,13 @@ def check(run_dir: str) -> int:
               f"first {(found.duplicates + found.extra)[:3]}", file=sys.stderr)
         return 2
     present = len(found.expected) - len(found.missing)
-    print(f"{run_dir}: {present} of {len(found.expected)} expected rows present")
+    print(f"{run_dir}: {present} of {len(found.expected)} expected rows present; run_state {state}")
+    if not found.missing and state != "complete":
+        # Every row is there but the run never said it finished: the report
+        # refuses it until environment.json says `complete` (review).
+        print(f"every row is present but run_state is {state!r}; the report reads only a complete run",
+              file=sys.stderr)
+        return 2
     if found.missing:
         print(f"missing {len(found.missing)} (key {', '.join(schema.KEY)}):", file=sys.stderr)
         for key in found.missing:
