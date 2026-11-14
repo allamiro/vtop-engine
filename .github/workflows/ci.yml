@@ -56,6 +56,7 @@ jobs:
       chaos: ${{ steps.filter.outputs.chaos }}
       upgrade: ${{ steps.filter.outputs.upgrade }}
       helm: ${{ steps.filter.outputs.helm }}
+      file_source: ${{ steps.filter.outputs.file_source }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Pinned to a full commit SHA (v3), not the mutable tag, so an upstream
@@ -314,6 +315,17 @@ jobs:
               # The metadata rolling upgrade (#554) runs the chaos harness.
               - 'scripts/live-chaos/lib.sh'
               - 'scripts/live-chaos/scenarios/22-meta-rolling-upgrade.sh'
+              - '.github/workflows/ci.yml'
+            # `cargo clippy -p vtop-adapters` and `cargo test -p vtop-adapters
+            # --lib` on macOS (#619). The closure is vtop-adapters + vtop-core
+            # with the default features (no `kafka`, so no librdkafka).
+            file_source:
+              - 'crates/vtop-adapters/**'
+              - 'crates/vtop-core/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain*'
               - '.github/workflows/ci.yml'
   build-and-test:
     name: fmt + clippy + test + build
@@ -1558,6 +1570,46 @@ jobs:
             upgrade-meta/logs
           if-no-files-found: ignore
           retention-days: 7
+
+  # The file source's delete path on macOS (#619). Everything else in CI runs
+  # on Linux, where delete_after_commit proves no process holds a file open
+  # with a write lease. macOS has no lease, so its half of that code - the
+  # refusal, the Apple rename that never replaces a file
+  # (renameatx_np(RENAME_EXCL)), the put-back by hard link, the ctime reads -
+  # was built and run by no job: 14 of the adapter's lib tests failed there
+  # unnoticed. Default features only, so there is no librdkafka or OpenSSL
+  # build and the job takes minutes. The vtop-cli tests that delete files
+  # would refuse here the same way and are not run.
+  file-source-macos:
+    name: file source (macOS)
+    needs: changes
+    if: needs.changes.outputs.file_source == 'true'
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-file-source-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-file-source-
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy -p vtop-adapters --all-targets --locked -- -D warnings
+
+      - name: File source lib tests
+        run: cargo test -p vtop-adapters --lib --locked
 
   # The MSRV is a tested promise, not a number in a file: this builds on exactly
   # the declared toolchain. The floor is set by aws-smithy-types 1.6.3
