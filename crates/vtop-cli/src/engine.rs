@@ -1561,6 +1561,19 @@ impl Engine {
         }
         if let Some(f) = &config.sources.file {
             if f.enabled {
+                if f.delete_after_commit
+                    && !f.delete_without_open_check
+                    && !cfg!(target_os = "linux")
+                {
+                    // Said at startup, not first when a file is due (#619).
+                    tracing::warn!(
+                        "sources.file.delete_after_commit is set, but this platform has no check \
+                         that no process holds a file open (the engine uses Linux write leases), \
+                         so fully archived files are KEPT; set \
+                         sources.file.delete_without_open_check: true to delete them on the quiet \
+                         period alone"
+                    );
+                }
                 let fmt = default_format_for(&streams, SourceType::File);
                 adapters.insert(
                     SourceType::File,
@@ -1571,7 +1584,8 @@ impl Engine {
                             f.delete_after_commit,
                             f.whole_file,
                         )
-                        .with_delete_quiet_period(Duration::from_secs(f.delete_quiet_seconds)),
+                        .with_delete_quiet_period(Duration::from_secs(f.delete_quiet_seconds))
+                        .with_delete_without_open_check(f.delete_without_open_check),
                     ),
                 );
             }

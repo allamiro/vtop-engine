@@ -392,8 +392,8 @@ What follows from that, in the engine:
   exactly like that for `delete_quiet_seconds` (default 3600), timed on the
   engine's monotonic clock from that commit. With `delete_quiet_seconds: 0`
   there is no wait: the covering commit deletes the file at once, still
-  through the rename-and-check below, but with no quiet-period protection
-  for a writer that holds the file open. The check runs again at the next commit or
+  through the lease, rename and check below, so never while a process has it
+  open. The check runs again at the next commit or
   read pass. Until then the file is kept and read as usual. Before, the
   engine deleted the path the moment it caught up. Most appenders hold their
   log open with `O_APPEND`, so every later line went into the unlinked
@@ -412,12 +412,66 @@ What follows from that, in the engine:
   for each write creates a new file once the rename has happened, and that
   file is read as a new source. A delete that fails (the open, the rename or
   the unlink) keeps the wait's result and is retried on the next pass.
-- **"Unchanged" is one identity test**, shared with #620's delete guard
-  (`delete_identity_ok`): the same inode, the first page (#578) and the
-  page below the committed end (#620's tail fingerprint), plus the exact
-  length and mtime. Both the delete decision and the final check before the
-  unlink make it. A file that is gone, or that fails it in any way, is no
-  longer a candidate, and is kept until a new commit covers it.
+- **...and only on proof that no process has the file open** (#619, after
+  #631). A quiet file is not a closed one. With the quiet period alone, a
+  writer that held the file open lost its lines three ways: it was silent
+  for longer than the period and then wrote again; its write landed between
+  the final check of the renamed file and the unlink; or it opened the file
+  while the delete was under way and wrote after it. So the delete takes a
+  Linux write lease (`fcntl(F_SETLEASE, F_WRLCK)`, `vtop-adapters`
+  `write_lease.rs`) on the file before moving it aside, and holds it until
+  after the unlink. The kernel grants it only when the engine's descriptor
+  is the file's only open file description: no other process, and no other
+  descriptor of this one, has it open, for reading or writing, mapped
+  included. While it is held, any open of the file breaks it, and the
+  opener waits until it is released. So:
+  - a writer that still holds the file - silent however long - makes the
+    lease fail, and the file is kept; the wait starts again;
+  - a writer that opens the file after the lease is granted breaks it. The
+    final check sees that, the file is put back under its name, and only
+    then is the lease released, so the opener gets a file that still has
+    its name;
+  - after the rename, an open of the path finds a new file, never this one.
+
+  Leases are per inode in the kernel, so the check also sees a writer in
+  another container sharing the volume, which a scan of `/proc/*/fd` cannot.
+  The engine's own descriptors count too: the descriptor kept to re-read a
+  file's outstanding ranges (#621) is the one the lease is taken through,
+  and the descriptor the covering commit checks the file with is closed
+  before the delete. The final checks run through the leased descriptor,
+  since opening the renamed file again would break the lease. A break sends
+  the holder a signal, SIGIO by default, whose default action ends the
+  process, so the lease is set to signal SIGURG, ignored by default, and
+  then to signal no one.
+
+  This is the only `unsafe` in the engine's `src/` trees: `fcntl` with
+  integer arguments on a descriptor a borrowed `File` keeps open for the
+  call, behind a safe wrapper (`write_lease::take`, `WriteLease::intact`,
+  and the release on drop), with a `SAFETY` note on the one block.
+- **Where there is no such proof, the delete is refused.** The lease needs
+  Linux, a local filesystem (NFS and most FUSE, 9p and virtiofs mounts
+  answer `EINVAL`), the engine running as the file's owner or with
+  `CAP_LEASE` (otherwise `EACCES`), and `fs.leases-enable` on. Without it
+  the fully archived file is kept, and a warning names the reason and the
+  remedies; the candidate is dropped, so the refusal is said once per
+  covering commit rather than retried every pass. On a platform other than
+  Linux the engine also says so at startup. `delete_without_open_check:
+  true` restores deletion on the quiet period alone there, and with it the
+  losses above, by the operator's choice. Where the lease can be had, it is
+  always taken, and a file some process holds is kept whatever that key
+  says.
+- **"Unchanged" is one identity test**, `continuity::proves` (#647), the
+  test every identity decision shares: the same inode, the first page
+  (#578) and the page below the committed end (#620's tail fingerprint),
+  plus the exact length and mtime. The covering commit, the delete decision
+  and the final check before the unlink all make it. Before #619 was
+  finished, the delete had a test of its own, which passed a marker that
+  named no first page on the inode and length alone, so a same-inode,
+  same-length rewrite that landed before the commit was deleted unread; and
+  on a platform without inode numbers it judged the size alone. Now
+  anything unknown answers no: a marker with no inode or no first page
+  never deletes a file. A file that is gone, or that fails the test in any
+  way, is no longer a candidate, and is kept until a new commit covers it.
 - **A moved mtime restarts the wait only when the tail proves it a touch.**
   With the inode, first page, tail and length all unchanged, a new mtime
   (a producer stamping a finished drop, a `touch`) restarts the quiet
@@ -444,31 +498,35 @@ What follows from that, in the engine:
 
 Limits, stated plainly:
 
-- **No portable check proves that no process holds a file open**, so
-  `delete_after_commit` cannot prove it either. Two windows remain for a
-  writer that keeps the file open:
+- **Where the engine cannot check that no process holds a file open**, it
+  keeps the file (above). With `delete_without_open_check: true` it deletes
+  on the quiet period alone instead, and a writer that keeps the file open
+  loses lines in two windows:
   - it is silent for longer than `delete_quiet_seconds` and then writes
-    again: it writes into a deleted file, and those lines are lost;
+    again: it writes into a deleted file;
   - after that same silence, its write lands between the delete's final
-    check of the renamed file and the unlink: that write is lost the same
-    way.
+    check of the renamed file and the unlink.
 
-  Scanning `/proc/*/fd` was considered and rejected: it is Linux-only, it
-  needs privileges to see other users' descriptors, and it cannot see
-  writers in other containers' PID namespaces, which is exactly where a
-  sidecar deployment puts them. The option is meant for files that are
-  finished: whole-file drops, and rotated logs after the writer has
-  reopened.
+  Scanning `/proc/*/fd` was considered and rejected as the check: it is
+  Linux-only like the lease, it needs privileges to see other users'
+  descriptors, and it cannot see writers in other containers' PID
+  namespaces, which is exactly where a sidecar deployment puts them.
+- **With the lease, one window is left**: a process that opens the file by
+  its hidden name (`.vtop-delete.<nanos>.<n>`) between the final check and
+  the unlink. Its open waits on the lease, and gets the unlinked file once
+  the lease is released. Nothing has reason to open that name, and the
+  engine logs an error if it happens. A process that reaches the file
+  through another hard link is not in this window: the file keeps that
+  name, and the link is its own source (#378).
 - A crash between the rename and the unlink leaves the file under its
-  hidden name; it is never deleted unchecked. It holds the archived bytes,
-  plus any write that landed after the decision to delete it - one the
-  crash kept the engine from putting back, or one through a held descriptor
-  after the final check - which is not archived. If a configured pattern
-  matches the hidden name, the file is archived again from byte 0 (a
-  duplicate of what was archived, with the late write). If not, it stays
-  until it is removed by hand. If the hard link back fails (a new file
-  already has the name, or the filesystem has no hard links), the file is
-  left under the hidden name and an error names both paths.
+  hidden name; it is never deleted unchecked. The crash releases the lease,
+  and an opener that was waiting on it then gets that file: anything it
+  writes there is not archived. If a configured pattern matches the hidden
+  name, the file is archived again from byte 0 (a duplicate of what was
+  archived, with any late write). If not, it stays until it is removed by
+  hand. If the hard link back fails (a new file already has the name, or
+  the filesystem has no hard links), the file is left under the hidden name
+  and an error names both paths.
 
 - The **unread tail of a rotated-away file** is not read through the old path.
   If the rotated name (`app.log.1`) also matches a configured pattern it is

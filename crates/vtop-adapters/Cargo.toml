@@ -33,5 +33,10 @@ futures = { workspace = true }
 # moves a file aside without ever replacing another (#619).
 rustix = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# fcntl(F_SETLEASE): delete_after_commit deletes a file only on proof that no
+# other process holds it open (#619, src/write_lease.rs).
+libc = "0.2.189"
+
 [dev-dependencies]
 tempfile = { workspace = true }
