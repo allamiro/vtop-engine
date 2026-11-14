@@ -30,6 +30,15 @@ archive is complete, then the procedures you will need less often.
 
     [:octicons-arrow-right-24: Scrub and audit](scrub-and-audit.md)
 
+-   **Rotate the manifest MAC key**
+
+    ---
+
+    Add a key as verify-only, switch the signing key, scrub, and retire a
+    withdrawn key.
+
+    [:octicons-arrow-right-24: Key rotation](manifest-key-rotation.md)
+
 -   **Upgrades**
 
     ---

@@ -16,7 +16,7 @@ which requires a nightly toolchain.
 |---|---|---|
 | `detect_record` | `detect_record(&[u8])` | never panics on any byte string |
 | `detect_batch` | `detect_batch(&[Vec<u8>])` (input split on newlines) | never panics on any set of records |
-| `manifest_parse` | `ParsedManifest::from_slice` (version check first, strict 0.4 parse and canonical form) + `verify_self_hash` / `verify_authentication`; `serde_json::from_slice::<VtopManifest>` + `self_hash` / `verify_self_hash` / `to_json_bytes` | parsing returns `Err`, never panics; the verification helpers don't panic on a hostile manifest. Seeds include the released v0.7.0 and v0.8.0 manifests, the first 0.4 manifests release B wrote (signed and unsigned, with `verification_plan`), a 0.4 document with unknown fields, a 0.4 plan with an unknown `method` and field, and newer, duplicate-key and fractional-number cases |
+| `manifest_parse` | `ParsedManifest::from_slice` (version check first, strict 0.4 parse and canonical form) + `verify_self_hash` / `verify_authentication` / keyring `authenticate`; `serde_json::from_slice::<VtopManifest>` + `self_hash` / `verify_self_hash` / `to_json_bytes` | parsing returns `Err`, never panics; the verification helpers don't panic on a hostile manifest. Seeds include the released v0.7.0 and v0.8.0 manifests, the first 0.4 manifests release B wrote (signed and unsigned, with `verification_plan`), a 0.4 document with unknown fields, a 0.4 plan with an unknown `method` and field, the 0.4 manifests signed under key ids `q3` and `q4` (#685), and newer, duplicate-key and fractional-number cases. Each parsed manifest is also authenticated against a keyring, so a hostile `mac_key_id` goes through the key lookup |
 
 ## Run
 

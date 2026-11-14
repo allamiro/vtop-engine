@@ -285,6 +285,7 @@ A conformant manifest:
 | `manifest.uri` | string | MUST | Manifest storage URI/key. |
 | `manifest.sha256` (self-hash) | string | MUST | Reproducible SHA-256 computed with both embedded hash/MAC values blanked. |
 | `manifest.mac` | string | MAY | 32-byte keyed BLAKE3 authenticator (lowercase hex), computed over the same canonical bytes. |
+| `manifest.mac_key_id` | string | `0.4` with a keyring: MUST; earlier: MUST NOT | The id of the key that computed `manifest.mac` (#685): 1 to 64 characters from `[A-Za-z0-9._-]`. Not blanked for the hash, so the self-hash and the MAC both cover it. Absent: the manifest is verified with the reader's key marked `legacy`. See "Key ids" below. |
 | `state` | enum | SHOULD | Lifecycle state at manifest-write time (`manifest_uploaded`). |
 | `verification_status` | enum | SHOULD | Status at manifest-write time, so always `not_verified`. **Deprecated** in favour of `verification_plan` plus the ledger; still written in `0.4` because v0.8.0 readers require it. |
 | `verification_plan` | object | `0.4` writer: MUST; earlier: MUST NOT | How the object will be verified, as configured when the manifest was written (`0.4`, #671). `method` and `require_strong` below. A `0.4` reader does not require it (a `0.4` document without it still verifies), and refuses a malformed one as a malformed document. |
@@ -354,6 +355,34 @@ document with `"version": "0.4"` and one more object:
   unauthenticated. A reader ignores one found in such a document, whatever
   its value, as an unknown key, exactly as a v0.8.0 reader does.
 - **`0.3` output is unchanged** byte for byte while the setting is off.
+
+**Key ids (#685).** A writer with several MAC keys signs with one, the
+active key, and records its id in `manifest.mac_key_id`; the field sits next
+to `manifest.mac` because they are read together.
+
+- **`0.4` only.** A `0.1`-`0.3` reader hashes the decoded struct, so it would
+  drop the id and report the manifest as tampered. A writer **MUST NOT**
+  record an id in a `0.1`-`0.3` manifest, and a reader ignores one found
+  there as an unknown key (as a v0.8.0 reader does) and verifies that
+  manifest with its legacy key: no legacy hash covers the id, so it cannot
+  choose the key.
+- **Verify with the named key.** A reader **MUST** verify the MAC with the
+  key whose id the manifest names, and **MUST NOT** try other keys. A
+  manifest with no id is verified with the one key the reader marks
+  `legacy`.
+- **Outcomes.** A named id the reader holds: verified with it, and a
+  mismatch is "MAC verification failed for key id X". A named id the reader
+  has tombstoned: unauthenticated, "key id X is retired". A named id the
+  reader does not hold: unauthenticated, "signed with key id X, which is not
+  in this keyring". No id and no legacy key: unauthenticated, saying so. No
+  MAC where a key is configured: refused, as before. None of these is
+  reported as a corrupt manifest: the bytes may be intact.
+- **An id is a label, and storage is untrusted.** A reader quotes an id from
+  a manifest escaped and bounded, and never uses it as a metric label.
+- **Readers that predate key ids** (v0.8.0 and earlier) authenticate the id
+  as an unknown `0.4` field and verify with their one key: they pass a
+  manifest their key signed and fail any other. Every reader therefore runs a
+  release that reads key ids before the active key changes.
 
 **Version grammar.** A version is dotted digits, `MAJOR.MINOR` or
 `MAJOR.MINOR.PATCH`, each part with no leading zero (`0` itself is fine). A
@@ -638,6 +667,12 @@ A writer of `0.4` **MUST** compute the self-hash and MAC over the canonical
 form of the document it stores, and verifies those stored bytes the way a
 reader will before the batch may reach `VERIFIED` (§11.2, "Writing `0.4`").
 
+A reader with several MAC keys **MUST** verify a manifest with the key its
+`manifest.mac_key_id` names, or with its legacy key when it names none, and
+**MUST NOT** search its keys. A manifest naming a key the reader does not
+hold, or a retired one, is unauthenticated, and is reported as that, not as
+corrupt (§11.2, "Key ids").
+
 ---
 
 ## 18. Security considerations
@@ -648,7 +683,9 @@ reader will before the batch may reach `VERIFIED` (§11.2, "Writing `0.4`").
 - Object storage permissions **SHOULD** follow least privilege; on-demand bucket creation (§15.2) has `CreateBucket` implications addressed in the security model.
 - Implementations **SHOULD** support object immutability (e.g., object lock / WORM) where the backend allows it.
 - Implementations **SHOULD** support manifest authentication. VTOP 0.2 supports
-  a shared-key BLAKE3 MAC; public-key signatures remain a possible extension.
+  a shared-key BLAKE3 MAC, and `0.4` names the key that computed it so keys
+  can be rotated (§11.2, "Key ids"); public-key signatures remain a possible
+  extension.
 - Verification (§10, §17) protects against silent corruption but is not a substitute for transport security.
 
 See the accompanying [SECURITY_MODEL.md](SECURITY_MODEL.md) for the full security model.

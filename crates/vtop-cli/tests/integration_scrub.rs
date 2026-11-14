@@ -442,7 +442,7 @@ async fn a_pruned_row_is_scrubbed_from_its_digest() {
 
     let rows = scrub::committed_rows(engine.store.list_batches().await.unwrap(), digested);
     assert_eq!(rows.len(), 2, "the ledger's row and the digest's");
-    let report = scrub::scrub(engine.backend.as_ref(), None, rows, &opts())
+    let report = scrub::scrub(engine.backend.as_ref(), &Default::default(), rows, &opts())
         .await
         .unwrap();
     assert_eq!(
@@ -530,7 +530,8 @@ async fn an_interrupted_run_resumes_after_the_last_object_it_finished() {
         ..ScrubOptions::default()
     };
     let rows = a.rows().await;
-    let run = scrub::scrub(gate.as_ref(), None, rows, &opts);
+    let no_keys = vtop_core::manifest::ManifestKeyring::default();
+    let run = scrub::scrub(gate.as_ref(), &no_keys, rows, &opts);
     // The third object's verification never returns: the run is cut off there.
     let cut = tokio::time::timeout(Duration::from_millis(500), run).await;
     assert!(cut.is_err(), "the gated run must still be waiting");
@@ -568,7 +569,8 @@ async fn a_run_killed_after_a_finding_resumes_at_the_finding() {
         cursor_file: Some(cursor.clone()),
         ..ScrubOptions::default()
     };
-    let run = scrub::scrub(gate.as_ref(), None, a.rows().await, &opts);
+    let no_keys = vtop_core::manifest::ManifestKeyring::default();
+    let run = scrub::scrub(gate.as_ref(), &no_keys, a.rows().await, &opts);
     assert!(tokio::time::timeout(Duration::from_millis(500), run)
         .await
         .is_err());
@@ -667,7 +669,7 @@ async fn concurrency_never_exceeds_its_bound() {
     let probe = Arc::new(Probe::new(a.mock.clone()));
     let report = scrub::scrub(
         probe.as_ref(),
-        None,
+        &Default::default(),
         a.rows().await,
         &ScrubOptions {
             concurrency: 3,
@@ -1330,5 +1332,278 @@ async fn a_mixed_03_and_04_archive_scrubs_clean_and_a_tampered_04_manifest_is_re
             "signed={signed}: {report:#?}"
         );
         assert_eq!(count(&report, ScrubResult::Ok), 3, "{report:#?}");
+    }
+}
+
+// ---- #685: manifest MAC key rotation -----------------------------------------
+
+/// Key files for the rotation tests, outside the archive: `q3` (`3c` x 32,
+/// the key the fleet signed with before key ids) and `q4` (`4d` x 32).
+const Q3_HEX: &str = "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c";
+const Q4_HEX: &str = "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d";
+
+/// A `manifest.mac` over key files in `dir`: `keys` as (id, legacy).
+fn keyring_config(
+    dir: &Path,
+    active: &str,
+    keys: &[(&str, bool)],
+    retired: &[&str],
+) -> vtop_core::config::ManifestMacConfig {
+    use vtop_core::config::{ManifestKeyConfig, ManifestMacConfig};
+    let key_dir = dir.join("keys");
+    std::fs::create_dir_all(&key_dir).unwrap();
+    for (id, hex) in [("q3", Q3_HEX), ("q4", Q4_HEX)] {
+        std::fs::write(key_dir.join(id), format!("{hex}\n")).unwrap();
+    }
+    ManifestMacConfig {
+        active: active.into(),
+        keys: keys
+            .iter()
+            .map(|(id, legacy)| ManifestKeyConfig {
+                id: (*id).into(),
+                env: None,
+                file: Some(key_dir.join(id).to_string_lossy().into_owned()),
+                legacy: *legacy,
+            })
+            .collect(),
+        retired: retired.iter().map(|r| r.to_string()).collect(),
+    }
+}
+
+/// An engine over the archive's ledger and mock store, recovered (so the
+/// file source resumes after what is committed) and ready to scrub.
+async fn engine_over(mock: &Arc<MockBackend>, cfg: VtopConfig) -> Engine {
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    engine.backend = mock.clone();
+    engine.recover().await.unwrap();
+    engine
+}
+
+fn append(inputs: &[PathBuf], line: &str) {
+    for input in inputs {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(input)
+            .unwrap();
+        writeln!(f, "{line}").unwrap();
+    }
+}
+
+/// The key id each committed batch's pinned manifest names, by batch id.
+async fn key_ids(engine: &Engine, mock: &MockBackend) -> Vec<Option<String>> {
+    let mut rows = engine.store.list_batches().await.unwrap();
+    rows.sort_by(|a, b| a.batch_id.cmp(&b.batch_id));
+    let mut ids = Vec::new();
+    for row in rows {
+        let bytes = mock
+            .get_manifest_pinned(
+                row.manifest_uri.as_deref().unwrap(),
+                row.manifest_version_id.as_deref().unwrap(),
+                1 << 20,
+            )
+            .await
+            .unwrap();
+        ids.push(
+            vtop_core::manifest::ParsedManifest::from_slice(&bytes)
+                .unwrap()
+                .fields()
+                .manifest
+                .mac_key_id
+                .clone(),
+        );
+    }
+    ids
+}
+
+/// #685, the rotation procedure end to end, as the operate page documents
+/// it. A fleet signing with `manifest_mac_key_env` (0.3, no key id) moves to
+/// a keyring holding its key as `q3` (legacy) and a new `q4`, verify-only;
+/// then switches the active key to `q4`; then scrubs. Every manifest, from
+/// every phase, verifies with the key it names, and the scrub counts them by
+/// key. Afterwards: a keyring that dropped `q3` reports its manifests as
+/// unauthenticated naming the key (never mismatched or corrupt), and one
+/// that retired `q3` says "retired".
+#[tokio::test]
+async fn a_key_rotation_verify_only_then_switch_then_scrub_keeps_every_manifest_verified() {
+    use vtop_core::manifest::{KeyResult, ManifestWriteVersion};
+    let dir = tempfile::tempdir().unwrap();
+    let inputs: Vec<PathBuf> = (0..2)
+        .map(|i| write_input(dir.path(), &format!("rotate-{i}.log"), 2))
+        .collect();
+    let mock = Arc::new(MockBackend::new());
+
+    // Phase 0: before key ids. One key, from manifest_mac_key_env.
+    let env = format!("VTOP_TEST_ROTATION_MAC_{}", std::process::id());
+    std::env::set_var(&env, Q3_HEX);
+    let mut cfg = config(dir.path(), &inputs, "mock");
+    cfg.manifest_mac_key_env = Some(env.clone());
+    let mut engine = engine_over(&mock, cfg).await;
+    std::env::remove_var(&env);
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert!(out.len() == 2 && out.iter().all(|o| o.committed), "{out:?}");
+    drop(engine);
+
+    // Step 1: the keyring, with the new key verify-only. The old key is
+    // active (and legacy, for the manifests that name no id).
+    let mut cfg = config(dir.path(), &inputs, "mock");
+    cfg.manifest.write_version = ManifestWriteVersion::V0_4;
+    cfg.manifest.mac = Some(keyring_config(
+        dir.path(),
+        "q3",
+        &[("q3", true), ("q4", false)],
+        &[],
+    ));
+    let mut engine = engine_over(&mock, cfg).await;
+    append(&inputs, "written after q4 was added verify-only");
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert!(out.len() == 2 && out.iter().all(|o| o.committed), "{out:?}");
+    drop(engine);
+
+    // Step 3: switch the active key.
+    let mut cfg = config(dir.path(), &inputs, "mock");
+    cfg.manifest.write_version = ManifestWriteVersion::V0_4;
+    cfg.manifest.mac = Some(keyring_config(
+        dir.path(),
+        "q4",
+        &[("q3", true), ("q4", false)],
+        &[],
+    ));
+    let mut engine = engine_over(&mock, cfg).await;
+    append(&inputs, "written after the switch");
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert!(out.len() == 2 && out.iter().all(|o| o.committed), "{out:?}");
+
+    let mut ids = key_ids(&engine, &mock).await;
+    ids.sort();
+    assert_eq!(
+        ids,
+        [
+            None,
+            None,
+            Some("q3".into()),
+            Some("q3".into()),
+            Some("q4".into()),
+            Some("q4".into())
+        ],
+        "two manifests per phase, each naming the key that signed it"
+    );
+
+    // Step 4: scrub. Everything verifies; the counts say by which key.
+    let report = engine
+        .scrub(
+            scrub::committed_rows(engine.store.list_batches().await.unwrap(), vec![]),
+            &opts(),
+        )
+        .await
+        .unwrap();
+    assert!(report.passed, "{report:#?}");
+    assert_eq!(count(&report, ScrubResult::Ok), 6);
+    assert_eq!(
+        report.manifest_keys,
+        [("q3".to_string(), 4), ("q4".to_string(), 2)].into(),
+        "the legacy key verified the four manifests before the switch"
+    );
+    let text = report.lines().join("\n");
+    assert!(
+        text.contains("manifests authenticated by key: q3=4 q4=2"),
+        "{text}"
+    );
+    let prom = report.prometheus_text(None, 1000);
+    for series in [
+        "vtop_scrub_manifest_keys_total{key_id=\"q3\"} 4\n",
+        "vtop_scrub_manifest_keys_total{key_id=\"q4\"} 2\n",
+    ] {
+        assert!(prom.contains(series), "{series}: {prom}");
+    }
+    // Carried across runs like the per-result counter.
+    let again = report.prometheus_text(Some(&prom), 2000);
+    assert!(
+        again.contains("vtop_scrub_manifest_keys_total{key_id=\"q3\"} 8\n"),
+        "{again}"
+    );
+    drop(engine);
+
+    // Afterwards, the two ways to lose the old key. Dropped: its manifests
+    // name a key this keyring does not hold. Retired: they name a withdrawn
+    // key. Either way unauthenticated, named, and never mismatched.
+    for (retired, needle, result) in [
+        (&[][..], "not in this keyring", KeyResult::UnknownKey),
+        (&["q3"][..], "retired", KeyResult::RetiredKey),
+    ] {
+        let mut cfg = config(dir.path(), &inputs, "mock");
+        cfg.manifest.write_version = ManifestWriteVersion::V0_4;
+        cfg.manifest.mac = Some(keyring_config(dir.path(), "q4", &[("q4", false)], retired));
+        let engine = engine_over(&mock, cfg).await;
+        let rows = scrub::committed_rows(engine.store.list_batches().await.unwrap(), vec![]);
+        // The engine's keyring stays inside it; the same config resolves
+        // the same keys for the per-batch check.
+        let keyring = engine.config.resolve_manifest_keyring().unwrap();
+        let mut checked = Vec::new();
+        for row in &rows {
+            checked.push(
+                scrub::check_stored_batch(engine.backend.as_ref(), &keyring, &row.record).await,
+            );
+        }
+        let report = engine.scrub(rows, &opts()).await.unwrap();
+        assert_eq!(count(&report, ScrubResult::Ok), 2, "{report:#?}");
+        assert_eq!(
+            count(&report, ScrubResult::Unauthenticated),
+            4,
+            "{report:#?}"
+        );
+        assert_eq!(count(&report, ScrubResult::Mismatched), 0);
+        assert_eq!(report.manifest_keys, [("q4".to_string(), 2)].into());
+        let details: Vec<&str> = report.findings.iter().map(|f| f.detail.as_str()).collect();
+        assert_eq!(
+            details
+                .iter()
+                .filter(|d| d.contains(needle) && d.contains("key id \"q3\""))
+                .count(),
+            2,
+            "{details:#?}"
+        );
+        assert_eq!(
+            details
+                .iter()
+                .filter(|d| d.contains("names no key id"))
+                .count(),
+            2,
+            "the manifests from before key ids have no legacy key now: {details:#?}"
+        );
+        for detail in &details {
+            assert!(detail.contains("unauthenticated"), "{detail}");
+            let lower = detail.to_ascii_lowercase();
+            assert!(
+                !lower.contains("corrupt") && !lower.contains("tamper"),
+                "{detail}"
+            );
+            assert!(
+                !detail.contains(Q3_HEX) && !detail.contains(Q4_HEX),
+                "{detail}"
+            );
+        }
+        let mut seen: Vec<(String, KeyResult)> = checked
+            .iter()
+            .filter_map(|c| c.key.clone())
+            .map(|k| (k.key_id, k.result))
+            .collect();
+        seen.sort();
+        let label = if result == KeyResult::RetiredKey {
+            "q3"
+        } else {
+            "other"
+        };
+        let mut want = vec![
+            ("none".to_string(), KeyResult::UnknownKey),
+            ("none".to_string(), KeyResult::UnknownKey),
+            (label.to_string(), result),
+            (label.to_string(), result),
+            ("q4".to_string(), KeyResult::Ok),
+            ("q4".to_string(), KeyResult::Ok),
+        ];
+        want.sort();
+        assert_eq!(seen, want, "the check says which key, by bounded label");
     }
 }

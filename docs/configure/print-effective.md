@@ -51,7 +51,7 @@ as JSON, with `effective_version: 1`, `status` and `warnings` beside it.
 | `resolved_upload_width` | Batches uploaded and verified at once, after every ceiling is applied. |
 | `path_template` | The object key layout; see [`partitioning`](reference.md#partitioning). |
 | `upload.require_strong_verification` | The global verification floor no stream can lower. |
-| `manifest_mac` | `enabled` or `disabled`, never the key. |
+| `manifest_mac` | `enabled` (`manifest_mac_key_env`) or `disabled`, never the key. With a keyring, `keyring:` followed by the active key, the verify-only keys and the retired ids, each key with its source kind (`env` or `file`) and `legacy` where set; never a key, a variable name or a file path. |
 | `manifest.write_version` | The manifest version new batches are written in, `0.3` or `0.4`; see [`manifest`](reference.md#manifest). |
 
 The output is an allowlist: it never includes a secret, a secret reference's

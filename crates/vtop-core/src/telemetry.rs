@@ -133,6 +133,13 @@ pub struct Metrics {
     /// `0.4` sample is the signal that every reader of this archive must run
     /// v0.8.0 or later; an earlier one reports those manifests as tampered.
     pub manifests_written_total: IntCounterVec,
+    /// Manifest MAC checks (#685), by the key used and what it found.
+    /// `key_id` is a CONFIGURED id, `none` (a key with no id, or a manifest
+    /// naming none where no key is legacy) or `other` (an id this process
+    /// does not hold): never the id read from a manifest, which comes from
+    /// storage and would be unbounded. `result` is `ok`, `failed`,
+    /// `unknown_key` or `retired_key`.
+    pub manifest_authentications_total: IntCounterVec,
 
     /// Volume. Rates are derived from these in PromQL, never exported directly.
     pub records_total: IntCounterVec,
@@ -312,6 +319,11 @@ impl Metrics {
             "Manifests stored, by manifest version (manifest.write_version); readers before v0.8.0 report version 0.4 manifests as tampered",
             vec!["tenant", "version"],
         )?;
+        let manifest_authentications_total = cv(
+            "manifest_authentications_total",
+            "Manifest MAC checks by key_id (a configured key id; none: a key with no id, or no id and no legacy key; other: an id not in this keyring) and result (ok, failed, unknown_key, retired_key). unknown_key or retired_key: the manifest is unauthenticated, not corrupt; add the key as verify-only, or accept that the id was retired",
+            vec!["key_id", "result"],
+        )?;
         let failed_total = cv(
             "failed_total",
             "Batches that reached the FAILED state",
@@ -441,6 +453,7 @@ impl Metrics {
             recovery_unsupported_manifest_total,
             recovery_rechecks_total,
             manifests_written_total,
+            manifest_authentications_total,
             records_total,
             bytes_in_total,
             bytes_out_total,

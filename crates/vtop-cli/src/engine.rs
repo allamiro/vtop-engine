@@ -28,7 +28,7 @@ use vtop_core::compression::compress_batch;
 use vtop_core::config::{ResolvedStateStore, StreamConfig, StreamsConfig, VtopConfig};
 use vtop_core::errors::VtopError;
 use vtop_core::manifest::{
-    ManifestBuilder, ManifestFormat, ManifestMacKey, ManifestWriteVersion, ParsedManifest,
+    ManifestBuilder, ManifestFormat, ManifestKeyring, ManifestWriteVersion, ParsedManifest,
     VerificationPlan, MAX_MANIFEST_BYTES,
 };
 use vtop_core::metrics::BatchMetrics;
@@ -132,8 +132,9 @@ pub struct Pipeline<'a> {
     pub store: &'a dyn StateStore,
     pub backend: Arc<dyn UploadBackend>,
     pub config: &'a VtopConfig,
-    /// Runtime-only secret, resolved once at startup and never serialized.
-    pub manifest_mac_key: Option<ManifestMacKey>,
+    /// Runtime-only manifest keys (#685), resolved once at startup and never
+    /// serialized: the active key signs, the key a manifest names verifies.
+    pub manifest_keyring: Arc<ManifestKeyring>,
     /// Buckets whose versioning status passed the hardened-profile preflight
     /// (#135). Owned by [`Engine`] and shared into every pipeline so the
     /// check runs once per bucket per process, not per batch.
@@ -1011,7 +1012,7 @@ impl<'a> Pipeline<'a> {
             upload_backend: self.backend.backend_name().to_string(),
             created_at: now.clone(),
         }
-        .build_written(manifest_format, self.manifest_mac_key.as_ref())?;
+        .build_signed(manifest_format, &self.manifest_keyring)?;
         let manifest_version = manifest.fields().version.clone();
 
         // Track the expected path before writing so even a short/failed write
@@ -1084,7 +1085,7 @@ impl<'a> Pipeline<'a> {
         // ---- MANIFEST_UPLOADED -> VERIFIED (or FAILED) ------------------
         let t = Instant::now();
         // 1) the manifest is internally consistent (self-hash),
-        if let Err(e) = manifest.verify_authentication(self.manifest_mac_key.as_ref()) {
+        if let Err(e) = manifest.authenticate(&self.manifest_keyring).into_result() {
             fail!(format!("manifest authentication verification failed: {e}"));
         }
         // 2) the stored object matches size + checksum,
@@ -1146,7 +1147,7 @@ impl<'a> Pipeline<'a> {
         // the engine rather than content read back from the object (#64), so
         // keyed mode always downloads the small manifest and checks its
         // binding before the batch may reach VERIFIED.
-        if let Some(key) = self.manifest_mac_key.as_ref() {
+        if self.manifest_keyring.is_configured() {
             // When storage assigned a version, authenticate the bytes of that
             // exact immutable version — the same bytes recovery will pin to —
             // instead of whatever currently sits at the key.
@@ -1180,12 +1181,18 @@ impl<'a> Pipeline<'a> {
                 Ok(stored) => stored,
                 Err(e) => fail!(format!("stored manifest parse failed: {e}")),
             };
-            if stored.verify_authentication(Some(key)).is_err()
-                || stored.fields().batch_id != batch_id
+            // The stored bytes' check is the one counted by key (#685): it
+            // is what every later reader will repeat.
+            let authentication = stored.authenticate(&self.manifest_keyring);
+            authentication.count();
+            if let Err(e) = authentication.into_result() {
+                fail!(format!("stored manifest authentication failed: {e}"));
+            }
+            if stored.fields().batch_id != batch_id
                 || stored.fields().manifest.uri != manifest_uri
                 || stored.fields().object.uri != object_uri
             {
-                fail!("stored manifest authentication or batch binding failed".to_string());
+                fail!("stored manifest batch binding failed".to_string());
             }
         }
         metrics.verify_ms = t.elapsed().as_millis() as u64;
@@ -1703,9 +1710,9 @@ pub struct Engine {
     pub store: Box<dyn StateStore>,
     pub backend: Arc<dyn UploadBackend>,
     pub adapters: HashMap<SourceType, Box<dyn SourceAdapter>>,
-    /// Runtime-only manifest authentication secret, resolved from the named
-    /// environment variable before any backend is initialized.
-    manifest_mac_key: Option<ManifestMacKey>,
+    /// Runtime-only manifest keys (#685), resolved from their environment
+    /// variables or files before any backend is initialized.
+    manifest_keyring: Arc<ManifestKeyring>,
     /// Process-wide hardened-profile preflight cache (#135); see
     /// [`Pipeline::versioned_buckets`].
     versioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -1949,7 +1956,7 @@ impl Engine {
             ));
         }
 
-        let manifest_mac_key = config.resolve_manifest_mac_key()?;
+        let manifest_keyring = Arc::new(config.resolve_manifest_keyring()?);
         let store = connect_configured_store(&config.engine, &state_store).await?;
         let backend = vtop_upload::build_backend(&config.upload).await?;
 
@@ -2042,7 +2049,7 @@ impl Engine {
             store,
             backend,
             adapters,
-            manifest_mac_key,
+            manifest_keyring,
             versioned_buckets: Arc::default(),
             throttles: Arc::default(),
             attempts: Arc::default(),
@@ -2073,7 +2080,7 @@ impl Engine {
             store: self.store.as_ref(),
             backend: self.backend.clone(),
             config: &self.config,
-            manifest_mac_key: self.manifest_mac_key.clone(),
+            manifest_keyring: Arc::clone(&self.manifest_keyring),
             versioned_buckets: Arc::clone(&self.versioned_buckets),
             throttles: Arc::clone(&self.throttles),
             attempts: Arc::clone(&self.attempts),
@@ -2104,21 +2111,21 @@ impl Engine {
         }
     }
 
-    /// Key used by read-only manifest verification, if authentication is
-    /// required by this process's configuration.
-    pub(crate) fn manifest_mac_key(&self) -> Option<&ManifestMacKey> {
-        self.manifest_mac_key.as_ref()
+    /// Keys used by read-only manifest verification (#685); empty when
+    /// authentication is not configured.
+    pub(crate) fn manifest_keyring(&self) -> &ManifestKeyring {
+        &self.manifest_keyring
     }
 
     /// Scrub committed `rows` against this engine's store, authenticating
-    /// manifests with its key (#628). The key stays inside the engine: a
-    /// caller gets the report, never the secret it could forge manifests
-    /// with. The guard below fails to compile if the key accessor is ever
+    /// manifests with its keys (#628, #685). The keys stay inside the
+    /// engine: a caller gets the report, never the secret it could forge
+    /// manifests with. The guard below fails to compile if the key accessor is ever
     /// made public again (review of #652):
     ///
     /// ```compile_fail
     /// fn leak(engine: &vtop_cli::Engine) {
-    ///     let _ = engine.manifest_mac_key();
+    ///     let _ = engine.manifest_keyring();
     /// }
     /// ```
     pub async fn scrub(
@@ -2126,13 +2133,7 @@ impl Engine {
         rows: Vec<crate::scrub::ScrubRow>,
         opts: &crate::scrub::ScrubOptions,
     ) -> Result<crate::scrub::ScrubReport, VtopError> {
-        crate::scrub::scrub(
-            self.backend.as_ref(),
-            self.manifest_mac_key.as_ref(),
-            rows,
-            opts,
-        )
-        .await
+        crate::scrub::scrub(self.backend.as_ref(), &self.manifest_keyring, rows, opts).await
     }
 
     /// [`Engine::scrub`] under locks the caller holds until it has published
@@ -2146,7 +2147,7 @@ impl Engine {
     ) -> Result<crate::scrub::ScrubReport, VtopError> {
         crate::scrub::scrub_held(
             self.backend.as_ref(),
-            self.manifest_mac_key.as_ref(),
+            &self.manifest_keyring,
             rows,
             opts,
             held,
@@ -2857,12 +2858,9 @@ impl Engine {
         // passed the object with `backend_limited`, having confirmed size and
         // existence but no digest. Whether that may commit, and how it is
         // logged, stays #651's decision.
-        let check = crate::scrub::check_stored_batch(
-            self.backend.as_ref(),
-            self.manifest_mac_key.as_ref(),
-            rec,
-        )
-        .await;
+        let check =
+            crate::scrub::check_stored_batch(self.backend.as_ref(), &self.manifest_keyring, rec)
+                .await;
         match check.result {
             crate::scrub::ScrubResult::Ok => Recheck::Strong,
             crate::scrub::ScrubResult::UnsupportedVersion => {
@@ -2891,12 +2889,36 @@ impl Engine {
                 verification_mode::recheck_size_only(&self.config, rec, &check.detail)
             }
             result => {
-                tracing::warn!(
-                    batch_id = %rec.batch_id,
-                    result = result.as_str(),
-                    detail = %check.detail,
-                    "recovery re-check: the stored batch does not check out"
-                );
+                use vtop_core::manifest::KeyResult;
+                match check.key.as_ref().map(|k| (k.key_id.as_str(), k.result)) {
+                    // Signed with a key this engine was not given (#685): the
+                    // bytes may be intact, so this is named apart from damage.
+                    Some((key_id, KeyResult::UnknownKey)) => tracing::error!(
+                        batch_id = %rec.batch_id,
+                        key_id,
+                        detail = %check.detail,
+                        "recovery: a VERIFIED batch's manifest is signed with a key this engine \
+                         does not hold, so it is unauthenticated (not corrupt); the range is \
+                         replayed instead of committed (duplicates, never a gap). Add the key \
+                         to manifest.mac.keys as a verify-only entry on every engine before the \
+                         next restart"
+                    ),
+                    Some((key_id, KeyResult::RetiredKey)) => tracing::warn!(
+                        batch_id = %rec.batch_id,
+                        key_id,
+                        detail = %check.detail,
+                        "recovery: a VERIFIED batch's manifest is signed with a retired key \
+                         (manifest.mac.retired), so it is unauthenticated; the range is \
+                         replayed instead of committed and archived again under the active \
+                         key. Expected only if that key was withdrawn"
+                    ),
+                    _ => tracing::warn!(
+                        batch_id = %rec.batch_id,
+                        result = result.as_str(),
+                        detail = %check.detail,
+                        "recovery re-check: the stored batch does not check out"
+                    ),
+                }
                 Recheck::Failed
             }
         }

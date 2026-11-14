@@ -125,7 +125,10 @@ attacker able to rewrite the manifest can recompute it. Set
 32-byte hex key to add `manifest.mac`, a keyed BLAKE3 authenticator. Both
 embedded values are blanked for canonicalization. The key itself is never
 serialized. Enabling a key intentionally rejects older unsigned manifests;
-verify the backlog before cutover. Key rotation is not implemented yet.
+verify the backlog before cutover. To rotate the key, configure a keyring
+(`manifest.mac`, version 0.4 manifests only): a `0.4` manifest then names its
+key in `manifest.mac_key_id`, and readers verify it with that key. See
+[Rotate the manifest MAC key](../operate/manifest-key-rotation.md).
 
 ## Upload and verification
 

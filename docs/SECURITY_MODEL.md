@@ -376,10 +376,10 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 ## 8. Manifest authentication
 
 - VTOP 0.2 supports an optional keyed BLAKE3 authenticator in `manifest.mac` ([VTOP_PROTOCOL_DRAFT.md §11.2](VTOP_PROTOCOL_DRAFT.md#11-manifest-object), §17.3).
-- Config stores only the environment-variable name (`manifest_mac_key_env`); the 32-byte hex key **MUST NOT** appear in config serialization, manifests, or logs.
-- Naming an absent or malformed key **MUST** fail startup rather than silently emit unsigned manifests.
+- Config stores only where a key is read from: an environment-variable name (`manifest_mac_key_env`, or `env:` in a keyring entry) or a file path (`file:`). The 32-byte hex key **MUST NOT** appear in config serialization, manifests, logs, metric labels or `validate --print-effective`, which shows key ids and source kinds (`env`, `file`) only.
+- Naming an absent or malformed key **MUST** fail startup rather than silently emit unsigned manifests. The error names the key id and the variable or file, never the value.
 - Enabling a key deliberately rejects unsigned pre-cutover manifests. Operators **MUST** verify or explicitly migrate their backlog before enabling it.
-- One active key is supported. Rotation and public-key signatures are not implemented.
+- Several keys can be configured, each with an id, so the key can be rotated (§8.3). Public-key signatures are not implemented.
 
 ### 8.1 Freshness: version pinning and the hardened profile (#135)
 
@@ -455,6 +455,56 @@ never a gap.
 `vtopctl verify-manifest`, run standalone with no ledger to bind the bytes
 to, reports that the manifest at that URI claims a version this build cannot
 authenticate. It never reports it as intact.
+
+### 8.3 Key ids and rotation (#685)
+
+Manifests are immutable and pinned (§8.1), so a rotation cannot re-sign the
+archive. After a rotation the archive holds manifests signed by several keys
+for as long as it is retained. Signing stays simple, and verification is
+key-aware:
+
+- **One active key signs.** `manifest.mac.active` names it, and a version 0.4
+  manifest records its id in `manifest.mac_key_id`. The id sits beside
+  `manifest.mac` and is not blanked for the hash, so the self-hash and the MAC
+  both cover it: editing the id fails both.
+- **The id exists only in version 0.4.** A 0.3 reader re-encodes the decoded
+  manifest before hashing, so it would drop the id and report the manifest as
+  tampered. A keyring therefore requires `manifest.write_version: "0.4"`, and
+  config load refuses the combination otherwise. A legacy (0.1-0.3) reader
+  path ignores an id found in a legacy document, as v0.8.0 does.
+- **The key the manifest names verifies it, never a search.** A reader
+  **MUST NOT** try every key it holds: that would make retiring a key
+  meaningless and hide which key signed what. A manifest with no id (every
+  manifest before key ids, and any written with `manifest_mac_key_env`) is
+  verified with the one key marked `legacy: true`.
+- **Unknown and retired ids are unauthenticated, not corrupt.** A manifest
+  naming an id the reader does not hold, or a tombstoned one
+  (`manifest.mac.retired`), or naming none where no key is legacy, fails
+  authentication with a message that names the id and says which case it is.
+  Recovery treats it like any unauthenticated manifest (FAILED, then
+  REPLAY_REQUIRED: duplicates, never a gap), and the scrub reports
+  `unauthenticated`. The bytes may be intact, so the message never calls them
+  damaged.
+- **Retire means stop signing.** A key rotated out in the normal way stays in
+  `manifest.mac.keys` as a verify-only entry for as long as its manifests are
+  audited. A **tombstone** is for a key that was withdrawn or compromised:
+  manifests under it then fail by design, and the scrub names them. No key
+  material is configured for a tombstone.
+- **Metric labels are configured ids only.** `vtop_manifest_authentications_total`
+  and `vtop_scrub_manifest_keys_total` label by a configured id, `none` or
+  `other`. An id read from a manifest comes from storage and is never a label;
+  messages quote it escaped and cut to 64 characters.
+- **Key files** (`file:`) are read once at startup, at most 4 KiB, and their
+  permissions are not checked, as for `engine.state_store` files. Mount them
+  readable by the engine's user only (`defaultMode: 0400` for a Kubernetes
+  secret).
+- **An older reader cannot follow a rotation.** v0.8.0 and earlier hold one
+  key and ignore the id: they verify a manifest only if their key signed it,
+  and report the rest as unauthenticated (a live engine replays them). Every
+  engine, scrub and auditor **MUST** run the keyring release before the
+  active key changes. The engine cannot see which releases read the archive,
+  so this gate is the operator's. The procedure is
+  [Rotate the manifest MAC key](operate/manifest-key-rotation.md).
 
 ## 9. Resource exhaustion controls
 
@@ -540,7 +590,8 @@ the ignore list and the build re-audited.
 | Backend-limited verification disclosure | Yes | Size-only mode is labeled and rejected by default. |
 | Data-at-rest encryption | Not by VTOP | Delegated to storage layer (SSE/bucket default). |
 | Object immutability (WORM) | Partial | Bucket versioning is validated and manifest versions pinned under the hardened profile (§8.1); object-lock retention itself is deployment policy, not engine-configured. |
-| Public-key manifest signing / MAC rotation | Not yet | One shared MAC key is supported. |
+| MAC key rotation | Yes | Key ids in version 0.4 manifests and a keyring (§8.3). |
+| Public-key manifest signing | Not yet | MAC keys are shared secrets: an auditor needs the key to verify. |
 | Multipart upload integrity for very large objects | Not yet | Native backend uses single-part `put_object`. |
 | Authorization / multi-tenant isolation | Not by VTOP | Relies on storage-side IAM and least-privilege credentials. |
 
@@ -559,6 +610,8 @@ the ignore list and the build re-audited.
 | Verify object + manifest before commit | **MUST** |
 | Report backend-limited verification as such (not cryptographic) | **MUST** |
 | Configured manifest MAC verifies without downgrade | **MUST** |
+| A manifest is verified with the key it names (or the legacy key), never by trying every key | **MUST** |
+| Every reader runs the keyring release before the active manifest key changes | **MUST** (operator) |
 | Pinned manifest version unreadable → fail closed (`FAILED` → `REPLAY_REQUIRED`) | **MUST** |
 | Hardened profile: versioned bucket preflight + version on every manifest upload | **MUST** (when `require_object_versioning`) |
 | Object Lock retention on versioned manifest buckets | **SHOULD** |
@@ -586,7 +639,7 @@ flagged and collected below the tables.
 
 | Primitive | Where it runs | What it protects | Proposed class |
 |---|---|---|---|
-| BLAKE3 keyed MAC (`manifest_mac_key_env`) | manifest build/verify (`vtop-core/manifest.rs`) | manifest authenticity against an adversary with object-store write access; constant-time compare, fail-closed when keyed | **security function** |
+| BLAKE3 keyed MAC (`manifest_mac_key_env`, or the `manifest.mac` keyring) | manifest build/verify (`vtop-core/manifest.rs`, `manifest/keyring.rs`) | manifest authenticity against an adversary with object-store write access; constant-time compare, fail-closed when keyed; verified with the key the manifest names (`manifest.mac_key_id`, authenticated), never by search | **security function** |
 | BLAKE3 keyed MAC (segment commit key) | v2 commit statement (`vtop-log/types.rs`, seal/verify/tier) | signed assertion of a sealed segment's identity, boundaries, root and manifest digest | **security function** |
 | BLAKE3 unkeyed content commitments: v2 chunk-tree root + Merkle proofs, v1 `blake3_root`, `manifest_core_digest`, tier-copy whole-file digest gate | seal, offline verify, `vtopctl tier copy/rehydrate`, Raft-pinned `CommitTierEvidence` | tamper-evidence of sealed content **when the root is pinned somewhere the adversary cannot rewrite** (Raft metadata, operator `--expect-root`, cursors); locally, corruption detection | **flagged — Q1 below** |
 | SHA-256 / BLAKE3 object checksum (`checksum.algorithm`, default sha256) | archive-plane object write + read-back verify before commit | stored-object corruption; unkeyed, so substitution is the MAC's job | integrity check |

@@ -47,7 +47,7 @@ three places:
 |---|---|
 | **The state ledger** | Every batch's state, source range, object and manifest URIs and checksums, with `owner` (the engine's `engine.name`) and `created_at` / `updated_at` timestamps. |
 | **The metadata Raft log** (cluster plane) | Every cluster command and promotion. The admin endpoint authorizes each command by the caller's verified mTLS identity, and `meta.adminAuthorization` can restrict cluster-scoped commands to named certificate CNs. |
-| **Manifests** | What was archived: each object's source range and checksum, pinned by version under `upload.require_object_versioning`, and MAC'd when `manifest_mac_key_env` is set. |
+| **Manifests** | What was archived: each object's source range and checksum, pinned by version under `upload.require_object_versioning`, and MAC'd when `manifest_mac_key_env` or `manifest.mac` is set; with a keyring, each `0.4` manifest names its key. Until #694, the startup line naming the active key id is the record of a key change. |
 
 Commands that change state on purpose, such as `prune-ledger`, `replay`,
 `migrate`, `meta enable-features` and `node repair`, log what they did. Keep

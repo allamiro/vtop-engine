@@ -52,6 +52,19 @@ pub(crate) fn announce(config: &VtopConfig, streams: &StreamsConfig) {
         "{}",
         manifest_version_notice(config)
     );
+    // The manifest keys by id (#685): which signs, which only verify, which
+    // are retired. Ids and source kinds only, never a value. Until the audit
+    // stream (#694) exists, this line is the record of an active-key change.
+    tracing::info!(
+        active_key_id = config
+            .manifest
+            .mac
+            .as_ref()
+            .map(|mac| mac.active.as_str())
+            .unwrap_or(""),
+        "{}",
+        config.manifest_key_summary()
+    );
     if let Some(mx) = telemetry::metrics() {
         let size_only = !config.upload.require_strong_verification;
         let tenant = config.engine.tenant.as_str();

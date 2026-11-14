@@ -909,6 +909,41 @@ limitations:
   v0.8.0 and v0.7.0 binaries against a `0.4` archive is the next change
   (#671, PR 2).
 
+**Manifest MAC key rotation (#685).** A keyring, `manifest.mac`, holds
+several keys by id: `active` signs, every key in `keys` verifies the manifests
+that name it, the one marked `legacy` verifies manifests with no id, and
+`retired` tombstones a withdrawn key. A `0.4` manifest records its signing key
+in `manifest.mac_key_id`, covered by its hash and MAC, and a reader verifies
+it with that key, never by trying the others. A manifest naming a key the
+reader does not hold, or a retired one, is unauthenticated (not corrupt) and
+the message names the key; recovery replays it and the scrub reports it.
+`manifest_mac_key_env` stays as one key that writes no id. Startup logs the
+keyring by id, `validate --print-effective` shows ids and source kinds, and
+`vtop_manifest_authentications_total{key_id,result}` and the scrub's
+`vtop_scrub_manifest_keys_total{key_id}` count by configured id. The
+procedure is [docs/operate/manifest-key-rotation.md](operate/manifest-key-rotation.md).
+Known limitations:
+
+- **Every reader must run the keyring release before the active key
+  changes.** v0.8.0 and earlier hold one key and ignore the id: they pass a
+  manifest their key signed and report the rest as unauthenticated (checked
+  with the released v0.8.0 `vtopctl verify-manifest`: it passed a manifest
+  signed by its key under id `q3` and failed one signed by `q4`). An engine
+  on such a release replays those batches. The engine cannot check this.
+- **A keyring needs `manifest.write_version: "0.4"`,** refused at config load
+  otherwise, so the `0.4` reader rule (every reader on v0.8.0 or later)
+  applies first.
+- **Older engines ignore `manifest.mac`.** One that still has
+  `manifest_mac_key_env` keeps signing with that key and no id (verified on
+  keyring engines through the `legacy` key) and cannot verify new-key
+  manifests. Rotation is complete only when none remains.
+- **Unknown keys inside `manifest.mac` are refused,** unlike the rest of the
+  engine config, so a misspelt `retired` cannot leave a withdrawn key
+  working. A later release's new key there will be refused by this one.
+- **Manifests are never re-signed.** A retired (tombstoned) key's manifests
+  fail on purpose; re-archiving that data is a separate decision.
+- **Key files are not permission-checked,** as for `engine.state_store`.
+
 ---
 
 ## Versioning

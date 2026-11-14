@@ -162,3 +162,57 @@ fn the_manifest_write_version_is_shown_with_its_origin() {
         serde_json::json!({"origin": "global", "value": "0.4"})
     );
 }
+
+/// #685: `--print-effective` shows the keyring by key id and source kind
+/// only. It resolves nothing and prints no key, no variable value, no
+/// variable name and no key file path, in text or JSON.
+#[test]
+fn the_manifest_keyring_is_shown_by_id_and_source_kind_only() {
+    let dir = tempfile::tempdir().unwrap();
+    config(dir.path());
+    let path = dir.path().join("config.yaml");
+    let mut yaml = std::fs::read_to_string(&path).unwrap();
+    yaml.push_str(
+        "manifest:\n  write_version: \"0.4\"\n  mac:\n    active: q4-2026\n    keys:\n      \
+         - {id: q3-2026, env: SECRET_MAC_Q3_ENV, legacy: true}\n      \
+         - {id: q4-2026, file: /run/secrets/secret-mac-q4-file}\n    retired: [q1-2026]\n",
+    );
+    std::fs::write(&path, yaml).unwrap();
+    for json in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_vtopctl"));
+        if json {
+            command.arg("--json");
+        }
+        let out = command
+            .args(["validate", "--print-effective", "--config"])
+            .arg(&path)
+            .env("SECRET_MAC_Q3_ENV", "3c".repeat(32))
+            .env_remove("RUST_LOG")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let output = String::from_utf8(out.stdout).unwrap();
+        let want = "keyring: active key q4-2026 (file); verify-only: q3-2026 (env, legacy); \
+                    retired: q1-2026";
+        if json {
+            let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(
+                value["effective"]["default"]["manifest_mac"],
+                serde_json::json!({"value": want, "origin": "global"})
+            );
+        } else {
+            assert!(
+                output.contains(&format!("manifest_mac: \"{want}\" (global)"))
+                    || output.contains(&format!("manifest_mac: {want} (global)")),
+                "{output}"
+            );
+        }
+        for secret in ["SECRET_MAC_Q3_ENV", "secret-mac-q4-file", "3c3c3c3c"] {
+            assert!(!output.contains(secret), "leaked {secret}: {output}");
+        }
+    }
+}
