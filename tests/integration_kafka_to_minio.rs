@@ -86,6 +86,7 @@ fn kafka_client_never_auto_commits() {
 // them explicitly with `-- --ignored` against a seeded broker.
 // ---------------------------------------------------------------------------
 
+use std::collections::HashMap;
 use vtop_adapters::base::{DiscoveredSource, SourceAdapter};
 use vtop_adapters::KafkaSource;
 use vtop_core::types::{ProgressMarker, TelemetryFormat};
@@ -1588,8 +1589,12 @@ async fn recovering_one_partition_does_not_move_another_that_started_at_the_end(
 async fn a_topic_the_broker_did_not_list_at_the_first_pass_is_read_once_it_does() {
     let late = fresh_topic_name("late");
     let group = unique_group("late-topic");
-    let mut adapter =
-        KafkaSource::new(kafka_cfg(&bootstrap(), &group), TelemetryFormat::Cef).unwrap();
+    // `latest`: the adapter was reading the topic before it existed, so every
+    // record in it is newer than the start `latest` promises, and none may be
+    // skipped (#675 follow-up).
+    let mut cfg = kafka_cfg(&bootstrap(), &group);
+    cfg.auto_offset_reset = "latest".into();
+    let mut adapter = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
     let sources = vec![kafka_source(&late)];
 
     // The pass asks the broker for the topic's partitions, gets none, and
@@ -1621,6 +1626,184 @@ async fn a_topic_the_broker_did_not_list_at_the_first_pass_is_read_once_it_does(
         3,
         "a topic the broker did not list at the first pass was not read within {:?}",
         started.elapsed()
+    );
+}
+
+/// Records read per (source index, partition) in one 250ms pass; a failed
+/// pass reads nothing, as in `read_pass`.
+async fn read_pass_by_partition(
+    adapter: &mut KafkaSource,
+    sources: &[DiscoveredSource],
+) -> HashMap<(usize, i32), usize> {
+    capture_adapter_warnings();
+    let mut counts = HashMap::new();
+    let Ok(report) = adapter
+        .read_all_batch_candidates(
+            sources,
+            1000,
+            1 << 20,
+            std::time::Duration::from_millis(250),
+        )
+        .await
+    else {
+        return counts;
+    };
+    for outcome in &report.outcomes {
+        for read in outcome.result.as_ref().expect("per-source result ok") {
+            if let ProgressMarker::Kafka { partition, .. } = &read.progress_end {
+                *counts
+                    .entry((outcome.source_index, *partition))
+                    .or_default() += read.records.len();
+            }
+        }
+    }
+    counts
+}
+
+/// Raise `topic` to `partitions` partitions.
+async fn add_partitions(topic: &str, partitions: usize) {
+    use rdkafka::admin::{AdminClient, AdminOptions, NewPartitions};
+
+    let admin: AdminClient<_> = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-admin"))
+        .unwrap()
+        .create()
+        .expect("admin client");
+    admin
+        .create_partitions(
+            &[NewPartitions::new(topic, partitions)],
+            &AdminOptions::new(),
+        )
+        .await
+        .expect("create_partitions call failed")
+        .pop()
+        .expect("one topic result")
+        .expect("adding partitions failed");
+}
+
+/// Write `n` records to one partition of `topic`.
+fn produce_to(topic: &str, partition: i32, n: usize) {
+    use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+    let producer: BaseProducer = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-producer"))
+        .unwrap()
+        .create()
+        .expect("producer");
+    for i in 0..n {
+        let payload = format!("CEF:0|VTOP|IT|1.0|{i}|Grow|3|src=10.0.0.{}", i % 250);
+        producer
+            .send(
+                BaseRecord::<(), str>::to(topic)
+                    .partition(partition)
+                    .payload(&payload),
+            )
+            .expect("enqueue produce");
+    }
+    producer
+        .flush(std::time::Duration::from_secs(10))
+        .expect("flush produce");
+}
+
+/// #675 follow-up: a partition added to a topic the adapter is already
+/// reading. The partition list was cached for five minutes, so the new
+/// partition was in no assignment and the stall check never saw it; and when
+/// it was finally assigned at `Offset::Stored` under `latest`, it started at
+/// its end and skipped every record written to it in between. It must be
+/// found within the re-check interval and read from its beginning.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_partition_added_while_the_topic_is_read_is_read_from_its_start() {
+    let (topic, _cleanup) = fresh_topic("grow", 0).await;
+    let group = unique_group("grow");
+    let mut cfg = kafka_cfg(&bootstrap(), &group);
+    cfg.auto_offset_reset = "latest".into();
+    let mut adapter = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
+    let sources = vec![kafka_source(&topic)];
+
+    let mut first_read = 0;
+    let warmup = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while first_read == 0 {
+        assert!(
+            std::time::Instant::now() < warmup,
+            "precondition: partition 0 is read"
+        );
+        produce_to(&topic, 0, 2);
+        first_read += read_pass_by_partition(&mut adapter, &sources)
+            .await
+            .get(&(0, 0))
+            .copied()
+            .unwrap_or_default();
+    }
+    add_partitions(&topic, 2).await;
+    produce_to(&topic, 1, 3);
+
+    let started = std::time::Instant::now();
+    let mut added_read = 0;
+    while added_read < 3 && started.elapsed() < std::time::Duration::from_secs(60) {
+        added_read += read_pass_by_partition(&mut adapter, &sources)
+            .await
+            .get(&(0, 1))
+            .copied()
+            .unwrap_or_default();
+    }
+    assert_eq!(
+        added_read,
+        3,
+        "a partition added while the topic was read was not read from its start within {:?}",
+        started.elapsed()
+    );
+}
+
+/// #675 follow-up: a whole re-assign (here a new topic joins the read set)
+/// assigned every partition still waiting at `Offset::Stored` again. Under
+/// `latest`, a partition that had not delivered yet resolved at the NEW end
+/// and skipped what was written to it since its first assign, and nothing
+/// recovered it: its new start was the new end. It must be pinned where it
+/// started first.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn renewing_the_assignment_does_not_move_a_partition_that_started_at_the_end() {
+    let (busy, _busy_cleanup) = fresh_topic("renew_busy", 0).await;
+    let (quiet, _quiet_cleanup) = fresh_topic("renew_quiet", 0).await;
+    let group = unique_group("renew");
+    let mut cfg = kafka_cfg(&bootstrap(), &group);
+    cfg.auto_offset_reset = "latest".into();
+    let mut adapter = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
+    let sources = vec![kafka_source(&busy), kafka_source(&quiet)];
+
+    let mut busy_read = 0;
+    let warmup = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while busy_read == 0 {
+        assert!(
+            std::time::Instant::now() < warmup,
+            "precondition: the busy topic is read"
+        );
+        produce(&busy, 2);
+        busy_read += read_pass(&mut adapter, &sources).await[0];
+    }
+    // Quiet has delivered nothing; its fetcher stops before the records
+    // arrive, so they are still waiting when the assignment is renewed.
+    adapter
+        .stop_fetcher_behind_the_adapter(&quiet, 0)
+        .expect("stop quiet's fetcher");
+    produce(&quiet, 3);
+
+    let (extra, _extra_cleanup) = fresh_topic("renew_extra", 0).await;
+    let sources = vec![
+        kafka_source(&busy),
+        kafka_source(&quiet),
+        kafka_source(&extra),
+    ];
+    let started = std::time::Instant::now();
+    let mut quiet_read = 0;
+    while quiet_read < 3 && started.elapsed() < std::time::Duration::from_secs(30) {
+        quiet_read += read_pass(&mut adapter, &sources).await[1];
+    }
+    assert_eq!(
+        quiet_read,
+        3,
+        "renewing the assignment skipped records written to a partition that started at \
+         the end of the log (within {:?}; stall recoveries: {})",
+        started.elapsed(),
+        adapter.stall_recoveries()
     );
 }
 

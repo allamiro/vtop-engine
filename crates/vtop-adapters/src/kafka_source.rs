@@ -15,7 +15,7 @@ use rdkafka::message::Message;
 use rdkafka::topic_partition_list::TopicPartitionList;
 use rdkafka::Offset;
 use regex::Regex;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 use vtop_core::config::KafkaSourceConfig;
 use vtop_core::errors::VtopError;
@@ -715,6 +715,17 @@ fn resets_to_earliest(auto_offset_reset: &str) -> bool {
     )
 }
 
+/// The position a partition is held at, when the broker's end offset
+/// (`high`) is below it (#675 follow-up). A live log never shrinks below a
+/// position read from it: the topic was deleted and recreated (its offsets
+/// start at 0 again), or the log was truncated by an unclean leader election.
+/// The two cannot be told apart from offsets, and topic ids are not in the
+/// metadata this client exposes, so it is reported for the operator, not
+/// acted on: re-reading a truncated log from its start would archive it again.
+fn end_below_position(position: Option<i64>, high: i64) -> Option<i64> {
+    position.filter(|position| *position > high)
+}
+
 /// The offset at `at` (`Offset::Beginning` or `Offset::End`, i.e. the low or
 /// high watermark) for each of `partitions`, in one bounded ListOffsets call
 /// per leader. A partition the broker did not answer for is absent.
@@ -878,15 +889,22 @@ pub struct KafkaSource {
     liveness: PartitionLiveness,
     /// Re-assigns the stall check has made in this process, for the log.
     stall_reassigns: u64,
-    /// Partition ids per topic, cached with a TTL. A list with no partitions
-    /// is never cached (#675, `cached_partition_ids`).
+    /// Partition ids per topic, cached with a TTL, and what each metadata
+    /// answer changed (#675 follow-up: see `PartitionCache`).
     ///
     /// assign() needs the partition list, but fetching metadata on EVERY read
     /// costs a broker round trip per topic per cycle. With a few topics that is
     /// invisible; with 28 topics under load it dominated the cycle and the
     /// engine appeared to stall for minutes at ~0% CPU. A topic's partition
     /// count changes rarely, so cache it and re-check on the TTL.
-    partitions: HashMap<String, (Vec<i32>, Instant)>,
+    partitions: PartitionCache,
+    /// The (topic, partition) set of the last whole assign(), kept when
+    /// `assigned` is cleared to force a renewal: the renewal must first pin
+    /// the partitions in it still waiting at the end of the log (#675
+    /// follow-up, `pin_latest_starts`).
+    last_assigned: Vec<(String, i32)>,
+    /// Rate limit for the read path's repeated warnings (#675 follow-up).
+    warnings: WarnLimiter,
 }
 
 /// How long a cached partition list is trusted.
@@ -922,7 +940,9 @@ impl KafkaSource {
             paused: Vec::new(),
             liveness: PartitionLiveness::default(),
             stall_reassigns: 0,
-            partitions: HashMap::new(),
+            partitions: PartitionCache::default(),
+            last_assigned: Vec::new(),
+            warnings: WarnLimiter::default(),
         })
     }
 
@@ -985,6 +1005,7 @@ impl KafkaSource {
             .ok();
 
         let mut newly_reported: Vec<((String, i32), i64)> = Vec::new();
+        let mut end_fell: Vec<((String, i32), i64, i64, i64)> = Vec::new();
         for (topic, partition) in &self.assigned {
             // The in-memory cursor is what this process would read next; the
             // group commit is what a fresh one would. Whichever exists is the
@@ -1002,13 +1023,21 @@ impl KafkaSource {
                             _ => None,
                         })
                 });
-            let Ok((low_watermark, _high)) = consumer.fetch_watermarks(
+            let Ok((low_watermark, high_watermark)) = consumer.fetch_watermarks(
                 topic,
                 *partition,
                 std::time::Duration::from_secs(WATERMARK_TIMEOUT_SECONDS),
             ) else {
                 continue;
             };
+            if let Some(position) = end_below_position(next_offset, high_watermark) {
+                end_fell.push((
+                    (topic.clone(), *partition),
+                    position,
+                    low_watermark,
+                    high_watermark,
+                ));
+            }
             if let Some(lost) = retention_gap(next_offset, low_watermark) {
                 let key = (topic.clone(), *partition);
                 let newly = newly_lost(
@@ -1030,6 +1059,33 @@ impl KafkaSource {
                      covers records the engine read, and these were never read, never \
                      manifested and never verified. Size retention above worst-case lag \
                      and monitor consumer lag independently (#361)"
+                );
+            }
+        }
+        // #675 follow-up: an end offset below the position this process holds
+        // cannot happen in a live log. Reported, not acted on: see
+        // `end_below_position`.
+        let now = Instant::now();
+        for ((topic, partition), position, low_watermark, high_watermark) in end_fell {
+            let subject = format!("end:{topic}:{partition}");
+            if let Some(suppressed) = self.warnings.allow(&subject, now) {
+                tracing::warn!(
+                    topic = %topic,
+                    partition,
+                    position,
+                    high_watermark,
+                    low_watermark,
+                    auto_offset_reset = %self.cfg.auto_offset_reset,
+                    suppressed,
+                    "kafka partition's end offset fell below this consumer's position: the topic \
+                     was deleted and recreated, or its log was truncated (unclean leader \
+                     election). The engine does not move the position itself: the broker \
+                     answers the next fetch out of range and auto.offset.reset applies \
+                     (earliest: the new log from its start; latest: its end, skipping what it \
+                     holds). The ledger cannot tell the two logs apart: check whether the topic \
+                     was recreated and what was archived for it, and restart the engine with \
+                     auto.offset.reset=earliest if the new log must be read from its start \
+                     (#675)"
                 );
             }
         }
@@ -1503,7 +1559,7 @@ impl KafkaSource {
             return true;
         }
         let waiting: Vec<(String, i32)> = self
-            .assigned
+            .last_assigned
             .iter()
             .filter(|key| {
                 !self.delivered.contains_key(*key)
@@ -1520,9 +1576,100 @@ impl KafkaSource {
             return false;
         };
         for (key, start) in pins {
+            tracing::info!(
+                topic = %key.0,
+                partition = key.1,
+                offset = start,
+                "kafka partition still waiting at the end of the log is pinned where it \
+                 started before it is assigned again, so what arrived since is read, not \
+                 skipped (#675)"
+            );
             self.cursors.entry(key).or_default().committed_offset = Some(start);
         }
         true
+    }
+
+    /// Where each of `keys` - a partition born after this process read its
+    /// topic, with no position of its own - starts (#675 follow-up). Under
+    /// `latest`: the group's committed offset when it has one, else the
+    /// partition's beginning, pinned in its cursor; every record in it is
+    /// newer than the start `latest` promised when this process began reading
+    /// the topic. `Offset::Stored` would resolve to its END and skip what was
+    /// written to it before the assign. A partition whose start cannot be
+    /// established (the group or the broker did not answer) is left out of
+    /// this pass and asked again at the next. Other policies resolve at
+    /// `Offset::Stored` as before: `earliest` already starts at the beginning.
+    fn start_born_partitions(&mut self, keys: &[(String, i32)]) -> Vec<((String, i32), Offset)> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        if !resets_to_latest(&self.cfg.auto_offset_reset) {
+            for key in keys {
+                self.partitions.settle_born(key);
+            }
+            return keys
+                .iter()
+                .map(|key| (key.clone(), Offset::Stored))
+                .collect();
+        }
+        let answers = self.group_committed_answers(keys);
+        let need_low: Vec<(String, i32)> = keys
+            .iter()
+            .filter(|key| matches!(answers.as_ref().and_then(|a| a.get(*key)), Some(None)))
+            .cloned()
+            .collect();
+        let lows = match self.consumer.as_ref() {
+            Some(consumer) => list_offsets(consumer, &need_low, Offset::Beginning),
+            None => HashMap::new(),
+        };
+        let mut starts = Vec::new();
+        for key in keys {
+            match (answers.as_ref().and_then(|a| a.get(key)), lows.get(key)) {
+                (Some(Some(committed)), _) => {
+                    tracing::info!(
+                        topic = %key.0,
+                        partition = key.1,
+                        offset = *committed,
+                        "kafka partition added after this consumer began reading its topic is \
+                         assigned from the group's committed offset (#675)"
+                    );
+                    self.partitions.settle_born(key);
+                    starts.push((key.clone(), Offset::Stored));
+                }
+                (Some(None), Some(&low)) => {
+                    tracing::info!(
+                        topic = %key.0,
+                        partition = key.1,
+                        offset = low,
+                        "kafka partition added after this consumer began reading its topic is \
+                         assigned from its beginning, with nothing committed for it, so no \
+                         record written to it is skipped (#675)"
+                    );
+                    self.cursors
+                        .entry(key.clone())
+                        .or_default()
+                        .committed_offset = Some(low);
+                    self.partitions.settle_born(key);
+                    starts.push((key.clone(), Offset::Offset(low)));
+                }
+                _ => {
+                    let subject = format!("born:{}:{}", key.0, key.1);
+                    if let Some(suppressed) = self.warnings.allow(&subject, Instant::now()) {
+                        tracing::warn!(
+                            topic = %key.0,
+                            partition = key.1,
+                            suppressed,
+                            "kafka partition added after this consumer began reading its topic \
+                             is not assigned yet: where it starts could not be established (the \
+                             group or the broker did not answer). Asked again next pass; \
+                             nothing is skipped. Check the group coordinator if this repeats \
+                             (#675)"
+                        );
+                    }
+                }
+            }
+        }
+        starts
     }
 
     /// Where each of `waiting` (assigned, `latest`, nothing delivered or held
@@ -1701,8 +1848,7 @@ impl KafkaSource {
     pub fn prune_partition_cache(&mut self, live_topics: &[String]) {
         let live: std::collections::HashSet<&str> =
             live_topics.iter().map(|s| s.as_str()).collect();
-        self.partitions
-            .retain(|topic, _| live.contains(topic.as_str()));
+        self.partitions.retain(&live);
         // The loss bookmark tracks a broker-side fact, so it lives exactly as
         // long as the broker-side subject: a topic absent from live metadata
         // can never report that gap again, and a topic recreated under the
@@ -1728,52 +1874,396 @@ impl KafkaSource {
     fn partitions_for(&mut self, topic: &str) -> Result<Vec<i32>, VtopError> {
         self.consumer()?;
         let consumer = self.consumer.as_ref().expect("consumer built above");
-        cached_partition_ids(&mut self.partitions, topic, Instant::now(), |topic| {
-            let md = consumer
-                .fetch_metadata(Some(topic), Duration::from_secs(10))
-                .map_err(|e| VtopError::Source(format!("fetch_metadata {topic}: {e}")))?;
-            Ok(md
+        self.partitions.ids(topic, Instant::now(), |topic| {
+            fetch_partition_ids(consumer, topic)
+        })
+    }
+
+    /// Re-check the partition counts of every cached topic, at most once per
+    /// `PARTITION_RECHECK_INTERVAL`, in ONE metadata request (#675 follow-up).
+    /// A partition added to a topic this adapter reads was otherwise found
+    /// only when the topic's entry expired, up to `PARTITION_CACHE_TTL` later,
+    /// and until then it was in no assignment, so the stall check never saw
+    /// it either. A failed request changes nothing; the next one is due one
+    /// interval later.
+    fn recheck_partition_counts(&mut self) {
+        let now = Instant::now();
+        if !self.partitions.recheck_due(now) {
+            return;
+        }
+        let Some(consumer) = self.consumer.as_ref() else {
+            return;
+        };
+        let listed = match consumer.fetch_metadata(None, Duration::from_secs(10)) {
+            Ok(md) => md
                 .topics()
                 .iter()
-                .find(|t| t.name() == topic)
-                .map(|t| t.partitions().iter().map(|p| p.id()).collect())
-                .unwrap_or_default())
-        })
+                .map(|t| {
+                    let ids: Vec<i32> = t.partitions().iter().map(|p| p.id()).collect();
+                    (t.name().to_string(), ids)
+                })
+                .collect::<HashMap<String, Vec<i32>>>(),
+            Err(e) => {
+                if let Some(suppressed) = self.warnings.allow("recheck", now) {
+                    tracing::warn!(
+                        error = %e,
+                        suppressed,
+                        "kafka partition re-check failed: partitions added since the last \
+                         answer are found at the next re-check or when a topic's cached list \
+                         expires; nothing already assigned is affected. Check the broker's \
+                         metadata service if this repeats (#675)"
+                    );
+                }
+                return;
+            }
+        };
+        for topic in self.partitions.cached_topics() {
+            if let Some(ids) = listed.get(&topic).filter(|ids| !ids.is_empty()) {
+                self.partitions.observe(&topic, ids, now);
+            }
+        }
     }
 }
 
-/// Partition ids for `topic` from `cache` while the entry is younger than
-/// `PARTITION_CACHE_TTL`, else from `lookup` (a metadata request).
-///
-/// An answer that lists NO partitions is returned but never cached (#675).
-/// A broker answers that way for a topic it does not know yet - one created
-/// moments before, whose metadata the broker has not applied - as well as for
-/// one just deleted. Cached, the topic was left out of every assignment for
-/// the whole TTL, five minutes: none of its records were read, and the stall
-/// check never saw it, since it watches assigned partitions only. Under
-/// `latest`, the assign that finally came resolved at the end of the log and
-/// skipped everything written in between. A topic created just before the
-/// adapter's first pass gives exactly the signature of the live-broker
-/// failure in #675. Asking again on the next pass costs one metadata round trip
-/// per partitionless topic; a topic the broker lists is cached as before.
-fn cached_partition_ids(
-    cache: &mut HashMap<String, (Vec<i32>, Instant)>,
-    topic: &str,
-    now: Instant,
-    lookup: impl FnOnce(&str) -> Result<Vec<i32>, VtopError>,
-) -> Result<Vec<i32>, VtopError> {
-    if let Some((ids, at)) = cache.get(topic) {
-        if now.saturating_duration_since(*at) < PARTITION_CACHE_TTL {
-            return Ok(ids.clone());
+/// The partition ids a metadata request lists for `topic`; empty when the
+/// broker does not list the topic or lists it without partitions.
+fn fetch_partition_ids(consumer: &BaseConsumer, topic: &str) -> Result<Vec<i32>, VtopError> {
+    let md = consumer
+        .fetch_metadata(Some(topic), Duration::from_secs(10))
+        .map_err(|e| VtopError::Source(format!("fetch_metadata {topic}: {e}")))?;
+    Ok(md
+        .topics()
+        .iter()
+        .find(|t| t.name() == topic)
+        .map(|t| t.partitions().iter().map(|p| p.id()).collect())
+        .unwrap_or_default())
+}
+
+/// How often the read path re-checks the partition counts of the topics it
+/// reads (#675 follow-up). One all-topic metadata request per interval,
+/// whatever the topic count, rather than a shorter per-topic TTL, which would
+/// multiply the per-topic requests the cache exists to avoid. A partition
+/// added in between is assigned from its beginning when nothing is committed
+/// for it, so the interval bounds how late it is read, not what is read.
+const PARTITION_RECHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How often one warning repeats for one subject while its condition lasts
+/// (#675 follow-up): a condition asked about on every pass would otherwise log
+/// on every pass.
+const WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// Rate limit for warnings about a condition that persists across passes.
+#[derive(Debug, Default)]
+struct WarnLimiter {
+    /// Per subject: when it was last logged, and how many were held back since.
+    last: HashMap<String, (Instant, u64)>,
+}
+
+impl WarnLimiter {
+    /// `Some(held back since the last one)` when `subject` may be logged now.
+    fn allow(&mut self, subject: &str, now: Instant) -> Option<u64> {
+        match self.last.get_mut(subject) {
+            Some((at, held)) if now.saturating_duration_since(*at) < WARN_EVERY => {
+                *held += 1;
+                None
+            }
+            Some((at, held)) => {
+                let suppressed = *held;
+                *at = now;
+                *held = 0;
+                Some(suppressed)
+            }
+            None => {
+                self.last.insert(subject.to_string(), (now, 0));
+                Some(0)
+            }
         }
     }
-    let ids = lookup(topic)?;
+}
+
+/// What one metadata answer for a topic changed (#675 follow-up).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PartitionChange {
+    /// The same partitions as before.
+    Unchanged,
+    /// The first answer for the topic in this process.
+    First,
+    /// The topic listed no partitions.
+    NoneListed,
+    /// Partitions after an answer that listed none; `recreated` when the
+    /// topic had listed partitions before that.
+    Appeared { recreated: bool },
+    /// More partitions than before; `added` are the new ones.
+    Grew {
+        from: usize,
+        to: usize,
+        added: Vec<i32>,
+    },
+    /// Fewer partitions than before. Kafka cannot remove partitions, so the
+    /// topic was deleted and recreated.
+    Shrank { from: usize, to: usize },
+}
+
+/// Classify an answer listing `ids` for a topic that last listed `previous`
+/// (`None`: never answered, or listed nothing), `absent` when the last answer
+/// listed nothing, `had_partitions` when it ever listed some.
+fn classify_partition_answer(
+    previous: Option<&[i32]>,
+    absent: bool,
+    had_partitions: bool,
+    ids: &[i32],
+) -> PartitionChange {
     if ids.is_empty() {
-        cache.remove(topic);
-    } else {
-        cache.insert(topic.to_string(), (ids.clone(), now));
+        return PartitionChange::NoneListed;
     }
-    Ok(ids)
+    if absent {
+        return PartitionChange::Appeared {
+            recreated: had_partitions,
+        };
+    }
+    let Some(previous) = previous else {
+        return PartitionChange::First;
+    };
+    if ids.len() < previous.len() {
+        return PartitionChange::Shrank {
+            from: previous.len(),
+            to: ids.len(),
+        };
+    }
+    let added: Vec<i32> = ids
+        .iter()
+        .copied()
+        .filter(|id| !previous.contains(id))
+        .collect();
+    if added.is_empty() {
+        PartitionChange::Unchanged
+    } else {
+        PartitionChange::Grew {
+            from: previous.len(),
+            to: ids.len(),
+            added,
+        }
+    }
+}
+
+/// Partition ids per topic, and what the answers that filled it changed
+/// (#675 and its follow-up). Kept free of rdkafka types, and the clock and
+/// the lookup are passed in, so the decisions are unit-testable.
+#[derive(Debug, Default)]
+struct PartitionCache {
+    /// The last list each topic answered with, and when. Only lists that
+    /// name partitions are kept.
+    entries: HashMap<String, (Vec<i32>, Instant)>,
+    /// Topics whose last answer listed no partitions, and whether they had
+    /// listed partitions before that.
+    absent: HashMap<String, bool>,
+    /// Partitions that did not exist when this process first read their
+    /// topic (added later, or the topic was created after it was asked for).
+    /// Every record in one is newer than the start `latest` promised, so one
+    /// with nothing committed is assigned from its beginning, never at
+    /// `Offset::Stored`, which under `latest` resolves to its END and skips
+    /// what was written to it before the assign.
+    born: HashSet<(String, i32)>,
+    /// When the partition counts were last re-checked.
+    last_recheck: Option<Instant>,
+    /// Rate limit for repeated lookup warnings.
+    warnings: WarnLimiter,
+}
+
+impl PartitionCache {
+    /// Partition ids for `topic`: from the cache while its entry is younger
+    /// than `PARTITION_CACHE_TTL`, else from `lookup`.
+    ///
+    /// An answer that lists NO partitions is returned but never cached (#675).
+    /// A broker answers that way for a topic it does not know yet - one
+    /// created moments before, whose metadata the broker has not applied - as
+    /// well as for one just deleted. Cached, the topic was left out of every
+    /// assignment for the whole TTL, five minutes: none of its records were
+    /// read, and the stall check never saw it, since it watches assigned
+    /// partitions only.
+    ///
+    /// A failed lookup serves the last list the topic answered with (#675
+    /// follow-up): its partitions cannot have gone - only a recreate changes
+    /// them, and that shows as a later answer. Failing instead dropped the
+    /// topic from the assignment set, which renewed every other partition's
+    /// assignment too. A topic never answered for has nothing to serve.
+    fn ids(
+        &mut self,
+        topic: &str,
+        now: Instant,
+        lookup: impl FnOnce(&str) -> Result<Vec<i32>, VtopError>,
+    ) -> Result<Vec<i32>, VtopError> {
+        if let Some((ids, at)) = self.entries.get(topic) {
+            if now.saturating_duration_since(*at) < PARTITION_CACHE_TTL {
+                return Ok(ids.clone());
+            }
+        }
+        match lookup(topic) {
+            Ok(ids) => {
+                self.observe(topic, &ids, now);
+                Ok(ids)
+            }
+            Err(e) => {
+                let stale = self
+                    .entries
+                    .get(topic)
+                    .map(|(ids, at)| (ids.clone(), now.saturating_duration_since(*at).as_secs()));
+                let held = self.warnings.allow(&format!("lookup:{topic}"), now);
+                match stale {
+                    Some((ids, age_secs)) => {
+                        if let Some(suppressed) = held {
+                            tracing::warn!(
+                                topic,
+                                error = %e,
+                                partitions = ids.len(),
+                                age_secs,
+                                suppressed,
+                                "kafka partition lookup failed; serving the topic's last known \
+                                 partition list and asking again next pass. Nothing is skipped; \
+                                 check the broker's metadata service if this repeats (#675)"
+                            );
+                        }
+                        Ok(ids)
+                    }
+                    None => {
+                        if let Some(suppressed) = held {
+                            tracing::warn!(
+                                topic,
+                                error = %e,
+                                suppressed,
+                                "kafka partition lookup failed for a topic never answered for; \
+                                 it is not read this pass and is asked again next pass. Check \
+                                 the broker's metadata service if this repeats (#675)"
+                            );
+                        }
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record an answer listing `ids` for `topic`, log what it changed, and
+    /// mark the partitions that were born after this process read the topic.
+    fn observe(&mut self, topic: &str, ids: &[i32], now: Instant) {
+        let previous = self.entries.get(topic).map(|(ids, _)| ids.clone());
+        let absent = self.absent.get(topic).copied();
+        let change = classify_partition_answer(
+            previous.as_deref(),
+            absent.is_some(),
+            absent.unwrap_or(false) || previous.is_some(),
+            ids,
+        );
+        match &change {
+            PartitionChange::NoneListed => {
+                let had = absent.unwrap_or(false) || previous.is_some();
+                self.entries.remove(topic);
+                self.absent.insert(topic.to_string(), had);
+                if let Some(suppressed) = self.warnings.allow(&format!("none:{topic}"), now) {
+                    tracing::warn!(
+                        topic,
+                        suppressed,
+                        "kafka topic listed with no partitions: the broker does not know it \
+                         (created moments ago, or deleted). Not cached; asked again next pass, \
+                         and its partitions are read from their beginning once listed. If the \
+                         topic should exist, check that it does (#675)"
+                    );
+                }
+                return;
+            }
+            PartitionChange::Appeared { recreated: false } => {
+                tracing::info!(
+                    topic,
+                    partitions = ids.len(),
+                    "kafka topic now lists partitions after listing none: it did not exist when \
+                     this consumer asked for it, so its partitions are assigned from the \
+                     group's committed offset, else from their beginning (#675)"
+                );
+                self.born
+                    .extend(ids.iter().map(|&p| (topic.to_string(), p)));
+            }
+            PartitionChange::Appeared { recreated: true } => {
+                tracing::warn!(
+                    topic,
+                    partitions = ids.len(),
+                    "kafka topic lists partitions again after listing none: it was deleted and \
+                     recreated. A partition this consumer has no position for is assigned from \
+                     the group's committed offset, else its beginning; one it read before keeps \
+                     its old position, which the new log may answer out of range, and then \
+                     auto.offset.reset applies. The ledger cannot tell the two topics apart: \
+                     check what was archived for it, and restart the engine if the new topic \
+                     must be read from its start (#675)"
+                );
+                self.born
+                    .extend(ids.iter().map(|&p| (topic.to_string(), p)));
+            }
+            PartitionChange::Grew { from, to, added } => {
+                tracing::info!(
+                    topic,
+                    from,
+                    to,
+                    added = ?added,
+                    "kafka topic grew: its new partitions are assigned on the next pass, from \
+                     the group's committed offset, else from their beginning, so nothing \
+                     written to them is skipped (#675)"
+                );
+                self.born
+                    .extend(added.iter().map(|&p| (topic.to_string(), p)));
+            }
+            PartitionChange::Shrank { from, to } => {
+                tracing::warn!(
+                    topic,
+                    from,
+                    to,
+                    "kafka topic lists fewer partitions than before: Kafka cannot remove \
+                     partitions, so the topic was deleted and recreated. The new list is \
+                     assigned; positions held for the old topic are kept, and auto.offset.reset \
+                     applies where the new log answers them out of range. The ledger cannot \
+                     tell the two topics apart: check what was archived for it (#675)"
+                );
+            }
+            PartitionChange::First | PartitionChange::Unchanged => {}
+        }
+        self.absent.remove(topic);
+        self.entries.insert(topic.to_string(), (ids.to_vec(), now));
+    }
+
+    /// Whether a re-check of the cached partition counts is due; the first
+    /// call only starts the clock.
+    fn recheck_due(&mut self, now: Instant) -> bool {
+        match self.last_recheck {
+            Some(at) if now.saturating_duration_since(at) < PARTITION_RECHECK_INTERVAL => false,
+            Some(_) => {
+                self.last_recheck = Some(now);
+                true
+            }
+            None => {
+                self.last_recheck = Some(now);
+                false
+            }
+        }
+    }
+
+    fn cached_topics(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
+    }
+
+    fn is_born(&self, key: &(String, i32)) -> bool {
+        self.born.contains(key)
+    }
+
+    /// The partition's start is decided (or it has a position of its own).
+    fn settle_born(&mut self, key: &(String, i32)) {
+        self.born.remove(key);
+    }
+
+    /// Keep only `live` topics.
+    fn retain(&mut self, live: &std::collections::HashSet<&str>) {
+        self.entries
+            .retain(|topic, _| live.contains(topic.as_str()));
+        self.absent.retain(|topic, _| live.contains(topic.as_str()));
+        self.born.retain(|(topic, _)| live.contains(topic.as_str()));
+    }
 }
 
 #[async_trait]
@@ -1860,6 +2350,7 @@ impl SourceAdapter for KafkaSource {
         // instead of fetching. assign() is rebalance-free and lets us control
         // the exact start offset per partition.
         self.consumer()?;
+        self.recheck_partition_counts();
         // A metadata failure for ONE topic must not abort the pass for the
         // others — the serial loop isolated it per source, and so does this:
         // the failing topic is skipped and its outcome carries the error.
@@ -1875,6 +2366,9 @@ impl SourceAdapter for KafkaSource {
         // plus the sorted set for the sticky-assignment comparison.
         let mut desired: Vec<(String, i32, Offset)> = Vec::new();
         let mut assignment_set: Vec<(String, i32)> = Vec::new();
+        // Partitions born after this process read their topic, with no
+        // position of their own: where they start is decided below.
+        let mut born_waiting: Vec<(String, i32)> = Vec::new();
         for source in sources {
             let topic = &source.source_name;
             // A topic with no partitions (e.g. just deleted) simply contributes
@@ -1895,6 +2389,15 @@ impl SourceAdapter for KafkaSource {
             }
             partitions_by_source.push(partitions.clone());
             for p in partitions {
+                let key = (topic.clone(), p);
+                if self.partitions.is_born(&key) {
+                    let cur = self.cursors.entry(key.clone()).or_default();
+                    if cur.last_read_offset.is_none() && cur.committed_offset.is_none() {
+                        born_waiting.push(key);
+                        continue;
+                    }
+                    self.partitions.settle_born(&key);
+                }
                 let cur = self.cursors.entry((topic.clone(), p)).or_default();
                 let off = match cur.last_read_offset {
                     // Continue from our in-session read head.
@@ -1923,6 +2426,10 @@ impl SourceAdapter for KafkaSource {
                 desired.push((topic.clone(), p, off));
                 assignment_set.push((topic.clone(), p));
             }
+        }
+        for ((topic, p), off) in self.start_born_partitions(&born_waiting) {
+            assignment_set.push((topic.clone(), p));
+            desired.push((topic, p, off));
         }
         assignment_set.sort();
         // Time spent resolving metadata is FAILED time when any topic errored:
@@ -1967,6 +2474,42 @@ impl SourceAdapter for KafkaSource {
                 retention_lost: self.take_pending_losses(),
             });
         }
+        // A whole re-assign over an earlier assignment assigns every partition
+        // still at `Offset::Stored` again; under `latest`, one that has not
+        // delivered would resolve at the NEW end and skip what arrived since
+        // its first assign, and nothing would recover it: its new start is the
+        // new end (#675 follow-up). Pin those first; when that cannot be
+        // established, keep the current assignment and try again next pass.
+        if self.assigned != assignment_set && !self.last_assigned.is_empty() {
+            if !self.pin_latest_starts() {
+                if let Some(suppressed) = self.warnings.allow("renewal", Instant::now()) {
+                    tracing::warn!(
+                        suppressed,
+                        "kafka assignment renewal deferred: where a partition assigned at the \
+                         end of the log started could not be established (the group or the \
+                         broker did not answer), and renewing without it would skip what \
+                         arrived since. Nothing is read this pass; retried next pass. Check \
+                         the group coordinator if this repeats (#675)"
+                    );
+                }
+                return Err(VtopError::Source(
+                    "kafka assignment renewal deferred: the start of a partition waiting at the \
+                     end of the log could not be established; retried next pass"
+                        .into(),
+                ));
+            }
+            for (topic, p, off) in &mut desired {
+                if matches!(off, Offset::Stored) {
+                    if let Some(pin) = self
+                        .cursors
+                        .get(&(topic.clone(), *p))
+                        .and_then(|c| c.committed_offset)
+                    {
+                        *off = Offset::Offset(pin);
+                    }
+                }
+            }
+        }
         let consumer = self.consumer.as_ref().expect("consumer built above");
 
         // STICKY ASSIGNMENT. assign() tears down librdkafka's fetchers; with a
@@ -2002,6 +2545,7 @@ impl SourceAdapter for KafkaSource {
                 );
             }
             self.liveness.on_assign(&assignment_set);
+            self.last_assigned.clone_from(&assignment_set);
             self.assigned = assignment_set;
             self.delivered.clear();
             // Seed delivered with the offsets just assigned, so idle
@@ -2659,6 +3203,7 @@ mod tests {
         cfg.auto_offset_reset = "latest".into();
         let mut src = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
         src.assigned = keys.to_vec();
+        src.last_assigned = keys.to_vec();
         src
     }
 
@@ -3348,12 +3893,85 @@ mod tests {
         let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
         // Seed the cache directly - partitions_for would need a broker.
         src.partitions
+            .entries
             .insert("live".into(), (vec![0], std::time::Instant::now()));
         src.partitions
+            .entries
             .insert("dead".into(), (vec![0], std::time::Instant::now()));
         src.prune_partition_cache(&["live".to_string()]);
-        assert!(src.partitions.contains_key("live"), "live topic kept");
-        assert!(!src.partitions.contains_key("dead"), "dead topic dropped");
+        assert!(
+            src.partitions.entries.contains_key("live"),
+            "live topic kept"
+        );
+        assert!(
+            !src.partitions.entries.contains_key("dead"),
+            "dead topic dropped"
+        );
+    }
+
+    /// Every event logged while `f` runs, as `LEVEL message field=value ...`
+    /// (#675 follow-up: the operator-facing messages are part of the
+    /// contract). A minimal subscriber, so no logging crate is needed here.
+    fn logged<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+        use std::fmt::Write as _;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+
+        struct Line(String);
+        impl Visit for Line {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    let _ = write!(self.0, " {value:?}");
+                } else {
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    let _ = write!(self.0, " {value}");
+                } else {
+                    let _ = write!(self.0, " {}={value}", field.name());
+                }
+            }
+        }
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for Capture {
+            fn register_callsite(
+                &self,
+                _: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::always()
+            }
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut line = Line(event.metadata().level().to_string());
+                event.record(&mut line);
+                self.0.lock().unwrap().push(line.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let out = tracing::subscriber::with_default(Capture(lines.clone()), f);
+        let lines = lines.lock().unwrap().clone();
+        (out, lines)
+    }
+
+    fn one_line<'a>(lines: &'a [String], needle: &str) -> &'a str {
+        let found: Vec<&String> = lines.iter().filter(|l| l.contains(needle)).collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "one line containing {needle:?} in {lines:#?}"
+        );
+        found[0]
     }
 
     /// #675: a metadata answer that lists no partitions - a topic the broker
@@ -3361,30 +3979,217 @@ mod tests {
     /// next pass asks again and gets the partitions; before the fix the empty
     /// answer was served from the cache for `PARTITION_CACHE_TTL`, so the
     /// second lookup below was never made and the topic stayed unassigned for
-    /// five minutes. A list that names partitions is cached as before.
+    /// five minutes. A list that names partitions is cached as before. The
+    /// operator is told once, not on every pass.
     #[test]
     fn a_topic_listed_without_partitions_is_asked_again_on_the_next_pass() {
-        let mut cache = HashMap::new();
+        let mut cache = PartitionCache::default();
         let mut asked = 0;
-        let mut answers = [Vec::new(), vec![0]].into_iter();
+        let mut answers = [Vec::new(), Vec::new(), vec![0]].into_iter();
         let mut lookup = |_: &str| {
             asked += 1;
-            Ok(answers.next().expect("asked at most twice"))
+            Ok(answers.next().expect("asked at most three times"))
         };
         let t0 = Instant::now();
-        let first = cached_partition_ids(&mut cache, "t", t0, &mut lookup).unwrap();
-        assert!(first.is_empty(), "the broker did not know the topic yet");
-        let second = cached_partition_ids(&mut cache, "t", t0 + PASS, &mut lookup).unwrap();
+        let ((first, again, second, third), lines) = logged(|| {
+            (
+                cache.ids("t", t0, &mut lookup).unwrap(),
+                cache.ids("t", t0 + PASS, &mut lookup).unwrap(),
+                cache.ids("t", t0 + PASS * 2, &mut lookup).unwrap(),
+                cache.ids("t", t0 + PASS * 3, &mut lookup).unwrap(),
+            )
+        });
+        assert!(
+            first.is_empty() && again.is_empty(),
+            "the broker did not know it yet"
+        );
         assert_eq!(second, vec![0], "the next pass asks again");
-        let third = cached_partition_ids(&mut cache, "t", t0 + PASS * 2, &mut lookup).unwrap();
         assert_eq!(third, vec![0]);
-        assert_eq!(asked, 2, "a list with partitions is served from the cache");
+        assert_eq!(asked, 3, "a list with partitions is served from the cache");
+        let warned = one_line(&lines, "listed with no partitions");
+        assert!(
+            warned.starts_with("WARN") && warned.contains("topic=t"),
+            "{warned}"
+        );
+        assert!(warned.contains("asked again next pass"), "{warned}");
+        let appeared = one_line(&lines, "now lists partitions after listing none");
+        assert!(appeared.starts_with("INFO"), "{appeared}");
+        assert!(
+            cache.is_born(&tp("t", 0)),
+            "a topic that did not exist when asked for is read from its beginning"
+        );
 
         // Once the entry is stale, a topic the broker no longer lists (deleted)
         // is dropped from the cache, not served from it.
+        let stale = t0 + PARTITION_CACHE_TTL + PASS * 4;
+        let gone = cache.ids("t", stale, |_| Ok(Vec::new())).unwrap();
+        assert!(gone.is_empty() && !cache.entries.contains_key("t"));
+    }
+
+    /// #675 follow-up: a failed lookup for a topic whose cached list has gone
+    /// stale keeps serving that list (a topic's partitions cannot disappear;
+    /// only a recreate changes them, and that shows as a new answer). Failing
+    /// instead dropped the topic from the assignment set, which renewed every
+    /// other partition's assignment as well. A topic never answered for is an
+    /// error, as before. Repeated failures warn once per `WARN_EVERY`, naming
+    /// the error.
+    #[test]
+    fn a_failed_lookup_serves_the_last_known_partition_list() {
+        let mut cache = PartitionCache::default();
+        let t0 = Instant::now();
+        cache.ids("t", t0, |_| Ok(vec![0, 1])).unwrap();
         let stale = t0 + PARTITION_CACHE_TTL + PASS;
-        let gone = cached_partition_ids(&mut cache, "t", stale, |_| Ok(Vec::new())).unwrap();
-        assert!(gone.is_empty() && !cache.contains_key("t"));
+        let failed = |_: &str| Err(VtopError::Source("fetch_metadata t: timed out".into()));
+        let ((served, again, never), lines) = logged(|| {
+            (
+                cache.ids("t", stale, failed),
+                cache.ids("t", stale + PASS, failed),
+                cache.ids("never", stale, failed),
+            )
+        });
+        assert_eq!(
+            served.ok(),
+            Some(vec![0, 1]),
+            "the last known list is served"
+        );
+        assert_eq!(again.ok(), Some(vec![0, 1]));
+        assert!(
+            never.is_err(),
+            "a topic never answered for has no list to serve"
+        );
+        let served = one_line(&lines, "serving the topic's last known partition list");
+        assert!(served.starts_with("WARN"), "{served}");
+        assert!(
+            served.contains("timed out") && served.contains("topic=t"),
+            "{served}"
+        );
+        let never = one_line(&lines, "for a topic never answered for");
+        assert!(
+            never.contains("topic=never") && never.contains("timed out"),
+            "{never}"
+        );
+    }
+
+    /// #675 follow-up: what one metadata answer changed for a topic.
+    #[test]
+    fn a_partition_answer_is_classified_against_the_last_one() {
+        use PartitionChange::*;
+        assert_eq!(classify_partition_answer(None, false, false, &[0]), First);
+        assert_eq!(
+            classify_partition_answer(Some(&[0, 1]), false, true, &[0, 1]),
+            Unchanged
+        );
+        assert_eq!(
+            classify_partition_answer(Some(&[0]), false, true, &[]),
+            NoneListed
+        );
+        assert_eq!(
+            classify_partition_answer(Some(&[0]), false, true, &[0, 1, 2]),
+            Grew {
+                from: 1,
+                to: 3,
+                added: vec![1, 2]
+            }
+        );
+        // Kafka cannot remove partitions: fewer means deleted and recreated.
+        assert_eq!(
+            classify_partition_answer(Some(&[0, 1, 2]), false, true, &[0]),
+            Shrank { from: 3, to: 1 }
+        );
+        assert_eq!(
+            classify_partition_answer(None, true, false, &[0]),
+            Appeared { recreated: false }
+        );
+        assert_eq!(
+            classify_partition_answer(None, true, true, &[0]),
+            Appeared { recreated: true }
+        );
+    }
+
+    /// #675 follow-up: a partition added to a topic this adapter reads is
+    /// marked to start from its beginning, and the operator is told; a topic
+    /// that shrinks (deleted and recreated) or comes back after listing none
+    /// is a warning. The first answer and an unchanged one say nothing.
+    #[test]
+    fn partition_changes_are_reported_and_new_partitions_marked() {
+        let mut cache = PartitionCache::default();
+        let t0 = Instant::now();
+        let ((), lines) = logged(|| {
+            cache.observe("g", &[0], t0);
+            cache.observe("g", &[0], t0 + PASS);
+            cache.observe("g", &[0, 1, 2], t0 + PASS * 2);
+            cache.observe("s", &[0, 1], t0);
+            cache.observe("s", &[0], t0 + PASS);
+            cache.observe("r", &[0], t0);
+            cache.observe("r", &[], t0 + PASS);
+            cache.observe("r", &[0], t0 + PASS * 2);
+        });
+        let grew = one_line(&lines, "kafka topic grew");
+        assert!(grew.starts_with("INFO"), "{grew}");
+        for field in [
+            "topic=g",
+            "from=1",
+            "to=3",
+            "added=[1, 2]",
+            "from their beginning",
+        ] {
+            assert!(grew.contains(field), "{field} in {grew}");
+        }
+        assert!(
+            !cache.is_born(&tp("g", 0)),
+            "an existing partition keeps its start"
+        );
+        assert!(cache.is_born(&tp("g", 1)) && cache.is_born(&tp("g", 2)));
+        let shrank = one_line(&lines, "fewer partitions than before");
+        assert!(shrank.starts_with("WARN") && shrank.contains("deleted and recreated"));
+        assert!(
+            shrank.contains("from=2") && shrank.contains("to=1"),
+            "{shrank}"
+        );
+        let back = one_line(&lines, "lists partitions again after listing none");
+        assert!(
+            back.starts_with("WARN") && back.contains("topic=r"),
+            "{back}"
+        );
+        assert_eq!(lines.len(), 4, "nothing else is logged: {lines:#?}");
+        cache.settle_born(&tp("g", 1));
+        assert!(!cache.is_born(&tp("g", 1)));
+    }
+
+    /// #675 follow-up: the partition counts are re-checked at most once per
+    /// interval; the first pass only starts the clock.
+    #[test]
+    fn the_partition_recheck_runs_once_per_interval() {
+        let mut cache = PartitionCache::default();
+        let t0 = Instant::now();
+        assert!(!cache.recheck_due(t0));
+        assert!(!cache.recheck_due(t0 + PASS));
+        assert!(cache.recheck_due(t0 + PARTITION_RECHECK_INTERVAL));
+        assert!(!cache.recheck_due(t0 + PARTITION_RECHECK_INTERVAL + PASS));
+        assert!(cache.recheck_due(t0 + PARTITION_RECHECK_INTERVAL * 2));
+    }
+
+    /// #675 follow-up: a repeated warning is held back for `WARN_EVERY`, and
+    /// the next one says how many were held back.
+    #[test]
+    fn a_repeated_warning_is_rate_limited_and_counts_what_it_held_back() {
+        let mut limiter = WarnLimiter::default();
+        let t0 = Instant::now();
+        assert_eq!(limiter.allow("a", t0), Some(0));
+        assert_eq!(limiter.allow("a", t0 + PASS), None);
+        assert_eq!(limiter.allow("a", t0 + PASS * 2), None);
+        assert_eq!(limiter.allow("b", t0 + PASS), Some(0), "per subject");
+        assert_eq!(limiter.allow("a", t0 + WARN_EVERY), Some(2));
+    }
+
+    /// #675 follow-up: an end offset below the position held for a partition
+    /// is a recreated topic or a truncated log; anything else is not.
+    #[test]
+    fn an_end_offset_below_the_position_is_found() {
+        assert_eq!(end_below_position(Some(500), 3), Some(500));
+        assert_eq!(end_below_position(Some(3), 3), None, "caught up");
+        assert_eq!(end_below_position(Some(2), 3), None, "behind");
+        assert_eq!(end_below_position(None, 3), None, "no position yet");
     }
 
     /// The report carries one entry per topic (#361): the topic names the

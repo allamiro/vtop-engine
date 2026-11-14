@@ -260,6 +260,29 @@ is a real and silent condition.
   last case the ledger is not consulted for that run, and the protection
   against a stale engine's commit does not apply to it.
 
+While running, the partition list changes in ways a restart never sees, and
+`latest` must not skip what arrived meanwhile (#675):
+
+- **A partition added to a topic being read**, or **a topic that listed no
+  partitions when first asked for** (created moments later, or not yet known to
+  the broker), starts from the group's committed offset, else from its
+  **beginning**: every record in it is newer than the start `latest` promised
+  when the engine began reading the topic. Partition counts are re-checked in
+  one metadata request every 30s, so a new partition is assigned within that.
+  An answer with no partitions is never cached.
+- **A whole re-assign** (the topic set or a partition count changed, a record
+  was rejected, a poll failed) first pins every partition still waiting at
+  `Offset::Stored` under `latest` where it started; when that cannot be
+  established, the renewal waits for the next pass.
+- **A failed partition lookup** serves the topic's last known list.
+- **A deleted and recreated topic** (fewer partitions than before, a topic that
+  lists partitions again after listing none, or an end offset below the
+  position held) is reported, not acted on: the ledger cannot tell the two
+  topics apart, and offsets alone cannot tell a recreate from a truncated log.
+
+Each of these logs what happened, what the engine did and what the operator
+should check, with the topic, partition and offsets as fields.
+
 When retention has already removed records past that position, `auto.offset.reset`
 applies by two different routes, and both end the same way:
 
