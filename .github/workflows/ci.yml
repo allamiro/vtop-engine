@@ -1136,7 +1136,7 @@ jobs:
   # capable of failing by scripts/tests/naming-and-claims.bats in the shell
   # job; this job is the enforcement itself.
   claims:
-    name: naming + substantiation
+    name: naming + substantiation + format registry
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -1147,6 +1147,21 @@ jobs:
 
       - name: substantiation lint (every measurement row carries its conditions)
         run: bash scripts/check-egress-claims.sh
+
+      # The format registry (#743): every magic and version constant in the
+      # sources has an entry in scripts/compat/formats.yaml with the value
+      # written there, and the inventory on docs/reference/compatibility.md
+      # is what the registry generates. A version bump, a new magic, feature
+      # level or command kind therefore always edits the reviewed registry.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install the pinned PyYAML
+        run: python -m pip install --disable-pip-version-check --require-hashes -r scripts/compat/requirements.txt
+      - name: the registry check can fail for each drift it exists to catch
+        run: python -m unittest discover -s scripts/compat/tests -p 'test_format_registry.py' -v
+      - name: format registry (every magic and version constant has an entry)
+        run: python scripts/check-format-registry.py
 
   # Kafka was entirely untested in CI, which is how a P0 shipped: every read
   # returned zero records (a subscribe() per read forced a rebalance that
