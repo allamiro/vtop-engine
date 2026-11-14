@@ -73,7 +73,23 @@ impl LocalFsBackend {
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::copy(local_path, &dest).await?;
+        // Copy beside the key, then rename onto it (review of #626): a
+        // derived key can have a second writer of the same bytes, and a copy
+        // straight onto the key truncates it first, so a crash mid-copy left
+        // a verified object torn. The rename replaces the key whole.
+        let mut staging = dest.as_os_str().to_owned();
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        staging.push(format!(".{}-{n}.partial", std::process::id()));
+        let staging = PathBuf::from(staging);
+        if let Err(e) = tokio::fs::copy(local_path, &staging).await {
+            let _ = tokio::fs::remove_file(&staging).await;
+            return Err(e.into());
+        }
+        if let Err(e) = tokio::fs::rename(&staging, &dest).await {
+            let _ = tokio::fs::remove_file(&staging).await;
+            return Err(e.into());
+        }
         let sidecar = Self::checksum_sidecar(&dest);
         match checksum {
             Some(c) => tokio::fs::write(&sidecar, c).await?,

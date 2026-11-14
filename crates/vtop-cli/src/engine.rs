@@ -517,7 +517,12 @@ impl<'a> Pipeline<'a> {
                     &bucket,
                     &self.config.upload.prefix,
                     &resolved_prefix,
-                    &vtop_core::batch::build_object_name(&source.source_name, &window, digest),
+                    &vtop_core::batch::build_object_name(
+                        &self.config.engine.name,
+                        &source.source_name,
+                        &window,
+                        digest,
+                    ),
                     format.clone(),
                     compressed.compression,
                 )
@@ -650,6 +655,7 @@ impl<'a> Pipeline<'a> {
         if reused {
             tracing::info!(batch_id, uri = %object_uri, "object_reused");
         }
+        metrics.object_reused = reused;
 
         // ONE PUT, OR RESUMABLE MULTIPART above the threshold (#482). The
         // retransmission unit for a single put is the whole batch — a lost
@@ -1083,9 +1089,12 @@ impl<'a> Pipeline<'a> {
             mx.bytes_in_total
                 .with_label_values(&l)
                 .inc_by(metrics.uncompressed_bytes);
-            mx.bytes_out_total
-                .with_label_values(&l)
-                .inc_by(metrics.compressed_bytes);
+            // A reused object put nothing on the wire (#626).
+            if !metrics.object_reused {
+                mx.bytes_out_total
+                    .with_label_values(&l)
+                    .inc_by(metrics.compressed_bytes);
+            }
             mx.batch_duration_seconds
                 .with_label_values(&l)
                 .observe(metrics.total_ms as f64 / 1000.0);
@@ -1105,6 +1114,11 @@ impl<'a> Pipeline<'a> {
                 ("commit", metrics.commit_ms),
                 ("state_write", metrics.state_write_ms),
             ] {
+                // A reused object made no upload; a 0 ms sample would pull
+                // the upload latency distribution down.
+                if stage == "object_upload" && metrics.object_reused {
+                    continue;
+                }
                 mx.stage_duration_seconds
                     .with_label_values(&[l[0], l[1], l[2], stage])
                     .observe(ms as f64 / 1000.0);
@@ -8720,5 +8734,33 @@ mod tests {
             "a size-only pass does not prove the bytes are this batch's"
         );
         assert_eq!(throttles.load(Ordering::Relaxed), 0);
+
+        // A HEAD the store refused says nothing about the key: it is not
+        // free, so nothing is written to it.
+        let refused = Arc::new(
+            vtop_upload::MockBackend::new().with_head_fault(vtop_upload::HeadFault::Refused),
+        );
+        assert!(
+            matches!(probe(refused).await, KeyProbe::Unusable(why) if why.contains("403")),
+            "a refused probe falls back to the attempt key"
+        );
+
+        // A throttled HEAD is the store asking for less: the batch fails like
+        // any other stage, and the throttle is counted.
+        let throttled =
+            vtop_upload::MockBackend::new().with_head_fault(vtop_upload::HeadFault::Throttled);
+        let err = probe_object_key(
+            &throttled,
+            uri,
+            size,
+            ck(),
+            ["default", "file", "raw"],
+            &attempts,
+            &throttles,
+        )
+        .await
+        .expect_err("a throttled probe is not an answer");
+        assert!(err.is_upload_throttle(), "{err}");
+        assert_eq!(throttles.load(Ordering::Relaxed), 1);
     }
 }

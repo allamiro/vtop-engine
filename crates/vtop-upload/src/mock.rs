@@ -94,6 +94,18 @@ pub struct MockBackend {
     /// When true, abort_multipart_upload fails — so the sweep's
     /// keep-session-on-failed-abort path is testable (#482).
     fail_abort: bool,
+    /// When set, every `head_object` fails this way instead of answering
+    /// (#626): a refusal that says nothing about the key, or a throttle.
+    head_fault: Option<HeadFault>,
+}
+
+/// How [`MockBackend::with_head_fault`] makes `head_object` fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadFault {
+    /// `Upload` with a 403, as S3 answers a caller without list permission.
+    Refused,
+    /// `UploadThrottled`, as an overloaded store answers.
+    Throttled,
 }
 
 impl Default for MockBackend {
@@ -118,6 +130,12 @@ impl MockBackend {
         self
     }
 
+    /// Every `head_object` fails with `fault` (#626).
+    pub fn with_head_fault(mut self, fault: HeadFault) -> Self {
+        self.head_fault = Some(fault);
+        self
+    }
+
     pub fn new() -> Self {
         Self {
             objects: Mutex::new(HashMap::new()),
@@ -130,6 +148,7 @@ impl MockBackend {
             s3_checksum_semantics: false,
             min_part_size: 0,
             fail_abort: false,
+            head_fault: None,
             multipart_fail_after_parts: Arc::new(AtomicUsize::new(usize::MAX)),
             multipart_parts_uploaded: Arc::new(AtomicUsize::new(0)),
             bucket_ensures: AtomicUsize::new(0),
@@ -385,6 +404,19 @@ impl UploadBackend for MockBackend {
     }
 
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
+        match self.head_fault {
+            Some(HeadFault::Refused) => {
+                return Err(VtopError::Upload(format!(
+                    "mock head_object {object_uri}: AccessDenied (http 403)"
+                )))
+            }
+            Some(HeadFault::Throttled) => {
+                return Err(VtopError::UploadThrottled(format!(
+                    "mock head_object {object_uri}: SlowDown (http 503)"
+                )))
+            }
+            None => {}
+        }
         let map = self.objects.lock().unwrap();
         let s = map
             .get(object_uri)

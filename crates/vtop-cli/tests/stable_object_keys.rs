@@ -147,11 +147,55 @@ async fn a_replay_of_an_uploaded_range_writes_no_second_object() {
     );
 }
 
+/// An object may only be shared by attempts at ONE unit and range of ONE
+/// engine (review of #626): the object URI is what a reader dedupes on, so two
+/// engines that archive byte-identical windows of their own files, or a new
+/// file at the same path holding the same bytes, must not share an object, or
+/// a reader that dedupes by object drops one of them.
+#[tokio::test]
+async fn identical_bytes_from_another_engine_or_another_file_get_their_own_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "banner", 3);
+    let backend = Arc::new(MockBackend::new());
+
+    let mut host_a = config(dir.path(), "a.db", std::slice::from_ref(&input));
+    host_a.engine.name = "host-a".into();
+    let mut a = engine(host_a, &backend).await;
+    let out = a.process_once(SourceType::File).await.unwrap();
+    assert!(out.iter().all(|o| o.committed), "{out:?}");
+    let from_a = out[0].object_uri.clone().unwrap();
+
+    // Another engine, its own ledger, the same bytes at the same path.
+    let mut host_b = config(dir.path(), "b.db", std::slice::from_ref(&input));
+    host_b.engine.name = "host-b".into();
+    let mut b = engine(host_b, &backend).await;
+    let out = b.process_once(SourceType::File).await.unwrap();
+    assert!(out.iter().all(|o| o.committed), "{out:?}");
+    let from_b = out[0].object_uri.clone().unwrap();
+    assert_ne!(from_b, from_a, "another engine's batch is another object");
+
+    // The same engine after its ledger is lost, with the path now naming a new
+    // file (another inode) that holds the same bytes.
+    let bytes = std::fs::read(&input).unwrap();
+    let moved = dir.path().join("app.log.1");
+    std::fs::rename(&input, &moved).unwrap();
+    std::fs::write(&input, &bytes).unwrap();
+    let mut host_a_again = config(dir.path(), "a2.db", std::slice::from_ref(&input));
+    host_a_again.engine.name = "host-a".into();
+    let mut a2 = engine(host_a_again, &backend).await;
+    let out = a2.process_once(SourceType::File).await.unwrap();
+    assert!(out.iter().all(|o| o.committed), "{out:?}");
+    let from_new_file = out[0].object_uri.clone().unwrap();
+    assert_ne!(from_new_file, from_a, "another file is another object");
+    assert!(!put_twice(&backend, &from_a).await);
+}
+
 /// The same range read again with different bytes (the file was replaced by
 /// one of the same length) is a different object: it gets its own key, and
 /// the archived object keeps its bytes and its single version.
 #[tokio::test]
-async fn a_replay_with_different_bytes_never_overwrites_the_archived_object() {
+async fn a_replay_with_different_bytes_gets_its_own_key_and_leaves_the_archived_object() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("app.log");
     write_lines(&input, "aaa", 4);

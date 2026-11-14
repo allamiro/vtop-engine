@@ -273,8 +273,15 @@ pub fn build_batch_id(source_name: &str, range: &ProgressMarker) -> String {
 pub const OBJECT_NAME_DIGEST_HEX: usize = 32;
 
 /// The name of the object that holds a batch's bytes (#626):
-/// `vtop-<source>-<range>-<digest>`, where `digest` is the first
-/// [`OBJECT_NAME_DIGEST_HEX`] hex digits of the object's checksum.
+/// `vtop-<engine>-<source>-<range>[-i<inode>]-<digest>`, where `digest` is the
+/// first [`OBJECT_NAME_DIGEST_HEX`] hex digits of the object's checksum and
+/// the inode is that of the file or spool file the range was read from.
+///
+/// The engine name and the inode keep an object to ONE engine's attempts at
+/// ONE unit's range (review): readers may dedupe on the object URI, so two
+/// engines that archive byte-identical windows of their own files, or a new
+/// file at a path that holds the same bytes as the old one, must not share an
+/// object. Engine names must already be unique per instance.
 ///
 /// Derived from what the object IS, not from the attempt that wrote it: a
 /// replay that reads the same range of the same source and compresses it to
@@ -285,8 +292,23 @@ pub const OBJECT_NAME_DIGEST_HEX: usize = 32;
 /// and can never land on an object that holds other bytes unless the stored
 /// object was damaged, which the engine checks before it reuses anything.
 /// `range` is the batch's whole range, as for [`build_batch_id`].
-pub fn build_object_name(source_name: &str, range: &ProgressMarker, digest_hex: &str) -> String {
+pub fn build_object_name(
+    engine_name: &str,
+    source_name: &str,
+    range: &ProgressMarker,
+    digest_hex: &str,
+) -> String {
+    let safe_engine = sanitize_token(engine_name);
     let safe_source = sanitize_token(source_name);
+    let unit = match range {
+        ProgressMarker::File {
+            inode: Some(inode), ..
+        }
+        | ProgressMarker::SyslogSpool {
+            inode: Some(inode), ..
+        } => format!("-i{inode}"),
+        _ => String::new(),
+    };
     let range = range.range_token();
     let digest: String = digest_hex
         .chars()
@@ -294,7 +316,7 @@ pub fn build_object_name(source_name: &str, range: &ProgressMarker, digest_hex: 
         .take(OBJECT_NAME_DIGEST_HEX)
         .map(|c| c.to_ascii_lowercase())
         .collect();
-    format!("vtop-{safe_source}-{range}-{digest}")
+    format!("vtop-{safe_engine}-{safe_source}-{range}{unit}-{digest}")
 }
 
 /// Replace characters that are unsafe in object keys / file names.
@@ -325,25 +347,52 @@ mod tests {
     fn an_object_name_is_the_same_for_the_same_bytes_of_the_same_range() {
         let range = kafka_marker(100, 249);
         let digest = "AB".repeat(32);
-        let a = build_object_name("app.events", &range, &digest);
-        let b = build_object_name("app.events", &range, &digest);
-        assert_eq!(a, b, "no clock and no randomness in the name");
-        assert_eq!(a, format!("vtop-app_events-p0-100-249-{}", "ab".repeat(16)));
-        assert_ne!(
+        let name = |engine: &str, source: &str, range: &ProgressMarker, digest: &str| {
+            build_object_name(engine, source, range, digest)
+        };
+        let a = name("eng-1", "app.events", &range, &digest);
+        assert_eq!(
             a,
-            build_object_name("app.events", &range, &"cd".repeat(32)),
-            "other bytes, another name"
+            name("eng-1", "app.events", &range, &digest),
+            "no clock and no randomness in the name"
         );
-        assert_ne!(
+        assert_eq!(
             a,
-            build_object_name("app.events", &kafka_marker(100, 250), &digest),
-            "another range, another name"
+            format!("vtop-eng-1-app_events-p0-100-249-{}", "ab".repeat(16))
         );
+        for (other, why) in [
+            (
+                name("eng-1", "app.events", &range, &"cd".repeat(32)),
+                "other bytes",
+            ),
+            (
+                name("eng-1", "app.events", &kafka_marker(100, 250), &digest),
+                "another range",
+            ),
+            (name("eng-1", "other", &range, &digest), "another source"),
+            (
+                name("eng-2", "app.events", &range, &digest),
+                "another engine",
+            ),
+        ] {
+            assert_ne!(a, other, "{why}, another name");
+        }
+        let file = |inode| ProgressMarker::File {
+            path: "/var/log/app.log".into(),
+            inode,
+            start_byte: 0,
+            end_byte: 10,
+            file_size: 10,
+            mtime: String::new(),
+            content_fingerprint: None,
+            tail_fingerprint: None,
+        };
         assert_ne!(
-            a,
-            build_object_name("other", &range, &digest),
-            "another source, another name"
+            name("e", "/var/log/app.log", &file(Some(1)), &digest),
+            name("e", "/var/log/app.log", &file(Some(2)), &digest),
+            "another file at the path, another name"
         );
+        assert!(name("e", "/var/log/app.log", &file(Some(7)), &digest).contains("-b0-10-i7-"));
         // Two attempts at the same range are still two batch ids.
         assert_ne!(
             build_batch_id("app.events", &range),

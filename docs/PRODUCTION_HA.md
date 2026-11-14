@@ -161,7 +161,7 @@ section calls out the consequence.
 ### 2.5 Current vs. target behavior (read this before trusting any HA claim)
 | Property | Current code | Target for production HA |
 |---|---|---|
-| Object key | `vtop-<source>-<range>-<digest>` — **deterministic for the same bytes** (#626); falls back to the per-attempt `vtop-<UTCstamp>-<source>-<range>-<uuid8>` without a checksum, on a command backend, or when the derived key holds bytes that do not verify | **Deterministic or content-addressed** so retries are idempotent |
+| Object key | `vtop-<engine>-<source>-<range>[-i<inode>]-<digest>` — **deterministic for the same bytes** (#626); falls back to the per-attempt `vtop-<UTCstamp>-<source>-<range>-<uuid8>` without a checksum, on a command backend, or when the derived key holds bytes that do not verify | **Deterministic or content-addressed** so retries are idempotent |
 | Replay outcome | Same bytes → **the stored object is reused** after strong verification; other boundaries, a later seal-time hour, or other bytes → **second object, no overwrite, no loss** | Retry resolves to the **same** object/version; duplicates impossible **[PROPOSED]** |
 | File/syslog cursor | Lives **only in the state store** (rebuilt from `SOURCE_COMMITTED` rows) | Same, but **migrate/drain on backend switch** (§6.4) |
 | Kafka offset | Committed to the **broker** after VERIFIED (resumes broker-side) | Same; consumer-group mode for multi-instance **[PROPOSED]** |
@@ -652,7 +652,7 @@ This section supersedes any earlier "rewrites the same object" wording.
 
 ### 7.1 Current reality
 Since #626 the object key is **content-addressed within its range**:
-`vtop-<source>-<range>-<digest>`, under the partition prefix. A replay that
+`vtop-<engine>-<source>-<range>[-i<inode>]-<digest>`, under the partition prefix. A replay that
 produces the same bytes finds the object an earlier attempt stored, reuses it
 only after a strong verification against the batch's digest, and never writes
 over an object that does not verify (it falls back to the per-attempt key, the
@@ -1526,7 +1526,7 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
   overwrite attempt against a locked bucket (MinIO Object Lock in Compose).
 - **Exit criteria:** replay produces zero duplicate objects; retries never
   overwrite or delete a protected version.
-- **Rollback:** `VTOP_OBJECT_KEY_MODE=legacy` (duplicates return; no loss).
+- **Rollback:** as planned, `VTOP_OBJECT_KEY_MODE=legacy` (duplicates return; no loss). As shipped (#626) there is no toggle: roll back by running the previous release, which names every object per attempt again; archives with both kinds of key read the same.
 - **Status (#626):** objects are named by source, range and content digest
   (`build_object_name`); an object already at the key is reused only after a
   strong verification, and anything else there is never overwritten (the
@@ -1631,7 +1631,7 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 | 1 | `StateStore` trait | ✅ done | P0 | 0 | no behavior change; `sqlite://` works | revert refactor |
 | 2 | Shared invariant tests | ✅ done | P0 | 1 | one invariant impl; battery green | keep SQLite path |
 | 3 | Postgres backend | ✅ done | P1 | 2 | `postgres://` works; DB enforces invariant | switch to `sqlite://` (drain first) |
-| 4 | Deterministic keys | 🟡 partial (#626) | P1 | 3 | no duplicate objects; Object Lock safe | `VTOP_OBJECT_KEY_MODE=legacy` |
+| 4 | Deterministic keys | 🟡 partial (#626) | P1 | 3 | no duplicate objects; Object Lock safe | previous release (no toggle shipped) |
 | 5 | Kafka fleet mode | ⬜ | P1 | 4 | safe rebalance; no double-commit; no double-recovery | `assign` mode, 1 replica |
 | 6 | Observability & alerting | ◐ partial | P1 | 0 | alerts fire; traces exported; SLOs documented | disable metrics endpoint |
 | 7 | Engine k8s deployment | ⬜ | P1 | 4,5,6 | rolling upgrade w/o loss; bounded autoscale | Helm rollback |
