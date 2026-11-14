@@ -1,5 +1,8 @@
 # Metrics and alerts
 
+The metrics follow the batch lifecycle on [How it works](../concepts/how-it-works.md):
+per-stage timings for its steps, and counters for the ways they fail.
+
 ## Turn on the endpoint
 
 The engine serves Prometheus metrics only when `VTOP_METRICS_ADDR` is set:

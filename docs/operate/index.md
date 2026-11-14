@@ -1,15 +1,60 @@
 # Operate
 
-Day-two work for a running engine, and for a cluster-plane deployment where it
-differs.
+Day-two work for a running engine, and for the cluster plane where it
+differs. Set up monitoring first, then the scheduled checks that prove the
+archive is complete, then the procedures you will need less often.
 
-| Task | Page |
-|---|---|
-| Scrape metrics and set alerts | [Metrics and alerts](monitoring.md) |
-| Cluster-node endpoints, readiness and the full node metric list | [Node endpoints and metrics](../NODE_OBSERVABILITY.md) |
-| Prove the archive is complete and still intact | [Scrub and coverage audit](scrub-and-audit.md) |
-| Move to a new release | [Upgrades](upgrades.md) |
-| Find out why something failed | [Troubleshooting](troubleshooting.md) |
+<div class="grid cards" markdown>
 
-For the engine's runbook and rollback procedures, see
+-   **Metrics and alerts**
+
+    ---
+
+    The endpoint, the metrics that carry the commit rule, and alert rules.
+
+    [:octicons-arrow-right-24: Monitoring](monitoring.md)
+
+-   **Logs and auditing**
+
+    ---
+
+    Log format and levels, where audit evidence lives, and what is planned.
+
+    [:octicons-arrow-right-24: Logs and auditing](logs-and-auditing.md)
+
+-   **Scrub and coverage audit**
+
+    ---
+
+    Prove the archive has no holes and every object is still intact.
+
+    [:octicons-arrow-right-24: Scrub and audit](scrub-and-audit.md)
+
+-   **Upgrades**
+
+    ---
+
+    Upgrade order, feature levels, one-way changes.
+
+    [:octicons-arrow-right-24: Upgrades](upgrades.md)
+
+-   **Backup and recovery**
+
+    ---
+
+    What the engine recovers by itself, and what you must back up.
+
+    [:octicons-arrow-right-24: Backup and recovery](backup-and-recovery.md)
+
+-   **Troubleshooting**
+
+    ---
+
+    Error messages, missing data, stuck stops, the cluster plane.
+
+    [:octicons-arrow-right-24: Troubleshooting](troubleshooting.md)
+
+</div>
+
+The engine's runbook and rollback procedures are in
 [Production HA §18](../PRODUCTION_HA.md#18-operator-runbook--rollback-procedures).

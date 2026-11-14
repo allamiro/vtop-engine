@@ -2,7 +2,8 @@
 
 Verification gates each commit, but nothing reads an object again after it is
 committed. Two scheduled commands close that gap. Both are read-only and can
-run beside a live engine.
+run beside a live engine. They check the guarantees described on
+[Security](../concepts/security.md#integrity).
 
 | Command | Question it answers | Reads |
 |---|---|---|
