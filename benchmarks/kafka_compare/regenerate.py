@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regenerate every Kafka-comparison chart and report from the committed runs (#600).
 
-    python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt
+    python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt
     python3 benchmarks/kafka_compare/regenerate.py
     git diff --exit-code -- docs/benchmarks/        # what CI does next
 
@@ -79,11 +79,13 @@ def _committed_names(repo: str, prefix: str) -> list[str]:
 
 
 def read_pins(path: str = PINS) -> dict[str, str]:
+    """`name==version` per package from a hash-locked requirements file: the `--hash` options and
+    the continuation backslashes that carry them are pip's, not pins, and are skipped."""
     pins = {}
     with open(path) as handle:
         for line in handle:
-            line = line.split("#", 1)[0].strip()
-            if not line:
+            line = line.split("#", 1)[0].strip().removesuffix("\\").strip()
+            if not line or line.startswith("--hash="):
                 continue
             name, sep, version = line.partition("==")
             if not sep or not version.strip():

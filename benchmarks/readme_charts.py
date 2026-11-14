@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The README's evidence charts, drawn from committed measurements only.
 
-    python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt
+    python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt
     python3 benchmarks/readme_charts.py
     git status --porcelain -- docs/assets/readme/      # what CI does next: empty means no drift
 
