@@ -107,8 +107,10 @@ As of **August 2026** (repo at v0.3.0):
   the engine.
 
 **Partially done**
-- Phase 6 (observability & ops): metrics, readiness, dashboards and OTLP trace
-  export exist; Alertmanager rules do not.
+- Phase 6 (observability & ops): metrics, readiness, dashboards, OTLP trace
+  export and a unit-tested Prometheus alert rule set with runbooks and
+  documented SLOs exist (#720); a store write-latency SLO and its alert do
+  not.
 - Phase 8 (retention/backup/DR/security): retention shipped; backup/restore
   runbook, DR drills, and the divergence checker have not been exercised.
 
@@ -1239,10 +1241,18 @@ path needed by the distributed options is already implemented (§6.3).
   as a textfile; the [observability README](../observability/README.md#archive-scrub)
   has an example alert rule set.
 
+- **Alerting rules** (#720): `observability/prometheus/vtop-rules.yaml`, also
+  shipped as the chart's `PrometheusRule`: verification failures, no commits
+  while data waits, replay-rate spike, Kafka lag growth (from kafka-exporter),
+  size-only verification, failed Object Lock checks, retention loss, refused
+  replays and piling multipart sessions. Each has a promtool unit test and a
+  section in [Alert runbooks](operate/runbooks.md); the objectives are on
+  [Service level objectives](operate/slos.md).
+
 **Still needed for production [PROPOSED]:**
-- **Alerting rules** (Alertmanager): verification failures > 0; replay-rate
-  spike; lag growth; store write-latency SLO breach; no committed batches in N
-  minutes.
+- **Alerting rules:** a store write-latency SLO breach (the engine has no
+  write-latency objective yet; `vtop_stage_duration_seconds{stage="state_write"}`
+  is the metric it would read).
 - Metric coverage review: **verification-failure rate**, **replay /
   REPLAY_REQUIRED rate**, Kafka **consumer lag**, state-store write latency,
   **duplicate-object rate** (needed until deterministic keys land).
@@ -1737,10 +1747,14 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
   `vtop-observe`); structured per-stage events; `observability/` compose stack
   (Grafana, Loki, Mimir, Tempo, Alloy) with generated dashboards; OTLP trace
   export from the engine into that Tempo (#683).
-- **Remaining:** Alertmanager rules (verification failures > 0, replay-rate
-  spike, lag growth, store-latency SLO breach, no-commits-in-N-minutes); metric
-  coverage review (duplicate-object rate until Phase 4 lands, consumer lag,
-  state-store write latency); documented SLOs.
+- **Done (#720):** Prometheus alert rules (verification failures, replay-rate
+  spike, lag growth, no commits in 30 minutes while data waits, and five more),
+  each unit-tested with promtool in CI and linked to a runbook section;
+  documented SLOs ([operate/slos.md](operate/slos.md)).
+- **Remaining:** a store-latency SLO and its alert; metric coverage review
+  (duplicate-object rate until Phase 4 lands, an engine-side consumer lag,
+  state-store write latency); wiring the rules to an Alertmanager is the
+  deployment's.
 - **Test plan:** force a verification failure and confirm the alert; load test
   and watch lag/replay panels.
 - **Exit criteria:** operators see throughput, lag, replay, failures; alerts
@@ -1872,7 +1886,8 @@ Object storage
 Operability
   [x] Prometheus metrics endpoint + readiness probe (VTOP_METRICS_ADDR)
   [x] dashboards defined (observability/ stack)
-  [ ] Alertmanager rules wired                                         (Phase 6)
+  [x] Prometheus alert rules, unit-tested, with runbooks (#720)       (Phase 6)
+  [ ] Alertmanager routing wired (deployment-side)                    (Phase 6)
   [x] OpenTelemetry traces exported (opt-in, OTEL_EXPORTER_OTLP_ENDPOINT)
   [ ] engine k8s chart: probes, limits, PDB, NetworkPolicy, runbook    (Phase 7)
 

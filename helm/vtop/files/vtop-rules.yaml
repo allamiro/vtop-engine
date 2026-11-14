@@ -1,0 +1,189 @@
+# VTOP engine alert rules (Prometheus rule format).
+#
+# Load this file with `rule_files:` in prometheus.yml, or through the chart's
+# PrometheusRule (helm/vtop, metrics.prometheusRule.enabled). The chart ships
+# a byte-for-byte copy at helm/vtop/files/vtop-rules.yaml; CI fails when the
+# two differ, so edit this file and copy it there.
+#
+# Every alert is unit-tested in tests/vtop-rules.test.yaml (`promtool test
+# rules`), and its runbook_url points at a section of
+# docs/operate/runbooks.md (scripts/check-alert-runbooks.py checks both).
+#
+# Thresholds. These are defaults to tune, not measured values; the SLO page
+# (docs/operate/slos.md) says what each one protects. Each is written once,
+# in the one rule that uses it. PromQL cannot take a range or a duration
+# from another series, so the windows are literals. A threshold kept in a
+# recording rule would make each alert depend silently on another rule
+# being loaded, so the numbers are literals too.
+#
+#   Name                         Default  Used in
+#   verification_window          10m      VtopVerificationFailures
+#   no_commits_quiet_window      10m      VtopNoCommits (no commit in this window...)
+#   no_commits_hold              20m      VtopNoCommits (...held this long: 30 min in all)
+#   replay_rate_window           15m      VtopReplayRateSpike
+#   replay_rate_floor            0.01/s   VtopReplayRateSpike (about 9 replays in 15 min)
+#   replay_baseline_window       6h       VtopReplayRateSpike
+#   replay_baseline_multiple     3        VtopReplayRateSpike
+#   lag_deriv_window             15m      VtopSourceLagGrowing
+#   lag_rising_hold              30m      VtopSourceLagGrowing
+#   lag_consumer_group           vtop-engine  VtopSourceLagGrowing (sources.kafka.consumer_group)
+#   object_lock_window           15m      VtopObjectLockCheckFailed
+#   retention_loss_window        15m      VtopRetentionLoss
+#   replay_refused_window        15m      VtopSourceReplayRefused
+#   multipart_window             26h      VtopMultipartSessionsPiling (past the 24 h abandon window)
+#   multipart_hold               1h       VtopMultipartSessionsPiling
+#
+# Severity: `page` wakes someone (data is missing, at risk, or not being
+# archived); `ticket` is for working hours (degraded, or a setting to fix).
+#
+# Counters are per engine process and restart at zero. Every rule keeps the
+# series' own labels (job, instance, tenant, source_type, format, ...), so an
+# alert names the engine and the stream it is about.
+
+groups:
+  - name: vtop-engine
+    rules:
+      # The commit rule's own failure: a stored copy did not match its
+      # manifest, so the batch was not committed. The counter is not primed:
+      # its series appears at the first failure, and increase() needs two
+      # samples, so the second branch fires on a series that is non-zero now
+      # and did not exist one window ago.
+      - alert: VtopVerificationFailures
+        expr: |
+          increase(vtop_verification_failures_total[10m]) > 0
+          or
+          (vtop_verification_failures_total > 0 unless vtop_verification_failures_total offset 10m)
+        labels:
+          severity: page
+        annotations:
+          summary: "Verification failed for {{ $labels.tenant }}/{{ $labels.source_type }}/{{ $labels.format }} on {{ $labels.instance }}"
+          description: "A stored object or manifest did not match what the engine uploaded. The batch was not committed and its data is still in the source. Find the batch id in the engine's verification WARN lines, check the object store, then run vtopctl scrub over the affected range."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopverificationfailures"
+
+      # An engine holding data that has committed nothing. vtop_inflight_batches
+      # is the engine's count of batches still accumulating; it stays at zero
+      # for an idle source, so an idle engine never pages. The fallback to
+      # inflight*0 makes an engine that has not committed once since it
+      # started count as zero commits instead of having no series at all.
+      # The 20m hold also covers the first batches after a start.
+      - alert: VtopNoCommits
+        expr: |
+          (
+            sum by (job, instance) (increase(vtop_commits_total[10m]))
+            or on (job, instance)
+            max by (job, instance) (vtop_inflight_batches) * 0
+          ) == 0
+          and on (job, instance)
+          max by (job, instance) (max_over_time(vtop_inflight_batches[10m])) > 0
+        for: 20m
+        labels:
+          severity: page
+        annotations:
+          summary: "No batch committed for 30 minutes on {{ $labels.instance }} while data is waiting"
+          description: "The engine has batches in memory but has not committed one for 30 minutes, so nothing is being archived and source progress is not moving. Check the engine's WARN and ERROR lines and vtopctl status for where batches stop (upload, verify or the state store)."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopnocommits"
+
+      # Batches marked REPLAY_REQUIRED and re-read from source, well above
+      # both a floor and this stream's own recent rate. The baseline window
+      # ends where the short window starts, so a spike does not raise its own
+      # baseline; a stream with no baseline yet compares against zero.
+      - alert: VtopReplayRateSpike
+        expr: |
+          rate(vtop_replay_required_total[15m]) > 0.01
+          and
+          rate(vtop_replay_required_total[15m])
+            > 3 * (
+              rate(vtop_replay_required_total[6h] offset 15m)
+              or
+              rate(vtop_replay_required_total[15m]) * 0
+            )
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Replays of {{ $labels.tenant }}/{{ $labels.source_type }}/{{ $labels.format }} on {{ $labels.instance }} are well above their usual rate"
+          description: "Batches are failing after they were sealed and are being re-read from the source. Nothing is lost while the source still holds the data, but the work is repeated. Read the engine's WARN lines for why batches fail (upload, verification, Object Lock or the state store) and fix that cause."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopreplayratespike"
+
+      # The engine has no lag metric of its own. This reads
+      # kafka_consumergroup_lag from kafka-exporter (the lab runs
+      # danielqsj/kafka-exporter, docker-compose.observability.yml), and is
+      # silent without it. Set the consumergroup matcher to your
+      # sources.kafka.consumer_group (default vtop-engine).
+      - alert: VtopSourceLagGrowing
+        expr: |
+          sum by (consumergroup, topic) (deriv(kafka_consumergroup_lag{consumergroup="vtop-engine"}[15m])) > 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Kafka lag of consumer group {{ $labels.consumergroup }} on {{ $labels.topic }} has risen for 30 minutes"
+          description: "The engine is reading this topic more slowly than it is written. If the lag reaches the topic's retention, records are deleted before they are archived (VtopRetentionLoss). Check upload throughput and throttling, then scale the engine or raise the topic's retention."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopsourcelaggrowing"
+
+      # Set once at startup: upload.require_strong_verification is false, so
+      # verification compares sizes only and same-size corruption commits.
+      - alert: VtopSizeOnlyVerification
+        expr: |
+          vtop_verification_mode{mode="size_only"} == 1
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Engine {{ $labels.instance }} verifies tenant {{ $labels.tenant }} by size only"
+          description: "upload.require_strong_verification is false, so a stored object of the right size but wrong content is committed. Turn on strong verification (a backend and checksum that can hash the stored bytes), or record why this deployment accepts size-only checks."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopsizeonlyverification"
+
+      # Primed at zero at startup when upload.object_lock is set, so
+      # increase() sees the first failure. Any result but ok failed a batch.
+      - alert: VtopObjectLockCheckFailed
+        expr: |
+          increase(vtop_object_lock_checks_total{result!="ok"}[15m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "Object Lock check failed ({{ $labels.result }}) for tenant {{ $labels.tenant }} on {{ $labels.instance }}"
+          description: "A written or reused object or manifest is not under the retention upload.object_lock asks for, or its bucket has no Object Lock. The batch failed and will be replayed. Read the object_lock_check_failed or object_lock_bucket_refused ERROR line, then fix the bucket or the credentials' retention permissions."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopobjectlockcheckfailed"
+
+      # Records Kafka retention deleted before the engine read them: never
+      # archived. Primed at zero at startup; the second branch also catches a
+      # series that first appears with the loss (an engine before the primer).
+      - alert: VtopRetentionLoss
+        expr: |
+          increase(vtop_retention_lost_records_total[15m]) > 0
+          or
+          (vtop_retention_lost_records_total > 0 unless vtop_retention_lost_records_total offset 15m)
+        labels:
+          severity: page
+        annotations:
+          summary: "Source retention deleted records {{ $labels.instance }} had not read ({{ $labels.tenant }}/{{ $labels.source_type }})"
+          description: "Records were removed by the source's retention before the engine read them. They will never be archived. Read the WARN line for the topic and partition, record the loss, and raise the topic's retention above the engine's worst-case lag."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopretentionloss"
+
+      # A failed range the source could not hand back for re-reading: a range
+      # missing from the archive. Primed at zero at startup.
+      - alert: VtopSourceReplayRefused
+        expr: |
+          increase(vtop_source_replay_refused_total[15m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "A failed range could not be re-read from {{ $labels.source_type }} on {{ $labels.instance }}"
+          description: "A batch failed and its source refused to hand the range back (for a file: truncated, rewritten, or rotated away and removed). That range is missing from the archive. The path is in the ERROR line beside the count; recover the data from another copy if one exists."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopsourcereplayrefused"
+
+      # Sessions kept after failed uploads, with none resumed and none swept
+      # for longer than the 24 h abandon window: incomplete uploads pile up
+      # in the bucket, where their parts are billed. The outcomes are primed
+      # at zero at startup.
+      - alert: VtopMultipartSessionsPiling
+        expr: |
+          sum by (job, instance) (increase(vtop_multipart_sessions_total{outcome="kept_after_failure"}[26h])) > 0
+          unless on (job, instance)
+          sum by (job, instance) (increase(vtop_multipart_sessions_total{outcome=~"resumed|swept"}[26h])) > 0
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Incomplete multipart uploads on {{ $labels.instance }} are kept and never resumed or swept"
+          description: "Failed uploads kept their multipart sessions for the replay, but for over a day none was resumed and none swept, so their parts stay billed in the bucket. Check the engine's multipart_sweep_failed events and the bucket's lifecycle rule for incomplete uploads."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopmultipartsessionspiling"

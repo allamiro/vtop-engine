@@ -56,8 +56,33 @@ object URIs are in the logs, not in labels.
 
 ## Alerts
 
-Two alert sets ship with the repository. Both are starting points, not a
-complete production rule set.
+Two alert sets ship with the repository, side by side: a Prometheus rule set
+for the engine, and the Grafana rules the lab provisions, most of them for the
+cluster plane.
+
+**The engine's Prometheus rules.**
+[`observability/prometheus/vtop-rules.yaml`](../../observability/prometheus/vtop-rules.yaml)
+is a plain Prometheus rule file. Load it with `rule_files:` in
+`prometheus.yml`, or, on Kubernetes with the Prometheus Operator, through the
+chart's `PrometheusRule` (`metrics.prometheusRule.enabled`, see
+[Kubernetes with Helm](../deploy/kubernetes.md)). Each alert has a promtool unit
+test, a runbook section, and an objective on [Service level objectives](slos.md):
+
+| Alert | Severity | Fires on |
+|---|---|---|
+| [VtopVerificationFailures](runbooks.md#vtopverificationfailures) | page | Any increase of `vtop_verification_failures_total`, or the series first appearing non-zero |
+| [VtopNoCommits](runbooks.md#vtopnocommits) | page | No commit for 30 minutes while `vtop_inflight_batches` shows data waiting |
+| [VtopReplayRateSpike](runbooks.md#vtopreplayratespike) | ticket | `vtop_replay_required_total` above 0.01/s and above three times its 6-hour rate |
+| [VtopSourceLagGrowing](runbooks.md#vtopsourcelaggrowing) | ticket | `kafka_consumergroup_lag` (kafka-exporter) rising for 30 minutes |
+| [VtopSizeOnlyVerification](runbooks.md#vtopsizeonlyverification) | ticket | `vtop_verification_mode{mode="size_only"} == 1` |
+| [VtopObjectLockCheckFailed](runbooks.md#vtopobjectlockcheckfailed) | page | Any increase of `vtop_object_lock_checks_total` with a result other than `ok` |
+| [VtopRetentionLoss](runbooks.md#vtopretentionloss) | page | Any increase of `vtop_retention_lost_records_total` |
+| [VtopSourceReplayRefused](runbooks.md#vtopsourcereplayrefused) | page | Any increase of `vtop_source_replay_refused_total` |
+| [VtopMultipartSessionsPiling](runbooks.md#vtopmultipartsessionspiling) | ticket | Multipart sessions kept after failures, none resumed or swept for 26 hours |
+
+The thresholds are defaults, listed at the top of the file. The rules route
+nowhere by themselves: point Prometheus at your Alertmanager and route on the
+`severity` label (`page` or `ticket`).
 
 **Provisioned in the lab.**
 [`observability/grafana/provisioning/alerting/vtop-alerts.yaml`](../../observability/grafana/provisioning/alerting/vtop-alerts.yaml)
@@ -76,31 +101,12 @@ holds the Grafana rules the optional observability stack loads:
 | Consumer group cursor below log start | A group's committed cursor below the serving replica's log start, for 5 minutes |
 | Consumer group near eviction | A group's cursor close to log start, for 15 minutes |
 
-The first rule is about the engine; the rest are about the cluster plane.
+The first rule is about the engine, and overlaps `VtopRetentionLoss`; the rest
+are about the cluster plane and have no Prometheus-format equivalent yet.
 
 **For the scrub.** `vtopctl scrub` writes its own metrics to a file, and the
 [observability README](../../observability/README.md#archive-scrub) has an
 example Prometheus rule set for it. See [Scrub and coverage audit](scrub-and-audit.md).
-
-Worth adding for any engine (examples; tune them to your deployment):
-
-```yaml
-groups:
-  - name: vtop-engine
-    rules:
-      # The series appears at the first failure, so increase() would miss
-      # that one: alert on the value. It clears when the engine restarts.
-      - alert: VtopVerificationFailures
-        expr: sum(vtop_verification_failures_total) > 0
-      - alert: VtopSizeOnlyVerification
-        expr: vtop_verification_mode{mode="size_only"} == 1
-      # Primed at zero at startup with upload.object_lock set.
-      - alert: VtopObjectLockCheckFailed
-        expr: increase(vtop_object_lock_checks_total{result!="ok"}[15m]) > 0
-      # Primed at zero at startup, so increase() sees the first one.
-      - alert: VtopSourceReplayRefused
-        expr: increase(vtop_source_replay_refused_total[15m]) > 0
-```
 
 ## The lab's Grafana stack
 

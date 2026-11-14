@@ -28,6 +28,15 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # promtool for the alert rules (#720), used by the prometheus-rules and helm
+  # jobs. Pinned by digest, resolved with `docker manifest inspect
+  # prom/prometheus:v3.15.1` (the multi-arch index; quay.io/prometheus/
+  # prometheus:v3.15.1 serves the same digest), not by the mutable tag. The
+  # tag is in the trailing comment and PROMETHEUS_VERSION; the prometheus-rules
+  # job fails when the comment, the variable and what the image reports
+  # disagree, so a retag or a half-done bump is caught. Bump all three.
+  PROMETHEUS_IMAGE: prom/prometheus@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2 # v3.15.1
+  PROMETHEUS_VERSION: "3.15.1"
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
@@ -58,6 +67,7 @@ jobs:
       manifest_compat: ${{ steps.filter.outputs.manifest_compat }}
       helm: ${{ steps.filter.outputs.helm }}
       file_source: ${{ steps.filter.outputs.file_source }}
+      prometheus_rules: ${{ steps.filter.outputs.prometheus_rules }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Pinned to a full commit SHA (v3), not the mutable tag, so an upstream
@@ -173,6 +183,17 @@ jobs:
 
             dashboards:
               - 'observability/**'
+            # The engine's alert rules (#720): the rules and their promtool
+            # tests, the chart's copy (which must equal them), the runbook page
+            # every runbook_url points into, and the checker with its tests.
+            prometheus_rules:
+              - 'observability/prometheus/**'
+              - 'helm/vtop/files/**'
+              - 'docs/operate/runbooks.md'
+              - 'scripts/check-alert-runbooks.py'
+              - 'scripts/tests/test_check_alert_runbooks.py'
+              - 'scripts/tests/fixtures/alert-runbooks/**'
+              - '.github/workflows/ci.yml'
             benchmarks:
               - 'benchmarks/**'
             # The Kafka-comparison charts and reports: their generators, the
@@ -651,6 +672,55 @@ jobs:
           manifests=$(grep -c '^kind:' /tmp/rendered.yaml)
           echo "rendered $manifests manifests"
           test "$manifests" -ge 5
+
+      # The engine's alert rules as a PrometheusRule (#720): off by default,
+      # refused like the ServiceMonitor where the Operator's CRDs are absent,
+      # and when on, its spec is helm/vtop/files/vtop-rules.yaml verbatim (the
+      # prometheus-rules job proves that copy equals the rules file and that
+      # every runbook link in it resolves), valid to promtool, with
+      # runbookBaseUrl moving every runbook link and keeping its #section.
+      - name: The PrometheusRule serves the shipped rules, and only when asked
+        run: |
+          set -euo pipefail
+          values=helm/vtop/ci/default-values.yaml
+          if helm template vtop helm/vtop -f "$values" | grep -q '^kind: PrometheusRule'; then
+            echo "::error::a PrometheusRule rendered with metrics.prometheusRule.enabled unset; it must be opt-in"
+            exit 1
+          fi
+          if output=$(helm template vtop helm/vtop -f "$values" --set metrics.prometheusRule.enabled=true 2>&1); then
+            echo "::error::the PrometheusRule rendered without monitoring.coreos.com/v1; it must refuse as the ServiceMonitor does"
+            exit 1
+          fi
+          printf '%s' "$output" | grep -qF 'does not expose monitoring.coreos.com/v1' \
+            || { echo "::error::refused without the CRDs, but not with the CRD message"; printf '%s\n' "$output" | tail -5; exit 1; }
+          helm template vtop helm/vtop -f "$values" --set metrics.prometheusRule.enabled=true \
+            --api-versions monitoring.coreos.com/v1 > /tmp/prometheusrule.yaml
+          python3 - /tmp/prometheusrule.yaml helm/vtop/files/vtop-rules.yaml /tmp/prometheusrule-groups.yaml <<'PYEOF'
+          import sys
+          docs = [d for d in open(sys.argv[1]).read().split('\n---\n') if d.strip()]
+          rules = [d for d in docs if '\nkind: PrometheusRule\n' in '\n' + d + '\n']
+          assert len(rules) == 1, f'expected one PrometheusRule, rendered {len(rules)}'
+          body = rules[0].split('\nspec:\n', 1)[1].split('\n')
+          assert all(not line.strip() or line.startswith('  ') for line in body), 'spec is not indented under spec:'
+          spec = '\n'.join(line[2:] for line in body).strip('\n')
+          shipped = open(sys.argv[2]).read().strip('\n')
+          assert spec == shipped, 'the PrometheusRule spec is not helm/vtop/files/vtop-rules.yaml verbatim'
+          open(sys.argv[3], 'w').write(spec + '\n')
+          print(f'the PrometheusRule spec is the shipped rules file ({len(spec.splitlines())} lines)')
+          PYEOF
+          docker run --rm --network none -v /tmp/prometheusrule-groups.yaml:/rules/vtop-rules.yaml:ro \
+            --entrypoint promtool "$PROMETHEUS_IMAGE" check rules /rules/vtop-rules.yaml
+          helm template vtop helm/vtop -f "$values" --set metrics.prometheusRule.enabled=true \
+            --set metrics.prometheusRule.runbookBaseUrl=https://runbooks.example.internal/vtop/ \
+            --api-versions monitoring.coreos.com/v1 > /tmp/prometheusrule-base.yaml
+          shipped=$(grep -c 'runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#' helm/vtop/files/vtop-rules.yaml)
+          moved=$(grep -c 'runbook_url: "https://runbooks.example.internal/vtop/#' /tmp/prometheusrule-base.yaml)
+          if [ "$shipped" -eq 0 ] || [ "$moved" -ne "$shipped" ] \
+            || grep -q 'allamiro.github.io/vtop-engine/operate/runbooks' /tmp/prometheusrule-base.yaml; then
+            echo "::error::runbookBaseUrl moved $moved of $shipped runbook links (or left one on the default page)"
+            exit 1
+          fi
+          echo "runbookBaseUrl moved all $moved runbook links, each keeping its section"
 
       # Stdlib only, deliberately. A YAML library would have to be installed,
       # and an install step that quietly fails leaves a check that no longer
@@ -1965,6 +2035,69 @@ jobs:
   # or the e2e lab. This job lints the generators, re-runs them and fails if the
   # committed JSON is stale (the exact drift that shipped once), and checks the
   # JSON parses. Seconds, not tens of minutes.
+  # The engine's alert rules (#720). promtool runs from the pinned image with
+  # the rules mounted read-only and no network; the checker proves every alert
+  # has a runbook section its link resolves to, and a firing and a quiet test.
+  prometheus-rules:
+    name: prometheus rules (promtool + runbooks)
+    needs: changes
+    if: needs.changes.outputs.prometheus_rules == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # A digest pin stops the image moving under us, but a pin bumped
+      # halfway (a new digest under the old comment) or a registry that no
+      # longer serves the digest would otherwise only show as a confusing
+      # failure later. Check the pin itself first.
+      - name: The pinned promtool image exists and is the version its pin names
+        run: |
+          set -euo pipefail
+          comment=$(sed -n 's/^  PROMETHEUS_IMAGE: [^ ]* # v\([0-9][^ ]*\)$/\1/p' .github/workflows/ci.yml)
+          if [ "$comment" != "$PROMETHEUS_VERSION" ]; then
+            echo "::error::the PROMETHEUS_IMAGE pin comment names v$comment but PROMETHEUS_VERSION is $PROMETHEUS_VERSION; bump them together"
+            exit 1
+          fi
+          docker pull --quiet "$PROMETHEUS_IMAGE" \
+            || { echo "::error::$PROMETHEUS_IMAGE could not be pulled; the registry no longer serves the pinned digest"; exit 1; }
+          reported=$(docker run --rm --network none --entrypoint promtool "$PROMETHEUS_IMAGE" --version \
+            | sed -n 's/^promtool, version \([^ ]*\) .*/\1/p')
+          if [ "$reported" != "$PROMETHEUS_VERSION" ]; then
+            echo "::error::the pinned image reports promtool '$reported', but the pin names $PROMETHEUS_VERSION"
+            exit 1
+          fi
+          echo "pinned promtool is $reported"
+
+      - name: The chart's copy of the rules is the rules file
+        run: |
+          if ! diff -u observability/prometheus/vtop-rules.yaml helm/vtop/files/vtop-rules.yaml; then
+            echo "::error::helm/vtop/files/vtop-rules.yaml differs from observability/prometheus/vtop-rules.yaml (diff above). Edit the rules file, then copy it: cp observability/prometheus/vtop-rules.yaml helm/vtop/files/vtop-rules.yaml"
+            exit 1
+          fi
+
+      - name: promtool check rules
+        run: |
+          docker run --rm --network none -v "$PWD/observability/prometheus:/rules:ro" -w /rules \
+            --entrypoint promtool "$PROMETHEUS_IMAGE" check rules vtop-rules.yaml
+
+      - name: promtool test rules
+        run: |
+          docker run --rm --network none -v "$PWD/observability/prometheus:/rules:ro" -w /rules \
+            --entrypoint promtool "$PROMETHEUS_IMAGE" test rules tests/vtop-rules.test.yaml
+
+      - name: Install the runbook checker's dependency (hash-pinned)
+        run: python -m pip install --disable-pip-version-check --require-hashes -r observability/prometheus/requirements.txt
+
+      - name: The runbook checker can fail
+        run: python -m unittest discover -s scripts/tests -p 'test_check_alert_runbooks.py' -v
+
+      - name: Every alert has a runbook section, a working link and both unit tests
+        run: python scripts/check-alert-runbooks.py
+
   dashboards:
     name: dashboards (generators + no drift)
     needs: changes
