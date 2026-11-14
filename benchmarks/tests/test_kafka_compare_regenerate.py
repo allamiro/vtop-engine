@@ -69,6 +69,17 @@ def test_pins_are_read_from_a_hash_locked_file(tmp_path):
     assert regenerate.read_pins(str(pins)) == {"matplotlib": "3.10.3", "six": "1.17.0"}
 
 
+def test_a_pin_with_a_marker_or_an_inline_hash_reads_as_its_version(tmp_path):
+    pins = tmp_path / "pins.txt"
+    pins.write_text('numpy==2.4.6 ; python_version >= "3.11"\npillow==13.0.0 --hash=sha256:' + "d" * 64 + "\n")
+    assert regenerate.read_pins(str(pins)) == {"numpy": "2.4.6", "pillow": "13.0.0"}
+
+
+def test_the_refusal_names_the_hash_checked_install():
+    with pytest.raises(regenerate.Refused, match="--require-hashes -r"):
+        regenerate.check_stack({"matplotlib": "3.10.3"}, {}.get)
+
+
 def test_a_hash_line_without_a_pin_is_refused(tmp_path):
     pins = tmp_path / "pins.txt"
     pins.write_text("    --hash=sha256:" + "a" * 64 + "\n")
@@ -327,18 +338,31 @@ def test_committed_svgs_draw_text_as_paths(path):
 
 
 # Variations a developer's shell or a CI runner could bring, none of which may reach the output.
+# The first is a plain C locale with Python's UTF-8 mode and locale coercion
+# off, so the default text encoding is ASCII wherever the C locale is ASCII
+# (Linux): a generator that writes non-ASCII text without naming an encoding
+# fails there, and only there.
 ENVIRONMENTS = (
-    {"PYTHONHASHSEED": "1", "TZ": "UTC", "LC_ALL": "C", "LANG": "C"},
+    {"PYTHONHASHSEED": "1", "TZ": "UTC", "LC_ALL": "C", "LANG": "C", "PYTHONUTF8": "0",
+     "PYTHONCOERCECLOCALE": "0"},
     {"PYTHONHASHSEED": "4242", "TZ": "Pacific/Kiritimati", "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8",
-     "SOURCE_DATE_EPOCH": "1"},
+     "PYTHONUTF8": "1", "SOURCE_DATE_EPOCH": "1"},
 )
+VARIED = ("PYTHONHASHSEED", "TZ", "LC_ALL", "LANG", "PYTHONUTF8", "PYTHONCOERCECLOCALE", "SOURCE_DATE_EPOCH")
 
 
 def _env(extra):
-    env = {key: value for key, value in os.environ.items()
-           if key not in ("PYTHONHASHSEED", "TZ", "LC_ALL", "LANG", "SOURCE_DATE_EPOCH")}
+    env = {key: value for key, value in os.environ.items() if key not in VARIED}
     env.update(extra)
     return env
+
+
+def _same_output(first, second):
+    """The names each run wrote, then the names whose bytes differ: a file only one run writes
+    is a difference too, not something to skip."""
+    assert first, "nothing was written"
+    assert set(first) == set(second), f"the two runs wrote different files: {sorted(set(first) ^ set(second))}"
+    return sorted(name for name in first if first[name] != second[name])
 
 
 def _read_all(directory):
@@ -355,7 +379,9 @@ def _read_all(directory):
 def _render_report_twice(tmp_path, run):
     outputs = []
     for index, extra in enumerate(ENVIRONMENTS):
-        out = tmp_path / "out"
+        # One output directory per run, at the same depth (the page's relative links depend on
+        # it): a shared one would let the second run pass on files only the first wrote.
+        out = tmp_path / f"out{index}"
         cwd = tmp_path / f"cwd{index}"
         cwd.mkdir()
         run_dir = os.path.join(regenerate.REPO, regenerate.RESULTS, run)
@@ -374,9 +400,7 @@ def _committed_run_ids():
 @pytest.mark.parametrize("run", _committed_run_ids())
 def test_report_output_does_not_depend_on_the_environment(tmp_path, run):
     pytest.importorskip("matplotlib")
-    first, second = _render_report_twice(tmp_path, run)
-    assert first, "report.py wrote no SVG or Markdown"
-    changed = sorted(name for name in first if first[name] != second.get(name))
+    changed = _same_output(*_render_report_twice(tmp_path, run))
     assert not changed, f"the same run drew different bytes under a different hash seed, zone, locale or cwd: {changed}"
 
 
@@ -387,12 +411,12 @@ def test_readme_chart_output_does_not_depend_on_the_environment(tmp_path):
         repo = tmp_path / f"repo{index}"
         repo.mkdir()
         (repo / "benchmarks").symlink_to(os.path.join(regenerate.REPO, "benchmarks"))
+        cwd = tmp_path / f"cwd{index}"
+        cwd.mkdir()
         code = "import sys; sys.path.insert(0, sys.argv[1]); import readme_charts; readme_charts.render(sys.argv[2])"
         proc = subprocess.run([sys.executable, "-c", code, os.path.join(regenerate.REPO, "benchmarks"), str(repo)],
-                              cwd=tmp_path, env=_env(extra), capture_output=True, text=True)
+                              cwd=cwd, env=_env(extra), capture_output=True, text=True)
         assert proc.returncode == 0, proc.stderr
         outputs.append(_read_all(repo / "docs"))
-    first, second = outputs
-    assert first
-    changed = sorted(name for name in first if first[name] != second.get(name))
+    changed = _same_output(*outputs)
     assert not changed, f"the README charts differ under a different hash seed, zone, locale or cwd: {changed}"

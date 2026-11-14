@@ -15,6 +15,8 @@ import glob
 import os
 import re
 
+import pytest
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH = os.path.dirname(HERE)
 REPO = os.path.dirname(BENCH)
@@ -98,18 +100,48 @@ def test_the_chart_job_pins_the_python_patch_version():
             "with the runner image, so pin the patch")
 
 
-def test_the_chart_job_installs_the_stack_with_hash_checking():
+def test_the_chart_job_installs_everything_with_hash_checking():
+    # The test tools too: pytest's own dependencies are otherwise whatever is newest at run time.
     block = job_block("benchmark-charts")
-    install = [line for line in block.splitlines() if "requirements-report.txt" in line and "pip install" in line]
-    assert install, "the benchmark-charts job does not install requirements-report.txt"
+    install = [line.strip() for line in block.splitlines() if "pip install" in line and "echo" not in line]
+    assert any("requirements-report.txt" in line for line in install), \
+        "the benchmark-charts job does not install requirements-report.txt"
     for line in install:
-        assert "--require-hashes" in line, f"installed without --require-hashes: {line.strip()}"
+        assert "--require-hashes" in line, f"installed without --require-hashes: {line}"
+        assert re.search(r"-r \S+\.txt", line) and not re.search(r"\s[A-Za-z][\w.-]*==", line), \
+            f"installs a package by name, outside a hash-locked file: {line}"
 
 
-def test_the_plotting_stack_is_hash_locked():
-    with open(PINS, encoding="utf-8") as handle:
+def test_the_chart_job_fails_when_a_test_skips_for_want_of_the_plotting_stack():
+    # The file list above is read as text; this is the run-time half: a test that skipped because
+    # matplotlib or Pillow was missing fails the job, however the skip was written.
+    block = job_block("benchmark-charts")
+    assert re.search(r"python -m pytest [^\n]*-rs", block), "the chart job's pytest does not report skips (-rs)"
+    assert re.search(r"grep -E? ?[\"'][^\"']*SKIPPED[^\"']*matplotlib", block), \
+        "the chart job does not fail on a skip that names matplotlib"
+
+
+TEST_PINS = os.path.join(BENCH, "kafka_compare", "requirements-report-test.txt")
+
+
+@pytest.mark.parametrize("path", [PINS, TEST_PINS], ids=os.path.basename)
+def test_every_lock_the_chart_job_installs_is_hash_locked(path):
+    with open(path, encoding="utf-8") as handle:
         text = handle.read()
     entries = re.findall(r"^([A-Za-z0-9_.-]+)==([^\s\\]+)((?:\s*\\\n\s+--hash=sha256:[0-9a-f]{64})*)", text, re.M)
-    assert entries, f"{PINS} pins nothing"
+    assert entries, f"{path} pins nothing"
     unhashed = sorted(name for name, _version, hashes in entries if "--hash=sha256:" not in hashes)
-    assert not unhashed, f"{PINS}: these pins carry no hash, so pip cannot check what it installs: {unhashed}"
+    assert not unhashed, f"{path}: these pins carry no hash, so pip cannot check what it installs: {unhashed}"
+
+
+def test_the_test_tools_lock_agrees_with_the_plotting_stack():
+    # Both files go into one pip command; a package in both must be the same version.
+    def pins(path):
+        with open(path, encoding="utf-8") as handle:
+            return dict(re.findall(r"^([A-Za-z0-9_.-]+)==([^\s\\;]+)", handle.read(), re.M))
+    report, tools = pins(PINS), pins(TEST_PINS)
+    assert "pytest" in tools
+    clash = {name: (report[name], tools[name]) for name in set(report) & set(tools) if report[name] != tools[name]}
+    assert not clash, f"the two locks pin these packages differently: {clash}"
+
+

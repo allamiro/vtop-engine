@@ -2040,18 +2040,25 @@ jobs:
         with:
           python-version: "3.12.16"
       # Hash-checked, as docs/requirements.txt is: pip refuses a file whose
-      # hash is not in the lock. pytest is not part of the plotting stack and
-      # is installed on its own, so the lock stays the stack and nothing else.
+      # hash is not in the lock. The test runner has its own lock, compiled
+      # against the plotting stack's, so the stack's lock stays the stack.
       - name: Install the pinned plotting stack
         run: |
           pip install --disable-pip-version-check --require-hashes -r benchmarks/kafka_compare/requirements-report.txt
-          pip install --disable-pip-version-check pytest==9.2.0
+          pip install --disable-pip-version-check --require-hashes -r benchmarks/kafka_compare/requirements-report-test.txt
       # The benchmarks job runs without matplotlib or Pillow, so every test
       # file that needs them skips there and runs here;
       # tests/test_benchmark_charts_job.py fails when one is missing below.
+      # That check reads this file as text, so the run checks too: a test
+      # that skipped here for want of matplotlib or Pillow fails the job.
       - name: Report and drift-check tests, with matplotlib
         working-directory: benchmarks
-        run: python -m pytest tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py
+        run: |
+          python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py | tee "$RUNNER_TEMP/chart-tests.log"
+          if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/chart-tests.log"; then
+            echo "::error::A chart test skipped for want of matplotlib or Pillow, in the one job that installs them."
+            exit 1
+          fi
       - name: Regenerate every chart and report and fail on drift
         run: |
           python3 benchmarks/kafka_compare/regenerate.py

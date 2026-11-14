@@ -1,6 +1,7 @@
 # The plotting stack the committed charts are drawn with (#600), one line per
-# package of matplotlib's dependency closure, so the lock below resolves to
-# exactly these versions. A bump changes a line here, regenerates
+# package of matplotlib's dependency closure, so its lock,
+# requirements-report.txt, resolves to exactly these versions. A bump changes
+# a line here, recompiles
 # requirements-report.txt, and regenerates docs/benchmarks/ and
 # docs/assets/readme/ in the same commit.
 matplotlib==3.10.3

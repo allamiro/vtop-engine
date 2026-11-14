@@ -75,7 +75,7 @@ class Refused(Exception):
 
 
 def _read_csv(rel: str, repo: str = REPO) -> list[dict[str, str]]:
-    with open(os.path.join(repo, rel), newline="") as handle:
+    with open(os.path.join(repo, rel), newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
 
 

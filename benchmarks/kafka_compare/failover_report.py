@@ -581,7 +581,7 @@ def write_markdown(run: fschema.FailoverRun, images: dict[str, str], csv_rel: di
     if noise:
         add(noise)
         add("")
-    with open(doc_path, "w") as handle:
+    with open(doc_path, "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines))
 
 
@@ -614,9 +614,9 @@ def steady_ab_note(run_dir: str) -> str:
     path = os.path.join(run_dir, "steady-ab", "ab.csv")
     if not os.path.isfile(path):
         return ""
-    with open(path, newline="") as handle:
+    with open(path, newline="", encoding="utf-8") as handle:
         runs = [r for r in csv.DictReader(handle) if r["max_gap_ms"]]
-    with open(os.path.join(run_dir, "steady-ab", "environment.json")) as handle:
+    with open(os.path.join(run_dir, "steady-ab", "environment.json"), encoding="utf-8") as handle:
         ab_env = json.load(handle)
     if not runs:
         return ""

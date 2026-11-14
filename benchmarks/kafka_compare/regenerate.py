@@ -87,10 +87,12 @@ def read_pins(path: str = PINS) -> dict[str, str]:
             line = line.split("#", 1)[0].strip().removesuffix("\\").strip()
             if not line or line.startswith("--hash="):
                 continue
-            name, sep, version = line.partition("==")
-            if not sep or not version.strip():
+            # An environment marker or an inline option is not part of the version.
+            name, sep, version = line.split(";", 1)[0].partition("==")
+            version = version.split()[0] if version.split() else ""
+            if not sep or not version:
                 raise Refused(f"{path}: `{line}` is not an exact `name==version` pin")
-            pins[name.strip().lower()] = version.strip()
+            pins[name.strip().lower()] = version
     if not pins:
         raise Refused(f"{path}: no pins")
     return pins
@@ -114,7 +116,7 @@ def check_stack(pins: dict[str, str], installed: Callable[[str], str | None] | N
             wrong.append(f"{name} {have or 'not installed'} (pinned {want})")
     if wrong:
         raise Refused("the plotting stack is not the pinned one: " + "; ".join(wrong) +
-                      f". Install it with `python3 -m pip install -r {os.path.relpath(PINS, REPO)}`.")
+                      f". Install it with `python3 -m pip install --require-hashes -r {os.path.relpath(PINS, REPO)}`.")
 
 
 def check_font() -> None:
