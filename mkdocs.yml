@@ -93,10 +93,12 @@ extra_css:
 
 plugins:
   - search:
-      # No '-' or '_' here: identifiers such as print-effective and
-      # require_strong_verification stay whole tokens, so searching for one
-      # finds it.
-      separator: '[\s,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;'
+      # Material's default separator, minus '_' and the camelCase split:
+      # snake_case keys such as require_strong_verification stay whole
+      # tokens, which the query side also keeps whole. '-' stays a separator
+      # because lunr's query lexer always splits a query on it, so
+      # print-effective is matched as its two words on both sides.
+      separator: '[\s\-,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;'
 
 markdown_extensions:
   - abbr
