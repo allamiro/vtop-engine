@@ -1225,6 +1225,7 @@ jobs:
         env:
           VTOP_TEST_KAFKA: localhost:9092
         run: cargo test -p vtop-cli --test integration_kafka_to_minio -- --ignored
+
   # The live S3 tests against a real store (#668). They are `#[ignore]` and
   # need `VTOP_TEST_S3_ENDPOINT`, so until this job they ran only by hand:
   # the multipart resume test (#668) proved the store keeps the parts that
@@ -1309,9 +1310,11 @@ jobs:
           cargo test -p vtop-cli --locked --test live_s3_object_lock_engine \
             -- --ignored --test-threads=1
 
+      # minio-init ran as a one-off `compose run` container, removed when it
+      # exited; its output is in the "Start MinIO" step above.
       - name: MinIO logs on failure
         if: failure()
-        run: docker compose logs --tail=200 minio minio-init || true
+        run: docker compose logs --tail=200 minio || true
 
   # cargo-deny covers what cargo-audit does not: license compliance, dependency
   # bans, and source provenance. Advisory decisions are mirrored from
