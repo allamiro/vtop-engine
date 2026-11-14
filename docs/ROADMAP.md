@@ -920,12 +920,15 @@ stores its records as ordinary native records, so Fetch serves them as an
 uncompressed batch (codec bits 0, CRC recomputed, the producer's create
 times kept). The CRC is checked over the compressed bytes before the
 decoder sees any of them, and the record count stays binding over the
-decompressed records. The compressed batches of one produce may expand to
-16 MiB in total, the most an uncompressed one can carry: past that the
-request is refused whole with `MESSAGE_TOO_LARGE`, a stream that does not
+decompressed records. The compressed batches of one produce request, across all
+its partition entries, may expand to 16 MiB in total, the most an
+uncompressed field can carry: past that the partition is refused whole with
+`MESSAGE_TOO_LARGE`, a stream that does not
 decompress is `CORRUPT_MESSAGE`, and snappy, lz4 and codec ids Kafka does not
-define stay `UNSUPPORTED_COMPRESSION_TYPE` with the codecs to use instead. A
-large compressed produce is decompressed off the async workers. The cost is
+define stay `UNSUPPORTED_COMPRESSION_TYPE` with the codecs to use instead. Every
+compressed field is decompressed off the async workers, and a zstd frame
+that asks for a window wider than 16 MiB is refused before it is allocated
+(`CORRUPT_MESSAGE`; producers at zstd levels 20 to 22 can ask for one). The cost is
 stated, not hidden: the native log stores and Fetch serves the uncompressed
 bytes where Kafka keeps the producer's compressed ones. No stored format
 and no advertised API version changes.

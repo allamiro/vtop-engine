@@ -20,6 +20,9 @@ pub const SNAPPY: i16 = 2;
 pub const LZ4: i16 = 3;
 pub const ZSTD: i16 = 4;
 
+/// The widest zstd window a frame may ask for: 2^24 bytes, the field cap.
+const ZSTD_WINDOW_LOG_MAX: u32 = 24;
+
 /// The codecs this build decompresses, in the order a refusal lists them.
 pub const SERVED: [i16; 2] = [GZIP, ZSTD];
 
@@ -70,12 +73,19 @@ pub fn decompress(codec: i16, input: &[u8], limit: usize) -> Result<Vec<u8>, Cod
             limit,
         ),
         ZSTD => {
-            let decoder = zstd::stream::read::Decoder::with_buffer(input).map_err(|error| {
-                CodecError::Corrupt {
-                    codec,
-                    reason: error.to_string(),
-                }
-            })?;
+            let corrupt = |error: std::io::Error| CodecError::Corrupt {
+                codec,
+                reason: error.to_string(),
+            };
+            let mut decoder = zstd::stream::read::Decoder::with_buffer(input).map_err(corrupt)?;
+            // The history window is allocated when the frame header is read,
+            // before any output, and libzstd's default ceiling is 128 MiB: a
+            // ten-byte frame could cost that much (review). No batch here may
+            // expand past MAX_FIELD_BYTES (16 MiB = 2^24), so no window wider
+            // than that is needed; a frame asking for more is refused.
+            decoder
+                .window_log_max(ZSTD_WINDOW_LOG_MAX)
+                .map_err(corrupt)?;
             bounded(codec, decoder, limit)
         }
         SNAPPY | LZ4 => Err(CodecError::NotServed { codec }),
@@ -84,16 +94,40 @@ pub fn decompress(codec: i16, input: &[u8], limit: usize) -> Result<Vec<u8>, Cod
 }
 
 /// Read `reader` to its end or to `limit + 1` bytes, whichever is first.
-fn bounded(codec: i16, reader: impl Read, limit: usize) -> Result<Vec<u8>, CodecError> {
-    let mut out = Vec::new();
-    let cap = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
-    reader
-        .take(cap)
-        .read_to_end(&mut out)
-        .map_err(|error| CodecError::Corrupt {
-            codec,
-            reason: error.to_string(),
-        })?;
+///
+/// In chunks, with the buffer's capacity never above `limit + 1`: a plain
+/// `read_to_end` doubles its buffer, so output near the limit could hold
+/// twice the limit, and more while it copies (review).
+fn bounded(codec: i16, mut reader: impl Read, limit: usize) -> Result<Vec<u8>, CodecError> {
+    const CHUNK: usize = 64 * 1024;
+    let cap = limit.saturating_add(1);
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        if out.len() == out.capacity() {
+            if out.len() >= cap {
+                return Err(CodecError::TooLarge { codec, limit });
+            }
+            let target = out.capacity().saturating_mul(2).max(CHUNK).min(cap);
+            out.reserve_exact(target - out.len());
+        }
+        let start = out.len();
+        let end = out.capacity().min(cap);
+        out.resize(end, 0);
+        match reader.read(&mut out[start..end]) {
+            Ok(0) => {
+                out.truncate(start);
+                break;
+            }
+            Ok(n) => out.truncate(start + n),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => out.truncate(start),
+            Err(error) => {
+                return Err(CodecError::Corrupt {
+                    codec,
+                    reason: error.to_string(),
+                })
+            }
+        }
+    }
     if out.len() > limit {
         return Err(CodecError::TooLarge { codec, limit });
     }
@@ -160,6 +194,41 @@ mod tests {
             );
         }
         assert_eq!(served_list(), "gzip, zstd, none");
+    }
+
+    /// A zstd frame that asks for a 128 MiB window is refused before the
+    /// window is allocated, however little it would output (review); one
+    /// within 2^24 decodes.
+    #[test]
+    fn a_zstd_frame_asking_for_a_wide_window_is_refused() {
+        use std::io::Write as _;
+        let frame = |window_log: u32| {
+            let mut e = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+            e.window_log(window_log).unwrap();
+            e.include_contentsize(false).unwrap();
+            e.write_all(b"x").unwrap();
+            e.finish().unwrap()
+        };
+        let wide = frame(27);
+        assert!(wide.len() < 32, "{} bytes", wide.len());
+        assert!(
+            matches!(
+                decompress(ZSTD, &wide, 1024),
+                Err(CodecError::Corrupt { .. })
+            ),
+            "{:?}",
+            decompress(ZSTD, &wide, 1024)
+        );
+        assert_eq!(decompress(ZSTD, &frame(24), 1024).unwrap(), b"x");
+    }
+
+    /// The output buffer never holds more than the limit plus one byte.
+    #[test]
+    fn the_output_buffer_is_capped_at_the_limit() {
+        let plain = vec![9_u8; 300_000];
+        let out = decompress(GZIP, &gzip(&plain), 300_000).unwrap();
+        assert_eq!(out.len(), 300_000);
+        assert!(out.capacity() <= 300_001, "capacity {}", out.capacity());
     }
 
     #[test]

@@ -18,9 +18,13 @@ use vtop_kafka::records::{crc32c, RecordBatch};
 const CAP: usize = 1 << 20;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = RecordBatch::decode_within(data, CAP);
+    if let Ok((_, expanded)) = RecordBatch::decode_within(data, CAP) {
+        assert!(expanded <= CAP, "decoded {expanded} bytes past the {CAP}-byte cap");
+    }
     for codec in 0..8 {
-        let _ = vtop_kafka::codec::decompress(codec, data, CAP);
+        if let Ok(out) = vtop_kafka::codec::decompress(codec, data, CAP) {
+            assert!(out.len() <= CAP, "codec {codec} returned {} bytes past the cap", out.len());
+        }
     }
     if data.len() < 3 {
         return;
@@ -45,5 +49,7 @@ fuzz_target!(|data: &[u8]| {
     batch.extend_from_slice(section);
     let crc = crc32c(&batch[21..]);
     batch[17..21].copy_from_slice(&crc.to_be_bytes());
-    let _ = RecordBatch::decode_within(&batch, CAP);
+    if let Ok((_, expanded)) = RecordBatch::decode_within(&batch, CAP) {
+        assert!(expanded <= CAP, "decoded {expanded} bytes past the {CAP}-byte cap");
+    }
 });
