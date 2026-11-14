@@ -62,3 +62,5 @@ stream two:
   upload.require_object_versioning: false (built-in default)
   upload.require_strong_verification: true (built-in default)
   verification_method: read_back (global)
+opentelemetry:
+  export: off (OTEL_EXPORTER_OTLP_ENDPOINT unset)

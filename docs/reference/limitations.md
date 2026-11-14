@@ -17,7 +17,7 @@ engine's HA status is in [PRODUCTION_HA.md](../PRODUCTION_HA.md).
 | Syslog timestamps | `received_time_*` is not yet extracted into the spool marker | add timestamp extraction |
 | Manifest integrity | self-hash plus optional keyed-BLAKE3 authentication; key rotation not implemented | add multi-key rotation and public-key signatures if required |
 | Object immutability | manifest version pinning + bucket-versioning validation implemented (hardened profile, `upload.require_object_versioning`); Object Lock retention itself is deployment policy | document an Object Lock deployment profile |
-| Metrics export | **Prometheus `/metrics` implemented** (opt-in via `VTOP_METRICS_ADDR`); OpenTelemetry trace export not yet | add OTLP span export |
+| Metrics and trace export | **Prometheus `/metrics` implemented** (opt-in via `VTOP_METRICS_ADDR`); **OpenTelemetry export implemented** (#683): traces of the batch lifecycle, recovery and scrub, the same metrics over OTLP, and trace ids in the JSON logs, built in and idle until `OTEL_EXPORTER_OTLP_ENDPOINT` is set (HTTP/protobuf only, no gRPC) | gRPC transport if a deployment needs it |
 | Kafka integration test | requires live broker and is ignored by default | add optional CI service profile |
 | Binary / pre-compressed inputs | **supported** via the file source `whole_file` mode (archived verbatim, byte-exact) | streaming for very large files |
 | Local filesystem backend | **available** (`backend: localfs`, objects under `local_path/<bucket>/<key>`; sidecars are inventory hints only) | — |
@@ -33,6 +33,12 @@ engine's HA status is in [PRODUCTION_HA.md](../PRODUCTION_HA.md).
 - [x] **Prometheus metrics exporter** — the engine serves `/metrics` (`/healthz`,
       `/readyz`) behind `VTOP_METRICS_ADDR`; see [observability/](../../observability/)
       for the optional Grafana LGTM stack and dashboards
+- [x] **OpenTelemetry export** (#683) — a span per batch with a child per step
+      (seal, compress, checksum, upload, manifest, verify, commit), plus
+      recovery and scrub; the `/metrics` series over OTLP; trace ids in the
+      JSON logs. Built into `vtopctl` and `vtop-node`, idle until
+      `OTEL_EXPORTER_OTLP_ENDPOINT` is set; see
+      [observability/](../../observability/README.md#opentelemetry)
 - [x] **end-to-end smoke + live-broker Kafka CI** over the full compose lab
 - [x] Kafka is isolated behind the optional `kafka` Cargo feature
 - [x] first Kafka-independent native segment-log storage kernel
@@ -70,5 +76,4 @@ engine's HA status is in [PRODUCTION_HA.md](../PRODUCTION_HA.md).
 
 - [ ] manifest MAC key rotation / optional public-key signatures
 - [ ] S3 Object Lock profile
-- [ ] OpenTelemetry trace export (the metrics endpoint exists; spans do not yet)
 - [ ] million-file benchmark suite

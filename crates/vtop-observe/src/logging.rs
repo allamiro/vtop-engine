@@ -53,6 +53,91 @@ pub fn init(level: &str, json: bool) {
     }
 }
 
+/// [`init`] with one more layer beside the log output: the OpenTelemetry
+/// trace layer (#683). Returns whether this call installed the subscriber;
+/// when it did not (one was already in place), `extra` was dropped unused.
+///
+/// The log filter here is the log layer's own, not the subscriber's, so the
+/// extra layer sees what it asks for whatever `RUST_LOG` says, and the log
+/// output is filtered exactly as [`init`] filters it.
+///
+/// With `correlate` and JSON output, a line written inside an exported span
+/// starts with its `trace_id` and `span_id`, so Loki and Tempo can link the
+/// two. Lines outside one are unchanged.
+pub fn init_with_layer<L>(level: &str, json: bool, extra: L, correlate: bool) -> bool
+where
+    L: tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+{
+    use std::io::IsTerminal;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::{EnvFilter, Layer};
+
+    let json = json || json_requested();
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level.to_lowercase()));
+    let logs = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    let logs = if json && correlate {
+        logs.json()
+            .event_format(Correlated(
+                tracing_subscriber::fmt::format()
+                    .json()
+                    .with_current_span(false),
+            ))
+            .with_filter(filter)
+            .boxed()
+    } else if json {
+        logs.json()
+            .with_current_span(false)
+            .with_filter(filter)
+            .boxed()
+    } else {
+        logs.with_ansi(std::io::stderr().is_terminal())
+            .with_filter(filter)
+            .boxed()
+    };
+    tracing_subscriber::registry()
+        .with(extra)
+        .with(logs)
+        .try_init()
+        .is_ok()
+}
+
+/// A JSON line with the current span's `trace_id` and `span_id` in front.
+struct Correlated<F>(F);
+
+impl<S, N, F> tracing_subscriber::fmt::FormatEvent<S, N> for Correlated<F>
+where
+    F: tracing_subscriber::fmt::FormatEvent<S, N>,
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let Some((trace_id, span_id)) = crate::otel::current_ids() else {
+            return self.0.format_event(ctx, writer, event);
+        };
+        let mut line = String::new();
+        self.0.format_event(
+            ctx,
+            tracing_subscriber::fmt::format::Writer::new(&mut line),
+            event,
+        )?;
+        match line.strip_prefix('{') {
+            // Both ids are lowercase hex, so they need no escaping.
+            Some(rest) => write!(
+                writer,
+                "{{\"trace_id\":\"{trace_id}\",\"span_id\":\"{span_id}\",{rest}"
+            ),
+            None => writer.write_str(&line),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

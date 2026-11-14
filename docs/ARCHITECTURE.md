@@ -78,7 +78,7 @@ The project is a Cargo workspace. `vtop-core` is protocol-independent and depend
 | `vtop-adapters` | Source adapters behind the `SourceAdapter` trait: Kafka, file, syslog spool. | `rdkafka` |
 | `vtop-upload` | Upload backends behind the `UploadBackend` trait. | `aws-sdk-s3`, external CLIs |
 | `vtop-state` | Durable state journal behind the `StateStore` trait: SQLite by default, PostgreSQL behind `--features postgres`. | `sqlx` |
-| `vtop-observe` | Opt-in metrics/readiness HTTP endpoint (`VTOP_METRICS_ADDR`). | — |
+| `vtop-observe` | Opt-in metrics/readiness HTTP endpoint (`VTOP_METRICS_ADDR`); OpenTelemetry export over OTLP, idle until an endpoint is set (#683). | `opentelemetry-otlp`, `tracing-opentelemetry` |
 | `vtop-cli` | The `vtopctl` binary and the engine runtime that wires everything together. | all of the above |
 
 (The workspace also contains the cluster-plane crates `vtop-meta`, `vtop-node`, `vtop-broker`, `vtop-log`, and `vtop-protocol`, documented in [NATIVE_BROKER_ARCHITECTURE.md](NATIVE_BROKER_ARCHITECTURE.md); they are outside this document's scope.)
@@ -1164,7 +1164,7 @@ reality.
 | Upload backends incl. `localfs`, hardened command backends (§8) | ✅ shipped | Verification strength declared per backend (protocol §17). |
 | `StateStore`: SQLite + PostgreSQL, shared battery, DB constraints (§12) | ✅ shipped | Retry-on-`40001`; `vtopctl migrate` privilege split; retention (#128). |
 | Manifest self-hash + keyed BLAKE3 MAC, version pinning (§9) | ✅ shipped | Public-key signatures and key rotation are future work. |
-| Metrics endpoint + readiness, dashboards-as-code (§14) | ✅ shipped | OTLP trace export and alerting rules are future work. |
+| Metrics endpoint + readiness, dashboards-as-code (§14) | ✅ shipped | OpenTelemetry export (traces and metrics over OTLP, idle until configured, #683) shipped too; alerting rules are future work. |
 | Deterministic object naming (§11, §13) | ✅ objects (#626) | Object keys derived from source, range and content digest; reused only after strong verification. Narrowed, not closed: manifests stay per attempt, and the limits in §13 item 3 still produce a second object. |
 | Multi-instance fleet (consumer groups + multi-writer recovery) | ⬜ planned | Phase 5; single-instance lock (#66) until then. |
 | Engine Kubernetes chart | ⬜ planned | Phase 7 — `helm/vtop` deploys the cluster plane, not the engine. |

@@ -66,6 +66,26 @@ serde_yaml = "0.9"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# OpenTelemetry export (#683), compiled into every binary through
+# vtop-observe and idle until an OTLP endpoint is set. HTTP/protobuf only: the
+# gRPC transport would add tonic and its stack, while this one rides the
+# hyper 1 + hyper-rustls client the aws-sdk already brings. Default features
+# are off throughout: they would add the reqwest client and the logs signal.
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "internal-logs"] }
+# No `internal-logs` on the exporter: its DEBUG events quote the request URL
+# whole and the collector's response body (review of #693). The SDK's own
+# internal logs stay; they report failures without either.
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto"] }
+opentelemetry-http = { version = "0.33", default-features = false, features = ["hyper"] }
+# The OTLP metrics messages, built from the Prometheus registry (vtop-observe
+# `otel::metrics`). Already in the tree through opentelemetry-otlp.
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "metrics", "trace"] }
+prost = { version = "0.14", default-features = false, features = ["std"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
+# Only features the aws-sdk already turns on, so this adds no package. The
+# crypto provider is rustls's `ring`, chosen explicitly as everywhere else.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "tls12"] }
 thiserror = "2"
 anyhow = "1"
 async-trait = "0.1"

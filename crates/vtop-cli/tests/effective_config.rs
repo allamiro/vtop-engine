@@ -16,6 +16,10 @@ fn run(dir: &Path, json: bool, effective: bool) -> Output {
     }
     c.env_remove("RUST_LOG")
         .env_remove("VTOP_LOG_FORMAT")
+        .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+        .env_remove("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
+        .env_remove("OTEL_SDK_DISABLED")
         .output()
         .unwrap()
 }

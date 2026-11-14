@@ -215,7 +215,9 @@ fn every_exported_label_is_from_a_bounded_set() {
     // size_only, failed, unsupported_version) are closed sets (#664), and
     // "version" is the manifest version, "0.3" or "0.4", the values
     // `manifest.write_version` accepts (#671 release B).
-    const BOUNDED: [&str; 12] = [
+    // "reason" and "signal" label the OpenTelemetry exporter's own counters
+    // (#683): three drop reasons and two signals, fixed in vtop-observe.
+    const BOUNDED: [&str; 14] = [
         "tenant",
         "source_type",
         "format",
@@ -227,6 +229,8 @@ fn every_exported_label_is_from_a_bounded_set() {
         "event",
         "verification_class",
         "result",
+        "reason",
+        "signal",
         "version",
     ];
     let text = populated();
@@ -371,6 +375,25 @@ async fn serves_metrics_health_and_readiness() {
         metrics.contains("vtop_records_total"),
         "/metrics must serve the registry: {metrics}"
     );
+    // #683: the OpenTelemetry exporter's own counters are served too, from
+    // the first scrape and with export off, so an alert on them reads 0
+    // rather than "no data".
+    for series in [
+        "vtop_otel_spans_exported_total ",
+        "vtop_otel_spans_dropped_total{reason=\"queue_full\"} ",
+        "vtop_otel_spans_dropped_total{reason=\"export_failed\"} ",
+        "vtop_otel_spans_dropped_total{reason=\"shutdown\"} ",
+        "vtop_otel_export_failures_total{signal=\"traces\"} ",
+        "vtop_otel_export_failures_total{signal=\"metrics\"} ",
+        "vtop_otel_metric_points_exported_total ",
+        "vtop_otel_metric_points_dropped_total ",
+        "vtop_otel_export_queue_length ",
+    ] {
+        assert!(
+            metrics.contains(series),
+            "{series} is not served: {metrics}"
+        );
+    }
 
     assert!(get("/healthz").await.trim_end().ends_with("200"));
     assert!(get("/readyz").await.trim_end().ends_with("200"));
