@@ -2519,6 +2519,50 @@ upload:
         }
     }
 
+    /// `manifest.verification_receipts` (#671 release B): off unless set,
+    /// a boolean, recorded as configured, and ignored by the v0.9.0 shape of
+    /// the section (no `deny_unknown_fields`), so an engine that has not been
+    /// upgraded keeps running and writes no receipts.
+    #[test]
+    fn verification_receipts_default_off_and_take_a_boolean() {
+        let base = tuning_base();
+        let parsed = VtopConfig::from_yaml_str(base).unwrap();
+        assert!(!parsed.manifest.verification_receipts);
+        assert!(!parsed
+            .configured_fields
+            .contains("manifest.verification_receipts"));
+        let cfg = VtopConfig::from_yaml_str(&format!(
+            "{base}manifest:\n  verification_receipts: true\n"
+        ))
+        .unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.manifest.verification_receipts);
+        assert!(cfg
+            .configured_fields
+            .contains("manifest.verification_receipts"));
+        for value in ["\"yes\"", "1", "[true]"] {
+            let err = VtopConfig::from_yaml_str(&format!(
+                "{base}manifest:\n  verification_receipts: {value}\n"
+            ))
+            .expect_err(value)
+            .to_string();
+            assert!(err.contains("manifest.verification_receipts"), "{value}: {err}");
+        }
+
+        // A test-local copy of the section as v0.9.0 declares it.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct ManifestV090 {
+            #[serde(default)]
+            write_version: ManifestWriteVersion,
+            #[serde(default)]
+            mac: Option<ManifestMacConfig>,
+        }
+        let old: ManifestV090 =
+            serde_yaml::from_str("write_version: \"0.4\"\nverification_receipts: true\n").unwrap();
+        assert_eq!(old.write_version, ManifestWriteVersion::V0_4);
+    }
+
     fn tuning_base() -> &'static str {
         r#"
 engine:

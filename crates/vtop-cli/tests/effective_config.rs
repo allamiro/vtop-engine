@@ -167,6 +167,37 @@ fn the_manifest_write_version_is_shown_with_its_origin() {
     );
 }
 
+/// #671 release B: `--print-effective` shows whether verification receipts
+/// are written, and where the setting came from.
+#[test]
+fn verification_receipts_are_shown_with_their_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    config(dir.path());
+    let text = String::from_utf8(run(dir.path(), false, true).stdout).unwrap();
+    assert!(
+        text.contains("  manifest.verification_receipts: false (built-in default)\n"),
+        "{text}"
+    );
+    let path = dir.path().join("config.yaml");
+    let base = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        format!("{base}manifest:\n  verification_receipts: true\n"),
+    )
+    .unwrap();
+    let text = String::from_utf8(run(dir.path(), false, true).stdout).unwrap();
+    assert!(
+        text.contains("  manifest.verification_receipts: true (global)\n"),
+        "{text}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&run(dir.path(), true, true).stdout).unwrap();
+    assert_eq!(
+        json["effective"]["default"]["manifest.verification_receipts"],
+        serde_json::json!({"origin": "global", "value": true})
+    );
+}
+
 /// #685: `--print-effective` shows the keyring by key id and source kind
 /// only. It resolves nothing and prints no key, no variable value, no
 /// variable name and no key file path, in text or JSON.

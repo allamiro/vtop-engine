@@ -3328,3 +3328,122 @@ impl vtop_adapters::base::SourceAdapter for FlakyCommit {
         self.inner.as_any_mut()
     }
 }
+
+// ---- #671 release B: verification receipts --------------------------------
+
+/// D8: a crash after VERIFIED and before the receipt was written (here: the
+/// receipt PUT failed, then the source commit failed, as a crash between
+/// them would leave it) leaves a VERIFIED row with no receipt. Recovery
+/// re-checks the stored batch, commits it and writes the receipt, marked
+/// `origin: "recovery"`. A row whose receipt the engine did write keeps it:
+/// recovery looks first and never writes over one (#684: under Object Lock
+/// an overwrite is a second version, and the first is the evidence).
+#[tokio::test]
+async fn recovery_writes_a_missing_receipt_and_never_overwrites_one() {
+    use std::sync::Arc;
+    use vtop_adapters::base::SourceAdapter;
+    use vtop_adapters::FileSource;
+    use vtop_cli::testkit::{pipeline, FailCommitAdapter};
+    use vtop_core::manifest::{ManifestKeyring, ParsedReceipt, RECEIPT_ORIGIN_ENGINE, RECEIPT_ORIGIN_RECOVERY};
+    use vtop_core::partitioning::receipt_uri;
+    use vtop_upload::UploadBackend;
+
+    vtop_core::telemetry::init().unwrap();
+    let tenant = "receipt-recovery";
+    let repaired = || {
+        vtop_core::telemetry::metrics()
+            .map(|m| {
+                m.verification_receipts_total
+                    .with_label_values(&[tenant, "repaired"])
+                    .get()
+            })
+            .unwrap_or(0)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let url = format!("sqlite://{}", dir.path().join("receipts.db").display());
+    let inputs: Vec<String> = ["no-receipt.log", "has-receipt.log"]
+        .iter()
+        .map(|name| {
+            let path = dir.path().join(name);
+            let mut f = std::fs::File::create(&path).unwrap();
+            for i in 0..3 {
+                writeln!(f, "{name} line {i}").unwrap();
+            }
+            path.to_string_lossy().into_owned()
+        })
+        .collect();
+    let mut cfg = file_config(work.to_str().unwrap(), &url, inputs.clone(), "mock");
+    cfg.engine.tenant = tenant.into();
+    cfg.manifest.verification_receipts = true;
+    let mock = Arc::new(vtop_upload::MockBackend::new());
+    let backend: Arc<dyn UploadBackend> = mock.clone();
+
+    let mut rows = Vec::new();
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        for (i, input) in inputs.iter().enumerate() {
+            // The first batch's receipt PUT fails; the second's lands.
+            mock.set_failing_put_suffix((i == 0).then_some(".receipt.json"));
+            let inner = FileSource::new(vec![input.clone()], TelemetryFormat::Raw, false);
+            let mut adapter = FailCommitAdapter::new(inner, 1);
+            let source = adapter.discover_sources().await.unwrap().pop().unwrap();
+            let read = adapter
+                .read_batch_candidates(&source, 1000, 1 << 20, std::time::Duration::ZERO)
+                .await
+                .unwrap()
+                .remove(0);
+            let outcome = pipeline(&store, backend.clone(), &cfg)
+                .process(&mut adapter, &source, read, None)
+                .await
+                .unwrap();
+            assert_eq!(outcome.final_state, BatchState::Verified);
+            rows.push(store.get_batch(&outcome.batch_id).await.unwrap().unwrap());
+        }
+    }
+    mock.set_failing_put_suffix(None);
+    let uris: Vec<String> = rows
+        .iter()
+        .map(|r| receipt_uri(r.manifest_uri.as_deref().unwrap()).unwrap())
+        .collect();
+    assert!(!mock.contains(&uris[0]), "the first batch has no receipt");
+    let engine_written = mock.get_object(&uris[1]).await.unwrap();
+    let versions_before = mock.version_count(&uris[1]);
+
+    let before = repaired();
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    engine.backend = backend;
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(summary.committed, 2, "{summary:?}");
+    for row in &rows {
+        let got = engine.store.get_batch(&row.batch_id).await.unwrap().unwrap();
+        assert_eq!(got.state, BatchState::SourceCommitted);
+    }
+
+    let repaired_receipt =
+        ParsedReceipt::from_slice(&mock.get_object(&uris[0]).await.unwrap()).unwrap();
+    assert!(repaired_receipt.authenticate(&ManifestKeyring::default()).is_ok());
+    let r = repaired_receipt.fields();
+    assert_eq!(r.origin, RECEIPT_ORIGIN_RECOVERY);
+    assert_eq!(r.batch_id, rows[0].batch_id);
+    assert_eq!(Some(r.manifest.sha256.as_str()), rows[0].manifest_sha256.as_deref());
+    assert_eq!(r.manifest.version_id, rows[0].manifest_version_id);
+    assert_eq!(
+        Some(r.verification.class.as_str()),
+        rows[0].verification_class.map(VerificationClass::as_str),
+        "the class the batch was verified with, from the ledger"
+    );
+    assert_eq!(r.verification.method, "read_back", "what recovery's re-check ran");
+    assert_eq!(repaired(), before + 1);
+
+    assert_eq!(
+        mock.get_object(&uris[1]).await.unwrap(),
+        engine_written,
+        "the engine's receipt is left as it was"
+    );
+    assert_eq!(mock.version_count(&uris[1]), versions_before, "and not written again");
+    let kept = ParsedReceipt::from_slice(&engine_written).unwrap();
+    assert_eq!(kept.fields().origin, RECEIPT_ORIGIN_ENGINE);
+}

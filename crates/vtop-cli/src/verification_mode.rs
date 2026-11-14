@@ -450,4 +450,23 @@ mod tests {
             assert!(opted_in.contains(needle), "{needle}: {opted_in}");
         }
     }
+
+    /// #671 release B: with receipts on, one startup line says what is
+    /// written, where, that a consumer listing the prefix will see the
+    /// objects, and that a failure never holds a batch back. Nothing is said
+    /// with them off.
+    #[test]
+    fn the_startup_notice_names_verification_receipts() {
+        assert_eq!(receipts_notice(&config("")), None);
+        let on = receipts_notice(&config("manifest:\n  verification_receipts: true\n")).unwrap();
+        for needle in [
+            "manifest.verification_receipts = true",
+            "<batch_id>.receipt.json beside each manifest",
+            "a consumer that lists the prefix will see these objects",
+            "a receipt that cannot be written never holds a batch back",
+            "vtopctl scrub",
+        ] {
+            assert!(on.contains(needle), "{needle}: {on}");
+        }
+    }
 }

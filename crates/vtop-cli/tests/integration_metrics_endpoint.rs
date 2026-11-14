@@ -127,6 +127,11 @@ fn populated() -> String {
             .with_label_values(&["default", mode])
             .set(0);
     }
+    for r in telemetry::RECEIPT_WRITE_RESULTS {
+        m.verification_receipts_total
+            .with_label_values(&["default", r])
+            .inc_by(0);
+    }
     m.inflight_batches.set(2);
     m.encode().expect("encode must succeed")
 }
@@ -214,6 +219,27 @@ fn manifests_written_are_counted_by_version() {
         let series = format!(
             r#"vtop_manifests_written_total{{tenant="metrics-endpoint",version="{version}"}}"#
         );
+        assert!(text.contains(&series), "missing {series}");
+    }
+}
+
+/// #671 release B: verification receipts are counted by tenant and a closed
+/// `result` (written by the engine, failed, repaired by recovery), never by
+/// batch id or URI, so an alert can catch a store refusing receipts.
+#[test]
+fn verification_receipts_are_counted_by_bounded_result() {
+    assert_eq!(
+        telemetry::RECEIPT_WRITE_RESULTS,
+        ["written", "failed", "repaired"]
+    );
+    let text = populated();
+    assert!(
+        text.contains("# TYPE vtop_verification_receipts_total counter"),
+        "{text}"
+    );
+    for result in telemetry::RECEIPT_WRITE_RESULTS {
+        let series =
+            format!(r#"vtop_verification_receipts_total{{result="{result}",tenant="default"}}"#);
         assert!(text.contains(&series), "missing {series}");
     }
 }
