@@ -1354,6 +1354,17 @@ jobs:
           - server: minio
             gating: true
             timeout: 30
+          # Pulled, pinned by digest: start in seconds. Measured locally at
+          # under a minute of tests each; twenty minutes is generous.
+          - server: rustfs
+            gating: false
+            timeout: 20
+          - server: garage
+            gating: false
+            timeout: 20
+          - server: seaweedfs
+            gating: false
+            timeout: 20
     env:
       RESULTS: ${{ github.workspace }}/s3-compat-out/results-${{ matrix.server }}.jsonl
     steps:

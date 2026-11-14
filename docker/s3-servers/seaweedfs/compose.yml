@@ -1,0 +1,60 @@
+# The S3 compatibility matrix's SeaweedFS leg (#722). SeaweedFS 4.53 in one
+# container: `weed server -s3` runs the master, a volume server, the filer
+# and the S3 gateway. Apache-2.0. The two services every server's compose
+# file has (see docker/s3-servers/minio/compose.yml). LAB-ONLY credentials
+# (s3.json beside this file); the loopback bind is the boundary.
+name: vtop-s3-seaweedfs
+
+services:
+  server:
+    # chrislusf/seaweedfs:4.53 (amd64), pinned by digest (D7).
+    image: chrislusf/seaweedfs:4.53@sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0
+    # A small volume size limit: the default preallocates gigabytes per
+    # volume, more than a CI runner's disk wants to give a test store.
+    command:
+      - server
+      - -dir=/data
+      - -s3
+      - -s3.port=8333
+      - -s3.config=/etc/seaweedfs/s3.json
+      - -master.volumeSizeLimitMB=64
+      - -volume.max=32
+    ports:
+      - "127.0.0.1:8333:8333"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    # The image's entrypoint takes ownership of /data and drops to its own
+    # user with su-exec, which needs these three and nothing else.
+    cap_add: [CHOWN, SETGID, SETUID]
+    pids_limit: 1024
+    mem_limit: 1g
+    volumes:
+      - ./s3.json:/etc/seaweedfs/s3.json:ro
+      - data:/data
+
+  init:
+    # amazon/aws-cli 2.40.3, pinned by digest (D7, D8).
+    image: amazon/aws-cli:2.40.3@sha256:33a16c53ea442e918b58df67301ad76a8fb57082c39f7e78753b898c3f3e87c2
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    pids_limit: 256
+    mem_limit: 256m
+    read_only: true
+    tmpfs: [/tmp]
+    entrypoint: ["/bin/sh", "/bootstrap.sh"]
+    environment:
+      HOME: /tmp
+      S3_ENDPOINT: http://server:8333
+      AWS_ACCESS_KEY_ID: vtoplab
+      AWS_SECRET_ACCESS_KEY: vtoplab-secret-key
+      CREATE_LOCKED: "true"
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    volumes:
+      - ../init/bootstrap.sh:/bootstrap.sh:ro
+    depends_on: [server]
+
+volumes:
+  data:

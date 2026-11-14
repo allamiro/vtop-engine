@@ -1,0 +1,39 @@
+# Garage v2.5.0, one node (docker/s3-servers/garage). Garage documents bucket
+# versioning and Object Lock as missing, and a first run with every
+# capability unknown confirmed it (#722): GetObjectLockConfiguration answers
+# 501 NotImplemented, GetBucketVersioning answers with no status, and
+# PutBucketVersioning answers NotImplemented. VTOP refuses both at startup
+# (#770), and the cases that need them assert that refusal. New to the
+# matrix, so not gating yet (D11).
+id: garage
+name: Garage
+gating: false
+capabilities:
+  put_get_head: pass
+  path_style: pass
+  # The lab is reached by path style only (decision D12).
+  virtual_host: not_applicable
+  # Asked by the probes (#722): a wrong SHA-256 is refused (InvalidDigest).
+  checksum_sha256_enforced: pass
+  checksum_sha256_returned: pass
+  checksum_crc32_default:
+    state: xfail
+    issue: 778
+    note: "The SDK's default CRC32 trailer (aws-chunked) is refused with 'Invalid payload signature', so a BLAKE3 write fails; with AWS_REQUEST_CHECKSUM_CALCULATION=when_required it succeeds."
+  multipart: pass
+  multipart_abort: pass
+  multipart_list_uploads: pass
+  multipart_resume: pass
+  versioning:
+    state: unsupported
+    refusal: startup
+    note: "GetBucketVersioning always answers with no status and PutBucketVersioning is not implemented: upload.require_object_versioning is refused at startup."
+  object_lock:
+    state: unsupported
+    refusal: startup
+    note: "GetObjectLockConfiguration answers 501 NotImplemented: upload.object_lock is refused at startup, saying the store does not implement S3 Object Lock."
+  object_lock_enforced: { state: unsupported, refusal: startup }
+  conditional_put:
+    state: xfail
+    issue: 722
+    note: "PutObject ignores If-None-Match: a second PUT overwrites the key. Informational: VTOP does not use conditional writes."
