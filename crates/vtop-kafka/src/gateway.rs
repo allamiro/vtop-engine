@@ -323,8 +323,9 @@ pub struct Gateway {
     /// Every call handed to another task, for the drain (review).
     jobs: Arc<Jobs>,
     /// Every refusal counted by API and reason (#596), exported by the node
-    /// as `vtop_kafka_requests_refused_total`; the totals also pace the
-    /// rate-limited warnings, so a log line and the counter never disagree.
+    /// as `vtop_kafka_requests_refused_total`. The OffsetCommit warning is
+    /// paced on the same total it reports; the unserved-api warning on a
+    /// per-key count (below), whose sum is the exported total.
     refusals: Arc<Refusals>,
     /// Requests for an unserved api key, per named key and one slot for any
     /// other (#596): each named key gets its own rate limit, so a client's
@@ -1484,10 +1485,10 @@ impl Gateway {
                 "kafka OffsetCommit refused: this node runs without a metadata plane (a static \
                  leader or a standalone node), so there is no durable offset store. Nothing was \
                  stored and the client was answered INVALID_REQUEST; produce and fetch are \
-                 unaffected, and {refused} commits so far have been dropped. To keep committed \
-                 offsets, run the node as a leased leader on a metadata plane (live-chaos \
-                 scenario 20's shape). For a read that does not need them, set \
-                 `enable.auto.commit=false` on the consumer."
+                 unaffected. OffsetCommit requests refused so far, across all groups: {refused} \
+                 (`group` is this request's). To keep committed offsets, run the node as a leased \
+                 leader on a metadata plane (a `lease:` block, docs/PRODUCTION_HA.md). For a read \
+                 that does not need them, set `enable.auto.commit=false` on the consumer."
             );
         }
     }
@@ -6129,6 +6130,7 @@ mod tests {
             "INVALID_REQUEST",
             "produce and fetch are unaffected",
             "leased leader on a metadata plane",
+            "across all groups: 1",
             "enable.auto.commit=false",
             "api=OffsetCommit",
             "group=billing",
@@ -6137,6 +6139,10 @@ mod tests {
         ] {
             assert!(first.contains(part), "{part:?} missing from {first}");
         }
+        assert!(
+            !first.contains("live-chaos"),
+            "operators are pointed at docs: {first}"
+        );
         assert!(refusals[2].contains("refused=4"), "{}", refusals[2]);
         assert!(!first.contains("#457"), "stale text: {first}");
         assert_eq!(gateway.refusals().get(Refusal::OffsetCommitWithoutStore), 4);

@@ -20,11 +20,12 @@ pub const SERVED_APIS: &str = "Produce, Fetch, ListOffsets, Metadata, ApiVersion
      InitProducerId, and the group protocol: FindCoordinator, JoinGroup, SyncGroup, Heartbeat, \
      LeaveGroup, OffsetCommit, OffsetFetch";
 
-/// Api keys a stock client or admin tool sends that this gateway does not
-/// serve, by name (#596). Used in log lines and refusal reasons only: a
-/// client's key is never a metric label. These are the topic and config
-/// administration requests (`kafka-topics --create`, `kafka-configs
-/// --describe`), which a VTOP topic answers on the metadata plane instead.
+/// The topic and config administration api keys this gateway does not
+/// serve, by name (#596), for the gateway's log line. A stock tool checks
+/// ApiVersions first and refuses on its own side ("The node does not support
+/// CREATE_TOPICS"), so only a client that skips or ignores ApiVersions sends
+/// one. A client's key is never a metric label. A VTOP topic is created and
+/// configured on the metadata plane instead.
 pub const UNSERVED_API_NAMES: [(i16, &str); 6] = [
     (19, "CreateTopics"),
     (20, "DeleteTopics"),
@@ -383,14 +384,7 @@ impl RequestHeader {
                     client_id: None,
                 },
                 code: ErrorCode::UnsupportedVersion,
-                reason: match unserved_api_name(api_key) {
-                    Some(name) => format!(
-                        "{name} (api key {api_key}) is not served by this gateway ({SERVED_APIS})"
-                    ),
-                    None => {
-                        format!("api key {api_key} is not served by this gateway ({SERVED_APIS})")
-                    }
-                },
+                reason: format!("api key {api_key} is not served by this gateway ({SERVED_APIS})"),
             });
         };
 
@@ -501,7 +495,6 @@ mod tests {
                 assert_eq!(header.correlation_id, 7);
                 assert_eq!(code, ErrorCode::UnsupportedVersion);
                 assert!(reason.contains("19"), "{reason}");
-                assert!(reason.starts_with("CreateTopics (api key 19)"), "{reason}");
             }
             other => panic!("expected Refuse, got {other:?}"),
         }

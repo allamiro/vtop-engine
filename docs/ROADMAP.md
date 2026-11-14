@@ -926,10 +926,13 @@ A request for an api the gateway does not serve (CreateTopics,
 DescribeConfigs and four other admin keys) is logged by name with the
 operator path (`vtopctl meta create-topic`), at most at each power of two
 per key. Both are counted in a new node metric,
-`vtop_kafka_requests_refused_total{api,reason}`. Live-chaos scenarios 19
-and 21 run librdkafka group consumers with auto-commit on against
-standalone gateways under this code: they are refused, read every record
-and exit cleanly.
+`vtop_kafka_requests_refused_total{api,reason}`, on every node that runs
+a gateway. A consumer with auto-commit on logs the failed commit and keeps
+reading; an explicit commit fails, as it did with 43. Live-chaos scenario
+19 asserts the refusal for a librdkafka group consumer that reads every
+record and exits cleanly, and scenario 21 runs two such consumers under it.
+Other refusals (a metadata plane that predates head cursors, a version
+outside a served range) are not counted yet.
 
 **Manifest format evolution (#671).** v0.8.0's readers check a
 manifest's `version` first, read `0.1`-`0.4`, verify `0.4` over the stored
