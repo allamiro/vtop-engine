@@ -2899,7 +2899,7 @@ where
                         .expect("metrics registry")
                         .recovery_rechecks_total
                         .with_label_values(&[
-                            &tenant,
+                            tenant.as_str(),
                             "file",
                             TelemetryFormat::Raw.extension(),
                             class_name,
