@@ -239,10 +239,11 @@ pub enum ProgressMarker {
         tail_fingerprint: Option<ContentFingerprint>,
         /// The file's ctime as this read saw it (#619): from the same fstat,
         /// after the read, as `mtime`, and written the same way (RFC 3339
-        /// with nanoseconds). A rewrite of the file moves it, and so does
-        /// setting the mtime back, and no process can set it; so a
-        /// same-length rewrite confined between the first page and the page
-        /// below `end_byte`, with the mtime put back, still differs here.
+        /// in UTC, up to nanosecond precision). A rewrite of the file moves
+        /// it, and so does setting the mtime back, and no process can set
+        /// it; so a same-length rewrite confined between the first page and
+        /// the page below `end_byte`, with the mtime put back, still differs
+        /// here.
         /// `delete_after_commit` requires the file to still have it, at the
         /// covering commit and when a restart re-arms the delete.
         ///

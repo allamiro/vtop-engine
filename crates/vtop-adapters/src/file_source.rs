@@ -1064,9 +1064,11 @@ impl FileSource {
                 format!(
                     "not deleting {path}: its {committed_byte} bytes were archived before the \
                      restart, but its mtime or ctime is not the one the archiving batch recorded \
-                     (a touch, a chmod, a hard link made or removed, or a rewrite while the \
-                     engine was down - which cannot be told apart); it is KEPT, and not tried \
-                     again - remove it by hand once you know it holds nothing new"
+                     (a touch, a chmod, a hard link made or removed, a rewrite while the engine \
+                     was down, or an earlier delete attempt of this engine that moved it aside \
+                     and put it back - which cannot be told apart); it is KEPT, and deleted only \
+                     if a later commit covers it unchanged - otherwise remove it by hand once you \
+                     know it holds nothing new"
                 ),
             );
             return;
@@ -3532,7 +3534,10 @@ impl SourceAdapter for FileSource {
                                                 .is_some_and(|read| ctime_of(md) != Some(read))
                                     }) =>
                             {
-                                moved_since_read = true;
+                                // An empty mtime recorded nothing to differ
+                                // from: the generic message, not "is not the
+                                // one the batch recorded".
+                                moved_since_read = !marker_mtime.is_empty();
                                 Compared::Kept(Kept::MetadataMoved)
                             }
                             verdict => verdict,

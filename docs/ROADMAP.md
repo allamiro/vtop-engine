@@ -1095,6 +1095,12 @@ readers verify (ARCHITECTURE.md, "Ledger format note: ctime").
   `delete_quiet_seconds` before the upgrade until someone removed it by hand.
 - **Older engines ignore the field** (serde skips unknown keys) and judge as
   they always did. Downgrade is still not supported.
+- **Known, and on the side of keeping:** a restart after one of the engine's
+  own delete attempts moved a file aside and put it back (a process opened
+  it during the delete, or the unlink failed) finds the file's ctime moved
+  by the put-back, so the file is kept with a warning that lists that
+  attempt among the causes, and is removed by hand. A stored ctime that is
+  not a timestamp reads as absent, and arms as a pre-v0.10.0 row does.
 
 ---
 

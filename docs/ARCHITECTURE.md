@@ -865,7 +865,15 @@ migrate` has nothing to apply.
 - New, optional and omitted when unknown: `ctime` on file markers, the
   file's ctime from the same fstat as `mtime` - the one after the read, so a
   file that stops growing during a read still matches it - and written the
-  same way (RFC 3339 with nanoseconds). Absent on a platform without ctimes.
+  same way (RFC 3339 in UTC, up to nanosecond precision; compared as an
+  instant). Absent on a platform without ctimes.
+- Taken after the read, it also takes in a change the file went through
+  DURING the read: a rewrite of bytes the read has already passed, landing
+  before that fstat, is in the marker's mtime and ctime, and the covering
+  commit agrees with it. The window is the length of one read. The
+  fingerprints still catch such a rewrite in the first page or the page
+  below the end; between them it is the documented limit, now narrowed to
+  the read itself.
 - Rows written before it decode with the field absent. The covering commit
   then judges the file by the mtime alone, and the restart seed arms the
   delete as before, with the file's ctime at the restart (see "The wait is
@@ -873,7 +881,17 @@ migrate` has nothing to apply.
   serializes byte for byte as the code before it wrote the same marker.
 - A stored value that is not an RFC 3339 timestamp - another string, a
   number, an object - decodes as absent, in markers decoded whole and in the
-  restart seed alike: absent only forgoes the check.
+  restart seed alike: absent only forgoes the check, so such a row arms the
+  delete on the mtime alone, like a row from before the field. This is
+  unlike a missing fingerprint, which keeps the file: the fingerprints are
+  the identity test, while the ctime only narrows the window a rewrite with
+  the mtime set back can use.
+- A restart after one of the engine's own delete attempts moved the file
+  aside and put it back (an opener broke the lease, or the unlink failed)
+  finds the file's ctime moved by that put-back. In memory the candidate
+  took the new ctime; the ledger keeps the read's. So the seed keeps the
+  file, and the warning lists that attempt among the causes. It costs disk,
+  not data.
 - The manifest's `source_progress` never carries it (`for_manifest` clears
   it), for the reason above, so a manifest is byte for byte what released
   readers verify. The coverage audit does not use it.
