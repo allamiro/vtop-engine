@@ -242,7 +242,9 @@ batch.
 **What it means.** Uploads failed and kept their multipart sessions so the
 replay could resume them, but for over a day none was resumed and none was
 swept. Incomplete multipart uploads stay in the bucket, where their parts are
-billed, until they complete or are aborted.
+billed, until they complete or are aborted. It looks at sessions kept 30 to
+36 hours ago, so a session still inside the abandon window plus one sweep
+interval (24 h + 6 h by default) never raises it.
 
 **What the engine already did.** It kept each session after the failed upload
 (`vtop_multipart_sessions_total{outcome="kept_after_failure"}`). Sessions

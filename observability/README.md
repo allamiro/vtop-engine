@@ -103,8 +103,9 @@ A failed multipart upload keeps its session and completed parts so the replay
 resumes it (#668). They are billed storage until the upload completes or is
 aborted, so watch that kept sessions are resumed or swept rather than piling
 up: the shipped rule `VtopMultipartSessionsPiling` (see
-[Alert rules](#alert-rules)) fires when sessions were kept after failures and,
-for longer than the 24 h abandon window, none was resumed and none swept.
+[Alert rules](#alert-rules)) fires when a session was kept 30 to 36 hours ago, past the 24 h abandon window
+and the 6 h sweep interval, and none was resumed and none swept for 36 hours.
+A session the sweep is not yet due to abort does not raise it.
 
 ### Retention loss
 

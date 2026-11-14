@@ -78,7 +78,7 @@ test, a runbook section, and an objective on [Service level objectives](slos.md)
 | [VtopObjectLockCheckFailed](runbooks.md#vtopobjectlockcheckfailed) | page | Any increase of `vtop_object_lock_checks_total` with a result other than `ok` |
 | [VtopRetentionLoss](runbooks.md#vtopretentionloss) | page | Any increase of `vtop_retention_lost_records_total` |
 | [VtopSourceReplayRefused](runbooks.md#vtopsourcereplayrefused) | page | Any increase of `vtop_source_replay_refused_total` |
-| [VtopMultipartSessionsPiling](runbooks.md#vtopmultipartsessionspiling) | ticket | Multipart sessions kept after failures, none resumed or swept for 26 hours |
+| [VtopMultipartSessionsPiling](runbooks.md#vtopmultipartsessionspiling) | ticket | A session kept 30 to 36 hours ago (past the 24 h abandon window and the 6 h sweep interval), and none resumed or swept for 36 hours |
 
 The thresholds are defaults, listed at the top of the file. The rules route
 nowhere by themselves: point Prometheus at your Alertmanager and route on the

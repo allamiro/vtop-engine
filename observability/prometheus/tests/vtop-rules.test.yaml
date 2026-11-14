@@ -387,21 +387,19 @@ tests:
     alertname: VtopSourceReplayRefused
     exp_alerts: []
 - name: 'VtopMultipartSessionsPiling: fires when kept sessions are neither resumed nor swept'
-  interval: 10m
+  interval: 30m
   input_series:
+  # One session kept at 2 h, never resumed and never swept.
   - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="kept_after_failure"}
-    values: 0x10 1x30
+    values: 0x3 1x90
   - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="resumed"}
-    values: '0x40'
+    values: '0x93'
   - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="swept"}
-    values: '0x40'
+    values: '0x93'
   - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="completed"}
-    values: 0+5x40
+    values: 0+5x93
   alert_rule_test:
-  - eval_time: 150m
-    alertname: VtopMultipartSessionsPiling
-    exp_alerts: []
-  - eval_time: 180m
+  - eval_time: 34h
     alertname: VtopMultipartSessionsPiling
     exp_alerts:
     - exp_labels:
@@ -412,33 +410,52 @@ tests:
         summary: Incomplete multipart uploads on engine-1:9090 are kept and never resumed or swept
         description: Failed uploads kept their multipart sessions for the replay, but for over a day none was resumed and none swept, so their parts stay billed in the bucket. Check the engine's multipart_sweep_failed events and the bucket's lifecycle rule for incomplete uploads.
         runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopmultipartsessionspiling
-- name: 'VtopMultipartSessionsPiling: quiet when a kept session is resumed'
-  interval: 10m
+# Review of #772: the session is younger than the abandon window plus one
+# sweep interval, so the sweep has not been due yet. The rule as first
+# written fired an hour after the session was kept.
+- name: 'VtopMultipartSessionsPiling: quiet while a kept session is within the abandon window'
+  interval: 30m
   input_series:
   - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="kept_after_failure"}
-    values: 0x10 1x30
+    values: 0x3 1x90
   - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="resumed"}
-    values: 0x12 1x28
+    values: '0x93'
   - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="swept"}
-    values: '0x40'
-  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="completed"}
-    values: 0+5x40
+    values: '0x93'
   alert_rule_test:
-  - eval_time: 180m
+  - eval_time: 4h
+    alertname: VtopMultipartSessionsPiling
+    exp_alerts: []
+  - eval_time: 26h
+    alertname: VtopMultipartSessionsPiling
+    exp_alerts: []
+  - eval_time: 31h
+    alertname: VtopMultipartSessionsPiling
+    exp_alerts: []
+- name: 'VtopMultipartSessionsPiling: quiet when a kept session is resumed'
+  interval: 30m
+  input_series:
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="kept_after_failure"}
+    values: 0x3 1x90
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="resumed"}
+    values: 0x5 1x88
+  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="swept"}
+    values: '0x93'
+  alert_rule_test:
+  - eval_time: 34h
     alertname: VtopMultipartSessionsPiling
     exp_alerts: []
 - name: 'VtopMultipartSessionsPiling: quiet when the sweep aborts kept sessions'
-  interval: 10m
+  interval: 30m
   input_series:
   - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="kept_after_failure"}
-    values: 0x10 1x30
+    values: 0x3 1x90
   - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="resumed"}
-    values: '0x40'
+    values: '0x93'
+  # The sweep aborts it at 27 h, past the 24 h window.
   - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="swept"}
-    values: 0x12 1x28
-  - series: vtop_multipart_sessions_total{job="vtop-engine",instance="engine-1:9090",outcome="completed"}
-    values: 0+5x40
+    values: 0x53 1x40
   alert_rule_test:
-  - eval_time: 180m
+  - eval_time: 34h
     alertname: VtopMultipartSessionsPiling
     exp_alerts: []

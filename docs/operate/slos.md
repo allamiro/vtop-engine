@@ -17,7 +17,7 @@ section in [Alert runbooks](runbooks.md) says what to do.
 | Ranges missing after a failure | Zero ranges a source refuses to hand back | Any 15 minutes | `vtop_source_replay_refused_total` | [VtopSourceReplayRefused](runbooks.md#vtopsourcereplayrefused) (page) |
 | Retention under Object Lock | Every check `ok` | Any 15 minutes | `vtop_object_lock_checks_total{result}` | [VtopObjectLockCheckFailed](runbooks.md#vtopobjectlockcheckfailed) (page) |
 | Strong verification | On for every production engine | At startup | `vtop_verification_mode{mode}` | [VtopSizeOnlyVerification](runbooks.md#vtopsizeonlyverification) (ticket) |
-| Incomplete multipart uploads | Kept sessions resumed or swept within a day | 26 hours, held for 1 | `vtop_multipart_sessions_total{outcome}` | [VtopMultipartSessionsPiling](runbooks.md#vtopmultipartsessionspiling) (ticket) |
+| Incomplete multipart uploads | Kept sessions resumed or swept within the abandon window plus one sweep interval | a session kept 30 to 36 hours ago and nothing resumed or swept for 36 hours, held for 1 | `vtop_multipart_sessions_total{outcome}` | [VtopMultipartSessionsPiling](runbooks.md#vtopmultipartsessionspiling) (ticket) |
 
 ## How to read them
 

@@ -30,7 +30,9 @@
 #   object_lock_window           15m      VtopObjectLockCheckFailed
 #   retention_loss_window        15m      VtopRetentionLoss
 #   replay_refused_window        15m      VtopSourceReplayRefused
-#   multipart_window             26h      VtopMultipartSessionsPiling (past the 24 h abandon window)
+#   multipart_kept_offset        30h      VtopMultipartSessionsPiling (24 h abandon window + 6 h sweep interval)
+#   multipart_kept_window        6h       VtopMultipartSessionsPiling (sessions kept 30-36 h ago)
+#   multipart_cleared_window     36h      VtopMultipartSessionsPiling (no resume or sweep in this window)
 #   multipart_hold               1h       VtopMultipartSessionsPiling
 #
 # Severity: `page` wakes someone (data is missing, at risk, or not being
@@ -174,15 +176,21 @@ groups:
           description: "A batch failed and its source refused to hand the range back (for a file: truncated, rewritten, or rotated away and removed). That range is missing from the archive. The path is in the ERROR line beside the count; recover the data from another copy if one exists."
           runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopsourcereplayrefused"
 
-      # Sessions kept after failed uploads, with none resumed and none swept
-      # for longer than the 24 h abandon window: incomplete uploads pile up
-      # in the bucket, where their parts are billed. The outcomes are primed
-      # at zero at startup.
+      # Sessions kept after failed uploads that the sweep should have
+      # aborted by now, with none resumed and none swept: incomplete uploads
+      # pile up in the bucket, where their parts are billed. The sweep aborts
+      # a session once it is older than upload.multipart_abandon_after_secs
+      # (default 24 h) and runs every quarter of that window (6 h), so a
+      # session kept 30 to 36 hours ago is one a working sweep has already
+      # aborted; a younger one is still waiting for it and is not an alert.
+      # With a different abandon window, scale the offset (window + window/4)
+      # and the second lookback (offset + 6h) to match. The outcomes are
+      # primed at zero at startup.
       - alert: VtopMultipartSessionsPiling
         expr: |
-          sum by (job, instance) (increase(vtop_multipart_sessions_total{outcome="kept_after_failure"}[26h])) > 0
+          sum by (job, instance) (increase(vtop_multipart_sessions_total{outcome="kept_after_failure"}[6h] offset 30h)) > 0
           unless on (job, instance)
-          sum by (job, instance) (increase(vtop_multipart_sessions_total{outcome=~"resumed|swept"}[26h])) > 0
+          sum by (job, instance) (increase(vtop_multipart_sessions_total{outcome=~"resumed|swept"}[36h])) > 0
         for: 1h
         labels:
           severity: ticket
