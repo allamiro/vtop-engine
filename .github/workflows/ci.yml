@@ -58,6 +58,7 @@ jobs:
       manifest_compat: ${{ steps.filter.outputs.manifest_compat }}
       helm: ${{ steps.filter.outputs.helm }}
       file_source: ${{ steps.filter.outputs.file_source }}
+      s3_report: ${{ steps.filter.outputs.s3_report }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Pinned to a full commit SHA (v3), not the mutable tag, so an upstream
@@ -221,6 +222,16 @@ jobs:
               # helm job is skipped by exactly the PR that bumps it — the one
               # case the check exists for.
               - 'Cargo.toml'
+            # The S3 compatibility page and README line (#722), generated
+            # from committed results by scripts/s3_compat_report.py.
+            s3_report:
+              - 'scripts/s3_compat_report.py'
+              - 'scripts/tests/test_s3_compat_report.py'
+              - 'tests/s3-compat/**'
+              - 'docker/s3-servers/**'
+              - 'docs/reference/s3-compatibility.md'
+              - 'README.md'
+              - '.github/workflows/ci.yml'
             shell:
               - 'docker/*.sh'
               - 'docker/tests/**'
@@ -1402,6 +1413,28 @@ jobs:
       - name: MinIO logs on failure
         if: failure()
         run: docker compose logs --tail=200 minio || true
+
+  # The S3 compatibility page and the README's line are generated from the
+  # committed results (#722, D6): regenerate both and fail on any
+  # difference, and on results from another image than the one a server's
+  # compose file pins. Cheap: one Python file and PyYAML.
+  s3-compat-report:
+    name: s3 compat report (regenerate + no drift)
+    needs: changes
+    if: needs.changes.outputs.s3_report == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install the report's dependencies
+        run: pip install --disable-pip-version-check pyyaml==6.0.3 pytest==9.2.0
+      - name: Report tests
+        run: python -m pytest -p no:cacheprovider scripts/tests/test_s3_compat_report.py
+      - name: Regenerate and fail on drift
+        run: python3 scripts/s3_compat_report.py --check
 
   # cargo-deny covers what cargo-audit does not: license compliance, dependency
   # bans, and source provenance. Advisory decisions are mirrored from

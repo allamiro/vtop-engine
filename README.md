@@ -233,6 +233,10 @@ is in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | AWS CLI, s3cmd, MinIO client (explicit opt-in) | downloaded and re-hashed |
 | mock, for tests | the stored in-memory bytes are hashed |
 
+<!-- s3-compat:start -->
+No S3 compatibility results are committed yet; see [S3 compatibility](docs/reference/s3-compatibility.md) for how they are produced.
+<!-- s3-compat:end -->
+
 The Kafka source is a Cargo feature: `cargo build -p vtop-cli --no-default-features`
 builds without it. The same repository holds a native Rust broker and control
 plane (Raft metadata, quorum replication, fenced range leadership), in which
