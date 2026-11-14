@@ -547,6 +547,8 @@ async fn an_archive_with_per_attempt_keys_still_recovers_scrubs_and_audits() {
         object_sha256: Some(digest.clone()),
         manifest_sha256: Some(manifest.manifest.sha256.clone()),
         manifest_version_id: stored_manifest.version_id.clone(),
+        // A row written before #664 recorded no verification class.
+        verification_class: None,
         object_size_bytes: Some(bytes.len() as i64),
         record_count: Some(4),
         error_message: None,
