@@ -9160,25 +9160,20 @@ mod tests {
         }
     }
 
-    /// Review of #753: an open that reaches the file between the final check
-    /// and the unlink, through ANOTHER hard link. The file keeps that name,
-    /// so nothing the opener writes is lost; the engine said "what that
-    /// process writes to it is not archived", an ERROR that sends the
-    /// operator hunting for a loss there is not.
+    /// The open from another hard link that reaches the file between the
+    /// final check and the unlink of `path` (review of #753): a seam that
+    /// opens `other` for appending from a thread, writes "late", and waits
+    /// until the open has reached the file (/proc/locks shows the lease
+    /// breaking). Returns the opener's handle slot.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn an_open_through_another_hard_link_at_the_unlink_says_nothing_is_lost() {
+    fn open_through_at_unlink(
+        fs: &mut FileSource,
+        other: &str,
+    ) -> std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> {
         use std::os::unix::fs::MetadataExt;
         use std::sync::{Arc, Mutex};
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("app.log").to_string_lossy().into_owned();
-        let other = dir.path().join("other.log").to_string_lossy().into_owned();
-        std::fs::write(&path, "one\ntwo\n").unwrap();
-        std::fs::hard_link(&path, &other).unwrap();
-        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
-            .with_delete_quiet_period(Duration::ZERO);
         let opener: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
-        let (seam_opener, seam_other) = (opener.clone(), other.clone());
+        let (seam_opener, seam_other) = (opener.clone(), other.to_owned());
         fs.before_unlink = Some(Arc::new(move |_| {
             let mut slot = seam_opener.lock().unwrap();
             if slot.is_some() {
@@ -9212,6 +9207,26 @@ mod tests {
             }
             panic!("the open through the other name never reached the file");
         }));
+        opener
+    }
+
+    /// Review of #753: an open that reaches the file between the final check
+    /// and the unlink, through ANOTHER hard link that no configured pattern
+    /// names. The file keeps that name, so the opener's lines are not gone -
+    /// but nothing archives them either (review of #753 by Codex: the engine
+    /// said they were "archived under that name; nothing to do"). The
+    /// operator has to act: an error that says so.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_open_through_an_unread_hard_link_at_the_unlink_says_it_is_not_archived() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let other = dir.path().join("other.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        std::fs::hard_link(&path, &other).unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let opener = open_through_at_unlink(&mut fs, &other);
         let read = fs
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
             .await
@@ -9236,11 +9251,71 @@ mod tests {
                     "deleted the name {path} after a process opened the file between the final \
                      check and the unlink"
                 )
-            ) && notice(&fs, "still has 1 other name(s)")
-                && notice(&fs, "nothing to do")
-                && !notice(&fs, "is not archived"),
+            ) && notice(&fs, "none of them a source this engine reads")
+                && notice(&fs, "is NOT archived")
+                && !notice(&fs, "nothing to do"),
             "{:?}",
             fs.notices
+        );
+    }
+
+    /// Review of #753: the same open, through a hard link this engine reads
+    /// as a source of its own (#378). The opener's lines stay in the file
+    /// under that name and are archived from it: nothing to do.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_open_through_a_hard_link_this_engine_reads_at_the_unlink_says_nothing_is_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let other = dir.path().join("other.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        std::fs::hard_link(&path, &other).unwrap();
+        let quiet = Duration::from_millis(50);
+        let mut fs = FileSource::new(
+            vec![path.clone(), other.clone()],
+            TelemetryFormat::Raw,
+            true,
+        )
+        .with_delete_quiet_period(quiet);
+        for p in [&path, &other] {
+            let read = fs
+                .read_batch_candidates(&src(p), 100, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            fs.commit_progress(&read[0].progress_end).await.unwrap();
+        }
+        let opener = open_through_at_unlink(&mut fs, &other);
+        pass_after(&mut fs, &path, quiet).await;
+        opener
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam never ran")
+            .join()
+            .unwrap();
+        assert!(!Path::new(&path).exists());
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "deleted the name {path} after a process opened the file between the final \
+                     check and the unlink"
+                )
+            ) && notice(
+                &fs,
+                &format!("the file is still named {other}, a source this engine reads")
+            ) && notice(&fs, "nothing to do"),
+            "{:?}",
+            fs.notices
+        );
+        let next = fs
+            .read_batch_candidates(&src(&other), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            next[0].records,
+            vec![b"late".to_vec()],
+            "archived from the other name"
         );
     }
 
