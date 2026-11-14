@@ -25,7 +25,14 @@
 //! - a multipart object carries the lock its CreateMultipartUpload asked for;
 //! - a store error quoting a signed URL never reaches the ledger or the log;
 //! - `vtopctl scrub --check-retention` reports locked, elapsed, missing and
-//!   mode_mismatch, the last two as findings.
+//!   mode_mismatch, the last two as findings;
+//! - when the scrub also checks verification receipts, it reads each existing
+//!   receipt's own retention (#710), counted apart from the batch's in
+//!   `vtop_scrub_receipt_retention_total`: a receipt with no retention or
+//!   under another mode is a finding, an ended one is not, a missing receipt
+//!   is never a retention finding, a retention that cannot be read makes the
+//!   receipt (not the batch) unreadable, and nothing is read unless both
+//!   checks run.
 #![cfg(unix)]
 
 use std::path::PathBuf;
@@ -784,6 +791,17 @@ async fn three_committed(
     tenant: &str,
     retain: Duration,
 ) -> (tempfile::TempDir, Engine, Arc<MockBackend>) {
+    three_committed_with(tenant, retain, false).await
+}
+
+/// Three committed batches, with `manifest.verification_receipts` set when
+/// `receipts` is: each receipt then goes through the manifest's write path
+/// and carries the same retention.
+async fn three_committed_with(
+    tenant: &str,
+    retain: Duration,
+    receipts: bool,
+) -> (tempfile::TempDir, Engine, Arc<MockBackend>) {
     let dir = tempfile::tempdir().unwrap();
     let inputs: Vec<PathBuf> = (0..3)
         .map(|i| dir.path().join(format!("f{i}.log")))
@@ -802,6 +820,7 @@ async fn three_committed(
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
     }
+    cfg.manifest.verification_receipts = receipts;
     let mut engine = engine(cfg, Some(lock), &backend).await;
     let out = engine.process_once(SourceType::File).await.unwrap();
     assert_eq!(out.len(), 3, "{out:?}");
@@ -890,6 +909,681 @@ async fn scrub_check_retention_counts_an_ended_lock_without_failing() {
         Some(3),
         "{report:#?}"
     );
+}
+
+// ---- Scrub --check-retention over verification receipts (#710) -------------
+
+fn with_receipt_retention() -> ScrubOptions {
+    ScrubOptions {
+        check_receipts: true,
+        ..with_retention()
+    }
+}
+
+fn receipt_of(row: &vtop_state::BatchRecord) -> String {
+    vtop_core::partitioning::receipt_uri(row.manifest_uri.as_deref().unwrap()).unwrap()
+}
+
+/// The `vtop_scrub_receipt_retention_total` samples of a metrics file, in
+/// the order written.
+fn receipt_retention_samples(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|l| l.starts_with("vtop_scrub_receipt_retention_total{"))
+        .collect()
+}
+
+#[tokio::test]
+async fn scrub_check_retention_reads_each_receipt_and_reports_it_apart_from_the_batch() {
+    let (_dir, engine, backend) = three_committed_with(
+        "scrub-receipt-retention",
+        Duration::from_secs(30 * 86_400),
+        true,
+    )
+    .await;
+    let rows = committed(&engine).await;
+    // The objects and manifests all stay locked. One receipt stays locked;
+    // one lost its retention (a principal allowed to bypass governance
+    // removed it); one is under another mode.
+    backend.set_stored_retention(&receipt_of(&rows[1]), None, StoredRetention::default());
+    let mut compliance = backend.stored_retention(&receipt_of(&rows[2]), None);
+    compliance.mode = Some("COMPLIANCE".into());
+    backend.set_stored_retention(&receipt_of(&rows[2]), None, compliance);
+
+    let all = scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
+    let report = engine
+        .scrub(all.clone(), &with_receipt_retention())
+        .await
+        .unwrap();
+    assert!(
+        !report.passed,
+        "a receipt that can be deleted fails the run: {report:#?}"
+    );
+    // The batch's own retention keeps #708's meaning: object and manifest.
+    let batch = |r: RetentionResult| report.retention.get(r.as_str()).copied();
+    assert_eq!(batch(RetentionResult::Locked), Some(3), "{report:#?}");
+    assert_eq!(batch(RetentionResult::Missing), Some(0), "{report:#?}");
+    let receipt = |r: RetentionResult| report.receipt_retention.get(r.as_str()).copied();
+    assert_eq!(receipt(RetentionResult::Locked), Some(1), "{report:#?}");
+    assert_eq!(receipt(RetentionResult::Missing), Some(1), "{report:#?}");
+    assert_eq!(
+        receipt(RetentionResult::ModeMismatch),
+        Some(1),
+        "{report:#?}"
+    );
+    assert_eq!(receipt(RetentionResult::Elapsed), Some(0), "{report:#?}");
+    assert_eq!(
+        report.receipts.get("ok").copied(),
+        Some(3),
+        "the receipts themselves are sound: {report:#?}"
+    );
+
+    let mut found: Vec<_> = report
+        .findings
+        .iter()
+        .map(|f| {
+            (
+                f.batch_id.clone(),
+                f.receipt_retention,
+                f.retention,
+                f.receipt,
+            )
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            (
+                rows[1].batch_id.clone(),
+                Some(RetentionResult::Missing),
+                None,
+                None
+            ),
+            (
+                rows[2].batch_id.clone(),
+                Some(RetentionResult::ModeMismatch),
+                None,
+                None
+            ),
+        ],
+        "only the receipts are findings, each as a receipt retention finding"
+    );
+    for finding in &report.findings {
+        let ruri = receipt_of(
+            rows.iter()
+                .find(|r| r.batch_id == finding.batch_id)
+                .unwrap(),
+        );
+        let (what, remedy): (&str, &[&str]) =
+            if finding.receipt_retention == Some(RetentionResult::Missing) {
+                (
+                    "carries no retention",
+                    &[
+                        "can be deleted or overwritten",
+                        "written before upload.object_lock was set",
+                        "verification_receipt_failed",
+                        "re-apply the retention with PutObjectRetention",
+                        "check who could bypass it",
+                        // A HEAD without the permission reads as no lock
+                        // (review of #749).
+                        "s3:GetObjectRetention",
+                    ],
+                )
+            } else {
+                (
+                    "is under another retention mode than the configured one",
+                    &[
+                        "nothing to do if upload.object_lock.mode was changed on purpose",
+                        "find who wrote or re-locked it",
+                    ],
+                )
+            };
+        assert_says(
+            &finding.detail,
+            &[
+                // What happened.
+                &format!("verification receipt {ruri} {what}"),
+                "expected governance",
+                // What the scrub did.
+                "the scrub reported it and changed nothing",
+                "the batch's object and manifest are checked separately",
+            ],
+        );
+        // What to do.
+        assert_says(&finding.detail, remedy);
+    }
+
+    let lines = report.lines();
+    assert!(
+        lines.contains(&"receipt retention: elapsed=0 locked=1 missing=1 mode_mismatch=1".into()),
+        "its own line, so an operator can tell a receipt from an object: {lines:#?}"
+    );
+    assert!(
+        lines.contains(&"retention: elapsed=0 locked=3 missing=0 mode_mismatch=0".into()),
+        "{lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with(&format!(
+            "FAIL receipt retention missing {} ",
+            rows[1].batch_id
+        ))),
+        "{lines:#?}"
+    );
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["receipt_retention"]["missing"], 1, "{json:#}");
+    let json_findings = json["findings"].as_array().unwrap();
+    assert!(
+        json_findings
+            .iter()
+            .any(|f| f["receipt_retention"] == "missing"
+                && f["batch_id"] == rows[1].batch_id.as_str()),
+        "{json:#}"
+    );
+
+    // Its own family, with the bounded result set of
+    // vtop_scrub_retention_total; that family is unchanged.
+    let first = report.prometheus_text(None, 1_000);
+    assert_eq!(
+        receipt_retention_samples(&first),
+        vec![
+            "vtop_scrub_receipt_retention_total{result=\"elapsed\"} 0",
+            "vtop_scrub_receipt_retention_total{result=\"locked\"} 1",
+            "vtop_scrub_receipt_retention_total{result=\"missing\"} 1",
+            "vtop_scrub_receipt_retention_total{result=\"mode_mismatch\"} 1",
+        ],
+        "{first}"
+    );
+    assert!(
+        first.contains("# TYPE vtop_scrub_receipt_retention_total counter\n"),
+        "{first}"
+    );
+    assert!(
+        first.contains("vtop_scrub_retention_total{result=\"locked\"} 3\n")
+            && first.contains("vtop_scrub_retention_total{result=\"missing\"} 0\n"),
+        "{first}"
+    );
+    assert!(
+        first.contains("vtop_scrub_last_run_findings 2\n"),
+        "{first}"
+    );
+
+    // A run that reads no retention carries the totals forward unchanged; a
+    // run that does adds to them.
+    let plain = engine
+        .scrub(
+            all.clone(),
+            &ScrubOptions {
+                check_receipts: true,
+                ..ScrubOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(plain.passed, "{plain:#?}");
+    assert!(plain.receipt_retention.is_empty(), "{plain:#?}");
+    let second = plain.prometheus_text(Some(&first), 2_000);
+    assert_eq!(
+        receipt_retention_samples(&second),
+        receipt_retention_samples(&first),
+        "{second}"
+    );
+    let again = engine.scrub(all, &with_receipt_retention()).await.unwrap();
+    let third = again.prometheus_text(Some(&second), 3_000);
+    assert_eq!(
+        receipt_retention_samples(&third),
+        vec![
+            "vtop_scrub_receipt_retention_total{result=\"elapsed\"} 0",
+            "vtop_scrub_receipt_retention_total{result=\"locked\"} 2",
+            "vtop_scrub_receipt_retention_total{result=\"missing\"} 2",
+            "vtop_scrub_receipt_retention_total{result=\"mode_mismatch\"} 2",
+        ],
+        "{third}"
+    );
+}
+
+#[tokio::test]
+async fn a_receipt_whose_lock_has_ended_is_counted_not_reported() {
+    let (_dir, engine, backend) = three_committed_with(
+        "scrub-receipt-elapsed",
+        Duration::from_secs(30 * 86_400),
+        true,
+    )
+    .await;
+    let rows = committed(&engine).await;
+    let mut ended = backend.stored_retention(&receipt_of(&rows[0]), None);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    ended.retain_until_unix_secs = Some(now - 60);
+    backend.set_stored_retention(&receipt_of(&rows[0]), None, ended);
+    let all = scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
+    let report = engine.scrub(all, &with_receipt_retention()).await.unwrap();
+    assert!(
+        report.passed,
+        "an ended retention is normal for an old receipt: {report:#?}"
+    );
+    let receipt = |r: RetentionResult| report.receipt_retention.get(r.as_str()).copied();
+    assert_eq!(receipt(RetentionResult::Elapsed), Some(1), "{report:#?}");
+    assert_eq!(receipt(RetentionResult::Locked), Some(2), "{report:#?}");
+}
+
+/// The receipt is read at its key, not pinned (#710): a later version
+/// written there without a lock is the one judged.
+#[tokio::test]
+async fn receipt_retention_is_read_at_the_current_key() {
+    let (_dir, engine, backend) = three_committed_with(
+        "scrub-receipt-current",
+        Duration::from_secs(30 * 86_400),
+        true,
+    )
+    .await;
+    let rows = committed(&engine).await;
+    let ruri = receipt_of(&rows[0]);
+    let same = backend.get_object(&ruri).await.unwrap();
+    backend.add_unlocked_version(&ruri, same);
+    let all = scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
+    let report = engine.scrub(all, &with_receipt_retention()).await.unwrap();
+    let found: Vec<_> = report
+        .findings
+        .iter()
+        .map(|f| (f.batch_id.clone(), f.receipt, f.receipt_retention))
+        .collect();
+    assert_eq!(
+        found,
+        vec![(
+            rows[0].batch_id.clone(),
+            None,
+            Some(RetentionResult::Missing)
+        )],
+        "the same receipt, re-written unlocked: {report:#?}"
+    );
+}
+
+/// A receipt that exists is read for its lock whatever its own check found
+/// (#710): a tampered receipt that is also unlocked has both findings, so
+/// each is fixed on its own.
+#[tokio::test]
+async fn a_tampered_receipt_without_a_lock_has_both_findings() {
+    let (_dir, engine, backend) = three_committed_with(
+        "scrub-receipt-tampered",
+        Duration::from_secs(30 * 86_400),
+        true,
+    )
+    .await;
+    let rows = committed(&engine).await;
+    backend.add_unlocked_version(&receipt_of(&rows[2]), b"{ not a receipt".to_vec());
+    let all = scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
+    let report = engine.scrub(all, &with_receipt_retention()).await.unwrap();
+    assert!(!report.passed, "{report:#?}");
+    assert_eq!(report.receipts.get("invalid").copied(), Some(1));
+    assert_eq!(
+        report
+            .receipt_retention
+            .get(RetentionResult::Missing.as_str())
+            .copied(),
+        Some(1),
+        "{report:#?}"
+    );
+    let mut found: Vec<_> = report
+        .findings
+        .iter()
+        .map(|f| (f.batch_id.clone(), f.receipt, f.receipt_retention))
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            (
+                rows[2].batch_id.clone(),
+                None,
+                Some(RetentionResult::Missing)
+            ),
+            (
+                rows[2].batch_id.clone(),
+                Some(scrub::ReceiptResult::Invalid),
+                None
+            ),
+        ],
+        "{report:#?}"
+    );
+}
+
+/// Review of #749: a receipt that is already a finding and whose retention
+/// cannot be read keeps its result, and its detail does not claim it was
+/// reported unreadable.
+#[tokio::test]
+async fn a_tampered_receipt_whose_retention_cannot_be_read_stays_invalid() {
+    let (_dir, engine, backend) = three_committed_with(
+        "scrub-receipt-tampered-unreadable",
+        Duration::from_secs(30 * 86_400),
+        true,
+    )
+    .await;
+    let rows = committed(&engine).await;
+    let ruri = receipt_of(&rows[2]);
+    backend.add_unlocked_version(&ruri, b"{ not a receipt".to_vec());
+    backend.set_retention_error(Some("head_object: connection reset".into()));
+    backend.set_retention_error_only_for(Some(&ruri));
+    let all = scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
+    let report = engine.scrub(all, &with_receipt_retention()).await.unwrap();
+    assert_eq!(
+        report.receipts.get("invalid").copied(),
+        Some(1),
+        "{report:#?}"
+    );
+    assert_eq!(
+        report.receipts.get("unreadable").copied(),
+        Some(0),
+        "{report:#?}"
+    );
+    assert_eq!(
+        report.receipt_retention.values().sum::<u64>(),
+        2,
+        "no verdict for the receipt that could not be read: {report:#?}"
+    );
+    let found: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.batch_id == rows[2].batch_id)
+        .collect();
+    assert_eq!(found.len(), 1, "{report:#?}");
+    assert_eq!(found[0].receipt, Some(scrub::ReceiptResult::Invalid));
+    assert_says(
+        &found[0].detail,
+        &[
+            "does not parse",
+            "its retention could not be read either",
+            "connection reset",
+            "the receipt stays reported invalid",
+        ],
+    );
+    assert!(
+        !found[0].detail.contains("reported unreadable"),
+        "{}",
+        found[0].detail
+    );
+}
+
+/// Review of #749: a receipt that is another batch's (mismatched) is read
+/// for its lock too.
+#[tokio::test]
+async fn a_mismatched_receipt_without_a_lock_has_both_findings() {
+    let (_dir, engine, backend) = three_committed_with(
+        "scrub-receipt-mismatched",
+        Duration::from_secs(30 * 86_400),
+        true,
+    )
+    .await;
+    let rows = committed(&engine).await;
+    let other = backend.get_object(&receipt_of(&rows[1])).await.unwrap();
+    backend.add_unlocked_version(&receipt_of(&rows[0]), other);
+    let all = scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
+    let before = backend.retention_reads().len();
+    let report = engine.scrub(all, &with_receipt_retention()).await.unwrap();
+    assert!(
+        backend.retention_reads()[before..].contains(&receipt_of(&rows[0])),
+        "the mismatched receipt's retention was not read"
+    );
+    let mut found: Vec<_> = report
+        .findings
+        .iter()
+        .map(|f| (f.batch_id.clone(), f.receipt, f.receipt_retention))
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            (
+                rows[0].batch_id.clone(),
+                None,
+                Some(RetentionResult::Missing)
+            ),
+            (
+                rows[0].batch_id.clone(),
+                Some(scrub::ReceiptResult::Mismatched),
+                None
+            ),
+        ],
+        "{report:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_receipt_is_not_a_retention_finding() {
+    let (_dir, engine, backend) =
+        three_committed_with("scrub-receipt-gone", Duration::from_secs(30 * 86_400), true).await;
+    let rows = committed(&engine).await;
+    let gone = receipt_of(&rows[1]);
+    backend.delete_object(&gone).await.unwrap();
+    let all = scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
+
+    let before = backend.retention_reads().len();
+    let report = engine
+        .scrub(all.clone(), &with_receipt_retention())
+        .await
+        .unwrap();
+    assert!(
+        report.passed,
+        "a missing receipt is counted, not a finding: {report:#?}"
+    );
+    assert_eq!(report.receipts.get("missing").copied(), Some(1));
+    let receipt = |r: RetentionResult| report.receipt_retention.get(r.as_str()).copied();
+    assert_eq!(receipt(RetentionResult::Locked), Some(2), "{report:#?}");
+    assert_eq!(
+        receipt(RetentionResult::Missing),
+        Some(0),
+        "an absent receipt has no retention to judge: {report:#?}"
+    );
+    assert!(
+        !backend.retention_reads()[before..].contains(&gone),
+        "the scrub asked for the retention of a receipt it found absent"
+    );
+
+    // Required: the missing receipt is a receipt finding, and only that.
+    let required = engine
+        .scrub(
+            all,
+            &ScrubOptions {
+                require_receipts: true,
+                ..with_retention()
+            },
+        )
+        .await
+        .unwrap();
+    let found: Vec<_> = required
+        .findings
+        .iter()
+        .map(|f| (f.batch_id.clone(), f.receipt, f.receipt_retention))
+        .collect();
+    assert_eq!(
+        found,
+        vec![(
+            rows[1].batch_id.clone(),
+            Some(scrub::ReceiptResult::Missing),
+            None
+        )],
+        "{required:#?}"
+    );
+    assert_eq!(
+        required
+            .receipt_retention
+            .get(RetentionResult::Missing.as_str())
+            .copied(),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn receipts_are_read_for_retention_only_when_both_checks_run() {
+    let (_dir, engine, backend) =
+        three_committed_with("scrub-receipt-when", Duration::from_secs(30 * 86_400), true).await;
+    let rows = committed(&engine).await;
+    let receipts: Vec<String> = rows.iter().map(receipt_of).collect();
+    let all = scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
+    let receipt_reads = |since: usize| -> Vec<String> {
+        backend.retention_reads()[since..]
+            .iter()
+            .filter(|uri| uri.ends_with(".receipt.json"))
+            .cloned()
+            .collect()
+    };
+
+    // --check-retention without receipts being checked.
+    let before = backend.retention_reads().len();
+    let report = engine.scrub(all.clone(), &with_retention()).await.unwrap();
+    assert!(report.passed, "{report:#?}");
+    assert_eq!(receipt_reads(before), Vec::<String>::new());
+    assert!(report.receipt_retention.is_empty(), "{report:#?}");
+    assert!(
+        receipt_retention_samples(&report.prometheus_text(None, 1)).is_empty(),
+        "no family for a run that read no receipt"
+    );
+
+    // Receipts checked without --check-retention.
+    let before = backend.retention_reads().len();
+    let report = engine
+        .scrub(
+            all.clone(),
+            &ScrubOptions {
+                check_receipts: true,
+                ..ScrubOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(report.passed, "{report:#?}");
+    assert_eq!(report.receipts.get("ok").copied(), Some(3));
+    assert_eq!(backend.retention_reads()[before..].len(), 0);
+    assert!(report.receipt_retention.is_empty(), "{report:#?}");
+
+    // Both, by the config's receipts and by --require-receipts: each receipt
+    // is read once, at its key.
+    for opts in [
+        with_receipt_retention(),
+        ScrubOptions {
+            require_receipts: true,
+            ..with_retention()
+        },
+    ] {
+        let before = backend.retention_reads().len();
+        let report = engine.scrub(all.clone(), &opts).await.unwrap();
+        assert!(report.passed, "{report:#?}");
+        let mut read = receipt_reads(before);
+        read.sort();
+        let mut want = receipts.clone();
+        want.sort();
+        assert_eq!(read, want);
+        assert_eq!(
+            report
+                .receipt_retention
+                .get(RetentionResult::Locked.as_str())
+                .copied(),
+            Some(3),
+            "{report:#?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_receipt_retention_the_store_cannot_answer_is_an_unreadable_receipt_redacted() {
+    let (_dir, engine, backend) = three_committed_with(
+        "scrub-receipt-unreadable",
+        Duration::from_secs(30 * 86_400),
+        true,
+    )
+    .await;
+    let rows = committed(&engine).await;
+    let ruri = receipt_of(&rows[0]);
+    let signed = format!(
+        "{}?versionId=v1&X-Amz-Algorithm=AWS4-HMAC-SHA256\
+         &X-Amz-Credential=AKIAEXAMPLE%2F20261114&X-Amz-Signature=deadbeefcafe",
+        ruri.replacen(
+            "s3://telemetry-raw/",
+            "https://telemetry-raw.s3.amazonaws.com/",
+            1
+        )
+    );
+    backend.set_retention_error(Some(format!("head_object {signed}: connection reset")));
+    backend.set_retention_error_only_for(Some(".receipt.json"));
+    let all = scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
+    let report = engine.scrub(all, &with_receipt_retention()).await.unwrap();
+    assert!(
+        !report.passed,
+        "a scrub that could not look did not pass: {report:#?}"
+    );
+    // The receipt is unreadable, not the batch: its data and its own lock
+    // were read and are fine.
+    assert_eq!(report.results.get("ok").copied(), Some(3), "{report:#?}");
+    assert_eq!(
+        report
+            .retention
+            .get(RetentionResult::Locked.as_str())
+            .copied(),
+        Some(3),
+        "{report:#?}"
+    );
+    assert!(
+        report
+            .findings
+            .iter()
+            .all(|f| f.result == scrub::ScrubResult::Ok && f.retention.is_none()),
+        "{report:#?}"
+    );
+    assert_eq!(
+        report.receipts.get("unreadable").copied(),
+        Some(3),
+        "{report:#?}"
+    );
+    assert!(
+        report.receipt_retention.values().all(|n| *n == 0),
+        "nothing was judged: {report:#?}"
+    );
+    let receipt_findings: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.receipt == Some(scrub::ReceiptResult::Unreadable))
+        .collect();
+    assert_eq!(receipt_findings.len(), 3, "{report:#?}");
+    let first = receipt_findings
+        .iter()
+        .find(|f| f.batch_id == rows[0].batch_id)
+        .unwrap();
+    assert_says(
+        &first.detail,
+        &[
+            // What happened.
+            &format!("the retention of verification receipt {ruri} could not be read"),
+            "connection reset",
+            // What the scrub did.
+            "the receipt is reported unreadable and the batch's own result is left alone",
+            // What to do.
+            "check the store's health and the scrub's read permission",
+        ],
+    );
+    let everything = format!(
+        "{}\n{}\n{}",
+        report
+            .findings
+            .iter()
+            .map(|f| f.detail.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        report.lines().join("\n"),
+        report.prometheus_text(None, 1)
+    );
+    for secret in [
+        "X-Amz-Signature",
+        "deadbeefcafe",
+        "X-Amz-Credential",
+        "AKIAEXAMPLE",
+        "versionId=v1",
+    ] {
+        assert!(
+            !everything.contains(secret),
+            "the report holds {secret}: {everything}"
+        );
+    }
 }
 
 // ---- Review of #708 ---------------------------------------------------------
