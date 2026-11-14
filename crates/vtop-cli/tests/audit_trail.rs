@@ -463,6 +463,8 @@ async fn a_scrub_that_keeps_a_cursor_is_recorded() {
         cursor.display().to_string()
     );
     assert_eq!(file[0]["params"]["limit"], "10");
+    // #671 release B: whether a missing receipt was a finding.
+    assert_eq!(file[0]["params"]["require_receipts"], "false");
     assert!(file[0]["after"]["cursor_moved"].is_boolean());
     // Without a cursor the scrub changes nothing and writes no record.
     let out = vtopctl(

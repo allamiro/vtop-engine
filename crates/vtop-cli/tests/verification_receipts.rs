@@ -109,7 +109,10 @@ fn receipts(tenant: &str, result: &str) -> u64 {
 /// the ledger holds (#664).
 fn assert_binds(receipt: &VerificationReceipt, row: &BatchRecord) {
     assert_eq!(receipt.batch_id, row.batch_id);
-    assert_eq!(Some(receipt.manifest.uri.as_str()), row.manifest_uri.as_deref());
+    assert_eq!(
+        Some(receipt.manifest.uri.as_str()),
+        row.manifest_uri.as_deref()
+    );
     assert_eq!(
         Some(receipt.manifest.sha256.as_str()),
         row.manifest_sha256.as_deref()
@@ -375,7 +378,8 @@ async fn under_object_lock_a_receipt_carries_the_manifests_retention() {
         legal_hold: false,
     };
     let cfg = config(dir.path(), "receipts-locked", &input);
-    let backend = Arc::new(MockBackend::new().with_object_lock(ObjectLockPolicy::from_config(&lock)));
+    let backend =
+        Arc::new(MockBackend::new().with_object_lock(ObjectLockPolicy::from_config(&lock)));
     let mut engine = engine(cfg, &backend).await;
     engine.config.upload.require_object_versioning = true;
     engine.config.upload.object_lock = Some(lock);
@@ -389,7 +393,11 @@ async fn under_object_lock_a_receipt_carries_the_manifests_retention() {
         row.manifest_uri.as_deref().unwrap(),
         row.manifest_version_id.as_deref(),
     );
-    assert_eq!(kept.mode.as_deref(), Some("GOVERNANCE"), "the receipt is locked: {kept:?}");
+    assert_eq!(
+        kept.mode.as_deref(),
+        Some("GOVERNANCE"),
+        "the receipt is locked: {kept:?}"
+    );
     assert!(
         kept.retain_until_unix_secs >= manifest_kept.retain_until_unix_secs
             && manifest_kept.retain_until_unix_secs.is_some(),

@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use vtop_core::effective_config::VerificationMethod;
 use vtop_core::errors::VtopError;
 
 #[derive(Default)]
@@ -153,6 +154,10 @@ pub struct MockBackend {
     lock_config_errors: AtomicUsize,
     /// The retention the store keeps per `(key, version)` (#684).
     retention: Mutex<HashMap<(String, String), StoredRetention>>,
+    /// Every put (object or manifest) to a key ending with this suffix fails
+    /// (#671 release B): a store refusing verification receipts. Settable on
+    /// a shared mock, so one attempt can fail and the next succeed.
+    failing_put_suffix: Mutex<Option<String>>,
 }
 
 /// How [`MockBackend::with_part_fault`] makes `upload_part` fail (#668).
@@ -407,6 +412,7 @@ impl MockBackend {
             lock_config_buckets: Mutex::new(Vec::new()),
             lock_config_errors: AtomicUsize::new(0),
             retention: Mutex::new(HashMap::new()),
+            failing_put_suffix: Mutex::new(None),
             multipart_fail_after_parts: Arc::new(AtomicUsize::new(usize::MAX)),
             multipart_parts_uploaded: Arc::new(AtomicUsize::new(0)),
             bucket_ensures: AtomicUsize::new(0),
@@ -450,6 +456,43 @@ impl MockBackend {
         } else {
             Ok(())
         }
+    }
+
+    /// Every put to a key ending with `suffix` fails, as a store that
+    /// refuses the request does (#671 release B). The error quotes a signed
+    /// URL, as an SDK error can, so a test can show it never reaches a log.
+    pub fn with_failing_put_suffix(self, suffix: &str) -> Self {
+        self.set_failing_put_suffix(Some(suffix));
+        self
+    }
+
+    /// [`MockBackend::with_failing_put_suffix`] on a shared mock; `None`
+    /// lets every put through again.
+    pub fn set_failing_put_suffix(&self, suffix: Option<&str>) {
+        *self.failing_put_suffix.lock().unwrap() = suffix.map(str::to_owned);
+    }
+
+    fn refuse_put(&self, uri: &str) -> Result<(), VtopError> {
+        match self.failing_put_suffix.lock().unwrap().as_deref() {
+            Some(suffix) if uri.ends_with(suffix) => {
+                let key = uri.strip_prefix("s3://").unwrap_or(uri);
+                Err(VtopError::Upload(format!(
+                    "mock put {uri}: InternalError (http 500) at \
+                     https://store.example/{key}?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIDEXAMPLE"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// How many versions of `uri` the store holds: a write that replaced
+    /// the key adds one.
+    pub fn version_count(&self, uri: &str) -> usize {
+        self.versions
+            .lock()
+            .unwrap()
+            .get(uri)
+            .map_or(0, |history| history.entries.len())
     }
 
     /// A mock that always fails verification.
@@ -669,6 +712,7 @@ impl UploadBackend for MockBackend {
         object_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<StoredObject, VtopError> {
+        self.refuse_put(object_uri)?;
         self.take_throttle(&self.throttled_object_puts, object_uri)?;
         let asked = self.asked();
         let version_id = self
@@ -690,6 +734,7 @@ impl UploadBackend for MockBackend {
         manifest_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<StoredManifest, VtopError> {
+        self.refuse_put(manifest_uri)?;
         self.take_throttle(&self.throttled_manifest_puts, manifest_uri)?;
         let asked = self.asked();
         let version_id = self
@@ -851,6 +896,7 @@ impl UploadBackend for MockBackend {
                                  service whole-object checksum; multipart or \
                                  unchecked upload)",
                             )
+                            .by(VerificationMethod::ReadBack)
                         } else {
                             VerificationResult::failed(
                                 "stored content SHA-256 mismatch on read-back",
@@ -862,6 +908,7 @@ impl UploadBackend for MockBackend {
                     let actual = vtop_core::checksum::blake3_bytes(&stored.data);
                     if actual.eq_ignore_ascii_case(expected.hex) {
                         VerificationResult::passed("mock s3: read-back BLAKE3 verified")
+                            .by(VerificationMethod::ReadBack)
                     } else {
                         VerificationResult::failed("mock s3: read-back BLAKE3 mismatch")
                     }
@@ -894,9 +941,10 @@ impl UploadBackend for MockBackend {
         let actual = vtop_core::checksum::digest_bytes(algo, &stored.data)
             .expect("enabled checksum algorithm has a digest");
         if actual.eq_ignore_ascii_case(expected.hex) {
-            Ok(VerificationResult::passed(
-                "mock: stored content checksum verified",
-            ))
+            Ok(
+                VerificationResult::passed("mock: stored content checksum verified")
+                    .by(VerificationMethod::ReadBack),
+            )
         } else {
             Ok(VerificationResult::failed("mock: checksum mismatch"))
         }

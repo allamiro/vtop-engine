@@ -1793,7 +1793,10 @@ async fn a_missing_receipt_is_reported_and_is_a_finding_only_when_required() {
         .unwrap();
 
     let report = a.scrub(&with_receipts(false)).await;
-    assert!(report.passed, "missing is not a finding by default: {report:#?}");
+    assert!(
+        report.passed,
+        "missing is not a finding by default: {report:#?}"
+    );
     assert_eq!(receipt_count(&report, ReceiptResult::Missing), 1);
     assert_eq!(receipt_count(&report, ReceiptResult::Ok), 1);
 
@@ -1804,8 +1807,15 @@ async fn a_missing_receipt_is_reported_and_is_a_finding_only_when_required() {
         vec![(victim.batch_id.clone(), ReceiptResult::Missing)]
     );
     let finding = &report.findings[0];
-    assert!(finding.detail.contains(&a.receipt_uri_of(victim)), "{finding:?}");
-    assert_eq!(finding.result, ScrubResult::Ok, "the content itself is fine");
+    assert!(
+        finding.detail.contains(&a.receipt_uri_of(victim)),
+        "{finding:?}"
+    );
+    assert_eq!(
+        finding.result,
+        ScrubResult::Ok,
+        "the content itself is fine"
+    );
     let line = report
         .lines()
         .into_iter()
@@ -1883,7 +1893,8 @@ async fn a_tampered_or_rebound_receipt_is_reported() {
     a.overwrite(&a.receipt_uri_of(&ledger[1]), &copied, true)
         .await;
     let report = a.scrub(&with_receipts(false)).await;
-    assert!(receipt_findings(&report).contains(&(ledger[1].batch_id.clone(), ReceiptResult::Mismatched)));
+    assert!(receipt_findings(&report)
+        .contains(&(ledger[1].batch_id.clone(), ReceiptResult::Mismatched)));
 }
 
 /// With a key configured, a receipt forged without the MAC fails, even with
@@ -1929,7 +1940,10 @@ async fn a_forged_or_foreign_key_receipt_is_reported_by_its_kind() {
         "{report:#?}"
     );
     assert!(report.findings[0].detail.contains("MAC"), "{report:#?}");
-    assert!(report.findings[1].detail.contains("elsewhere"), "{report:#?}");
+    assert!(
+        report.findings[1].detail.contains("elsewhere"),
+        "{report:#?}"
+    );
 }
 
 /// The command: receipts are checked when the config enables them or
@@ -1967,7 +1981,9 @@ async fn the_command_checks_receipts_and_require_receipts_fails_on_a_missing_one
             args.push("--require-receipts");
         }
         let cli = vtop_cli::commands::Cli::try_parse_from(args).unwrap();
-        vtop_cli::commands::dispatch(cli)
+        // On the heap: with the receipt check, the debug build's command
+        // future outgrows a test thread's 2 MiB stack.
+        Box::pin(vtop_cli::commands::dispatch(cli))
     };
     assert_eq!(run(true).await, 0, "every receipt is there");
     let text = std::fs::read_to_string(&metrics).unwrap();

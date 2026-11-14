@@ -287,7 +287,7 @@ A conformant manifest:
 | `manifest.mac` | string | MAY | 32-byte keyed BLAKE3 authenticator (lowercase hex), computed over the same canonical bytes. |
 | `manifest.mac_key_id` | string | `0.4` with a keyring: MUST; earlier: MUST NOT | The id of the key that computed `manifest.mac` (#685): 1 to 64 characters from `[A-Za-z0-9._-]`. Not blanked for the hash, so the self-hash and the MAC both cover it. Absent: the manifest is verified with the reader's key marked `legacy`. See "Key ids" below. |
 | `state` | enum | SHOULD | Lifecycle state at manifest-write time (`manifest_uploaded`). |
-| `verification_status` | enum | SHOULD | Status at manifest-write time, so always `not_verified`. **Deprecated** in favour of `verification_plan` plus the ledger; still written in `0.4` because v0.8.0 readers require it. |
+| `verification_status` | enum | SHOULD | Status at manifest-write time, so always `not_verified`. **Deprecated** in favour of `verification_plan` plus the ledger or a verification receipt (§11.3); still written in `0.4` because v0.8.0 readers require it. |
 | `verification_plan` | object | `0.4` writer: MUST; earlier: MUST NOT | How the object will be verified, as configured when the manifest was written (`0.4`, #671). `method` and `require_strong` below. A `0.4` reader does not require it (a `0.4` document without it still verifies), and refuses a malformed one as a malformed document. |
 | `verification_plan.method` | string | MUST | `store_checksum`, `read_back` or `size_only`: the method for the configured backend and the object's `checksum_algorithm`, the same value `vtopctl validate --print-effective` and the startup log print. A reader accepts any string. |
 | `verification_plan.require_strong` | boolean | MUST | `upload.require_strong_verification` when the manifest was written. |
@@ -480,7 +480,73 @@ row was pruned, from the prune digest that replaced it, not from the manifest;
 their end is correct. The field's shape did not change, so every released
 verifier verifies manifests of both versions.
 
-> The manifest is written at the `MANIFEST_UPLOADED` step, before storage-side verification, so its embedded `state`/`verification_status` reflect that point in time and its hash stays stable. The authoritative post-verification state (`VERIFIED` → `SOURCE_COMMITTED`) lives in the state store. A `0.4` manifest also states the verification method it was written to expect (`verification_plan`), which is likewise true at write time.
+> The manifest is written at the `MANIFEST_UPLOADED` step, before storage-side verification, so its embedded `state`/`verification_status` reflect that point in time and its hash stays stable. The authoritative post-verification state (`VERIFIED` → `SOURCE_COMMITTED`) lives in the state store. A `0.4` manifest also states the verification method it was written to expect (`verification_plan`), which is likewise true at write time. What verification found can be recorded in the archive too, in a separate verification receipt (§11.3).
+
+### 11.3 Verification receipt (extension)
+
+A manifest cannot record how its object was verified: it is stored, and its
+digest pinned, before verification runs. A **verification receipt** is an
+optional second object that records the outcome, written after the batch
+reaches `VERIFIED` (#671 release B). The reference implementation writes one
+when `manifest.verification_receipts: true` (off by default).
+
+**Location.** `<batch_id>.receipt.json`, in the same bucket and prefix as
+`<batch_id>.manifest.json`: the manifest's key with `.manifest.json` replaced
+by `.receipt.json`. A reader that does not know about receipts never fetches
+one, but a consumer that lists the prefix sees them.
+
+**Fields.** Version `"1"`:
+
+| Field | Type | Requirement | Description |
+|---|---|---|---|
+| `protocol` | string | MUST | Constant `"VTOP"`. |
+| `receipt_version` | string | MUST | `"1"`. A reader reports a larger integer as a receipt **newer** than it reads, and anything else as malformed. |
+| `batch_id` | string | MUST | The batch, as in its manifest and the ledger. |
+| `manifest.uri` | string | MUST | The manifest's URI. |
+| `manifest.sha256` | string | MUST | The manifest's own self-hash (`manifest.sha256`), as the ledger recorded it. The manifest's MAC covers that value, so a receipt cannot be moved to another manifest. |
+| `manifest.version_id` | string | MAY | The manifest version the ledger pinned, when the store gave one. |
+| `object.uri` | string | MUST | The object's URI. |
+| `object.size_bytes` | integer | MUST | As in the manifest. |
+| `object.checksum_algorithm` | string | MUST | As in the manifest. |
+| `object.checksum` | string | MUST | As in the manifest (empty when checksums are disabled). |
+| `object.version_id` | string | MAY | The object version the write returned. Absent for a reused object and for a receipt written by recovery. |
+| `verification.class` | string | MUST | `strong` or `size_only`: the class the state store recorded with `VERIFIED`. |
+| `verification.method` | string | MUST | The check the backend ran on the object: `store_checksum`, `read_back` or `size_only`, or `unspecified` when the backend did not say. Never guessed from the configuration: native S3 configured for `store_checksum` reads a multipart object back, and the receipt says `read_back`. A reader accepts any string. |
+| `verified_at` | string (RFC 3339) | MUST | When verification passed, by the writer's clock. |
+| `verified_by` | string | MUST | The writing engine's configured name. |
+| `origin` | string | MUST | `engine` (written after the engine's own verification) or `recovery` (written by recovery after its re-check of a `VERIFIED` batch that had none). |
+| `receipt.sha256` | string | MUST | The receipt's self-hash. |
+| `receipt.mac` | string | MAY | Keyed BLAKE3 over the same input, with the manifest MAC key. |
+| `receipt.mac_key_id` | string | MAY | The id of the key that computed `receipt.mac`, as for `manifest.mac_key_id` (§11.2, "Key ids"). |
+
+The receipt **MUST NOT** carry record content, credentials, key material, or
+a URI with a query string, fragment or user info.
+
+**Hash and MAC.** Exactly the `0.4` manifest scheme (§11.2, "Reading a
+manifest"), with the `receipt` object in place of the `manifest` object: the
+**stored** document with `receipt.sha256` set to `""` and `receipt.mac` set
+to `""` where present, object keys sorted at every depth, compact JSON; the
+same refusals (duplicate keys, numbers that are not 64-bit integers, `-0`);
+fields the reader does not know stay in and are authenticated. A reader
+verifies the MAC with the key `receipt.mac_key_id` names, or its legacy key
+when it names none, and never searches its keys; an unknown or retired key
+is **unauthenticated**, not corrupt.
+
+**What it is not.** The receipt is evidence about verification, not part of
+the commit rule (§13): an implementation **MUST NOT** wait for it before
+`SOURCE_COMMITTED`, and **MUST NOT** treat a missing receipt as a reason to
+replay. The state store stays the authority for commit state. A receipt that
+cannot be written is logged and counted; recovery writes the receipt of a
+`VERIFIED` batch that has none, after looking first, so an existing receipt
+is never replaced (under object lock a second write would be a second
+version). A batch committed without one keeps none: a later re-read would be
+a different statement, so an audit reports it missing rather than writing
+one.
+
+**Checking a receipt.** Against the state store's row for its batch: the
+batch id, the manifest URI, digest and pinned version, the object URI, size
+and digest, and the class. Any difference means the receipt is not this
+batch's. The reference implementation's `vtopctl scrub` does this (§17.3).
 
 ---
 
@@ -677,6 +743,11 @@ A reader with several MAC keys **MUST** verify a manifest with the key its
 **MUST NOT** search its keys. A manifest naming a key the reader does not
 hold, or a retired one, is unauthenticated, and is reported as that, not as
 corrupt (§11.2, "Key ids").
+
+A verification receipt (§11.3), where one is written, is not part of this
+check and **MUST NOT** gate the commit. A reader that checks one verifies it
+by the `0.4` scheme with the key it names, then binds it to the state
+store's row: batch, manifest digest and version, object, and class.
 
 ---
 

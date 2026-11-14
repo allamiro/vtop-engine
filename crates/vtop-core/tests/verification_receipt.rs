@@ -123,11 +123,23 @@ fn a_tampered_receipt_fails_its_hash_and_a_rehashed_one_fails_its_mac() {
     let single = ManifestKeyring::single(k);
     let signed = builder().build_signed(&single).unwrap();
     for (path, value) in [
-        (vec!["verification", "class"], serde_json::json!("size_only")),
-        (vec!["verification", "method"], serde_json::json!("store_checksum")),
-        (vec!["manifest", "sha256"], serde_json::json!("ef".repeat(32))),
+        (
+            vec!["verification", "class"],
+            serde_json::json!("size_only"),
+        ),
+        (
+            vec!["verification", "method"],
+            serde_json::json!("store_checksum"),
+        ),
+        (
+            vec!["manifest", "sha256"],
+            serde_json::json!("ef".repeat(32)),
+        ),
         (vec!["origin"], serde_json::json!("recovery")),
-        (vec!["verified_at"], serde_json::json!("2030-01-01T00:00:00Z")),
+        (
+            vec!["verified_at"],
+            serde_json::json!("2030-01-01T00:00:00Z"),
+        ),
     ] {
         let mut doc: serde_json::Value = serde_json::from_slice(signed.bytes()).unwrap();
         let mut slot = &mut doc;
@@ -151,7 +163,11 @@ fn a_tampered_receipt_fails_its_hash_and_a_rehashed_one_fails_its_mac() {
             "{path:?}"
         );
         assert!(
-            outcome.result.unwrap_err().to_string().contains("receipt MAC"),
+            outcome
+                .result
+                .unwrap_err()
+                .to_string()
+                .contains("receipt MAC"),
             "{path:?}: the message names the receipt"
         );
     }
@@ -265,7 +281,10 @@ fn a_receipt_carries_no_key_and_refuses_a_uri_with_a_query_or_user_info() {
         let mut b = builder();
         b.object_uri = bad.into();
         let e = b.build_signed(&single).unwrap_err().to_string();
-        assert!(!e.contains("secret") && !e.contains("X-Amz-Signature"), "{e}");
+        assert!(
+            !e.contains("secret") && !e.contains("X-Amz-Signature"),
+            "{e}"
+        );
         let mut b = builder();
         b.manifest_uri = bad.into();
         assert!(b.build_signed(&single).is_err(), "{bad}");
@@ -277,9 +296,13 @@ fn a_receipt_carries_no_key_and_refuses_a_uri_with_a_query_or_user_info() {
 #[test]
 fn the_committed_release_b_receipt_verifies_from_its_stored_bytes() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/manifests");
-    let k = key("6b");
+    // The fixture key every signed fixture uses (fixtures README).
+    let k = key("11");
     for (name, keyring) in [
-        ("release-b-receipt-unsigned.json", ManifestKeyring::default()),
+        (
+            "release-b-receipt-unsigned.json",
+            ManifestKeyring::default(),
+        ),
         ("release-b-receipt-signed.json", ManifestKeyring::single(k)),
     ] {
         let bytes = std::fs::read(dir.join(name)).unwrap();

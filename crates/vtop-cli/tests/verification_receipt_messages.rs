@@ -107,10 +107,13 @@ async fn a_receipt_that_cannot_be_written_is_a_rate_limited_warning_that_leaks_n
     let message = event["fields"]["message"].as_str().unwrap();
     for part in [
         // what happened
-        &format!("the verification receipt for batch {} could not be written", batch_ids[0]),
+        &format!(
+            "the verification receipt for batch {} could not be written",
+            batch_ids[0]
+        ),
         "InternalError",
         // what the engine did
-        "the batch is verified and was committed regardless; batches are unaffected",
+        "the batch is verified and is committed regardless; batches are unaffected",
         // what to do
         "recovery writes the receipt if the batch is still VERIFIED at the next start",
         "vtopctl scrub reports it missing",
@@ -120,12 +123,18 @@ async fn a_receipt_that_cannot_be_written_is_a_rate_limited_warning_that_leaks_n
     }
     // Redaction: no key, no MAC value, no URL query, anywhere in the log.
     assert!(!raw.contains(&key_hex), "the key leaked: {raw}");
-    assert!(!raw.contains("X-Amz-Signature=") && !raw.contains("X-Amz-Credential="), "{raw}");
+    assert!(
+        !raw.contains("X-Amz-Signature=") && !raw.contains("X-Amz-Credential="),
+        "{raw}"
+    );
     assert!(message.contains("?[redacted]"), "{message}");
     let hex_run = message
         .split(|c: char| !c.is_ascii_hexdigit())
         .map(str::len)
         .max()
         .unwrap_or(0);
-    assert!(hex_run < 64, "a digest or MAC value in the warning: {message}");
+    assert!(
+        hex_run < 64,
+        "a digest or MAC value in the warning: {message}"
+    );
 }

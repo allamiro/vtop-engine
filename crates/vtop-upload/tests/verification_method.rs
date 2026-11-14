@@ -330,11 +330,21 @@ async fn the_mock_reports_the_method_it_ran() {
     let plain = MockBackend::new();
     plain.put_object(&file, "s3://b/k", sha()).await.unwrap();
     let r = plain.verify_object("s3://b/k", 7, sha()).await.unwrap();
-    assert_eq!((r.passed, r.method), (true, Some(VerificationMethod::ReadBack)));
+    assert_eq!(
+        (r.passed, r.method),
+        (true, Some(VerificationMethod::ReadBack))
+    );
     let r = plain.verify_object("s3://b/k", 7, None).await.unwrap();
-    assert_eq!((r.passed, r.method), (true, Some(VerificationMethod::SizeOnly)));
+    assert_eq!(
+        (r.passed, r.method),
+        (true, Some(VerificationMethod::SizeOnly))
+    );
     let r = plain
-        .verify_object("s3://b/k", 7, Some(ObjectChecksum::new("sha256", &"0".repeat(64))))
+        .verify_object(
+            "s3://b/k",
+            7,
+            Some(ObjectChecksum::new("sha256", &"0".repeat(64))),
+        )
         .await
         .unwrap();
     assert_eq!((r.passed, r.method), (false, None), "{}", r.message);
@@ -342,23 +352,41 @@ async fn the_mock_reports_the_method_it_ran() {
     let limited = MockBackend::limited();
     limited.put_object(&file, "s3://b/k", sha()).await.unwrap();
     let r = limited.verify_object("s3://b/k", 7, sha()).await.unwrap();
-    assert_eq!((r.backend_limited, r.method), (true, Some(VerificationMethod::SizeOnly)));
+    assert_eq!(
+        (r.backend_limited, r.method),
+        (true, Some(VerificationMethod::SizeOnly))
+    );
 
     let s3 = MockBackend::new().with_s3_checksum_semantics();
     s3.put_object(&file, "s3://b/single", sha()).await.unwrap();
     let r = s3.verify_object("s3://b/single", 7, sha()).await.unwrap();
-    assert_eq!((r.passed, r.method), (true, Some(VerificationMethod::StoreChecksum)), "{}", r.message);
+    assert_eq!(
+        (r.passed, r.method),
+        (true, Some(VerificationMethod::StoreChecksum)),
+        "{}",
+        r.message
+    );
     let created = s3
         .create_multipart_upload("s3://b/multi", "application/octet-stream", sha())
         .await
         .unwrap();
     let part = s3
-        .upload_part("s3://b/multi", &created.upload_id, 1, bytes::Bytes::from_static(b"payload"))
+        .upload_part(
+            "s3://b/multi",
+            &created.upload_id,
+            1,
+            bytes::Bytes::from_static(b"payload"),
+        )
         .await
         .unwrap();
     s3.complete_multipart_upload("s3://b/multi", &created.upload_id, &[part])
         .await
         .unwrap();
     let r = s3.verify_object("s3://b/multi", 7, sha()).await.unwrap();
-    assert_eq!((r.passed, r.method), (true, Some(VerificationMethod::ReadBack)), "{}", r.message);
+    assert_eq!(
+        (r.passed, r.method),
+        (true, Some(VerificationMethod::ReadBack)),
+        "{}",
+        r.message
+    );
 }

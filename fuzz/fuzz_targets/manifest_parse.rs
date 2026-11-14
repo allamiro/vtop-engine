@@ -7,7 +7,9 @@
 //! return `Err`, never panic, and neither may the self-hash and MAC checks that
 //! run on anything that parses, with one key or with a keyring that picks the
 //! key by the manifest's `mac_key_id` (#685). The legacy decode-and-re-encode helpers are
-//! still exercised on anything that decodes into a `VtopManifest`.
+//! still exercised on anything that decodes into a `VtopManifest`. The same bytes go
+//! through the verification receipt parser (#671 release B), which shares the strict
+//! 0.4 parser and canonical form and is read from the same store.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -16,6 +18,20 @@ use vtop_core::manifest::{ParsedManifest, VtopManifest};
 fuzz_target!(|data: &[u8]| {
     // Read on a newer-version claim, before anything is authenticated.
     let _ = vtop_core::manifest::claimed_binding(data);
+    if let Ok(receipt) = vtop_core::manifest::ParsedReceipt::from_slice(data) {
+        let _ = receipt.verify_self_hash();
+        let _ = receipt
+            .authenticate(&vtop_core::manifest::ManifestKeyring::default())
+            .result
+            .map_err(|e| e.to_string());
+        let key = vtop_core::manifest::ManifestMacKey::from_hex(&"11".repeat(32)).unwrap();
+        // A hostile `receipt.mac_key_id` goes through the lookup and the
+        // messages that quote it.
+        let _ = receipt
+            .authenticate(&vtop_core::manifest::ManifestKeyring::single(key))
+            .result
+            .map_err(|e| e.to_string());
+    }
     if let Ok(stored) = ParsedManifest::from_slice(data) {
         let _ = stored.verify_self_hash();
         let _ = stored.verify_authentication(None);

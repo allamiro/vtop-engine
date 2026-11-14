@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use vtop_core::checksum::digest_reader;
+use vtop_core::effective_config::VerificationMethod;
 use vtop_core::errors::VtopError;
 use vtop_core::types::ChecksumAlgorithm;
 
@@ -313,21 +314,34 @@ pub struct VerificationResult {
     /// to a weaker check (e.g. size + existence only).
     pub backend_limited: bool,
     pub message: String,
+    /// The check that ran (#671 release B, D9): a checksum the store
+    /// computed over the body, a read-back of the body, or size and
+    /// existence only. Set by the backend that ran it, so a verification
+    /// receipt names what happened rather than what the configuration
+    /// implies: native S3 falls back from the store's SHA-256 to a read-back
+    /// for a multipart object. `None` for a failed check, and for a backend
+    /// that does not say; a receipt then records `unspecified`, never a
+    /// guess.
+    pub method: Option<VerificationMethod>,
 }
 
 impl VerificationResult {
+    /// A strong pass. Name the check with [`VerificationResult::by`].
     pub fn passed(message: impl Into<String>) -> Self {
         Self {
             passed: true,
             backend_limited: false,
             message: message.into(),
+            method: None,
         }
     }
+    /// A size-and-existence pass: by definition `size_only`.
     pub fn limited(message: impl Into<String>) -> Self {
         Self {
             passed: true,
             backend_limited: true,
             message: message.into(),
+            method: Some(VerificationMethod::SizeOnly),
         }
     }
     pub fn failed(message: impl Into<String>) -> Self {
@@ -335,7 +349,16 @@ impl VerificationResult {
             passed: false,
             backend_limited: false,
             message: message.into(),
+            method: None,
         }
+    }
+    /// The same result, naming the check that ran. A failed result names
+    /// none: nothing was confirmed by any method.
+    pub fn by(mut self, method: VerificationMethod) -> Self {
+        if self.passed {
+            self.method = Some(method);
+        }
+        self
     }
 }
 
@@ -354,6 +377,7 @@ pub(crate) fn judge_service_sha256(
     match service {
         Some(stored) if stored.eq_ignore_ascii_case(expected_hex) => {
             VerificationResult::passed("S3 service-computed SHA-256 verified")
+                .by(VerificationMethod::StoreChecksum)
         }
         Some(_) => VerificationResult::failed("S3 service-computed SHA-256 mismatch"),
         None => VerificationResult::limited(
@@ -433,7 +457,8 @@ where
             VerificationResult::passed(format!(
                 "{backend}: stored content {algorithm} verified",
                 algorithm = algo.as_str()
-            )),
+            ))
+            .by(VerificationMethod::ReadBack),
             false,
         ))
     } else {

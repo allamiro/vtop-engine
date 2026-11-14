@@ -336,16 +336,34 @@ impl ManifestKeyring {
     /// Check `manifest`'s MAC over `bytes` (its version's authenticated
     /// bytes) with the key it names. See [`KeyResult`] for the outcomes.
     pub(crate) fn check(&self, manifest: &VtopManifest, bytes: &[u8]) -> Authentication {
+        self.check_document(
+            "manifest",
+            manifest.manifest.mac_key_id.as_deref(),
+            manifest.manifest.mac.as_deref(),
+            bytes,
+        )
+    }
+
+    /// Check a MAC over `bytes` with the key `named` (the document's key id,
+    /// or `None` for a document that names none), by the same rules for
+    /// every signed document: a manifest, or a verification receipt (#671).
+    /// `what` names the document in the messages.
+    pub(crate) fn check_document(
+        &self,
+        what: &str,
+        named: Option<&str>,
+        mac: Option<&str>,
+        bytes: &[u8],
+    ) -> Authentication {
         if self.entries.is_empty() {
             return Authentication {
                 key: None,
                 result: Ok(()),
             };
         }
-        let named = manifest.manifest.mac_key_id.as_deref();
         if let (Some(id), [only]) = (named, self.entries.as_slice()) {
             if only.id.is_none() {
-                return self.check_with_the_one_key(only, id, manifest, bytes);
+                return self.check_with_the_one_key(what, only, id, mac, bytes);
             }
         }
         let entry = match named {
@@ -356,8 +374,8 @@ impl ManifestKeyring {
                         id.to_owned(),
                         KeyResult::RetiredKey,
                         format!(
-                            "manifest is unauthenticated: it names key id {}, which is retired \
-                             (manifest.mac.retired); manifests signed with a withdrawn key no \
+                            "{what} is unauthenticated: it names key id {}, which is retired \
+                             (manifest.mac.retired); {what}s signed with a withdrawn key no \
                              longer authenticate. Expected if the key was withdrawn; otherwise \
                              move the id back to manifest.mac.keys",
                             shown_id(id)
@@ -369,7 +387,7 @@ impl ManifestKeyring {
                         KEY_LABEL_OTHER.to_owned(),
                         KeyResult::UnknownKey,
                         format!(
-                            "manifest is unauthenticated: it names key id {}, which is not in \
+                            "{what} is unauthenticated: it names key id {}, which is not in \
                              this keyring (it holds {}); if the key is yours, add it to \
                              manifest.mac.keys as a verify-only entry",
                             shown_id(id),
@@ -384,41 +402,42 @@ impl ManifestKeyring {
                     return Authentication::failed(
                         KEY_LABEL_NONE.to_owned(),
                         KeyResult::UnknownKey,
-                        "manifest is unauthenticated: it names no key id and no key in \
-                         manifest.mac.keys is marked legacy: true; mark the key that signed \
-                         manifests before key ids (the manifest_mac_key_env key) as legacy"
-                            .to_owned(),
+                        format!(
+                            "{what} is unauthenticated: it names no key id and no key in \
+                             manifest.mac.keys is marked legacy: true; mark the key that signed \
+                             manifests before key ids (the manifest_mac_key_env key) as legacy"
+                        ),
                     )
                 }
             },
         };
         let label = entry_label(entry);
-        // Which key the message names: the id the manifest gave, the legacy
-        // key standing in for a manifest that gave none, or nothing for the
+        // Which key the message names: the id the document gave, the legacy
+        // key standing in for a document that gave none, or nothing for the
         // `manifest_mac_key_env` key, whose messages predate key ids.
         let which = match (named, entry.id.as_deref()) {
             (Some(id), _) => format!(" for key id {}", shown_id(id)),
             (None, Some(id)) => format!(
-                " for the legacy key {} (the manifest names no key id)",
+                " for the legacy key {} (the {what} names no key id)",
                 shown_id(id)
             ),
             (None, None) => String::new(),
         };
-        let Some(actual_hex) = manifest.manifest.mac.as_deref() else {
+        let Some(actual_hex) = mac else {
             let why = match entry.id {
                 None => {
-                    "manifest MAC is required because manifest_mac_key_env is configured".to_owned()
+                    format!("{what} MAC is required because manifest_mac_key_env is configured")
                 }
-                Some(_) => format!("manifest MAC is required{which}, but the manifest has none"),
+                Some(_) => format!("{what} MAC is required{which}, but the {what} has none"),
             };
             return Authentication::failed(label, KeyResult::Failed, why);
         };
-        let result = match decode_mac(actual_hex) {
+        let result = match decode_mac(what, actual_hex) {
             Err(why) => Err(why),
             Ok(actual) if constant_time_eq(entry.key.authenticate(bytes).as_bytes(), &actual) => {
                 Ok(())
             }
-            Ok(_) => Err(format!("manifest MAC verification failed{which}")),
+            Ok(_) => Err(format!("{what} MAC verification failed{which}")),
         };
         match result {
             Ok(()) => Authentication {
@@ -432,7 +451,7 @@ impl ManifestKeyring {
         }
     }
 
-    /// The `manifest_mac_key_env` key meets a manifest that names a key id
+    /// The `manifest_mac_key_env` key meets a document that names a key id
     /// (review of #703). It holds one key and no ids, so it verifies with
     /// that key and ignores the id, exactly as v0.8.0 does: an engine still
     /// on the single-key setting mid-rotation keeps verifying what keyring
@@ -441,17 +460,15 @@ impl ManifestKeyring {
     /// as an unknown key, naming the id.
     fn check_with_the_one_key(
         &self,
+        what: &str,
         only: &Entry,
         id: &str,
-        manifest: &VtopManifest,
+        mac: Option<&str>,
         bytes: &[u8],
     ) -> Authentication {
-        let verified = manifest
-            .manifest
-            .mac
-            .as_deref()
+        let verified = mac
             .ok_or(())
-            .and_then(|hex| decode_mac(hex).map_err(drop))
+            .and_then(|hex| decode_mac(what, hex).map_err(drop))
             .is_ok_and(|actual| constant_time_eq(only.key.authenticate(bytes).as_bytes(), &actual));
         if verified {
             return Authentication {
@@ -466,7 +483,7 @@ impl ManifestKeyring {
             KEY_LABEL_OTHER.to_owned(),
             KeyResult::UnknownKey,
             format!(
-                "manifest is unauthenticated: it names key id {}, and the one \
+                "{what} is unauthenticated: it names key id {}, and the one \
                  manifest_mac_key_env key does not verify it; if {} is another of your keys, \
                  configure manifest.mac with it as a verify-only entry",
                 shown_id(id),
@@ -495,10 +512,10 @@ fn entry_label(entry: &Entry) -> String {
         .unwrap_or_else(|| KEY_LABEL_NONE.to_owned())
 }
 
-fn decode_mac(actual_hex: &str) -> Result<Vec<u8>, String> {
-    let actual = hex::decode(actual_hex).map_err(|_| "manifest MAC is not valid hex".to_owned())?;
+fn decode_mac(what: &str, actual_hex: &str) -> Result<Vec<u8>, String> {
+    let actual = hex::decode(actual_hex).map_err(|_| format!("{what} MAC is not valid hex"))?;
     if actual.len() != 32 {
-        return Err("manifest MAC must be exactly 32 bytes".into());
+        return Err(format!("{what} MAC must be exactly 32 bytes"));
     }
     Ok(actual)
 }

@@ -83,6 +83,10 @@ pub struct EffectiveStream {
     /// Global (#671 release B): the version new manifests are written in.
     #[serde(rename = "manifest.write_version")]
     pub manifest_write_version: EffectiveSetting<String>,
+    /// Global (#671 release B): whether a verification receipt is written
+    /// beside each manifest once its batch is VERIFIED.
+    #[serde(rename = "manifest.verification_receipts")]
+    pub manifest_verification_receipts: EffectiveSetting<bool>,
     #[serde(rename = "upload.require_object_versioning")]
     pub require_object_versioning: EffectiveSetting<bool>,
     #[serde(rename = "upload.backend")]
@@ -398,6 +402,10 @@ pub fn effective_streams(config: &VtopConfig, streams: Option<&StreamsConfig>) -
             manifest_write_version: EffectiveSetting {
                 value: config.manifest.write_version.as_str().to_owned(),
                 origin: global("manifest.write_version"),
+            },
+            manifest_verification_receipts: EffectiveSetting {
+                value: config.manifest.verification_receipts,
+                origin: global("manifest.verification_receipts"),
             },
             require_object_versioning: EffectiveSetting {
                 value: config.upload.require_object_versioning,

@@ -3344,7 +3344,9 @@ async fn recovery_writes_a_missing_receipt_and_never_overwrites_one() {
     use vtop_adapters::base::SourceAdapter;
     use vtop_adapters::FileSource;
     use vtop_cli::testkit::{pipeline, FailCommitAdapter};
-    use vtop_core::manifest::{ManifestKeyring, ParsedReceipt, RECEIPT_ORIGIN_ENGINE, RECEIPT_ORIGIN_RECOVERY};
+    use vtop_core::manifest::{
+        ManifestKeyring, ParsedReceipt, RECEIPT_ORIGIN_ENGINE, RECEIPT_ORIGIN_RECOVERY,
+    };
     use vtop_core::partitioning::receipt_uri;
     use vtop_upload::UploadBackend;
 
@@ -3418,24 +3420,37 @@ async fn recovery_writes_a_missing_receipt_and_never_overwrites_one() {
     let summary = engine.recover().await.unwrap();
     assert_eq!(summary.committed, 2, "{summary:?}");
     for row in &rows {
-        let got = engine.store.get_batch(&row.batch_id).await.unwrap().unwrap();
+        let got = engine
+            .store
+            .get_batch(&row.batch_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.state, BatchState::SourceCommitted);
     }
 
     let repaired_receipt =
         ParsedReceipt::from_slice(&mock.get_object(&uris[0]).await.unwrap()).unwrap();
-    assert!(repaired_receipt.authenticate(&ManifestKeyring::default()).is_ok());
+    assert!(repaired_receipt
+        .authenticate(&ManifestKeyring::default())
+        .is_ok());
     let r = repaired_receipt.fields();
     assert_eq!(r.origin, RECEIPT_ORIGIN_RECOVERY);
     assert_eq!(r.batch_id, rows[0].batch_id);
-    assert_eq!(Some(r.manifest.sha256.as_str()), rows[0].manifest_sha256.as_deref());
+    assert_eq!(
+        Some(r.manifest.sha256.as_str()),
+        rows[0].manifest_sha256.as_deref()
+    );
     assert_eq!(r.manifest.version_id, rows[0].manifest_version_id);
     assert_eq!(
         Some(r.verification.class.as_str()),
         rows[0].verification_class.map(VerificationClass::as_str),
         "the class the batch was verified with, from the ledger"
     );
-    assert_eq!(r.verification.method, "read_back", "what recovery's re-check ran");
+    assert_eq!(
+        r.verification.method, "read_back",
+        "what recovery's re-check ran"
+    );
     assert_eq!(repaired(), before + 1);
 
     assert_eq!(
@@ -3443,7 +3458,11 @@ async fn recovery_writes_a_missing_receipt_and_never_overwrites_one() {
         engine_written,
         "the engine's receipt is left as it was"
     );
-    assert_eq!(mock.version_count(&uris[1]), versions_before, "and not written again");
+    assert_eq!(
+        mock.version_count(&uris[1]),
+        versions_before,
+        "and not written again"
+    );
     let kept = ParsedReceipt::from_slice(&engine_written).unwrap();
     assert_eq!(kept.fields().origin, RECEIPT_ORIGIN_ENGINE);
 }

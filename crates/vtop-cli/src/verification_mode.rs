@@ -52,6 +52,19 @@ pub(crate) fn announce(config: &VtopConfig, streams: &StreamsConfig) {
         "{}",
         manifest_version_notice(config)
     );
+    if let Some(notice) = receipts_notice(config) {
+        tracing::info!(verification_receipts = true, "{notice}");
+    }
+    if let Some(mx) = telemetry::metrics() {
+        // At zero from the start, so an alert on increase() sees the first.
+        if config.manifest.verification_receipts {
+            for result in telemetry::RECEIPT_WRITE_RESULTS {
+                mx.verification_receipts_total
+                    .with_label_values(&[config.engine.tenant.as_str(), result])
+                    .inc_by(0);
+            }
+        }
+    }
     // The manifest keys by id (#685): which signs, which only verify, which
     // are retired. Ids and source kinds only, never a value. Until the audit
     // stream (#694) exists, this line is the record of an active-key change.
@@ -109,6 +122,21 @@ pub(crate) fn manifest_version_notice(config: &VtopConfig) -> String {
              0.4 manifests already written stay readable"
             .to_owned(),
     }
+}
+
+/// The startup line for `manifest.verification_receipts` (#671 release B):
+/// what is written, where, who sees it, and that it never holds a batch
+/// back. `None` with receipts off.
+pub(crate) fn receipts_notice(config: &VtopConfig) -> Option<String> {
+    config.manifest.verification_receipts.then(|| {
+        "manifest.verification_receipts = true: after each batch is verified, the engine \
+         writes <batch_id>.receipt.json beside each manifest, naming the verification class \
+         and the method the store ran, signed like the manifest; a consumer that lists the \
+         prefix will see these objects. Writing one is not part of the commit: a receipt that \
+         cannot be written never holds a batch back, and vtopctl scrub reports any that are \
+         missing"
+            .to_owned()
+    })
 }
 
 /// The `vtop_manifest_authentications_total` series created at zero at

@@ -37,13 +37,15 @@ use tokio::time::Instant;
 use tracing::Instrument;
 use vtop_core::errors::VtopError;
 use vtop_core::manifest::{
-    KeyOutcome, KeyResult, ManifestKeyring, ParsedManifest, MAX_MANIFEST_BYTES,
+    KeyOutcome, KeyResult, ManifestKeyring, ObjectMetadata, ParsedManifest, ParsedReceipt,
+    MAX_MANIFEST_BYTES, MAX_RECEIPT_BYTES,
 };
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::ChecksumAlgorithm;
 use vtop_state::BatchRecord;
 use vtop_upload::{
     ObjectChecksum, ObjectLockMode, RetentionCheck, RetentionExpectation, UploadBackend,
+    VerificationMethod,
 };
 
 /// What a check found. The `result` label of `vtop_scrub_objects_total`: a
@@ -129,6 +131,14 @@ pub struct BatchCheck {
     /// and what it found. `None` when no key is configured or the check did
     /// not get that far.
     pub key: Option<KeyOutcome>,
+    /// The check the backend ran on the object (#671 release B, D9), when
+    /// the object was verified (`ok` or `limited`): what a receipt recovery
+    /// writes names.
+    pub method: Option<VerificationMethod>,
+    /// The object as the authenticated manifest describes it, when the
+    /// object was verified against it. Boxed: a `BatchCheck` is also an
+    /// error type.
+    pub object: Option<Box<ObjectMetadata>>,
 }
 
 impl BatchCheck {
@@ -137,6 +147,22 @@ impl BatchCheck {
             result,
             detail: detail.into(),
             key: None,
+            method: None,
+            object: None,
+        }
+    }
+
+    /// A check whose object was verified, recording how and what.
+    fn verified(
+        result: ScrubResult,
+        detail: impl Into<String>,
+        method: Option<VerificationMethod>,
+        object: &ObjectMetadata,
+    ) -> Self {
+        Self {
+            method,
+            object: Some(Box::new(object.clone())),
+            ..Self::new(result, detail)
         }
     }
 }
@@ -411,11 +437,18 @@ async fn check_authenticated(
             ScrubResult::Mismatched,
             format!("object {uri}: {}", result.message),
         ),
-        Ok(result) if result.backend_limited => BatchCheck::new(
+        Ok(result) if result.backend_limited => BatchCheck::verified(
             ScrubResult::Limited,
             format!("object {uri}: {}", result.message),
+            result.method,
+            &manifest.fields().object,
         ),
-        Ok(result) => BatchCheck::new(ScrubResult::Ok, result.message),
+        Ok(result) => BatchCheck::verified(
+            ScrubResult::Ok,
+            result.message,
+            result.method,
+            &manifest.fields().object,
+        ),
     }
 }
 
@@ -554,6 +587,184 @@ async fn retention_of(
     Ok(worst)
 }
 
+/// What the receipt check found for one committed batch (#671 release B):
+/// the verification receipt beside its manifest. Counted in
+/// `vtop_scrub_receipts_total`, its own family, so the `result` set of
+/// `vtop_scrub_objects_total` does not change. The scrub only reports: it
+/// writes no receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptResult {
+    /// It authenticates and binds the batch as the ledger recorded it.
+    Ok,
+    /// No receipt is stored. Normal for batches archived before
+    /// `manifest.verification_receipts` was enabled, so a finding only
+    /// under `--require-receipts`.
+    Missing,
+    /// It does not parse, or fails its self-hash or MAC with a key this scrub
+    /// holds (a tampered receipt, or one forged without the key).
+    Invalid,
+    /// It names a key this scrub does not hold, or a retired one (#685):
+    /// not proven bad, and not checkable here.
+    Unauthenticated,
+    /// It authenticates, and is not this batch's as the ledger recorded it:
+    /// another batch, another manifest digest or version, another object, or
+    /// another verification class than the ledger's (#664).
+    Mismatched,
+    /// The store could not be read for a reason other than absence.
+    Unreadable,
+}
+
+impl ReceiptResult {
+    pub const ALL: [ReceiptResult; 6] = [
+        ReceiptResult::Ok,
+        ReceiptResult::Missing,
+        ReceiptResult::Invalid,
+        ReceiptResult::Unauthenticated,
+        ReceiptResult::Mismatched,
+        ReceiptResult::Unreadable,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReceiptResult::Ok => "ok",
+            ReceiptResult::Missing => "missing",
+            ReceiptResult::Invalid => "invalid",
+            ReceiptResult::Unauthenticated => "unauthenticated",
+            ReceiptResult::Mismatched => "mismatched",
+            ReceiptResult::Unreadable => "unreadable",
+        }
+    }
+
+    /// Whether this result fails the scrub: everything but `ok`, and
+    /// `missing` only when receipts are required.
+    pub fn is_finding(self, required: bool) -> bool {
+        match self {
+            ReceiptResult::Ok => false,
+            ReceiptResult::Missing => required,
+            _ => true,
+        }
+    }
+}
+
+/// Check the verification receipt beside `rec`'s manifest: read at its key
+/// (receipts are not pinned), authenticated with the key it names (#685),
+/// then bound to the ledger row: the batch, the manifest's URI, digest and
+/// pinned version, the object, and the class the ledger recorded.
+async fn receipt_of(
+    backend: &dyn UploadBackend,
+    keyring: &ManifestKeyring,
+    rec: &BatchRecord,
+) -> (ReceiptResult, String) {
+    let mismatched = |why: String| (ReceiptResult::Mismatched, why);
+    let Some(muri) = rec.manifest_uri.as_deref() else {
+        return mismatched("the ledger row names no manifest, so no receipt key".into());
+    };
+    let Some(ruri) = vtop_core::partitioning::receipt_uri(muri) else {
+        return mismatched(format!(
+            "manifest {muri} does not end in .manifest.json, so it has no receipt key"
+        ));
+    };
+    let bytes = match backend.get_object_bounded(&ruri, MAX_RECEIPT_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(e) if looks_missing(&e) => {
+            return (
+                ReceiptResult::Missing,
+                format!("verification receipt {ruri} is not in the store"),
+            )
+        }
+        Err(e) => {
+            return (
+                ReceiptResult::Unreadable,
+                format!(
+                    "verification receipt {ruri} could not be read: {}",
+                    vtop_upload::multipart::redact_urls(&e.to_string())
+                ),
+            )
+        }
+    };
+    let receipt = match ParsedReceipt::from_slice(&bytes) {
+        Ok(receipt) => receipt,
+        Err(e) => {
+            return (
+                ReceiptResult::Invalid,
+                format!("verification receipt {ruri} does not parse: {e}"),
+            )
+        }
+    };
+    let authentication = receipt.authenticate(keyring);
+    if let Err(e) = authentication.result {
+        let result = match authentication.key.map(|k| k.result) {
+            Some(KeyResult::UnknownKey | KeyResult::RetiredKey) => ReceiptResult::Unauthenticated,
+            _ => ReceiptResult::Invalid,
+        };
+        return (
+            result,
+            format!("verification receipt {ruri} does not authenticate: {e}"),
+        );
+    }
+    let r = receipt.fields();
+    if r.batch_id != rec.batch_id {
+        return mismatched(format!(
+            "verification receipt {ruri} is batch {}'s, not {}",
+            r.batch_id, rec.batch_id
+        ));
+    }
+    if r.manifest.uri != muri || Some(r.object.uri.as_str()) != rec.object_uri.as_deref() {
+        return mismatched(format!(
+            "verification receipt {ruri} names manifest {} and object {}, the ledger {muri} and {}",
+            r.manifest.uri,
+            r.object.uri,
+            rec.object_uri.as_deref().unwrap_or("nothing")
+        ));
+    }
+    let digest_bound = rec
+        .manifest_sha256
+        .as_deref()
+        .is_some_and(|want| !want.is_empty() && want.eq_ignore_ascii_case(&r.manifest.sha256));
+    if !digest_bound {
+        return mismatched(format!(
+            "verification receipt {ruri} binds manifest digest {}, the ledger recorded {}",
+            r.manifest.sha256,
+            rec.manifest_sha256.as_deref().unwrap_or("nothing")
+        ));
+    }
+    if let (Some(want), Some(got)) = (
+        rec.manifest_version_id.as_deref(),
+        r.manifest.version_id.as_deref(),
+    ) {
+        if want != got {
+            return mismatched(format!(
+                "verification receipt {ruri} names manifest version {got}, the ledger pinned {want}"
+            ));
+        }
+    }
+    if rec
+        .object_size_bytes
+        .is_some_and(|want| want < 0 || want as u64 != r.object.size_bytes)
+        || rec
+            .object_sha256
+            .as_deref()
+            .is_some_and(|want| !want.is_empty() && !want.eq_ignore_ascii_case(&r.object.checksum))
+    {
+        return mismatched(format!(
+            "verification receipt {ruri} and the ledger disagree on object {}'s size or digest",
+            r.object.uri
+        ));
+    }
+    if let Some(class) = rec.verification_class {
+        if r.verification.class != class.as_str() {
+            return mismatched(format!(
+                "verification receipt {ruri} says the batch was verified {}, the ledger \
+                 recorded class {}",
+                r.verification.class,
+                class.as_str()
+            ));
+        }
+    }
+    (ReceiptResult::Ok, String::new())
+}
+
 // ---- What to check ----------------------------------------------------------
 
 /// Where a committed row was read from.
@@ -626,6 +837,12 @@ pub struct ScrubOptions {
     /// `--check-retention` (#684): also read each committed batch's S3 Object
     /// Lock retention and expect this mode.
     pub check_retention: Option<ObjectLockMode>,
+    /// Also check each committed batch's verification receipt (#671
+    /// release B): set when the config writes receipts, or by
+    /// `--require-receipts`. A missing one is counted, not a finding.
+    pub check_receipts: bool,
+    /// `--require-receipts`: check receipts, and a missing one is a finding.
+    pub require_receipts: bool,
 }
 
 pub const DEFAULT_CONCURRENCY: usize = 4;
@@ -641,6 +858,8 @@ impl Default for ScrubOptions {
             sample: None,
             seed: None,
             check_retention: None,
+            check_receipts: false,
+            require_receipts: false,
         }
     }
 }
@@ -904,6 +1123,9 @@ pub struct ScrubFinding {
     /// Set for a retention finding (#684); `result` is then the content
     /// check's, which passed.
     pub retention: Option<RetentionResult>,
+    /// Set for a receipt finding (#671 release B); `result` is then the
+    /// content check's.
+    pub receipt: Option<ReceiptResult>,
     pub detail: String,
 }
 
@@ -948,6 +1170,9 @@ pub struct ScrubReport {
     /// `--check-retention` results by [`RetentionResult`] (#684), every one
     /// at zero when nothing had it; empty without the flag.
     pub retention: BTreeMap<&'static str, u64>,
+    /// Receipt results by [`ReceiptResult`] (#671 release B), every one at
+    /// zero when nothing had it; empty when receipts were not checked.
+    pub receipts: BTreeMap<&'static str, u64>,
     pub findings: Vec<ScrubFinding>,
     pub cursor: Option<CursorProgress>,
     pub sample_seed: Option<u64>,
@@ -1074,6 +1299,12 @@ pub async fn scrub_held(
     } else {
         BTreeMap::new()
     };
+    let check_receipts = opts.check_receipts || opts.require_receipts;
+    let mut receipt_counts: BTreeMap<&'static str, u64> = if check_receipts {
+        ReceiptResult::ALL.iter().map(|r| (r.as_str(), 0)).collect()
+    } else {
+        BTreeMap::new()
+    };
     let mut checked_ids = Vec::with_capacity(selected.len());
     let selected_count = selected.len();
 
@@ -1107,6 +1338,13 @@ pub async fn scrub_held(
                         }
                     }
                 }
+                // The receipt beside the manifest (#671 release B),
+                // whatever the content check found: it is its own evidence.
+                let receipt = if check_receipts {
+                    Some(receipt_of(backend, keyring, &row.record).await)
+                } else {
+                    None
+                };
                 span.record("result", check.result.as_str());
                 span.record(
                     "otel.status_code",
@@ -1116,12 +1354,34 @@ pub async fn scrub_held(
                         "ok"
                     },
                 );
-                (row, check, retention)
+                (row, check, retention, receipt)
             })
             // In order, so the cursor only ever passes a contiguous run of
             // checked batches.
             .buffered(concurrency);
-        while let Some((row, check, retention)) = checks.next().await {
+        while let Some((row, check, retention, receipt)) = checks.next().await {
+            if let Some((found, detail)) = receipt {
+                *receipt_counts.entry(found.as_str()).or_default() += 1;
+                if found.is_finding(opts.require_receipts) {
+                    tracing::warn!(
+                        batch_id = %row.record.batch_id,
+                        receipt = found.as_str(),
+                        detail = %detail,
+                        "scrub receipt finding"
+                    );
+                    findings.push(ScrubFinding {
+                        batch_id: row.record.batch_id.clone(),
+                        result: check.result,
+                        origin: row.origin,
+                        object_uri: row.record.object_uri.clone(),
+                        manifest_uri: row.record.manifest_uri.clone(),
+                        manifest_version_id: row.record.manifest_version_id.clone(),
+                        retention: None,
+                        receipt: Some(found),
+                        detail,
+                    });
+                }
+            }
             if let Some(found) = retention {
                 *retention_counts.entry(found.as_str()).or_default() += 1;
                 if found.is_finding() {
@@ -1142,6 +1402,7 @@ pub async fn scrub_held(
                         manifest_uri: row.record.manifest_uri.clone(),
                         manifest_version_id: row.record.manifest_version_id.clone(),
                         retention: Some(found),
+                        receipt: None,
                         detail: format!(
                             "the object or its manifest {what} (S3 Object Lock, expected {}); \
                              it can be deleted or overwritten. Re-apply the retention with \
@@ -1171,6 +1432,7 @@ pub async fn scrub_held(
                     manifest_uri: row.record.manifest_uri.clone(),
                     manifest_version_id: row.record.manifest_version_id.clone(),
                     retention: None,
+                    receipt: None,
                     detail: check.detail,
                 });
             }
@@ -1228,6 +1490,7 @@ pub async fn scrub_held(
         results,
         manifest_keys,
         retention: retention_counts,
+        receipts: receipt_counts,
         findings,
         cursor: progress,
         sample_seed,
@@ -1309,14 +1572,25 @@ impl ScrubReport {
                     .join(" ")
             ));
         }
+        if !self.receipts.is_empty() {
+            out.push(format!(
+                "receipts: {}",
+                self.receipts
+                    .iter()
+                    .map(|(result, n)| format!("{result}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
         for finding in &self.findings {
             let origin = match finding.origin {
                 RowOrigin::Ledger => "ledger",
                 RowOrigin::Digest => "prune digest",
             };
-            let result = match finding.retention {
-                Some(retention) => format!("retention {}", retention.as_str()),
-                None => finding.result.as_str().to_owned(),
+            let result = match (finding.retention, finding.receipt) {
+                (Some(retention), _) => format!("retention {}", retention.as_str()),
+                (None, Some(receipt)) => format!("receipt {}", receipt.as_str()),
+                (None, None) => finding.result.as_str().to_owned(),
             };
             out.push(format!(
                 "FAIL {result} {} (row from the {origin}): {}",
@@ -1395,6 +1669,32 @@ impl ScrubReport {
                 ));
             }
         }
+        // Only when receipts were checked (#671 release B), in their own
+        // family; a run that did not check them carries the totals forward.
+        let receipts: BTreeMap<String, u64> = if self.receipts.is_empty() {
+            carried.receipts.clone()
+        } else {
+            self.receipts
+                .iter()
+                .map(|(result, n)| {
+                    let total = carried.receipts.get(*result).copied().unwrap_or(0) + n;
+                    ((*result).to_owned(), total)
+                })
+                .collect()
+        };
+        if !receipts.is_empty() {
+            out.push_str(
+                "# HELP vtop_scrub_receipts_total Committed batches whose verification receipt \
+                 the scrub checked, by result: ok; missing (a finding only with \
+                 --require-receipts); invalid, unauthenticated, mismatched and unreadable \
+                 (findings)\n# TYPE vtop_scrub_receipts_total counter\n",
+            );
+            for (result, total) in &receipts {
+                out.push_str(&format!(
+                    "vtop_scrub_receipts_total{{result=\"{result}\"}} {total}\n"
+                ));
+            }
+        }
         // By configured key only (#685): the labels are this run's keyring,
         // never an id read from storage, and a key no longer configured
         // drops out (its counter resets if it comes back).
@@ -1419,7 +1719,7 @@ impl ScrubReport {
         gauge(
             &mut out,
             "vtop_scrub_last_run_findings",
-            "Findings (missing, mismatched, unauthenticated, unreadable, unsupported_version) in the latest scrub run",
+            "Findings (missing, mismatched, unauthenticated, unreadable, unsupported_version; a retention or receipt finding) in the latest scrub run",
             self.findings.len().to_string(),
         );
         gauge(
@@ -1463,7 +1763,7 @@ impl ScrubReport {
         gauge(
             &mut out,
             "vtop_scrub_last_finding_timestamp_seconds",
-            "When a scrub run last found a missing, mismatched, unauthenticated, unreadable or unsupported-version batch (0: never)",
+            "When a scrub run last found a missing, mismatched, unauthenticated, unreadable or unsupported-version batch, or a retention or receipt finding (0: never)",
             finding.to_string(),
         );
         out
@@ -1476,6 +1776,7 @@ struct Carried {
     counts: BTreeMap<String, u64>,
     key_counts: BTreeMap<String, u64>,
     retention: BTreeMap<String, u64>,
+    receipts: BTreeMap<String, u64>,
     last_success: i64,
     last_pass_complete: i64,
     last_finding: i64,
@@ -1497,6 +1798,12 @@ impl Carried {
                 if let Some((result, value)) = rest.split_once("\"} ") {
                     if let Ok(value) = value.trim().parse::<u64>() {
                         carried.retention.insert(result.to_owned(), value);
+                    }
+                }
+            } else if let Some(rest) = line.strip_prefix("vtop_scrub_receipts_total{result=\"") {
+                if let Some((result, value)) = rest.split_once("\"} ") {
+                    if let Ok(value) = value.trim().parse::<u64>() {
+                        carried.receipts.insert(result.to_owned(), value);
                     }
                 }
             } else if let Some(rest) = line.strip_prefix("vtop_scrub_manifest_keys_total{key_id=\"")
@@ -1612,6 +1919,7 @@ mod tests {
             results: counts,
             manifest_keys: BTreeMap::new(),
             retention: BTreeMap::new(),
+            receipts: BTreeMap::new(),
             findings: (0..findings)
                 .map(|i| ScrubFinding {
                     batch_id: format!("b{i}"),
@@ -1621,6 +1929,7 @@ mod tests {
                     manifest_uri: None,
                     manifest_version_id: None,
                     retention: None,
+                    receipt: None,
                     detail: String::new(),
                 })
                 .collect(),
