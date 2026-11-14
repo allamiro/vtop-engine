@@ -29,8 +29,9 @@ pub mod tls;
 pub mod wire;
 
 pub use admin::{
-    predates_cluster_versions_read, refuses_lineage_verdicts, refuses_version_report,
-    resolve_endpoint, stub_status, AdminCandidate, AdminClient, AdminHandler, AdminServer,
+    predates_cluster_versions_read, refuses_lineage_verdicts, refuses_promote_unproven,
+    refuses_version_report, resolve_endpoint, stub_status, AdminCandidate, AdminClient,
+    AdminHandler, AdminServer,
 };
 pub use authz::{AdminAuthorizer, AdminIdentity, CommandClass, Refusal};
 pub use maybe_tls::{
@@ -47,7 +48,8 @@ pub use wire::{
     AdminGroupCursorView, AdminInitRequest, AdminLeaseView, AdminMembershipResponse,
     AdminProposeRequest, AdminProposeResponse, AdminRangeReplicaSetView,
     AdminReadClusterVersionsRequest, AdminReadClusterVersionsResponse, AdminReadGroupCursorRequest,
-    AdminReadGroupCursorResponse, AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse,
+    AdminReadGroupCursorResponse, AdminReadPromotionAttestationRequest,
+    AdminReadPromotionAttestationResponse, AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse,
     AdminReadRangeReplicaSetRequest, AdminReadRangeReplicaSetResponse,
     AdminReadRangeTransitionsRequest, AdminReadRangeTransitionsResponse,
     AdminReadSegmentPlacementRequest, AdminReadSegmentPlacementResponse, AdminRebalanceIntentView,
@@ -58,7 +60,8 @@ pub use wire::{
     KIND_ADMIN_INIT_REQ, KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ,
     KIND_ADMIN_PROPOSE_RESP, KIND_ADMIN_READ_CLUSTER_VERSIONS_REQ,
     KIND_ADMIN_READ_CLUSTER_VERSIONS_RESP, KIND_ADMIN_READ_GROUP_CURSOR_REQ,
-    KIND_ADMIN_READ_GROUP_CURSOR_RESP, KIND_ADMIN_READ_RANGE_LEASE_REQ,
+    KIND_ADMIN_READ_GROUP_CURSOR_RESP, KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ,
+    KIND_ADMIN_READ_PROMOTION_ATTESTATION_RESP, KIND_ADMIN_READ_RANGE_LEASE_REQ,
     KIND_ADMIN_READ_RANGE_LEASE_RESP, KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ,
     KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP, KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ,
     KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP, KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ,

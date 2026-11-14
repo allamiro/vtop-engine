@@ -112,6 +112,7 @@ const COMMAND_KIND_SPLIT_RANGE: u16 = 35;
 const COMMAND_KIND_SET_FEATURE_LEVEL: u16 = 36;
 const COMMAND_KIND_SET_RANGE_REPLICA_SET: u16 = 37;
 const COMMAND_KIND_REPORT_NODE_VERSION: u16 = 38;
+const COMMAND_KIND_ATTEST_UNPROVEN_PROMOTION: u16 = 39;
 
 /// The metadata feature level of a cluster that has never recorded one: the
 /// command set of v0.6.0, the last release before levels existed (#554).
@@ -133,7 +134,7 @@ pub const BASELINE_FEATURE_LEVEL: u32 = 3;
 /// behaviour on the recorded level, so every replica applies the same
 /// thing). `every_kind_newer_than_the_baseline_release_is_gated` catches a
 /// kind that forgets; the other two are on the author.
-pub const SUPPORTED_FEATURE_LEVEL: u32 = 7;
+pub const SUPPORTED_FEATURE_LEVEL: u32 = 8;
 
 /// The level at which a promotion report may carry a lineage verdict on each
 /// quorum answer (#577). Gated by PAYLOAD rather than by kind: the command is
@@ -158,6 +159,18 @@ pub const NODE_VERSION_REPORTS_FEATURE_LEVEL: u32 = 7;
 /// as `0.8.0`, or one with a build suffix. Bounded like every other string a
 /// command carries.
 pub const MAX_RELEASE_BYTES: usize = 64;
+
+/// The level of the operator's last-resort override for a range whose
+/// replicas cannot prove lineage (#636): the attestation command
+/// ([`MetadataCommand::AttestUnprovenPromotion`]), a promotion report that
+/// carries the attestation it used, and the
+/// [`PromotionRefusal::LineageUnproven`] reason. All three are payloads an
+/// older voter cannot decode, so each is held back below this level exactly
+/// as a new kind is.
+pub const PROMOTE_UNPROVEN_FEATURE_LEVEL: u32 = 8;
+
+/// Bound on the operator name an attestation records (#636).
+pub const MAX_ATTESTATION_OPERATOR_BYTES: usize = 128;
 
 /// Why a fenced cursor commit is refused (#457 slice 2b): the commit did not
 /// come from the range's current leaseholder at its current fencing epoch. A
@@ -450,6 +463,13 @@ pub enum PromotionRefusal {
     /// The quorum's boundary fell below a watermark an earlier promotion of
     /// the range published (#449).
     BelowPublished,
+    /// Enough replicas were fenced and answered to form a quorum, but too
+    /// few of the answers had a lineage the candidate could prove (#577,
+    /// #636): the refusal is about history, not reachability, and waiting
+    /// for replicas does not clear it. Recorded only at
+    /// [`PROMOTE_UNPROVEN_FEATURE_LEVEL`]; below it the same refusal is
+    /// recorded as [`PromotionRefusal::QuorumUnavailable`], as it always was.
+    LineageUnproven,
 }
 
 impl PromotionRefusal {
@@ -459,6 +479,18 @@ impl PromotionRefusal {
             PromotionRefusal::LeaderBehind => 2,
             PromotionRefusal::CandidateBehindVoters => 3,
             PromotionRefusal::BelowPublished => 4,
+            PromotionRefusal::LineageUnproven => 5,
+        }
+    }
+
+    /// The name operators see in logs, metrics and `vtopctl` output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PromotionRefusal::QuorumUnavailable => "quorum_unavailable",
+            PromotionRefusal::LeaderBehind => "leader_behind",
+            PromotionRefusal::CandidateBehindVoters => "candidate_behind_voters",
+            PromotionRefusal::BelowPublished => "below_published",
+            PromotionRefusal::LineageUnproven => "lineage_unproven",
         }
     }
 
@@ -468,11 +500,62 @@ impl PromotionRefusal {
             2 => Ok(PromotionRefusal::LeaderBehind),
             3 => Ok(PromotionRefusal::CandidateBehindVoters),
             4 => Ok(PromotionRefusal::BelowPublished),
+            5 => Ok(PromotionRefusal::LineageUnproven),
             other => Err(CodecError::UnknownTag {
                 what: "promotion refusal",
                 tag: u32::from(other),
             }),
         }
+    }
+}
+
+/// An operator's statement that one replica's log is to become a range's
+/// canonical history although its lineage cannot be proven (#636): the
+/// last-resort override for a range whose replicas have no epoch history,
+/// in the spirit of an unclean leader election, and as explicit.
+///
+/// Recorded by [`MetadataCommand::AttestUnprovenPromotion`], never by
+/// configuration or by any automatic path. It lets exactly ONE promotion of
+/// the range, by the replica it names, count answers whose lineage is
+/// Unknown. That promotion carries it into the transition record, and
+/// metadata removes it in the same apply, so a second promotion needs a new
+/// one. Records the named replica does not hold are lost; the operator
+/// accepts that by recording it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromotionAttestation {
+    /// The attesting command's request id: the attestation's identity, so
+    /// a report names exactly the one it used.
+    pub attestation_id: Uuid,
+    /// The replica whose log becomes canonical.
+    pub replica_node_uuid: Uuid,
+    /// Who attested, as they named themselves to `vtopctl`.
+    pub operator: String,
+    /// The attesting command's `issued_at_ms`: the operator's clock, kept
+    /// for the audit and read by no decision.
+    pub attested_at_ms: i64,
+}
+
+impl PromotionAttestation {
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        put_uuid(out, self.attestation_id);
+        put_uuid(out, self.replica_node_uuid);
+        put_bounded_str(
+            out,
+            &self.operator,
+            MAX_ATTESTATION_OPERATOR_BYTES,
+            "attestation operator",
+        )?;
+        put_i64(out, self.attested_at_ms);
+        Ok(())
+    }
+
+    pub(crate) fn decode_from(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            attestation_id: reader.uuid("attestation id")?,
+            replica_node_uuid: reader.uuid("attested replica")?,
+            operator: reader.bounded_str(MAX_ATTESTATION_OPERATOR_BYTES, "attestation operator")?,
+            attested_at_ms: reader.i64("attested at")?,
+        })
     }
 }
 
@@ -500,6 +583,12 @@ pub enum PromotionOutcome {
         quorum: Vec<QuorumAnswer>,
         votes: u32,
         required: u32,
+        /// The operator's attestation this promotion counted Unknown
+        /// answers under (#636); `None` for every promotion that proved its
+        /// quorum's lineage, which is all of them but the override. Present
+        /// only with lineage verdicts, so the record shows exactly which
+        /// answers were counted on the operator's word.
+        attestation: Option<PromotionAttestation>,
     },
     Refused {
         reason: PromotionRefusal,
@@ -507,6 +596,46 @@ pub enum PromotionOutcome {
 }
 
 impl PromotionOutcome {
+    /// The feature level a cluster must be at to record this outcome: the
+    /// level of the oldest release that can decode it.
+    pub fn feature_level(&self) -> u32 {
+        match self {
+            PromotionOutcome::Established {
+                attestation: Some(_),
+                ..
+            }
+            | PromotionOutcome::Refused {
+                reason: PromotionRefusal::LineageUnproven,
+            } => PROMOTE_UNPROVEN_FEATURE_LEVEL,
+            outcome if outcome.records_lineage() => LINEAGE_VERDICTS_FEATURE_LEVEL,
+            // v0.5.0 (#240 item 5).
+            _ => 2,
+        }
+    }
+
+    /// The attestation this promotion used, if it was the override (#636).
+    pub fn attestation(&self) -> Option<&PromotionAttestation> {
+        match self {
+            PromotionOutcome::Established { attestation, .. } => attestation.as_ref(),
+            PromotionOutcome::Refused { .. } => None,
+        }
+    }
+
+    /// This outcome as a cluster below [`PROMOTE_UNPROVEN_FEATURE_LEVEL`]
+    /// records it (#636): [`PromotionRefusal::LineageUnproven`] becomes the
+    /// [`PromotionRefusal::QuorumUnavailable`] it was recorded as before
+    /// the reason existed. Every other outcome is returned unchanged.
+    pub fn without_unproven_refusal(&self) -> PromotionOutcome {
+        match self {
+            PromotionOutcome::Refused {
+                reason: PromotionRefusal::LineageUnproven,
+            } => PromotionOutcome::Refused {
+                reason: PromotionRefusal::QuorumUnavailable,
+            },
+            other => other.clone(),
+        }
+    }
+
     /// Whether this outcome carries lineage verdicts on its quorum answers -
     /// the payload only a cluster at [`LINEAGE_VERDICTS_FEATURE_LEVEL`] may
     /// record (#577).
@@ -529,14 +658,23 @@ impl PromotionOutcome {
     /// (`established_under`) as though it held the candidate's log. The
     /// promoter never counted them, so `votes`, `required` and the boundary
     /// recompute from what remains exactly as they were computed.
+    ///
+    /// An outcome that used an attestation (#636) DID count its Unknown
+    /// answers and has no legacy form: it is returned unchanged, and stays
+    /// refused below its level.
     pub fn without_lineage(&self) -> PromotionOutcome {
         match self {
+            PromotionOutcome::Established {
+                attestation: Some(_),
+                ..
+            } => self.clone(),
             PromotionOutcome::Established {
                 boundary_offset,
                 sealed_prefix_end,
                 quorum,
                 votes,
                 required,
+                attestation: None,
             } => PromotionOutcome::Established {
                 boundary_offset: *boundary_offset,
                 sealed_prefix_end: *sealed_prefix_end,
@@ -550,6 +688,7 @@ impl PromotionOutcome {
                     .collect(),
                 votes: *votes,
                 required: *required,
+                attestation: None,
             },
             refused @ PromotionOutcome::Refused { .. } => refused.clone(),
         }
@@ -564,6 +703,9 @@ const PROMOTION_OUTCOME_REFUSED: u8 = 2;
 /// answer (#577). A new tag rather than a new field, so every existing record
 /// keeps its bytes; recorded only at [`LINEAGE_VERDICTS_FEATURE_LEVEL`].
 const PROMOTION_OUTCOME_ESTABLISHED_WITH_LINEAGE: u8 = 3;
+/// The lineage-carrying form followed by the attestation the promotion used
+/// (#636). Recorded only at [`PROMOTE_UNPROVEN_FEATURE_LEVEL`].
+const PROMOTION_OUTCOME_ESTABLISHED_UNDER_ATTESTATION: u8 = 4;
 
 const ANSWER_LINEAGE_AGREED: u8 = 1;
 const ANSWER_LINEAGE_RECONCILED: u8 = 2;
@@ -580,6 +722,7 @@ pub(crate) fn encode_promotion_outcome(
             quorum,
             votes,
             required,
+            attestation,
         } => {
             // Verdicts on every answer or on none: a record half of whose
             // answers carry one would be read by no reader correctly.
@@ -590,9 +733,19 @@ pub(crate) fn encode_promotion_outcome(
                     reason: "a lineage verdict must be on every answer or on none",
                 });
             }
+            // An attestation says which answers were counted on the
+            // operator's word, which only verdicts can show (#636).
+            if attestation.is_some() && !with_lineage {
+                return Err(CodecError::InvalidValue {
+                    what: "promotion attestation",
+                    reason: "an attested promotion carries a lineage verdict on every answer",
+                });
+            }
             put_u8(
                 out,
-                if with_lineage {
+                if attestation.is_some() {
+                    PROMOTION_OUTCOME_ESTABLISHED_UNDER_ATTESTATION
+                } else if with_lineage {
                     PROMOTION_OUTCOME_ESTABLISHED_WITH_LINEAGE
                 } else {
                     PROMOTION_OUTCOME_ESTABLISHED
@@ -623,6 +776,9 @@ pub(crate) fn encode_promotion_outcome(
             }
             put_u32(out, *votes);
             put_u32(out, *required);
+            if let Some(attestation) = attestation {
+                attestation.encode_into(out)?;
+            }
         }
         PromotionOutcome::Refused { reason } => {
             put_u8(out, PROMOTION_OUTCOME_REFUSED);
@@ -636,8 +792,11 @@ pub(crate) fn decode_promotion_outcome(
     reader: &mut Reader<'_>,
 ) -> Result<PromotionOutcome, CodecError> {
     match reader.u8("promotion outcome")? {
-        tag @ (PROMOTION_OUTCOME_ESTABLISHED | PROMOTION_OUTCOME_ESTABLISHED_WITH_LINEAGE) => {
-            let with_lineage = tag == PROMOTION_OUTCOME_ESTABLISHED_WITH_LINEAGE;
+        tag @ (PROMOTION_OUTCOME_ESTABLISHED
+        | PROMOTION_OUTCOME_ESTABLISHED_WITH_LINEAGE
+        | PROMOTION_OUTCOME_ESTABLISHED_UNDER_ATTESTATION) => {
+            let attested = tag == PROMOTION_OUTCOME_ESTABLISHED_UNDER_ATTESTATION;
+            let with_lineage = attested || tag == PROMOTION_OUTCOME_ESTABLISHED_WITH_LINEAGE;
             let boundary_offset = decode_optional_u64(reader, "promotion boundary offset")?;
             let sealed_prefix_end = decode_optional_u64(reader, "promotion sealed prefix end")?;
             let count = reader.u16("promotion quorum answer count")? as usize;
@@ -684,12 +843,20 @@ pub(crate) fn decode_promotion_outcome(
                     reason: "a lineage-carrying outcome must carry at least one answer",
                 });
             }
+            let votes = reader.u32("promotion votes")?;
+            let required = reader.u32("promotion required votes")?;
+            let attestation = if attested {
+                Some(PromotionAttestation::decode_from(reader)?)
+            } else {
+                None
+            };
             Ok(PromotionOutcome::Established {
                 boundary_offset,
                 sealed_prefix_end,
                 quorum,
-                votes: reader.u32("promotion votes")?,
-                required: reader.u32("promotion required votes")?,
+                votes,
+                required,
+                attestation,
             })
         }
         PROMOTION_OUTCOME_REFUSED => Ok(PromotionOutcome::Refused {
@@ -1214,6 +1381,23 @@ pub enum MetadataCommand {
         members: Vec<Uuid>,
         expected_generation: u64,
     },
+    /// Record an operator's attestation that `replica_node_uuid`'s log is to
+    /// become the range's canonical history although its lineage cannot be
+    /// proven (#636): the last-resort override for a range whose replicas
+    /// have no epoch history, after restore from backup. See
+    /// [`PromotionAttestation`] for what it permits and what it costs.
+    ///
+    /// Cluster-scoped (an operator's, never a data node's). It replaces any
+    /// live attestation of the range: the newest statement is the one that
+    /// counts. The replica must be a registered node and, where the range
+    /// records a replica set, a member of it.
+    AttestUnprovenPromotion {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        replica_node_uuid: Uuid,
+        operator: String,
+    },
     /// A data node's own account of what it runs (#634): its release, the
     /// highest replica-plane protocol it speaks, and the highest metadata
     /// feature level it implements. Sent when the node starts, and repeated
@@ -1243,16 +1427,12 @@ impl MetadataCommand {
     /// the log (#554): the level of the release that introduced its kind.
     pub fn feature_level(&self) -> u32 {
         match self {
-            // A lineage verdict on each quorum answer (#577) is the same kind
-            // with a payload an older voter cannot decode, so it is gated by
-            // what it carries; the report without one is still v0.5.0's.
-            MetadataCommand::ReportPromotionOutcome { outcome, .. }
-                if outcome.records_lineage() =>
-            {
-                LINEAGE_VERDICTS_FEATURE_LEVEL
-            }
-            // v0.5.0 (#240 item 5).
-            MetadataCommand::ReportPromotionOutcome { .. } => 2,
+            // A lineage verdict on each quorum answer (#577), an attestation
+            // and the lineage-unproven refusal (#636) are the same kind with
+            // a payload an older voter cannot decode, so a report is gated
+            // by what it carries; a report with none of them is still
+            // v0.5.0's.
+            MetadataCommand::ReportPromotionOutcome { outcome, .. } => outcome.feature_level(),
             // v0.6.0 (#457 slices 2b and 4a).
             MetadataCommand::CommitGroupCursorFenced { .. }
             | MetadataCommand::EnsureGroupMemberForRange { .. }
@@ -1264,6 +1444,9 @@ impl MetadataCommand {
             MetadataCommand::SetRangeReplicaSet { .. } => 5,
             // A data node's version report (#634).
             MetadataCommand::ReportNodeVersion { .. } => NODE_VERSION_REPORTS_FEATURE_LEVEL,
+            // The operator's override for a range with no provable lineage
+            // (#636).
+            MetadataCommand::AttestUnprovenPromotion { .. } => PROMOTE_UNPROVEN_FEATURE_LEVEL,
             // Everything v0.4.0 already knew.
             _ => 1,
         }
@@ -1308,7 +1491,8 @@ impl MetadataCommand {
             | MetadataCommand::CancelRetention { env, .. }
             | MetadataCommand::SetFeatureLevel { env, .. }
             | MetadataCommand::SetRangeReplicaSet { env, .. }
-            | MetadataCommand::ReportNodeVersion { env, .. } => env,
+            | MetadataCommand::ReportNodeVersion { env, .. }
+            | MetadataCommand::AttestUnprovenPromotion { env, .. } => env,
         }
     }
 
@@ -1467,6 +1651,25 @@ impl MetadataCommand {
                 put_uuid(&mut out, *range_uuid);
                 encode_uuid_list(&mut out, members, MAX_REPLICAS, "replica set members")?;
                 put_u64(&mut out, *expected_generation);
+            }
+            MetadataCommand::AttestUnprovenPromotion {
+                env,
+                topic_uuid,
+                range_uuid,
+                replica_node_uuid,
+                operator,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_ATTEST_UNPROVEN_PROMOTION);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *replica_node_uuid);
+                put_bounded_str(
+                    &mut out,
+                    operator,
+                    MAX_ATTESTATION_OPERATOR_BYTES,
+                    "attestation operator",
+                )?;
             }
             MetadataCommand::ReportNodeVersion {
                 env,
@@ -2126,6 +2329,16 @@ impl MetadataCommand {
                 members: decode_uuid_list(reader, MAX_REPLICAS, "replica set members")?,
                 expected_generation: reader.u64("expected replica set generation")?,
             }),
+            COMMAND_KIND_ATTEST_UNPROVEN_PROMOTION => {
+                Ok(MetadataCommand::AttestUnprovenPromotion {
+                    env: decode_envelope(reader)?,
+                    topic_uuid: reader.uuid("topic uuid")?,
+                    range_uuid: reader.uuid("range uuid")?,
+                    replica_node_uuid: reader.uuid("attested replica")?,
+                    operator: reader
+                        .bounded_str(MAX_ATTESTATION_OPERATOR_BYTES, "attestation operator")?,
+                })
+            }
             COMMAND_KIND_REPORT_NODE_VERSION => Ok(MetadataCommand::ReportNodeVersion {
                 env: decode_envelope(reader)?,
                 node_uuid: reader.uuid("node uuid")?,
@@ -3351,6 +3564,7 @@ mod tests {
                     ],
                     votes: 2,
                     required: 2,
+                    attestation: None,
                 },
             },
             MetadataCommand::ReportPromotionOutcome {
@@ -3373,6 +3587,33 @@ mod tests {
                 holder_node_uuid: Uuid::from_u128(10),
                 fencing_epoch: 6,
                 outcome: lineage_outcome(),
+            },
+            // The operator's override (#636): the attestation, a report
+            // that used one, and the refusal that names the missing lineage.
+            MetadataCommand::AttestUnprovenPromotion {
+                env: envelope(41),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                replica_node_uuid: Uuid::from_u128(12),
+                operator: "oncall@example".to_owned(),
+            },
+            MetadataCommand::ReportPromotionOutcome {
+                env: envelope(42),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                holder_node_uuid: Uuid::from_u128(12),
+                fencing_epoch: 7,
+                outcome: attested_outcome(),
+            },
+            MetadataCommand::ReportPromotionOutcome {
+                env: envelope(43),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                holder_node_uuid: Uuid::from_u128(10),
+                fencing_epoch: 8,
+                outcome: PromotionOutcome::Refused {
+                    reason: PromotionRefusal::LineageUnproven,
+                },
             },
             // The four group commands a gateway sends (#457). They were not
             // in this list when they landed, so the round-trip, the
@@ -3513,6 +3754,128 @@ mod tests {
             ],
             votes: 2,
             required: 2,
+            attestation: None,
+        }
+    }
+
+    /// The override's shape (#636): every answer Unknown - a range whose
+    /// replicas have no epoch history - counted on the attestation naming
+    /// the candidate, 12.
+    fn attested_outcome() -> PromotionOutcome {
+        PromotionOutcome::Established {
+            boundary_offset: Some(500),
+            sealed_prefix_end: None,
+            quorum: vec![
+                QuorumAnswer {
+                    node_uuid: Uuid::from_u128(11),
+                    offset: 500,
+                    lineage: Some(AnswerLineage::Unknown),
+                },
+                QuorumAnswer {
+                    node_uuid: Uuid::from_u128(12),
+                    offset: 500,
+                    lineage: Some(AnswerLineage::Unknown),
+                },
+            ],
+            votes: 2,
+            required: 2,
+            attestation: Some(PromotionAttestation {
+                attestation_id: Uuid::from_u128(41),
+                replica_node_uuid: Uuid::from_u128(12),
+                operator: "oncall@example".to_owned(),
+                attested_at_ms: 1_700_000_000_000,
+            }),
+        }
+    }
+
+    /// #636: the attestation command, a report that used one, and the
+    /// lineage-unproven refusal are each a payload no release below level 8
+    /// can decode, so each is held back below it; the forms a lower level
+    /// records instead are the ones it always recorded. An attested
+    /// promotion has no lower form at all: it counted Unknown answers, and
+    /// dropping them would leave a record whose votes do not add up.
+    #[test]
+    fn the_override_and_its_refusal_reason_need_their_own_level() {
+        const { assert!(PROMOTE_UNPROVEN_FEATURE_LEVEL > LINEAGE_VERDICTS_FEATURE_LEVEL) };
+        let refused = PromotionOutcome::Refused {
+            reason: PromotionRefusal::LineageUnproven,
+        };
+        assert_eq!(refused.feature_level(), PROMOTE_UNPROVEN_FEATURE_LEVEL);
+        assert_eq!(
+            refused.without_unproven_refusal(),
+            PromotionOutcome::Refused {
+                reason: PromotionRefusal::QuorumUnavailable,
+            },
+            "below level 8 the refusal is recorded as it always was"
+        );
+        assert_eq!(refused.without_unproven_refusal().feature_level(), 2);
+
+        let attested = attested_outcome();
+        assert_eq!(attested.feature_level(), PROMOTE_UNPROVEN_FEATURE_LEVEL);
+        assert_eq!(
+            attested.attestation().map(|a| a.replica_node_uuid),
+            Some(Uuid::from_u128(12))
+        );
+        assert_eq!(attested.without_lineage(), attested);
+        assert_eq!(attested.without_unproven_refusal(), attested);
+        // An attestation without verdicts would hide which answers were
+        // counted on the operator's word: refused by the codec.
+        let PromotionOutcome::Established { quorum, .. } = &attested else {
+            unreachable!()
+        };
+        let mut unverdicted = attested.clone();
+        if let PromotionOutcome::Established { quorum: q, .. } = &mut unverdicted {
+            *q = quorum
+                .iter()
+                .map(|answer| QuorumAnswer {
+                    lineage: None,
+                    ..*answer
+                })
+                .collect();
+        }
+        assert!(matches!(
+            encode_promotion_outcome(&mut Vec::new(), &unverdicted),
+            Err(CodecError::InvalidValue {
+                what: "promotion attestation",
+                ..
+            })
+        ));
+        // The attested tag reads as NEWER on a reader that predates it.
+        let mut bytes = Vec::new();
+        encode_promotion_outcome(&mut bytes, &attested).unwrap();
+        assert_eq!(bytes[0], PROMOTION_OUTCOME_ESTABLISHED_UNDER_ATTESTATION);
+        let mut refusal_bytes = Vec::new();
+        encode_promotion_outcome(&mut refusal_bytes, &refused).unwrap();
+        assert_eq!(refusal_bytes, vec![PROMOTION_OUTCOME_REFUSED, 5]);
+        refusal_bytes[1] = 0x7f;
+        assert!(crate::storage::is_newer_format(
+            &decode_promotion_outcome(&mut Reader::new(&refusal_bytes)).unwrap_err()
+        ));
+        // Every refusal has a distinct operator-facing name.
+        let names: std::collections::BTreeSet<_> = [
+            PromotionRefusal::QuorumUnavailable,
+            PromotionRefusal::LeaderBehind,
+            PromotionRefusal::CandidateBehindVoters,
+            PromotionRefusal::BelowPublished,
+            PromotionRefusal::LineageUnproven,
+        ]
+        .into_iter()
+        .map(PromotionRefusal::as_str)
+        .collect();
+        assert_eq!(names.len(), 5);
+        // ...and a distinct wire tag that reads back as itself.
+        let reasons = [
+            PromotionRefusal::QuorumUnavailable,
+            PromotionRefusal::LeaderBehind,
+            PromotionRefusal::CandidateBehindVoters,
+            PromotionRefusal::BelowPublished,
+            PromotionRefusal::LineageUnproven,
+        ];
+        let tags: std::collections::BTreeSet<u8> =
+            reasons.iter().map(|reason| reason.wire_tag()).collect();
+        assert_eq!(tags.len(), reasons.len(), "two refusal reasons share a tag");
+        for reason in reasons {
+            assert_eq!(PromotionRefusal::from_wire(reason.wire_tag()), Ok(reason));
         }
     }
 
@@ -3585,6 +3948,7 @@ mod tests {
             mut quorum,
             votes,
             required,
+            ..
         } = lineage_outcome()
         else {
             unreachable!()
@@ -3596,6 +3960,7 @@ mod tests {
             quorum,
             votes,
             required,
+            attestation: None,
         };
         let mut out = Vec::new();
         assert!(matches!(
@@ -3647,14 +4012,20 @@ mod tests {
                 (1..=SUPPORTED_FEATURE_LEVEL).contains(&level),
                 "kind {kind}: level {level}"
             );
-            let newer_payload = matches!(
-                &command,
-                MetadataCommand::ReportPromotionOutcome { outcome, .. }
-                    if outcome.records_lineage()
-            );
-            if newer_payload {
-                assert_eq!(level, LINEAGE_VERDICTS_FEATURE_LEVEL, "kind {kind}");
-                continue;
+            // The report's newer payloads: lineage verdicts (#577), an
+            // attestation and the lineage-unproven refusal (#636).
+            if let MetadataCommand::ReportPromotionOutcome { outcome, .. } = &command {
+                if outcome.feature_level() > 2 {
+                    assert!(
+                        [
+                            LINEAGE_VERDICTS_FEATURE_LEVEL,
+                            PROMOTE_UNPROVEN_FEATURE_LEVEL
+                        ]
+                        .contains(&level),
+                        "kind {kind}: level {level}"
+                    );
+                    continue;
+                }
             }
             assert_eq!(
                 kind > LAST_BASELINE_KIND,
@@ -4005,6 +4376,7 @@ mod tests {
                 ],
                 votes: 2,
                 required: 2,
+                attestation: None,
             },
         };
         assert_eq!(

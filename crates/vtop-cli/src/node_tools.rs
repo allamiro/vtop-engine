@@ -83,6 +83,51 @@ pub enum NodeCommand {
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout_seconds: u64,
     },
+    /// LAST RESORT, AFTER RESTORE FROM BACKUP: let a range whose replicas
+    /// cannot prove their lineage promote anyway, on the log of the replica
+    /// named here (#636).
+    ///
+    /// A range that holds records while no replica has epoch history
+    /// refuses every promotion (`lineage_unproven`), because counting an
+    /// answer whose history cannot be compared could expose another
+    /// leadership's records or lose acknowledged ones. This records an
+    /// attestation in metadata naming the replica whose log becomes
+    /// canonical, who attested, and when. Only that replica, at its next
+    /// promotion, counts those answers; the promotion records the
+    /// attestation in the range's transition chain (`vtopctl meta
+    /// transitions`) and uses it up, so a second one needs a new
+    /// attestation. Records the named replica does not hold - on any other
+    /// replica - may be lost. Repair the other replicas from it afterwards.
+    ///
+    /// Never automatic and never a configuration default. Needs metadata
+    /// feature level 8 and `--i-accept-data-loss`. See
+    /// docs/PRODUCTION_HA.md before running it.
+    PromoteUnproven {
+        /// A `vtopctl meta` admin client YAML (endpoint and PEM paths).
+        #[arg(long)]
+        meta_config: PathBuf,
+        /// The range's topic UUID.
+        #[arg(long)]
+        topic: Uuid,
+        /// The range's UUID.
+        #[arg(long)]
+        range: Uuid,
+        /// The replica (registered node UUID) whose log becomes canonical.
+        #[arg(long)]
+        replica: Uuid,
+        /// Who is attesting, recorded with the attestation [default: $USER].
+        #[arg(long)]
+        operator: Option<String>,
+        /// Required: the statement that records not on --replica may be lost.
+        #[arg(long)]
+        i_accept_data_loss: bool,
+        /// The attestation's id [default: a new one, printed on stderr]. A
+        /// run that timed out may or may not have been recorded: retry it
+        /// with the SAME --request-id, so metadata answers the first one
+        /// instead of recording a second.
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
     /// Change a range's roll thresholds by rolling once (#314).
     ///
     /// A segment's limits live in its header and are carried forward at every
@@ -561,6 +606,53 @@ async fn run_inner(command: NodeCommand, json: bool) -> Result<i32, String> {
             )
             .await
         }
+        NodeCommand::PromoteUnproven {
+            meta_config,
+            topic,
+            range,
+            replica,
+            operator,
+            i_accept_data_loss,
+            request_id,
+        } => {
+            let operator = attesting_operator(
+                i_accept_data_loss,
+                operator,
+                std::env::var("USER")
+                    .ok()
+                    .or_else(|| std::env::var("LOGNAME").ok()),
+            )?;
+            let request_id = request_id.unwrap_or_else(Uuid::new_v4);
+            // On stderr in both modes, so a --json run still learns the id it
+            // must retry with.
+            eprintln!(
+                "recording attestation {request_id}: replica {replica}'s log becomes range \
+                 {range}'s history at its next promotion; records it does not hold may be lost \
+                 (operator {operator:?}). If this run times out, retry with --request-id \
+                 {request_id}"
+            );
+            let command = vtop_meta::MetadataCommand::AttestUnprovenPromotion {
+                env: vtop_meta::CommandEnvelope {
+                    request_id,
+                    issued_at_ms: chrono::Utc::now().timestamp_millis(),
+                },
+                topic_uuid: topic,
+                range_uuid: range,
+                replica_node_uuid: replica,
+                operator,
+            };
+            crate::meta_tools::propose_and_print(&meta_config, command, json)
+                .await
+                .map_err(|error| crate::meta_tools::explain_attestation_refusal(&error))?;
+            if !json {
+                println!(
+                    "attestation {request_id} recorded (the reply's generation is the range's \
+                     fencing epoch now); it is used up by {replica}'s next promotion, which \
+                     `vtopctl meta transitions` will show as ATTESTED"
+                );
+            }
+            Ok(0)
+        }
         NodeCommand::ReconfigureRange {
             data_dir,
             max_record_bytes,
@@ -578,6 +670,40 @@ async fn run_inner(command: NodeCommand, json: bool) -> Result<i32, String> {
             json,
         ),
     }
+}
+
+/// The operator an attestation names (#636), and the refusal without the
+/// explicit acceptance of data loss. Checked before anything is sent.
+fn attesting_operator(
+    i_accept_data_loss: bool,
+    operator: Option<String>,
+    from_environment: Option<String>,
+) -> Result<String, String> {
+    if !i_accept_data_loss {
+        return Err(
+            "promote-unproven lets a replica's log become the range's history although its \
+             lineage cannot be proven: records that replica does not hold, on any other \
+             replica, may be lost. Restore the range from backup first if you can. To proceed \
+             anyway, pass --i-accept-data-loss (see docs/PRODUCTION_HA.md)"
+                .to_owned(),
+        );
+    }
+    let operator = operator
+        .or(from_environment)
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            "name the operator attesting with --operator (it is recorded with the attestation)"
+                .to_owned()
+        })?;
+    if operator.len() > vtop_meta::MAX_ATTESTATION_OPERATOR_BYTES {
+        return Err(format!(
+            "--operator is {} bytes; at most {} are recorded",
+            operator.len(),
+            vtop_meta::MAX_ATTESTATION_OPERATOR_BYTES
+        ));
+    }
+    Ok(operator)
 }
 
 /// The four thresholds of one header, format-independent, for reporting.
@@ -1438,7 +1564,9 @@ fn empty_history_warning(from: &str, transferred_end: Option<u64>) -> Option<Str
          release with #577) never counts such an answer; a promotion recorded without \
          verdicts counts it by offset. Repair from a replica that has epoch history. If no \
          replica of this range has one, repair cannot restore it and a range holding records \
-         cannot promote; there is no in-product remedy yet (#612)"
+         cannot promote: restore it from backup, and failing that, the last resort is \
+         `vtopctl node promote-unproven`, which loses every record the replica it names does \
+         not hold (#636, docs/PRODUCTION_HA.md)"
     ))
 }
 
@@ -1932,6 +2060,40 @@ mod empty_history_warning_tests {
         let warning = empty_history_warning("peer", Some(40)).expect("records moved");
         assert!(warning.contains("\"unknown\""), "{warning}");
         assert!(warning.contains("recorded without verdicts"), "{warning}");
-        assert!(warning.contains("no in-product remedy"), "{warning}");
+        assert!(warning.contains("restore it from backup"), "{warning}");
+        assert!(warning.contains("promote-unproven"), "{warning}");
+    }
+}
+
+#[cfg(test)]
+mod promote_unproven_tests {
+    use super::attesting_operator;
+
+    /// #636: the override is refused without the explicit acceptance of
+    /// data loss, before anything is sent, and it always names an operator.
+    #[test]
+    fn the_override_needs_the_acceptance_and_an_operator() {
+        let refused = attesting_operator(false, Some("oncall".to_owned()), None).unwrap_err();
+        assert!(refused.contains("--i-accept-data-loss"), "{refused}");
+        assert!(refused.contains("backup"), "{refused}");
+        assert_eq!(
+            attesting_operator(true, Some(" oncall ".to_owned()), Some("env".to_owned())),
+            Ok("oncall".to_owned()),
+            "the flag wins over the environment"
+        );
+        assert_eq!(
+            attesting_operator(true, None, Some("env-user".to_owned())),
+            Ok("env-user".to_owned())
+        );
+        assert!(attesting_operator(true, None, None)
+            .unwrap_err()
+            .contains("--operator"));
+        assert!(attesting_operator(true, Some("   ".to_owned()), None).is_err());
+        assert!(attesting_operator(
+            true,
+            Some("x".repeat(vtop_meta::MAX_ATTESTATION_OPERATOR_BYTES + 1)),
+            None
+        )
+        .is_err());
     }
 }

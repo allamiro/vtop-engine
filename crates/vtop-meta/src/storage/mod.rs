@@ -103,7 +103,10 @@ pub(crate) fn is_newer_format(error: &CodecError) -> bool {
                 // verdict this build does not know was written by a newer
                 // one, exactly as an unknown kind is.
                 | "promotion outcome"
-                | "quorum answer lineage",
+                | "quorum answer lineage"
+                // A refusal reason this build does not know (#636 added
+                // one) is the same: a newer writer, not corruption.
+                | "promotion refusal",
             ..
         }
     )

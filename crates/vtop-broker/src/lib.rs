@@ -1228,6 +1228,21 @@ impl LocalBroker {
         journal.truncate_to(next_offset.saturating_add(1)).is_ok()
     }
 
+    /// Make this replica's log the range's history on an operator's
+    /// attestation (#636): see
+    /// [`crate::fencing_epochs::FencingEpochJournal::seed_attested_history`].
+    ///
+    /// PRECONDITION: call it only once metadata has recorded a promotion of
+    /// this replica made under an attestation naming it. Nothing here can
+    /// check that; written earlier, the seed is lineage nobody authorized.
+    pub fn adopt_attested_history(&self, epoch: u64) -> BrokerResult<bool> {
+        crate::fencing_epochs::FencingEpochJournal::seed_attested_history_in(
+            &self.fencing_epoch_journal,
+            &self.fencing_epoch_history_broken,
+            epoch,
+        )
+    }
+
     /// This replica's epoch history.
     ///
     /// Empty means "no history you may reconcile against" — either none was

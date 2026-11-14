@@ -64,6 +64,20 @@
 //! the replica's answer Unknown, because the candidate cannot see the
 //! replica's retained base.
 //!
+//! **Closed (#636): that refusal says why, and has one explicit way out.**
+//! A quorum that answered but could not prove its lineage is refused as
+//! [`Promotion::LineageUnproven`], not as the quorum shortfall it used to
+//! share a reason with: waiting for replicas does not clear it. The way out
+//! is the operator's, never automatic and never a configuration default:
+//! `vtopctl node promote-unproven` records an attestation naming the
+//! replica whose log becomes canonical, and only that replica, at its next
+//! promotion, counts Unknown answers ([`establish_under_attestation`]).
+//! Metadata accepts that promotion's report only while the attestation is
+//! live and names its holder, and uses it up in the same apply. Everything
+//! else is judged as before: the floor, the candidate holding it, the vote
+//! restriction and the published watermark. What the override gives up is
+//! lineage proof, and with it every record the named replica does not hold.
+//!
 //! **Closed (#611): the fence discards only what is proven unacknowledged.**
 //! A replica ahead of the candidate keeps its records through the fence and
 //! refuses the vote. It used to compare the candidate's tail adoption as a
@@ -232,18 +246,23 @@ pub enum Promotion {
     /// A quorum answered; this is the boundary they can prove.
     Established {
         committed_offset: u64,
-        /// Replicas that answered with a proven lineage - the ones counted -
-        /// for the operator record.
+        /// Replicas that answered and were counted, for the operator
+        /// record: those with a proven lineage - and, under an operator's
+        /// attestation (#636), those whose lineage is Unknown too.
         answered: BTreeMap<Uuid, u64>,
         /// Replicas that answered but whose lineage could not be proven
-        /// (#577): recorded, never counted.
+        /// (#577): recorded, never counted. Empty under an operator's
+        /// attestation (#636), which counts them in `answered`.
         unproven: BTreeMap<Uuid, u64>,
     },
-    /// Too few replicas answered with a proven lineage to establish anything.
+    /// Too few replicas answered at all to establish anything.
     ///
     /// Refusing to serve is the only safe response. A leader that promoted
     /// anyway would be publishing a high-water mark no quorum had confirmed,
     /// which is precisely the guess this exists to prevent.
+    ///
+    /// `unproven` is never large enough to have completed the quorum here:
+    /// when it is, the refusal is [`Promotion::LineageUnproven`] instead.
     QuorumUnavailable {
         /// Answers that count: fenced, with a proven lineage.
         answered: usize,
@@ -267,6 +286,23 @@ pub enum Promotion {
         /// The leader's own reported boundary; `None` if its probe was absent,
         /// which is refused for the same reason.
         leader_committed_offset: Option<u64>,
+    },
+    /// Enough replicas were fenced and answered to form a quorum, but too
+    /// few of them with a lineage the candidate could prove (#577, #636).
+    ///
+    /// Distinct from [`Promotion::QuorumUnavailable`] because the remedy is
+    /// different: the replicas are there, and waiting for more of them does
+    /// not help. A replica with epoch history can be promoted or used to
+    /// repair the others (`vtopctl node repair`); where none has one, the
+    /// remedies are restore from backup and, last, the operator's override
+    /// ([`establish_under_attestation`]).
+    LineageUnproven {
+        /// Answers that count: fenced, with a proven lineage.
+        answered: usize,
+        required: usize,
+        /// Answers fenced but with an Unknown lineage: enough, with
+        /// `answered`, to have formed a quorum by offset alone.
+        unproven: usize,
     },
     /// The candidate holds the proven floor, but fewer than a majority of the
     /// fenced replicas are at or below its own offset — Raft's election
@@ -357,6 +393,58 @@ pub fn establish(
     leader_id: Uuid,
     published_floor: Option<u64>,
 ) -> Promotion {
+    establish_counting(
+        probes,
+        replication_factor,
+        leader_id,
+        published_floor,
+        Unproven::NotCounted,
+    )
+}
+
+/// [`establish`] for a candidate an operator's live attestation names
+/// (#636): the one promotion that counts answers whose lineage is Unknown.
+///
+/// Call it ONLY after metadata has shown a live attestation naming
+/// `leader_id` for this range, and report the attestation with the outcome:
+/// metadata records the promotion only if that attestation is still live
+/// and names the holder, and uses it up in the same apply, so the
+/// promotion that counts on it is exactly one. Nothing else is relaxed. The
+/// candidate must still hold the floor, a majority must still be at or below
+/// it, and the published watermark still holds - the override gives up
+/// lineage proof, not the arithmetic. What it gives up is real: an Unknown
+/// answer's offset counts records whatever wrote them, so every record the
+/// candidate does not hold, on any replica, may be lost.
+pub fn establish_under_attestation(
+    probes: &[ReplicaProbe],
+    replication_factor: usize,
+    leader_id: Uuid,
+    published_floor: Option<u64>,
+) -> Promotion {
+    establish_counting(
+        probes,
+        replication_factor,
+        leader_id,
+        published_floor,
+        Unproven::CountedUnderAttestation,
+    )
+}
+
+/// Whether answers of Unknown lineage count (#636). Only an attestation
+/// switches it, and only [`establish_under_attestation`] passes it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unproven {
+    NotCounted,
+    CountedUnderAttestation,
+}
+
+fn establish_counting(
+    probes: &[ReplicaProbe],
+    replication_factor: usize,
+    leader_id: Uuid,
+    published_floor: Option<u64>,
+    unproven_answers: Unproven,
+) -> Promotion {
     debug_assert!(
         probes.len() <= replication_factor,
         "more probes ({}) than configured replicas ({replication_factor})",
@@ -372,7 +460,8 @@ pub fn establish(
     let mut unproven = BTreeMap::new();
     for probe in probes {
         if let Some(offset) = probe.local_committed_offset {
-            if probe.lineage.is_provable() {
+            if probe.lineage.is_provable() || unproven_answers == Unproven::CountedUnderAttestation
+            {
                 answered.insert(probe.node_id, offset);
             } else {
                 unproven.insert(probe.node_id, offset);
@@ -380,10 +469,22 @@ pub fn establish(
         }
     }
     if answered.len() < required {
-        return Promotion::QuorumUnavailable {
-            answered: answered.len(),
-            required,
-            unproven: unproven.len(),
+        // Short of a quorum. WHY matters to whoever has to fix it (#636):
+        // replicas that did not answer may come back, but replicas that
+        // answered with no provable lineage will answer the same way next
+        // round.
+        return if answered.len() + unproven.len() >= required {
+            Promotion::LineageUnproven {
+                answered: answered.len(),
+                required,
+                unproven: unproven.len(),
+            }
+        } else {
+            Promotion::QuorumUnavailable {
+                answered: answered.len(),
+                required,
+                unproven: unproven.len(),
+            }
         };
     }
     debug_assert_eq!(
@@ -871,13 +972,138 @@ mod tests {
         );
         assert_eq!(
             promotion,
-            Promotion::QuorumUnavailable {
+            Promotion::LineageUnproven {
                 answered: 1,
                 required: 2,
                 unproven: 1,
             },
-            "an answer whose lineage was not proven was counted toward the quorum"
+            "an answer whose lineage was not proven was counted toward the quorum, or the \
+             refusal was not told apart from a quorum shortfall (#636)"
         );
+    }
+
+    /// #636: the two refusals are told apart by what would fix them. Too few
+    /// answers is a shortfall waiting can cure; enough answers that cannot
+    /// prove their lineage is not, and says so. #607's rule is unchanged in
+    /// both: the Unknown answers are counted by neither.
+    #[test]
+    fn a_lineage_refusal_is_distinguishable_from_a_quorum_shortfall() {
+        let shortfall = establish(
+            &[
+                probe(1, Some(100)),
+                probe_with(2, 100, AnswerLineage::Unknown),
+                probe(3, None),
+            ],
+            5,
+            Uuid::from_u128(1),
+            None,
+        );
+        assert_eq!(
+            shortfall,
+            Promotion::QuorumUnavailable {
+                answered: 1,
+                required: 3,
+                unproven: 1,
+            },
+            "two of five answered: a shortfall, whatever their lineage"
+        );
+        // Every replica answered, none with history: the #607 shape.
+        let unproven = establish(
+            &[
+                probe_with(1, 100, AnswerLineage::Unknown),
+                probe_with(2, 100, AnswerLineage::Unknown),
+                probe_with(3, 100, AnswerLineage::Unknown),
+            ],
+            3,
+            Uuid::from_u128(1),
+            None,
+        );
+        assert_eq!(
+            unproven,
+            Promotion::LineageUnproven {
+                answered: 0,
+                required: 2,
+                unproven: 3,
+            }
+        );
+        assert_ne!(
+            std::mem::discriminant(&shortfall),
+            std::mem::discriminant(&unproven)
+        );
+    }
+
+    /// #636: under an attestation the candidate it names counts Unknown
+    /// answers - and only that relaxes. The #607 shape promotes; the floor,
+    /// the vote restriction and the published watermark still refuse what
+    /// they always refused.
+    #[test]
+    fn under_an_attestation_unknown_answers_count_and_nothing_else_relaxes() {
+        let history_less = [
+            probe_with(1, 100, AnswerLineage::Unknown),
+            probe_with(2, 100, AnswerLineage::Unknown),
+            probe_with(3, 90, AnswerLineage::Unknown),
+        ];
+        let Promotion::Established {
+            committed_offset,
+            answered,
+            unproven,
+        } = establish_under_attestation(&history_less, 3, Uuid::from_u128(1), None)
+        else {
+            panic!("the attested candidate must promote over a history-less range")
+        };
+        assert_eq!(committed_offset, 100);
+        assert_eq!(answered.len(), 3, "every Unknown answer was counted");
+        assert!(unproven.is_empty());
+
+        // A replica ahead of the attested candidate still refuses the vote,
+        // and is named: the operator should attest that one instead.
+        assert_eq!(
+            establish_under_attestation(
+                &[
+                    probe_with(1, 90, AnswerLineage::Unknown),
+                    probe_with(2, 100, AnswerLineage::Unknown),
+                    probe_with(3, 100, AnswerLineage::Unknown),
+                ],
+                3,
+                Uuid::from_u128(1),
+                None,
+            ),
+            Promotion::LeaderBehind {
+                committed_offset: 100,
+                leader_committed_offset: Some(90),
+            }
+        );
+        assert!(matches!(
+            establish_under_attestation(
+                &[
+                    probe_with(1, 100, AnswerLineage::Unknown),
+                    probe_with(2, 101, AnswerLineage::Unknown),
+                ],
+                3,
+                Uuid::from_u128(1),
+                None,
+            ),
+            Promotion::CandidateBehindVoters { votes: 1, .. }
+        ));
+        // ...and a published watermark it cannot hold.
+        assert!(matches!(
+            establish_under_attestation(&history_less, 3, Uuid::from_u128(1), Some(150)),
+            Promotion::BelowPublished { .. }
+        ));
+        // ...and absent replicas are still absent.
+        assert!(matches!(
+            establish_under_attestation(
+                &[
+                    probe_with(1, 100, AnswerLineage::Unknown),
+                    probe(2, None),
+                    probe(3, None),
+                ],
+                3,
+                Uuid::from_u128(1),
+                None,
+            ),
+            Promotion::QuorumUnavailable { answered: 1, .. }
+        ));
     }
 
     /// #577: nor does an Unknown answer move the boundary. By offset, the

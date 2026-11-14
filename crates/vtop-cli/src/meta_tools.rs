@@ -1394,6 +1394,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                             "broken_links": audit.broken_links,
                             "vote_disagreements": audit.vote_disagreements,
                             "boundary_regressions": audit.boundary_regressions,
+                            "attested_promotions": audit.attested,
                             "regression_floor_known": !audit.regression_floor_unknown,
                             "mac": { "verified": audit.verified, "unsigned": audit.unsigned, "unverified": audit.unverified, "mismatch": audit.mismatches },
                         },
@@ -1406,11 +1407,12 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                     println!("{}", transition_line(view, record));
                 }
                 println!(
-                    "{} transition(s) from epoch {from_epoch} (read at applied index {}); links: {} broken; votes: {} disagree; mac: {} verified, {} unsigned, {} unverified, {} MISMATCH",
+                    "{} transition(s) from epoch {from_epoch} (read at applied index {}); links: {} broken; votes: {} disagree; attested: {}; mac: {} verified, {} unsigned, {} unverified, {} MISMATCH",
                     audit.records.len(),
                     read_at_applied_index,
                     audit.broken_links,
                     audit.vote_disagreements,
+                    audit.attested,
                     audit.verified,
                     audit.unsigned,
                     audit.unverified,
@@ -2086,6 +2088,26 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
     }
 }
 
+/// What `vtopctl node promote-unproven` says when metadata refuses the
+/// attestation at its feature-level gate (#636): the gate's own words, and
+/// what they mean here. Anything else is passed through as it came.
+pub(crate) fn explain_attestation_refusal(error: &str) -> String {
+    if vtop_meta::transport::refuses_promote_unproven(
+        &vtop_meta::transport::TransportError::Protocol(error.to_owned()),
+    ) || error.contains("unknown command kind tag 39")
+    {
+        format!(
+            "the cluster does not support the promotion override yet: it needs metadata feature \
+             level {} (#636), and nothing was recorded. Upgrade every metadata voter, then raise \
+             the level with `vtopctl meta enable-features --level {}`. Metadata said: {error}",
+            vtop_meta::PROMOTE_UNPROVEN_FEATURE_LEVEL,
+            vtop_meta::PROMOTE_UNPROVEN_FEATURE_LEVEL
+        )
+    } else {
+        error.to_owned()
+    }
+}
+
 /// `node-versions --level`'s verdict (#634): the same judgement as a raise,
 /// but with no state machine behind it to judge the nodes past a truncated
 /// list, so a truncated list that names no blocker is inconclusive.
@@ -2542,6 +2564,10 @@ pub struct VoteAudit {
     /// `required`-th highest answer, as the promoter takes it; `None` for
     /// a standalone promotion, which proves none.
     pub boundary_ok: bool,
+    /// Under an attestation (#636), it names the holder: an attestation for
+    /// another replica is not one this promotion could have used. `true`
+    /// for a promotion with no attestation.
+    pub attestation_ok: bool,
     /// The recomputation agrees, the holder answered, no replica is
     /// counted twice, the majority required is at least a majority of the
     /// replicas that answered, the boundary is the quorum's, AND the
@@ -2587,6 +2613,11 @@ pub struct ChainAudit {
     /// Promotions whose boundary fell below one an earlier promotion
     /// published (#449).
     pub boundary_regressions: usize,
+    /// Promotions made under an operator's attestation (#636): answers of
+    /// unproven lineage were counted, and records the holder did not hold
+    /// may have been lost. Not a failure - the operator asked for it - but
+    /// every one is listed, with who attested and when.
+    pub attested: usize,
     /// The audit started past the chain's head and the boundaries published
     /// before it could not be read, so the regression check is unverified
     /// for this window (#449).
@@ -2821,20 +2852,31 @@ pub fn cross_check_epoch_vectors(
     from_epoch: u64,
     vectors: &[ReplicaEpochVector],
 ) -> EpochCrossCheck {
-    let granted: std::collections::BTreeMap<u64, (Uuid, Option<u64>)> = chain
+    // Per granted epoch: its holder, the boundary its promotion proved, and
+    // whether that promotion was made under an attestation naming the
+    // holder (#636) - whose history is then the holder's whole log, seeded
+    // at offset 0 on purpose.
+    let granted: std::collections::BTreeMap<u64, (Uuid, Option<u64>, bool)> = chain
         .iter()
         .map(|view| {
-            let boundary = match &view.outcome {
+            let (boundary, attested) = match &view.outcome {
                 TransitionOutcome::Reported {
                     outcome:
                         PromotionOutcome::Established {
-                            boundary_offset, ..
+                            boundary_offset,
+                            attestation,
+                            ..
                         },
                     ..
-                } => *boundary_offset,
-                _ => None,
+                } => (
+                    *boundary_offset,
+                    attestation
+                        .as_ref()
+                        .is_some_and(|attestation| attestation.replica_node_uuid == view.holder_to),
+                ),
+                _ => (None, false),
             };
-            (view.epoch_to, (view.holder_to, boundary))
+            (view.epoch_to, (view.holder_to, boundary, attested))
         })
         .collect();
     let replicas = vectors
@@ -2854,8 +2896,14 @@ pub fn cross_check_epoch_vectors(
                             epoch: start.epoch,
                             start_offset: start.start_offset,
                         }),
-                        Some((holder, Some(boundary)))
-                            if holder == node_uuid && start.start_offset < *boundary =>
+                        // The attested seed is the operator's statement,
+                        // not an overwrite: exactly offset 0, under an
+                        // attestation naming this holder. Any other start
+                        // below the boundary is still a finding.
+                        Some((holder, Some(boundary), attested))
+                            if holder == node_uuid
+                                && start.start_offset < *boundary
+                                && !(*attested && start.start_offset == 0) =>
                         {
                             Some(EpochFinding::BelowBoundary {
                                 epoch: start.epoch,
@@ -3004,10 +3052,21 @@ pub fn audit_transitions(
                         quorum,
                         votes,
                         required,
+                        attestation,
                         ..
                     },
                 ..
             } => {
+                // An attested promotion (#636) counted its Unknown answers,
+                // on the operator's word, and only for the replica the
+                // attestation names.
+                let attested = attestation.is_some();
+                let attestation_ok = attestation
+                    .as_ref()
+                    .is_none_or(|attestation| attestation.replica_node_uuid == view.holder_to);
+                if attested {
+                    audit.attested += 1;
+                }
                 // ONE answer per replica (review): the promoter built its
                 // evidence from a map keyed by node, and neither the report
                 // validation nor the wire enforce uniqueness, so a quorum
@@ -3028,7 +3087,7 @@ pub fn audit_transitions(
                 // did.
                 let answers: std::collections::BTreeMap<Uuid, u64> = answers
                     .into_iter()
-                    .filter(|(_, answer)| answer.counts())
+                    .filter(|(_, answer)| answer.counts() || attested)
                     .map(|(node, answer)| (node, answer.offset))
                     .collect();
                 // The holder's own offset, as the promoter used it: its
@@ -3065,6 +3124,7 @@ pub fn audit_transitions(
                 let ok = holder_answered
                     && majority_recorded
                     && boundary_ok
+                    && attestation_ok
                     && !duplicated
                     && recomputed == *votes
                     && *votes >= *required;
@@ -3077,6 +3137,7 @@ pub fn audit_transitions(
                     required: *required,
                     holder_answered,
                     boundary_ok,
+                    attestation_ok,
                     ok,
                 })
             }
@@ -3141,6 +3202,7 @@ fn outcome_text(view: &AdminTransitionView, record: &TransitionAudit) -> String 
                 boundary_offset,
                 sealed_prefix_end,
                 quorum,
+                attestation,
                 ..
             } => {
                 let vote = record
@@ -3158,6 +3220,8 @@ fn outcome_text(view: &AdminTransitionView, record: &TransitionAudit) -> String 
                                 "HOLDER ABSENT FROM QUORUM"
                             } else if !vote.boundary_ok {
                                 "BOUNDARY NOT THE QUORUM'S"
+                            } else if !vote.attestation_ok {
+                                "ATTESTATION NAMES ANOTHER REPLICA"
                             } else {
                                 "VOTE MISMATCH"
                             }
@@ -3168,6 +3232,10 @@ fn outcome_text(view: &AdminTransitionView, record: &TransitionAudit) -> String 
                     .iter()
                     .map(|answer| match answer.lineage {
                         None => format!("{}:{}", answer.node_uuid, answer.offset),
+                        // Counted, under an attestation (#636).
+                        Some(vtop_meta::AnswerLineage::Unknown) if attestation.is_some() => {
+                            format!("{}:{}:unknown-counted-attested", answer.node_uuid, answer.offset)
+                        }
                         Some(lineage) => format!(
                             "{}:{}:{}",
                             answer.node_uuid,
@@ -3181,8 +3249,22 @@ fn outcome_text(view: &AdminTransitionView, record: &TransitionAudit) -> String 
                     .regressed_below
                     .map(|published| format!(" BOUNDARY BELOW PUBLISHED {published}"))
                     .unwrap_or_default();
+                let attested = attestation
+                    .as_ref()
+                    .map(|attestation| {
+                        format!(
+                            " ATTESTED attestation={} replica={} operator={:?} attested_at_ms={} \
+                             (answers of unproven lineage counted; records the holder did not \
+                             hold may be lost)",
+                            attestation.attestation_id,
+                            attestation.replica_node_uuid,
+                            attestation.operator,
+                            attestation.attested_at_ms
+                        )
+                    })
+                    .unwrap_or_default();
                 format!(
-                    "established boundary={} sealed_prefix_end={} {vote}{regression} quorum=[{quorum}] reported_at_ms={reported_at_ms} reported_apply_index={reported_apply_index}",
+                    "established boundary={} sealed_prefix_end={} {vote}{regression}{attested} quorum=[{quorum}] reported_at_ms={reported_at_ms} reported_apply_index={reported_apply_index}",
                     boundary_offset.map(|n| n.to_string()).unwrap_or_else(|| "none".to_owned()),
                     sealed_prefix_end.map(|n| n.to_string()).unwrap_or_else(|| "none".to_owned()),
                 )
@@ -3285,8 +3367,16 @@ fn transition_json(view: &AdminTransitionView, record: &TransitionAudit) -> serd
                 quorum,
                 votes,
                 required,
+                attestation,
             } => serde_json::json!({
                 "kind": "established",
+                // The operator's override (#636), or null.
+                "attestation": attestation.as_ref().map(|attestation| serde_json::json!({
+                    "attestation_id": attestation.attestation_id,
+                    "replica_node_uuid": attestation.replica_node_uuid,
+                    "operator": attestation.operator,
+                    "attested_at_ms": attestation.attested_at_ms,
+                })),
                 "boundary_offset": boundary_offset,
                 "sealed_prefix_end": sealed_prefix_end,
                 "quorum": quorum.iter().map(|answer| {
@@ -3294,8 +3384,16 @@ fn transition_json(view: &AdminTransitionView, record: &TransitionAudit) -> serd
                     // Absent for a record without verdicts (#577), so a
                     // consumer cannot mistake "not recorded" for a verdict.
                     if let Some(lineage) = answer.lineage {
-                        json["lineage"] = serde_json::json!(lineage_word(lineage));
-                        json["counted"] = serde_json::json!(answer.counts());
+                        // Counted under an attestation (#636): the same
+                        // label the text listing uses, never "not counted".
+                        json["lineage"] = match lineage {
+                            vtop_meta::AnswerLineage::Unknown if attestation.is_some() => {
+                                serde_json::json!("unknown-counted-attested")
+                            }
+                            _ => serde_json::json!(lineage_word(lineage)),
+                        };
+                        json["counted"] =
+                            serde_json::json!(answer.counts() || attestation.is_some());
                         if let vtop_meta::AnswerLineage::Reconciled { truncated_records } = lineage {
                             json["truncated_records"] = serde_json::json!(truncated_records);
                         }
@@ -3326,7 +3424,7 @@ fn transition_json(view: &AdminTransitionView, record: &TransitionAudit) -> serd
         "granted_apply_index": view.granted_apply_index,
         "link_ok": record.link_ok,
         "vote": record.vote.as_ref().map(|vote| serde_json::json!({
-            "recorded": vote.recorded, "recomputed": vote.recomputed, "required": vote.required, "holder_answered": vote.holder_answered, "boundary_ok": vote.boundary_ok, "ok": vote.ok,
+            "recorded": vote.recorded, "recomputed": vote.recomputed, "required": vote.required, "holder_answered": vote.holder_answered, "boundary_ok": vote.boundary_ok, "attestation_ok": vote.attestation_ok, "ok": vote.ok,
         })),
         "mac": record.mac.word(),
         "outcome": outcome,
@@ -3361,6 +3459,182 @@ fn mac_key_from_env(name: &str) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #636: below level 8 the attestation is refused at metadata's gate,
+    /// and the operator is told what that means and what to do - by the
+    /// gate's text and by an older release's codec alike. Any other error
+    /// passes through untouched.
+    #[test]
+    fn a_refused_attestation_says_the_cluster_is_below_level_8() {
+        let gate = vtop_meta::ConsensusError::FeatureNotEnabled {
+            needed: vtop_meta::PROMOTE_UNPROVEN_FEATURE_LEVEL,
+            enabled: 6,
+        }
+        .to_string();
+        for refusal in [gate, "unknown command kind tag 39".to_owned()] {
+            let explained = explain_attestation_refusal(&refusal);
+            assert!(explained.contains("feature level 8"), "{explained}");
+            assert!(explained.contains("nothing was recorded"), "{explained}");
+            assert!(
+                explained.contains("enable-features --level 8"),
+                "{explained}"
+            );
+        }
+        assert_eq!(
+            explain_attestation_refusal("metadata command was rejected"),
+            "metadata command was rejected"
+        );
+    }
+
+    /// #636: an attested promotion is audited as made - its Unknown answers
+    /// were counted, so the vote recomputes from them - and it is listed as
+    /// ATTESTED with who and when. An attestation naming a replica other
+    /// than the holder fails the audit: no promotion could have used it.
+    /// #656 review: the history an attested promotion writes - the holder's
+    /// whole log owned by the attested epoch, from offset 0 - is what the
+    /// operator asked for, not an overwrite, so the epoch-vector cross-check
+    /// accepts it. Only that seed: the same start without the attestation,
+    /// or any other start below the boundary under it, is still a finding.
+    #[test]
+    fn the_attested_history_seed_is_not_a_boundary_finding() {
+        let holder = Uuid::from_u128(1);
+        let transition = |attested: bool| AdminTransitionView {
+            epoch_from: 0,
+            epoch_to: 1,
+            holder_from: None,
+            holder_to: holder,
+            grant: GrantKind::Election,
+            granted_at_ms: 1_000,
+            granted_apply_index: 10,
+            outcome: TransitionOutcome::Reported {
+                outcome: PromotionOutcome::Established {
+                    boundary_offset: Some(100),
+                    sealed_prefix_end: None,
+                    quorum: vec![vtop_meta::QuorumAnswer {
+                        node_uuid: holder,
+                        offset: 100,
+                        lineage: Some(vtop_meta::AnswerLineage::Unknown),
+                    }],
+                    votes: 1,
+                    required: 1,
+                    attestation: attested.then(|| vtop_meta::PromotionAttestation {
+                        attestation_id: Uuid::from_u128(0x636),
+                        replica_node_uuid: holder,
+                        operator: "oncall".to_owned(),
+                        attested_at_ms: 900,
+                    }),
+                },
+                reported_at_ms: 1_500,
+                reported_apply_index: 12,
+            },
+            mac: None,
+        };
+        let vector = |start_offset: u64| -> Vec<ReplicaEpochVector> {
+            vec![(
+                holder,
+                "a:1".to_owned(),
+                Ok(vec![ReplicaEpochStart {
+                    epoch: 1,
+                    start_offset,
+                }]),
+            )]
+        };
+        let findings = |attested: bool, start: u64| {
+            cross_check_epoch_vectors(&[transition(attested)], 1, &vector(start)).replicas[0]
+                .findings
+                .len()
+        };
+        assert_eq!(
+            findings(true, 0),
+            0,
+            "the attested seed was reported as an overwrite"
+        );
+        assert_eq!(
+            findings(false, 0),
+            1,
+            "an ordinary promotion keeps the check"
+        );
+        assert_eq!(
+            findings(true, 40),
+            1,
+            "only the seed at 0 is the operator's"
+        );
+    }
+
+    #[test]
+    fn an_attested_promotion_is_listed_and_its_vote_recomputes() {
+        let (topic, range) = (Uuid::from_u128(0x20), Uuid::from_u128(0x21));
+        let holder = Uuid::from_u128(1);
+        let unknown = |node: u128| vtop_meta::QuorumAnswer {
+            node_uuid: Uuid::from_u128(node),
+            offset: 100,
+            lineage: Some(vtop_meta::AnswerLineage::Unknown),
+        };
+        let attested_by = |replica: Uuid| AdminTransitionView {
+            epoch_from: 0,
+            epoch_to: 1,
+            holder_from: None,
+            holder_to: holder,
+            grant: GrantKind::Election,
+            granted_at_ms: 1_000,
+            granted_apply_index: 10,
+            outcome: TransitionOutcome::Reported {
+                outcome: PromotionOutcome::Established {
+                    boundary_offset: Some(100),
+                    sealed_prefix_end: None,
+                    quorum: vec![unknown(1), unknown(2), unknown(3)],
+                    votes: 3,
+                    required: 2,
+                    attestation: Some(vtop_meta::PromotionAttestation {
+                        attestation_id: Uuid::from_u128(0x636),
+                        replica_node_uuid: replica,
+                        operator: "oncall".to_owned(),
+                        attested_at_ms: 900,
+                    }),
+                },
+                reported_at_ms: 1_500,
+                reported_apply_index: 12,
+            },
+            mac: None,
+        };
+        let views = vec![attested_by(holder)];
+        let audit = audit_transitions(&views, None, topic, range, 1, None, Some(None)).unwrap();
+        assert!(audit.verdict().is_ok(), "{audit:?}");
+        assert_eq!(audit.attested, 1);
+        let vote = audit.records[0].vote.as_ref().unwrap();
+        assert_eq!((vote.recorded, vote.recomputed, vote.ok), (3, 3, true));
+        let line = transition_line(&views[0], &audit.records[0]);
+        assert!(line.contains("ATTESTED"), "{line}");
+        assert!(line.contains("operator=\"oncall\""), "{line}");
+        assert!(line.contains("unknown-counted-attested"), "{line}");
+        let json = transition_json(&views[0], &audit.records[0]);
+        assert_eq!(json["outcome"]["attestation"]["operator"], "oncall");
+        assert_eq!(json["outcome"]["quorum"][0]["counted"], true);
+        assert_eq!(
+            json["outcome"]["quorum"][0]["lineage"], "unknown-counted-attested",
+            "a counted answer must not be labelled not counted"
+        );
+
+        // The same record without its attestation is the #577 shape: the
+        // Unknown answers are not counted, and three votes do not recompute.
+        let mut unattested = views.clone();
+        if let TransitionOutcome::Reported {
+            outcome: PromotionOutcome::Established { attestation, .. },
+            ..
+        } = &mut unattested[0].outcome
+        {
+            *attestation = None;
+        }
+        let audit =
+            audit_transitions(&unattested, None, topic, range, 1, None, Some(None)).unwrap();
+        assert_eq!(audit.vote_disagreements, 1);
+
+        let elsewhere = vec![attested_by(Uuid::from_u128(2))];
+        let audit = audit_transitions(&elsewhere, None, topic, range, 1, None, Some(None)).unwrap();
+        assert_eq!(audit.vote_disagreements, 1);
+        assert!(!audit.records[0].vote.as_ref().unwrap().attestation_ok);
+        assert!(audit.verdict().is_err());
+    }
 
     /// #634: `enable-features` refuses a level while one live range member
     /// reports an older one, naming it, and lets the same raise through once
@@ -3502,6 +3776,7 @@ mod tests {
                     quorum: Vec::new(),
                     votes: 2,
                     required: 2,
+                    attestation: None,
                 },
                 reported_at_ms: 1_500 * epoch_to as i64,
                 reported_apply_index: 10 * epoch_to + 2,
@@ -4197,6 +4472,7 @@ transport: plaintext
                         ],
                         votes: 2,
                         required: 2,
+                        attestation: None,
                     },
                     reported_at_ms: 1_500,
                     reported_apply_index: 12,
@@ -4410,6 +4686,7 @@ transport: plaintext
                 quorum: Vec::new(),
                 votes: 0,
                 required: 0,
+                attestation: None,
             },
             reported_at_ms: 1_500,
             reported_apply_index: 12,
@@ -4565,6 +4842,7 @@ transport: plaintext
                         ],
                         votes: 2,
                         required: 2,
+                        attestation: None,
                     },
                     reported_at_ms: 1_500,
                     reported_apply_index: 12,
