@@ -532,6 +532,18 @@ s3://{bucket}/{prefix}/tenant={tenant}/source={source}/format={format}/year={yyy
 - `batch_id` **MUST** be unique within its partition prefix.
 - The naming scheme **MUST** be deterministic so that replay produces the same object key for the same batch.
 
+*Implementation note (reference engine, #626).* The object's file name is not
+the `batch_id` but `vtop-[{engine}-]{source}-{range}[-i{inode}]-{digest}` (the
+engine and inode only for file and spool ranges), where
+`digest` is the first 32 hex digits of the object checksum: the same bytes of the same range
+give the same key, and an object already at the key is reused only after it
+verifies against the batch's full digest. The manifest keeps
+`{batch_id}.manifest.json`, with a `batch_id` unique per attempt, so several
+manifests can name one object. A batch whose replay has other boundaries or
+another partition hour is a different batch under this rule and gets another
+key. Without a checksum, or when the backend cannot report an absent key, the
+object is named by the `batch_id` as above.
+
 ### 15.2 Per-format bucket templating
 
 A conformant implementation **MAY** route objects to **per-format buckets** via a templated bucket name, for example `bucket: "telemetry-{format}"`. When bucket templating is used:
@@ -651,4 +663,4 @@ Adding any extension **MUST NOT** weaken the commit rule (§13) or the replay ru
 - [SECURITY_MODEL.md](SECURITY_MODEL.md) — security model and normative security rules.
 - [INVENTION_DISCLOSURE_DRAFT.md](INVENTION_DISCLOSURE_DRAFT.md) — candidate-invention disclosure draft.
 - [PRIOR_ART_SEARCH_PLAN.md](PRIOR_ART_SEARCH_PLAN.md) — prior-art search plan.
-- Project [README](../README.md) — setup, CLI, and Docker lab.
+- Project [README](../README.md), the [quick start](getting-started/quickstart.md) (Docker lab) and [the CLI](reference/cli.md).

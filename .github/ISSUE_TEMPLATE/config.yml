@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/allamiro/vtop-engine/security/advisories/new
+    about: Report it privately, never as a public issue. Give the version, the configuration and what an attacker gains.
+  - name: Documentation
+    url: https://github.com/allamiro/vtop-engine/blob/main/docs/README.md
+    about: Architecture, the protocol draft, the security model, deployment guides and the roadmap. A docs error can go in a bug report with component "Documentation".

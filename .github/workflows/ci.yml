@@ -56,7 +56,7 @@ jobs:
       upgrade: ${{ steps.filter.outputs.upgrade }}
       helm: ${{ steps.filter.outputs.helm }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Pinned to a full commit SHA (v3), not the mutable tag, so an upstream
       # tag move cannot change CI behaviour without a reviewed commit here.
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
@@ -152,6 +152,15 @@ jobs:
             benchmark_charts:
               - 'benchmarks/kafka_compare/**'
               - 'docs/benchmarks/**'
+              # The README's evidence charts: their generator and test, the
+              # measurements they are drawn from, the output, and the README
+              # whose prose quotes the same figures.
+              - 'benchmarks/readme_charts.py'
+              - 'benchmarks/tests/test_readme_charts.py'
+              - 'benchmarks/measurements/483-tcp-baseline/**'
+              - 'benchmarks/measurements/663-policed-uplink/**'
+              - 'docs/assets/readme/**'
+              - 'README.md'
               - '.github/workflows/ci.yml'
             scripts:
               - 'scripts/**'
@@ -416,7 +425,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
@@ -495,7 +504,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
@@ -1041,7 +1050,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # Pinned to reviewed versions rather than the mutable `stable`/`latest`
       # tags, so a tool update cannot change CI results without a commit.
@@ -1089,7 +1098,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: naming check (no commercial mark outside the prior-art files)
         run: bash scripts/check-naming.sh
@@ -1134,7 +1143,7 @@ jobs:
           --health-retries 12
           --health-start-period 20s
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -1199,7 +1208,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
         with:
           tool: cargo-deny
@@ -1226,7 +1235,7 @@ jobs:
     # than occupy a runner.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
@@ -1311,7 +1320,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # The whole point is building OTHER releases: the worktrees below
           # check out release tags, which a shallow clone does not have.
@@ -1433,7 +1442,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Read rust-version from Cargo.toml
         id: msrv
         run: |
@@ -1467,7 +1476,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
@@ -1517,7 +1526,7 @@ jobs:
       run:
         working-directory: benchmarks
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -1556,7 +1565,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # Build the engine image once, up front: the script's `compose up` would
       # otherwise build it inside the timed wait loop and could time out on a
@@ -1608,7 +1617,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           # Pinned: the floating "nightly" channel broke on 2026-07-24 with an
@@ -1650,7 +1659,7 @@ jobs:
     timeout-minutes: 30
     continue-on-error: true
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
@@ -1691,7 +1700,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
@@ -1746,7 +1755,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
@@ -1756,7 +1765,7 @@ jobs:
       # need it skip there; here they run.
       - name: Report and drift-check tests, with matplotlib
         working-directory: benchmarks
-        run: python -m pytest tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py
+        run: python -m pytest tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_readme_charts.py
       - name: Regenerate every chart and report and fail on drift
         run: |
           python3 benchmarks/kafka_compare/regenerate.py
@@ -1768,6 +1777,15 @@ jobs:
             echo "::error::Committed benchmark charts or reports differ from what the committed CSVs produce. Run 'python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/kafka_compare/regenerate.py' and commit the result."
             echo "$drift"
             git diff --stat -- docs/benchmarks/
+            exit 1
+          fi
+      - name: Redraw the README's charts and fail on drift
+        run: |
+          python3 benchmarks/readme_charts.py
+          drift="$(git status --porcelain -- docs/assets/readme/)"
+          if [ -n "$drift" ]; then
+            echo "::error::The README's charts differ from what the committed measurements produce. Run 'python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/readme_charts.py' and commit the result."
+            echo "$drift"
             exit 1
           fi
 
@@ -1795,7 +1813,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable

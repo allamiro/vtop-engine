@@ -191,16 +191,18 @@ pub fn sanitize_bucket(name: &str) -> String {
     }
 }
 
-/// The object file name: `{batch_id}.{format}.{compression_ext}` (compression
-/// extension omitted when [`CompressionType::None`]).
+/// The object file name: `{name}.{format}.{compression_ext}` (compression
+/// extension omitted when [`CompressionType::None`]). `name` is the batch's
+/// derived object name ([`crate::batch::build_object_name`]) or, when no
+/// digest names it, its batch id.
 pub fn object_file_name(
-    batch_id: &str,
+    name: &str,
     format: TelemetryFormat,
     compression: CompressionType,
 ) -> String {
     match compression.extension() {
-        Some(ext) => format!("{batch_id}.{}.{ext}", format.extension()),
-        None => format!("{batch_id}.{}", format.extension()),
+        Some(ext) => format!("{name}.{}.{ext}", format.extension()),
+        None => format!("{name}.{}", format.extension()),
     }
 }
 
@@ -215,14 +217,14 @@ pub fn object_uri(
     bucket: &str,
     prefix: &str,
     resolved_prefix: &str,
-    batch_id: &str,
+    name: &str,
     format: TelemetryFormat,
     compression: CompressionType,
 ) -> String {
     let key = join_key(&[
         prefix,
         resolved_prefix,
-        &object_file_name(batch_id, format, compression),
+        &object_file_name(name, format, compression),
     ]);
     format!("s3://{bucket}/{key}")
 }

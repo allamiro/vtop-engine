@@ -26,7 +26,9 @@
 //!
 //! Compiled only with `--features postgres`.
 
-use crate::models::{BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset};
+use crate::models::{
+    BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset, VerificationClass,
+};
 use crate::store::StateStore;
 use async_trait::async_trait;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
@@ -54,16 +56,41 @@ const MIGRATION: &str = include_str!("../migrations/postgres/0001_state_store.sq
 /// under the newer comment.
 const SCHEMA_MARKER_PREFIX: &str = "-- vtop-state-schema ";
 const MIN_SCHEMA_VERSION: u32 = 3;
+/// The newest marker this build reads: the one its own migration writes.
+/// A higher marker means a newer release migrated the database for a change
+/// this build could misread - the marker is bumped for nothing else - so this
+/// build refuses it, at startup and in `vtopctl migrate`, rather than run on
+/// it or reinstall its older trigger over it (#664). Releases before this one
+/// accepted any marker at or above their minimum, and cannot be made to
+/// refuse; this is the refusal path for the releases from here on.
+const SCHEMA_VERSION: u32 = 3;
 
-/// Whether the trigger function's body opens with a schema version this
-/// engine accepts. A marker anywhere but the first non-empty line, or a
-/// missing or unparseable one, is an old schema.
-fn schema_marker_is_current(function_body: Option<&str>) -> bool {
+/// The schema version the trigger function's body opens with: the first
+/// non-empty line. A marker anywhere else, or a missing or unparseable one,
+/// is no marker.
+fn schema_marker(function_body: Option<&str>) -> Option<u32> {
     function_body
         .and_then(|body| body.lines().map(str::trim).find(|line| !line.is_empty()))
         .and_then(|line| line.strip_prefix(SCHEMA_MARKER_PREFIX))
         .and_then(|v| v.trim().parse::<u32>().ok())
-        .is_some_and(|v| v >= MIN_SCHEMA_VERSION)
+}
+
+/// Whether the trigger function's body opens with a schema version this
+/// engine accepts. A missing or older marker is an old schema.
+fn schema_marker_is_current(function_body: Option<&str>) -> bool {
+    schema_marker(function_body).is_some_and(|v| (MIN_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&v))
+}
+
+/// The refusal for a schema a newer release migrated, or `None`.
+fn newer_schema_refusal(function_body: Option<&str>) -> Option<VtopError> {
+    let marker = schema_marker(function_body).filter(|v| *v > SCHEMA_VERSION)?;
+    Some(VtopError::State(format!(
+        "PostgreSQL state-store schema marker {marker} (`{SCHEMA_MARKER_PREFIX}{marker}` in the \
+         commit-rule trigger) is newer than this release supports (minimum {MIN_SCHEMA_VERSION}, \
+         newest {SCHEMA_VERSION}): a newer release has migrated this database. Nothing was \
+         started or changed. Run the release that migrated it, or a later one; do not run this \
+         release's `vtopctl migrate` against it"
+    )))
 }
 
 /// Retry budget for transient serialization failures (SQLSTATE 40001). One
@@ -217,13 +244,29 @@ fn schema_migration_required() -> VtopError {
     )
 }
 
+/// [`schema_migration_required`], naming what the database reported missing
+/// (a column such as `verification_class`, #664, or the table), so the
+/// operator can see which release's migration has not run.
+fn schema_migration_required_because(what: &str) -> VtopError {
+    VtopError::State(format!(
+        "PostgreSQL state-store schema is missing or outdated ({}); run `vtopctl migrate --config <path>` with the privileged migration identity before starting the engine",
+        redact_postgres_urls(what)
+    ))
+}
+
 fn map_schema_check(error: sqlx::Error) -> VtopError {
+    let what = error
+        .as_database_error()
+        .map(|database_error| database_error.message().to_owned());
     match error
         .as_database_error()
         .and_then(|database_error| database_error.code())
         .as_deref()
     {
-        Some("42P01" | "42703" | "42883" | "3F000") => schema_migration_required(),
+        Some("42P01" | "42703" | "42883" | "3F000") => match what {
+            Some(what) => schema_migration_required_because(&what),
+            None => schema_migration_required(),
+        },
         Some("42501") => VtopError::State(
             "PostgreSQL runtime identity lacks schema/table access; grant USAGE on the state-store schema and SELECT, INSERT, UPDATE on batches"
                 .into(),
@@ -279,10 +322,54 @@ impl PgStateStore {
     /// deployment identity. The engine never calls this during startup.
     pub async fn migrate(conn_str: &str) -> Result<(), VtopError> {
         let pool = connect_pool(conn_str, 1).await?;
+        // A schema a newer release migrated is left alone: this release's
+        // `CREATE OR REPLACE` would install its older trigger body over it
+        // (#664).
+        let body: Option<String> = sqlx::query_scalar(
+            "SELECT p.prosrc \
+             FROM pg_catalog.pg_trigger t \
+             JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid \
+             WHERE t.tgrelid = to_regclass('batches') \
+               AND t.tgname = 'trg_commit_after_verify' \
+               AND NOT t.tgisinternal",
+        )
+        .fetch_optional(&pool)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(refusal) = newer_schema_refusal(body.as_deref()) {
+            return Err(refusal);
+        }
+        // Whether this run adds the verification class column (#664) to a
+        // table that already holds rows: those rows keep no class, and the
+        // operator is told how many.
+        let adds_class_column: bool = sqlx::query_scalar(
+            "SELECT to_regclass('batches') IS NOT NULL AND NOT EXISTS ( \
+                SELECT 1 FROM pg_catalog.pg_attribute \
+                WHERE attrelid = to_regclass('batches') \
+                  AND attname = 'verification_class' AND NOT attisdropped)",
+        )
+        .fetch_one(&pool)
+        .await
+        .map_err(map_sqlx)?;
         sqlx::raw_sql(MIGRATION)
             .execute(&pool)
             .await
             .map_err(map_sqlx)?;
+        if adds_class_column {
+            // Best effort (review of #664): the migration has committed, and
+            // a failed count must not report it as failed. An exact count, as
+            // the message promises a number; migrate is a one-off step.
+            match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM batches")
+                .fetch_one(&pool)
+                .await
+            {
+                Ok(rows) => crate::models::log_class_column_added("PostgreSQL", rows),
+                Err(e) => crate::models::log_class_column_added_uncounted(
+                    "PostgreSQL",
+                    &redact_postgres_urls(&e.to_string()),
+                ),
+            }
+        }
         Self {
             pool,
             fence: Default::default(),
@@ -308,21 +395,9 @@ impl PgStateStore {
     }
 
     async fn check_schema(&self) -> Result<(), VtopError> {
-        // Listing every runtime column makes an old/partial schema fail during
-        // startup instead of halfway through a batch. This is a SELECT only.
-        sqlx::query(
-            "SELECT batch_id, tenant, source_type, source_name, format, state, \
-                    progress_start_json, progress_end_json, object_uri, manifest_uri, \
-                    object_sha256, manifest_sha256, manifest_version_id, object_size_bytes, record_count, \
-                    error_message, owner, lease_expires_at, created_at, updated_at, claim_gen \
-             FROM batches WHERE FALSE",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_schema_check)?;
-
-        // The trigger must be enabled and call a function whose body carries a
-        // current schema marker, not merely exist by name: a schema restored
+        // First, the schema marker. The trigger must be enabled and call a
+        // function whose body carries a current schema marker, not merely
+        // exist by name (a missing table is reported as needing migrate): a schema restored
         // from an older archive, never re-migrated, or re-migrated by an older
         // release keeps the name with an older body, and a restore that
         // disabled the trigger may never have enabled it again.
@@ -338,9 +413,27 @@ impl PgStateStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(map_schema_check)?;
+        if let Some(refusal) = newer_schema_refusal(body.as_deref()) {
+            return Err(refusal);
+        }
         if !schema_marker_is_current(body.as_deref()) {
             return Err(schema_migration_required());
         }
+
+        // Listing every runtime column makes an old/partial schema fail during
+        // startup instead of halfway through a batch. This is a SELECT only.
+        // The list every whole-row read names (`batch_columns!`). After the
+        // marker (review of #664): a newer release may drop or rename one of
+        // these, and its schema must be refused as newer, not sent to a
+        // `vtopctl migrate` that then refuses it.
+        sqlx::query(concat!(
+            "SELECT ",
+            batch_columns!(),
+            " FROM batches WHERE FALSE"
+        ))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_schema_check)?;
 
         // The state CHECK must admit every state this build writes (#567),
         // under a current marker or not: see STATE_ADDED_SINCE_FIRST_SCHEMA.
@@ -460,6 +553,7 @@ impl StateStore for PgStateStore {
         // names recur. A lost claim is not a lost update — retrying cannot
         // help — so it is reported at once. A row this process holds no
         // generation for is refused (see the fence module).
+        crate::store::require_class_only_at_verified(batch_id, to, patch)?;
         let held = self.fence.held(batch_id);
         let mut attempt = 0;
         loop {
@@ -480,7 +574,8 @@ impl StateStore for PgStateStore {
                          object_size_bytes = COALESCE($7, object_size_bytes),
                          record_count = COALESCE($8, record_count),
                          error_message = COALESCE($9, error_message),
-                         updated_at = $10
+                         updated_at = $10,
+                         verification_class = CASE WHEN $14 THEN $15 ELSE verification_class END
                        WHERE batch_id = $11 AND state = $12 AND claim_gen = $13"#,
                 )
                 .bind(validated.as_str())
@@ -496,6 +591,10 @@ impl StateStore for PgStateStore {
                 .bind(batch_id)
                 .bind(expected)
                 .bind(held)
+                // As SQLite: the transition to VERIFIED writes the class it
+                // was given, NULL included (#664).
+                .bind(validated == BatchState::Verified)
+                .bind(patch.verification_class.map(VerificationClass::as_str))
                 .execute(&self.pool)
             })
             .await?
@@ -527,17 +626,28 @@ impl StateStore for PgStateStore {
     }
 
     async fn get_batch(&self, batch_id: &str) -> Result<Option<BatchRecord>, VtopError> {
-        let row = sqlx::query("SELECT * FROM batches WHERE batch_id = $1")
-            .bind(batch_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            batch_columns!(),
+            " FROM batches WHERE batch_id = $1"
+        ))
+        .bind(batch_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         row.map(row_to_record).transpose()
     }
 
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
-        self.query_records("SELECT * FROM batches ORDER BY created_at DESC", None)
-            .await
+        self.query_records(
+            concat!(
+                "SELECT ",
+                batch_columns!(),
+                " FROM batches ORDER BY created_at DESC"
+            ),
+            None,
+        )
+        .await
     }
 
     async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError> {
@@ -577,13 +687,14 @@ impl StateStore for PgStateStore {
         // RETURNING gives exactly the rows THIS statement claimed, with the
         // generation it set (see the SQLite implementation and #557).
         let claimed = with_retry(|| {
-            sqlx::query(
+            sqlx::query(concat!(
                 "UPDATE batches SET owner = $1, lease_expires_at = $2, updated_at = $3, \
                         claim_gen = claim_gen + 1 \
                  WHERE state NOT IN ($4, $5) \
                    AND (owner IS NULL OR owner = $1 OR lease_expires_at IS NULL OR lease_expires_at <= $3) \
-                 RETURNING *",
-            )
+                 RETURNING ",
+                batch_columns!()
+            ))
             .bind(owner)
             .bind(lease_until)
             .bind(now)
@@ -743,9 +854,11 @@ impl StateStore for PgStateStore {
     }
 
     async fn list_incomplete_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
-        let rows = sqlx::query(
-            "SELECT * FROM batches WHERE state NOT IN ($1, $2) ORDER BY created_at ASC",
-        )
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            batch_columns!(),
+            " FROM batches WHERE state NOT IN ($1, $2) ORDER BY created_at ASC"
+        ))
         .bind(BatchState::SourceCommitted.as_str())
         .bind(BatchState::Superseded.as_str())
         .fetch_all(&self.pool)
@@ -756,7 +869,11 @@ impl StateStore for PgStateStore {
 
     async fn list_failed_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
         self.query_records(
-            "SELECT * FROM batches WHERE state = $1 ORDER BY created_at ASC",
+            concat!(
+                "SELECT ",
+                batch_columns!(),
+                " FROM batches WHERE state = $1 ORDER BY created_at ASC"
+            ),
             Some(BatchState::Failed.as_str().to_string()),
         )
         .await
@@ -771,8 +888,16 @@ impl StateStore for PgStateStore {
             .await
     }
 
-    async fn mark_verified(&self, batch_id: &str) -> Result<(), VtopError> {
-        self.update_batch_state(batch_id, BatchState::Verified, &BatchPatch::default())
+    async fn mark_verified(
+        &self,
+        batch_id: &str,
+        class: VerificationClass,
+    ) -> Result<(), VtopError> {
+        let patch = BatchPatch {
+            verification_class: Some(class),
+            ..Default::default()
+        };
+        self.update_batch_state(batch_id, BatchState::Verified, &patch)
             .await
     }
 
@@ -821,7 +946,9 @@ impl StateStore for PgStateStore {
     ) -> Result<Vec<BatchRecord>, VtopError> {
         let rows = with_retry(|| {
             sqlx::query(concat!(
-                "SELECT * FROM batches WHERE batch_id IN ( \
+                "SELECT ",
+                batch_columns!(),
+                " FROM batches WHERE batch_id IN ( \
                     SELECT b.batch_id FROM batches b WHERE ",
                 pg_prune_predicate_sql!(),
                 " LIMIT $3 ) ORDER BY created_at, batch_id"
@@ -881,6 +1008,10 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> Result<BatchRecord, VtopError> {
         manifest_sha256: row.get("manifest_sha256"),
         manifest_version_id: row.get("manifest_version_id"),
         object_size_bytes: row.get("object_size_bytes"),
+        verification_class: VerificationClass::from_stored(
+            row.get::<Option<String>, _>("verification_class")
+                .as_deref(),
+        ),
         record_count: row.get("record_count"),
         error_message: row.get("error_message"),
         owner: row.get("owner"),
@@ -927,9 +1058,25 @@ mod security_tests {
         assert!(schema_marker_is_current(Some(&body(
             "-- vtop-state-schema 3"
         ))));
-        assert!(schema_marker_is_current(Some(&body(
+        // A newer release's marker is not current: it is refused as newer,
+        // naming the marker and the versions this release reads (#664).
+        assert!(!schema_marker_is_current(Some(&body(
             "    -- vtop-state-schema 4"
         ))));
+        let refusal = newer_schema_refusal(Some(&body("-- vtop-state-schema 4")))
+            .expect("a newer marker is refused")
+            .to_string();
+        for part in [
+            "schema marker 4",
+            "-- vtop-state-schema 4",
+            "minimum 3",
+            "newest 3",
+        ] {
+            assert!(refusal.contains(part), "{part:?} missing from: {refusal}");
+        }
+        for not_newer in ["-- vtop-state-schema 3", "-- vtop-state-schema 2", ""] {
+            assert!(newer_schema_refusal(Some(&body(not_newer))).is_none());
+        }
     }
 
     #[test]

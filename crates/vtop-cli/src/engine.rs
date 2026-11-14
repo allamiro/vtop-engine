@@ -152,6 +152,67 @@ pub struct Pipeline<'a> {
     /// CreateBucket calls, and first batches for DIFFERENT buckets must not
     /// wait on each other's network round trip.
     pub provisioned_buckets: ProvisionedBuckets,
+    /// Rate limit for object-key notices that repeat on every batch while a
+    /// setting stays as it is (#626). Owned by [`Engine`] and shared like
+    /// `versioned_buckets`.
+    pub key_notices: Arc<KeyNotices>,
+}
+
+/// Rate limit for the object-key notices a setting repeats on every batch
+/// (#626): no checksum, a backend that cannot report an absent key, a probe
+/// the store refuses. The first is logged at once; later ones at most once a
+/// minute per kind, with how many were suppressed in between. Each decision
+/// is still counted in `vtop_object_key_decisions_total`.
+type NoticeKey = (&'static str, String);
+
+#[derive(Debug)]
+pub struct KeyNotices {
+    every: Duration,
+    /// (kind, source) -> (when one was last logged, suppressed since).
+    last: std::sync::Mutex<HashMap<NoticeKey, (Instant, u64)>>,
+}
+
+impl Default for KeyNotices {
+    fn default() -> Self {
+        Self::every(Duration::from_secs(60))
+    }
+}
+
+impl KeyNotices {
+    fn every(every: Duration) -> Self {
+        Self {
+            every,
+            last: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `Some(suppressed since the last one logged)` when a notice of `kind`
+    /// about `source` should be logged now, `None` when it is suppressed. Per
+    /// source, so one stream's notices never hide another's; sources are
+    /// bounded by configuration and discovery.
+    fn admit(&self, kind: &'static str, source: &str) -> Option<u64> {
+        self.admit_at(kind, source, Instant::now())
+    }
+
+    fn admit_at(&self, kind: &'static str, source: &str, now: Instant) -> Option<u64> {
+        let mut last = self.last.lock().unwrap();
+        match last.get_mut(&(kind, source.to_owned())) {
+            None => {
+                last.insert((kind, source.to_owned()), (now, 0));
+                Some(0)
+            }
+            Some((at, suppressed)) if now.duration_since(*at) >= self.every => {
+                let n = *suppressed;
+                *at = now;
+                *suppressed = 0;
+                Some(n)
+            }
+            Some((_, suppressed)) => {
+                *suppressed += 1;
+                None
+            }
+        }
+    }
 }
 
 impl<'a> Pipeline<'a> {
@@ -276,6 +337,7 @@ impl<'a> Pipeline<'a> {
             manifest_sha256: None,
             manifest_version_id: None,
             object_size_bytes: None,
+            verification_class: None,
             record_count: Some(batch.records.len() as i64),
             error_message: None,
             // Ownership (#93): this engine claims the batch at birth, leased so
@@ -494,7 +556,14 @@ impl<'a> Pipeline<'a> {
         // Bucket may be templated (e.g. "telemetry-{format}") for one bucket
         // per data format.
         let bucket = partitioning::resolve_bucket(&self.config.upload.bucket, &ctx);
-        let object_uri = partitioning::object_uri(
+        // Two candidate object keys (#626). The DERIVED key is named by the
+        // source, the range and the digest of the bytes, so a replay that
+        // produces the same bytes finds the object an earlier attempt left;
+        // it needs a digest. The ATTEMPT key is named by this attempt's
+        // batch id, unique by construction: the fallback when there is no
+        // digest, when the backend cannot tell an absent key from a refused
+        // request, or when the derived key holds bytes that do not verify.
+        let attempt_object_uri = partitioning::object_uri(
             &bucket,
             &self.config.upload.prefix,
             &resolved_prefix,
@@ -502,6 +571,32 @@ impl<'a> Pipeline<'a> {
             format.clone(),
             compressed.compression,
         );
+        let derived_object_uri: Result<String, String> = match object_checksum.as_deref() {
+            None => Err(
+                "checksums are disabled (checksum.algorithm: none), so the object cannot be \
+                 named by its content; enable a checksum so a replay of this range reuses it"
+                    .to_string(),
+            ),
+            Some(_) if !self.backend.reports_absent_objects() => Err(format!(
+                "backend {} cannot tell a missing key from a refused request, so a derived key \
+                 could be written over; use the s3_native or localfs backend so a replay of \
+                 this range reuses it",
+                self.backend.backend_name()
+            )),
+            Some(digest) => Ok(partitioning::object_uri(
+                &bucket,
+                &self.config.upload.prefix,
+                &resolved_prefix,
+                &vtop_core::batch::build_object_name(
+                    &self.config.engine.name,
+                    &source.source_name,
+                    &window,
+                    digest,
+                ),
+                format.clone(),
+                compressed.compression,
+            )),
+        };
         let manifest_uri = partitioning::manifest_uri(
             &bucket,
             &self.config.upload.prefix,
@@ -585,6 +680,175 @@ impl<'a> Pipeline<'a> {
             .as_deref()
             .map(|h| ObjectChecksum::new(algo.as_str(), h));
 
+        // Which key the bytes go under, and whether they are already there
+        // (#626). An object already at the derived key is reused only when it
+        // verifies STRONGLY against this batch's digest: then it holds these
+        // bytes and putting them again would only add a version. Anything
+        // else at the key is never overwritten - it may be a damaged object
+        // a scrub has yet to report - and the batch goes under its attempt
+        // key instead. The reused object is verified again below like any
+        // other, so VERIFIED still rests on a read of the stored bytes.
+        let labels = [
+            tenant.as_str(),
+            source.source_type.as_str(),
+            format.extension(),
+        ];
+        // Every outcome is logged for the operator with what happened, what
+        // the engine did and what to do, with the batch id, keys and range as
+        // fields, and counted by decision (#626). The notices a setting
+        // repeats on every batch are rate-limited; the counter is not.
+        let range = window.range_token();
+        let source_name = source.source_name.as_str();
+        let decided = |decision: &str| {
+            debug_assert!(
+                telemetry::OBJECT_KEY_DECISIONS.contains(&decision),
+                "{decision} is not a pinned decision value"
+            );
+            if let Some(mx) = telemetry::metrics() {
+                mx.object_key_decisions_total
+                    .with_label_values(&[labels[0], labels[1], labels[2], decision])
+                    .inc();
+            }
+        };
+        let (object_uri, reused) = match derived_object_uri {
+            Err(why) => {
+                decided("per_attempt");
+                if let Some(suppressed) = self.key_notices.admit("per_attempt", source_name) {
+                    tracing::info!(
+                        event = "object_key_per_attempt",
+                        batch_id,
+                        source = source_name,
+                        range,
+                        key = %attempt_object_uri,
+                        reason = %why,
+                        suppressed,
+                        "range {range} of {source_name} is written under its per-attempt key \
+                         {attempt_object_uri}, so a replay of it will write another object \
+                         (nothing is lost): {why} ({suppressed} more like this suppressed since \
+                         the last notice)"
+                    );
+                }
+                (attempt_object_uri, false)
+            }
+            Ok(derived) => match probe_object_key(
+                self.backend.as_ref(),
+                &derived,
+                compressed.size_bytes,
+                object_ck,
+                labels,
+                &self.attempts,
+                &self.throttles,
+            )
+            .await
+            {
+                Ok(KeyProbe::Free) => {
+                    decided("derived");
+                    tracing::info!(
+                        event = "object_key_derived",
+                        batch_id,
+                        source = source_name,
+                        range,
+                        key = %derived,
+                        "no object for range {range} of {source_name} is stored yet; uploading it \
+                         under its derived key {derived}, so a replay of the same bytes will reuse \
+                         it; nothing to do"
+                    );
+                    (derived, false)
+                }
+                Ok(KeyProbe::Holds) => {
+                    decided("reused");
+                    tracing::info!(
+                        event = "object_key_reused",
+                        batch_id,
+                        source = source_name,
+                        range,
+                        key = %derived,
+                        "object for range {range} of {source_name} already archived and verified; \
+                         reusing key {derived}, no upload; nothing to do"
+                    );
+                    (derived, true)
+                }
+                Ok(probe) => {
+                    let (decision, what, todo) = match &probe {
+                        KeyProbe::Differs(_) => (
+                            "fallback_differs",
+                            "exists but its bytes differ from this batch",
+                            "nothing is lost; run `vtopctl scrub` to see whether a committed \
+                             batch names the damaged object",
+                        ),
+                        KeyProbe::SizeOnly(_) => (
+                            "fallback_size_only",
+                            "exists but the backend could confirm only its size",
+                            "nothing is lost; use a backend and checksum that verify stored \
+                             content so a replay can reuse it",
+                        ),
+                        KeyProbe::Unreadable(_) => (
+                            "fallback_unreadable",
+                            "exists but could not be read to verify it",
+                            "nothing is lost; run `vtopctl scrub` to see whether a committed \
+                             batch names it, and check the store's health",
+                        ),
+                        KeyProbe::Unchecked(why) if why.contains("403") => (
+                            "fallback_unchecked",
+                            "could not be checked: the store refused the request",
+                            "nothing is lost; grant list permission on the bucket: without it \
+                             S3 answers a missing key with 403, not 404, and no replay can reuse \
+                             an object",
+                        ),
+                        _ => (
+                            "fallback_unchecked",
+                            "could not be checked: the store did not answer the request",
+                            "nothing is lost; check the store's health if this persists",
+                        ),
+                    };
+                    decided(decision);
+                    // A failed check of the key repeats for every batch while
+                    // the store or its permissions stay as they are; an
+                    // object that does not verify, verifies by size only or
+                    // cannot be read is about one key and is always reported.
+                    let suppressed = if decision == "fallback_unchecked" {
+                        self.key_notices.admit(decision, source_name)
+                    } else {
+                        Some(0)
+                    };
+                    if let Some(suppressed) = suppressed {
+                        let why = probe.reason();
+                        tracing::warn!(
+                            event = "object_key_fallback",
+                            batch_id,
+                            source = source_name,
+                            range,
+                            key = %derived,
+                            fallback_key = %attempt_object_uri,
+                            reason = %why,
+                            decision,
+                            suppressed,
+                            "object at {derived} {what} ({why}); writing range {range} of \
+                             {source_name} under {attempt_object_uri} instead of overwriting it; \
+                             {todo}"
+                        );
+                    }
+                    (attempt_object_uri, false)
+                }
+                Err(e) => {
+                    decided("probe_throttled");
+                    tracing::warn!(
+                        event = "object_key_probe_throttled",
+                        batch_id,
+                        source = source_name,
+                        range,
+                        key = %derived,
+                        error = %e,
+                        "the store throttled the check of {derived}; nothing was written, the \
+                         batch fails and range {range} of {source_name} is handed back for retry; \
+                         nothing to do unless it persists, then reduce upload concurrency"
+                    );
+                    fail!(format!("object key probe of {derived} failed: {e}"))
+                }
+            },
+        };
+        metrics.object_reused = reused;
+
         // ONE PUT, OR RESUMABLE MULTIPART above the threshold (#482). The
         // retransmission unit for a single put is the whole batch — a lost
         // object near the end of a 100 MB batch costs the whole 100 MB
@@ -593,19 +857,25 @@ impl<'a> Pipeline<'a> {
         // built ONE way for both this path and `vtopctl tier`, so part
         // sizes and fencing cannot drift.
         //
-        // The fence is derived from the batch id and the content digest,
+        // The fence is derived from the object key and the content digest,
         // NOT a lease this path does not have. What it protects: a session
         // resumed for THIS object identity carries THIS content — the
         // resume refuses if the local bytes or their digest changed, so a
         // re-derived batch (a new digest) never adopts a stale session. It
         // does NOT fence against a concurrent writer to the same object
-        // key; the telemetry path has one writer per batch id by
-        // construction (the run's own key prefix), which is the property
-        // that stands in for the lease `tier` holds.
+        // key. An attempt key has one writer by construction; a derived key
+        // is named by its content digest, so two writers of it write the
+        // same bytes (#626), which is the property that stands in for the
+        // lease `tier` holds. A replay of the same bytes after a crash
+        // resumes the session the crashed attempt left under the derived
+        // key, where an attempt key always started a new one.
         let mp_cfg = MultipartUploadConfig::from_upload(&self.config.upload, work_dir.clone());
         let t = Instant::now();
-        let multipart_used = mp_cfg.should_multipart(self.backend.as_ref(), compressed.size_bytes);
-        let upload_result = if multipart_used {
+        let multipart_used =
+            !reused && mp_cfg.should_multipart(self.backend.as_ref(), compressed.size_bytes);
+        let upload_result = if reused {
+            None
+        } else if multipart_used {
             let fence = MultipartFence {
                 // No segment lineage on the telemetry path; the identity is
                 // the batch and its bytes.
@@ -615,33 +885,36 @@ impl<'a> Pipeline<'a> {
                 content_digest_algorithm: algo.as_str().to_owned(),
                 byte_length: compressed.size_bytes,
             };
-            multipart::upload_resumable(
-                self.backend.as_ref(),
-                &mp_cfg,
-                &compressed.path,
-                &object_uri,
-                object_ck,
-                fence,
-            )
-            .await
-            .map(|_| ())
-        } else {
-            self.backend
-                .put_object(&compressed.path, &object_uri, object_ck)
+            Some(
+                multipart::upload_resumable(
+                    self.backend.as_ref(),
+                    &mp_cfg,
+                    &compressed.path,
+                    &object_uri,
+                    object_ck,
+                    fence,
+                )
                 .await
-                .map(|_| ())
+                .map(|_| ()),
+            )
+        } else {
+            Some(
+                self.backend
+                    .put_object(&compressed.path, &object_uri, object_ck)
+                    .await
+                    .map(|_| ()),
+            )
         };
-        if let Err(e) = note_store_request(
-            upload_result,
-            "object_upload",
-            [
-                tenant.as_str(),
-                source.source_type.as_str(),
-                format.extension(),
-            ],
-            &self.attempts,
-            &self.throttles,
-        ) {
+        // A reused object made no request here, so none is counted.
+        if let Some(Err(e)) = upload_result.map(|result| {
+            note_store_request(
+                result,
+                "object_upload",
+                labels,
+                &self.attempts,
+                &self.throttles,
+            )
+        }) {
             // NO ORPHANED SESSION (#482): a failed multipart leaves a
             // *.multipart.json and a live upload id, and mark_failed
             // re-derives the batch — a re-derivation with the same bytes
@@ -692,7 +965,9 @@ impl<'a> Pipeline<'a> {
             .await?;
         state_write += t_write.elapsed();
         mark_state!(BatchState::ObjectUploaded);
-        tracing::info!(batch_id, uri = %object_uri, "object_uploaded");
+        if !reused {
+            tracing::info!(batch_id, uri = %object_uri, "object_uploaded");
+        }
 
         // ---- Build + upload manifest ------------------------------------
         let manifest = ManifestBuilder {
@@ -899,13 +1174,34 @@ impl<'a> Pipeline<'a> {
         // (VERIFIED -> SOURCE_COMMITTED below). The on-disk manifest was written
         // and uploaded *before* this step (its hash must be stable), so we do
         // not re-stamp it here — querying the store is the source of truth.
-        if backend_limited {
-            tracing::warn!(batch_id, "verification_passed (backend_limited: size-only)");
+        // The class goes into the ledger with the transition (#664): a
+        // recovery after a restart counts the commit by it, not by what its
+        // own re-check of the store finds then. The backends' own messages
+        // name the check that ran (a store checksum, a read-back, size only).
+        let class = if backend_limited {
+            vtop_state::VerificationClass::SizeOnly
         } else {
-            tracing::info!(batch_id, "verification_passed");
+            vtop_state::VerificationClass::Strong
+        };
+        if backend_limited {
+            tracing::warn!(
+                batch_id,
+                verification_class = class.as_str(),
+                object_check = %obj_v.message,
+                manifest_check = %man_v.message,
+                "verification_passed (backend_limited: size-only)"
+            );
+        } else {
+            tracing::info!(
+                batch_id,
+                verification_class = class.as_str(),
+                object_check = %obj_v.message,
+                manifest_check = %man_v.message,
+                "verification_passed"
+            );
         }
         let t_write = Instant::now();
-        self.store.mark_verified(&batch_id).await?;
+        self.store.mark_verified(&batch_id, class).await?;
         state_write += t_write.elapsed();
         // Counted only AFTER the store has persisted ManifestUploaded ->
         // Verified. Incrementing first would let a failed state write leave
@@ -1008,9 +1304,12 @@ impl<'a> Pipeline<'a> {
             mx.bytes_in_total
                 .with_label_values(&l)
                 .inc_by(metrics.uncompressed_bytes);
-            mx.bytes_out_total
-                .with_label_values(&l)
-                .inc_by(metrics.compressed_bytes);
+            // A reused object put nothing on the wire (#626).
+            if !metrics.object_reused {
+                mx.bytes_out_total
+                    .with_label_values(&l)
+                    .inc_by(metrics.compressed_bytes);
+            }
             mx.batch_duration_seconds
                 .with_label_values(&l)
                 .observe(metrics.total_ms as f64 / 1000.0);
@@ -1030,6 +1329,11 @@ impl<'a> Pipeline<'a> {
                 ("commit", metrics.commit_ms),
                 ("state_write", metrics.state_write_ms),
             ] {
+                // A reused object made no upload; a 0 ms sample would pull
+                // the upload latency distribution down.
+                if stage == "object_upload" && metrics.object_reused {
+                    continue;
+                }
                 mx.stage_duration_seconds
                     .with_label_values(&[l[0], l[1], l[2], stage])
                     .observe(ms as f64 / 1000.0);
@@ -1213,6 +1517,81 @@ fn note_store_request<T>(
     result
 }
 
+/// What a batch's derived object key holds (#626).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyProbe {
+    /// The store says nothing is there: put the batch under it.
+    Free,
+    /// An object is there and verified strongly against the batch's size and
+    /// digest: these bytes are already stored, reuse it.
+    Holds,
+    /// An object is there and does not verify against this batch.
+    Differs(String),
+    /// An object is there and the backend could confirm only its size.
+    SizeOnly(String),
+    /// An object is there and its verification failed with an error.
+    Unreadable(String),
+    /// The store refused or failed the check of the key (a 403 without list
+    /// permission, a 5xx, a timeout): it did not say the key is absent.
+    Unchecked(String),
+}
+
+impl KeyProbe {
+    fn reason(&self) -> &str {
+        match self {
+            KeyProbe::Free | KeyProbe::Holds => "",
+            KeyProbe::Differs(why)
+            | KeyProbe::SizeOnly(why)
+            | KeyProbe::Unreadable(why)
+            | KeyProbe::Unchecked(why) => why,
+        }
+    }
+}
+
+/// Look at a derived object key before writing to it (#626). A throttle is
+/// returned as an error, since the store is asking for less traffic and the
+/// batch is retried like any other stage's; every other failure only makes
+/// the key unusable, so the batch falls back to its attempt key rather than
+/// fail on a probe a backend may refuse (a HEAD without list permission is a
+/// 403 on S3).
+async fn probe_object_key(
+    backend: &dyn UploadBackend,
+    uri: &str,
+    size: u64,
+    checksum: Option<ObjectChecksum<'_>>,
+    labels: [&str; 3],
+    attempts: &AtomicU64,
+    throttles: &AtomicU64,
+) -> Result<KeyProbe, VtopError> {
+    match note_store_request(
+        backend.head_object(uri).await,
+        "object_probe",
+        labels,
+        attempts,
+        throttles,
+    ) {
+        Ok(_) => {}
+        Err(VtopError::NotFound(_)) => return Ok(KeyProbe::Free),
+        Err(e) if e.is_upload_throttle() => return Err(e),
+        Err(e) => return Ok(KeyProbe::Unchecked(format!("the probe failed: {e}"))),
+    }
+    match note_store_request(
+        backend.verify_object(uri, size, checksum).await,
+        "object_probe_verify",
+        labels,
+        attempts,
+        throttles,
+    ) {
+        Ok(v) if v.passed && !v.backend_limited => Ok(KeyProbe::Holds),
+        Ok(v) if v.passed => Ok(KeyProbe::SizeOnly(v.message)),
+        Ok(v) => Ok(KeyProbe::Differs(v.message)),
+        Err(e) if e.is_upload_throttle() => Err(e),
+        Err(e) => Ok(KeyProbe::Unreadable(format!(
+            "an object is there and could not be verified: {e}"
+        ))),
+    }
+}
+
 fn note_upload_throttle(error: &VtopError, stage: &str, labels: [&str; 3], throttles: &AtomicU64) {
     if !error.is_upload_throttle() {
         return;
@@ -1311,6 +1690,9 @@ pub struct Engine {
     /// Process-wide bucket-provisioning cells (#102); see
     /// [`Pipeline::provisioned_buckets`].
     provisioned_buckets: ProvisionedBuckets,
+    /// Process-wide object-key notice limiter (#626); see
+    /// [`Pipeline::key_notices`].
+    key_notices: Arc<KeyNotices>,
     /// Per-source accumulation buffers, keyed by `(source_type, source_name)`.
     pending: HashMap<(SourceType, String), PendingBuffer>,
     /// Set by a read cycle that returned any records; drives the adaptive
@@ -1561,6 +1943,28 @@ impl Engine {
         }
         if let Some(f) = &config.sources.file {
             if f.enabled {
+                if f.delete_after_commit && !cfg!(unix) {
+                    // Said at startup, not first when a file is due (#619).
+                    // Without inode numbers no file can be proven to be the
+                    // one a batch read, so none is ever deleted, whatever
+                    // delete_without_open_check says (review of #689).
+                    tracing::warn!(
+                        "sources.file.delete_after_commit is set, but this platform has no \
+                         inode numbers to prove a file is the one archived, so no file is ever \
+                         deleted"
+                    );
+                } else if f.delete_after_commit
+                    && !f.delete_without_open_check
+                    && !cfg!(target_os = "linux")
+                {
+                    tracing::warn!(
+                        "sources.file.delete_after_commit is set, but this platform has no check \
+                         that no process holds a file open (the engine uses Linux write leases), \
+                         so fully archived files are KEPT; set \
+                         sources.file.delete_without_open_check: true to delete them on the quiet \
+                         period alone"
+                    );
+                }
                 let fmt = default_format_for(&streams, SourceType::File);
                 adapters.insert(
                     SourceType::File,
@@ -1571,7 +1975,8 @@ impl Engine {
                             f.delete_after_commit,
                             f.whole_file,
                         )
-                        .with_delete_quiet_period(Duration::from_secs(f.delete_quiet_seconds)),
+                        .with_delete_quiet_period(Duration::from_secs(f.delete_quiet_seconds))
+                        .with_delete_without_open_check(f.delete_without_open_check),
                     ),
                 );
             }
@@ -1614,6 +2019,7 @@ impl Engine {
             attempts: Arc::default(),
             width,
             provisioned_buckets: Arc::default(),
+            key_notices: Arc::default(),
             pending: HashMap::new(),
             cycle_had_data: false,
             cycle_had_failure: false,
@@ -1643,6 +2049,7 @@ impl Engine {
             throttles: Arc::clone(&self.throttles),
             attempts: Arc::clone(&self.attempts),
             provisioned_buckets: Arc::clone(&self.provisioned_buckets),
+            key_notices: Arc::clone(&self.key_notices),
         }
     }
 
@@ -1910,14 +2317,17 @@ impl Engine {
                         ])
                         .inc();
                 }
-                // A size-only acceptance at recovery's re-check is counted at
-                // the commit, as `commit_recovered` counts it (#651).
+                // A size-only verification is counted at the commit, as
+                // `commit_recovered` counts it (#651): by the class `rec`,
+                // read again just above, was verified with (#664), and by
+                // recovery's re-check only for a row with none.
                 if let Some(recheck) = row.recheck {
                     verification_mode::count_size_only_commit(recheck, &rec);
                 }
                 tracing::info!(
                     batch_id = %rec.batch_id,
                     held_back = row.held_back,
+                    verification_class = verification_mode::class_name(&rec),
                     "source_committed (an earlier pass left it VERIFIED)"
                 );
                 true
@@ -2506,6 +2916,7 @@ impl Engine {
                     // anything less trusts a stale claim about a system this
                     // process has never observed.
                     let recheck = self.storage_still_verified(&rec).await;
+                    verification_mode::count_recheck(&rec, recheck);
                     if recheck == Recheck::UnsupportedVersion {
                         // Written by a newer release (#671): not stale, only
                         // unreadable here. It is neither committed nor marked
@@ -2533,6 +2944,7 @@ impl Engine {
                         tracing::warn!(
                             batch_id = %rec.batch_id,
                             object_uri = rec.object_uri.as_deref().unwrap_or(""),
+                            verification_class = verification_mode::class_name(&rec),
                             "recovery: VERIFIED batch failed storage re-check; replaying instead of committing"
                         );
                         // The replay decision must be DURABLE before the
@@ -2595,6 +3007,7 @@ impl Engine {
                         summary.replay_required += 1;
                         continue;
                     }
+                    verification_mode::note_stored_class(&rec, recheck);
                     verified.push((rec, recheck));
                 }
                 RecoveryAction::None => {}
@@ -2999,10 +3412,18 @@ impl Engine {
                     }
                     // Counted at the commit, like verified_total above, not
                     // at the re-check: a held-back row passes the re-check on
-                    // every restart without committing (#629 review).
+                    // every restart without committing (#629 review). By the
+                    // class the row was verified with, as the claim read it
+                    // from the ledger (#664); by the re-check only for a row
+                    // with none.
                     verification_mode::count_size_only_commit(recheck, rec);
                     summary.committed += 1;
-                    tracing::info!(batch_id = %rec.batch_id, "recovered: source_committed");
+                    tracing::info!(
+                        batch_id = %rec.batch_id,
+                        verification_class = verification_mode::class_name(rec),
+                        recheck = recheck.as_str(),
+                        "recovered: source_committed"
+                    );
                 }
                 Err(e) => {
                     tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery commit failed");
@@ -3787,8 +4208,10 @@ struct Unsettled {
     /// it; a pipeline row's verification is counted already.
     count_verified: bool,
     /// What recovery's storage re-check of the row concluded (#651), for a
-    /// row recovery left: a size-only acceptance is counted when the row
-    /// commits, as `commit_recovered` counts it, never at the hold.
+    /// row recovery left. A size-only verification is counted when the row
+    /// commits, as `commit_recovered` counts it, never at the hold - by the
+    /// class the ledger holds for the row, and by this only for a row with
+    /// none (#664).
     recheck: Option<Recheck>,
 }
 
@@ -5470,9 +5893,13 @@ mod tests {
             self.refuse(LedgerWrite::To(BatchState::Failed))?;
             self.inner.mark_failed(batch_id, message).await
         }
-        async fn mark_verified(&self, batch_id: &str) -> Result<(), VtopError> {
+        async fn mark_verified(
+            &self,
+            batch_id: &str,
+            class: vtop_state::VerificationClass,
+        ) -> Result<(), VtopError> {
             self.refuse(LedgerWrite::To(BatchState::Verified))?;
-            self.inner.mark_verified(batch_id).await
+            self.inner.mark_verified(batch_id, class).await
         }
         async fn mark_source_committed(&self, batch_id: &str) -> Result<(), VtopError> {
             self.refuse(LedgerWrite::To(BatchState::SourceCommitted))?;
@@ -6966,8 +7393,9 @@ mod tests {
             row.batch_id
         );
         assert!(
-            row.object_uri.as_deref().unwrap().contains(&row.batch_id),
-            "and so does the object key"
+            row.object_uri.as_deref().unwrap().contains(&token),
+            "and so does the object key: {:?}",
+            row.object_uri
         );
 
         // The ledger and the adapter keep the last read's marker, exactly as
@@ -8530,5 +8958,195 @@ mod tests {
             BatchState::SourceCommitted,
             "the hold on offset 1 is released once offset 0 is archived"
         );
+    }
+
+    /// A store whose objects exist but cannot be read back to verify.
+    struct UnreadableObjects(Arc<vtop_upload::MockBackend>);
+
+    #[async_trait::async_trait]
+    impl UploadBackend for UnreadableObjects {
+        async fn put_object(
+            &self,
+            local_path: &std::path::Path,
+            object_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredObject, VtopError> {
+            self.0.put_object(local_path, object_uri, checksum).await
+        }
+        async fn put_manifest(
+            &self,
+            local_path: &std::path::Path,
+            manifest_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredManifest, VtopError> {
+            self.0
+                .put_manifest(local_path, manifest_uri, checksum)
+                .await
+        }
+        async fn head_object(&self, uri: &str) -> Result<vtop_upload::ObjectHead, VtopError> {
+            self.0.head_object(uri).await
+        }
+        async fn get_object(&self, uri: &str) -> Result<Vec<u8>, VtopError> {
+            self.0.get_object(uri).await
+        }
+        async fn get_object_bounded(&self, uri: &str, max: usize) -> Result<Vec<u8>, VtopError> {
+            self.0.get_object_bounded(uri, max).await
+        }
+        async fn verify_object(
+            &self,
+            uri: &str,
+            _size: u64,
+            _expected: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::VerificationResult, VtopError> {
+            Err(VtopError::Upload(format!(
+                "get_object {uri}: connection reset"
+            )))
+        }
+        async fn delete_object(&self, uri: &str) -> Result<(), VtopError> {
+            self.0.delete_object(uri).await
+        }
+        fn backend_name(&self) -> &'static str {
+            "unreadable"
+        }
+        fn supports_checksum_verification(&self) -> bool {
+            true
+        }
+        fn supports_multipart(&self) -> bool {
+            false
+        }
+        fn reports_absent_objects(&self) -> bool {
+            true
+        }
+    }
+
+    /// #626: what may be done with a derived key. Only an absent key is
+    /// written to, and only an object that verifies STRONGLY against the
+    /// batch's digest is reused; damaged bytes and a size-only pass leave the
+    /// key alone.
+    #[tokio::test]
+    async fn a_derived_key_is_reused_only_for_strongly_verified_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("object");
+        std::fs::write(&path, b"the batch's bytes\n").unwrap();
+        let digest = vtop_core::checksum::sha256_bytes(b"the batch's bytes\n");
+        let size = std::fs::metadata(&path).unwrap().len();
+        let ck = || Some(ObjectChecksum::new("sha256", &digest));
+        let (attempts, throttles) = (AtomicU64::new(0), AtomicU64::new(0));
+        let uri = "s3://bucket/x/vtop-src-b0-18-abc.raw";
+        let probe = |backend: Arc<vtop_upload::MockBackend>| {
+            let (attempts, throttles) = (&attempts, &throttles);
+            let ck = ck();
+            async move {
+                probe_object_key(
+                    backend.as_ref(),
+                    uri,
+                    size,
+                    ck,
+                    ["default", "file", "raw"],
+                    attempts,
+                    throttles,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let strong = Arc::new(vtop_upload::MockBackend::new());
+        assert_eq!(probe(strong.clone()).await, KeyProbe::Free);
+        strong.put_object(&path, uri, ck()).await.unwrap();
+        assert_eq!(probe(strong.clone()).await, KeyProbe::Holds);
+        strong.corrupt(uri);
+        assert!(
+            matches!(probe(strong.clone()).await, KeyProbe::Differs(_)),
+            "damaged bytes are neither reused nor written over"
+        );
+
+        let limited = Arc::new(vtop_upload::MockBackend::limited());
+        limited.put_object(&path, uri, ck()).await.unwrap();
+        assert!(
+            matches!(probe(limited).await, KeyProbe::SizeOnly(_)),
+            "a size-only pass does not prove the bytes are this batch's"
+        );
+        assert_eq!(throttles.load(Ordering::Relaxed), 0);
+
+        // An object is there but reading it to verify fails: not reused, not
+        // written over, and told apart from a refused check.
+        let unreadable = UnreadableObjects(Arc::new(vtop_upload::MockBackend::new()));
+        unreadable.0.put_object(&path, uri, ck()).await.unwrap();
+        let got = probe_object_key(
+            &unreadable,
+            uri,
+            size,
+            ck(),
+            ["default", "file", "raw"],
+            &attempts,
+            &throttles,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&got, KeyProbe::Unreadable(why) if why.contains("could not be verified")),
+            "{got:?}"
+        );
+
+        // A HEAD the store refused says nothing about the key: it is not
+        // free, so nothing is written to it.
+        let refused = Arc::new(
+            vtop_upload::MockBackend::new().with_head_fault(vtop_upload::HeadFault::Refused),
+        );
+        assert!(
+            matches!(probe(refused).await, KeyProbe::Unchecked(why) if why.contains("403")),
+            "a refused probe falls back to the attempt key"
+        );
+
+        // A throttled HEAD is the store asking for less: the batch fails like
+        // any other stage, and the throttle is counted.
+        let throttled =
+            vtop_upload::MockBackend::new().with_head_fault(vtop_upload::HeadFault::Throttled);
+        let err = probe_object_key(
+            &throttled,
+            uri,
+            size,
+            ck(),
+            ["default", "file", "raw"],
+            &attempts,
+            &throttles,
+        )
+        .await
+        .expect_err("a throttled probe is not an answer");
+        assert!(err.is_upload_throttle(), "{err}");
+        assert_eq!(throttles.load(Ordering::Relaxed), 1);
+    }
+
+    /// #626: a notice a setting repeats on every batch is logged once, then at
+    /// most once per interval, saying how many were suppressed in between.
+    #[test]
+    fn key_notices_admit_the_first_then_one_per_interval_with_the_suppressed_count() {
+        let notices = KeyNotices::every(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        assert_eq!(
+            notices.admit_at("per_attempt", "a", at(0)),
+            Some(0),
+            "the first is logged"
+        );
+        assert_eq!(notices.admit_at("per_attempt", "a", at(1)), None);
+        assert_eq!(notices.admit_at("per_attempt", "a", at(59)), None);
+        assert_eq!(
+            notices.admit_at("per_attempt", "b", at(2)),
+            Some(0),
+            "another source is not hidden by the first"
+        );
+        assert_eq!(
+            notices.admit_at("fallback_unchecked", "a", at(3)),
+            Some(0),
+            "each kind has its own interval"
+        );
+        assert_eq!(
+            notices.admit_at("per_attempt", "a", at(60)),
+            Some(2),
+            "the next one reports the two suppressed"
+        );
+        assert_eq!(notices.admit_at("per_attempt", "a", at(61)), None);
     }
 }
