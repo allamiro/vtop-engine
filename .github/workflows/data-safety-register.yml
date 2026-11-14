@@ -1,0 +1,63 @@
+# The data-safety register (docs/reference/data-safety-register.md) has a row
+# for every issue labelled `data-safety`. The label is applied by hand after
+# triage and the register is written by hand, so this keeps them in step.
+#
+#   pull_request       the check's unit tests, then the check against the live
+#                      label, when the register, the script or this file change.
+#   issues             the live check when the data-safety label is added or
+#                      removed, or a labelled issue is closed or reopened.
+#   schedule           the live check weekly.
+#   workflow_dispatch  the live check by hand.
+#
+# A red run on an issue event or the schedule is the alert: a newly labelled
+# issue needs a row, or a row's state is stale. It also prints the quiet
+# period, the days since the most recent data-safety issue was opened.
+name: Data-safety register
+
+on:
+  pull_request:
+    paths:
+      - "docs/reference/data-safety-register.md"
+      - "scripts/check-data-safety-register.py"
+      - "scripts/tests/test_check_data_safety_register.py"
+      - ".github/workflows/data-safety-register.yml"
+  issues:
+    types: [labeled, unlabeled, closed, reopened]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: data-safety-register-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: register matches the data-safety label
+    # On an issue event, run only when the data-safety label is the one that
+    # changed, or the closed or reopened issue carries it.
+    if: >-
+      github.event_name != 'issues' ||
+      github.event.label.name == 'data-safety' ||
+      ((github.event.action == 'closed' || github.event.action == 'reopened') &&
+        contains(github.event.issue.labels.*.name, 'data-safety'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Unit tests for the check
+        run: python -m unittest discover -s scripts/tests -p 'test_check_data_safety_register.py' -v
+
+      - name: The register matches the labelled issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/check-data-safety-register.py --repo "${{ github.repository }}" --quiet-days
