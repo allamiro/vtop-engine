@@ -392,6 +392,8 @@ Additional guidance:
 - Delete permissions **SHOULD NOT** be granted unless an operational lifecycle policy explicitly requires them.
 - Separate read-only credentials **SHOULD** be used for downstream consumers.
 
+The PostgreSQL state store follows the same rule (#694): the engine's runtime role has `SELECT, INSERT, UPDATE` on `batches` and `SELECT, INSERT` on `audit_events` (with `USAGE` on its sequence), and no `UPDATE`, `DELETE` or `TRUNCATE` on the audit table; a trigger refuses those to every role but the table's owner, so even a maintenance role granted `DELETE` for `prune-ledger` cannot remove an audit row ([POSTGRES_DEPLOYMENT.md](POSTGRES_DEPLOYMENT.md)).
+
 ### 5.1 Per-backend least privilege
 
 | Backend | Minimum permissions | Notes |
@@ -601,7 +603,18 @@ Resource exhaustion controls are part of the security boundary:
 
 ## 10. Audit and failure logging
 
-- The engine **SHOULD** emit structured audit logs for batch lifecycle events (seal, upload, verify, commit) including `batch_id`, object key, and outcome.
+**Audit records (who changed state, #694)** are a separate obligation from batch lifecycle logs, and are described in [docs/operate/auditing.md](operate/auditing.md):
+
+- Every command that changes engine or cluster state (`prune-ledger`, `replay`, `migrate`, `scrub --cursor-file`, the audited `vtopctl meta`, `node` and `tier` commands, and the admin endpoint's and every metadata replica's handling of them) **MUST** write a versioned audit record naming its actor, action, target, parameters and outcome, including failures and refusals. Every refusal by the admin endpoint's authorization policy is recorded, whatever the command.
+- Audit records go to the `vtop::audit` log target, which the operator's log filter cannot silence and which is never sampled or rate-limited; to the append-only file `VTOP_AUDIT_LOG` names (mode `0600`, synced per record); and, for the ledger commands, to the state store's append-only `audit_events` table.
+- The destructive ledger commands (`prune-ledger`, `replay`, `migrate`) **MUST** be refused when their attempt record cannot be written. There is no switch to run them unrecorded.
+- The actor of a local command is the process's uid, its `/etc/passwd` name, the host and `$SUDO_USER`: as strong as the host's logins, and not authentication. The actor of a cluster command is the admin endpoint's verified certificate identity, or `anonymous` on a plaintext endpoint.
+- `audit_events` is hash-chained; with a manifest MAC key configured the chain is keyed (a key derived from the signing key, §16.1), so a writer who can edit the table cannot recompute it. `vtopctl audit verify` recomputes it. A chain cannot show rows removed from its end.
+- Audit parameters are an allowlist per action and pass through the redaction of §11; no audit record or audit metric label carries a credential, a connection string, a key, a key variable's value or a URL with its path or query.
+
+**Batch lifecycle and failure logs:**
+
+- The engine **SHOULD** emit structured logs for batch lifecycle events (seal, upload, verify, commit) including `batch_id`, object key, and outcome.
 - Failures **SHOULD** be logged with enough context to support replay and forensic review, **without** including secrets or raw sensitive payloads.
 - Audit logs **SHOULD** be append-oriented and suitable for retention alongside the archived objects.
 
@@ -719,6 +732,7 @@ flagged and collected below the tables.
 | Primitive | Where it runs | What it protects | Proposed class |
 |---|---|---|---|
 | BLAKE3 keyed MAC (`manifest_mac_key_env`, or the `manifest.mac` keyring) | manifest build/verify (`vtop-core/manifest.rs`, `manifest/keyring.rs`) | manifest authenticity against an adversary with object-store write access; constant-time compare, fail-closed when keyed; verified with the key the manifest names (`manifest.mac_key_id`, authenticated), never by search | **security function** |
+| BLAKE3 keyed MAC, audit chain (#694): a key derived (`blake3::derive_key`, its own context string) from the manifest signing key | `audit_events` link (`vtop-core/manifest.rs`, `vtop-state/audit.rs`), recomputed by `vtopctl audit verify` | tamper evidence of the audit table against a writer without the key; an unkeyed BLAKE3 chain without a configured key (corruption and casual-edit detection only) | **security function** (keyed); integrity check (unkeyed) |
 | BLAKE3 keyed MAC (segment commit key) | v2 commit statement (`vtop-log/types.rs`, seal/verify/tier) | signed assertion of a sealed segment's identity, boundaries, root and manifest digest | **security function** |
 | BLAKE3 unkeyed content commitments: v2 chunk-tree root + Merkle proofs, v1 `blake3_root`, `manifest_core_digest`, tier-copy whole-file digest gate | seal, offline verify, `vtopctl tier copy/rehydrate`, Raft-pinned `CommitTierEvidence` | tamper-evidence of sealed content **when the root is pinned somewhere the adversary cannot rewrite** (Raft metadata, operator `--expect-root`, cursors); locally, corruption detection | **flagged — Q1 below** |
 | SHA-256 / BLAKE3 object checksum (`checksum.algorithm`, default sha256) | archive-plane object write + read-back verify before commit | stored-object corruption; unkeyed, so substitution is the MAC's job | integrity check |

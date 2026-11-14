@@ -1064,7 +1064,11 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             // its record says whether the cursor moved (#694). Not refused
             // when the audit file fails: the scrub reads, it does not delete.
             if let Some(cursor) = cursor_file {
-                let outcome = if cursor_moved {
+                // Success: the run completed, whether or not it found
+                // anything (a run with nothing left to check keeps the
+                // cursor where it is). Failure: it stopped on an error
+                // before it could move the cursor.
+                let outcome = if cursor_moved || scrubbed.is_ok() {
                     vtop_observe::audit::Outcome::Success
                 } else {
                     vtop_observe::audit::Outcome::Failure

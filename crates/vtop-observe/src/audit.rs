@@ -805,29 +805,35 @@ impl AuditSink {
 
 /// The record on the log stream: WARN for a refusal or a failure, INFO
 /// otherwise, never sampled or rate-limited. The full record is in `record`,
-/// the fields an operator filters on beside it.
+/// the fields an operator filters on beside it, and the one-line account in
+/// `summary`. The message itself is only the action and the outcome, both
+/// from closed sets: a log pipeline that promotes the message to an index
+/// label (the lab's Alloy does) must not get one value per actor or target.
 fn emit_log(event: &AuditEvent, json: &str) {
     let summary = event.summary();
+    let (action, outcome) = (event.action.as_str(), event.outcome.as_str());
     match event.outcome {
         Outcome::Refused | Outcome::Failure => tracing::warn!(
             target: "vtop::audit",
             audit_version = event.audit_version,
             audit_id = %event.audit_id,
-            action = event.action.as_str(),
-            outcome = event.outcome.as_str(),
+            action,
+            outcome,
             actor = %event.actor.describe(),
+            summary = %summary,
             record = %json,
-            "{summary}"
+            "audit: {action} {outcome}"
         ),
         Outcome::Attempt | Outcome::Success => tracing::info!(
             target: "vtop::audit",
             audit_version = event.audit_version,
             audit_id = %event.audit_id,
-            action = event.action.as_str(),
-            outcome = event.outcome.as_str(),
+            action,
+            outcome,
             actor = %event.actor.describe(),
+            summary = %summary,
             record = %json,
-            "{summary}"
+            "audit: {action} {outcome}"
         ),
     }
 }
@@ -1121,6 +1127,25 @@ mod tests {
             "every audit record must pass RUST_LOG=error; got:\n{text}"
         );
         assert!(!text.contains("an ordinary INFO line"), "{text}");
+    }
+
+    /// The message is the action and the outcome only (a pipeline may index
+    /// it); who and what are in the fields.
+    #[test]
+    fn the_message_carries_only_bounded_values() {
+        let (captured, _guard) = production_logs("info");
+        AuditSink::new().record(&prune_event().reason("x")).unwrap();
+        let line: serde_json::Value =
+            serde_json::from_str(captured.text().lines().next().unwrap()).unwrap();
+        assert_eq!(line["fields"]["message"], "audit: ledger.prune attempt");
+        assert!(line["fields"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("by uid "));
+        assert!(line["fields"]["record"]
+            .as_str()
+            .unwrap()
+            .contains("\"audit_version\":1"));
     }
 
     /// Nothing in the audit path samples or rate-limits: a thousand identical

@@ -594,17 +594,26 @@ async fn run_inner(command: NodeCommand, json: bool) -> Result<i32, String> {
             seal_tail,
             timeout_seconds,
         } => {
-            let config = load_config(&common.config)?;
-            let repaired = repair(
-                &config,
-                from,
-                &into,
-                fencing_epoch,
-                seal_tail,
-                Duration::from_secs(timeout_seconds),
-                json,
-            )
-            .await;
+            let config = load_config(&common.config);
+            let range = config
+                .as_ref()
+                .ok()
+                .map(|config| format!("{}/{}", config.range.topic, config.range.range_id));
+            let repaired = match &config {
+                Ok(config) => {
+                    repair(
+                        config,
+                        from,
+                        &into,
+                        fencing_epoch,
+                        seal_tail,
+                        Duration::from_secs(timeout_seconds),
+                        json,
+                    )
+                    .await
+                }
+                Err(error) => Err(error.clone()),
+            };
             // The repair writes a range into a local directory from another
             // node: who ran it, from where, into what, and how it ended
             // (#694). The serving leader records its side.
@@ -612,10 +621,7 @@ async fn run_inner(command: NodeCommand, json: bool) -> Result<i32, String> {
                 vtop_observe::audit::Action::NodeRepair,
                 vtop_observe::audit::Stage::Local,
                 vtop_observe::audit::Actor::local(),
-                vtop_observe::audit::Target::new(
-                    "range",
-                    Some(format!("{}/{}", config.range.topic, config.range.range_id)),
-                ),
+                vtop_observe::audit::Target::new("range", range),
                 match &repaired {
                     Ok(0) => vtop_observe::audit::Outcome::Success,
                     _ => vtop_observe::audit::Outcome::Failure,

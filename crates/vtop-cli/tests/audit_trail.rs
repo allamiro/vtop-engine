@@ -428,3 +428,100 @@ async fn audit_verify_finds_an_edited_row() {
         "{stdout}"
     );
 }
+
+/// A scrub that keeps a cursor records the run: whether the cursor moved,
+/// and the cursor file it keeps.
+#[tokio::test]
+async fn a_scrub_that_keeps_a_cursor_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let audit_log = dir.path().join("audit.jsonl");
+    let cursor = dir.path().join("scrub.cursor");
+    let out = vtopctl(
+        &[
+            "scrub",
+            "--config",
+            config.to_str().unwrap(),
+            "--cursor-file",
+            cursor.to_str().unwrap(),
+            "--limit",
+            "10",
+            "--digest-dir",
+            dir.path().join("digests").to_str().unwrap(),
+        ],
+        Some(&audit_log),
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let file = records(&audit_log);
+    assert_eq!(file.len(), 1, "{file:#?}");
+    assert_eq!(file[0]["action"], "scrub.cursor");
+    assert_eq!(file[0]["outcome"], "success");
+    assert_eq!(
+        file[0]["params"]["cursor_file"],
+        cursor.display().to_string()
+    );
+    assert_eq!(file[0]["params"]["limit"], "10");
+    assert!(file[0]["after"]["cursor_moved"].is_boolean());
+    // Without a cursor the scrub changes nothing and writes no record.
+    let out = vtopctl(
+        &[
+            "scrub",
+            "--config",
+            config.to_str().unwrap(),
+            "--digest-dir",
+            dir.path().join("digests").to_str().unwrap(),
+        ],
+        Some(&audit_log),
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(records(&audit_log).len(), 1);
+}
+
+/// `node repair` and `node reconfigure-range` record the local actor and
+/// their outcome, a failure included.
+#[tokio::test]
+async fn node_commands_record_the_local_actor_and_a_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let audit_log = dir.path().join("audit.jsonl");
+    let node_config = dir.path().join("node.yaml");
+    std::fs::write(&node_config, "not: [a node config").unwrap();
+    let out = vtopctl(
+        &[
+            "node",
+            "repair",
+            "--config",
+            node_config.to_str().unwrap(),
+            "--from",
+            "00000000-0000-0000-0000-000000000bee",
+            "--into",
+            dir.path().join("replica").to_str().unwrap(),
+            "--fencing-epoch",
+            "7",
+        ],
+        Some(&audit_log),
+    );
+    assert!(!out.status.success());
+    let out = vtopctl(
+        &[
+            "node",
+            "reconfigure-range",
+            "--data-dir",
+            dir.path().join("no-such-range").to_str().unwrap(),
+            "--max-segment-bytes",
+            "1048576",
+        ],
+        Some(&audit_log),
+    );
+    assert!(!out.status.success());
+    let file = records(&audit_log);
+    assert_eq!(file.len(), 2, "{file:#?}");
+    assert_eq!(file[0]["action"], "node.repair");
+    assert_eq!(file[0]["outcome"], "failure");
+    assert_eq!(file[0]["actor"]["kind"], "os");
+    assert_eq!(file[0]["params"]["side"], "client");
+    assert_eq!(file[0]["params"]["fencing_epoch"], "7");
+    assert!(file[0]["reason"].is_string());
+    assert_eq!(file[1]["action"], "node.reconfigure_range");
+    assert_eq!(file[1]["outcome"], "failure");
+    assert_eq!(file[1]["params"]["max_segment_bytes"], "1048576");
+}

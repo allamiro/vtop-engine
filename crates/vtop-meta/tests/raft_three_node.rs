@@ -584,7 +584,7 @@ async fn every_replica_writes_one_applied_audit_record_per_audited_command() {
     };
     let audited = envelope();
     cluster
-        .write(register_cmd(audited.clone(), Uuid::from_u128(0x694)))
+        .write(register_cmd(audited, Uuid::from_u128(0x694)))
         .await;
     let records = audit.for_request(audited.request_id);
     assert_eq!(
@@ -623,7 +623,7 @@ async fn every_replica_writes_one_applied_audit_record_per_audited_command() {
     let rejected = envelope();
     cluster
         .write(MetadataCommand::RegisterNode {
-            env: rejected.clone(),
+            env: rejected,
             node_uuid: Uuid::from_u128(0x694),
             addr: "10.0.0.94:9200".to_owned(),
             expected_generation: Some(999),
@@ -644,7 +644,7 @@ async fn every_replica_writes_one_applied_audit_record_per_audited_command() {
     cluster.restart_node(follower, sim, root).await;
     let after = envelope();
     cluster
-        .write(register_cmd(after.clone(), Uuid::from_u128(0x695)))
+        .write(register_cmd(after, Uuid::from_u128(0x695)))
         .await;
     assert_eq!(
         audit.for_request(audited.request_id).len(),

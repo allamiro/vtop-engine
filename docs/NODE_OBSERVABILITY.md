@@ -301,6 +301,20 @@ codes into a container's captured stderr corrupts every downstream parser — a
 `level=~"WARN"` filter then matches nothing because the field names are wrapped
 in escape sequences.
 
+## Audit records
+
+A metadata node writes the audit records of the cluster plane (#694): the
+admin endpoint's record of every refused request and every operator command,
+with the caller's certificate identity, and each replica's record of the
+entries it applied, with the log index. A data node leading a range records
+the transfers it grants or refuses to `vtopctl node repair`. They go to the
+`vtop::audit` log target and, with `VTOP_AUDIT_LOG=/path` set, to an
+append-only JSONL file; a set but unwritable path stops `meta`, `data` and
+`node` at startup, naming the path. `vtop_audit_events_total{action,outcome}`
+and `vtop_audit_write_failures_total{sink}` are on every node's `/metrics`.
+Read a node's file with `vtopctl audit list --file`; see
+[operate/auditing.md](operate/auditing.md).
+
 ## OpenTelemetry
 
 `vtop-node` carries the same OpenTelemetry export as the engine (#683), built
