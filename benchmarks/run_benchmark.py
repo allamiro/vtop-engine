@@ -400,7 +400,10 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
             shaping.shaped_run(sc, shape=shape,
                                endpoint=engine.effective_endpoint(sc)), \
             competitor.contended(contention_spec,
-                                 vtop_bytes=lambda: out_bytes) as contention, \
+                                 vtop_bytes=lambda: out_bytes,
+                                 # A refused window leaves its raw iperf3
+                                 # reports beside the run's CSVs (#610).
+                                 diagnostics_dir=writer.dir) as contention, \
             contextlib.ExitStack() as on_exit:
         # A CONTENDED RUN'S SOLO WINDOWS BELONG TO THE HARNESS, NOT TO THE
         # ENGINE (#478). The competitor measures the empty link twice — once as

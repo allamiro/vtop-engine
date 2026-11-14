@@ -1423,7 +1423,7 @@ def test_the_runner_stamps_a_cycles_end_when_process_once_returns_not_after_its_
             return super().row(name, row)
 
     @contextlib.contextmanager
-    def contended(_spec, vtop_bytes):
+    def contended(_spec, vtop_bytes, **_diagnostics):
         yield recording
 
     monkeypatch.setattr(run_benchmark.competitor.CompetitorSpec, "from_scenario",
@@ -1500,7 +1500,7 @@ def test_the_bracket_closes_before_replay_so_replay_uploads_never_land_in_the_wi
         return 0, ""
 
     @contextlib.contextmanager
-    def contended(_spec, vtop_bytes):
+    def contended(_spec, vtop_bytes, **_diagnostics):
         yield Bracket()
 
     monkeypatch.setattr(run_benchmark.competitor.CompetitorSpec, "from_scenario",
@@ -2383,3 +2383,122 @@ def test_a_source_stamp_later_than_its_arrival_is_refused_as_another_kernels_clo
     lines, stamps = comp.split_source_stamps("11.999000 {}", (12.0,), "probe")
     assert (lines, stamps) == ("{}", (11.999,)), (
         "a line written a millisecond before it was read is exactly what a shared clock looks like")
+
+
+# ------------------------------------------------- raw reports on refusal (#610)
+
+
+def _raw_files(directory):
+    return sorted(name for name in os.listdir(directory) if name.startswith("competitor-iperf3-"))
+
+
+def _report_whose_receiver_outlasts_its_stream(extra_seconds):
+    """The shape every contended window took on the hosted runner (#610): the
+    stream covers the window it was asked for, and the receiver's summary says it
+    measured `extra_seconds` more, so the stream is laid down `extra_seconds`
+    late and the window's opening is a hole.
+
+    It carries the server's report the way iperf 3.21 streams one under
+    `--get-server-output`: as a `server_output_json` event of its OWN, written
+    just before `end` (iperf_json_finish), not as a field inside `end` (review)."""
+    steps = int(round(SCRIPTED_WINDOW_SECONDS / SCRIPTED_STEP_SECONDS))
+    sent, received = 9.0, 8.0
+    stream_seconds = steps * SCRIPTED_STEP_SECONDS
+    receiver_seconds = stream_seconds + extra_seconds
+    lines = iperf_stream(
+        iperf_intervals([sent] * steps, step=SCRIPTED_STEP_SECONDS),
+        end={"sum_sent": {"bits_per_second": sent * 1e6, "seconds": stream_seconds,
+                          "bytes": int(sent * 1e6 * stream_seconds / 8), "retransmits": 0},
+             "sum_received": {"bits_per_second": received * 1e6, "seconds": receiver_seconds,
+                              "bytes": int(received * 1e6 * receiver_seconds / 8)},
+             "sender_tcp_congestion": "cubic"}).splitlines()
+    server = {"event": "server_output_json", "data": {
+        "intervals": [{"sum": {"start": 0.0, "end": receiver_seconds,
+                               "seconds": receiver_seconds}}],
+        "end": {"sum_received": {"seconds": receiver_seconds}}}}
+    return "\n".join(lines[:-1] + [json.dumps(server), lines[-1]])
+
+
+def test_a_refused_contended_window_leaves_both_sides_raw_reports_and_is_refused_unchanged(
+        tmp_path):
+    report = _report_whose_receiver_outlasts_its_stream(0.02)
+    engine = ScriptedEngine()
+    box = ScriptedCompetitor([9.0, 8.0, 9.0], contended_report=report,
+                             during=cycles_inside_the_window(engine, [(0, 2_400)]))
+    with pytest.raises(ShapingError, match="says nothing about") as refused:
+        with contended(scripted_spec(), vtop_bytes=engine, run=box, log=lambda _m: None,
+                       diagnostics_dir=str(tmp_path)) as handle:
+            box.handle = handle
+            handle.start_with_vtop()
+            wait_for(lambda: handle._collected is not None, "collected its report")
+            handle.close()
+
+    sender = tmp_path / "competitor-iperf3-with-vtop-sender.jsonl"
+    receiver = tmp_path / "competitor-iperf3-with-vtop-receiver.json"
+    assert sender.exists() and receiver.exists(), (
+        f"a refused window must leave both sides' raw reports behind; found {_raw_files(tmp_path)}")
+    assert sender.read_text().rstrip("\n") == report, (
+        "the sender's file is the stream exactly as the parser read it, not a re-rendering")
+    assert json.loads(receiver.read_text())["end"]["sum_received"]["seconds"] == pytest.approx(
+        SCRIPTED_WINDOW_SECONDS + 0.02), "the receiver's file is the server's own report"
+    stamps = json.loads((tmp_path / "competitor-iperf3-with-vtop-line-stamps.json").read_text())
+    assert len(stamps["stamps"]) == len(report.splitlines()), (
+        "one source stamp per line of the sender's file, so the two can be paired")
+    assert (tmp_path / "competitor-iperf3-alone-before-sender.jsonl").exists(), (
+        "the solo window before it is kept too: it is the same flow on the empty link, and "
+        "the comparison the refusal needs")
+    assert "says nothing about" in str(refused.value), (
+        "keeping the reports changes no verdict: the refusal propagates as it was raised")
+
+
+def test_a_report_refused_before_it_became_a_sample_is_still_kept(tmp_path):
+    # No interval stream at all: the parser refuses it in the first solo window,
+    # so no sample ever holds it and the refusal itself has to carry it.
+    streamless = iperf_stream([], end={
+        "sum_received": {"bits_per_second": 9e6, "seconds": 30.0, "bytes": 33_750_000}})
+    box = ScriptedCompetitor([9.0], output=streamless)
+    with pytest.raises(ShapingError, match="carries no interval stream"):
+        with contended(spec(30), vtop_bytes=lambda: 0, run=box, log=lambda _m: None,
+                       diagnostics_dir=str(tmp_path)):
+            pass
+    assert (tmp_path / "competitor-iperf3-alone-before-sender.jsonl").read_text().rstrip(
+        "\n") == streamless
+    assert "absent" in json.loads(
+        (tmp_path / "competitor-iperf3-alone-before-receiver.json").read_text()), (
+        "a report with no server output says so in the receiver's file rather than leaving "
+        "it out, so a missing receiver view is a recorded fact")
+
+
+def test_a_window_that_is_not_refused_leaves_no_raw_reports(tmp_path):
+    engine = ScriptedEngine()
+    box = ScriptedCompetitor([9.0, 8.0, 9.0],
+                             during=cycles_inside_the_window(engine, [(0, 2_400)]))
+    with contended(scripted_spec(), vtop_bytes=engine, run=box, log=lambda _m: None,
+                   diagnostics_dir=str(tmp_path)) as handle:
+        box.handle = handle
+        handle.start_with_vtop()
+        wait_for(lambda: handle._collected is not None, "collected its report")
+        handle.close()
+    assert handle.jain is not None
+    assert _raw_files(tmp_path) == [], "the raw reports are a refusal's diagnostics only"
+
+
+def test_the_command_asks_for_the_receivers_own_report():
+    argv = CompetitorSpec(mode="bulk", seconds=45).argv()
+    assert competitor.SERVER_OUTPUT_FLAG in argv, (
+        "without --get-server-output a refused window keeps only the sender's side, and "
+        "the receiver's is one summary figure (#610)")
+
+
+def test_a_flow_that_exits_nonzero_still_leaves_what_it_wrote(tmp_path):
+    # A flow that wrote part of its stream and then exited nonzero is refused
+    # before the parser ever sees it (review): its output rides on the refusal
+    # all the same, so the evidence of how far it got is kept.
+    partial = '{"event": "start", "data": {}}\niperf3: error - control socket has closed'
+    box = ScriptedCompetitor([9.0], refuse=(1, partial))
+    with pytest.raises(ShapingError, match="could not be started"):
+        with contended(spec(30), vtop_bytes=lambda: 0, run=box, log=lambda _m: None,
+                       diagnostics_dir=str(tmp_path)):
+            pass
+    assert (tmp_path / "competitor-iperf3-alone-before-sender.jsonl").read_text().rstrip(
+        "\n") == partial
