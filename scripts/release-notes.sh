@@ -66,15 +66,18 @@ trap 'rm -f "$entries" "$issues"' EXIT
 # Contributor tooling is not part of what a release ships, so the notes leave
 # it out: a pull request whose files are all under .claude/ or .agents/, or
 # whose title (component prefix included) is about that tooling. Matched
-# case-insensitively on whole words.
-tooling_words='(^|[^a-z])(skills?|claude|codex|anthropic|llm|generative ai|ai)([^a-z]|$)'
+# case-insensitively on whole words; a letter, digit or underscore next to the
+# word means it is part of a longer identifier, not the word.
+tooling_words='(^|[^a-z0-9_])(skills?|claude|codex|anthropic|llm|generative ai|ai)([^a-z0-9_]|$)'
 
 is_tooling() {
     local json=$1 title
     title=$(printf '%s' "$json" | jq -r '.title')
-    # Every changed file is tooling. An empty file list is not "all tooling".
+    # Every changed file is tooling. An empty file list is not "all tooling",
+    # and neither is a list at the API's 100-file cap: paths past the cap are
+    # not seen, so the rule cannot conclude anything about them.
     if printf '%s' "$json" | jq -e '
-        (.files | length) > 0 and
+        (.files | length) > 0 and (.files | length) < 100 and
         all(.files[].path; startswith(".claude/") or startswith(".agents/"))
     ' >/dev/null; then
         return 0
@@ -87,6 +90,10 @@ for number in $pulls; do
         --json title,closingIssuesReferences,files 2>/dev/null || true)
     [ -n "$json" ] || continue
     if is_tooling "$json"; then
+        # Say what was left out, on stderr, so the release job's log shows
+        # every skipped pull request and a wrong match can be spotted.
+        printf 'release-notes: skipping #%s (contributor tooling): %s\n' \
+            "$number" "$(printf '%s' "$json" | jq -r '.title')" >&2
         continue
     fi
 
