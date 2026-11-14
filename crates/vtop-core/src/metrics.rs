@@ -38,6 +38,10 @@ pub struct BatchMetrics {
     /// stay deserializable.
     #[serde(default)]
     pub state_write_ms: u64,
+    /// The object was already stored and verified, so nothing was uploaded
+    /// (#626): `compressed_bytes` is its size, not bytes on the wire.
+    #[serde(default)]
+    pub object_reused: bool,
     /// Total time from batch start to source-committed.
     pub total_ms: u64,
 

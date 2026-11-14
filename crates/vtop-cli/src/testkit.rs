@@ -167,5 +167,6 @@ pub fn pipeline<'a>(
         manifest_mac_key: config.resolve_manifest_mac_key().unwrap(),
         versioned_buckets: std::sync::Arc::default(),
         provisioned_buckets: std::sync::Arc::default(),
+        key_notices: std::sync::Arc::default(),
     }
 }

@@ -40,6 +40,18 @@ const DASHBOARD_METRICS: [&str; 12] = [
     "vtop_batch_duration_seconds",
 ];
 
+/// The `event` values of `vtop_kafka_partition_events_total` (#675), as the
+/// Kafka source counts them.
+const KAFKA_PARTITION_EVENTS: [&str; 7] = [
+    "no_partitions",
+    "lookup_failed",
+    "grew",
+    "new_partition_from_beginning",
+    "start_deferred",
+    "pinned_before_renewal",
+    "recreated_or_truncated",
+];
+
 fn populated() -> String {
     let m = telemetry::init().expect("registry must initialize");
     let l = ["default", "kafka", "cef"];
@@ -68,6 +80,16 @@ fn populated() -> String {
         m.stage_duration_seconds
             .with_label_values(&["default", "kafka", "cef", s])
             .observe(0.01);
+    }
+    for d in telemetry::OBJECT_KEY_DECISIONS {
+        m.object_key_decisions_total
+            .with_label_values(&["default", "kafka", "cef", d])
+            .inc_by(0);
+    }
+    for e in KAFKA_PARTITION_EVENTS {
+        m.kafka_partition_events_total
+            .with_label_values(&[e])
+            .inc_by(0);
     }
     m.inflight_batches.set(2);
     m.encode().expect("encode must succeed")
@@ -150,15 +172,19 @@ fn unbounded_identifiers_are_never_labels() {
 fn every_exported_label_is_from_a_bounded_set() {
     // "le" is Prometheus's own histogram bucket label. It is bounded by the
     // bucket list defined in telemetry.rs, not free-form, so it is legitimate.
+    // "decision" takes the values of telemetry::OBJECT_KEY_DECISIONS (#626),
+    // "event" the seven of KAFKA_PARTITION_EVENTS (#675), and
     // `verification_class` (strong, size_only, unknown) and `result` (strong,
     // size_only, failed, unsupported_version) are closed sets (#664).
-    const BOUNDED: [&str; 8] = [
+    const BOUNDED: [&str; 10] = [
         "tenant",
         "source_type",
         "format",
         "state",
         "stage",
         "le",
+        "decision",
+        "event",
         "verification_class",
         "result",
     ];
@@ -371,4 +397,29 @@ async fn connection_cap_rejects_excess_and_recovers() {
         body.trim_end().ends_with("200"),
         "endpoint must recover once capacity frees: {body}"
     );
+}
+
+/// #626: how each object key was decided is exported, with `decision` from
+/// its bounded set, so an alert can see replays writing second objects
+/// (`fallback_*`, `per_attempt`) without parsing logs.
+#[test]
+fn object_key_decisions_are_exported_by_bounded_decision() {
+    let text = populated();
+    assert!(text.contains("vtop_object_key_decisions_total"), "{text}");
+    for d in vtop_core::telemetry::OBJECT_KEY_DECISIONS {
+        let label = format!(r#"decision="{d}""#);
+        assert!(text.contains(&label), "missing {label}");
+    }
+}
+
+/// #675: Kafka partition-list changes are exported by `event`, a fixed set,
+/// so `recreated_or_truncated` can be alerted on.
+#[test]
+fn kafka_partition_events_are_exported_by_bounded_event() {
+    let text = populated();
+    assert!(text.contains("vtop_kafka_partition_events_total"), "{text}");
+    for e in KAFKA_PARTITION_EVENTS {
+        let label = format!(r#"event="{e}""#);
+        assert!(text.contains(&label), "missing {label}");
+    }
 }

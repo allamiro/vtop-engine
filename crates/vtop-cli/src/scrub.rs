@@ -130,9 +130,10 @@ impl BatchCheck {
 
 /// Whether a read error says the thing is ABSENT, as opposed to unreadable.
 ///
-/// The mock and `localfs` say so with [`VtopError::NotFound`]. The S3 backend
-/// reports every service error as [`VtopError::Upload`] with the status and
-/// code in the message (`http 404`, `NoSuchKey`, `NoSuchVersion`), and the
+/// The mock and `localfs` say so with [`VtopError::NotFound`], and so does the
+/// S3 backend for a 404 HEAD (#626). Its other service errors are
+/// [`VtopError::Upload`] with the status and code in the message
+/// (`http 404`, `NoSuchKey`, `NoSuchVersion`), and the
 /// command backends relay the tool's own words; those are matched as text.
 /// A miss here only turns `missing` into `unreadable`; both are findings.
 pub fn looks_missing(error: &VtopError) -> bool {
