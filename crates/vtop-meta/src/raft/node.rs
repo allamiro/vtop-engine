@@ -68,6 +68,27 @@ pub async fn start_meta_node(
     let log_store = MetaRaftLogStore::new(store.clone());
     let read_store = store.clone();
     let state_machine = MetaRaftStateMachine::new(store).with_node_id(node_id);
+    // Applied audit records a crash or a refusing sink left undelivered are
+    // delivered before Raft starts (#706): the sink is already installed by
+    // the node process, and nothing can apply in between.
+    read_store.deliver_pending(super::audit_delivery::ReplayReason::Restart);
+    // And again on a timer, for a sink that refused them while running.
+    // It holds the store WEAKLY and ends once the node drops it: a task
+    // outliving its node could otherwise write the audit frontier of a data
+    // directory a restarted node in the same process has reopened.
+    let retry_store = read_store.downgrade();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(crate::audit::AUDIT_RETRY_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let Some(store) = retry_store.upgrade() else {
+                return;
+            };
+            store.deliver_pending(super::audit_delivery::ReplayReason::Retry);
+        }
+    });
     let network = TlsRaftNetworkFactory::new(node_id, directory, material);
     let config = Arc::new(
         Config {

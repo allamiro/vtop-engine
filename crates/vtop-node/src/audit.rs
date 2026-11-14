@@ -24,11 +24,14 @@ impl NodeAuditor {
 }
 
 impl Auditor for NodeAuditor {
-    fn record(&self, record: &AuditRecord) {
+    fn record(&self, record: &AuditRecord) -> Result<(), String> {
         // A file sink that cannot be written is logged and counted by the
         // sink, and the record is in the log stream: the command already
-        // ran (or was refused) and the node goes on serving.
-        let _ = vtop_observe::audit::record(&to_event(record, &self.engine));
+        // ran (or was refused) and the node goes on serving. The error goes
+        // back so an applied record is delivered again (#706).
+        vtop_observe::audit::record(&to_event(record, &self.engine))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -45,6 +48,7 @@ fn action(action: AuditAction) -> Action {
         AuditAction::ClusterCreateTopic => Action::ClusterCreateTopic,
         AuditAction::ClusterPropose => Action::ClusterPropose,
         AuditAction::PromotionAttest => Action::PromotionAttest,
+        AuditAction::AuditGap => Action::AuditGap,
     }
 }
 
@@ -99,7 +103,15 @@ pub fn to_event(record: &AuditRecord, engine: &str) -> AuditEvent {
     if let Some(index) = record.log_index {
         event = event.log_index(index);
     }
-    event
+    if let Some(term) = record.log_term {
+        event = event.log_term(term);
+    }
+    // An applied record is timed by its entry, never by this replica's
+    // clock (#706): every replica writes the same time for one entry.
+    if let Some(issued_at_ms) = record.issued_at_ms {
+        event = event.time_ms(issued_at_ms);
+    }
+    event.replayed(record.replayed)
 }
 
 /// The serving leader's record of a sealed-segment transfer request
@@ -263,6 +275,9 @@ mod tests {
                 reason: Some("no".into()),
                 request_id: None,
                 log_index: None,
+                log_term: None,
+                issued_at_ms: None,
+                replayed: false,
             };
             let event = to_event(&record, "meta-1");
             assert_eq!(event.params.len(), params.len());

@@ -191,6 +191,7 @@ fn action_of(action: vtop_meta::audit::AuditAction) -> Action {
         AuditAction::ClusterCreateTopic => Action::ClusterCreateTopic,
         AuditAction::ClusterPropose => Action::ClusterPropose,
         AuditAction::PromotionAttest => Action::PromotionAttest,
+        AuditAction::AuditGap => Action::AuditGap,
     }
 }
 

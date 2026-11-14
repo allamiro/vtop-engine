@@ -580,6 +580,116 @@ impl Collector for MetaRaftCollector {
     }
 }
 
+/// A metadata node's applied-audit delivery (#706): records delivered
+/// again, ranges it could not re-derive, and how far delivery trails apply.
+pub struct MetaAuditCollector {
+    consensus: Arc<OpenraftConsensus>,
+    metrics: MetaAuditMetrics,
+}
+
+impl MetaAuditCollector {
+    pub fn new(consensus: Arc<OpenraftConsensus>) -> Result<Self, String> {
+        Ok(Self {
+            consensus,
+            metrics: MetaAuditMetrics::new()?,
+        })
+    }
+}
+
+impl Collector for MetaAuditCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        self.metrics.desc()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        if let Some(progress) = self.consensus.audit_progress() {
+            self.metrics.publish(&progress);
+        }
+        self.metrics.collect()
+    }
+}
+
+/// The `reason` values of `vtop_audit_replayed_total`, in
+/// [`vtop_meta::raft::AuditProgressSnapshot::replayed`] order.
+pub const AUDIT_REPLAY_REASONS: [&str; 3] = ["restart", "retry", "snapshot"];
+/// The `reason` values of `vtop_audit_gaps_total`, in
+/// [`vtop_meta::raft::AuditProgressSnapshot::gaps`] order.
+pub const AUDIT_GAP_REASONS: [&str; 3] = ["snapshot_install", "log_purged", "tail_evicted"];
+
+/// Split from the collector so the mapping is asserted without a consensus
+/// node. The counters follow the replica's own monotonic counts.
+struct MetaAuditMetrics {
+    replayed: prometheus::IntCounterVec,
+    gaps: prometheus::IntCounterVec,
+    lag: IntGauge,
+    seen: std::sync::Mutex<vtop_meta::raft::AuditProgressSnapshot>,
+}
+
+impl MetaAuditMetrics {
+    fn new() -> Result<Self, String> {
+        let counter_vec = |name: &str, help: &str| {
+            prometheus::IntCounterVec::new(Opts::new(name, help), &["reason"])
+                .map_err(|error| format!("build {name}: {error}"))
+        };
+        let replayed = counter_vec(
+            "audit_replayed_total",
+            "Applied audit records this metadata node delivered again, marked replayed: at \
+             restart, after its sink refused them, or from a snapshot's attributed tail",
+        )?;
+        let gaps = counter_vec(
+            "audit_gaps_total",
+            "audit.gap records: ranges of applied audit records this metadata node could not \
+             re-derive (a snapshot install, a log purged past its audit frontier, or entries \
+             the attributed tail no longer held)",
+        )?;
+        for reason in AUDIT_REPLAY_REASONS {
+            replayed.with_label_values(&[reason]);
+        }
+        for reason in AUDIT_GAP_REASONS {
+            gaps.with_label_values(&[reason]);
+        }
+        Ok(Self {
+            replayed,
+            gaps,
+            lag: gauge(
+                "audit_delivery_lag_entries",
+                "Applied log entries whose audit records this metadata node has not delivered \
+                 yet; above 0 for more than a retry interval means its audit sink is failing",
+            )?,
+            seen: std::sync::Mutex::new(Default::default()),
+        })
+    }
+
+    fn publish(&self, progress: &vtop_meta::raft::AuditProgressSnapshot) {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        for (slot, reason) in AUDIT_REPLAY_REASONS.iter().enumerate() {
+            let delta = progress.replayed[slot].saturating_sub(seen.replayed[slot]);
+            self.replayed.with_label_values(&[reason]).inc_by(delta);
+        }
+        for (slot, reason) in AUDIT_GAP_REASONS.iter().enumerate() {
+            let delta = progress.gaps[slot].saturating_sub(seen.gaps[slot]);
+            self.gaps.with_label_values(&[reason]).inc_by(delta);
+        }
+        self.lag
+            .set(i64::try_from(progress.lag()).unwrap_or(i64::MAX));
+        *seen = *progress;
+    }
+
+    fn members(&self) -> Vec<&dyn Collector> {
+        vec![&self.replayed, &self.gaps, &self.lag]
+    }
+}
+
+impl Collector for MetaAuditMetrics {
+    fn desc(&self) -> Vec<&Desc> {
+        descs_of(&self.members())
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        collect_all(&self.members())
+    }
+}
+
 /// The gauge set, split from the collector so the observation-to-metric mapping
 /// can be asserted without standing up a consensus node.
 struct MetaRaftGauges {
@@ -2696,6 +2806,60 @@ mod tests {
         let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
         registry.register(Box::new(collector)).unwrap();
         registry
+    }
+
+    /// #706: the applied-audit delivery metrics, with every bounded label
+    /// value present from the first scrape and the counters following the
+    /// replica's own counts.
+    #[test]
+    fn audit_delivery_metrics_follow_the_replicas_counts() {
+        let metrics = MetaAuditMetrics::new().unwrap();
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        let progress =
+            |replayed, gaps, delivered, applied| vtop_meta::raft::AuditProgressSnapshot {
+                replayed,
+                gaps,
+                delivered_index: delivered,
+                applied_index: applied,
+            };
+        metrics.publish(&progress([0; 3], [0; 3], 10, 10));
+        registry.register(Box::new(metrics)).unwrap();
+        let text = scrape(&registry);
+        for reason in AUDIT_REPLAY_REASONS {
+            assert!(
+                text.contains(&format!(
+                    r#"vtop_audit_replayed_total{{reason="{reason}"}} 0"#
+                )),
+                "{text}"
+            );
+        }
+        for reason in AUDIT_GAP_REASONS {
+            assert!(
+                text.contains(&format!(r#"vtop_audit_gaps_total{{reason="{reason}"}} 0"#)),
+                "{text}"
+            );
+        }
+        assert!(text.contains("vtop_audit_delivery_lag_entries 0"), "{text}");
+
+        let metrics = MetaAuditMetrics::new().unwrap();
+        metrics.publish(&progress([3, 1, 0], [1, 0, 0], 10, 14));
+        metrics.publish(&progress([5, 1, 0], [1, 2, 0], 12, 14));
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry.register(Box::new(metrics)).unwrap();
+        let text = scrape(&registry);
+        assert!(
+            text.contains(r#"vtop_audit_replayed_total{reason="restart"} 5"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"vtop_audit_replayed_total{reason="retry"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"vtop_audit_gaps_total{reason="log_purged"} 2"#),
+            "{text}"
+        );
+        assert!(text.contains("vtop_audit_delivery_lag_entries 2"), "{text}");
     }
 
     /// The state label is one-hot, so `sum by (state)` across a cluster counts

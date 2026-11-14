@@ -39,6 +39,7 @@
 // value, so boxing at every adapter boundary is not workable.
 #![allow(clippy::result_large_err)]
 
+pub mod audit_delivery;
 pub mod consensus;
 pub mod convert;
 pub mod log_store;
@@ -49,6 +50,7 @@ pub mod state_machine;
 pub mod store;
 pub mod type_config;
 
+pub use audit_delivery::{AuditProgress, AuditProgressSnapshot, ReplayReason};
 pub use consensus::{
     CommitReceipt, Consensus, ConsensusError, ConsensusResult, OpenraftConsensus, ReadFence,
 };

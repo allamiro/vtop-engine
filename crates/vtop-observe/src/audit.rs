@@ -91,11 +91,16 @@ pub enum Action {
     /// `vtopctl node promote-unproven`: the operator's attestation (#636).
     #[serde(rename = "promotion.attest")]
     PromotionAttest,
+    /// A metadata replica's applied records it owes and cannot re-derive
+    /// (#706): a snapshot install, or a log purged past its audit frontier.
+    /// `params` name the log index range and why.
+    #[serde(rename = "audit.gap")]
+    AuditGap,
 }
 
 impl Action {
     /// Every action, for label sets and tests.
-    pub const ALL: [Action; 12] = [
+    pub const ALL: [Action; 13] = [
         Action::LedgerReplay,
         Action::LedgerPrune,
         Action::LedgerMigrate,
@@ -108,6 +113,7 @@ impl Action {
         Action::NodeRepair,
         Action::NodeReconfigureRange,
         Action::PromotionAttest,
+        Action::AuditGap,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -124,6 +130,7 @@ impl Action {
             Action::NodeRepair => "node.repair",
             Action::NodeReconfigureRange => "node.reconfigure_range",
             Action::PromotionAttest => "promotion.attest",
+            Action::AuditGap => "audit.gap",
         }
     }
 
@@ -199,6 +206,7 @@ impl Action {
                 "operator",
                 "command",
             ],
+            Action::AuditGap => &["from_index", "through_index", "reason"],
         }
     }
 
@@ -468,6 +476,10 @@ pub struct Correlation {
     /// through its state machine; none for entries a snapshot brought).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_index: Option<u64>,
+    /// The term of that entry (#706): with the index, the entry's identity,
+    /// the same on every replica.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_term: Option<u64>,
 }
 
 /// One audit record, `audit_version` 1.
@@ -496,6 +508,11 @@ pub struct AuditEvent {
     /// The engine's name, or the node that wrote the record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
+    /// Delivered again after a crash, a refusing sink or a restart (#706):
+    /// it may duplicate a record the same engine wrote for the same log
+    /// index. Absent means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replayed: bool,
 }
 
 impl AuditEvent {
@@ -522,7 +539,29 @@ impl AuditEvent {
             after: BTreeMap::new(),
             correlation: Correlation::default(),
             engine: None,
+            replayed: false,
         }
+    }
+
+    /// Time the record at `ms` since the Unix epoch instead of now: an
+    /// applied metadata record takes its entry's `issued_at_ms` (#706), so
+    /// every replica writes the same time. A value chrono cannot represent
+    /// leaves the time as it was.
+    pub fn time_ms(mut self, ms: i64) -> Self {
+        if let Some(at) = chrono::DateTime::from_timestamp_millis(ms) {
+            self.time = at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        }
+        self
+    }
+
+    pub fn log_term(mut self, term: u64) -> Self {
+        self.correlation.log_term = Some(term);
+        self
+    }
+
+    pub fn replayed(mut self, replayed: bool) -> Self {
+        self.replayed = replayed;
+        self
     }
 
     /// Add a parameter, if `name` is on the action's allowlist; the value is
