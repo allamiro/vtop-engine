@@ -117,6 +117,8 @@ async fn a_receipt_that_cannot_be_written_is_a_rate_limited_warning_that_leaks_n
         // what to do
         "recovery writes the receipt if the batch is still VERIFIED at the next start",
         "vtopctl scrub reports it missing",
+        // A receipt stored without its lock is not missing (review of #749).
+        "vtopctl scrub --check-retention reports its retention",
         "check the store's health and the engine's permission to write beside the manifests",
     ] {
         assert!(message.contains(part), "missing {part:?} in: {message}");
