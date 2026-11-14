@@ -198,6 +198,20 @@ upload:
   #
   # max_egress_bytes_per_second: 12500000     # e.g. 100 Mbit/s of body bytes
   # max_concurrency_ceiling: 8
+  #
+  # Multipart (objects of at least multipart_threshold_bytes). A failed part is
+  # sent again alone, up to multipart_part_attempts requests with a backoff of
+  # 1 s doubling to 30 s; the parts that completed are kept, and if the batch
+  # still fails under its content-derived object key its session is kept for
+  # the replay of the same bytes, which sends only the missing parts (#668). Sessions nobody resumes are aborted
+  # once older than multipart_abandon_after_secs. Incomplete parts are billed:
+  # add an AbortIncompleteMultipartUpload lifecycle rule with a longer window
+  # (docs/PRODUCTION_HA.md section 7.6).
+  # multipart_part_size_bytes: 8388608
+  # multipart_threshold_bytes: 8388608
+  # multipart_max_parallelism: 4
+  # multipart_part_attempts: 3
+  # multipart_abandon_after_secs: 86400
   # Per-transport egress TUNING (#480): ONE shape, keyed by transport name, so
   # both paths are tuned with the IDENTICAL set of keys — a comparison between
   # them is not tuned-vs-untuned. Only the active `transport` may carry a

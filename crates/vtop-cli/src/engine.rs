@@ -225,6 +225,91 @@ impl KeyNotices {
 }
 
 impl<'a> Pipeline<'a> {
+    /// What becomes of a failed multipart upload's session (#668).
+    ///
+    /// Kept, when a replay can resume it: the object is under its derived
+    /// key, which a replay of the same bytes names again (#626), and the
+    /// session on disk is one this upload can continue. Its completed parts
+    /// stay at the store and the replay sends only what is missing. A replay
+    /// whose bytes differ names another key and leaves this session to the
+    /// abandoned-session sweep, and a bucket lifecycle rule is the backstop
+    /// for an engine that never comes back.
+    ///
+    /// Aborted otherwise, as every failed upload was before #668: under a
+    /// per-attempt key nothing will ever name the session again, and a
+    /// session the upload refused to resume cannot be continued.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument is a fact the decision or its notice needs; a struct would \
+                  only name them twice"
+    )]
+    async fn settle_failed_multipart(
+        &self,
+        batch_id: &str,
+        object_uri: &str,
+        key_is_derived: bool,
+        fence: &MultipartFence,
+        report: &multipart::MultipartReport,
+        error: &VtopError,
+        work_dir: &std::path::Path,
+    ) {
+        let cause = multipart::redact_urls(&error.to_string());
+        let abandon = self.config.upload.multipart_abandon_after_secs;
+        if report.session_left && key_is_derived && !fence.content_digest_hex.is_empty() {
+            if let Some(mx) = telemetry::metrics() {
+                mx.multipart_sessions_total
+                    .with_label_values(&["kept_after_failure"])
+                    .inc();
+            }
+            tracing::warn!(
+                event = "multipart_session_kept",
+                batch_id,
+                key = object_uri,
+                parts_kept = report.parts_kept,
+                parts_total = report.parts_total,
+                error = %cause,
+                "{cause}; the batch was marked failed and will be replayed, and the replay \
+                 resumes the session if its bytes are unchanged; incomplete uploads are aborted \
+                 after upload.multipart_abandon_after_secs ({abandon} s); nothing to do unless \
+                 this repeats, then check the link to the store"
+            );
+            return;
+        }
+        let session = work_dir.join(multipart::session_file_name(object_uri, fence));
+        if !session.exists() {
+            // Nothing was left to keep or abort: the upload failed before a
+            // session was written, or the store had already lost it.
+            return;
+        }
+        let why = if key_is_derived {
+            "the session on disk cannot be resumed by this upload"
+        } else {
+            "it was written under the batch's per-attempt key, which no replay names again"
+        };
+        match multipart::abort_session(self.backend.as_ref(), work_dir, object_uri, fence).await {
+            Ok(()) => tracing::warn!(
+                event = "multipart_session_aborted",
+                batch_id,
+                key = object_uri,
+                reason = why,
+                error = %cause,
+                "{cause}; the multipart upload of {object_uri} was aborted rather than kept: \
+                 {why}; the replay uploads the object from its first byte; nothing to do"
+            ),
+            Err(abort_err) => tracing::warn!(
+                event = "multipart_session_aborted",
+                batch_id,
+                key = object_uri,
+                reason = why,
+                error = %multipart::redact_urls(&abort_err.to_string()),
+                "could not abort the failed multipart upload of {object_uri} ({}); the \
+                 abandoned-session sweep aborts it after upload.multipart_abandon_after_secs \
+                 ({abandon} s); nothing to do unless this repeats",
+                multipart::redact_urls(&abort_err.to_string())
+            ),
+        }
+    }
+
     /// Run a [`ReadResult`] all the way through the state machine. Source
     /// progress is committed only if (and after) verification passes.
     ///
@@ -764,7 +849,7 @@ impl<'a> Pipeline<'a> {
                     .inc();
             }
         };
-        let (object_uri, reused) = match derived_object_uri {
+        let (object_uri, reused, key_is_derived) = match derived_object_uri {
             Err(why) => {
                 decided("per_attempt");
                 if let Some(suppressed) = self.key_notices.admit("per_attempt", source_name) {
@@ -782,7 +867,7 @@ impl<'a> Pipeline<'a> {
                          the last notice)"
                     );
                 }
-                (attempt_object_uri, false)
+                (attempt_object_uri, false, false)
             }
             Ok(derived) => match probe_object_key(
                 self.backend.as_ref(),
@@ -807,7 +892,7 @@ impl<'a> Pipeline<'a> {
                          under its derived key {derived}, so a replay of the same bytes will reuse \
                          it; nothing to do"
                     );
-                    (derived, false)
+                    (derived, false, true)
                 }
                 Ok(KeyProbe::Holds) => {
                     decided("reused");
@@ -820,7 +905,7 @@ impl<'a> Pipeline<'a> {
                         "object for range {range} of {source_name} already archived and verified; \
                          reusing key {derived}, no upload; nothing to do"
                     );
-                    (derived, true)
+                    (derived, true, true)
                 }
                 Ok(probe) => {
                     let (decision, what, todo) = match &probe {
@@ -882,7 +967,7 @@ impl<'a> Pipeline<'a> {
                              {todo}"
                         );
                     }
-                    (attempt_object_uri, false)
+                    (attempt_object_uri, false, false)
                 }
                 Err(e) => {
                     decided("probe_throttled");
@@ -914,91 +999,82 @@ impl<'a> Pipeline<'a> {
         // The fence is derived from the object key and the content digest,
         // NOT a lease this path does not have. What it protects: a session
         // resumed for THIS object identity carries THIS content — the
-        // resume refuses if the local bytes or their digest changed, so a
+        // resume re-checks every kept part against the local bytes, so a
         // re-derived batch (a new digest) never adopts a stale session. It
         // does NOT fence against a concurrent writer to the same object
         // key. An attempt key has one writer by construction; a derived key
         // is named by its content digest, so two writers of it write the
         // same bytes (#626), which is the property that stands in for the
-        // lease `tier` holds. A replay of the same bytes after a crash
-        // resumes the session the crashed attempt left under the derived
-        // key, where an attempt key always started a new one.
+        // lease `tier` holds. A replay of the same bytes after a failed
+        // attempt or a crash resumes the session that attempt left under the
+        // derived key (#668), and sends only the parts it is missing.
         let mp_cfg = MultipartUploadConfig::from_upload(&self.config.upload, work_dir.clone());
         let t = Instant::now();
         let multipart_used =
             !reused && mp_cfg.should_multipart(self.backend.as_ref(), compressed.size_bytes);
         trace.record_stage("multipart", multipart_used);
         trace.record_stage("reused", reused);
+        let fence = MultipartFence {
+            // No segment lineage on the telemetry path; the identity is
+            // the batch's bytes.
+            expected_segment_generation: 0,
+            fencing_epoch: 0,
+            content_digest_hex: object_checksum.clone().unwrap_or_default(),
+            content_digest_algorithm: algo.as_str().to_owned(),
+            byte_length: compressed.size_bytes,
+        };
+        let mut mp_report = multipart::MultipartReport::default();
         let upload_result = if reused {
             None
         } else if multipart_used {
-            let fence = MultipartFence {
-                // No segment lineage on the telemetry path; the identity is
-                // the batch and its bytes.
-                expected_segment_generation: 0,
-                fencing_epoch: 0,
-                content_digest_hex: object_checksum.clone().unwrap_or_default(),
-                content_digest_algorithm: algo.as_str().to_owned(),
-                byte_length: compressed.size_bytes,
-            };
-            Some(
-                multipart::upload_resumable(
-                    self.backend.as_ref(),
-                    &mp_cfg,
-                    &compressed.path,
-                    &object_uri,
-                    object_ck,
-                    fence,
-                )
-                .await
-                .map(|_| ()),
+            let result = multipart::upload_resumable_with_report(
+                self.backend.as_ref(),
+                &mp_cfg,
+                &compressed.path,
+                &object_uri,
+                object_ck,
+                fence.clone(),
+                &mut mp_report,
             )
+            .await
+            .map(|_| ());
+            // Every request the upload made, and every throttle among them
+            // (#668): the per-part retries inside it would otherwise hide all
+            // but the last throttle from the width controller.
+            note_multipart_requests(
+                &mp_report,
+                &object_uri,
+                labels,
+                &self.attempts,
+                &self.throttles,
+            );
+            record_multipart(&mp_report);
+            Some(result)
         } else {
-            Some(
+            // A reused object made no request here, so none is counted.
+            Some(note_store_request(
                 self.backend
                     .put_object(&compressed.path, &object_uri, object_ck)
                     .await
                     .map(|_| ()),
-            )
-        };
-        // A reused object made no request here, so none is counted.
-        if let Some(Err(e)) = upload_result.map(|result| {
-            note_store_request(
-                result,
                 "object_upload",
                 labels,
                 &self.attempts,
                 &self.throttles,
-            )
-        }) {
-            // NO ORPHANED SESSION (#482): a failed multipart leaves a
-            // *.multipart.json and a live upload id, and mark_failed
-            // re-derives the batch — a re-derivation with the same bytes
-            // resumes it (the point of the session), but a re-derivation
-            // with DIFFERENT bytes mints a new digest and a new session
-            // filename, orphaning this one by construction. Abort it here
-            // so the abandoned upload id is released now rather than
-            // waiting out the abandon window. Best-effort: the failure is
-            // already decided, and a failed abort must not mask it.
+            ))
+        };
+        if let Some(Err(e)) = upload_result {
             if multipart_used {
-                let fence = MultipartFence {
-                    expected_segment_generation: 0,
-                    fencing_epoch: 0,
-                    content_digest_hex: object_checksum.clone().unwrap_or_default(),
-                    content_digest_algorithm: algo.as_str().to_owned(),
-                    byte_length: compressed.size_bytes,
-                };
-                if let Err(abort_err) =
-                    multipart::abort_session(self.backend.as_ref(), &work_dir, &object_uri, &fence)
-                        .await
-                {
-                    tracing::warn!(
-                        batch_id,
-                        error = %abort_err,
-                        "could not abort the failed multipart session; the abandon \
-                         sweep will reclaim it"
-                    );
-                }
+                self.settle_failed_multipart(
+                    &batch_id,
+                    &object_uri,
+                    key_is_derived,
+                    &fence,
+                    &mp_report,
+                    &e,
+                    &work_dir,
+                )
+                .await;
             }
             fail!(format!("object upload failed: {e}"));
         }
@@ -1708,6 +1784,71 @@ async fn probe_object_key(
     }
 }
 
+/// Count every request a multipart upload made, and every throttle among
+/// them (#668). The upload retries a part itself, so a throttle it recovered
+/// from never reaches the caller as an error; without this the width
+/// controller would see only a throttle the retries could not outlast.
+fn note_multipart_requests(
+    report: &multipart::MultipartReport,
+    object_uri: &str,
+    labels: [&str; 3],
+    attempts: &AtomicU64,
+    throttles: &AtomicU64,
+) {
+    attempts.fetch_add(u64::from(report.requests), Ordering::Relaxed);
+    let throttled = report.throttled_requests;
+    if throttled == 0 {
+        return;
+    }
+    throttles.fetch_add(u64::from(throttled), Ordering::Relaxed);
+    if let Some(mx) = telemetry::metrics() {
+        mx.upload_throttled_total
+            .with_label_values(&[labels[0], labels[1], labels[2], "object_upload"])
+            .inc_by(u64::from(throttled));
+    }
+    tracing::warn!(
+        event = "upload_throttled",
+        stage = "object_upload",
+        key = object_uri,
+        throttled,
+        "the store throttled {throttled} multipart request(s) for {object_uri}; each was \
+         retried after a pause, and the engine narrows its upload width when \
+         batching.adaptive_width is on; nothing to do unless this persists, then reduce \
+         upload concurrency"
+    );
+}
+
+/// The multipart metrics for one upload call (#668).
+fn record_multipart(report: &multipart::MultipartReport) {
+    let Some(mx) = telemetry::metrics() else {
+        return;
+    };
+    for (result, n) in [
+        ("uploaded", report.parts_uploaded),
+        ("reused", report.parts_reused),
+        ("retried", report.part_retries),
+        ("failed", report.parts_failed),
+    ] {
+        if n > 0 {
+            mx.multipart_parts_total
+                .with_label_values(&[result])
+                .inc_by(u64::from(n));
+        }
+    }
+    for (outcome, happened) in [
+        ("completed", report.completed),
+        ("resumed", report.resumed),
+        ("restarted", report.restarted),
+    ] {
+        if happened {
+            mx.multipart_sessions_total
+                .with_label_values(&[outcome])
+                .inc();
+        }
+    }
+    mx.multipart_bytes_reused_total.inc_by(report.bytes_reused);
+}
+
 fn note_upload_throttle(error: &VtopError, stage: &str, labels: [&str; 3], throttles: &AtomicU64) {
     if !error.is_upload_throttle() {
         return;
@@ -1825,6 +1966,10 @@ pub struct Engine {
     /// Last committed-history prune attempt (#128); pruning is idle-cycle
     /// only and rate-limited, so a busy pipeline never pays for it.
     last_ledger_prune: Option<std::time::Instant>,
+    /// Last abandoned-multipart sweep (#668). Failed uploads keep their
+    /// sessions for the replay now, so a long-running engine sweeps every
+    /// [`Engine::multipart_sweep_interval`], not only at startup.
+    last_multipart_sweep: Option<std::time::Instant>,
     /// VERIFIED rows this process holds and has not committed (#624): held
     /// back by recovery above a range of the same unit that is being read
     /// again, or whose source commit failed. Each is re-checked after every
@@ -1988,19 +2133,13 @@ impl Engine {
         let mut engine = Self::new_with_state_store(config, streams, state_store).await?;
         engine._instance_locks = locks;
         // Reclaim multipart sessions no source will replay (#482, review):
-        // a crash mid-upload leaves a *.multipart.json and a live upload id
-        // that the inline abort could not reach. The abandonment sweep is
-        // the only thing that frees them, and the engine is its only
-        // production caller — so it runs once at exclusive startup, under
-        // the instance lock, best-effort. Sessions younger than the abandon
-        // window are left for an in-flight run.
-        let mp_cfg = multipart::MultipartUploadConfig::from_upload(
-            &engine.config.upload,
-            std::path::PathBuf::from(&engine.config.engine.work_dir),
-        );
-        if let Err(e) = multipart::cleanup_abandoned(engine.backend.as_ref(), &mp_cfg).await {
-            tracing::warn!(error = %e, "multipart abandonment sweep failed at startup");
-        }
+        // a crash mid-upload leaves a *.multipart.json and a live upload id,
+        // and since #668 a failed upload keeps its session for the replay.
+        // The abandonment sweep frees the ones nobody resumed, under the
+        // instance lock, best-effort; sessions younger than the abandon
+        // window are left for the replay. It runs here and then periodically
+        // from `run_until`.
+        engine.sweep_abandoned_multipart().await;
         Ok(engine)
     }
 
@@ -2107,6 +2246,7 @@ impl Engine {
         }
 
         prime_source_counters(&config, &streams, adapters.keys());
+        prime_multipart_counters();
 
         // The active transport's max_concurrency narrows the batch ceiling by
         // MINIMUM (#480): the WidthController ceiling is the RESOLVED value, so
@@ -2141,6 +2281,7 @@ impl Engine {
             cycle_had_failure: false,
             failure_streak: 0,
             last_ledger_prune: None,
+            last_multipart_sweep: None,
             unsettled: Vec::new(),
             _instance_locks: Vec::new(),
         })
@@ -3682,6 +3823,69 @@ impl Engine {
         Ok(())
     }
 
+    /// How often a running engine sweeps abandoned multipart sessions
+    /// (#668): a quarter of `upload.multipart_abandon_after_secs`, and not
+    /// more often than every 15 minutes, so a session is aborted at most a
+    /// quarter-window after it becomes abandoned.
+    pub fn multipart_sweep_interval(&self) -> Duration {
+        Duration::from_secs(self.config.upload.multipart_abandon_after_secs / 4)
+            .max(Duration::from_secs(15 * 60))
+    }
+
+    /// Abort the multipart uploads of sessions older than
+    /// `upload.multipart_abandon_after_secs` and delete their files (#668):
+    /// the ones no replay resumed, because the replay's bytes differed or
+    /// the range was never read again. A session whose abort fails is kept
+    /// for the next sweep, so its upload id is not lost. Returns how many
+    /// were aborted.
+    pub async fn sweep_abandoned_multipart(&mut self) -> usize {
+        self.last_multipart_sweep = Some(std::time::Instant::now());
+        if !self.backend.supports_multipart() {
+            return 0;
+        }
+        let abandon = self.config.upload.multipart_abandon_after_secs;
+        let mp_cfg = MultipartUploadConfig::from_upload(
+            &self.config.upload,
+            std::path::PathBuf::from(&self.config.engine.work_dir),
+        );
+        match multipart::cleanup_abandoned(self.backend.as_ref(), &mp_cfg).await {
+            Ok(0) => 0,
+            Ok(aborted) => {
+                if let Some(mx) = telemetry::metrics() {
+                    mx.multipart_sessions_total
+                        .with_label_values(&["swept"])
+                        .inc_by(aborted as u64);
+                }
+                tracing::info!(
+                    event = "multipart_sweep",
+                    aborted,
+                    abandon_after_secs = abandon,
+                    "aborted {aborted} abandoned multipart upload(s) older than {abandon} s; \
+                     their parts are no longer stored; nothing to do"
+                );
+                aborted
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "multipart_sweep_failed",
+                    error = %e,
+                    "the abandoned multipart sweep failed ({e}); every session is kept and \
+                     the next sweep tries again in {} s; batches are unaffected; check the \
+                     work directory's permissions if this repeats",
+                    self.multipart_sweep_interval().as_secs()
+                );
+                0
+            }
+        }
+    }
+
+    /// Whether [`Engine::multipart_sweep_interval`] has passed since the last
+    /// sweep (#668).
+    fn multipart_sweep_due(&self) -> bool {
+        self.last_multipart_sweep
+            .is_none_or(|at| at.elapsed() >= self.multipart_sweep_interval())
+    }
+
     /// Run the continuous processing loop until the shutdown signal fires.
     /// #128: incremental committed-history retention. Disabled unless
     /// `engine.ledger_retention_days` is set; runs only on idle cycles, at
@@ -3804,6 +4008,25 @@ impl Engine {
             } else {
                 0
             };
+            // Abandoned multipart sessions are reclaimed while the engine
+            // runs, busy or idle (#668): a failed upload keeps its session
+            // for the replay, and one no replay resumes must not wait for a
+            // restart to be aborted. Cheap when not due. When due it can
+            // spend a request deadline per session against a store that does
+            // not answer, so a stop, pending or arriving, wins the race.
+            // Dropping the sweep half-way is safe: a session file is deleted
+            // only after its upload's abort succeeded, so an interrupted one
+            // is simply there for the next sweep.
+            if self.multipart_sweep_due() {
+                if let Some(cause) = shutdown.pending_request() {
+                    break 'run cause;
+                }
+                tokio::select! {
+                    biased;
+                    cause = shutdown.next_request() => break 'run cause,
+                    _ = self.sweep_abandoned_multipart() => {}
+                }
+            }
             // Failing cycle: wait, growing with the streak (the failed range is
             // read again, so a tight loop would hammer a store that is down).
             // Productive cycle: loop again immediately. Idle cycle: back off.
@@ -4575,6 +4798,22 @@ fn prime_source_counters<'a>(
             let _ = mx.retention_lost_records_total.with_label_values(&labels);
             let _ = mx.source_replay_refused_total.with_label_values(&labels);
         }
+    }
+}
+
+/// The multipart counters' children at zero before the first upload (#668),
+/// for the reason [`prime_source_counters`] gives: the alert on sessions kept
+/// after failures compares them with `resumed` and `swept`, and a child that
+/// does not exist yet compares as nothing rather than as zero.
+fn prime_multipart_counters() {
+    let Some(mx) = telemetry::metrics() else {
+        return;
+    };
+    for result in telemetry::MULTIPART_PART_RESULTS {
+        let _ = mx.multipart_parts_total.with_label_values(&[result]);
+    }
+    for outcome in telemetry::MULTIPART_SESSION_OUTCOMES {
+        let _ = mx.multipart_sessions_total.with_label_values(&[outcome]);
     }
 }
 
@@ -9306,5 +9545,277 @@ mod tests {
             "the next one reports the two suppressed"
         );
         assert_eq!(notices.admit_at("per_attempt", "a", at(61)), None);
+    }
+
+    /// A file source holding about 3.6 KB of records, uploaded uncompressed
+    /// in 1000-byte parts: four multipart parts (#668).
+    fn multipart_engine_config(dir: &std::path::Path, tenant: &str) -> VtopConfig {
+        use std::io::Write;
+        let input = dir.join("in.log");
+        let mut f = std::fs::File::create(&input).unwrap();
+        for i in 0..40 {
+            writeln!(
+                f,
+                "record {i:04} payload abcdefghijklmnopqrstuvwxyz0123456789 ABCDEFGHIJKLMNOPQRS"
+            )
+            .unwrap();
+        }
+        let mut cfg = file_config(
+            dir.join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.engine.tenant = tenant.into();
+        cfg.batching.max_batch_age_seconds = 3_600;
+        cfg.compression.kind = vtop_core::types::CompressionType::None;
+        cfg.upload.multipart_part_size_bytes = 1_000;
+        cfg.upload.multipart_threshold_bytes = 1_000;
+        cfg
+    }
+
+    /// #668 with #102: a part the store throttled is retried inside the
+    /// upload, so the batch commits, but the throttle still reaches the width
+    /// controller and the throttle counter. Swallowed by the retry, it would
+    /// hide exactly the signal the controller narrows the width on.
+    #[tokio::test]
+    async fn a_throttled_part_is_retried_and_still_narrows_the_upload_width() {
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let tenant = "multipart-throttle-668";
+        let mut cfg = multipart_engine_config(dir.path(), tenant);
+        cfg.batching.max_concurrent_batches = 4;
+        cfg.batching.adaptive_width.enabled = true;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let mock = Arc::new(vtop_upload::MockBackend::new().with_part_fault(
+            2,
+            vtop_upload::PartFault::Throttled,
+            1,
+        ));
+        engine.backend = mock.clone();
+        let counter = telemetry::init()
+            .unwrap()
+            .upload_throttled_total
+            .with_label_values(&[tenant, "file", "raw", "object_upload"]);
+        let before = counter.get();
+
+        let outcomes = engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        assert!(
+            outcomes[0].committed,
+            "the throttled part was retried and the object completed: {outcomes:?}"
+        );
+        assert_eq!(mock.part_sends(2), 2);
+        assert_eq!(
+            counter.get() - before,
+            1,
+            "the throttle the retry absorbed is counted"
+        );
+        assert_eq!(
+            engine.upload_width(),
+            2,
+            "and the width controller halved the next cycle's width on it"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_multipart_sweep_runs_every_quarter_window_and_not_more_than_every_15_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        for (abandon, every) in [(86_400, 21_600), (600, 900)] {
+            let mut cfg = multipart_engine_config(dir.path(), "default");
+            cfg.upload.multipart_abandon_after_secs = abandon;
+            let engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+                .await
+                .unwrap();
+            assert_eq!(
+                engine.multipart_sweep_interval(),
+                Duration::from_secs(every),
+                "abandon window {abandon} s"
+            );
+            assert!(
+                engine.multipart_sweep_due(),
+                "an engine that has not swept yet is due"
+            );
+        }
+    }
+
+    /// #668: failed uploads keep their sessions for the replay now, so the
+    /// abandoned-session sweep runs while the engine runs, not only at
+    /// startup. Inside `run_until`, a session older than the abandon window
+    /// has its upload aborted at the store and its file removed; a younger
+    /// one, which a replay may still resume, is left alone.
+    #[tokio::test]
+    async fn the_running_engine_sweeps_abandoned_multipart_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let input = dir.path().join("idle.log");
+        std::fs::write(&input, "").unwrap();
+        let mut cfg = file_config(
+            work.to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.idle_poll_interval_ms = 20;
+        let mut engine = Engine::new(cfg.clone(), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let backend = Arc::new(vtop_upload::MockBackend::new().with_part_fault(
+            2,
+            vtop_upload::PartFault::Reset,
+            usize::MAX,
+        ));
+        engine.backend = backend.clone();
+
+        // Two failed uploads, each leaving a session and an upload at the store.
+        let mut mp_cfg = MultipartUploadConfig::from_upload(&cfg.upload, work.clone());
+        mp_cfg.part_size_bytes = 1_000;
+        mp_cfg.part_attempts = 1;
+        let mut left = Vec::new();
+        for name in ["aged", "young"] {
+            let data = vec![name.len() as u8; 3_000];
+            let file = dir.path().join(name);
+            std::fs::write(&file, &data).unwrap();
+            let digest = vtop_core::checksum::sha256_bytes(&data);
+            let fence = MultipartFence {
+                expected_segment_generation: 0,
+                fencing_epoch: 0,
+                content_digest_hex: digest.clone(),
+                content_digest_algorithm: "sha256".into(),
+                byte_length: 3_000,
+            };
+            let uri = format!("s3://telemetry-data/{name}.raw");
+            multipart::upload_resumable(
+                backend.as_ref(),
+                &mp_cfg,
+                &file,
+                &uri,
+                Some(ObjectChecksum::new("sha256", &digest)),
+                fence.clone(),
+            )
+            .await
+            .expect_err("part 2 fails");
+            let path = work.join(multipart::session_file_name(&uri, &fence));
+            let session = multipart::load_session(&path).unwrap();
+            left.push((path, session));
+        }
+        let (aged_path, mut aged) = left.remove(0);
+        let (young_path, young) = left.remove(0);
+        aged.updated_at_unix_secs = 1;
+        multipart::save_session(&aged_path, &aged).unwrap();
+
+        let swept = telemetry::init()
+            .unwrap()
+            .multipart_sessions_total
+            .with_label_values(&["swept"]);
+        let swept_before = swept.get();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let watch = async {
+            for _ in 0..500 {
+                if !backend.has_pending_multipart(&aged.object_uri, &aged.upload_id) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tx.send("SIGTERM").unwrap();
+        };
+        let (ran, ()) = tokio::join!(engine.run_until(ChannelShutdown(rx)), watch);
+        ran.unwrap();
+
+        assert!(
+            !backend.has_pending_multipart(&aged.object_uri, &aged.upload_id),
+            "the aged session's upload was aborted at the store while the engine ran"
+        );
+        assert!(!aged_path.exists(), "and its session file removed");
+        assert!(
+            backend.has_pending_multipart(&young.object_uri, &young.upload_id),
+            "a session younger than the window is left for its replay"
+        );
+        assert!(young_path.exists());
+        assert!(engine.last_multipart_sweep.is_some());
+        assert!(
+            !engine.multipart_sweep_due(),
+            "the next sweep waits for the interval"
+        );
+        assert_eq!(swept.get() - swept_before, 1);
+    }
+
+    /// A stop that arrives while the abandoned-session sweep is waiting on a
+    /// store that does not answer ends the run at once (#668, review): each
+    /// abort would otherwise wait out its request deadline, and a pod's
+    /// termination grace period could expire mid-sweep. Dropping the sweep is
+    /// safe: a session is deleted only after its abort succeeded.
+    #[tokio::test]
+    async fn a_stop_during_a_sweep_against_a_silent_store_is_not_held_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let input = dir.path().join("idle.log");
+        std::fs::write(&input, "").unwrap();
+        let mut cfg = file_config(
+            work.to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.idle_poll_interval_ms = 20;
+        let mut engine = Engine::new(cfg.clone(), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+
+        // An aged session, left by an upload to a store that then went silent.
+        let failing = vtop_upload::MockBackend::new().with_part_fault(
+            1,
+            vtop_upload::PartFault::Reset,
+            usize::MAX,
+        );
+        let mut mp_cfg = MultipartUploadConfig::from_upload(&cfg.upload, work.clone());
+        mp_cfg.part_size_bytes = 1_000;
+        mp_cfg.part_attempts = 1;
+        let data = vec![7_u8; 3_000];
+        let file = dir.path().join("object");
+        std::fs::write(&file, &data).unwrap();
+        let digest = vtop_core::checksum::sha256_bytes(&data);
+        let fence = MultipartFence {
+            expected_segment_generation: 0,
+            fencing_epoch: 0,
+            content_digest_hex: digest.clone(),
+            content_digest_algorithm: "sha256".into(),
+            byte_length: 3_000,
+        };
+        let uri = "s3://telemetry-data/silent.raw";
+        multipart::upload_resumable(
+            &failing,
+            &mp_cfg,
+            &file,
+            uri,
+            Some(ObjectChecksum::new("sha256", &digest)),
+            fence.clone(),
+        )
+        .await
+        .expect_err("part 1 fails");
+        let path = work.join(multipart::session_file_name(uri, &fence));
+        let mut session = multipart::load_session(&path).unwrap();
+        session.updated_at_unix_secs = 1;
+        multipart::save_session(&path, &session).unwrap();
+        engine.backend = Arc::new(vtop_upload::MockBackend::new().with_hanging_abort());
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stop = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            tx.send("SIGTERM").unwrap();
+        };
+        let run = tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.run_until(ChannelShutdown(rx)),
+        );
+        let (ran, ()) = tokio::join!(run, stop);
+        ran.expect("the stop must not wait for the silent store's abort")
+            .unwrap();
+        assert!(
+            path.exists(),
+            "the session whose abort never answered is kept for the next sweep"
+        );
     }
 }

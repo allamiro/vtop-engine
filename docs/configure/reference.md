@@ -228,7 +228,8 @@ Each source is optional. A source block that is present but has
 | `multipart_part_size_bytes` | `8388608` (8 MiB) | Multipart part size. S3 needs at least 5 MiB for non-final parts. Must be > 0. |
 | `multipart_threshold_bytes` | `8388608` (8 MiB) | Use multipart for objects at least this large, on backends that support it. Must be > 0. |
 | `multipart_max_parallelism` | `4` | Parts in flight per object. Must be > 0; at most 10,000 on `s3_native`. |
-| `multipart_abandon_after_secs` | `86400` | An incomplete multipart session older than this is treated as abandoned. Must be > 0. |
+| `multipart_abandon_after_secs` | `86400` | An incomplete multipart session older than this is treated as abandoned: the engine aborts its upload at the store and deletes the session, at startup and then every quarter of this window (at most every 15 minutes) while it runs. Must be > 0. |
+| `multipart_part_attempts` | `3` | Requests per multipart part, the first included, before the part and the upload fail. Only the failed part is sent again, after a wait that doubles from 1 s to at most 30 s, drawn at random below that; the parts that completed are kept. Each request also gets the backend's own retries and its `request_timeout_seconds` deadline, so the longest one part can take is this many times that. If the upload still fails and the object is under its content-derived key (#626), the session is kept and the replay of the same bytes resumes it; under a per-attempt key (checksums off, a command backend, or a derived key that could not be used, such as a HEAD refused for lack of `s3:ListBucket`) it is aborted. At least 1. |
 
 ### `upload.transports`
 

@@ -23,9 +23,10 @@ pub use base::{
     ObjectChecksum, ObjectHead, StoredManifest, StoredObject, UploadBackend, UploadedPart,
     VerificationResult,
 };
-pub use mock::{HeadFault, MockBackend};
+pub use mock::{HeadFault, MockBackend, PartFault};
 pub use multipart::{
-    abort_session, cleanup_abandoned, upload_resumable, MultipartFence, MultipartUploadConfig,
+    abort_session, cleanup_abandoned, upload_resumable, upload_resumable_with_report,
+    MultipartFence, MultipartReport, MultipartUploadConfig, PartBackoff,
 };
 
 use std::sync::Arc;

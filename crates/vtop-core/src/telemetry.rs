@@ -24,8 +24,8 @@
 //!   panel at all.
 
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 use std::sync::OnceLock;
 
@@ -50,6 +50,21 @@ pub const OBJECT_KEY_DECISIONS: [&str; 8] = [
     "fallback_unchecked",
     "probe_throttled",
     "per_attempt",
+];
+
+/// The values of `result` on `vtop_multipart_parts_total` (#668): a part
+/// sent in this upload call, a part an earlier call left in the session and
+/// this one did not send again, an extra attempt at a part, and a part whose
+/// last attempt in the call failed.
+pub const MULTIPART_PART_RESULTS: [&str; 4] = ["uploaded", "reused", "retried", "failed"];
+
+/// The values of `outcome` on `vtop_multipart_sessions_total` (#668).
+pub const MULTIPART_SESSION_OUTCOMES: [&str; 5] = [
+    "completed",
+    "resumed",
+    "restarted",
+    "kept_after_failure",
+    "swept",
 ];
 
 /// The values of `outcome` on `vtop_file_delete_decisions_total` (#619):
@@ -245,6 +260,21 @@ pub struct Metrics {
     /// event only, a fixed set; the topic and partition are in the log line
     /// beside it.
     pub kafka_partition_events_total: IntCounterVec,
+
+    /// Multipart parts by `result` (#668), the bounded set
+    /// [`MULTIPART_PART_RESULTS`]. Per upload a part counts `uploaded` or
+    /// `reused` once, `failed` once if its last attempt failed, and `retried`
+    /// once per attempt after its first. A call that restarts on a new upload
+    /// counts the parts it sent to both, since both crossed the link.
+    pub multipart_parts_total: IntCounterVec,
+    /// Multipart sessions by `outcome` (#668), the bounded set
+    /// [`MULTIPART_SESSION_OUTCOMES`]: `kept_after_failure` growing while
+    /// neither `resumed` nor `swept` does means incomplete uploads are
+    /// piling up in the bucket, where their parts are billed.
+    pub multipart_sessions_total: IntCounterVec,
+    /// Bytes of kept parts a resumed upload did not send again (#668): what
+    /// keeping sessions saves. Unlabelled, like the egress account.
+    pub multipart_bytes_reused_total: IntCounter,
 }
 
 fn labels3() -> Vec<&'static str> {
@@ -382,6 +412,21 @@ impl Metrics {
             "Kafka partition-list changes seen while reading and what the source did (see logs for topic/partition): no_partitions, lookup_failed, grew, new_partition_from_beginning, start_deferred, pinned_before_renewal, recreated_or_truncated",
             vec!["event"],
         )?;
+        let multipart_parts_total = cv(
+            "multipart_parts_total",
+            "Multipart parts by result (#668): uploaded (sent in this upload call; after a restart, to each upload), reused (kept from an earlier call and not sent again), retried (one per extra attempt at a part), failed (the part's last attempt in the call failed); the object path is in the log line",
+            vec!["result"],
+        )?;
+        let multipart_sessions_total = cv(
+            "multipart_sessions_total",
+            "Multipart sessions by outcome (#668): completed, resumed (an earlier call's session adopted), restarted (the store no longer held the upload; a new one was started), kept_after_failure (an upload failed and its session and parts were kept for the replay), swept (an abandoned session's upload was aborted)",
+            vec!["outcome"],
+        )?;
+        let multipart_bytes_reused_total = IntCounter::with_opts(Opts::new(
+            "multipart_bytes_reused_total",
+            "Bytes of kept multipart parts a resumed upload did not send again (#668)",
+        ))?;
+        registry.register(Box::new(multipart_bytes_reused_total.clone()))?;
         let source_replay_refused_total = cv(
             "source_replay_refused_total",
             "Failed ranges the source refused to hand back for re-reading, or whose re-read it then refused; each is a range missing from the archive (see logs for the path). For a file: its file cannot be proven reachable - truncated, replaced or rewritten in place, or rotated away and then removed, compressed, copied by copytruncate, or truncated or rewritten before its re-read",
@@ -470,6 +515,9 @@ impl Metrics {
             file_delete_decisions_total,
             object_key_decisions_total,
             kafka_partition_events_total,
+            multipart_parts_total,
+            multipart_sessions_total,
+            multipart_bytes_reused_total,
         })
     }
 
