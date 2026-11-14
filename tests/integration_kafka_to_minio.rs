@@ -1713,6 +1713,36 @@ fn wait_for_partitions(topic: &str, partitions: usize) {
     }
 }
 
+/// Wait until the broker no longer lists `topic`.
+fn wait_for_partitions_gone(topic: &str) {
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    let probe: BaseConsumer = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-probe"))
+        .unwrap()
+        .create()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let listed = probe
+            .fetch_metadata(Some(topic), std::time::Duration::from_secs(5))
+            .ok()
+            .and_then(|md| {
+                md.topics()
+                    .iter()
+                    .find(|t| t.name() == topic)
+                    .map(|t| t.partitions().len())
+            })
+            .unwrap_or_default();
+        if listed == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "precondition: the broker stops listing {topic} once it is deleted"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// Write `n` records to one partition of `topic`.
 fn produce_to(topic: &str, partition: i32, n: usize) {
     use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
@@ -1876,8 +1906,12 @@ async fn deleting_a_topic_with_a_waiting_partition_does_not_stop_the_others() {
         produce(&busy, 2);
         busy_read += read_pass(&mut adapter, &sources).await[0];
     }
-    // As discovery does once the topic is gone.
+    // Drain what the warm-up wrote, so the count below is exactly what is
+    // written after the deletion.
+    while read_pass(&mut adapter, &sources).await[0] > 0 {}
+    // Gone from the broker's metadata, as discovery would then see it.
     drop(gone_cleanup);
+    wait_for_partitions_gone(&gone);
     let sources = vec![kafka_source(&busy)];
     produce(&busy, 3);
 

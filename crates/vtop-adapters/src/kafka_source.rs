@@ -930,6 +930,20 @@ pub struct KafkaSource {
     /// asked again: left out of the assignment until then, never assigned at
     /// `Offset::Stored`.
     pin_deferred: HashMap<(String, i32), Instant>,
+    /// Partitions whose group answered with a committed offset while they
+    /// waited at `Offset::Stored`: that resolves to the commit, so they need
+    /// no pin and are not asked about again (review of #675). The broker's
+    /// offset is never taken as a position here (#614).
+    has_commit: HashSet<(String, i32)>,
+    /// New partitions whose start could not be established, and when they may
+    /// be asked again (review of #675): without a back-off every pass would
+    /// wait on the same failing lookups.
+    born_deferred: HashMap<(String, i32), Instant>,
+    /// Topics missing from discovery, and since when. Their per-partition
+    /// state is forgotten only after `PARTITION_CACHE_TTL`: one listing that
+    /// misses a topic (a lagging broker) must not make it look new when it
+    /// comes back (review of #675).
+    gone_since: HashMap<String, Instant>,
     /// The partition lists the last `discover_sources` saw, handed to the
     /// next read pass so it re-checks partition counts without a request of
     /// its own (#675 follow-up).
@@ -978,6 +992,9 @@ impl KafkaSource {
             partitions: PartitionCache::default(),
             stored_since: HashMap::new(),
             pin_deferred: HashMap::new(),
+            has_commit: HashSet::new(),
+            born_deferred: HashMap::new(),
+            gone_since: HashMap::new(),
             discovered: std::sync::Mutex::new(None),
             warnings: WarnLimiter::default(),
         })
@@ -1602,7 +1619,7 @@ impl KafkaSource {
     /// topic deleted, say) needs no start, and asking the broker about it
     /// would only fail (#675 follow-up). Returns the partitions whose start
     /// could not be established; each is asked again no sooner than
-    /// `STALL_CHECK_INTERVAL` later.
+    /// `STALL_CHECK_INTERVAL` later. The caller logs what it does about them.
     fn pin_latest_starts(&mut self, candidates: &[(String, i32)]) -> Vec<(String, i32)> {
         if !resets_to_latest(&self.cfg.auto_offset_reset) {
             return Vec::new();
@@ -1641,26 +1658,24 @@ impl KafkaSource {
             self.cursors.entry(key).or_default().committed_offset = Some(start);
         }
         for key in unresolved {
-            count_partition_event("start_deferred");
-            let subject = format!("pin:{}:{}", key.0, key.1);
-            if let Some(suppressed) = self.warnings.allow(&subject, now) {
-                tracing::warn!(
-                    topic = %key.0,
-                    partition = key.1,
-                    suppressed,
-                    "kafka partition still waiting at the end of the log is left out of the \
-                     assignment: where it started could not be established (the group or the \
-                     broker did not answer for it), and assigning it without that would skip \
-                     what arrived since. Asked again shortly; nothing is skipped, and every \
-                     other partition is read. Check the partition's leader and the group \
-                     coordinator if this repeats (#675)"
-                );
-            }
             self.pin_deferred
                 .insert(key.clone(), now + STALL_CHECK_INTERVAL);
             unpinned.push(key);
         }
         unpinned
+    }
+
+    /// Pin each partition in `unkept` - it delivered records this pass, none
+    /// of which were kept, starting at the given offset - there, unless it
+    /// already holds a position (a read head, a commit, a rewind or the
+    /// ledger's resume point always wins). See the call in the read pass.
+    fn pin_unkept_deliveries(&mut self, unkept: Vec<((String, i32), i64)>) {
+        for (key, first) in unkept {
+            let cur = self.cursors.entry(key).or_default();
+            if cur.last_read_offset.is_none() && cur.committed_offset.is_none() {
+                cur.committed_offset = Some(first);
+            }
+        }
     }
 
     /// Where each of `keys` - a partition born after this process read its
@@ -1686,6 +1701,16 @@ impl KafkaSource {
                 .map(|key| (key.clone(), Offset::Stored))
                 .collect();
         }
+        let now = Instant::now();
+        let keys: Vec<(String, i32)> = keys
+            .iter()
+            .filter(|key| self.born_deferred.get(*key).is_none_or(|at| now >= *at))
+            .cloned()
+            .collect();
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let keys = keys.as_slice();
         let answers = self.group_committed_answers(keys);
         let need_low: Vec<(String, i32)> = keys
             .iter()
@@ -1727,19 +1752,28 @@ impl KafkaSource {
                     count_partition_event("new_partition_from_beginning");
                     starts.push((key.clone(), Offset::Offset(low)));
                 }
-                _ => {
+                (answered, _) => {
                     count_partition_event("start_deferred");
+                    self.born_deferred
+                        .insert(key.clone(), now + STALL_CHECK_INTERVAL);
+                    let unanswered = if answered.is_none() {
+                        "group coordinator"
+                    } else {
+                        "partition's leader"
+                    };
                     let subject = format!("born:{}:{}", key.0, key.1);
                     if let Some(suppressed) = self.warnings.allow(&subject, Instant::now()) {
                         tracing::warn!(
                             topic = %key.0,
                             partition = key.1,
                             suppressed,
+                            unanswered,
+                            retry_secs = STALL_CHECK_INTERVAL.as_secs(),
                             "kafka partition added after this consumer began reading its topic \
-                             is not assigned yet: where it starts could not be established (the \
-                             group or the broker did not answer). Asked again next pass; \
-                             nothing is skipped. Check the group coordinator if this repeats \
-                             (#675)"
+                             is not assigned yet: where it starts could not be established (see \
+                             unanswered). Asked again after retry_secs; nothing is skipped, and \
+                             every other partition is read. Check the group coordinator or the \
+                             partition's leader if this repeats (#675)"
                         );
                     }
                 }
@@ -1782,6 +1816,7 @@ impl KafkaSource {
             match answers.get(&key) {
                 Some(Some(_committed)) => {
                     self.stored_since.remove(&key);
+                    self.has_commit.insert(key);
                 }
                 Some(None) => uncommitted.push(key),
                 None => unresolved.push(key),
@@ -1949,10 +1984,33 @@ impl KafkaSource {
             live_topics.iter().map(|s| s.as_str()).collect();
         self.partitions.retain(&live);
         self.warnings.retain_topics(&live);
-        self.stored_since
-            .retain(|(topic, _), _| live.contains(topic.as_str()));
-        self.pin_deferred
-            .retain(|(topic, _), _| live.contains(topic.as_str()));
+        // Per-partition start state is kept through a grace period (review
+        // of #675): a listing that misses a topic once (a lagging broker)
+        // must not lose where its waiting partitions started.
+        let now = Instant::now();
+        let mut known: HashSet<String> = self
+            .stored_since
+            .keys()
+            .chain(self.pin_deferred.keys())
+            .chain(self.has_commit.iter())
+            .chain(self.born_deferred.keys())
+            .map(|(topic, _)| topic.clone())
+            .collect();
+        known.extend(self.gone_since.keys().cloned());
+        for topic in known {
+            if live.contains(topic.as_str()) {
+                self.gone_since.remove(&topic);
+            } else {
+                self.gone_since.entry(topic).or_insert(now);
+            }
+        }
+        self.gone_since
+            .retain(|_, since| now.saturating_duration_since(*since) < PARTITION_CACHE_TTL);
+        let keep = |topic: &str| live.contains(topic) || self.gone_since.contains_key(topic);
+        self.stored_since.retain(|(topic, _), _| keep(topic));
+        self.pin_deferred.retain(|(topic, _), _| keep(topic));
+        self.has_commit.retain(|(topic, _)| keep(topic));
+        self.born_deferred.retain(|(topic, _), _| keep(topic));
         // The loss bookmark tracks a broker-side fact, so it lives exactly as
         // long as the broker-side subject: a topic absent from live metadata
         // can never report that gap again, and a topic recreated under the
@@ -2001,11 +2059,7 @@ impl KafkaSource {
             .and_then(|discovered| discovered.take());
         if let Some(listed) = from_discovery {
             self.partitions.rechecked(now);
-            for topic in self.partitions.cached_topics() {
-                if let Some(ids) = listed.get(&topic).filter(|ids| !ids.is_empty()) {
-                    self.partitions.observe(&topic, ids, now);
-                }
-            }
+            self.observe_listing(&listed, now);
             return;
         }
         if !self.partitions.recheck_due(now) {
@@ -2037,8 +2091,26 @@ impl KafkaSource {
                 return;
             }
         };
+        self.observe_listing(&listed, now);
+    }
+
+    /// Re-check cached topics against an all-topic listing. Only growth (or
+    /// confirmation) is taken from it: a listing comes from whichever broker
+    /// answered, and one that has not caught up with a partition increase
+    /// lists fewer partitions, which would read as a recreate. A real
+    /// shrink is found by the topic's own lookup when its entry expires
+    /// (review of #675).
+    fn observe_listing(&mut self, listed: &HashMap<String, Vec<i32>>, now: Instant) {
         for topic in self.partitions.cached_topics() {
-            if let Some(ids) = listed.get(&topic).filter(|ids| !ids.is_empty()) {
+            let Some(ids) = listed.get(&topic) else {
+                continue;
+            };
+            let covers = self
+                .partitions
+                .entries
+                .get(&topic)
+                .is_some_and(|(cached, _)| cached.iter().all(|p| ids.contains(p)));
+            if !ids.is_empty() && covers {
                 self.partitions.observe(&topic, ids, now);
             }
         }
@@ -2069,11 +2141,15 @@ fn partition_ids_from_answer(
     topic: &str,
     answer: Option<(Option<rdkafka::types::RDKafkaRespErr>, Vec<i32>)>,
 ) -> Result<Vec<i32>, VtopError> {
-    use rdkafka::types::RDKafkaRespErr::RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART;
+    use rdkafka::types::RDKafkaRespErr::{
+        RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART, RD_KAFKA_RESP_ERR__UNKNOWN_TOPIC,
+    };
     match answer {
         None => Ok(Vec::new()),
         Some((Some(error), ids))
-            if ids.is_empty() && error != RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART =>
+            if ids.is_empty()
+                && error != RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART
+                && error != RD_KAFKA_RESP_ERR__UNKNOWN_TOPIC =>
         {
             Err(VtopError::Source(format!(
                 "fetch_metadata {topic}: the broker answered {error:?}"
@@ -2235,14 +2311,18 @@ struct PartitionCache {
     born: HashSet<(String, i32)>,
     /// When the partition counts were last re-checked.
     last_recheck: Option<Instant>,
-    /// Set once the first read pass has asked for its topics. A topic first
+    /// Set once the first read pass has asked for its topics (the engine's
+    /// multi-topic pass asks for every discovered topic; a caller reading one
+    /// topic at a time makes only its first topic initial). A topic first
     /// answered for after that was created while this process was reading
     /// (the engine reads every topic discovery lists, every pass), so it is
     /// born too: under `latest` its start is when this process began
     /// reading, not when it got round to the topic (#675 follow-up).
     initial_done: bool,
     /// The topics that first pass asked for: whatever they answer later,
-    /// they are not new.
+    /// they are not new. Never pruned: a topic missing from one listing must
+    /// not look new when it comes back, and the set never grows after the
+    /// first pass.
     initial_topics: HashSet<String>,
     /// Rate limit for repeated lookup warnings.
     warnings: WarnLimiter,
@@ -2478,8 +2558,6 @@ impl PartitionCache {
             .retain(|topic, _| live.contains(topic.as_str()));
         self.absent.retain(|topic, _| live.contains(topic.as_str()));
         self.born.retain(|(topic, _)| live.contains(topic.as_str()));
-        self.initial_topics
-            .retain(|topic| live.contains(topic.as_str()));
         self.warnings.retain_topics(live);
     }
 }
@@ -2666,7 +2744,55 @@ impl SourceAdapter for KafkaSource {
             0
         };
 
-        // Nothing to assign (no sources, or every topic is partitionless):
+        // A whole re-assign assigns every partition still at `Offset::Stored`
+        // again; under `latest`, one assigned there before that has not
+        // delivered would resolve at the NEW end and skip what arrived since,
+        // and nothing would recover it: its new start is the new end (#675
+        // follow-up). Pin those first. A partition whose start cannot be
+        // established is left out of the assignment, never assigned at
+        // `Offset::Stored`, and asked again shortly; every other partition is
+        // assigned and read. Once it is left out, the set without it matches
+        // the assignment, so later passes keep their fetchers warm.
+        if self.assigned != assignment_set {
+            let unpinned = self.pin_latest_starts(&assignment_set);
+            let now = Instant::now();
+            for key in &unpinned {
+                count_partition_event("start_deferred");
+                let subject = format!("pin:{}:{}", key.0, key.1);
+                if let Some(suppressed) = self.warnings.allow(&subject, now) {
+                    tracing::warn!(
+                        topic = %key.0,
+                        partition = key.1,
+                        suppressed,
+                        retry_secs = STALL_CHECK_INTERVAL.as_secs(),
+                        "kafka partition still waiting at the end of the log is left out of \
+                         the assignment: where it started could not be established (the group \
+                         coordinator or the partition's leader did not answer for it), and \
+                         assigning it without that would skip what arrived since. Asked again \
+                         after retry_secs; nothing is skipped, and every other partition is \
+                         read. Check the partition's leader and the group coordinator if this \
+                         repeats (#675)"
+                    );
+                }
+            }
+            if !unpinned.is_empty() {
+                desired.retain(|(topic, p, _)| !unpinned.contains(&(topic.clone(), *p)));
+                assignment_set.retain(|key| !unpinned.contains(key));
+            }
+            for (topic, p, off) in &mut desired {
+                if matches!(off, Offset::Stored) {
+                    if let Some(pin) = self
+                        .cursors
+                        .get(&(topic.clone(), *p))
+                        .and_then(|c| c.committed_offset)
+                    {
+                        *off = Offset::Offset(pin);
+                    }
+                }
+            }
+        }
+        // Nothing to assign (no sources, every topic is partitionless, or
+        // every partition waits for its start):
         // return without polling. The serial path never waited in this case,
         // and blocking `max_wait` on an empty assignment would turn an idle
         // adapter into a fixed per-cycle stall.
@@ -2696,33 +2822,6 @@ impl SourceAdapter for KafkaSource {
                 // subject unpaid. Any pass that completes pays it.
                 retention_lost: self.take_pending_losses(),
             });
-        }
-        // A whole re-assign assigns every partition still at `Offset::Stored`
-        // again; under `latest`, one assigned there before that has not
-        // delivered would resolve at the NEW end and skip what arrived since,
-        // and nothing would recover it: its new start is the new end (#675
-        // follow-up). Pin those first. A partition whose start cannot be
-        // established is left out of the assignment, never assigned at
-        // `Offset::Stored`, and asked again shortly; every other partition is
-        // assigned and read. Once it is left out, the set without it matches
-        // the assignment, so later passes keep their fetchers warm.
-        if self.assigned != assignment_set {
-            let unpinned = self.pin_latest_starts(&assignment_set);
-            if !unpinned.is_empty() {
-                desired.retain(|(topic, p, _)| !unpinned.contains(&(topic.clone(), *p)));
-                assignment_set.retain(|key| !unpinned.contains(key));
-            }
-            for (topic, p, off) in &mut desired {
-                if matches!(off, Offset::Stored) {
-                    if let Some(pin) = self
-                        .cursors
-                        .get(&(topic.clone(), *p))
-                        .and_then(|c| c.committed_offset)
-                    {
-                        *off = Offset::Offset(pin);
-                    }
-                }
-            }
         }
         // Topics that contributed at least one partition to the assignment —
         // the only topics that can ever fill up, so the count the poll loop's
@@ -2776,9 +2875,10 @@ impl SourceAdapter for KafkaSource {
             // `Offset::Stored` started: any later assign must pin it there.
             if resets_to_latest(&self.cfg.auto_offset_reset) {
                 for (topic, p, off) in &desired {
-                    if matches!(off, Offset::Stored) {
+                    let key = (topic.clone(), *p);
+                    if matches!(off, Offset::Stored) && !self.has_commit.contains(&key) {
                         self.stored_since
-                            .entry((topic.clone(), *p))
+                            .entry(key)
                             .or_insert(self.liveness.assigned_at_ms);
                     }
                 }
@@ -2959,18 +3059,12 @@ impl SourceAdapter for KafkaSource {
         // the forced re-assign would otherwise put it back at
         // `Offset::Stored`, which under `latest` resolves past them (review of
         // #675). Exact, with no broker call.
-        for (&(idx, p), &first) in &first_delivered {
-            if acc.parts.contains_key(&(idx, p)) {
-                continue;
-            }
-            let cur = self
-                .cursors
-                .entry((sources[idx].source_name.clone(), p))
-                .or_default();
-            if cur.last_read_offset.is_none() && cur.committed_offset.is_none() {
-                cur.committed_offset = Some(first);
-            }
-        }
+        let unkept: Vec<((String, i32), i64)> = first_delivered
+            .iter()
+            .filter(|(key, _)| !acc.parts.contains_key(*key))
+            .map(|(&(idx, p), &first)| ((sources[idx].source_name.clone(), p), first))
+            .collect();
+        self.pin_unkept_deliveries(unkept);
         let progressed: std::collections::HashSet<(usize, i32)> =
             delivered_local.keys().copied().collect();
         for &(idx, p) in &progressed {
@@ -4568,15 +4662,12 @@ mod tests {
     #[test]
     fn a_pin_is_asked_only_for_partitions_that_stay_and_is_backed_off() {
         let quiet = tp("q", 0);
-        let mut src = latest_source_assigned_to(std::slice::from_ref(&quiet));
+        let gone = tp("gone", 0);
+        let mut src = latest_source_assigned_to(&[quiet.clone(), gone.clone()]);
         src.consumer().expect("consumer");
-        let leaving = src.pin_latest_starts(&[]);
-        assert!(
-            leaving.is_empty(),
-            "a partition leaving the assignment needs no pin"
-        );
 
         let ((first, again, asked_again_in), lines) = logged(|| {
+            // `gone` waited too, but is not among the partitions assigned next.
             let first = src.pin_latest_starts(std::slice::from_ref(&quiet));
             let started = Instant::now();
             let again = src.pin_latest_starts(std::slice::from_ref(&quiet));
@@ -4585,13 +4676,16 @@ mod tests {
         assert_eq!(first, vec![quiet.clone()], "no start: left out");
         assert_eq!(again, vec![quiet.clone()], "still left out");
         assert!(
+            !src.pin_deferred.contains_key(&gone),
+            "a partition leaving the assignment is not asked about"
+        );
+        assert!(
             asked_again_in < Duration::from_secs(1),
             "not asked again within the back-off (took {asked_again_in:?})"
         );
-        let warned = one_line(&lines, "is left out of the assignment");
         assert!(
-            warned.starts_with("WARN") && warned.contains("topic=q"),
-            "{warned}"
+            lines.iter().all(|l| !l.contains("left out")),
+            "the caller says what it does about it, not the pin: {lines:#?}"
         );
         assert!(
             src.cursors
@@ -4630,6 +4724,41 @@ mod tests {
         let starts = src.start_born_partitions(std::slice::from_ref(&key));
         assert_eq!(starts, vec![(key.clone(), Offset::Stored)]);
         assert!(!src.partitions.is_born(&key), "earliest: settled");
+    }
+
+    /// Review of #675: a partition whose records in a pass were all rejected
+    /// (its topic filled its budget first) or discarded is pinned at the
+    /// first of them, so the forced re-assign does not put it back at
+    /// `Offset::Stored`, which under `latest` resolves past them. A partition
+    /// that already holds a position keeps it.
+    #[test]
+    fn a_partition_whose_records_were_all_rejected_is_pinned_at_the_first() {
+        let mut src = latest_source_assigned_to(&[]);
+        src.cursors
+            .entry(tp("read", 0))
+            .or_default()
+            .last_read_offset = Some(9);
+        src.cursors
+            .entry(tp("ledger", 0))
+            .or_default()
+            .committed_offset = Some(4);
+        src.pin_unkept_deliveries(vec![
+            (tp("fresh", 0), 17),
+            (tp("read", 0), 10),
+            (tp("ledger", 0), 7),
+        ]);
+        let pin = |key: &(String, i32)| src.cursors.get(key).and_then(|c| c.committed_offset);
+        assert_eq!(
+            pin(&tp("fresh", 0)),
+            Some(17),
+            "pinned at the first rejected record"
+        );
+        assert_eq!(pin(&tp("read", 0)), None, "a read head wins");
+        assert_eq!(
+            pin(&tp("ledger", 0)),
+            Some(4),
+            "a commit or ledger position wins"
+        );
     }
 
     /// The report carries one entry per topic (#361): the topic names the
