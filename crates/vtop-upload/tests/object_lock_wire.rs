@@ -188,9 +188,9 @@ impl Store {
         };
         let mut response = format!("HTTP/1.1 {status}\r\nconnection: close\r\n");
         for (k, v) in &extra {
-            if method == "HEAD" && k == "content-length" {
-                response.push_str(&format!("{k}: {v}\r\n"));
-            } else if k != "content-length" {
+            // A HEAD states the object's length; every other response's
+            // length is its body's, written below.
+            if method == "HEAD" || k != "content-length" {
                 response.push_str(&format!("{k}: {v}\r\n"));
             }
         }

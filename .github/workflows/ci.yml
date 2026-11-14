@@ -122,13 +122,23 @@ jobs:
               - '.github/workflows/ci.yml'
 
             # `cargo test -p vtop-upload --test live_s3_*` and
-            # `--test transport_conformance` against the lab's MinIO: vtop-upload
-            # and the one workspace crate it depends on, plus the MinIO build
+            # `--test transport_conformance` against the lab's MinIO, and
+            # `cargo test -p vtop-cli --test live_s3_object_lock_engine` (#684),
+            # the engine end to end. vtop-cli depends on every workspace crate
+            # except vtop-node (as the kafka filter says), plus the MinIO build
             # (docker/minio/**) and the compose file that runs it and creates
             # the buckets.
             minio:
-              - 'crates/vtop-upload/**'
+              - 'crates/vtop-adapters/**'
+              - 'crates/vtop-broker/**'
+              - 'crates/vtop-cli/**'
               - 'crates/vtop-core/**'
+              - 'crates/vtop-log/**'
+              - 'crates/vtop-meta/**'
+              - 'crates/vtop-observe/**'
+              - 'crates/vtop-protocol/**'
+              - 'crates/vtop-state/**'
+              - 'crates/vtop-upload/**'
               - 'docker/minio/**'
               - 'docker-compose.yml'
               - 'Cargo.toml'
@@ -1226,7 +1236,8 @@ jobs:
   # neither the pinned release tag nor `latest` on Docker Hub or quay.io).
   # The Dockerfile pins the release by commit and its base images by digest.
   # Compose runs the server on 127.0.0.1:9000 and `minio-init` creates the
-  # buckets the tests name, exactly as the lab does.
+  # buckets the tests name, exactly as the lab does, including
+  # `telemetry-locked`, created with Object Lock for the #684 tests.
   minio-integration:
     name: minio integration (live S3 tests)
     needs: changes
@@ -1248,6 +1259,13 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-minio-it-${{ hashFiles('**/Cargo.lock') }}
+
+      # The engine test builds vtop-cli, which compiles librdkafka.
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
 
       # Built before it is started, so a failed build reads as a build
       # failure rather than as a store that never became healthy.
@@ -1275,6 +1293,20 @@ jobs:
             --test live_s3_verification \
             --test transport_conformance \
             --test live_s3_multipart_resume \
+            --test live_s3_object_lock \
+            -- --ignored --test-threads=1
+
+      # The S3 Object Lock profile end to end (#684): the engine refuses a
+      # bucket without Object Lock at startup, and archives a batch whose
+      # object and manifest the store then reports locked.
+      - name: Run the live engine Object Lock test
+        env:
+          VTOP_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+        run: |
+          cargo test -p vtop-cli --locked --test live_s3_object_lock_engine \
             -- --ignored --test-threads=1
 
       - name: MinIO logs on failure

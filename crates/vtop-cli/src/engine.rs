@@ -165,6 +165,10 @@ pub struct Pipeline<'a> {
     /// setting stays as it is (#626). Owned by [`Engine`] and shared like
     /// `versioned_buckets`.
     pub key_notices: Arc<KeyNotices>,
+    /// Buckets whose Object Lock configuration passed the preflight (#684),
+    /// owned by [`Engine`] and shared like `versioned_buckets`: a literal
+    /// bucket is checked at startup, a templated one at its first upload.
+    pub locked_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Rate limit for the object-key notices a setting repeats on every batch
@@ -813,6 +817,58 @@ impl<'a> Pipeline<'a> {
             }
         }
 
+        // The S3 Object Lock profile (#684): the bucket must have Object Lock
+        // enabled before anything is written to it. A literal bucket passed
+        // this at startup; a templated one is checked here, at the first
+        // upload to each bucket it names, and cached like versioning.
+        if self.config.upload.object_lock.is_some()
+            && !self.locked_buckets.lock().unwrap().contains(&bucket)
+        {
+            let checked = note_store_request(
+                self.backend.bucket_object_lock_enabled(&bucket).await,
+                "bucket_object_lock",
+                [
+                    tenant.as_str(),
+                    source.source_type.as_str(),
+                    format.extension(),
+                ],
+                &self.attempts,
+                &self.throttles,
+            );
+            let refusal = match checked {
+                Ok(true) => None,
+                Ok(false) => {
+                    crate::object_lock::count(&tenant, "bucket_not_locked");
+                    Some(crate::object_lock::bucket_refusal(
+                        &bucket,
+                        "the batch was not uploaded and will be replayed",
+                    ))
+                }
+                Err(e) => {
+                    crate::object_lock::count(&tenant, "error");
+                    Some(crate::object_lock::bucket_unreadable(
+                        &bucket,
+                        "the batch was not uploaded and will be replayed",
+                        &e,
+                    ))
+                }
+            };
+            match refusal {
+                None => {
+                    self.locked_buckets.lock().unwrap().insert(bucket.clone());
+                }
+                Some(m) => {
+                    tracing::error!(
+                        event = "object_lock_bucket_refused",
+                        batch_id,
+                        bucket = %bucket,
+                        "{m}"
+                    );
+                    fail!(m)
+                }
+            }
+        }
+
         // ---- CHECKSUMMED -> OBJECT_UPLOADED -----------------------------
         // Engine-computed object checksum (algorithm + hex), if enabled.
         let object_ck = object_checksum
@@ -1024,6 +1080,10 @@ impl<'a> Pipeline<'a> {
             byte_length: compressed.size_bytes,
         };
         let mut mp_report = multipart::MultipartReport::default();
+        // What the write returned, kept for the Object Lock check (#684):
+        // the version it made and the retention it asked for. `None` for a
+        // reused object, which this attempt did not write.
+        let mut written: Option<vtop_upload::StoredObject> = None;
         let upload_result = if reused {
             None
         } else if multipart_used {
@@ -1037,7 +1097,7 @@ impl<'a> Pipeline<'a> {
                 &mut mp_report,
             )
             .await
-            .map(|_| ());
+            .map(|stored| written = Some(stored));
             // Every request the upload made, and every throttle among them
             // (#668): the per-part retries inside it would otherwise hide all
             // but the last throttle from the width controller.
@@ -1056,7 +1116,7 @@ impl<'a> Pipeline<'a> {
                 self.backend
                     .put_object(&compressed.path, &object_uri, object_ck)
                     .await
-                    .map(|_| ()),
+                    .map(|stored| written = Some(stored)),
                 "object_upload",
                 labels,
                 &self.attempts,
@@ -1273,6 +1333,78 @@ impl<'a> Pipeline<'a> {
                     .inc();
             }
             fail!(format!("manifest verification failed: {}", man_v.message));
+        }
+        // 4) the S3 Object Lock profile (#684): the object and the manifest
+        // carry the retention asked for, read on the exact versions written.
+        // Strictly against the date each write asked for (never the clock
+        // now, so engine-store skew cannot fail a batch); a reused object
+        // with the weaker bound, still locked in the configured mode, since
+        // its lock was set when it was first archived. Recovery and the
+        // scrub never run this: a retention that has ended is normal there.
+        if let Some(lock) = &self.config.upload.object_lock {
+            let now_secs = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            )
+            .unwrap_or(i64::MAX);
+            let object_expected = if reused {
+                Some(vtop_upload::RetentionExpectation {
+                    mode: lock.mode,
+                    retain_until_at_least_unix_secs: now_secs,
+                    legal_hold: lock.legal_hold,
+                })
+            } else {
+                written
+                    .as_ref()
+                    .and_then(|w| w.retention)
+                    .map(|r| r.expectation())
+            };
+            let object_version = written.as_ref().and_then(|w| w.version_id.clone());
+            let checks = [
+                (
+                    "object",
+                    object_uri.as_str(),
+                    object_version.as_deref(),
+                    reused,
+                    object_expected,
+                ),
+                (
+                    "manifest",
+                    manifest_uri.as_str(),
+                    stored_manifest.version_id.as_deref(),
+                    false,
+                    stored_manifest.retention.map(|r| r.expectation()),
+                ),
+            ];
+            for (what, uri, version_id, was_reused, expected) in checks {
+                let subject = crate::object_lock::Subject {
+                    batch_id: &batch_id,
+                    tenant: &tenant,
+                    what,
+                    uri,
+                    version_id,
+                    reused: was_reused,
+                    legal_hold_configured: lock.legal_hold,
+                };
+                if let Err(failed) =
+                    crate::object_lock::check(self.backend.as_ref(), subject, expected).await
+                {
+                    if failed.verification_failure {
+                        if let Some(mx) = telemetry::metrics() {
+                            mx.verification_failures_total
+                                .with_label_values(&[
+                                    tenant.as_str(),
+                                    source.source_type.as_str(),
+                                    format.extension(),
+                                ])
+                                .inc();
+                        }
+                    }
+                    fail!(failed.message);
+                }
+            }
         }
         // A MAC is meaningful only if we authenticate the bytes that actually
         // reached storage. Backend metadata can describe content supplied by
@@ -1950,6 +2082,9 @@ pub struct Engine {
     /// Process-wide object-key notice limiter (#626); see
     /// [`Pipeline::key_notices`].
     key_notices: Arc<KeyNotices>,
+    /// Process-wide Object Lock preflight cache (#684); see
+    /// [`Pipeline::locked_buckets`].
+    locked_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Per-source accumulation buffers, keyed by `(source_type, source_name)`.
     pending: HashMap<(SourceType, String), PendingBuffer>,
     /// Set by a read cycle that returned any records; drives the adaptive
@@ -2132,6 +2267,9 @@ impl Engine {
         verification_mode::announce(&config, &streams);
         let mut engine = Self::new_with_state_store(config, streams, state_store).await?;
         engine._instance_locks = locks;
+        // The S3 Object Lock profile's startup check (#684), before any
+        // recovery or batch can write an object.
+        engine.preflight_object_lock().await?;
         // Reclaim multipart sessions no source will replay (#482, review):
         // a crash mid-upload leaves a *.multipart.json and a live upload id,
         // and since #668 a failed upload keeps its session for the replay.
@@ -2276,6 +2414,7 @@ impl Engine {
             width,
             provisioned_buckets: Arc::default(),
             key_notices: Arc::default(),
+            locked_buckets: Arc::default(),
             pending: HashMap::new(),
             cycle_had_data: false,
             cycle_had_failure: false,
@@ -2288,9 +2427,15 @@ impl Engine {
     }
 
     /// The S3 Object Lock profile's startup check (#684).
+    ///
+    /// Run by [`Engine::new_exclusive`], so every mutating command (`run`,
+    /// `process-once`, `replay`) refuses to start against a literal bucket
+    /// without Object Lock, or a backend that does not apply the configured
+    /// lock, before anything is read or written. With the profile unset it
+    /// only sets `vtop_object_lock_mode{mode="off"}`.
     pub async fn preflight_object_lock(&self) -> Result<(), VtopError> {
-        // SKELETON (#684): the check lands with the implementation.
-        Ok(())
+        crate::object_lock::preflight(&self.config, self.backend.as_ref(), &self.locked_buckets)
+            .await
     }
 
     /// Batching thresholds (records / bytes / age) from config.
@@ -2313,6 +2458,7 @@ impl Engine {
             attempts: Arc::clone(&self.attempts),
             provisioned_buckets: Arc::clone(&self.provisioned_buckets),
             key_notices: Arc::clone(&self.key_notices),
+            locked_buckets: Arc::clone(&self.locked_buckets),
         }
     }
 

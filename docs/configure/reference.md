@@ -14,8 +14,8 @@ Default column means the key is unset unless you set it.
 
     Most sections accept a key they do not know and ignore it, so a misspelled
     key falls back to its default without an error. The exceptions, which
-    refuse unknown keys, are `upload.transports.<name>`, a stream's `checksum`
-    block, and the `{ env: ... }` / `{ file: ... }` forms of
+    refuse unknown keys, are `upload.transports.<name>`, `upload.object_lock`,
+    a stream's `checksum` block, and the `{ env: ... }` / `{ file: ... }` forms of
     `engine.state_store`. Check what took effect with
     `vtopctl validate --print-effective`.
 
@@ -219,6 +219,7 @@ Each source is optional. A source block that is present but has
 | `create_bucket` | `false` | `s3_native` only: create the bucket if it does not exist. Needs the CreateBucket permission. |
 | `require_strong_verification` | `true` | Commit only when verification is derived from stored content or a store-computed digest. `false` accepts same-size corruption; the engine warns at startup and in `validate`. |
 | `require_object_versioning` | `false` | Hardened profile: the bucket must have versioning enabled and every manifest upload must return a version, which recovery then reads. |
+| `object_lock` | - | `s3_native` only: the S3 Object Lock profile. Write every object and manifest under a retention lock, refuse a bucket without Object Lock, and fail a batch whose stored object or manifest does not carry the retention asked for. Needs `require_object_versioning: true`; refuses `create_bucket: true`. See [below](#uploadobject_lock). |
 | `local_path` | - | `localfs` only, and required there: objects are written under `<local_path>/<bucket>/<key>`. |
 | `command_binary` | - | `awscli`, `s3cmd`, `minio`: absolute path of the client. Required for those backends; PATH is never searched. |
 | `profile` | - | Command backends: named profile or alias (`minio` defaults to `local`). |
@@ -244,6 +245,20 @@ honour is refused at startup.
 | `part_size_bytes` | - | Part size; for `tcp_tls` it maps onto `multipart_part_size_bytes`. |
 | `parts_in_flight` | - | Parts per object; for `tcp_tls` it maps onto `multipart_max_parallelism`. |
 | `redundancy` | `none` | Only `none` is implemented. |
+
+### `upload.object_lock`
+
+The S3 Object Lock profile (#684). Unset by default, and unset sends no lock
+header and checks nothing. Unknown keys inside the block are refused. An
+engine older than v0.10.0 ignores the block and writes unlocked objects. The
+deployment profile, with the bucket setup and the permissions, is
+[S3 Object Lock](../OBJECT_LOCK_DEPLOYMENT.md).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `mode` | **Required** in the block | `governance` (a principal with `s3:BypassGovernanceRetention` can shorten or remove it) or `compliance` (nobody can, the account root included, until the date passes; the engine warns at startup). |
+| `retain_days` | **Required** in the block | Days each object and manifest is retained, counted from its write (from its CreateMultipartUpload for a multipart object). 1 to 3650. |
+| `legal_hold` | `false` | Also place a legal hold on every object and manifest. It has no end date: it stays until someone with `s3:PutObjectLegalHold` removes it. |
 
 ## `partitioning`
 

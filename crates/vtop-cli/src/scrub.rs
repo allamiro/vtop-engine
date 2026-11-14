@@ -42,7 +42,9 @@ use vtop_core::manifest::{
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::ChecksumAlgorithm;
 use vtop_state::BatchRecord;
-use vtop_upload::{ObjectChecksum, ObjectLockMode, UploadBackend};
+use vtop_upload::{
+    ObjectChecksum, ObjectLockMode, RetentionCheck, RetentionExpectation, UploadBackend,
+};
 
 /// What a check found. The `result` label of `vtop_scrub_objects_total`: a
 /// small closed set, never a batch id or a URI.
@@ -494,6 +496,62 @@ impl RetentionResult {
             RetentionResult::Missing | RetentionResult::ModeMismatch
         )
     }
+}
+
+/// `--check-retention` for one batch (#684): the object at its current key
+/// (the bytes the content check just read) and the manifest at its pinned
+/// version, each expected under `mode` until a date not yet past; the worse
+/// of the two. A read that fails is an `Unreadable` content finding: a
+/// scrub that could not look did not pass.
+async fn retention_of(
+    backend: &dyn UploadBackend,
+    rec: &BatchRecord,
+    mode: ObjectLockMode,
+) -> Result<RetentionResult, BatchCheck> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    let expected = RetentionExpectation {
+        mode,
+        retain_until_at_least_unix_secs: now,
+        legal_hold: false,
+    };
+    let targets = [
+        (rec.object_uri.as_deref(), None),
+        (
+            rec.manifest_uri.as_deref(),
+            rec.manifest_version_id.as_deref(),
+        ),
+    ];
+    let mut worst = RetentionResult::Locked;
+    for (uri, version) in targets {
+        let Some(uri) = uri else { continue };
+        let found = match backend.verify_retention(uri, version, &expected).await {
+            Ok(found) => found,
+            Err(e) => {
+                let e = VtopError::Upload(vtop_upload::multipart::redact_urls(&e.to_string()));
+                return Err(read_failure("the retention of", uri, &e));
+            }
+        };
+        let result = match found {
+            RetentionCheck::Ok { .. } | RetentionCheck::LegalHoldMissing => RetentionResult::Locked,
+            RetentionCheck::TooShort { .. } => RetentionResult::Elapsed,
+            RetentionCheck::Missing => RetentionResult::Missing,
+            RetentionCheck::ModeMismatch { .. } => RetentionResult::ModeMismatch,
+            RetentionCheck::Unsupported => {
+                return Err(BatchCheck::new(
+                    ScrubResult::Unreadable,
+                    format!(
+                        "the retention of {uri} cannot be read by the {} backend",
+                        backend.backend_name()
+                    ),
+                ))
+            }
+        };
+        worst = worst.max(result);
+    }
+    Ok(worst)
 }
 
 // ---- What to check ----------------------------------------------------------
@@ -1008,6 +1066,14 @@ pub async fn scrub_held(
     let mut manifest_keys: BTreeMap<String, u64> =
         keyring.key_labels().into_iter().map(|k| (k, 0)).collect();
     let mut findings = Vec::new();
+    let mut retention_counts: BTreeMap<&'static str, u64> = if opts.check_retention.is_some() {
+        RetentionResult::ALL
+            .iter()
+            .map(|r| (r.as_str(), 0))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
     let mut checked_ids = Vec::with_capacity(selected.len());
     let selected_count = selected.len();
 
@@ -1024,9 +1090,23 @@ pub async fn scrub_held(
                 // Opened after the pacer, so the span times the check and not
                 // the wait for its turn (#683).
                 let span = crate::spans::scrub_check(&row.record, row.origin.as_str());
-                let check = scrub_one(backend, keyring, &row.record)
+                let mut check = scrub_one(backend, keyring, &row.record)
                     .instrument(span.clone())
                     .await;
+                // Retention only where the content passed (#684): a missing
+                // or damaged object is already its own finding.
+                let mut retention = None;
+                if let (Some(mode), false) = (opts.check_retention, check.result.is_finding()) {
+                    match retention_of(backend, &row.record, mode).await {
+                        Ok(found) => retention = Some(found),
+                        Err(unreadable) => {
+                            check = BatchCheck {
+                                key: check.key,
+                                ..unreadable
+                            }
+                        }
+                    }
+                }
                 span.record("result", check.result.as_str());
                 span.record(
                     "otel.status_code",
@@ -1036,12 +1116,41 @@ pub async fn scrub_held(
                         "ok"
                     },
                 );
-                (row, check)
+                (row, check, retention)
             })
             // In order, so the cursor only ever passes a contiguous run of
             // checked batches.
             .buffered(concurrency);
-        while let Some((row, check)) = checks.next().await {
+        while let Some((row, check, retention)) = checks.next().await {
+            if let Some(found) = retention {
+                *retention_counts.entry(found.as_str()).or_default() += 1;
+                if found.is_finding() {
+                    let what = match found {
+                        RetentionResult::Missing => "carries no retention",
+                        _ => "is under another retention mode than the configured one",
+                    };
+                    tracing::warn!(
+                        batch_id = %row.record.batch_id,
+                        retention = found.as_str(),
+                        "scrub retention finding"
+                    );
+                    findings.push(ScrubFinding {
+                        batch_id: row.record.batch_id.clone(),
+                        result: check.result,
+                        origin: row.origin,
+                        object_uri: row.record.object_uri.clone(),
+                        manifest_uri: row.record.manifest_uri.clone(),
+                        manifest_version_id: row.record.manifest_version_id.clone(),
+                        retention: Some(found),
+                        detail: format!(
+                            "the object or its manifest {what} (S3 Object Lock, expected {}); \
+                             it can be deleted or overwritten. Re-apply the retention with \
+                             PutObjectRetention, and check who could bypass it",
+                            opts.check_retention.map(|m| m.as_str()).unwrap_or_default()
+                        ),
+                    });
+                }
+            }
             *results.entry(check.result.as_str()).or_default() += 1;
             if let Some(key) = check.key.as_ref().filter(|k| k.result == KeyResult::Ok) {
                 *manifest_keys.entry(key.key_id.clone()).or_default() += 1;
@@ -1118,7 +1227,7 @@ pub async fn scrub_held(
         checked: checked_ids.len(),
         results,
         manifest_keys,
-        retention: BTreeMap::new(),
+        retention: retention_counts,
         findings,
         cursor: progress,
         sample_seed,
@@ -1190,16 +1299,28 @@ impl ScrubReport {
                     .join(" ")
             ));
         }
+        if !self.retention.is_empty() {
+            out.push(format!(
+                "retention: {}",
+                self.retention
+                    .iter()
+                    .map(|(result, n)| format!("{result}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
         for finding in &self.findings {
             let origin = match finding.origin {
                 RowOrigin::Ledger => "ledger",
                 RowOrigin::Digest => "prune digest",
             };
+            let result = match finding.retention {
+                Some(retention) => format!("retention {}", retention.as_str()),
+                None => finding.result.as_str().to_owned(),
+            };
             out.push(format!(
-                "FAIL {} {} (row from the {origin}): {}",
-                finding.result.as_str(),
-                finding.batch_id,
-                finding.detail
+                "FAIL {result} {} (row from the {origin}): {}",
+                finding.batch_id, finding.detail
             ));
         }
         if let Some(cursor) = &self.cursor {
@@ -1245,6 +1366,22 @@ impl ScrubReport {
             out.push_str(&format!(
                 "vtop_scrub_objects_total{{result=\"{result}\"}} {total}\n"
             ));
+        }
+        // Only with --check-retention (#684), in its own family so the
+        // result set of vtop_scrub_objects_total does not change.
+        if !self.retention.is_empty() {
+            out.push_str(
+                "# HELP vtop_scrub_retention_total Committed batches whose S3 Object Lock \
+                 retention the scrub read (--check-retention), by result: locked, elapsed (the \
+                 retention has ended; not a finding), missing and mode_mismatch (findings)\n\
+                 # TYPE vtop_scrub_retention_total counter\n",
+            );
+            for (result, n) in &self.retention {
+                let total = carried.retention.get(*result).copied().unwrap_or(0) + n;
+                out.push_str(&format!(
+                    "vtop_scrub_retention_total{{result=\"{result}\"}} {total}\n"
+                ));
+            }
         }
         // By configured key only (#685): the labels are this run's keyring,
         // never an id read from storage, and a key no longer configured
@@ -1326,6 +1463,7 @@ impl ScrubReport {
 struct Carried {
     counts: BTreeMap<String, u64>,
     key_counts: BTreeMap<String, u64>,
+    retention: BTreeMap<String, u64>,
     last_success: i64,
     last_pass_complete: i64,
     last_finding: i64,
@@ -1341,6 +1479,12 @@ impl Carried {
                 if let Some((result, value)) = rest.split_once("\"} ") {
                     if let Ok(value) = value.trim().parse::<u64>() {
                         carried.counts.insert(result.to_owned(), value);
+                    }
+                }
+            } else if let Some(rest) = line.strip_prefix("vtop_scrub_retention_total{result=\"") {
+                if let Some((result, value)) = rest.split_once("\"} ") {
+                    if let Ok(value) = value.trim().parse::<u64>() {
+                        carried.retention.insert(result.to_owned(), value);
                     }
                 }
             } else if let Some(rest) = line.strip_prefix("vtop_scrub_manifest_keys_total{key_id=\"")

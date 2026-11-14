@@ -574,7 +574,26 @@ impl SessionCall<'_> {
                     report.completed = true;
                     return Ok(stored);
                 }
-                if existing.fence.content_digest_hex.is_empty() {
+                if let Some(why) = lock_mismatch(&existing, backend) {
+                    // S3 fixed the session's lock when it was created
+                    // (#684): an upload created without the lock this
+                    // backend asks for, or with another mode or hold, would
+                    // complete an object that fails its retention check on
+                    // every replay. It is aborted, best effort, and the
+                    // object starts again on an upload that carries the lock.
+                    tracing::info!(
+                        event = "multipart_session_lock_mismatch",
+                        key = object_uri,
+                        "the multipart session for {object_uri} was created {why}; aborting it \
+                         and starting a new upload that carries the lock; nothing to do"
+                    );
+                    let aborted = backend
+                        .abort_multipart_upload(&existing.object_uri, &existing.upload_id)
+                        .await;
+                    report.count(&aborted);
+                    delete_session(path)?;
+                    self.create(report).await?
+                } else if existing.fence.content_digest_hex.is_empty() {
                     // Nothing identifies the bytes this session was for
                     // (checksums are off), so it is never resumed (#668): its
                     // upload is aborted, best effort, and the object starts
@@ -699,6 +718,11 @@ impl SessionCall<'_> {
             }
         };
 
+        // The lock was fixed at create (#684); the session is what knows it.
+        let stored = StoredObject {
+            retention: session.retention,
+            ..stored
+        };
         session.phase = MultipartSessionPhase::Completed;
         session.completed_version_id = stored.version_id.clone();
         session.updated_at_unix_secs = now_unix_secs();
@@ -733,10 +757,27 @@ impl SessionCall<'_> {
             created_at_unix_secs: now,
             updated_at_unix_secs: now,
             completed_version_id: None,
-            retention: None,
+            retention: created.retention,
         };
         save_session(self.path, &session)?;
         Ok(session)
+    }
+}
+
+/// Why a session cannot complete the object this backend would write
+/// (#684), or `None` when it can: its upload was created without the lock
+/// the backend asks for now, or with another mode or legal hold. The date
+/// may differ (it was fixed at creation, and the engine checks against it);
+/// a lock this backend does not ask for is left as it is.
+fn lock_mismatch(session: &MultipartSession, backend: &dyn UploadBackend) -> Option<String> {
+    let policy = backend.object_lock()?;
+    match session.retention {
+        None => Some("without an Object Lock".to_owned()),
+        Some(r) if r.mode != policy.mode || r.legal_hold != policy.legal_hold => Some(format!(
+            "under mode {} with legal_hold={}, not mode {} with legal_hold={}",
+            r.mode, r.legal_hold, policy.mode, policy.legal_hold
+        )),
+        Some(_) => None,
     }
 }
 
@@ -807,10 +848,13 @@ async fn finish_idempotent(
         // current key has moved — evidence must cite the verified generation.
         return Ok(StoredObject {
             version_id: session.completed_version_id.clone(),
-            retention: None,
+            retention: session.retention,
         });
     }
-    Ok(stored)
+    Ok(StoredObject {
+        retention: session.retention,
+        ..stored
+    })
 }
 
 async fn recover_completed(

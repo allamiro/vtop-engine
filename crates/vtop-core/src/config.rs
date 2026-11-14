@@ -1117,7 +1117,37 @@ impl UploadConfig {
     /// VtopConfig. Each refusal names the keys involved. Which BACKEND can
     /// honour the block is decided in `vtop-upload`, which knows the backends.
     pub fn validate_object_lock(&self) -> Result<(), VtopError> {
-        // SKELETON (#684): the rules land with the implementation.
+        let Some(lock) = &self.object_lock else {
+            return Ok(());
+        };
+        if lock.retain_days == 0 || lock.retain_days > MAX_OBJECT_LOCK_RETAIN_DAYS {
+            return Err(VtopError::Config(format!(
+                "upload.object_lock.retain_days = {} is outside 1..={MAX_OBJECT_LOCK_RETAIN_DAYS}: \
+                 zero would lock nothing, and more than {MAX_OBJECT_LOCK_RETAIN_DAYS} days (ten \
+                 years) is refused as a likely typo because a compliance retention cannot be \
+                 shortened by anyone. Set a value in that range",
+                lock.retain_days
+            )));
+        }
+        if !self.require_object_versioning {
+            return Err(VtopError::Config(
+                "upload.object_lock is set but upload.require_object_versioning is false: \
+                 Object Lock works only on a versioned bucket, and the engine checks the \
+                 retention of the exact version it wrote. Set \
+                 upload.require_object_versioning: true"
+                    .into(),
+            ));
+        }
+        if self.create_bucket {
+            return Err(VtopError::Config(
+                "upload.object_lock is set together with upload.create_bucket: true: Object \
+                 Lock can only be enabled when a bucket is created, and the engine never \
+                 creates a locked bucket (CreateBucket stays out of its permissions). Create \
+                 the bucket with Object Lock enabled yourself and set upload.create_bucket: \
+                 false"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 

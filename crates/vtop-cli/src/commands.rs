@@ -164,6 +164,13 @@ pub enum Command {
         /// it replaces.
         #[arg(long)]
         metrics_file: Option<PathBuf>,
+        /// Also read each batch's S3 Object Lock retention (object and
+        /// pinned manifest) and expect the mode `upload.object_lock` sets.
+        /// Reports locked, elapsed (an ended retention, not a finding),
+        /// missing and mode_mismatch (findings). Needs `upload.object_lock`
+        /// in the config, and `s3:GetObjectRetention` on the bucket.
+        #[arg(long)]
+        check_retention: bool,
     },
     /// Incrementally delete old SOURCE_COMMITTED ledger rows (#128). The
     /// newest committed row per source path always survives, so recovery
@@ -930,6 +937,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             sample,
             seed,
             metrics_file,
+            check_retention,
         } => {
             let (cfg, streams) = load(config)?;
             init_tracing(
@@ -946,6 +954,8 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                     .clone()
                     .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
                 let retention_days = cfg.engine.ledger_retention_days;
+                let retention_mode =
+                    crate::object_lock::scrub_retention_mode(&cfg, *check_retention)?;
                 // Read-only construction, as for audit-coverage: a scrub may run
                 // beside a live engine.
                 let engine = Engine::new(cfg, streams).await?;
@@ -973,7 +983,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                     cursor_file: cursor_file.clone(),
                     sample: sample.map(to_usize),
                     seed: *seed,
-                    check_retention: None,
+                    check_retention: retention_mode,
                 };
                 // The run's locks, from before anything it will replace is read
                 // until it has published or rolled back (review of #652): an

@@ -401,6 +401,7 @@ The PostgreSQL state store follows the same rule (#694): the engine's runtime ro
 | `s3_native` | `PutObject`, `GetObject`/`HeadObject` (verify), `ListBucket` within prefix | SHA-256 uses a service-computed checksum; BLAKE3 requires read-back. |
 | `awscli` / `s3cmd` / `minio mc` | Same as above | Strong verification downloads and hashes the stored body. |
 | LocalFS | Filesystem write/read on the object tree only | The object tree directory **SHOULD** have restrictive permissions; the engine **SHOULD NOT** require broader filesystem access. |
+| `s3_native` with `upload.object_lock` (#684) | The `s3_native` row, plus `s3:PutObjectRetention`, `s3:GetObjectRetention`, `s3:GetBucketObjectLockConfiguration`, `s3:GetObjectVersion`, `s3:GetBucketVersioning`; with `legal_hold: true` also `s3:PutObjectLegalHold` and `s3:GetObjectLegalHold` | S3 returns the lock headers on `HeadObject` only to a caller holding `s3:GetObjectRetention` (`s3:GetObjectLegalHold` for the legal hold), so without it every batch fails its retention check. The runtime identity **SHOULD NOT** hold `s3:BypassGovernanceRetention`. See [OBJECT_LOCK_DEPLOYMENT.md](OBJECT_LOCK_DEPLOYMENT.md). |
 
 Command compatibility backends (`awscli`, `s3cmd`, `minio mc`) **MUST** use an
 explicit absolute executable path; PATH lookup is forbidden. VTOP resolves the
@@ -443,7 +444,12 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 
 ## 7. Data at rest and object immutability
 
-- Object immutability **SHOULD** be supported where the backend allows it ([VTOP_PROTOCOL_DRAFT.md §18](VTOP_PROTOCOL_DRAFT.md#18-security-considerations)). VTOP validates bucket versioning (§8.1); object-lock *configuration* is deployment policy, not automated by the engine.
+- Object immutability **SHOULD** be supported where the backend allows it ([VTOP_PROTOCOL_DRAFT.md §18](VTOP_PROTOCOL_DRAFT.md#18-security-considerations)). VTOP validates bucket versioning (§8.1), and with `upload.object_lock` set (the S3 Object Lock profile, #684, `s3_native` only) it writes every object and manifest under a retention lock and verifies it:
+  - every object PUT, manifest PUT and `CreateMultipartUpload` carries `x-amz-object-lock-mode`, `x-amz-object-lock-retain-until-date` (the write's time plus `retain_days`; for a multipart object, the time of its create) and, with `legal_hold`, `x-amz-object-lock-legal-hold: ON`;
+  - a bucket without Object Lock enabled is refused before anything is written to it: at startup for a literal bucket name, at the first batch for each bucket a template names;
+  - before a batch may reach `VERIFIED`, the retention of the exact object and manifest versions it wrote is read back and compared with what the engine asked for (same mode, a date no earlier, the legal hold). A missing, shorter, other-mode or hold-less lock **fails the batch** (`FAILED` then `REPLAY_REQUIRED`, source progress not committed). An object reused from an earlier attempt (#626) must still be under the configured mode;
+  - recovery and the scrub never fail a batch for a retention that has ended; `vtopctl scrub --check-retention` reports locked, elapsed, missing and mode_mismatch, the last two as findings.
+- The engine does **not** create a locked bucket, set a bucket default retention, or remove a lock. Object Lock is enabled when a bucket is created, and a bucket default retention **SHOULD** be set as the floor: an engine older than v0.10.0 ignores `upload.object_lock` and writes unlocked objects, which only a bucket default retention locks.
 - Where the backend supports it (e.g., S3 Object Lock / WORM), telemetry objects and manifests **SHOULD** be written as immutable for the configured retention period.
 - Immutability complements verification: verification detects tampering, immutability prevents post-write tampering or accidental overwrite.
 - At-rest encryption (server-side or bucket-default) **MAY** be enabled at the storage layer; it is orthogonal to VTOP's integrity guarantees.
@@ -490,7 +496,10 @@ complementary.
   keeps overwritten versions, and S3 **Object Lock** (compliance or
   governance retention covering the archive's audit window) **SHOULD** be
   configured so a privileged deleter cannot remove the pinned version itself.
-  VTOP validates versioning; object-lock configuration is deployment policy.
+  VTOP validates versioning, and with `upload.object_lock` (#684) it writes
+  each manifest version under that retention and checks the store kept it
+  before the batch is `VERIFIED` (§7). A bucket default retention remains the
+  floor for writers that do not set it.
 - Backends without object versions (`localfs`, the `awscli`/`s3cmd`/`minio`
   command backends) record no version and keep today's current-key behavior
   with ledger hash binding; the hardened profile refuses to run on them.
@@ -678,7 +687,7 @@ the ignore list and the build re-audited.
 | PostgreSQL transport authentication | Yes for remote hosts | Non-loopback connections require `sslmode=verify-full`; loopback/socket plaintext is limited to local operation. |
 | Backend-limited verification disclosure | Yes | Size-only mode is labeled and rejected by default. |
 | Data-at-rest encryption | Not by VTOP | Delegated to storage layer (SSE/bucket default). |
-| Object immutability (WORM) | Partial | Bucket versioning is validated and manifest versions pinned under the hardened profile (§8.1); object-lock retention itself is deployment policy, not engine-configured. |
+| Object immutability (WORM) | Yes, with `upload.object_lock` on `s3_native` | Objects and manifests written under an S3 Object Lock retention, the bucket's Object Lock checked first, and the stored retention of the exact versions verified before `VERIFIED` (§7, #684). The bucket's Object Lock and its default retention are created by the operator; `vtopctl tier copy` refuses the profile. |
 | MAC key rotation | Yes | Key ids in version 0.4 manifests and a keyring (§8.3). |
 | Public-key manifest signing | Not yet | MAC keys are shared secrets: an auditor needs the key to verify. |
 | Multipart upload integrity for very large objects | Not yet | Native backend uses single-part `put_object`. |
@@ -707,7 +716,8 @@ the ignore list and the build re-audited.
 | Pinned manifest version unreadable → fail closed (`FAILED` → `REPLAY_REQUIRED`) | **MUST** |
 | Hardened profile: versioned bucket preflight + version on every manifest upload | **MUST** (when `require_object_versioning`) |
 | Object Lock retention on versioned manifest buckets | **SHOULD** |
-| Object lock / immutability | **SHOULD** (later) |
+| With `upload.object_lock`: bucket Object Lock preflight, lock headers on every write, stored retention verified before `VERIFIED` | **MUST** |
+| Bucket default retention as the floor under `upload.object_lock` | **SHOULD** (operator) |
 | Secret redaction in logs | **MUST** |
 | Native broker transport restricted to TLS 1.3 with client certificates | **MUST** by default; a node config knob selects plaintext per plane, loopback-only unless acknowledged by name (§2) |
 | Native broker sessions authorized by an explicit `SessionAuthorizer` | **MUST** |

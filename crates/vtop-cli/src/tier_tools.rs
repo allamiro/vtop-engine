@@ -551,11 +551,23 @@ fn derived_tier_copy_request_id(args: &TierCopyArgs, expected_root: &[u8; 32]) -
 }
 
 /// `vtopctl tier copy` refuses `upload.object_lock` (#684).
-pub fn refuse_object_lock_for_tier(
-    _upload: &vtop_core::config::UploadConfig,
-) -> Result<(), String> {
-    // SKELETON (#684): the refusal lands with the implementation.
-    Ok(())
+///
+/// The copy goes through the same S3 backend as the engine, which would put
+/// the lock on every cold-tier object, but the tier path never reads a
+/// retention back, so the copy would be recorded as evidence of a lock
+/// nobody checked. Refused, naming the key, until locking a tier copy is
+/// designed; rehydrate and cleanup-abandoned write nothing and accept it.
+pub fn refuse_object_lock_for_tier(upload: &vtop_core::config::UploadConfig) -> Result<(), String> {
+    if upload.object_lock.is_none() {
+        return Ok(());
+    }
+    Err(
+        "upload.object_lock is set in the --upload-config file, but vtopctl tier copy does \
+         not check the retention of what it writes; nothing was copied. Remove \
+         upload.object_lock from the tier's --upload-config file (keep a bucket default \
+         retention on the cold-tier bucket if its copies must be locked)"
+            .into(),
+    )
 }
 
 /// Dispatch `vtopctl tier` and return a process exit code.
@@ -577,6 +589,7 @@ async fn run_inner(command: TierCommand, json: bool) -> Result<(), String> {
                 .map_err(|error| format!("read {}: {error}", args.upload_config.display()))?;
             let upload_config: vtop_core::config::UploadConfig = serde_yaml::from_str(&upload_text)
                 .map_err(|error| format!("parse {}: {error}", args.upload_config.display()))?;
+            refuse_object_lock_for_tier(&upload_config)?;
             request.multipart = multipart_config_from_args(args.as_ref(), &upload_config)?;
             let backend = vtop_upload::build_backend(&upload_config)
                 .await

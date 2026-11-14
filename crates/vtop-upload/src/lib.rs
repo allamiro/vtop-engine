@@ -53,6 +53,10 @@ pub async fn build_backend(cfg: &UploadConfig) -> Result<Arc<dyn UploadBackend>,
     // is a ceiling that path does not have — and the value it guards panics
     // rather than degrading.
     cfg.validate_multipart_limits()?;
+    // The Object Lock profile (#684): its own rules, then whether this
+    // backend can honour it, both before anything is built or probed.
+    cfg.validate_object_lock()?;
+    refuse_object_lock_the_backend_cannot_honour(cfg)?;
     let backend: Arc<dyn UploadBackend> = match cfg.backend.as_str() {
         "s3_native" => {
             let s3cfg = s3_native::config_from_upload(cfg);
@@ -138,9 +142,32 @@ fn refuse_an_egress_cap_the_backend_cannot_honour(cfg: &UploadConfig) -> Result<
 /// Refuse `upload.object_lock` on a backend that cannot write an object
 /// under a retention lock or read one back (#684), naming the key and the
 /// backend, before anything is built.
-fn refuse_object_lock_the_backend_cannot_honour(_cfg: &UploadConfig) -> Result<(), VtopError> {
-    // SKELETON (#684): the refusal lands with the implementation.
-    Ok(())
+///
+/// Only `s3_native` sends the lock headers on every write and reads the
+/// retention of the exact version back. A backend that accepted the block and
+/// wrote unlocked objects is the outcome this must not allow: the operator
+/// would believe the archive immutable while it is not.
+fn refuse_object_lock_the_backend_cannot_honour(cfg: &UploadConfig) -> Result<(), VtopError> {
+    if cfg.object_lock.is_none() {
+        return Ok(());
+    }
+    let why = match cfg.backend.as_str() {
+        "s3_native" => return Ok(()),
+        "s3cmd" | "awscli" | "minio" => {
+            "it shells out to an external CLI, which sends the request itself; VTOP cannot \
+             add the lock headers to it or read the retention of the version it wrote"
+        }
+        "localfs" => "it writes to a local directory, which has no retention lock",
+        "mock" | "mock_fail" | "mock_limited" => "it keeps objects in memory",
+        // Unknown names are refused below with the registered list.
+        _ => return Ok(()),
+    };
+    Err(VtopError::Config(format!(
+        "upload.object_lock is set, but the {} backend cannot write an object under an S3 \
+         Object Lock: {why}. Nothing was built. Only s3_native supports the profile; use \
+         s3_native or remove upload.object_lock",
+        cfg.backend
+    )))
 }
 
 #[cfg(test)]

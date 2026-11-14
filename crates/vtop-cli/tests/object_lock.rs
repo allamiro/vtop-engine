@@ -87,6 +87,9 @@ async fn engine(
     lock: Option<ObjectLockConfig>,
     backend: &Arc<MockBackend>,
 ) -> Engine {
+    // The registry, before the engine counts anything: without one the
+    // engine counts nothing, by design.
+    vtop_core::telemetry::init().unwrap();
     cfg.upload.object_lock = None;
     let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
         .await
@@ -599,7 +602,8 @@ async fn a_reused_object_still_locked_passes_and_the_new_manifest_is_checked_str
     let third = engine.process_once(SourceType::File).await.unwrap();
     assert!(third[0].committed, "{third:?}");
     assert_eq!(
-        third[0].object_uri, first[0].object_uri,
+        third[0].object_uri,
+        row(&engine, &first[0].batch_id).await.object_uri,
         "the object was reused"
     );
 }
@@ -612,7 +616,8 @@ async fn a_reused_object_whose_lock_has_ended_fails() {
     let tenant = "lock-reuse-elapsed";
     let lock = governance();
     // A one-second lock, which configuration cannot express: it has ended by
-    // the time the replay reuses the object.
+    // the time the replay reuses the object. The dates are whole seconds,
+    // rounded up when asked for, so the wait is three seconds.
     let backend = Arc::new(
         MockBackend::new()
             .with_object_lock(ObjectLockPolicy::with_retention_for_tests(
@@ -631,7 +636,7 @@ async fn a_reused_object_whose_lock_has_ended_fails() {
 
     let first = engine.process_once(SourceType::File).await.unwrap();
     assert!(!first[0].committed);
-    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    tokio::time::sleep(Duration::from_millis(3_100)).await;
     let second = engine.process_once(SourceType::File).await.unwrap();
     assert!(!second[0].committed, "{second:?}");
     let failed = row(&engine, &second[0].batch_id).await;
@@ -855,7 +860,7 @@ async fn scrub_check_retention_reports_locked_missing_and_mode_mismatch() {
 #[tokio::test]
 async fn scrub_check_retention_counts_an_ended_lock_without_failing() {
     let (_dir, engine, _backend) = three_committed("scrub-elapsed", Duration::from_secs(1)).await;
-    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    tokio::time::sleep(Duration::from_millis(3_100)).await;
     let all = scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
     let report = engine.scrub(all, &with_retention()).await.unwrap();
     assert!(
