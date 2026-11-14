@@ -583,7 +583,14 @@ What follows from that, in the engine:
   read and committed after the other's delete sees the file as it is then,
   and is deleted. Deletes are not serialised per inode in a pass, by
   choice: that would save disk on a configuration discovery already warns
-  about.
+  about. So names committed in one pass fall due together and their
+  deletes run side by side: each holds the file open while it checks it,
+  and moves its ctime when it moves it aside and back, so a name can be
+  kept as `open` or `metadata_changed` because of another, and tried again
+  a quiet period later. Those messages then add that the file had N names
+  when it was archived and that another name's delete also causes this.
+  In tests, one name was deleted and the rest kept as `links_changed`
+  within five quiet periods. Nothing is lost on any path.
 - With `delete_without_open_check` and no lease, a delete whose unlink fails
   after the move aside puts the file back, which moves its ctime; the next
   attempt then keeps the file and says so, rather than trusting a ctime it
@@ -622,22 +629,29 @@ Limits, stated plainly:
     (`.vtop-delete.<nanos>.<n>`) between the final check and the unlink,
     which nothing has reason to do.
 
-  Either open gets the unlinked file once the lease is released; if it
-  broke the lease before then, the engine logs an error ("deleted P after a
+  Either open gets the unlinked file once the lease is released. If it
+  broke the lease by the time the unlink returns (the engine checks the
+  lease right after it), the engine logs an error ("deleted P after a
   process opened it between the final check and the unlink ... what that
-  process writes to it is not archived") and counts `opened_at_unlink`. A
-  process that reaches the file through another hard link is not in this
-  window: the file keeps that name, and the link is its own source (#378).
+  process writes to it is not archived") and counts `opened_at_unlink`;
+  one that breaks it after that check, before the lease is dropped, is not
+  seen. A process that reaches the file through another hard link loses
+  nothing: the file keeps that name, and the link is its own source
+  (#378). If that open breaks the lease at the unlink, the engine says so
+  as a warning ("the file still has N other name(s), so what that process
+  writes stays in it and is archived under that name"), still counted
+  `opened_at_unlink`.
 
   **The 50 ms grace is a bound, not a proof.** An open of the path that
   began before the rename and spends more than 50 ms in the kernel before
   it reaches the file can still land after the unlink; what it writes is
   not archived. The engine counts `opened_at_unlink` and logs the error
-  only for an open that lands before the unlink returns. Two tests make
-  the late open deterministic, with an `O_PATH` descriptor taken before the
-  rename and opened through `/proc/self/fd` later: one that lands in the
-  grace keeps the file, and one that lands between the final check and the
-  unlink is logged and counted. With writers that open, append and close
+  only for an open that has broken the lease when the unlink returns (see
+  above). Two tests make the late open deterministic, with an `O_PATH`
+  descriptor taken before the rename and opened through `/proc/self/fd`
+  later, each waiting for `/proc/locks` to show the lease breaking: one
+  that lands in the grace keeps the file, and one that lands between the
+  final check and the unlink is logged and counted. With writers that open, append and close
   in a loop, 20 and 50 ms lost nothing in the #689 harness; the ignored
   test `delete_race_stress` repeats that run, and is run by hand on tmpfs,
   ext4 and overlay before a release.

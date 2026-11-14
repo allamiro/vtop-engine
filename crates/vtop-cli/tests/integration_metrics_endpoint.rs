@@ -639,8 +639,9 @@ fn file_delete_decisions_are_exported_by_bounded_outcome() {
 /// `deleted_unchecked` (a delete under `delete_without_open_check` with no
 /// lease, the signal an operator is living with the opt-in's windows) and
 /// `links_changed` (a file kept because its link count changed). A value
-/// dropped or renamed breaks an alert, so a change here is deliberate, and
-/// the endpoint exports no other.
+/// dropped or renamed breaks an alert, so a change here is deliberate.
+/// (`file_delete_decisions_are_exported_by_bounded_outcome` checks that
+/// /metrics exports each of them.)
 #[test]
 fn file_delete_outcomes_are_the_released_set_and_the_two_v0_10_0_adds() {
     let released = [
@@ -667,15 +668,6 @@ fn file_delete_outcomes_are_the_released_set_and_the_two_v0_10_0_adds() {
     let mut got: Vec<&str> = vtop_core::telemetry::FILE_DELETE_OUTCOMES.to_vec();
     got.sort_unstable();
     assert_eq!(got, expected, "telemetry::FILE_DELETE_OUTCOMES");
-    let text = populated();
-    let mut exported: Vec<&str> = text
-        .lines()
-        .filter(|l| l.starts_with("vtop_file_delete_decisions_total{"))
-        .filter_map(|l| l.split(r#"outcome=""#).nth(1)?.split('"').next())
-        .collect();
-    exported.sort_unstable();
-    exported.dedup();
-    assert_eq!(exported, expected, "outcomes on /metrics");
 }
 
 /// #675: Kafka partition-list changes are exported by `event`, a fixed set,

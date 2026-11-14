@@ -644,10 +644,10 @@ pub struct FileSourceConfig {
     /// mtime or ctime changed after the commit (a touch cannot be told from a
     /// same-length rewrite between its first and last pages); a file whose
     /// link count changed (another name of it deleted, or a hard link made:
-    /// `links_changed`); a configured
-    /// path that is a symbolic link; and a file that cannot be renamed aside
-    /// within its own directory (`EXDEV` for a bind-mounted single file,
-    /// `EACCES` for a directory the engine cannot write).
+    /// `links_changed`); a configured path that is a symbolic link; and a
+    /// file that cannot be renamed aside within its own directory (`EXDEV`
+    /// for a bind-mounted single file, `EACCES` for a directory the engine
+    /// cannot write).
     #[serde(default)]
     pub delete_after_commit: bool,
     /// How long, in seconds, a fully archived file must stay unwritten before

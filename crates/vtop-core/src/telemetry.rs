@@ -291,7 +291,8 @@ pub struct Metrics {
     /// `metadata_changed`, `links_changed`, `gone`, `symlink`, `open`,
     /// `no_open_check`, `rename_refused`, `failed`, `stale_commit` - plus
     /// `leftover_archived` for a file found under a delete's hidden name, and
-    /// `opened_at_unlink` for a delete a late open slipped past. A fixed set,
+    /// `opened_at_unlink` for a delete a late open slipped past (also counted
+    /// as `deleted`, so the two are not added). A fixed set,
     /// never the path: the path is in the log line beside each count. A
     /// rising `no_open_check` or `rename_refused` means files that will not
     /// be deleted until the operator acts; any `deleted_unchecked` means the

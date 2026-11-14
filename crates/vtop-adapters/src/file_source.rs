@@ -369,10 +369,12 @@ enum DeleteAttempt {
     /// no lease to be had, and why none could be (#619): nothing proved that
     /// no process had the file open. `opened_at_unlink`: a process broke
     /// the lease between the final check and the unlink, so it may have the
-    /// unlinked file open; the hidden name the file had.
+    /// unlinked file open; the hidden name the file had, and how many
+    /// names the file still has after the unlink (another hard link keeps
+    /// it, and what the opener writes, reachable).
     Deleted {
         unchecked: Option<String>,
-        opened_at_unlink: Option<PathBuf>,
+        opened_at_unlink: Option<(PathBuf, u64)>,
     },
     /// Kept, and the candidate dropped: see [`Kept`].
     Kept(Kept),
@@ -426,6 +428,8 @@ struct DeleteJob {
     first_aside: Option<PathBuf>,
     #[cfg(test)]
     after_lease: Option<DeleteHook>,
+    #[cfg(test)]
+    after_aside: Option<DeleteHook>,
     #[cfg(test)]
     before_unlink: Option<DeleteHook>,
 }
@@ -628,6 +632,10 @@ impl DeleteJob {
                 };
             }
         };
+        #[cfg(test)]
+        if let Some(hook) = &self.after_aside {
+            hook(&aside);
+        }
         // Put the file back and, if it is leased, say what its ctime is now:
         // the rename and the put-back moved it. Under the lease nothing can
         // have changed the content meanwhile - an opener waits on it, even
@@ -680,10 +688,18 @@ impl DeleteJob {
                     // rest of the delete's decisions.
                     Ok(()) => DeleteAttempt::Deleted {
                         unchecked,
-                        opened_at_unlink: lease
-                            .as_ref()
-                            .is_some_and(|lease| !lease.intact())
-                            .then(|| aside.clone()),
+                        opened_at_unlink: lease.as_ref().is_some_and(|lease| !lease.intact()).then(
+                            || {
+                                // Through the leased descriptor: the file's
+                                // link count after the unlink.
+                                let names = file
+                                    .metadata()
+                                    .ok()
+                                    .and_then(|md| nlink_of(&md))
+                                    .unwrap_or(0);
+                                (aside.clone(), names)
+                            },
+                        ),
                     },
                     Err(error) => DeleteAttempt::Failed {
                         what: format!("the file was moved aside but could not be deleted: {error}"),
@@ -712,7 +728,12 @@ const DELETE_GRACE: Duration = Duration::from_millis(50);
 /// opt-in does not log thousands of warnings. Each is counted.
 fn unchecked_delete_level() -> tracing::Level {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    warn_once(&WARNED)
+}
+
+/// WARN the first time `warned` is consulted, INFO after.
+fn warn_once(warned: &std::sync::atomic::AtomicBool) -> tracing::Level {
+    if warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::Level::INFO
     } else {
         tracing::Level::WARN
@@ -782,6 +803,9 @@ pub struct FileSource {
     /// file open, before the file is moved aside (#619).
     #[cfg(test)]
     after_lease: Option<DeleteHook>,
+    /// Runs once the file is moved aside, before the grace (#619).
+    #[cfg(test)]
+    after_aside: Option<DeleteHook>,
     /// Runs after the final check of the file moved aside, just before the
     /// unlink (#619).
     #[cfg(test)]
@@ -864,6 +888,8 @@ impl FileSource {
             first_aside: None,
             #[cfg(test)]
             after_lease: None,
+            #[cfg(test)]
+            after_aside: None,
             #[cfg(test)]
             before_unlink: None,
             #[cfg(test)]
@@ -1133,6 +1159,8 @@ impl FileSource {
             #[cfg(test)]
             after_lease: self.after_lease.clone(),
             #[cfg(test)]
+            after_aside: self.after_aside.clone(),
+            #[cfg(test)]
             before_unlink: self.before_unlink.clone(),
         })
     }
@@ -1179,6 +1207,20 @@ impl FileSource {
         };
         let (inode, archived) = (candidate.inode, candidate.end_byte);
         let quiet = self.delete_quiet.as_secs();
+        // A file archived under several names (#378): its other names'
+        // deletes, by this engine and in the same pass, run beside this one.
+        // They hold the file open while they check it, and move its ctime
+        // when they rename it aside and back, so this delete can be kept as
+        // `open` or `metadata_changed` for them rather than `links_changed`.
+        let names_hint = candidate
+            .nlink
+            .filter(|n| *n > 1)
+            .map_or_else(String::new, |n| {
+                format!(
+                    " It had {n} names (hard links) when it was archived: a delete of another of \
+                 them, by this engine in the same pass, also causes this (#378)."
+                )
+            });
         // For an outcome that repeats while its cause lasts: the first time
         // at `level`, then at debug.
         let once = |fs: &mut Self, level: tracing::Level| {
@@ -1213,7 +1255,27 @@ impl FileSource {
                 // this path is a different file and stays.
                 self.cursors.remove(path);
                 self.held.remove(path);
-                if let Some(aside) = opened_at_unlink {
+                if let Some((aside, names)) = opened_at_unlink.as_ref().filter(|(_, n)| *n > 0) {
+                    // The opener came through another hard link (#378), or
+                    // the file has one: the file keeps that name, so what
+                    // the opener writes stays reachable and is archived
+                    // under it. Nothing is lost.
+                    count_delete_decision("deleted");
+                    self.notify(
+                        "opened_at_unlink",
+                        tracing::Level::WARN,
+                        path,
+                        inode,
+                        archived,
+                        format!(
+                            "deleted the name {path} after a process opened the file between the \
+                             final check and the unlink (it was under its hidden name {}); the \
+                             file still has {names} other name(s), so what that process writes \
+                             stays in it and is archived under that name (#378); nothing to do",
+                            aside.display()
+                        ),
+                    );
+                } else if let Some((aside, _)) = opened_at_unlink {
                     // The limit the grace bounds (#619): an open of the path
                     // that resolved it before the rename and reached the
                     // file only after the final check - or an open of the
@@ -1278,7 +1340,10 @@ impl FileSource {
                 if let Some(c) = self.cursors.get_mut(path) {
                     c.delete_candidate = None;
                 }
-                let (level, message) = why.message(path, archived);
+                let (level, mut message) = why.message(path, archived);
+                if why == Kept::MetadataMoved {
+                    message.push_str(&names_hint);
+                }
                 self.notify(why.outcome(), level, path, inode, archived, message);
                 false
             }
@@ -1315,7 +1380,8 @@ impl FileSource {
                     format!(
                         "not deleting {path}: {what}; all {archived} bytes are archived and it \
                          is KEPT, and tried again after the quiet period ({quiet} s). Nothing to \
-                         do if a writer still uses it; otherwise find what holds it open"
+                         do if a writer still uses it; otherwise find what holds it \
+                         open.{names_hint}"
                     ),
                 );
                 false
@@ -3947,6 +4013,17 @@ mod tests {
                 "{outcome} is counted but not in telemetry::FILE_DELETE_OUTCOMES"
             );
         }
+    }
+
+    /// `deleted_unchecked` is a warning the first time in a process and
+    /// information after (#619): a directory of thousands of files under
+    /// the opt-in must not log thousands of warnings.
+    #[test]
+    fn the_unchecked_delete_warns_once_then_informs() {
+        let warned = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(warn_once(&warned), tracing::Level::WARN);
+        assert_eq!(warn_once(&warned), tracing::Level::INFO);
+        assert_eq!(warn_once(&warned), tracing::Level::INFO);
     }
 
     /// Whether a delete decision said `needle` to the operator (#619).
@@ -7959,30 +8036,41 @@ mod tests {
         std::fs::write(&path, "one\ntwo\n").unwrap();
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
             .with_delete_quiet_period(Duration::ZERO);
+        let early: Arc<Mutex<Option<std::fs::File>>> = Arc::default();
         let opener: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
-        let (seam_opener, seam_path) = (opener.clone(), path.clone());
+        let (seam_early, seam_path) = (early.clone(), path.clone());
+        // Under the lease, before the rename: the lookup finds the file.
         fs.after_lease = Some(Arc::new(move |_| {
-            let mut slot = seam_opener.lock().unwrap();
-            if slot.is_some() {
-                return;
+            let mut slot = seam_early.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(resolved(&seam_path));
             }
-            // Under the lease, before the rename: the lookup finds the file.
-            let early = resolved(&seam_path);
+        }));
+        // Moved aside, the grace not yet begun: the open lands now, and the
+        // seam waits until it has reached the file - /proc/locks shows the
+        // lease breaking - so the grace, not a race, is what is tested.
+        let (seam_early, seam_opener) = (early.clone(), opener.clone());
+        fs.after_aside = Some(Arc::new(move |_| {
+            let Some(early) = seam_early.lock().unwrap().take() else {
+                return;
+            };
             let inode = early.metadata().unwrap().ino();
-            let path = seam_path.clone();
-            *slot = Some(std::thread::spawn(move || {
-                // The open itself lands once the rename has moved the file
-                // away from its name: in the grace.
-                let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                while std::fs::metadata(&path).is_ok_and(|md| md.ino() == inode) {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "the delete never moved the file aside"
-                    );
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+            *seam_opener.lock().unwrap() = Some(std::thread::spawn(move || {
                 open_resolved(&early).write_all(b"late\n").unwrap();
             }));
+            let breaking = format!(":{inode} ");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                let locks = std::fs::read_to_string("/proc/locks").unwrap_or_default();
+                if locks
+                    .lines()
+                    .any(|l| l.contains("LEASE") && l.contains("BREAKING") && l.contains(&breaking))
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            panic!("the late open never reached the file");
         }));
         let read = fs
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
@@ -8884,11 +8972,14 @@ mod tests {
         let opened = decisions("opened_at_unlink") - opened_before;
         eprintln!(
             "delete_race_stress: {} lines by {WRITERS} writers in {secs} s on {}; {} archived, \
-             {} still on disk, {} deletes, opened_at_unlink {opened}, lost {}",
+             {} kept on disk unarchived, {} deletes, opened_at_unlink {opened}, lost {}",
             written.len(),
             dir.path().display(),
             written.iter().filter(|l| archived.contains(*l)).count(),
-            on_disk.len(),
+            written
+                .iter()
+                .filter(|l| !archived.contains(*l) && on_disk.contains(*l))
+                .count(),
             decisions("deleted") - deleted_before,
             lost.len()
         );
