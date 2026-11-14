@@ -175,3 +175,14 @@ pub fn assert_says(message: &str, parts: &[&str]) {
         assert!(message.contains(part), "{message:?} should say {part:?}");
     }
 }
+
+/// The count of `decision` on `vtop_object_key_decisions_total` for file
+/// batches of `tenant` (#626, #709). Each test uses a tenant of its own, so
+/// it can assert exact counts.
+pub fn decisions(tenant: &str, decision: &str) -> u64 {
+    vtop_core::telemetry::init()
+        .unwrap()
+        .object_key_decisions_total
+        .with_label_values(&[tenant, "file", "raw", decision])
+        .get()
+}

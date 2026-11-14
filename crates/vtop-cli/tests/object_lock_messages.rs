@@ -13,14 +13,19 @@
 //!   result, the batch id and the object URI;
 //! - a store error quoting a signed URL: the event is logged, redacted;
 //! - a bucket check the store could not answer at startup: a WARN saying the
-//!   engine started anyway and checks again at the first upload.
+//!   engine started anyway and checks again at the first upload;
+//! - a replay that finds its object unlocked or its lock ended (#709): an
+//!   `object_key_fallback` WARN naming the batch, the old key and the new
+//!   key, in three parts, with no query string;
+//! - a replay that cannot read that object's retention: an ERROR, and no
+//!   fallback.
 #![cfg(unix)]
 
 use std::sync::Arc;
 
 use vtop_core::config::ObjectLockMode;
 use vtop_core::types::SourceType;
-use vtop_upload::LockFault;
+use vtop_upload::{LockFault, StoredRetention};
 
 #[path = "support/object_lock.rs"]
 mod support;
@@ -165,6 +170,217 @@ async fn the_object_lock_events_carry_what_an_operator_needs() {
                 && raw.contains("the engine started anyway")
                 && raw.contains("checked again before the first upload"),
             "{raw}"
+        );
+    }
+
+    // ---- a replay that falls back from an unlocked or ended lock (#709)
+    for (decision, kept, why) in [
+        (
+            "fallback_unlocked",
+            StoredRetention::default(),
+            "it carries no Object Lock retention",
+        ),
+        (
+            "fallback_lock_elapsed",
+            StoredRetention {
+                mode: Some("GOVERNANCE".into()),
+                retain_until_unix_secs: Some(1_000_000_000),
+                legal_hold: Some(false),
+            },
+            "its Object Lock retention ended at 2001-09-09T01:46:40Z",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        write_lines(&input, "app", 3);
+        let lock = governance();
+        let backend = Arc::new(locked_mock(&lock).with_throttled_manifest_puts(1));
+        let mut engine = engine(
+            config(
+                dir.path(),
+                &format!("msg-{decision}"),
+                "telemetry-raw",
+                &input,
+            ),
+            Some(lock),
+            &backend,
+        )
+        .await;
+        let first = engine.process_once(SourceType::File).await.unwrap();
+        assert!(!first[0].committed, "[{decision}]");
+        let derived = row(&engine, &first[0].batch_id).await.object_uri.unwrap();
+        backend.set_stored_retention(&derived, None, kept);
+
+        let (logs, _guard) = Logs::capture();
+        let second = engine.process_once(SourceType::File).await.unwrap();
+        assert!(second[0].committed, "[{decision}] {second:?}");
+        let landed = second[0].object_uri.clone().unwrap();
+        let event = logs.events("object_key_fallback");
+        assert_eq!(event.len(), 1, "[{decision}] {}", logs.raw());
+        let raw = logs.raw();
+        let line = raw
+            .lines()
+            .find(|l| l.contains("object_key_fallback"))
+            .unwrap();
+        assert!(line.contains("\"level\":\"WARN\""), "[{decision}] {line}");
+        assert_eq!(text(&event[0], "decision"), decision);
+        assert_eq!(text(&event[0], "batch_id"), second[0].batch_id);
+        assert_eq!(text(&event[0], "key"), derived);
+        assert_eq!(text(&event[0], "fallback_key"), landed);
+        let message = text(&event[0], "message");
+        assert_says(
+            &message,
+            &[
+                // what happened
+                "is already archived at",
+                &derived,
+                why,
+                // what the engine did
+                &format!(
+                    "writing batch {} under its attempt key {landed}",
+                    second[0].batch_id
+                ),
+                "as a fresh object locked governance for 30 days",
+                "commits it only once that lock is read back",
+                "is left as it is (not written over, deleted or re-locked)",
+                // what to do
+                "nothing is lost",
+            ],
+        );
+        assert!(
+            !message.contains('?'),
+            "[{decision}] no query string: {message}"
+        );
+        assert!(
+            logs.events("object_lock_check_failed").is_empty(),
+            "[{decision}] the fallback is not a failed check: {}",
+            logs.raw()
+        );
+    }
+
+    // ---- a replay that cannot read the reused object's retention (#709)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        write_lines(&input, "app", 3);
+        let lock = governance();
+        let backend = Arc::new(
+            locked_mock(&lock)
+                .with_retention_error("mock head_object: ServiceUnavailable (http 503)"),
+        );
+        let mut engine = engine(
+            config(dir.path(), "msg-reuse-error", "telemetry-raw", &input),
+            Some(lock),
+            &backend,
+        )
+        .await;
+        let first = engine.process_once(SourceType::File).await.unwrap();
+        assert!(!first[0].committed);
+        let derived = row(&engine, &first[0].batch_id).await.object_uri.unwrap();
+
+        let (logs, _guard) = Logs::capture();
+        let second = engine.process_once(SourceType::File).await.unwrap();
+        assert!(!second[0].committed);
+        assert!(
+            logs.events("object_key_fallback").is_empty(),
+            "no fallback on a store error: {}",
+            logs.raw()
+        );
+        let event = logs.events("object_lock_check_failed");
+        assert_eq!(event.len(), 1, "{}", logs.raw());
+        assert_eq!(text(&event[0], "result"), "error");
+        assert_eq!(text(&event[0], "batch_id"), second[0].batch_id);
+        assert_eq!(text(&event[0], "object_uri"), derived);
+        assert_says(
+            &text(&event[0], "message"),
+            &[
+                "could not be read",
+                "it was neither reused nor replaced by a fresh object",
+                "the batch was marked failed and will be replayed",
+            ],
+        );
+    }
+
+    // ---- the fallback notice is rate-limited per source and kind (#709):
+    // a second fallback of the same kind for the same source within the
+    // minute is counted, not logged.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        write_lines(&input, "app", 3);
+        let lock = governance();
+        let backend = Arc::new(locked_mock(&lock));
+        let tenant = "msg-rate-limit";
+        let mut engine = engine(
+            config(dir.path(), tenant, "telemetry-raw", &input),
+            Some(lock),
+            &backend,
+        )
+        .await;
+        let (logs, _guard) = Logs::capture();
+        for round in 0..2 {
+            if round == 1 {
+                // A new range of the same file, archived the same way.
+                write_lines(&input, "more", 3);
+            }
+            // The first attempt's manifest put fails, leaving its object
+            // under the derived key.
+            backend.set_failing_put_suffix(Some(".manifest.json"));
+            let first = engine.process_once(SourceType::File).await.unwrap();
+            assert!(!first[0].committed, "[{round}]");
+            backend.set_failing_put_suffix(None);
+            let derived = row(&engine, &first[0].batch_id).await.object_uri.unwrap();
+            backend.set_stored_retention(&derived, None, StoredRetention::default());
+            let replay = engine.process_once(SourceType::File).await.unwrap();
+            assert!(replay[0].committed, "[{round}] {replay:?}");
+        }
+        assert_eq!(decisions(tenant, "fallback_unlocked"), 2);
+        assert_eq!(
+            logs.events("object_key_fallback").len(),
+            1,
+            "the second notice within the minute is suppressed: {}",
+            logs.raw()
+        );
+    }
+
+    // ---- lock_withheld: the fresh object is not usable either (#709)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        write_lines(&input, "app", 3);
+        let lock = governance();
+        let backend = Arc::new(locked_mock(&lock).with_throttled_manifest_puts(1));
+        let mut engine = engine(
+            config(dir.path(), "msg-withheld", "telemetry-raw", &input),
+            Some(lock),
+            &backend,
+        )
+        .await;
+        let first = engine.process_once(SourceType::File).await.unwrap();
+        assert!(!first[0].committed);
+        let derived = row(&engine, &first[0].batch_id).await.object_uri.unwrap();
+        backend.set_stored_retention(&derived, None, StoredRetention::default());
+        backend.set_lock_fault(Some(LockFault::Ignored));
+        let second = engine.process_once(SourceType::File).await.unwrap();
+        assert!(!second[0].committed);
+        let fresh = row(&engine, &second[0].batch_id).await.object_uri.unwrap();
+
+        let (logs, _guard) = Logs::capture();
+        let third = engine.process_once(SourceType::File).await.unwrap();
+        assert!(!third[0].committed);
+        let event = logs.events("object_key_fallback");
+        assert_eq!(event.len(), 1, "{}", logs.raw());
+        assert_eq!(text(&event[0], "decision"), "lock_withheld");
+        assert_eq!(text(&event[0], "batch_id"), third[0].batch_id);
+        assert_eq!(text(&event[0], "key"), derived);
+        assert_eq!(text(&event[0], "fallback_key"), fresh);
+        assert_says(
+            &text(&event[0], "message"),
+            &[
+                "is not usable either",
+                "nothing was written: the batch was marked failed and will be replayed",
+                "check the bucket's Object Lock configuration",
+            ],
         );
     }
 }

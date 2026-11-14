@@ -43,6 +43,7 @@ These carry the commit rule:
 | `vtop_verification_mode{mode="size_only"}` | `1` means `upload.require_strong_verification` is off: same-size corruption is accepted. |
 | `vtop_verification_backend_limited_total` | Batches committed on a size-only check. |
 | `vtop_object_lock_checks_total{result}` | With `upload.object_lock`: any result but `ok` is a batch that failed because the store did not keep the retention asked for (or its bucket has no Object Lock). See [S3 Object Lock](../OBJECT_LOCK_DEPLOYMENT.md). |
+| `vtop_object_key_decisions_total{decision}` | With `upload.object_lock`: `fallback_unlocked`, `fallback_lock_mode`, `fallback_hold_missing` and `lock_withheld` mean an object that should be locked is not, or the store is not keeping locks (#709). `fallback_lock_elapsed` is storage cost only. |
 | `vtop_retention_lost_records_total` | Kafka records deleted by broker retention before the engine read them. Never archived; any increase is an incident. |
 | `vtop_source_replay_refused_total` | A failed range its source could not hand back, so it is missing from the archive. |
 | `vtop_source_read_errors_total` | A source that cannot be read. |
@@ -97,6 +98,12 @@ groups:
       # Primed at zero at startup with upload.object_lock set.
       - alert: VtopObjectLockCheckFailed
         expr: increase(vtop_object_lock_checks_total{result!="ok"}[15m]) > 0
+      # A replay found its object not locked as configured and wrote a fresh
+      # one, or withheld it (#709). A warning, not a page: nothing failed.
+      # Not primed (its labels include source_type and format), so
+      # increase() misses the first one in a new series.
+      - alert: VtopObjectLockFallback
+        expr: increase(vtop_object_key_decisions_total{decision=~"fallback_unlocked|fallback_lock_mode|fallback_hold_missing|lock_withheld"}[1h]) > 0
       # Primed at zero at startup, so increase() sees the first one.
       - alert: VtopSourceReplayRefused
         expr: increase(vtop_source_replay_refused_total[15m]) > 0

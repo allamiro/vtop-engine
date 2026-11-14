@@ -169,6 +169,10 @@ pub struct Pipeline<'a> {
     /// owned by [`Engine`] and shared like `versioned_buckets`: a literal
     /// bucket is checked at startup, a templated one at its first upload.
     pub locked_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// The attempt key a replay last wrote for each derived key whose object
+    /// was not locked as configured (#709), owned by [`Engine`] and shared
+    /// like `key_notices`.
+    pub lock_fallbacks: Arc<LockFallbacks>,
 }
 
 /// Rate limit for the object-key notices a setting repeats on every batch
@@ -228,7 +232,153 @@ impl KeyNotices {
     }
 }
 
+/// How long a replay withholds a new fallback object after the last one it
+/// wrote for the same derived key turned out unusable (#709).
+const LOCK_FALLBACK_COOLDOWN: Duration = Duration::from_secs(300);
+/// Entries older than this are dropped when one is recorded.
+const LOCK_FALLBACK_KEEP: Duration = Duration::from_secs(3_600);
+/// At most this many derived keys are remembered.
+const LOCK_FALLBACK_MAX: usize = 4_096;
+
+/// The attempt key a replay last wrote for a derived key whose object was not
+/// locked as configured, and when (#709). Without it, two ordinary states
+/// write one more object per replay: a fallback object that landed while its
+/// manifest was throttled (the next replay would fall back again instead of
+/// reusing it), and a store that does not keep the lock (every fallback
+/// object fails its check). Process-local and bounded: a restart forgets it,
+/// which costs at most one more object per range.
+#[derive(Debug)]
+pub struct LockFallbacks {
+    cooldown: std::sync::Mutex<Duration>,
+    last: std::sync::Mutex<HashMap<String, (String, Instant)>>,
+}
+
+impl Default for LockFallbacks {
+    fn default() -> Self {
+        Self {
+            cooldown: std::sync::Mutex::new(LOCK_FALLBACK_COOLDOWN),
+            last: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl LockFallbacks {
+    /// The attempt key last written for `derived`, and how long ago.
+    pub(crate) fn earlier(&self, derived: &str) -> Option<(String, Duration)> {
+        self.last
+            .lock()
+            .unwrap()
+            .get(derived)
+            .map(|(key, at)| (key.clone(), at.elapsed()))
+    }
+
+    /// Remember that `attempt` was written for `derived`, now.
+    pub(crate) fn record(&self, derived: &str, attempt: &str) {
+        self.record_at(derived, attempt, Instant::now());
+    }
+
+    fn record_at(&self, derived: &str, attempt: &str, now: Instant) {
+        let mut last = self.last.lock().unwrap();
+        last.retain(|_, (_, at)| now.saturating_duration_since(*at) < LOCK_FALLBACK_KEEP);
+        if last.len() >= LOCK_FALLBACK_MAX && !last.contains_key(derived) {
+            if let Some(oldest) = last
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| k.clone())
+            {
+                last.remove(&oldest);
+            }
+        }
+        last.insert(derived.to_owned(), (attempt.to_owned(), now));
+    }
+
+    pub(crate) fn cooldown(&self) -> Duration {
+        *self.cooldown.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.last.lock().unwrap().len()
+    }
+}
+
+/// What the attempt key a replay wrote earlier for the same derived key
+/// holds now (#709).
+#[derive(Debug)]
+enum EarlierFallback {
+    /// These bytes, verified strongly and locked as configured: reuse it.
+    Usable,
+    /// The upload never landed: writing one now is not an extra object.
+    Absent,
+    /// There and not usable, with why.
+    Unusable(String),
+    /// The store could not answer: the batch fails with this message.
+    Failed(String),
+}
+
 impl<'a> Pipeline<'a> {
+    /// Read the retention of an object the batch would reuse and judge it
+    /// against the profile (#709).
+    async fn judge_reuse(
+        &self,
+        uri: &str,
+        lock: &vtop_core::config::ObjectLockConfig,
+        batch_id: &str,
+        tenant: &str,
+        labels: [&str; 3],
+    ) -> crate::object_lock::Reuse {
+        let expected = crate::object_lock::reuse_expectation(lock, unix_now_secs());
+        let read = note_store_request(
+            self.backend.verify_retention(uri, None, &expected).await,
+            "object_retention_probe",
+            labels,
+            &self.attempts,
+            &self.throttles,
+        );
+        crate::object_lock::judge_reuse(read, batch_id, tenant, uri, lock)
+    }
+
+    /// What the attempt key written earlier for this range holds now (#709):
+    /// probed and verified like a derived key, then its retention judged.
+    #[allow(clippy::too_many_arguments)]
+    async fn judge_earlier_fallback(
+        &self,
+        uri: &str,
+        size: u64,
+        checksum: Option<ObjectChecksum<'_>>,
+        lock: &vtop_core::config::ObjectLockConfig,
+        batch_id: &str,
+        tenant: &str,
+        labels: [&str; 3],
+    ) -> EarlierFallback {
+        match probe_object_key(
+            self.backend.as_ref(),
+            uri,
+            size,
+            checksum,
+            labels,
+            &self.attempts,
+            &self.throttles,
+        )
+        .await
+        {
+            Ok(KeyProbe::Holds) => {
+                match self.judge_reuse(uri, lock, batch_id, tenant, labels).await {
+                    crate::object_lock::Reuse::Locked => EarlierFallback::Usable,
+                    crate::object_lock::Reuse::Unlocked { why, .. } => {
+                        EarlierFallback::Unusable(why)
+                    }
+                    crate::object_lock::Reuse::Unanswered(message) => {
+                        EarlierFallback::Failed(message)
+                    }
+                }
+            }
+            Ok(KeyProbe::Free) => EarlierFallback::Absent,
+            Ok(probe) => EarlierFallback::Unusable(probe.reason().to_owned()),
+            Err(e) => EarlierFallback::Failed(format!("object key probe of {uri} failed: {e}")),
+        }
+    }
+
     /// What becomes of a failed multipart upload's session (#668).
     ///
     /// Kept, when a replay can resume it: the object is under its derived
@@ -925,17 +1075,40 @@ impl<'a> Pipeline<'a> {
                 }
                 (attempt_object_uri, false, false)
             }
-            Ok(derived) => match probe_object_key(
-                self.backend.as_ref(),
-                &derived,
-                compressed.size_bytes,
-                object_ck,
-                labels,
-                &self.attempts,
-                &self.throttles,
-            )
-            .await
-            {
+            Ok(derived) => match match (
+                probe_object_key(
+                    self.backend.as_ref(),
+                    &derived,
+                    compressed.size_bytes,
+                    object_ck,
+                    labels,
+                    &self.attempts,
+                    &self.throttles,
+                )
+                .await,
+                self.config.upload.object_lock.as_ref(),
+            ) {
+                // Under the Object Lock profile (#709), bytes already at the
+                // derived key are reused only if that object is still locked
+                // as configured. One whose lock has ended, that was stored
+                // unlocked, or that is in the other mode or lacks the
+                // configured legal hold would fail the check before the
+                // commit on every replay, and the range would stall. A
+                // retention the store cannot report fails the batch instead:
+                // falling back on an error would write a second object for
+                // every replay during an outage.
+                (Ok(KeyProbe::Holds), Some(lock)) => match self
+                    .judge_reuse(&derived, lock, &batch_id, &tenant, labels)
+                    .await
+                {
+                    crate::object_lock::Reuse::Locked => Ok(KeyProbe::Holds),
+                    crate::object_lock::Reuse::Unlocked { decision, why } => {
+                        Ok(KeyProbe::NotLocked { decision, why })
+                    }
+                    crate::object_lock::Reuse::Unanswered(message) => fail!(message),
+                },
+                (probe, _) => probe,
+            } {
                 Ok(KeyProbe::Free) => {
                     decided("derived");
                     tracing::info!(
@@ -962,6 +1135,133 @@ impl<'a> Pipeline<'a> {
                          reusing key {derived}, no upload; nothing to do"
                     );
                     (derived, true, true)
+                }
+                // Not reused (#709): the batch is written as a fresh object
+                // under its attempt key, and the check before the commit
+                // holds it to the configured lock on the exact version
+                // written, so the commit rule is unchanged. The old object
+                // is never written over, deleted or re-locked.
+                //
+                // What stops this from writing an object per replay: the
+                // attempt key last written for this derived key is
+                // remembered (process-local). If it holds these bytes,
+                // locked, it is reused, as when the fallback's manifest was
+                // throttled. If it is there and not usable (a store that
+                // does not keep the lock), nothing is written until
+                // `LockFallbacks::cooldown` has passed: one extra object per
+                // window, not one per replay.
+                Ok(KeyProbe::NotLocked { decision, why }) => {
+                    let lock = self
+                        .config
+                        .upload
+                        .object_lock
+                        .as_ref()
+                        .expect("NotLocked is only decided under the profile");
+                    let earlier = match self.lock_fallbacks.earlier(&derived) {
+                        None => None,
+                        Some((key, age)) => {
+                            let found = self
+                                .judge_earlier_fallback(
+                                    &key,
+                                    compressed.size_bytes,
+                                    object_ck,
+                                    lock,
+                                    &batch_id,
+                                    &tenant,
+                                    labels,
+                                )
+                                .await;
+                            Some((found, key, age))
+                        }
+                    };
+                    let cooldown = self.lock_fallbacks.cooldown();
+                    match earlier {
+                        Some((EarlierFallback::Failed(message), _, _)) => fail!(message),
+                        Some((EarlierFallback::Usable, earlier_key, _)) => {
+                            decided("reused");
+                            tracing::info!(
+                                event = "object_key_reused",
+                                batch_id,
+                                source = source_name,
+                                range,
+                                key = %earlier_key,
+                                key_source = "earlier_fallback",
+                                "range {range} of {source_name} already has a verified, locked \
+                                 object from an earlier attempt of this process at \
+                                 {earlier_key} (written because {derived} is not locked as \
+                                 configured); reusing it, no upload; nothing to do"
+                            );
+                            (earlier_key, true, false)
+                        }
+                        Some((EarlierFallback::Unusable(found), earlier_key, age))
+                            if age < cooldown =>
+                        {
+                            decided("lock_withheld");
+                            let message = format!(
+                                "range {range} of {source_name} is archived at {derived}, but \
+                                 {why}, and the object this engine wrote for it {}s ago at \
+                                 {earlier_key} is not usable either ({found}); nothing was \
+                                 written: the batch was marked failed and will be replayed, and \
+                                 a replay after {}s may write one more object; the store may \
+                                 not be keeping the lock it is asked for: check the bucket's \
+                                 Object Lock configuration and the credentials' \
+                                 s3:PutObjectRetention, s3:GetObjectRetention and \
+                                 s3:GetObjectLegalHold permissions",
+                                age.as_secs(),
+                                cooldown.as_secs(),
+                            );
+                            if let Some(suppressed) =
+                                self.key_notices.admit("lock_withheld", source_name)
+                            {
+                                tracing::warn!(
+                                    event = "object_key_fallback",
+                                    batch_id,
+                                    source = source_name,
+                                    range,
+                                    key = %derived,
+                                    fallback_key = %earlier_key,
+                                    reason = %found,
+                                    decision = "lock_withheld",
+                                    suppressed,
+                                    "{message} ({suppressed} more like this suppressed since \
+                                     the last notice)"
+                                );
+                            }
+                            fail!(message)
+                        }
+                        _ => {
+                            decided(decision);
+                            self.lock_fallbacks.record(&derived, &attempt_object_uri);
+                            // Rate-limited per source and kind: a store that
+                            // drops the lock headers repeats this.
+                            if let Some(suppressed) = self.key_notices.admit(decision, source_name)
+                            {
+                                tracing::warn!(
+                                    event = "object_key_fallback",
+                                    batch_id,
+                                    source = source_name,
+                                    range,
+                                    key = %derived,
+                                    fallback_key = %attempt_object_uri,
+                                    reason = %why,
+                                    decision,
+                                    suppressed,
+                                    "range {range} of {source_name} is already archived at \
+                                     {derived}, but {why}; writing batch {batch_id} under its \
+                                     attempt key {attempt_object_uri} instead, as a fresh \
+                                     object locked {} for {} days, and the engine commits it \
+                                     only once that lock is read back; {derived} is left as it \
+                                     is (not written over, deleted or re-locked); {} \
+                                     ({suppressed} more like this suppressed since the last \
+                                     notice)",
+                                    lock.mode,
+                                    lock.retain_days,
+                                    crate::object_lock::fallback_advice(decision),
+                                );
+                            }
+                            (attempt_object_uri, false, false)
+                        }
+                    }
                 }
                 Ok(probe) => {
                     let (decision, what, todo) = match &probe {
@@ -1342,19 +1642,9 @@ impl<'a> Pipeline<'a> {
         // its lock was set when it was first archived. Recovery and the
         // scrub never run this: a retention that has ended is normal there.
         if let Some(lock) = &self.config.upload.object_lock {
-            let now_secs = i64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            )
-            .unwrap_or(i64::MAX);
+            let now_secs = unix_now_secs();
             let object_expected = if reused {
-                Some(vtop_upload::RetentionExpectation {
-                    mode: lock.mode,
-                    retain_until_at_least_unix_secs: now_secs,
-                    legal_hold: lock.legal_hold,
-                })
+                Some(crate::object_lock::reuse_expectation(lock, now_secs))
             } else {
                 // Never earlier than now (review of #708): a fresh write asks
                 // for now plus at least a day, so this cannot fail on skew,
@@ -1881,6 +2171,18 @@ fn note_store_request<T>(
     result
 }
 
+/// The engine's clock in whole Unix seconds, for the Object Lock checks'
+/// "a date still ahead" bound (#684, #709).
+fn unix_now_secs() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
 /// What a batch's derived object key holds (#626).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum KeyProbe {
@@ -1898,6 +2200,10 @@ enum KeyProbe {
     /// The store refused or failed the check of the key (a 403 without list
     /// permission, a 5xx, a timeout): it did not say the key is absent.
     Unchecked(String),
+    /// Under the Object Lock profile (#709): an object is there and holds
+    /// these bytes, but it is not under the configured lock. `decision` is
+    /// its `vtop_object_key_decisions_total` value.
+    NotLocked { decision: &'static str, why: String },
 }
 
 impl KeyProbe {
@@ -1907,7 +2213,8 @@ impl KeyProbe {
             KeyProbe::Differs(why)
             | KeyProbe::SizeOnly(why)
             | KeyProbe::Unreadable(why)
-            | KeyProbe::Unchecked(why) => why,
+            | KeyProbe::Unchecked(why)
+            | KeyProbe::NotLocked { why, .. } => why,
         }
     }
 }
@@ -2125,6 +2432,9 @@ pub struct Engine {
     /// Process-wide Object Lock preflight cache (#684); see
     /// [`Pipeline::locked_buckets`].
     locked_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Process-wide Object Lock fallback memory (#709); see
+    /// [`Pipeline::lock_fallbacks`].
+    lock_fallbacks: Arc<LockFallbacks>,
     /// Per-source accumulation buffers, keyed by `(source_type, source_name)`.
     pending: HashMap<(SourceType, String), PendingBuffer>,
     /// Set by a read cycle that returned any records; drives the adaptive
@@ -2455,6 +2765,7 @@ impl Engine {
             provisioned_buckets: Arc::default(),
             key_notices: Arc::default(),
             locked_buckets: Arc::default(),
+            lock_fallbacks: Arc::default(),
             pending: HashMap::new(),
             cycle_had_data: false,
             cycle_had_failure: false,
@@ -2499,7 +2810,16 @@ impl Engine {
             provisioned_buckets: Arc::clone(&self.provisioned_buckets),
             key_notices: Arc::clone(&self.key_notices),
             locked_buckets: Arc::clone(&self.locked_buckets),
+            lock_fallbacks: Arc::clone(&self.lock_fallbacks),
         }
+    }
+
+    /// Set how long a replay withholds a new fallback object after the last
+    /// one it wrote for the same range turned out unusable (#709; five
+    /// minutes otherwise). For tests: configuration does not expose it.
+    #[doc(hidden)]
+    pub fn set_lock_fallback_cooldown(&self, cooldown: Duration) {
+        *self.lock_fallbacks.cooldown.lock().unwrap() = cooldown;
     }
 
     /// The upload width the next cycle will use (#102).
@@ -9126,6 +9446,110 @@ mod tests {
         );
     }
 
+    /// #709, the crash boundary: a replay falls back from an unlocked object
+    /// at the derived key, its fresh object lands, and the OBJECT_UPLOADED
+    /// write fails (the process dies there). After a restart, which
+    /// remembers no earlier fallback, the replay falls back again and
+    /// commits, and nothing commits before the retention check passes on the
+    /// object its manifest names. The first fresh object stays as an orphan:
+    /// one more locked object, the documented residual.
+    #[tokio::test]
+    async fn a_crash_after_a_fallback_put_commits_on_the_next_fresh_object_after_restart() {
+        use vtop_core::config::{ObjectLockConfig, ObjectLockMode};
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\nline 2\n").unwrap();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let lock = ObjectLockConfig {
+            mode: ObjectLockMode::Governance,
+            retain_days: 30,
+            legal_hold: false,
+        };
+        let backend = Arc::new(
+            vtop_upload::MockBackend::new()
+                .with_object_lock(vtop_upload::ObjectLockPolicy::from_config(&lock))
+                .with_throttled_manifest_puts(1),
+        );
+        let engine = |work: &str| {
+            let cfg = file_config(
+                dir.path().join(work).to_str().unwrap(),
+                &url,
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            let backend = backend.clone();
+            let lock = lock.clone();
+            async move {
+                let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+                    .await
+                    .unwrap();
+                engine.config.upload.require_object_versioning = true;
+                engine.config.upload.object_lock = Some(lock);
+                engine.backend = backend;
+                engine
+            }
+        };
+
+        // Attempt 1 leaves its object under the derived key (the manifest is
+        // throttled); the object then loses its lock.
+        let mut first = engine("work-1").await;
+        let out = first.process_once(SourceType::File).await.unwrap();
+        assert!(!out[0].committed, "{out:?}");
+        let derived = first
+            .store
+            .get_batch(&out[0].batch_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .object_uri
+            .unwrap();
+        backend.set_stored_retention(&derived, None, vtop_upload::StoredRetention::default());
+
+        // Attempt 2 falls back; its fresh object lands and the ledger write
+        // after it fails.
+        FaultyLedger::install(&mut first, &[LedgerWrite::To(BatchState::ObjectUploaded)]).await;
+        let crashed = first.process_once(SourceType::File).await;
+        let rows = first.store.list_batches().await.unwrap();
+        let orphan_batch = rows
+            .iter()
+            .find(|r| r.batch_id != out[0].batch_id)
+            .unwrap_or_else(|| panic!("attempt 2 has a row: {crashed:?} {rows:?}"));
+        assert_ne!(orphan_batch.state, BatchState::SourceCommitted);
+        assert!(orphan_batch.object_uri.is_none(), "{orphan_batch:?}");
+        let orphan_name = format!("{}.", orphan_batch.batch_id);
+        drop(first);
+
+        // Restart: recovery hands the range back, the replay falls back again.
+        let mut second = engine("work-2").await;
+        second.recover().await.unwrap();
+        let out = second.process_once(SourceType::File).await.unwrap();
+        let committed: Vec<_> = out.iter().filter(|o| o.committed).collect();
+        assert_eq!(committed.len(), 1, "{out:?}");
+        let landed = committed[0].object_uri.clone().unwrap();
+        assert_ne!(landed, derived);
+        assert!(landed.contains(&committed[0].batch_id), "{landed}");
+        assert!(!landed.contains(&orphan_name), "{landed}");
+        let orphan = landed.replace(&committed[0].batch_id, &orphan_batch.batch_id);
+        assert!(
+            backend.contains(&orphan),
+            "the first fresh object stays as an orphan: {orphan}"
+        );
+        assert_eq!(
+            backend.stored_retention(&orphan, None).mode.as_deref(),
+            Some("GOVERNANCE"),
+            "and it is locked"
+        );
+        assert_eq!(
+            backend.stored_retention(&landed, None).mode.as_deref(),
+            Some("GOVERNANCE")
+        );
+        assert_eq!(
+            backend.stored_retention(&derived, None),
+            vtop_upload::StoredRetention::default(),
+            "the old object is untouched"
+        );
+    }
+
     /// The ledger a crash leaves behind (#639): a lower range A of a source
     /// unit that recovery must replay, and a VERIFIED range B above it. Built
     /// by a first engine, `first`, whose `source` reads A, then (after
@@ -9807,6 +10231,36 @@ mod tests {
 
     /// #626: a notice a setting repeats on every batch is logged once, then at
     /// most once per interval, saying how many were suppressed in between.
+    /// #709: the fallback memory stays bounded. Entries older than an hour
+    /// are dropped when one is recorded, and at most 4096 are kept, the
+    /// oldest going first.
+    #[test]
+    fn the_lock_fallback_memory_is_bounded_by_age_and_count() {
+        let memory = LockFallbacks::default();
+        let start = Instant::now();
+        memory.record_at("old", "a-old", start);
+        let later = start + LOCK_FALLBACK_KEEP + Duration::from_secs(1);
+        memory.record_at("new", "a-new", later);
+        assert!(
+            memory.earlier("old").is_none(),
+            "an hour-old entry is dropped"
+        );
+        assert_eq!(memory.earlier("new").unwrap().0, "a-new");
+        for i in 0..LOCK_FALLBACK_MAX + 10 {
+            memory.record_at(
+                &format!("d{i}"),
+                &format!("a{i}"),
+                later + Duration::from_millis(i as u64 + 1),
+            );
+        }
+        assert_eq!(memory.len(), LOCK_FALLBACK_MAX);
+        assert!(memory.earlier("new").is_none(), "the oldest goes first");
+        assert!(memory
+            .earlier(&format!("d{}", LOCK_FALLBACK_MAX + 9))
+            .is_some());
+        assert_eq!(memory.cooldown(), Duration::from_secs(300));
+    }
+
     #[test]
     fn key_notices_admit_the_first_then_one_per_interval_with_the_suppressed_count() {
         let notices = KeyNotices::every(Duration::from_secs(60));

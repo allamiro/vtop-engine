@@ -694,7 +694,12 @@ verifies against the batch's full digest. The manifest keeps
 manifests can name one object. A batch whose replay has other boundaries or
 another partition hour is a different batch under this rule and gets another
 key. Without a checksum, or when the backend cannot report an absent key, the
-object is named by the `batch_id` as above.
+object is named by the `batch_id` as above. Under the reference engine's S3
+Object Lock profile (#684), an object at the key is reused only if it is also
+still locked as configured (the configured mode, a date ahead, the legal hold
+when configured); otherwise the batch is written as a new, locked object named
+by the `batch_id`, and the object at the key is left untouched (#709). A
+retention the store cannot report fails the batch rather than choosing either.
 
 ### 15.2 Per-format bucket templating
 

@@ -47,6 +47,36 @@ may bypass a governance retention are yours to set up.
   it was first archived, so it only has to be under the configured mode with
   a date still ahead. The replay's own manifest is new and is checked
   strictly.
+- **A reused object that is not locked as configured is not reused (#709).**
+  The replay reads that object's retention before it decides to reuse it.
+  If the lock has ended, the object has none (it was stored before the
+  profile was enabled, or by a store that did not keep the headers), it is
+  in the other mode, or it lacks the configured legal hold, the batch is
+  written as a fresh object under its per-attempt key, under the configured
+  lock, and verified like any write: its retention is read back on the
+  exact version written before anything commits. The manifest and the
+  ledger name the new key. The old object is never written over, deleted or
+  re-locked; the cost is one extra object. A mode mismatch falls back in
+  both directions: a compliance lock where governance is configured is
+  stronger, but the committed object must be under the mode the profile
+  sets. A retention the store cannot report (a 5xx, a timeout, a refused
+  `s3:GetObjectRetention`) is **not** a reason to fall back, since during an
+  outage every replay would write another object: the batch fails, writes
+  nothing, and is replayed. Before #709 such a range failed on every replay
+  until an operator extended the old object's retention or deleted it.
+- **A fallback is not repeated on every replay.** The engine remembers, per
+  process, the attempt key it last wrote for each such range. A replay
+  reuses that object if it holds the bytes and is locked as configured (the
+  fresh object landed but its manifest failed). If it is there and not
+  usable either (a store that does not keep the lock), the replay writes
+  nothing and fails (`lock_withheld`) for five minutes, then writes one more:
+  at most one extra object per range every five minutes, not one per replay.
+  A restart forgets this memory, which costs at most one more object per
+  range.
+- **The reuse bound is the date, not `retain_days`.** A reused object whose
+  lock ends tomorrow is still reused, so that batch's evidence is protected
+  until tomorrow, not for `retain_days`. This is the bound #684 set; a
+  minimum remaining retention would be a new setting.
 - **Recovery and the scrub never fail a batch for an ended retention.** The
   check runs once, before VERIFIED. `vtopctl scrub --check-retention` reads
   retention after the fact and reports an ended one as `elapsed`, which is
@@ -158,15 +188,26 @@ Each refusal says what happened, what the engine did, and what to do:
 | Startup, a backend that does not apply the lock | `upload.object_lock is set, but the X upload backend does not apply it ...` | Use `s3_native`. |
 | Written object or manifest without the lock (`object_lock_check_failed`, `result` = `missing`, `mode_mismatch`, `too_short` or `legal_hold_missing`) | `object X (version V) is not under the requested retention (expected governance until at least D, found ...); the batch was marked failed and will be replayed; check the bucket's Object Lock configuration and the credentials' s3:PutObjectRetention permission, and s3:GetObjectRetention, without which the store answers a HEAD with no lock at all` | Fix the store or the credentials. The replay writes the batch again. |
 | A write that asked for no lock (a multipart upload completed by a run without the profile) | `... was written by the s3_native backend without asking for the retention upload.object_lock sets (...); ... the replay checks the stored object itself` | Nothing, unless it repeats. |
-| Reused object without the lock | `object X, reused from an earlier attempt, is not under the requested retention (...); ... a replay of the same bytes reuses this object again, so extend its retention with PutObjectRetention, or delete that version if nothing protects it and the replay will write a locked one` | As it says. Until then this range fails on every replay. |
-| Reused object without the legal hold (`legal_hold` turned on later) | `... has no legal hold (...); ... place a legal hold on it with PutObjectLegalHold` | As it says. |
+| A replay finds its object unlocked, its lock ended, in the other mode, or without the configured legal hold (#709; WARN `object_key_fallback`, `decision` = `fallback_unlocked`, `fallback_lock_elapsed`, `fallback_lock_mode` or `fallback_hold_missing`; at most once a minute per source and kind, with a `suppressed` count) | `range R of S is already archived at X, but it carries no Object Lock retention (...); writing batch B under its attempt key Y instead, as a fresh object locked governance for 90 days, and the engine commits it only once that lock is read back; X is left as it is (not written over, deleted or re-locked); nothing is lost; run `vtopctl scrub --check-retention` ...` (the last part depends on the decision) | Nothing for the batch. If `fallback_unlocked` keeps rising for objects written since the profile was enabled, check that the store keeps the lock headers (`vtopctl scrub --check-retention` lists committed objects without a lock). |
+| The fresh object written for the range moments ago is not usable either (WARN `object_key_fallback`, `decision="lock_withheld"`) | `range R of S is archived at X, but ..., and the object this engine wrote for it Ns ago at Y is not usable either (...); nothing was written: the batch was marked failed and will be replayed, and a replay after 300s may write one more object; the store may not be keeping the lock it is asked for: check ...` | Check the bucket's Object Lock configuration and `s3:PutObjectRetention`, `s3:GetObjectRetention`, `s3:GetObjectLegalHold`. |
+| A replay reuses the fresh object an earlier fallback of this process wrote (INFO `object_key_reused`, `key_source="earlier_fallback"`) | `range R of S already has a verified, locked object from an earlier attempt of this process at Y ...; reusing it, no upload; nothing to do` | Nothing. |
+| The retention of the object a replay would reuse could not be read (`object_lock_check_failed`, `result="error"`) | `the retention of object X, already archived under this batch's derived key, could not be read (...); it was neither reused nor replaced by a fresh object, ...; the batch was marked failed and will be replayed; check the store's health and the credentials' s3:GetObjectRetention permission` | As it says. Nothing was written. |
+| Reused object that lost its lock while the batch was in flight (it passed the check before reuse) | `object X, reused from an earlier attempt, is not under the requested retention (...), though it was when this batch chose to reuse it; ... the replay writes the batch as a fresh locked object under its attempt key, leaving this one as it is; nothing to do unless it repeats` | Nothing, unless it repeats. |
 | Retention could not be read (`result="error"`) | `the retention of object X could not be read (...); ...; check the store's health and the credentials' s3:GetObjectRetention permission` | As it says. |
 
 Messages and logs never carry a signed URL or credentials. A store error that
 quotes one is redacted before it reaches the ledger or the log.
 
 Metrics: `vtop_object_lock_checks_total{tenant,result}` counts every check,
-and every result other than `ok` is a failed batch. Missing, shorter,
+and every result other than `ok` is a failed batch. The look a replay takes
+at an object before reusing it is a key decision, not a check: a fallback is
+counted in `vtop_object_key_decisions_total{decision}` (the four
+`fallback_*` values and `lock_withheld` above), and only a read that fails is
+counted here, as `error`. Alert on `fallback_unlocked`, `fallback_lock_mode`,
+`fallback_hold_missing` and `lock_withheld` as a warning (an object that
+should be locked is not, or the store is not keeping locks); an ended lock
+(`fallback_lock_elapsed`) is storage cost, not a finding. See
+[Monitoring](operate/monitoring.md). Missing, shorter,
 other-mode and hold-less locks are also counted in
 `vtop_verification_failures_total`. `vtop_object_lock_mode{tenant,mode}`
 reads 1 for the mode in force (`off` without the profile). See
@@ -195,6 +236,15 @@ keys (#626) make this rarer, because a replay of the same bytes reuses the
 object rather than writing a second one, but a replay with other batch
 boundaries still writes a new object. Budget for these objects. The startup
 WARN under `compliance` says so.
+
+A replay that finds its object unlocked, its lock ended, in the other mode
+or without the configured legal hold writes one more locked object and
+leaves the old one (#709). The old one is unlocked or elapsed, so it can be
+removed by a lifecycle rule or a delete, except when it is under the other
+mode: a compliance lock stays until its date. A crash between that fresh
+object's upload and its ledger write, or a restart after a fallback whose
+manifest failed, writes one more; these are counted as `fallback_*` in
+`vtop_object_key_decisions_total`.
 
 Incomplete multipart uploads are not objects and are not locked. The
 abandoned-session sweep and an `AbortIncompleteMultipartUpload` lifecycle rule
