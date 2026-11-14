@@ -37,6 +37,14 @@ The guides link here; these pages do not repeat the guides.
 
     [:octicons-arrow-right-24: Limitations](limitations.md)
 
+-   **Data-safety register**
+
+    ---
+
+    Every data-safety bug found so far: introduced, found, fixed.
+
+    [:octicons-arrow-right-24: Register](data-safety-register.md)
+
 -   **Protocol**
 
     ---
