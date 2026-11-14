@@ -48,6 +48,22 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// inside the retained log, and a restart can re-derive what it covers.
 pub(crate) const AUDIT_SAVE_LAG: u64 = 512;
 
+/// The most log entries one catch-up reads and delivers before it lets go of
+/// the locks (review of #767): a sink that recovers after a long outage must
+/// not hold apply for the whole backlog, and an apply must not re-read it.
+pub(crate) const AUDIT_CATCH_UP_CHUNK: u64 = 256;
+
+/// What one bounded catch-up step left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatchUp {
+    /// The frontier reached the applied frontier.
+    Done,
+    /// More to deliver: call again (after letting go of the locks).
+    More,
+    /// The sink refused, or the log could not be read: try later.
+    Stopped,
+}
+
 /// Why records were delivered again. Closed: the `reason` label of
 /// `vtop_audit_replayed_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +175,10 @@ pub(crate) struct DeliveryState {
     /// moved, so a restart re-derives the same gap from the log (#767
     /// review).
     pending_gap: Option<(AuditRecord, u64)>,
+    /// When the sink last refused. An apply does not try again before
+    /// [`crate::audit::AUDIT_RETRY_INTERVAL`] has passed, so a sink that
+    /// stays down costs each apply nothing (review of #767).
+    refused_at: Option<std::time::Instant>,
 }
 
 impl DeliveryState {
@@ -168,6 +188,7 @@ impl DeliveryState {
             sink: None,
             delivered,
             pending_gap: None,
+            refused_at: None,
         }
     }
 
@@ -274,8 +295,10 @@ impl MetaRaftStore {
     }
 
     /// The live records of an apply batch `first..=through`, just applied.
-    /// Delivered in order unless the frontier is behind the batch, in which
-    /// case everything above it is delivered from the log instead.
+    /// Delivered in order unless the frontier is behind the batch. Then one
+    /// bounded step of the backlog is delivered from the log instead - and
+    /// not even that while the sink refused within the retry interval: the
+    /// retry task and the next applies catch up, a chunk at a time.
     pub(crate) fn deliver_applied(
         &self,
         delivery: &mut DeliveryState,
@@ -285,6 +308,12 @@ impl MetaRaftStore {
     ) {
         self.progress.applied.store(through, Ordering::Relaxed);
         if delivery.pending_gap.is_some() || delivery.delivered.saturating_add(1) < first {
+            if delivery
+                .refused_at
+                .is_some_and(|at| at.elapsed() < crate::audit::AUDIT_RETRY_INTERVAL)
+            {
+                return;
+            }
             self.catch_up(delivery, ReplayReason::Retry);
             return;
         }
@@ -309,10 +338,18 @@ impl MetaRaftStore {
     }
 
     /// Deliver everything above the frontier: at start, and from the retry
-    /// task. Returns whether the frontier reached the applied frontier.
+    /// task. A chunk at a time, letting go of the locks between chunks so
+    /// apply goes on. Returns whether the frontier reached the applied
+    /// frontier.
     pub fn deliver_pending(&self, reason: ReplayReason) -> bool {
-        let mut delivery = self.lock_delivery();
-        self.catch_up(&mut delivery, reason)
+        loop {
+            let mut delivery = self.lock_delivery();
+            match self.catch_up(&mut delivery, reason) {
+                CatchUp::Done => return true,
+                CatchUp::Stopped => return false,
+                CatchUp::More => {}
+            }
+        }
     }
 
     /// A snapshot install moved this replica to `snapshot_index` without
@@ -331,6 +368,9 @@ impl MetaRaftStore {
         if snapshot_index <= delivery.delivered {
             return;
         }
+        // A newer snapshot's gap starts at the same frontier and covers an
+        // older one still owed (review of #767: it was sent twice).
+        delivery.pending_gap = None;
         let from = delivery.delivered + 1;
         let gap = AuditRecord::gap(
             delivery.node_id,
@@ -355,18 +395,20 @@ impl MetaRaftStore {
         self.save_frontier(delivery, true);
     }
 
-    /// Deliver `(delivered, applied]` from the log, in order, marked
-    /// `replayed`. A range the log no longer holds gets one gap record.
-    fn catch_up(&self, delivery: &mut DeliveryState, reason: ReplayReason) -> bool {
+    /// Deliver up to [`AUDIT_CATCH_UP_CHUNK`] entries above the frontier
+    /// from the log, in order, marked `replayed`. A range the log no longer
+    /// holds gets one gap record.
+    fn catch_up(&self, delivery: &mut DeliveryState, reason: ReplayReason) -> CatchUp {
         if let Some((gap, through)) = delivery.pending_gap.take() {
             if let Err(error) = delivery.send(&gap) {
-                self.sink_failed(delivery, delivery.delivered, &error);
+                let from = delivery.delivered + 1;
+                self.sink_failed(delivery, from, &error);
                 delivery.pending_gap = Some((gap, through));
-                return false;
+                return CatchUp::Stopped;
             }
             delivery.delivered = delivery.delivered.max(through);
         }
-        let (applied, gap, records) = {
+        let (applied, chunk_end, gap, records) = {
             let guard = self.lock();
             let storage = &guard.storage;
             let applied = storage.last_applied();
@@ -374,14 +416,15 @@ impl MetaRaftStore {
                 drop(guard);
                 // A refused gap delivered just now moved the frontier.
                 self.save_frontier(delivery, true);
-                return true;
+                return CatchUp::Done;
             }
             let from = delivery.delivered + 1;
-            let readable = readable_from(storage, from, applied);
-            let gap = (readable > from).then(|| (from, (readable - 1).min(applied)));
+            let (readable, cut_by) = readable_from(storage, from, applied);
+            let gap = (readable > from).then(|| (from, (readable - 1).min(applied), cut_by));
+            let chunk_end = applied.min(readable.saturating_add(AUDIT_CATCH_UP_CHUNK - 1));
             let mut records = Vec::new();
-            if readable <= applied {
-                match storage.log().read_range(readable, applied + 1) {
+            if readable <= chunk_end {
+                match storage.log().read_range(readable, chunk_end + 1) {
                     Ok(entries) => {
                         for entry in entries {
                             let record = match &entry.payload {
@@ -414,32 +457,38 @@ impl MetaRaftStore {
                         crate::transport::warn_rate_limited(
                             "audit-replay-read",
                             &format!(
-                                "could not read log indexes {readable}..={applied} to deliver \
+                                "could not read log indexes {readable}..={chunk_end} to deliver \
                                  their applied audit records ({error}); the node keeps serving \
                                  and tries again within {}s",
                                 crate::audit::AUDIT_RETRY_INTERVAL.as_secs()
                             ),
                         );
-                        return false;
+                        return CatchUp::Stopped;
                     }
                 }
             }
-            (applied, gap, records)
+            (
+                applied,
+                chunk_end.max(readable.saturating_sub(1)),
+                gap,
+                records,
+            )
         };
         self.progress.applied.store(applied, Ordering::Relaxed);
-        if let Some((from, through)) = gap {
-            let record = AuditRecord::gap(delivery.node_id, from, through, GapReason::LogPurged);
+        if let Some((from, through, cut_by)) = gap {
+            let record = AuditRecord::gap(delivery.node_id, from, through, cut_by);
             if let Err(error) = delivery.send(&record) {
                 self.sink_failed(delivery, from, &error);
-                return false;
+                return CatchUp::Stopped;
             }
             eprintln!(
                 "warning: meta node {} could not re-derive the applied audit records for log \
-                 indexes {from}..={through}: the log no longer holds them (record audit.gap). \
-                 Other nodes' audit files hold them: copy them and dedupe on log index",
-                describe_node(delivery.node_id)
+                 indexes {from}..={through} (record audit.gap, {}). Other nodes' audit files \
+                 hold them: copy them and dedupe on log index",
+                describe_node(delivery.node_id),
+                cut_by.as_str(),
             );
-            self.progress.count_gap(GapReason::LogPurged);
+            self.progress.count_gap(cut_by);
             delivery.delivered = through;
         }
         let mut replayed = 0_u64;
@@ -454,17 +503,22 @@ impl MetaRaftStore {
                 self.count_and_report_replay(delivery, reason, replayed, first, last);
                 self.sink_failed(delivery, index, &error);
                 self.save_frontier(delivery, true);
-                return false;
+                return CatchUp::Stopped;
             }
             replayed += 1;
             first.get_or_insert(index);
             last = Some(index);
             delivery.delivered = index;
         }
-        delivery.delivered = delivery.delivered.max(applied);
+        delivery.delivered = delivery.delivered.max(chunk_end);
+        delivery.refused_at = None;
         self.count_and_report_replay(delivery, reason, replayed, first, last);
         self.save_frontier(delivery, true);
-        true
+        if delivery.delivered >= applied {
+            CatchUp::Done
+        } else {
+            CatchUp::More
+        }
     }
 
     fn count_and_report_replay(
@@ -492,7 +546,8 @@ impl MetaRaftStore {
         );
     }
 
-    fn sink_failed(&self, delivery: &DeliveryState, index: u64, error: &str) {
+    fn sink_failed(&self, delivery: &mut DeliveryState, index: u64, error: &str) {
+        delivery.refused_at = Some(std::time::Instant::now());
         let applied = self.progress.applied.load(Ordering::Relaxed);
         crate::transport::warn_rate_limited(
             "audit-sink-refused",
@@ -537,17 +592,34 @@ impl MetaRaftStore {
 }
 
 /// The first index at or above `from` whose entry this replica can read as
-/// the committed one. Below the log's first entry nothing can be read. And
-/// below the newest snapshot only when the log agrees with it at the
-/// snapshot's index (Raft's log matching: the same index and term mean the
-/// same prefix) - after a snapshot install the log below it may be a stale
-/// branch this replica never applied.
-fn readable_from(storage: &crate::storage::MetaStorage, from: u64, applied: u64) -> u64 {
+/// the committed one, and what cut the range below it. Below the log's
+/// first entry nothing can be read (`LogPurged`). Below the newest snapshot
+/// only when the log agrees with it at the snapshot's index (Raft's log
+/// matching: the same index and term mean the same prefix); otherwise the
+/// log below it was replaced by an installed snapshot and may be a stale
+/// branch this replica never applied (`SnapshotInstall`).
+fn readable_from(
+    storage: &crate::storage::MetaStorage,
+    from: u64,
+    applied: u64,
+) -> (u64, GapReason) {
+    let newest = storage.snapshots().newest();
+    let installed_over = |cut_at: u64| {
+        newest
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.last_index >= cut_at.saturating_sub(1))
+    };
     let Some(first_in_log) = storage.log().first_index() else {
-        return applied + 1;
+        let reason = if installed_over(applied + 1) {
+            GapReason::SnapshotInstall
+        } else {
+            GapReason::LogPurged
+        };
+        return (applied + 1, reason);
     };
     let mut readable = from.max(first_in_log);
-    if let Some(snapshot) = storage.snapshots().newest() {
+    let mut reason = GapReason::LogPurged;
+    if let Some(snapshot) = &newest {
         if readable <= snapshot.last_index {
             let agrees = storage
                 .log()
@@ -557,10 +629,11 @@ fn readable_from(storage: &crate::storage::MetaStorage, from: u64, applied: u64)
                 .is_some_and(|entry| entry.term == snapshot.last_term);
             if !agrees {
                 readable = snapshot.last_index + 1;
+                reason = GapReason::SnapshotInstall;
             }
         }
     }
-    readable
+    (readable, reason)
 }
 
 fn describe_node(node_id: Option<u64>) -> String {

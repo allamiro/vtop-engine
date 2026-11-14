@@ -107,8 +107,11 @@ pub fn to_event(record: &AuditRecord, engine: &str) -> AuditEvent {
         event = event.log_term(term);
     }
     // An applied record is timed by its entry, never by this replica's
-    // clock (#706): every replica writes the same time for one entry.
-    if let Some(issued_at_ms) = record.issued_at_ms {
+    // clock (#706), so every replica writes the same time for one entry -
+    // when the entry carries one. `vtopctl` sends 0 unless told
+    // `--issued-at-ms`, and 1970 is no time: such a record keeps the time it
+    // was written (review of #767).
+    if let Some(issued_at_ms) = record.issued_at_ms.filter(|ms| *ms > 0) {
         event = event.time_ms(issued_at_ms);
     }
     event.replayed(record.replayed)
@@ -283,6 +286,38 @@ mod tests {
             assert_eq!(event.params.len(), params.len());
             assert_eq!(event.actor.kind, ActorKind::Anonymous);
         }
+    }
+
+    /// #706 with the review of #767: an applied record is timed by its
+    /// entry's `issued_at_ms`, the same on every replica; an entry stamped 0
+    /// (vtopctl's default) carries no time, and the record keeps the time it
+    /// was written rather than 1970.
+    #[test]
+    fn an_applied_record_is_timed_by_its_entry_when_the_entry_has_a_time() {
+        let command = MetadataCommand::RegisterNode {
+            env: CommandEnvelope {
+                request_id: Uuid::from_u128(0x767),
+                issued_at_ms: 0,
+            },
+            node_uuid: Uuid::from_u128(1),
+            addr: "10.0.0.1:9200".to_owned(),
+            expected_generation: None,
+        };
+        let audit = vtop_meta::audit::command_audit(&command).unwrap();
+        let mut record = AuditRecord::for_command(
+            AuditStage::Applied,
+            AuditActor::Replica(Some(2)),
+            &command,
+            audit,
+            AuditOutcome::Success,
+        );
+        record.issued_at_ms = Some(1_750_000_000_000);
+        assert_eq!(to_event(&record, "meta-2").time, "2025-06-15T15:06:40.000Z");
+        record.issued_at_ms = Some(0);
+        assert!(
+            !to_event(&record, "meta-2").time.starts_with("1970"),
+            "an unstamped entry keeps the write time"
+        );
     }
 
     #[test]

@@ -176,10 +176,12 @@ fn audited_frontier(store: &MetaRaftStore) -> Option<u64> {
 }
 
 /// A sink that refuses leaves the frontier behind, apply goes on, and the
-/// records are delivered - marked replayed, from the log - at the next apply
-/// once the sink takes them again. Before #706 they were gone.
+/// records are delivered - marked replayed, from the log - by the retry once
+/// the sink takes them again. Before #706 they were gone. Within the retry
+/// interval an apply does not retry, so a sink that stays down costs each
+/// apply nothing (review of #767).
 #[tokio::test]
-async fn a_refused_record_is_delivered_again_at_the_next_apply() {
+async fn a_refused_record_is_delivered_again_by_the_retry() {
     let (_sim, env) = sim();
     let entries = workload(6);
     append(&env, &entries);
@@ -203,6 +205,11 @@ async fn a_refused_record_is_delivered_again_at_the_next_apply() {
         .apply(entries[4..].iter().map(raft_entry).collect::<Vec<_>>())
         .await
         .unwrap();
+    assert!(
+        sink.accepted().is_empty(),
+        "an apply within the retry interval does not re-read the backlog"
+    );
+    assert!(store.deliver_pending(ReplayReason::Retry));
     assert_eq!(
         sink.indexes(),
         audited_indexes(&entries).into_iter().collect::<Vec<_>>(),
@@ -298,8 +305,8 @@ async fn a_clean_restart_delivers_nothing_again() {
 }
 
 /// A snapshot install brings entries this replica never applied one by one:
-/// one gap record names them, and the frontier moves to the snapshot even
-/// when the sink refuses the gap record (which is delivered next time).
+/// one gap record names them. While the sink refuses it the frontier stays
+/// where it was; once it is delivered the frontier moves to the snapshot.
 #[tokio::test]
 async fn a_snapshot_install_writes_one_gap_record_and_moves_the_frontier() {
     let sim = SimStorage::new();
@@ -394,8 +401,10 @@ async fn a_refused_snapshot_gap_survives_a_restart() {
     let snapshot = leader.write_snapshot().unwrap();
     let bytes = env.storage.read(&snapshot.path).unwrap();
 
-    // The follower holds a stale branch of term 1 it never applied.
-    append(&env, &workload(4));
+    // The follower holds a stale branch of term 1 it never applied, reaching
+    // past the snapshot, so reopening keeps it and only the log-matching
+    // check in `readable_from` stands between it and a replay.
+    append(&env, &workload(12));
     let refusing = Sink::refusing();
     let (store, mut machine) = open(&env, &refusing);
     let membership = openraft::Membership::new(
@@ -427,6 +436,7 @@ async fn a_refused_snapshot_gap_survives_a_restart() {
     let params: BTreeMap<_, _> = gaps[0].params.iter().cloned().collect();
     assert_eq!(params["from_index"], "1");
     assert_eq!(params["through_index"], "10");
+    assert_eq!(params["reason"], "snapshot_install");
     assert!(
         sink.indexes().is_empty(),
         "the stale branch was read: {:?}",
@@ -537,48 +547,104 @@ async fn a_log_purged_past_the_frontier_is_named_by_a_gap_record() {
     assert_eq!(audited_frontier(&store), Some(9));
 }
 
-/// A crash before every storage operation of an apply, then a restart:
-/// every audited entry the restarted replica has applied was delivered at
-/// least once across the two lives, nothing at or below the persisted audit
-/// frontier is delivered again, and the frontier never passes `applied`.
+/// A sink that appends each record's log index to a file on the same
+/// simulated disk and syncs it, so a crash can land between a record reaching
+/// the sink and the audit frontier being saved (review of #767: an in-memory
+/// sink never left that window open).
+struct DiskSink {
+    env: Env,
+}
+
+const SINK_FILE: &str = "/n/audit.sink";
+
+impl Auditor for DiskSink {
+    fn record(&self, record: &AuditRecord) -> Result<(), String> {
+        use std::io::{Seek, SeekFrom, Write};
+        let Some(index) = record.log_index else {
+            return Ok(());
+        };
+        let path = Path::new(SINK_FILE);
+        let mut file = self
+            .env
+            .storage
+            .open(path, vtop_log::env::OpenMode::CreateAppend)
+            .map_err(|e| e.to_string())?;
+        file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+        file.write_all(format!("{index}\n").as_bytes())
+            .and_then(|()| file.sync_data())
+            .map_err(|e| e.to_string())?;
+        self.env
+            .storage
+            .sync_dir(Path::new("/n"))
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn sunk(env: &Env) -> Vec<u64> {
+    let bytes = env.storage.read(Path::new(SINK_FILE)).unwrap_or_default();
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(|line| line.parse().ok())
+        .collect()
+}
+
+/// A crash before every storage operation of three applies - the record
+/// writes of the sink among them - then a restart: every audited entry the
+/// restarted replica has applied reached the sink at least once across the
+/// two lives, nothing at or below the persisted audit frontier reached it
+/// again, and the frontier never passes `applied`.
 #[tokio::test]
 async fn a_crash_at_every_write_of_an_apply_loses_no_applied_record() {
     let sim = SimStorage::new();
     sim.create_dir_all(Path::new("/n"));
     let env = sim.env(0x709);
-    let entries = workload(6);
+    let entries = workload(9);
     append(&env, &entries);
     let disk = sim.snapshot();
+    // Two audited, one node-initiated only, then the rest.
+    let batches: [std::ops::Range<usize>; 3] = [0..2, 2..3, 3..9];
+    let open_on_disk = |env: &Env| {
+        let store = MetaRaftStore::open_in(env, "/n", cluster()).unwrap();
+        store.set_audit_sink(Arc::new(DiskSink { env: env.clone() }));
+        let machine = MetaRaftStateMachine::new(store.clone()).with_node_id(NODE_ID);
+        (store, machine)
+    };
 
-    // A dry run counts the operations one apply performs.
+    // A dry run counts the operations of the three applies.
     let ops = {
-        let sink = Arc::new(Sink::default());
-        let (_store, mut machine) = open(&env, &sink);
+        let (_store, mut machine) = open_on_disk(&env);
         let before = sim.op_count();
-        machine
-            .apply(entries.iter().map(raft_entry).collect::<Vec<_>>())
-            .await
-            .unwrap();
+        for batch in batches.clone() {
+            machine
+                .apply(entries[batch].iter().map(raft_entry).collect::<Vec<_>>())
+                .await
+                .unwrap();
+        }
         sim.op_count() - before
     };
-    assert!(ops > 3, "an apply writes the applied and audit frontiers");
+    assert!(ops > 10, "{ops} operations");
 
     for crash_at in 0..=ops {
         sim.restore(&disk);
-        let first = Arc::new(Sink::default());
-        let (store, mut machine) = open(&env, &first);
+        let (store, mut machine) = open_on_disk(&env);
         let base = sim.op_count();
         sim.set_fault(FaultPlan::CrashBefore(base + crash_at));
-        let _ = machine
-            .apply(entries.iter().map(raft_entry).collect::<Vec<_>>())
-            .await;
+        for batch in batches.clone() {
+            if machine
+                .apply(entries[batch].iter().map(raft_entry).collect::<Vec<_>>())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
         drop((store, machine));
         sim.set_fault(FaultPlan::None);
         sim.crash();
         sim.reboot();
 
-        let second = Arc::new(Sink::default());
-        let (store, _machine) = open(&env, &second);
+        let first_life = sunk(&env);
+        let (store, _machine) = open_on_disk(&env);
         let (applied, persisted) =
             store.with_storage(|s| (s.last_applied(), s.audited_frontier().unwrap()));
         assert!(
@@ -586,14 +652,14 @@ async fn a_crash_at_every_write_of_an_apply_loses_no_applied_record() {
             "crash at op {crash_at}: audit frontier {persisted} passed applied {applied}"
         );
         assert!(store.deliver_pending(ReplayReason::Restart));
-        let redelivered = second.indexes();
+        let all = sunk(&env);
+        let redelivered = &all[first_life.len()..];
         assert!(
             redelivered.iter().all(|index| *index > persisted),
             "crash at op {crash_at}: {redelivered:?} re-delivered at or below the frontier \
              {persisted}"
         );
-        let mut seen: BTreeSet<u64> = first.indexes().into_iter().collect();
-        seen.extend(redelivered);
+        let seen: BTreeSet<u64> = all.iter().copied().collect();
         let owed: BTreeSet<u64> = audited_indexes(&entries)
             .into_iter()
             .filter(|index| *index <= applied)
@@ -603,6 +669,108 @@ async fn a_crash_at_every_write_of_an_apply_loses_no_applied_record() {
             "crash at op {crash_at}: applied through {applied}, owed {owed:?}, delivered \
              {seen:?}"
         );
-        assert!(second.gaps().is_empty(), "crash at op {crash_at}");
     }
+}
+
+/// Review of #767: a backlog left by a long sink outage is delivered a
+/// bounded chunk at a time. An apply after the retry interval delivers one
+/// chunk and lets apply go on; the retry delivers the rest, in order, each
+/// record once.
+#[tokio::test]
+async fn a_backlog_is_delivered_in_bounded_chunks() {
+    let (_sim, env) = sim();
+    let total = 700_u64;
+    let entries: Vec<MetaLogEntry> = (1..=total).map(|index| entry(1, index, true)).collect();
+    append(&env, &entries);
+    let sink = Sink::refusing();
+    let (store, mut machine) = open(&env, &sink);
+    machine
+        .apply(entries[..600].iter().map(raft_entry).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert_eq!(store.audit_progress().lag(), 600);
+
+    sink.refusing.store(false, Ordering::SeqCst);
+    // The retry delivers everything, a chunk per pass, letting go of the
+    // locks in between.
+    assert!(store.deliver_pending(ReplayReason::Retry));
+    assert_eq!(sink.indexes(), (1..=600).collect::<Vec<_>>());
+    machine
+        .apply(entries[600..].iter().map(raft_entry).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert_eq!(sink.indexes(), (1..=total).collect::<Vec<_>>());
+    assert_eq!(store.audit_progress().lag(), 0);
+}
+
+/// Review of #767: a snapshot's refused gap record is replaced, not repeated,
+/// by a newer snapshot's gap, which starts at the same frontier and covers
+/// it.
+#[tokio::test]
+async fn a_newer_snapshot_gap_replaces_a_refused_older_one() {
+    let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/leader"));
+    sim.create_dir_all(Path::new("/n"));
+    let env = sim.env(0x70c);
+    let mut leader = MetaStorage::open_in(&env, "/leader", cluster()).unwrap();
+    let mut entries = workload(20);
+    entries[0] = MetaLogEntry {
+        term: 1,
+        index: 1,
+        payload: MetaLogPayload::Membership(MetaMembership {
+            voters: vec![MetaNodeId(1), MetaNodeId(2)],
+            learners: vec![],
+            joint_outgoing: None,
+        }),
+    };
+    leader.append(&entries).unwrap();
+    leader.apply_through(10).unwrap();
+    let first = leader.write_snapshot().unwrap();
+    let first_bytes = env.storage.read(&first.path).unwrap();
+    leader.apply_through(20).unwrap();
+    let second = leader.write_snapshot().unwrap();
+    let second_bytes = env.storage.read(&second.path).unwrap();
+    let meta = |last: u64, id: &str| SnapshotMeta {
+        last_log_id: Some(LogId::new(CommittedLeaderId::new(1, 0), last - 1)),
+        last_membership: StoredMembership::new(
+            Some(LogId::new(CommittedLeaderId::new(1, 0), 0)),
+            openraft::Membership::new(
+                vec![std::collections::BTreeSet::from([1u64, 2u64])],
+                None::<BTreeSet<u64>>,
+            ),
+        ),
+        snapshot_id: id.to_owned(),
+    };
+
+    let sink = Sink::refusing();
+    let (store, mut machine) = open(&env, &sink);
+    machine
+        .install_snapshot(
+            &meta(10, &first.snapshot_id),
+            Box::new(Cursor::new(first_bytes)),
+        )
+        .await
+        .unwrap();
+    sink.refusing.store(false, Ordering::SeqCst);
+    machine
+        .install_snapshot(
+            &meta(20, &second.snapshot_id),
+            Box::new(Cursor::new(second_bytes)),
+        )
+        .await
+        .unwrap();
+    assert!(store.deliver_pending(ReplayReason::Retry));
+    let gaps: Vec<(String, String)> = sink
+        .gaps()
+        .iter()
+        .map(|gap| {
+            let params: BTreeMap<_, _> = gap.params.iter().cloned().collect();
+            (
+                params["from_index"].clone(),
+                params["through_index"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(gaps, vec![("1".to_owned(), "20".to_owned())]);
+    assert_eq!(audited_frontier(&store), Some(20));
 }

@@ -86,7 +86,12 @@ pub async fn start_meta_node(
             let Some(store) = retry_store.upgrade() else {
                 return;
             };
-            store.deliver_pending(super::audit_delivery::ReplayReason::Retry);
+            // Off the async workers: a recovering sink fsyncs per record
+            // (review of #767).
+            let _ = tokio::task::spawn_blocking(move || {
+                store.deliver_pending(super::audit_delivery::ReplayReason::Retry)
+            })
+            .await;
         }
     });
     let network = TlsRaftNetworkFactory::new(node_id, directory, material);

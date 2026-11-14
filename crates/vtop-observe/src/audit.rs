@@ -732,6 +732,40 @@ pub struct Recorded {
 struct FileSink {
     path: PathBuf,
     file: File,
+    /// A write failed part-way and the partial line could not be cut off:
+    /// the next record starts on a new line, so it is not glued to the
+    /// fragment and lost to every reader (review of #767).
+    needs_newline: bool,
+}
+
+impl FileSink {
+    /// Append one record as one line. A write that fails part-way (a full
+    /// disk) leaves a fragment: it is cut off again, and when it cannot be,
+    /// the next record starts on a new line. Either way every record that
+    /// is reported written is a line of its own that a reader parses.
+    fn append_line(&mut self, json: &str) -> std::io::Result<()> {
+        let before = self.file.metadata().map(|m| m.len()).ok();
+        let mut line = String::with_capacity(json.len() + 2);
+        if self.needs_newline {
+            line.push('\n');
+        }
+        line.push_str(json);
+        line.push('\n');
+        let written = self
+            .file
+            .write_all(line.as_bytes())
+            .and_then(|()| self.file.sync_data());
+        match &written {
+            Ok(()) => self.needs_newline = false,
+            Err(_) => {
+                let cut = before.is_some_and(|len| self.file.set_len(len).is_ok());
+                if !cut {
+                    self.needs_newline = true;
+                }
+            }
+        }
+        written
+    }
 }
 
 /// The process's sinks and counters. One global ([`record`]); tests build
@@ -772,6 +806,7 @@ impl AuditSink {
         *self.file.lock().unwrap_or_else(|e| e.into_inner()) = Some(FileSink {
             path: path.to_owned(),
             file,
+            needs_newline: false,
         });
         Ok(())
     }
@@ -822,10 +857,7 @@ impl AuditSink {
         }
         let mut guard = self.file.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(sink) = guard.as_mut() {
-            let written = sink
-                .file
-                .write_all(format!("{json}\n").as_bytes())
-                .and_then(|()| sink.file.sync_data());
+            let written = sink.append_line(&json);
             if let Err(e) = written {
                 let path = sink.path.clone();
                 drop(guard);
@@ -1104,6 +1136,52 @@ fn passwd_lookup(text: &str, uid: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review of #767: a write that failed part-way leaves a fragment the
+    /// next record must not be glued to, or the retried record is lost to
+    /// every reader. A fragment that could not be cut off is followed by a
+    /// newline before the next record.
+    #[test]
+    fn a_record_after_a_torn_write_is_still_a_line_of_its_own() {
+        let dir = std::env::temp_dir().join(format!("vtop-767-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let sink = AuditSink::default();
+        sink.open_file(&path).unwrap();
+        let event = || {
+            AuditEvent::new(
+                Action::ClusterPropose,
+                Stage::Applied,
+                Actor::replica("meta-1"),
+                Target::new("cluster", None),
+                Outcome::Success,
+            )
+        };
+        sink.record(&event()).unwrap();
+        {
+            let mut guard = sink.file.lock().unwrap();
+            let file_sink = guard.as_mut().unwrap();
+            file_sink
+                .file
+                .write_all(br#"{"audit_version":1,"aud"#)
+                .unwrap();
+            file_sink.needs_newline = true;
+        }
+        sink.record(&event()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(serde_json::from_str::<AuditEvent>(lines[0]).is_ok());
+        assert!(
+            serde_json::from_str::<AuditEvent>(lines[1]).is_err(),
+            "the fragment"
+        );
+        assert!(
+            serde_json::from_str::<AuditEvent>(lines[2]).is_ok(),
+            "the record after the fragment parses: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use tracing_subscriber::layer::SubscriberExt;
 
     /// Log lines captured in memory.

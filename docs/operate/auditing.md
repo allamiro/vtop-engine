@@ -78,7 +78,7 @@ ever added to version 1, and a reader ignores what it does not know.
 | `correlation.trace_id`, `span_id` | The OpenTelemetry trace the command ran in, when export is on (#683): the same ids its JSON log lines carry. |
 | `correlation.log_index` | The metadata log index a cluster command committed at. Dedupe applied records on the engine and this index: a replica delivers each of its applied records at least once (#706), so a crash can repeat one, marked `replayed`. A follower that redirects a request to the leader writes no edge record; the leader does. |
 | `correlation.log_term` | On an applied record, the entry's term (#706). With the index it names the entry, the same on every replica. |
-| `time` | When the record was written; on an applied record of a command, the entry's own `issued_at_ms` as its proposer stamped it, never the replica's clock, so every replica writes the same time (#706). Membership entries carry no time of their own: their applied records and `audit.gap` records are timed by the replica. |
+| `time` | When the record was written. On an applied record of a command, the entry's own `issued_at_ms` as its proposer stamped it, never the replica's clock, so every replica writes the same time (#706). That stamp is the proposer's claim, not checked against any clock. An entry stamped 0 carries no time: `vtopctl meta` sends 0 unless given `--issued-at-ms`, except for `enable-features`, which stamps the current time. Its applied records, membership records and `audit.gap` records are timed by the replica that writes them. |
 | `replayed` | `true` on a record delivered again after a crash, a refusing sink or a restart (#706); it may duplicate one this replica already wrote. Absent means false. |
 | `engine` | The engine's `engine.name`, `meta-<id>` for a metadata node, or a data node's UUID. |
 
@@ -119,6 +119,17 @@ sinks (#706). The frontier is saved only after delivery, so:
   `audit.gap` record naming the index range and why, and a warning. The other
   replicas wrote their own records for those entries: copy their audit files
   and dedupe on `engine` and `correlation.log_index`.
+
+While the sink refuses, an apply does not try again within the 10-second
+retry interval, and a backlog is delivered at most 256 entries at a time, so
+neither a failing sink nor its recovery stalls the metadata tier. A write to
+the audit file that fails part-way is cut off again, or the next record
+starts on a new line, so a re-delivered record is never glued to a fragment.
+
+If `meta.audited` is damaged, the node refuses to start and names the file.
+Removing it re-pins the frontier at the applied index on the next start:
+the records it still owed are not re-delivered by that node, and the other
+replicas' files hold theirs.
 
 With no `VTOP_AUDIT_LOG`, the log stream is the only sink, and the guarantee
 covers a process crash only: what the log pipeline does after it is outside
@@ -252,8 +263,11 @@ log, the file and the table. Alert on any increase of
 `vtop_audit_write_failures_total`, and look at a rising
 `vtop_audit_events_total{outcome="refused"}`. On metadata nodes, alert when
 `vtop_audit_delivery_lag_entries` stays above 0 for more than a minute (a
-failing sink), and on any increase of `vtop_audit_gaps_total` (copy the other
-replicas' audit files for the range the `audit.gap` record names).
+failing sink), and on any increase of `vtop_audit_gaps_total{reason="log_purged"}`
+(copy the other replicas' audit files for the range the `audit.gap` record
+names). `reason="snapshot_install"` is routine: a node added or replaced
+catches up by snapshot, and its gap names entries it never applied. It is
+worth a look only when no node was added or replaced.
 
 ## Compatibility
 
