@@ -302,6 +302,67 @@ impl TlsRaftNetworkFactory {
     }
 }
 
+impl TlsRaftNetworkFactory {
+    /// How this node asks the other metadata members what they run (#706):
+    /// over the same peer plane, with the same identity and directory, as
+    /// its Raft RPCs.
+    pub fn member_probe(&self) -> Arc<dyn crate::raft::consensus::MemberVersionProbe> {
+        Arc::new(PeerMemberProbe {
+            directory: self.directory.clone(),
+            material: self.material.clone(),
+            source: self.source,
+        })
+    }
+}
+
+/// [`crate::raft::consensus::MemberVersionProbe`] over the peer plane.
+struct PeerMemberProbe {
+    directory: PeerDirectory,
+    material: Option<Arc<TlsMaterialOwned>>,
+    source: NodeId,
+}
+
+#[async_trait]
+impl crate::raft::consensus::MemberVersionProbe for PeerMemberProbe {
+    async fn ask(&self, member: MetaNodeId) -> crate::versions::MemberVersion {
+        use crate::transport::peer::VersionAskError;
+        use crate::transport::wire::PeerVersionRequest;
+        use crate::versions::MemberVersion;
+        let Some(endpoint) = self.directory.get(member.0) else {
+            // A name that has not resolved yet: look again for next time,
+            // and say so now.
+            let directory = self.directory.clone();
+            tokio::spawn(async move { directory.re_resolve(member.0).await });
+            return MemberVersion::Unreachable("no peer address in the directory".to_owned());
+        };
+        let client = match &self.material {
+            Some(material) => {
+                match PeerClient::new(material.to_material(), endpoint.server_name, member) {
+                    Ok(client) => client,
+                    Err(error) => return MemberVersion::Unreachable(error.to_string()),
+                }
+            }
+            None => PeerClient::plaintext(endpoint.server_name, member),
+        };
+        let request = PeerVersionRequest {
+            from: MetaNodeId(self.source),
+        };
+        match client.version(endpoint.addr, &request).await {
+            Ok(answer) => MemberVersion::Reported {
+                node_id: answer.node_id,
+                release: answer.release,
+                supported_feature_level: answer.supported_feature_level,
+            },
+            Err(VersionAskError::NoAnswer) => MemberVersion::NoAnswer,
+            Err(VersionAskError::Unreachable(error)) => {
+                let directory = self.directory.clone();
+                tokio::spawn(async move { directory.re_resolve(member.0).await });
+                MemberVersion::Unreachable(error.to_string())
+            }
+        }
+    }
+}
+
 impl RaftNetworkFactory<MetaRaftTypeConfig> for TlsRaftNetworkFactory {
     type Network = TlsRaftNetwork;
 

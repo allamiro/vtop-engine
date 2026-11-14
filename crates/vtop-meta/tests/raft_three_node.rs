@@ -1854,3 +1854,216 @@ async fn the_promotion_override_never_reaches_a_log_below_level_8() {
         );
     }
 }
+
+/// #706: a raise to a level only the metadata tier reads waits for every
+/// metadata member to show it implements the level. Data nodes are judged
+/// from their replicated reports (#634); members are asked by the leader
+/// before it proposes, because a v0.9.0 voter cannot report and its state
+/// machine would reject the level deterministically - a diverged view and,
+/// at the first command of that level, a voter that appends nothing more.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_raise_to_level_9_waits_for_every_metadata_member() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use vtop_meta::{
+        Consensus, ConsensusError, MemberVersion, MemberVersionProbe, MetaNodeId,
+        OpenraftConsensus, FIRST_MEMBER_CHECKED_FEATURE_LEVEL, PROMOTE_UNPROVEN_FEATURE_LEVEL,
+    };
+
+    /// Answers for each member as the test says, counting the questions.
+    struct Members {
+        answers: BTreeMap<u64, MemberVersion>,
+        asked: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl MemberVersionProbe for Members {
+        async fn ask(&self, member: MetaNodeId) -> MemberVersion {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            self.answers
+                .get(&member.0)
+                .cloned()
+                .unwrap_or(MemberVersion::Unreachable("not in the test".into()))
+        }
+    }
+    let reported = |id: u64, level: u32| MemberVersion::Reported {
+        node_id: MetaNodeId(id),
+        release: "0.10.0".to_owned(),
+        supported_feature_level: level,
+    };
+
+    let seed = SEED ^ 0x706;
+    let mut cluster = Cluster::boot(seed).await;
+    let leader = cluster.leader_id();
+    let others: Vec<u64> = cluster
+        .nodes
+        .keys()
+        .copied()
+        .filter(|id| *id != leader)
+        .collect();
+    let (upgraded, old) = (others[0], others[1]);
+    let last_log = |cluster: &Cluster| {
+        cluster
+            .leader()
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0)
+    };
+    let level_on = |cluster: &Cluster| {
+        cluster
+            .leader()
+            .store
+            .with_storage(|s| s.state().feature_level())
+    };
+    let raise = |env: CommandEnvelope, level: u32| MetadataCommand::SetFeatureLevel {
+        env,
+        feature_level: level,
+    };
+
+    // One member upgraded, one still on v0.9.0: it closes the connection on
+    // a question it has no arm for.
+    let mixed = Arc::new(Members {
+        answers: BTreeMap::from([
+            (
+                upgraded,
+                reported(upgraded, FIRST_MEMBER_CHECKED_FEATURE_LEVEL),
+            ),
+            (old, MemberVersion::NoAnswer),
+        ]),
+        asked: AtomicUsize::new(0),
+    });
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone())
+        .with_member_probe(mixed.clone());
+
+    // Up to 8 the members are not asked: a v0.9.0 voter implements 8 and
+    // cannot answer, so asking would refuse a raise it can apply.
+    let env = cluster.envelope();
+    consensus
+        .propose(raise(env, PROMOTE_UNPROVEN_FEATURE_LEVEL))
+        .await
+        .unwrap();
+    assert_eq!(mixed.asked.load(Ordering::SeqCst), 0, "seed={seed:#x}");
+    assert_eq!(level_on(&cluster), PROMOTE_UNPROVEN_FEATURE_LEVEL);
+
+    // 9 is refused while the old member is there, naming it, and nothing
+    // reaches the log.
+    let before = last_log(&cluster);
+    let env = cluster.envelope();
+    match consensus
+        .propose(raise(env, FIRST_MEMBER_CHECKED_FEATURE_LEVEL))
+        .await
+    {
+        Err(error @ ConsensusError::MembersNotReady { .. }) => {
+            let text = error.to_string();
+            assert!(text.contains("feature level 9 not raised"), "{text}");
+            assert!(text.contains("the level stays 8"), "{text}");
+            assert!(
+                text.contains(&format!("{old} (no answer: v0.9.0 or older")),
+                "{text}"
+            );
+            assert!(
+                !text.contains(&format!("{upgraded} (")),
+                "the upgraded member is not a blocker: {text}"
+            );
+        }
+        other => panic!("a raise past an old member was not refused (seed={seed:#x}): {other:?}"),
+    }
+    assert_eq!(mixed.asked.load(Ordering::SeqCst), 2, "both others asked");
+    assert_eq!(
+        last_log(&cluster),
+        before,
+        "the refused raise reached the log"
+    );
+    assert_eq!(level_on(&cluster), PROMOTE_UNPROVEN_FEATURE_LEVEL);
+
+    // The admin plane carries it as a refusal, not an unknown outcome.
+    match vtop_meta::transport::AdminHandler::propose(
+        &consensus,
+        raise(cluster.envelope(), FIRST_MEMBER_CHECKED_FEATURE_LEVEL),
+    )
+    .await
+    {
+        Err(vtop_meta::TransportError::Refused(text)) => {
+            assert!(text.contains("Upgrade them, then raise again"), "{text}")
+        }
+        other => panic!("not carried as a refusal (seed={seed:#x}): {other:?}"),
+    }
+
+    // A node that cannot ask refuses rather than trusting.
+    let blind = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone());
+    let env = cluster.envelope();
+    let unasked = blind
+        .propose(raise(env, FIRST_MEMBER_CHECKED_FEATURE_LEVEL))
+        .await;
+    assert!(
+        matches!(
+            unasked,
+            Err(ConsensusError::MembersNotReady { ref blockers, .. })
+                if others.iter().all(|other| blockers.iter().any(|blocker| {
+                    blocker.member == MetaNodeId(*other)
+                        && matches!(blocker.answer, MemberVersion::Unreachable(_))
+                }))
+        ),
+        "seed={seed:#x}: {unasked:?}"
+    );
+
+    // A follower does not judge or write: it sends the caller to the leader.
+    let on_follower = OpenraftConsensus::new(cluster.nodes[&upgraded].raft.clone())
+        .with_store(cluster.nodes[&upgraded].store.clone())
+        .with_member_probe(mixed.clone());
+    let asked = mixed.asked.load(Ordering::SeqCst);
+    let env = cluster.envelope();
+    assert!(
+        matches!(
+            on_follower
+                .propose(raise(env, FIRST_MEMBER_CHECKED_FEATURE_LEVEL))
+                .await,
+            Err(ConsensusError::NotLeader { leader: Some(id) }) if id == MetaNodeId(leader)
+        ),
+        "seed={seed:#x}"
+    );
+    assert_eq!(mixed.asked.load(Ordering::SeqCst), asked);
+    assert_eq!(last_log(&cluster), before);
+
+    // Every other member upgraded: the leader judges itself too. A build
+    // that implements 9 raises it; this one implements 8, so the leader
+    // names itself and nothing else.
+    let ready = Arc::new(Members {
+        answers: BTreeMap::from([
+            (
+                upgraded,
+                reported(upgraded, FIRST_MEMBER_CHECKED_FEATURE_LEVEL),
+            ),
+            (old, reported(old, FIRST_MEMBER_CHECKED_FEATURE_LEVEL)),
+        ]),
+        asked: AtomicUsize::new(0),
+    });
+    let consensus = OpenraftConsensus::new(cluster.leader().raft.clone())
+        .with_store(cluster.leader().store.clone())
+        .with_member_probe(ready.clone());
+    let env = cluster.envelope();
+    let judged = consensus
+        .propose(raise(env, FIRST_MEMBER_CHECKED_FEATURE_LEVEL))
+        .await;
+    if vtop_meta::SUPPORTED_FEATURE_LEVEL >= FIRST_MEMBER_CHECKED_FEATURE_LEVEL {
+        assert_eq!(
+            judged.unwrap().response,
+            MetadataResponse::Ack {
+                generation: u64::from(FIRST_MEMBER_CHECKED_FEATURE_LEVEL)
+            }
+        );
+    } else {
+        match judged {
+            Err(ConsensusError::MembersNotReady { ref blockers, .. }) => assert_eq!(
+                blockers.iter().map(|b| b.member).collect::<Vec<_>>(),
+                vec![MetaNodeId(leader)],
+                "only the leader itself, which implements {}",
+                vtop_meta::SUPPORTED_FEATURE_LEVEL
+            ),
+            other => panic!("the leader did not judge itself (seed={seed:#x}): {other:?}"),
+        }
+    }
+    assert_eq!(ready.asked.load(Ordering::SeqCst), 2);
+}

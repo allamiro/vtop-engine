@@ -1365,6 +1365,17 @@ Short procedures now; expand into a full ops runbook before go-live.
   remains is the one way to stall the tier - that voter cannot decode the
   raise itself. A node that refuses to start with "written by a newer
   release" is an old binary on a newer log: upgrade it.
+  From level 9 on (#706) the leader checks this itself: before it proposes
+  the raise it asks every metadata voter and learner over the peer plane
+  what release it runs and the highest level it implements, and refuses -
+  proposing nothing - unless each answers that it supports the level. The
+  refusal names each member and what it answered: a release and level, "no
+  answer" (v0.9.0 or older has no answer to the question and closes the
+  connection), or why it could not be reached. Levels up to 8 are still
+  raised on the operator's word, because a v0.9.0 voter implements 8 but
+  cannot answer. The check runs when the raise is proposed, not when it is
+  applied: what a member answers is not replicated state, so add a voter on
+  an older release after a raise and that voter stalls as before.
 - **Upgrade the data nodes (#634): roll, verify, finalize.** Once metadata
   is at feature level 7, every data node with a `lease` block reports its
   release, the replica protocol it speaks and the feature level it

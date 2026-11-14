@@ -652,6 +652,11 @@ async fn dispatch_admin(
                             ));
                         }
                     }
+                    // Refused before anything was proposed (#706).
+                    Err(TransportError::Refused(reason)) => {
+                        record.outcome = crate::audit::AuditOutcome::Refused;
+                        record.reason = Some(reason.clone());
+                    }
                     // A transport error, a timeout above all, leaves the
                     // outcome unknown: the entry may still commit.
                     Err(error) => {
