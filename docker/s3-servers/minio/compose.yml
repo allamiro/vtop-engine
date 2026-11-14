@@ -1,0 +1,63 @@
+# The S3 compatibility matrix's MinIO leg (#722): the lab's MinIO, built from
+# source by docker/minio/Dockerfile (#507: no registry serves its images), so
+# this leg pins a commit there rather than a digest here. The baseline every
+# other server is compared with.
+#
+# Every server's compose file has the same two services, and server.env
+# beside it says how the tests reach it, so the CI leg and scripts/s3-lab.sh
+# are one script for all of them:
+#   server  the store, on a loopback port;
+#   init    the pinned aws-cli one-shot that waits for it and creates the
+#           buckets (docker/s3-servers/init/bootstrap.sh).
+# LAB-ONLY credentials; the loopback bind is the boundary.
+name: vtop-s3-minio
+
+services:
+  server:
+    build:
+      context: ../../minio
+    image: vtop-minio:RELEASE.2025-09-07T16-13-09Z
+    pull_policy: never
+    command: server /data
+    ports:
+      - "127.0.0.1:9000:9000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    pids_limit: 512
+    mem_limit: 1g
+    read_only: true
+    tmpfs: [/tmp]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - data:/data
+
+  init:
+    # amazon/aws-cli 2.40.3, pinned by digest (D7, D8).
+    image: amazon/aws-cli:2.40.3@sha256:33a16c53ea442e918b58df67301ad76a8fb57082c39f7e78753b898c3f3e87c2
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    pids_limit: 256
+    mem_limit: 256m
+    read_only: true
+    tmpfs: [/tmp]
+    entrypoint: ["/bin/sh", "/bootstrap.sh"]
+    environment:
+      HOME: /tmp
+      S3_ENDPOINT: http://server:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      CREATE_LOCKED: "true"
+      # Bucket setup only: no store should fail it for a checksum the CLI
+      # adds by default. The tests run both checksum modes themselves.
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    volumes:
+      - ../init/bootstrap.sh:/bootstrap.sh:ro
+    depends_on: [server]
+
+volumes:
+  data:

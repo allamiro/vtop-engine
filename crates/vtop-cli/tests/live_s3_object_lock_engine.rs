@@ -15,7 +15,7 @@
 //!  --test live_s3_object_lock_engine -- --ignored --test-threads=1`
 //! The objects it writes are under a one-day governance retention; the test
 //! deletes them with `x-amz-bypass-governance-retention`, which the lab's
-//! root credentials may use. CI runs it in the `minio-integration` job.
+//! root credentials may use. CI runs it in the `s3-compat` matrix (#722).
 //! `VTOP_TEST_S3_SERVER` names the server and its capability file (#722).
 #![cfg(unix)]
 

@@ -125,13 +125,12 @@ jobs:
               - 'rust-toolchain*'
               - '.github/workflows/ci.yml'
 
-            # `cargo test -p vtop-upload --test live_s3_*` and
-            # `--test transport_conformance` against the lab's MinIO, and
-            # `cargo test -p vtop-cli --test live_s3_object_lock_engine` (#684),
-            # the engine end to end. vtop-cli depends on every workspace crate
-            # except vtop-node (as the kafka filter says), plus the MinIO build
-            # (docker/minio/**) and the compose file that runs it and creates
-            # the buckets.
+            # The S3 compatibility matrix (#722): the live S3 tests of
+            # vtop-upload and vtop-cli against every server under
+            # docker/s3-servers/. vtop-cli depends on every workspace crate
+            # except vtop-node (as the kafka filter says), plus the test kit,
+            # the capability files, the MinIO build (docker/minio/**), the
+            # servers' compose files and the script every leg runs.
             minio:
               - 'crates/vtop-adapters/**'
               - 'crates/vtop-broker/**'
@@ -146,7 +145,8 @@ jobs:
               - 'crates/vtop-s3-testkit/**'
               - 'tests/s3-compat/**'
               - 'docker/minio/**'
-              - 'docker-compose.yml'
+              - 'docker/s3-servers/**'
+              - 'scripts/s3-lab.sh'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -267,6 +267,10 @@ jobs:
               # no second chance to get it right before people see it. Lint it
               # on the pull request instead.
               - 'scripts/release-notes.sh'
+              # The S3 compatibility matrix's scripts (#722): every leg runs
+              # them, and the bootstrap runs inside each server's init.
+              - 'scripts/s3-lab.sh'
+              - 'docker/s3-servers/**'
               - '.github/workflows/**'
 
             # `scripts/live-chaos/run-all.sh`. The harness drives real
@@ -1125,7 +1129,8 @@ jobs:
             scripts/k8s-smoke.sh scripts/e2e-smoke.sh scripts/upgrade-compat.sh \
             scripts/manifest-compat.sh \
             scripts/traffic-snapshot.sh scripts/test-progress.sh \
-            scripts/check-naming.sh scripts/check-egress-claims.sh
+            scripts/check-naming.sh scripts/check-egress-claims.sh \
+            scripts/s3-lab.sh docker/s3-servers/init/bootstrap.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
@@ -1257,21 +1262,18 @@ jobs:
           VTOP_TEST_KAFKA: localhost:9092
         run: cargo test -p vtop-cli --test integration_kafka_to_minio -- --ignored
 
-  # The live S3 tests against a real store (#668). They are `#[ignore]` and
-  # need `VTOP_TEST_S3_ENDPOINT`, so until this job they ran only by hand:
-  # the multipart resume test (#668) proved the store keeps the parts that
-  # completed only on someone's laptop. They run here against the lab's
-  # MinIO, the same release the compose lab and the e2e smoke use.
+  # The S3 compatibility matrix (#722): the live S3 tests, built once, run
+  # against each server in docker/s3-servers/ with its capability file
+  # (tests/s3-compat/servers/<id>.yaml) saying what the server is expected to
+  # do. They are `#[ignore]` and need `VTOP_TEST_S3_ENDPOINT`, so without this
+  # they would run only by hand. It replaces the single MinIO job (#707).
   #
-  # MinIO is BUILT from source (docker/minio/Dockerfile), not pulled: no
-  # registry serves its images any more (`docker manifest inspect` finds
-  # neither the pinned release tag nor `latest` on Docker Hub or quay.io).
-  # The Dockerfile pins the release by commit and its base images by digest.
-  # Compose runs the server on 127.0.0.1:9000 and `minio-init` creates the
-  # buckets the tests name, exactly as the lab does, including
-  # `telemetry-locked`, created with Object Lock for the #684 tests.
-  minio-integration:
-    name: minio integration (live S3 tests)
+  # The binaries are built once (D10): the compile, with librdkafka, is most
+  # of a leg's cost, and the tests themselves take minutes. The checkout path
+  # is the same in every job, so a binary finds the capability files where it
+  # was built; VTOP_TEST_S3_SERVERS_DIR says so explicitly anyway.
+  s3-compat-build:
+    name: s3 compat (build the live test binaries)
     needs: changes
     if: needs.changes.outputs.minio == 'true'
     runs-on: ubuntu-latest
@@ -1290,118 +1292,124 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-minio-it-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-s3-compat-${{ hashFiles('**/Cargo.lock') }}
 
-      # The engine test builds vtop-cli, which compiles librdkafka.
+      # The engine tests build vtop-cli, which compiles librdkafka.
       - name: Install librdkafka build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
 
-      # Built before it is started, so a failed build reads as a build
-      # failure rather than as a store that never became healthy.
-      - name: Build the lab's MinIO image
-        run: docker compose build minio
-
-      - name: Start MinIO and create the lab buckets
+      # Line tables only: a backtrace still names the line, and the artifact
+      # every leg downloads is a fraction of the size.
+      - name: Build the live test binaries
+        env:
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
         run: |
           set -euo pipefail
-          docker compose up -d minio
-          # `run` waits for minio's healthcheck (depends_on: service_healthy)
-          # and exits non-zero if a bucket cannot be created.
-          docker compose run --rm minio-init
-
-      # One test thread: the tests share the store, and the multipart ones
-      # count the requests a forwarder in front of it sees. The server and
-      # what it is expected to do come from tests/s3-compat/servers/minio.yaml
-      # (#722); every case appends a results line to VTOP_TEST_S3_RESULTS.
-      # What each results line names: the MinIO release the lab builds, the
-      # local image's id (it is built, not pulled, so it has no registry
-      # digest), and the PR's head commit rather than the merge commit
-      # GITHUB_SHA names on a pull request.
-      - name: Label the S3 compatibility results
-        run: |
-          set -euo pipefail
-          release=$(sed -n 's/^ARG MINIO_RELEASE=//p' docker/minio/Dockerfile)
-          image=$(docker compose config --format json | jq -r '.services.minio.image')
+          out="$RUNNER_TEMP/s3-compat-bin"
+          mkdir -p "$out"
+          build() {
+            cargo test --locked --no-run --message-format=json "$@" |
+              jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null)
+                | "\(.target.name) \(.executable)"'
+          }
           {
-            echo "VTOP_TEST_S3_SERVER_VERSION=RELEASE.${release//:/-}"
-            echo "VTOP_TEST_S3_IMAGE_DIGEST=$(docker image inspect --format '{{.Id}}' "$image")"
-            echo "VTOP_TEST_COMMIT=${{ github.event.pull_request.head.sha || github.sha }}"
-          } >> "$GITHUB_ENV"
+            build -p vtop-upload --test live_s3_verification --test transport_conformance \
+              --test live_s3_multipart_resume --test live_s3_object_lock
+            build -p vtop-cli --test live_s3_object_lock_engine --test live_s3_verification_receipts
+          } | while read -r name exe; do
+            cp "$exe" "$out/$name"
+          done
+          ls -la "$out"
+          test "$(find "$out" -type f | wc -l)" -eq 6
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: s3-compat-binaries
+          path: ${{ runner.temp }}/s3-compat-bin
+          retention-days: 1
+          if-no-files-found: error
+
+  # One leg per server, each on its own runner, with nothing shared but the
+  # binaries. A leg whose server's file says `gating: false` cannot fail the
+  # run (D11): its results are still written, summarised and uploaded, and a
+  # difference from its file still shows in the summary. `gating` is stated
+  # here because continue-on-error is decided before any step runs; the first
+  # step fails the leg if it disagrees with the file.
+  s3-compat:
+    name: s3 compat (${{ matrix.server }})
+    needs: [changes, s3-compat-build]
+    if: needs.changes.outputs.minio == 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ !matrix.gating }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # MinIO is BUILT from source (docker/minio/Dockerfile; no registry
+          # serves its images, #507), which is most of this leg's time.
+          - server: minio
+            gating: true
+            timeout: 30
+    env:
+      RESULTS: ${{ github.workspace }}/s3-compat-out/results-${{ matrix.server }}.jsonl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: The leg's gating agrees with the capability file
+        run: |
+          set -euo pipefail
+          file=$(scripts/s3-lab.sh gating "${{ matrix.server }}")
+          if [ "$file" != "${{ matrix.gating }}" ]; then
+            echo "::error file=tests/s3-compat/servers/${{ matrix.server }}.yaml::gating is $file in the file but ${{ matrix.gating }} in ci.yml's s3-compat matrix; change both together"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: s3-compat-binaries
+          path: ${{ runner.temp }}/s3-compat-bin
+
+      # Built before it is started, so a failed build reads as a build
+      # failure rather than as a store that never came up.
+      - name: Build the server's image, if it is built
+        run: |
+          chmod +x "$RUNNER_TEMP"/s3-compat-bin/*
+          scripts/s3-lab.sh build "${{ matrix.server }}"
+
+      - name: Start the server and create its buckets
+        run: scripts/s3-lab.sh up "${{ matrix.server }}"
+
+      # What each results line names: the server's release, its image digest
+      # (a built image's local id), and the PR's head commit rather than the
+      # merge commit GITHUB_SHA names on a pull request.
+      - name: Label the results
+        run: |
+          set -euo pipefail
+          scripts/s3-lab.sh label "${{ matrix.server }}" >> "$GITHUB_ENV"
+          echo "VTOP_TEST_COMMIT=${{ github.event.pull_request.head.sha || github.sha }}" >> "$GITHUB_ENV"
 
       - name: Run the live S3 tests
-        env:
-          VTOP_TEST_S3_SERVER: minio
-          VTOP_TEST_S3_RESULTS: ${{ runner.temp }}/s3-compat/results-minio.jsonl
-          VTOP_TEST_S3_ENDPOINT: http://127.0.0.1:9000
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
-          AWS_REGION: us-east-1
-        run: |
-          cargo test -p vtop-upload --locked \
-            --test live_s3_verification \
-            --test transport_conformance \
-            --test live_s3_multipart_resume \
-            --test live_s3_object_lock \
-            -- --ignored --test-threads=1
+        run: scripts/s3-lab.sh test "${{ matrix.server }}" "$RUNNER_TEMP/s3-compat-bin" "$RESULTS"
 
-      # The S3 Object Lock profile end to end (#684): the engine refuses a
-      # bucket without Object Lock at startup, and archives a batch whose
-      # object, manifest and verification receipt the store then reports
-      # locked. And the verification receipt (#671): the method it names is
-      # the one the real backend ran, store_checksum for a single PUT and
-      # read_back for a multipart object.
-      - name: Run the live engine tests
-        env:
-          VTOP_TEST_S3_SERVER: minio
-          VTOP_TEST_S3_RESULTS: ${{ runner.temp }}/s3-compat/results-minio.jsonl
-          VTOP_TEST_S3_ENDPOINT: http://127.0.0.1:9000
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
-          AWS_REGION: us-east-1
-        run: |
-          cargo test -p vtop-cli --locked --test live_s3_object_lock_engine \
-            --test live_s3_verification_receipts \
-            -- --ignored --test-threads=1
-
-      # Every case, and any whose outcome is not what minio.yaml says, in the
-      # job summary; the lines themselves as an artifact (#722, D6).
-      - name: Summarise the S3 compatibility results
+      - name: Summarise the results
         if: always()
-        env:
-          RESULTS: ${{ runner.temp }}/s3-compat/results-minio.jsonl
-        run: |
-          set -euo pipefail
-          if [ ! -s "$RESULTS" ]; then
-            echo "No results were written (the tests did not reach a case)." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          {
-            echo "### S3 compatibility: minio"
-            echo
-            echo "| case | outcome | expectation | method |"
-            echo "|---|---|---|---|"
-            jq -r '"| \(.case) | \(.outcome) | \(.expectation) | \(.method // "-") |"' "$RESULTS"
-            echo
-            jq -r 'select(.expected == false)
-              | "\(if .outcome == "unexpected_pass" then "UNEXPECTED PASS" else "UNEXPECTED FAIL" end) \(.case) (\(.deciding_capability // "every capability"), expected \(.expectation)): edit tests/s3-compat/servers/\(.server).yaml or fix the cause"' "$RESULTS"
-          } >> "$GITHUB_STEP_SUMMARY"
+        run: scripts/s3-lab.sh summary "${{ matrix.server }}" "$RESULTS" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload the S3 compatibility results
+      - name: Upload the results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: s3-compat-results-minio
-          path: ${{ runner.temp }}/s3-compat/results-minio.jsonl
+          name: s3-compat-results-${{ matrix.server }}
+          path: ${{ github.workspace }}/s3-compat-out/results-${{ matrix.server }}.jsonl
           if-no-files-found: ignore
 
-      # minio-init ran as a one-off `compose run` container, removed when it
-      # exited; its output is in the "Start MinIO" step above.
-      - name: MinIO logs on failure
+      - name: Server logs on failure
         if: failure()
-        run: docker compose logs --tail=200 minio || true
+        run: scripts/s3-lab.sh logs "${{ matrix.server }}" || true
 
   # cargo-deny covers what cargo-audit does not: license compliance, dependency
   # bans, and source provenance. Advisory decisions are mirrored from

@@ -22,7 +22,7 @@
 //!  AWS_SECRET_ACCESS_KEY=minioadmin cargo test -p vtop-upload
 //!  --test live_s3_object_lock -- --ignored --test-threads=1`
 //! `VTOP_TEST_S3_LOCKED_BUCKET` and `VTOP_TEST_S3_BUCKET` may name others.
-//! CI runs it in the `minio-integration` job.
+//! CI runs it in the `s3-compat` matrix (#722).
 
 use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
