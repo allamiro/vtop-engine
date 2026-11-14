@@ -244,8 +244,10 @@ reopen quietly.
   promote-unproven` records an operator's attestation naming the replica
   whose log becomes canonical. Only that replica, at its next promotion,
   counts Unknown answers; metadata records the promotion only while the
-  attestation is live, names its holder and is for the range's current
-  epoch, and uses it up in the same apply. The promoted replica's whole log
+  attestation is live and names its holder, and only from a report for the
+  range's current epoch (the attestation carries no epoch: it stays usable
+  by that replica until it is used, replaced or retired), and uses it up in
+  the same apply. The promoted replica's whole log
   then becomes its epoch history, so repair can install it on the others.
   It is never automatic, and every record the named replica does not hold
   may be lost (PRODUCTION_HA.md). The verdicts are recorded with the quorum and the replica-set gate

@@ -1286,7 +1286,19 @@ impl MetaValue {
                 })
             }
             VALUE_TAG_PROMOTION_ATTESTATION => {
-                MetaValue::PromotionAttestation(PromotionAttestation::decode_from(&mut reader)?)
+                let attestation = PromotionAttestation::decode_from(&mut reader)?;
+                // Apply refuses a blank operator, so a record holding one was
+                // not written by it (#636 review), as with NodeVersion below.
+                // Only the stored record is checked: a logged command
+                // carrying one must still decode on replay, and apply
+                // refuses it there. Safe because the tag is new at level 8.
+                if attestation.operator.trim().is_empty() {
+                    return Err(CodecError::InvalidValue {
+                        what: "promotion attestation",
+                        reason: "names no operator",
+                    });
+                }
+                MetaValue::PromotionAttestation(attestation)
             }
             VALUE_TAG_NODE_VERSION => {
                 let report = NodeVersionRecord {
@@ -10973,6 +10985,41 @@ mod tests {
                     })
                 ),
                 "release {release:?} protocol {protocol} level {level}: {refused:?}"
+            );
+        }
+    }
+
+    /// #636 review, as #634 with #657 above: apply never records an
+    /// attestation with a blank operator, so the value decoder refuses one,
+    /// and `encode_snapshot` with it. Safe because value tag 25 is new at
+    /// feature level 8: no older snapshot holds one.
+    #[test]
+    fn an_attestation_apply_never_writes_is_refused_by_the_snapshot() {
+        for operator in ["", "   "] {
+            let mut machine = MetaStateMachine::new();
+            machine.records.insert(
+                MetaKey::PromotionAttestation {
+                    topic_uuid: Uuid::from_u128(1),
+                    range_uuid: Uuid::from_u128(2),
+                }
+                .encode(),
+                MetaValue::PromotionAttestation(PromotionAttestation {
+                    attestation_id: Uuid::from_u128(3),
+                    replica_node_uuid: Uuid::from_u128(4),
+                    operator: operator.to_owned(),
+                    attested_at_ms: 1,
+                }),
+            );
+            let refused = machine.encode_snapshot();
+            assert!(
+                matches!(
+                    refused,
+                    Err(CodecError::InvalidValue {
+                        what: "promotion attestation",
+                        ..
+                    })
+                ),
+                "operator {operator:?}: {refused:?}"
             );
         }
     }

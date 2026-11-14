@@ -1437,7 +1437,12 @@ Short procedures now; expand into a full ops runbook before go-live.
   tells them apart). Records a producer was told were acknowledged can be
   among them. Once metadata records the promotion, the promoted replica's
   whole log becomes its epoch history, under the promotion's epoch, so it can
-  prove its lineage at the next failover. Repair every other replica from it
+  prove its lineage at the next failover. If metadata recorded it but the
+  answer was lost and that epoch ended first, the replica writes the history
+  at its next verification instead, once it finds the record as the newest
+  established promotion in the transition chain (the log says "answer was
+  lost"); it does not serve on it, since the others still cannot prove their
+  lineage. Repair every other replica from it
   so none keeps records that history does not contain, one stopped replica
   at a time:
 
@@ -1451,7 +1456,9 @@ Short procedures now; expand into a full ops runbook before go-live.
 
   (`--fencing-epoch` is the epoch metadata granted the promoted replica:
   `vtopctl meta transitions` shows it as the last `ATTESTED` line.) Expect
-  `vtop_broker_promotions_attested_total` to have moved by one, and alert on
+  `vtop_broker_promotions_attested_total` to have moved by one on the
+  promoted replica's data node (it is a per-process counter, so a restart
+  before the history was written counts it when it is), and alert on
   any increase.
 
   Needs metadata feature level 8: upgrade every metadata voter and every
