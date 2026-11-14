@@ -605,6 +605,7 @@ mod tests {
             transports: Default::default(),
             max_egress_bytes_per_second: None,
             max_concurrency_ceiling: None,
+            object_lock: None,
         }
     }
 

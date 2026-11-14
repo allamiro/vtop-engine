@@ -117,8 +117,51 @@ fn populated() -> String {
             .with_label_values(&["q4-2026", r.as_str()])
             .inc_by(0);
     }
+    for r in telemetry::OBJECT_LOCK_CHECK_RESULTS {
+        m.object_lock_checks_total
+            .with_label_values(&["default", r])
+            .inc_by(0);
+    }
+    for mode in telemetry::OBJECT_LOCK_MODES {
+        m.object_lock_mode
+            .with_label_values(&["default", mode])
+            .set(0);
+    }
     m.inflight_batches.set(2);
     m.encode().expect("encode must succeed")
+}
+
+/// #684: the Object Lock profile's two families, under their names, with
+/// `result` and `mode` from their closed sets. An alert on a failed lock
+/// check and a panel on the mode the engine writes under read these.
+#[test]
+fn the_object_lock_metrics_are_exported() {
+    let text = populated();
+    assert!(
+        text.contains("# TYPE vtop_object_lock_checks_total counter"),
+        "{text}"
+    );
+    assert!(
+        text.contains("# TYPE vtop_object_lock_mode gauge"),
+        "{text}"
+    );
+    for result in [
+        "ok",
+        "missing",
+        "mode_mismatch",
+        "too_short",
+        "legal_hold_missing",
+        "error",
+        "bucket_not_locked",
+    ] {
+        let series =
+            format!(r#"vtop_object_lock_checks_total{{result="{result}",tenant="default"}}"#);
+        assert!(text.contains(&series), "missing {series}:\n{text}");
+    }
+    for mode in ["off", "governance", "compliance"] {
+        let series = format!(r#"vtop_object_lock_mode{{mode="{mode}",tenant="default"}}"#);
+        assert!(text.contains(&series), "missing {series}:\n{text}");
+    }
 }
 
 #[test]
@@ -238,7 +281,10 @@ fn every_exported_label_is_from_a_bounded_set() {
     // "key_id" is a key id the operator configured in `manifest.mac`, or
     // `none` or `other`, never an id read from a manifest (#685): bounded by
     // the config, and pinned by `a_hostile_manifest_key_id_never_becomes_a_label`.
-    const BOUNDED: [&str; 17] = [
+    // "mode" is the Object Lock mode of `vtop_object_lock_mode` (#684): off,
+    // governance or compliance (and strong or size_only on
+    // `vtop_verification_mode`).
+    const BOUNDED: [&str; 18] = [
         "tenant",
         "source_type",
         "format",
@@ -256,6 +302,7 @@ fn every_exported_label_is_from_a_bounded_set() {
         "action",
         "sink",
         "key_id",
+        "mode",
     ];
     let text = populated();
     let mut seen = std::collections::BTreeSet::new();

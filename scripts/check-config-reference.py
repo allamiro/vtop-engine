@@ -19,7 +19,7 @@ STRUCTS = [
     "CompressionConfig", "ChecksumConfig", "SourcesConfig", "KafkaSourceConfig",
     "FileSourceConfig", "SyslogSpoolConfig", "UploadConfig", "EgressTuning",
     "PartitioningConfig", "ManifestConfig", "ManifestMacConfig",
-    "ManifestKeyConfig",
+    "ManifestKeyConfig", "ObjectLockConfig",
 ]
 
 

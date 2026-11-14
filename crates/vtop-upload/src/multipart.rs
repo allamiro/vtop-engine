@@ -226,6 +226,13 @@ pub struct MultipartSession {
     pub updated_at_unix_secs: u64,
     /// Set once complete succeeds so a retry can short-circuit.
     pub completed_version_id: Option<String>,
+    /// The Object Lock retention CreateMultipartUpload asked for (#684). S3
+    /// fixes it there, so after a resume this, not the time of the resume,
+    /// is the date the completed object carries. Optional and defaulted, so
+    /// `SESSION_SCHEMA` stays 1: a session written before the field reads as
+    /// one created without a lock, and an older binary ignores the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<crate::base::RequestedRetention>,
 }
 
 const SESSION_SCHEMA: u32 = 1;
@@ -567,7 +574,41 @@ impl SessionCall<'_> {
                     report.completed = true;
                     return Ok(stored);
                 }
-                if existing.fence.content_digest_hex.is_empty() {
+                if let Some(why) = lock_mismatch(&existing, backend) {
+                    // S3 fixed the session's lock when it was created
+                    // (#684): an upload created without the lock this
+                    // backend asks for, or with another mode or hold, would
+                    // complete an object that fails its retention check on
+                    // every replay. It is aborted, best effort, and the
+                    // object starts again on an upload that carries the lock.
+                    tracing::info!(
+                        event = "multipart_session_lock_mismatch",
+                        key = object_uri,
+                        "the multipart session for {object_uri} was created {why}; aborting it \
+                         and starting a new upload that carries the lock; nothing to do"
+                    );
+                    let aborted = backend
+                        .abort_multipart_upload(&existing.object_uri, &existing.upload_id)
+                        .await;
+                    report.count(&aborted);
+                    if let Err(e) = aborted {
+                        if !matches!(e, VtopError::UploadSessionGone(_)) {
+                            let cause = redact_urls(&e.to_string());
+                            tracing::warn!(
+                                event = "multipart_abort_failed",
+                                key = %existing.object_uri,
+                                error = %cause,
+                                "could not abort the multipart upload for {} that cannot carry \
+                                 the lock ({cause}); its parts stay at the store until a bucket \
+                                 lifecycle rule (AbortIncompleteMultipartUpload) removes them; \
+                                 add one if the bucket has none",
+                                existing.object_uri
+                            );
+                        }
+                    }
+                    delete_session(path)?;
+                    self.create(report).await?
+                } else if existing.fence.content_digest_hex.is_empty() {
                     // Nothing identifies the bytes this session was for
                     // (checksums are off), so it is never resumed (#668): its
                     // upload is aborted, best effort, and the object starts
@@ -692,6 +733,11 @@ impl SessionCall<'_> {
             }
         };
 
+        // The lock was fixed at create (#684); the session is what knows it.
+        let stored = StoredObject {
+            retention: session.retention,
+            ..stored
+        };
         session.phase = MultipartSessionPhase::Completed;
         session.completed_version_id = stored.version_id.clone();
         session.updated_at_unix_secs = now_unix_secs();
@@ -711,13 +757,14 @@ impl SessionCall<'_> {
             .create_multipart_upload(self.object_uri, "application/octet-stream", self.checksum)
             .await;
         report.count(&created);
+        let created = created?;
         let now = now_unix_secs();
         let session = MultipartSession {
             schema_version: SESSION_SCHEMA,
             backend_id: self.backend.backend_name().to_owned(),
             object_uri: self.object_uri.to_owned(),
             local_path: self.local_path.to_path_buf(),
-            upload_id: created?,
+            upload_id: created.upload_id,
             part_size_bytes: self.cfg.part_size_bytes,
             fence: self.fence.clone(),
             phase: MultipartSessionPhase::InProgress,
@@ -725,9 +772,34 @@ impl SessionCall<'_> {
             created_at_unix_secs: now,
             updated_at_unix_secs: now,
             completed_version_id: None,
+            retention: created.retention,
         };
         save_session(self.path, &session)?;
         Ok(session)
+    }
+}
+
+/// Why a session cannot complete the object this backend would write
+/// (#684), or `None` when it can: its upload was created without the lock
+/// the backend asks for now, or with another mode or legal hold. The date
+/// may differ (it was fixed at creation, and the engine checks against it);
+/// a lock this backend does not ask for is left as it is.
+fn lock_mismatch(session: &MultipartSession, backend: &dyn UploadBackend) -> Option<String> {
+    let policy = backend.object_lock()?;
+    match session.retention {
+        None => Some("without an Object Lock".to_owned()),
+        Some(r) if r.mode != policy.mode || r.legal_hold != policy.legal_hold => Some(format!(
+            "under mode {} with legal_hold={}, not mode {} with legal_hold={}",
+            r.mode, r.legal_hold, policy.mode, policy.legal_hold
+        )),
+        // A session lives as long as replays keep resuming it: one whose
+        // lock has already ended would complete an object nobody has to keep
+        // (review of #708).
+        Some(r) if r.retain_until_unix_secs <= now_unix_secs() as i64 => Some(format!(
+            "under a retention that ended at {}",
+            crate::base::format_unix_secs(r.retain_until_unix_secs)
+        )),
+        Some(_) => None,
     }
 }
 
@@ -798,9 +870,13 @@ async fn finish_idempotent(
         // current key has moved — evidence must cite the verified generation.
         return Ok(StoredObject {
             version_id: session.completed_version_id.clone(),
+            retention: session.retention,
         });
     }
-    Ok(stored)
+    Ok(StoredObject {
+        retention: session.retention,
+        ..stored
+    })
 }
 
 async fn recover_completed(
@@ -827,7 +903,10 @@ async fn recover_completed(
     // head_object does not currently surface version id; leave None and let
     // callers that require versioning re-complete or treat as unversioned.
     // Mock/S3 complete paths return version ids on the happy path.
-    Ok(StoredObject { version_id: None })
+    Ok(StoredObject {
+        version_id: None,
+        retention: None,
+    })
 }
 
 async fn revalidate_persisted_parts(
@@ -1676,6 +1755,7 @@ mod tests {
                 created_at_unix_secs: now,
                 updated_at_unix_secs: now,
                 completed_version_id: first.version_id.clone(),
+                retention: None,
             },
         )
         .unwrap();

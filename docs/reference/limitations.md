@@ -16,7 +16,7 @@ engine's HA status is in [PRODUCTION_HA.md](../PRODUCTION_HA.md).
 | Command backend verification cost | `aws`, `s3cmd`, and `mc` download each stored object to hash it | prefer native S3 SHA-256 when read-back bandwidth is costly |
 | Syslog timestamps | `received_time_*` is not yet extracted into the spool marker | add timestamp extraction |
 | Manifest integrity | self-hash plus optional keyed-BLAKE3 authentication; key rotation through key ids and a keyring (`manifest.mac`, version 0.4 manifests only, every reader on the keyring release first) | add public-key signatures if required |
-| Object immutability | manifest version pinning + bucket-versioning validation implemented (hardened profile, `upload.require_object_versioning`); Object Lock retention itself is deployment policy | document an Object Lock deployment profile |
+| Object immutability | manifest version pinning + bucket-versioning validation (hardened profile, `upload.require_object_versioning`); **S3 Object Lock profile implemented** (#684, `upload.object_lock`, `s3_native` only): objects and manifests written under retention, the bucket's Object Lock checked, the stored retention verified before VERIFIED. The bucket and its default retention are the operator's; older engines ignore the key ([OBJECT_LOCK_DEPLOYMENT.md](../OBJECT_LOCK_DEPLOYMENT.md)) | lock cold-tier copies (`vtopctl tier copy` refuses the profile) |
 | Metrics and trace export | **Prometheus `/metrics` implemented** (opt-in via `VTOP_METRICS_ADDR`); **OpenTelemetry export implemented** (#683): traces of the batch lifecycle, recovery and scrub, the same metrics over OTLP, and trace ids in the JSON logs, built in and idle until `OTEL_EXPORTER_OTLP_ENDPOINT` is set (HTTP/protobuf only, no gRPC) | gRPC transport if a deployment needs it |
 | Kafka integration test | requires live broker and is ignored by default | add optional CI service profile |
 | Binary / pre-compressed inputs | **supported** via the file source `whole_file` mode (archived verbatim, byte-exact) | streaming for very large files |
@@ -76,5 +76,5 @@ engine's HA status is in [PRODUCTION_HA.md](../PRODUCTION_HA.md).
 
 - [x] manifest MAC key rotation (#685)
 - [ ] optional public-key manifest signatures
-- [ ] S3 Object Lock profile
+- [x] S3 Object Lock profile (#684)
 - [ ] million-file benchmark suite

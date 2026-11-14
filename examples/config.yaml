@@ -271,6 +271,22 @@ upload:
   # compatibility/lab operation: it accepts same-size corruption, and the
   # engine says so at startup and in `vtopctl validate`.
   require_strong_verification: true
+  # The S3 Object Lock profile (#684), s3_native only. Unset by default, and
+  # unset sends no lock header and checks nothing. When set, every object,
+  # manifest and multipart upload is written under this retention; the bucket
+  # must have Object Lock enabled (refused at startup for a literal bucket,
+  # at the first batch for a templated one), and a batch whose stored object
+  # or manifest does not carry the retention asked for FAILS and is replayed.
+  # It needs require_object_versioning: true and refuses create_bucket: true
+  # (Object Lock is enabled only when a bucket is created; create it yourself,
+  # with a default retention as the floor for engines older than v0.10.0,
+  # which ignore this block). compliance cannot be shortened by anyone, and
+  # objects of failed attempts are locked too. docs/OBJECT_LOCK_DEPLOYMENT.md.
+  # require_object_versioning: true
+  # object_lock:
+  #   mode: governance            # governance | compliance
+  #   retain_days: 90             # 1..3650, counted from each write
+  #   legal_hold: false           # also place a legal hold on every object
 
 partitioning:
   template: "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/"

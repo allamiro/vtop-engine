@@ -208,6 +208,11 @@ services:
         for b in telemetry-data telemetry-cef telemetry-leef telemetry-json telemetry-jsonl telemetry-syslog telemetry-raw; do
           mc mb --ignore-existing "local/$$b"
         done
+        # Created WITH Object Lock, for the S3 Object Lock profile's live
+        # tests only (#684): Object Lock can only be enabled when a bucket is
+        # created. The lab's engine does not use it; the buckets above stay
+        # as they are.
+        mc mb --ignore-existing --with-lock local/telemetry-locked
         mc ls local
         echo "per-format buckets ready"
 

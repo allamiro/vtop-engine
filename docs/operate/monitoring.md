@@ -42,6 +42,7 @@ These carry the commit rule:
 | `vtop_commits_total` vs `vtop_verified_total` | Commits must never exceed verifications. |
 | `vtop_verification_mode{mode="size_only"}` | `1` means `upload.require_strong_verification` is off: same-size corruption is accepted. |
 | `vtop_verification_backend_limited_total` | Batches committed on a size-only check. |
+| `vtop_object_lock_checks_total{result}` | With `upload.object_lock`: any result but `ok` is a batch that failed because the store did not keep the retention asked for (or its bucket has no Object Lock). See [S3 Object Lock](../OBJECT_LOCK_DEPLOYMENT.md). |
 | `vtop_retention_lost_records_total` | Kafka records deleted by broker retention before the engine read them. Never archived; any increase is an incident. |
 | `vtop_source_replay_refused_total` | A failed range its source could not hand back, so it is missing from the archive. |
 | `vtop_source_read_errors_total` | A source that cannot be read. |
@@ -93,6 +94,9 @@ groups:
         expr: sum(vtop_verification_failures_total) > 0
       - alert: VtopSizeOnlyVerification
         expr: vtop_verification_mode{mode="size_only"} == 1
+      # Primed at zero at startup with upload.object_lock set.
+      - alert: VtopObjectLockCheckFailed
+        expr: increase(vtop_object_lock_checks_total{result!="ok"}[15m]) > 0
       # Primed at zero at startup, so increase() sees the first one.
       - alert: VtopSourceReplayRefused
         expr: increase(vtop_source_replay_refused_total[15m]) > 0

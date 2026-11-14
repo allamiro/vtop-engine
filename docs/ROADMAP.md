@@ -1003,6 +1003,38 @@ Known limitations:
   fail on purpose; re-archiving that data is a separate decision.
 - **Key files are not permission-checked,** as for `engine.state_store`.
 
+**The S3 Object Lock profile (#684).** `upload.object_lock` (`mode`,
+`retain_days`, `legal_hold`) makes the `s3_native` backend write every object,
+manifest and multipart upload under an S3 Object Lock retention. The engine
+refuses a bucket without Object Lock (at startup for a literal bucket, at the
+first batch for each bucket a template names), and before a batch may be
+VERIFIED it reads the retention of the exact versions it wrote and compares it
+with what it asked for: a missing, shorter, other-mode or hold-less lock fails
+the batch, which is replayed. `vtop_object_lock_checks_total{tenant,result}`
+counts the checks, `vtop_object_lock_mode{tenant,mode}` shows the mode, and
+`vtopctl scrub --check-retention` reports locked, elapsed, missing and
+mode_mismatch. The deployment profile is
+[OBJECT_LOCK_DEPLOYMENT.md](OBJECT_LOCK_DEPLOYMENT.md). Known limitations:
+
+- **Older engines ignore `upload.object_lock` and write unlocked objects.**
+  Nothing at the object says so. Keep a bucket default retention as the
+  floor, drain engines before v0.10.0 before relying on the setting, and run
+  `scrub --check-retention` afterwards to find any unlocked object.
+- **Unknown keys inside `upload.object_lock` are refused,** like
+  `manifest.mac`, so a later release's new key there is refused by this one.
+- **A reused object whose lock ended, or that was stored unlocked, fails on
+  every replay** of the same bytes (#626 reuses it) until the operator
+  extends its retention or deletes that unprotected version. The message says
+  so.
+- **Objects from failed attempts are locked too,** and under `compliance`
+  nobody can remove them before the date: storage cost, said at startup.
+- **`vtopctl tier copy` refuses the block;** locking cold-tier copies is a
+  separate decision.
+- **Proven against MinIO only** (RELEASE.2025-09-07, the lab's build). AWS S3
+  behaviour is taken from its documentation (the integrity header a locked
+  write needs, the permissions a HEAD needs to return the lock headers), not
+  measured.
+
 ---
 
 ## Versioning

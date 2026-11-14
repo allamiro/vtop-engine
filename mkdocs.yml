@@ -186,6 +186,7 @@ nav:
       - Auditing: operate/auditing.md
       - Scrub and coverage audit: operate/scrub-and-audit.md
       - Rotate the manifest MAC key: operate/manifest-key-rotation.md
+      - S3 Object Lock: OBJECT_LOCK_DEPLOYMENT.md
       - Upgrades: operate/upgrades.md
       - Backup and recovery: operate/backup-and-recovery.md
       - Troubleshooting: operate/troubleshooting.md

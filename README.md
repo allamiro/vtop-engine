@@ -267,8 +267,8 @@ The limits that matter most when evaluating it:
 - **The Kafka gateway is slower than Apache Kafka**, by 12.0x to 13.9x in
   records per second in the comparison above, and a Kafka client cannot yet
   follow a VTOP failover.
-- **Not built yet:** public-key manifest signatures, an S3 Object Lock
-  profile, and a million-file benchmark.
+- **Not built yet:** public-key manifest signatures and a million-file
+  benchmark.
 
 The full table, with what is done and what is planned, is in
 [limitations.md](docs/reference/limitations.md). Per-release limits are in
