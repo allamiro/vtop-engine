@@ -7,7 +7,7 @@ about Northguard/Xinfra come from LinkedIn's public materials (their system is
 closed source, so that comparison is necessarily against what they have
 published, not against their code).
 
-VTOP is a **prototype / reference implementation** (0.x pre-releases). This
+VTOP is a **prototype / reference implementation** (0.x releases). This
 document compares architectures and guarantees, not production mileage —
 Kafka and Northguard both carry years of at-scale operation that no design
 argument substitutes for.

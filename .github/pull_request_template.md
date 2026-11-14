@@ -38,7 +38,8 @@ new default; does an older node ignore, refuse or misread the key?), and a
 mixed-version cluster mid-upgrade. "None" is fine, with the reason.
 A format change follows docs/reference/compatibility.md: name the format's
 row there, say whether the change is one-way (and the operator action that
-takes it), and add the fixture and the matrix cell it needs.
+takes it), and add the fixture and the matrix cell it needs (until the
+matrix exists, the upgrade-compat or manifest-compat coverage).
 -->
 
 ## Docs
