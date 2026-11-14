@@ -172,6 +172,11 @@ fn the_committed_fuzz_seeds_open() {
     let mut count = 0;
     for entry in std::fs::read_dir(seed_dir()).unwrap() {
         let path = entry.unwrap().path();
+        // Only the committed seeds: a local fuzzing run leaves the inputs it
+        // found here too (git-ignored), and those may rightly not decode.
+        if path.extension().and_then(|e| e.to_str()) != Some("seed") {
+            continue;
+        }
         opens(&path.display().to_string(), &std::fs::read(&path).unwrap());
         count += 1;
     }

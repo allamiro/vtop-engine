@@ -3297,6 +3297,11 @@ mod tests {
         let mut kinds = std::collections::BTreeSet::new();
         for entry in std::fs::read_dir(fuzz_seed_dir()).unwrap() {
             let path = entry.unwrap().path();
+            // Only the committed seeds: a local fuzzing run leaves the inputs it
+            // found here too (git-ignored), and those may rightly not decode.
+            if path.extension().and_then(|e| e.to_str()) != Some("seed") {
+                continue;
+            }
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             let frame = VtpmFrame::decode(&std::fs::read(&path).unwrap())
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
