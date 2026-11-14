@@ -10,14 +10,17 @@ use super::tls::{server_name, TlsMaterial};
 use super::wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
     AdminInitRequest, AdminMembershipResponse, AdminProposeRequest, AdminProposeResponse,
-    AdminReadGroupCursorRequest, AdminReadGroupCursorResponse, AdminReadRangeLeaseRequest,
-    AdminReadRangeLeaseResponse, AdminReadRangeReplicaSetRequest, AdminReadRangeReplicaSetResponse,
-    AdminReadRangeTransitionsRequest, AdminReadRangeTransitionsResponse,
-    AdminReadSegmentPlacementRequest, AdminReadSegmentPlacementResponse, AdminStatusRequest,
-    AdminStatusResponse, NotLeaderHint, TransportError, TransportResult, VtpmFrame,
-    KIND_ADMIN_ADD_LEARNER_REQ, KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR,
-    KIND_ADMIN_INIT_REQ, KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ,
-    KIND_ADMIN_PROPOSE_RESP, KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+    AdminReadGroupCursorRequest, AdminReadGroupCursorResponse,
+    AdminReadPromotionAttestationRequest, AdminReadPromotionAttestationResponse,
+    AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse, AdminReadRangeReplicaSetRequest,
+    AdminReadRangeReplicaSetResponse, AdminReadRangeTransitionsRequest,
+    AdminReadRangeTransitionsResponse, AdminReadSegmentPlacementRequest,
+    AdminReadSegmentPlacementResponse, AdminStatusRequest, AdminStatusResponse, NotLeaderHint,
+    TransportError, TransportResult, VtpmFrame, KIND_ADMIN_ADD_LEARNER_REQ,
+    KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR, KIND_ADMIN_INIT_REQ,
+    KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ, KIND_ADMIN_PROPOSE_RESP,
+    KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+    KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ, KIND_ADMIN_READ_PROMOTION_ATTESTATION_RESP,
     KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP,
     KIND_ADMIN_READ_RANGE_REPLICA_SET_REQ, KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP,
     KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ, KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP,
@@ -93,6 +96,18 @@ pub trait AdminHandler: Send + Sync {
     ) -> TransportResult<AdminReadRangeReplicaSetResponse> {
         Err(TransportError::Protocol(
             "this admin handler does not serve replica set reads".to_owned(),
+        ))
+    }
+    /// Linearizable read of a range's live promotion attestation (#636).
+    /// Defaulted to a refusal, as the transition read is - and a refusal
+    /// is read by every caller as "no attestation", which is the safe
+    /// answer: Unknown answers stay uncounted.
+    async fn read_promotion_attestation(
+        &self,
+        _request: AdminReadPromotionAttestationRequest,
+    ) -> TransportResult<AdminReadPromotionAttestationResponse> {
+        Err(TransportError::Protocol(
+            "this admin handler does not serve promotion attestation reads".to_owned(),
         ))
     }
     /// Linearizable read of the cluster's feature level and what each node
@@ -410,6 +425,44 @@ pub fn refuses_version_report(error: &TransportError) -> bool {
     message.starts_with(gate_prefix) || message.contains(&undecodable)
 }
 
+/// Whether metadata refused a promotion report BECAUSE it carries a payload
+/// of the override's level (#636): the lineage-unproven refusal reason, or
+/// an attestation. Recognized as [`refuses_lineage_verdicts`] recognizes its
+/// own payload, by the gate's text below
+/// [`crate::PROMOTE_UNPROVEN_FEATURE_LEVEL`] or by an older codec's
+/// unknown-tag text, and nothing else.
+///
+/// The two payloads need opposite responses. A refusal reason has an older
+/// form (`QuorumUnavailable`, which it was recorded as before), so the
+/// report goes again in that form; an attested promotion has none, and is
+/// simply not recorded - and so never exposed.
+pub fn refuses_promote_unproven(error: &TransportError) -> bool {
+    let TransportError::Protocol(message) = error else {
+        return false;
+    };
+    let gate = crate::raft::ConsensusError::FeatureNotEnabled {
+        needed: crate::command::PROMOTE_UNPROVEN_FEATURE_LEVEL,
+        enabled: 0,
+    }
+    .to_string();
+    let gate_prefix = gate
+        .split(" and the cluster runs at")
+        .next()
+        .unwrap_or(&gate);
+    let undecodable = [
+        crate::wire::CodecError::UnknownTag {
+            what: "promotion refusal",
+            tag: 5,
+        },
+        crate::wire::CodecError::UnknownTag {
+            what: "promotion outcome",
+            tag: 4,
+        },
+    ]
+    .map(|error| error.to_string());
+    message.starts_with(gate_prefix) || undecodable.iter().any(|text| message.contains(text))
+}
+
 fn truncate_error(message: &str) -> String {
     let max = crate::command::MAX_ERROR_DETAIL_BYTES;
     if message.len() <= max {
@@ -506,6 +559,18 @@ async fn dispatch_admin(
             let response = handler.read_range_replica_set(request).await?;
             Ok(VtpmFrame {
                 kind: KIND_ADMIN_READ_RANGE_REPLICA_SET_RESP,
+                payload: response.encode()?,
+            })
+        }
+        KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ => {
+            let request = AdminReadPromotionAttestationRequest::decode(&frame.payload)?;
+            // A read, like the others: an operator's override on a range is
+            // for anybody entitled to look at the cluster - the audit needs
+            // it most.
+            authorize(authorizer.authorize_read(identity))?;
+            let response = handler.read_promotion_attestation(request).await?;
+            Ok(VtpmFrame {
+                kind: KIND_ADMIN_READ_PROMOTION_ATTESTATION_RESP,
                 payload: response.encode()?,
             })
         }
@@ -855,6 +920,41 @@ impl AdminClient {
             KIND_ADMIN_READ_RANGE_LEASE_RESP => {
                 Ok(AdminReadRangeLeaseResponse::decode(&frame.payload)?)
             }
+            KIND_ADMIN_ERROR => {
+                let error = AdminError::decode(&frame.payload)?;
+                Err(TransportError::Protocol(error.message))
+            }
+            other => Err(TransportError::UnexpectedKind(other)),
+        }
+    }
+
+    /// Linearizable read of a range's live promotion attestation (#636).
+    ///
+    /// Unlike the replica-set read, a metadata node that predates the read
+    /// needs no special handling: it refuses the kind, the caller gets an
+    /// error, and every caller reads an error as "no attestation" - the
+    /// safe answer, since an Unknown answer then stays uncounted. A tier too
+    /// old to serve the read is too old to hold an attestation anyway (the
+    /// command that records one is gated at feature level 8).
+    pub async fn read_promotion_attestation(
+        &self,
+        topic_uuid: uuid::Uuid,
+        range_uuid: uuid::Uuid,
+    ) -> TransportResult<AdminReadPromotionAttestationResponse> {
+        let frame = self
+            .round_trip(VtpmFrame {
+                kind: KIND_ADMIN_READ_PROMOTION_ATTESTATION_REQ,
+                payload: AdminReadPromotionAttestationRequest {
+                    topic_uuid,
+                    range_uuid,
+                }
+                .encode(),
+            })
+            .await?;
+        match frame.kind {
+            KIND_ADMIN_READ_PROMOTION_ATTESTATION_RESP => Ok(
+                AdminReadPromotionAttestationResponse::decode(&frame.payload)?,
+            ),
             KIND_ADMIN_ERROR => {
                 let error = AdminError::decode(&frame.payload)?;
                 Err(TransportError::Protocol(error.message))
@@ -1912,6 +2012,46 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// #636: the refusals of a report carrying the override's payloads,
+    /// pinned to the texts a gate below level 8 and an older codec emit, and
+    /// nothing else read as one - in particular not the lineage verdicts'
+    /// own refusal, which has a different remedy.
+    #[test]
+    fn a_refusal_of_the_override_payloads_is_recognized_and_nothing_else_is() {
+        let gate = crate::raft::ConsensusError::FeatureNotEnabled {
+            needed: crate::command::PROMOTE_UNPROVEN_FEATURE_LEVEL,
+            enabled: 6,
+        }
+        .to_string();
+        assert_eq!(
+            gate,
+            "this command needs metadata feature level 8 and the cluster runs at 6; finish \
+             upgrading every metadata voter, then raise the level (vtopctl meta enable-features \
+             --level 8)"
+        );
+        assert!(refuses_promote_unproven(&TransportError::Protocol(gate)));
+        assert!(refuses_promote_unproven(&TransportError::Protocol(
+            "unknown promotion refusal tag 5".to_owned()
+        )));
+        assert!(refuses_promote_unproven(&TransportError::Protocol(
+            "unknown promotion outcome tag 4".to_owned()
+        )));
+        for other in [
+            TransportError::Protocol(
+                crate::raft::ConsensusError::FeatureNotEnabled {
+                    needed: crate::command::LINEAGE_VERDICTS_FEATURE_LEVEL,
+                    enabled: 5,
+                }
+                .to_string(),
+            ),
+            TransportError::Protocol("unknown promotion outcome tag 3".to_owned()),
+            TransportError::Protocol("not the metadata leader; no leader is known yet".to_owned()),
+            TransportError::Closed,
+        ] {
+            assert!(!refuses_promote_unproven(&other), "{other}");
+        }
     }
 
     /// #577: the two refusals of a lineage-carrying promotion report, pinned

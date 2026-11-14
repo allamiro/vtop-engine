@@ -116,6 +116,8 @@ optional keyed-BLAKE3 authentication.
 > The object is named by its source, range and content digest, plus the engine and inode for a file or spool range (`vtop-[<engine>-]<source>-<range>[-i<inode>]-<digest>`), so a replay that produces the same bytes resolves to the object already stored, and is never written over an object that does not verify (#626). The manifest is named by the per-attempt `batch_id`, whose trailing token is a random suffix. A replay with different batch boundaries (a source that grew since), a later seal-time hour, no checksum, or a command backend (`awscli`, `minio`, `s3cmd`) still writes a second object: see [ARCHITECTURE.md §13](../ARCHITECTURE.md) and the deterministic-naming rule of [VTOP_PROTOCOL_DRAFT.md §15.1](../VTOP_PROTOCOL_DRAFT.md#151-object-key).
 >
 > The authoritative post-verification state lives in the state store and can be queried with `vtopctl status` or `vtopctl list-batches --json`.
+>
+> This is a version `0.3` manifest, the default. With `manifest.write_version: "0.4"` (#671) new manifests say `"version": "0.4"` and add `"verification_plan": {"method": "read_back", "require_strong": true}`: the verification method configured for the backend and algorithm, and the strong-verification policy. Enable it only once every engine, `vtopctl scrub` and auditor of the archive runs v0.8.0 or later; v0.7.0 and earlier report `0.4` manifests as tampered. See [VTOP_PROTOCOL_DRAFT.md §11.2](../VTOP_PROTOCOL_DRAFT.md#112-field-reference).
 
 The manifest self-hash is reproducible and detects accidental changes, but an
 attacker able to rewrite the manifest can recompute it. Set

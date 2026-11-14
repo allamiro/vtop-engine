@@ -1081,6 +1081,7 @@ path needed by the distributed options is already implemented (§6.3).
 | `checksum.algorithm` | global `sha256` \| `blake3` \| `none`; inherited by streams without an override |
 | `streams.yaml`: `streams[].checksum.algorithm` | per-stream override with the same shape; `none` requires the global strong floor to be off, otherwise config load fails naming the stream |
 | `manifest_mac_key_env` | optional env-var name for the 32-byte hex manifest MAC key; the secret is not serialized |
+| `manifest.write_version` | `"0.3"` (default) or `"0.4"`, quoted; anything else fails config load (#671). `0.4` adds `verification_plan` to new manifests. Set it only once every engine, `vtopctl scrub` and auditor of the archive runs v0.8.0 or later: v0.7.0 and earlier report `0.4` manifests as tampered. Engines before this release ignore the key and keep writing `0.3`; setting `"0.3"` again goes back, and `0.4` manifests already written stay readable |
 | `sources.kafka.*` | brokers, group, include/exclude, `enable_auto_commit:false` |
 | `sources.file.*` | paths, `delete_after_commit`, `delete_quiet_seconds`, `delete_without_open_check`, `whole_file`. `delete_after_commit` is for files nothing writes to any more: whole-file drops, and rotated logs once the writer has reopened its new file. A fully archived file is deleted only after it has stayed unwritten for `delete_quiet_seconds` (default 3600) from the commit that covered it, so the engine catching up on a live log does not delete it out from under a writer that still holds it open (#619). A file whose mtime or ctime moves after the commit (a touch, a chmod, a producer stamping a finished drop) is **kept**, with a warning: a same-length rewrite between its first page and the page below the committed end looks the same, and only the ctime, which no process can set, shows it. A configured path that is a symbolic link is never deleted (point the pattern at the target). The delete renames the file within its directory first, so the directory must be writable by the engine and on the file's own filesystem; a bind-mounted single file fails with `EXDEV`, and the file is kept with that errno in the warning. A file a crash (or a failed put-back) leaves under a hidden `.vtop-delete.*` name is archived as a source of its own and then deleted. The wait is kept in memory: a restart starts it again, from the newest committed row, and only when that row names the file's inode and first page, its batch read the file to its end, and the file still has the mtime that batch recorded; otherwise the file stays until a new commit covers it. A quiet file is not a closed one, so the delete also needs proof that no process has the file open: a Linux write lease, held from before the file is moved aside until after the unlink. A writer that still holds the file - silent however long - or opens it while it is being deleted keeps it, and the wait starts again. `delete_quiet_seconds: 0` deletes at the covering commit, through the same lease, rename and check. The lease needs Linux, a local filesystem (ext2/3/4, xfs, btrfs, tmpfs, overlay, f2fs, zfs or bcachefs; never NFS, CIFS, FUSE, 9p, virtiofs or CephFS, where it could not see a writer on another machine), and the engine running as the files' owner or with `CAP_LEASE` in its effective set. In Kubernetes, `securityContext.capabilities.add: ["LEASE"]` reaches the effective set only of a container running as root. The chart runs the engine as uid 10001 with every capability dropped and `allowPrivilegeEscalation: false`, under which neither an added capability nor a file capability (`setcap`) takes effect, so there the engine must run as the uid that owns the files. **On upgrade**, an engine that deleted files written by another user, or on a network or FUSE mount, stops deleting them. Without the lease a fully archived file is **kept**, with a warning naming the reason; `delete_without_open_check: true` deletes it on the quiet period alone instead, and then a writer that keeps the file open loses lines in two cases: it is silent for longer than the quiet period and then writes again, or its write lands between the delete's final check and the unlink. That opt-out is warned about on every start and by `vtopctl validate`. Every delete, and every file kept, logs one line saying what happened, what the engine did and what to do, with `path`, `inode` and `archived_bytes` fields. Do not point the option at a live log. Two directory entries naming one file — a symlink beside its target, two hard links — are **two sources** by ruling (#378): each is archived under its own name, so the file's records are archived twice, and discovery warns once per alias group naming every spelling. Narrow the patterns to one spelling if one source is meant. There is no merge and no knob, because a merge needs a cursor identity that survives an alias being removed and none is safe: keyed by the surviving spelling, `delete_after_commit` removes it and the target is re-read from zero; keyed by inode, a freed inode reused by a new file inherits the old cursor and that file's opening records are skipped. A duplicate costs storage; a merge risks data. |
 | `sources.syslog_spool.*` | spool paths |
@@ -1353,10 +1354,15 @@ Short procedures now; expand into a full ops runbook before go-live.
     a replica that disputes nothing). Every candidate holding records is Unknown to itself and
     stands aside, and a candidate holding none stands aside for them, so
     the range goes unled. (A fresh, empty range is not affected: a
-    candidate at 0 disputes nothing and promotes.) The transition record shows
-    `Refused{QuorumUnavailable}`, the same as an ordinary missing quorum;
-    the data node's warning names the lineage cause. There is no
-    in-product remedy yet.
+    candidate at 0 disputes nothing and promotes.) The refusal says so
+    (#636): the data node logs `reason="lineage_unproven"` and counts it in
+    `vtop_broker_promotion_refusals_total{reason="lineage_unproven"}`, and at
+    feature level 8 the transition record shows `Refused{LineageUnproven}`
+    (below 8 it shows `Refused{QuorumUnavailable}`, as before). Alert on that
+    series: unlike `quorum_unavailable`, waiting does not clear it. The
+    remedies, in order: restore the range from backup; failing that, the
+    last-resort override below ("Promote a range whose lineage cannot be
+    proven").
   - **A replica whose only dispute with the candidate is below its retained
     base is not counted.** The replica itself finds the retained records in
     agreement (#408), but the candidate cannot see its base, so the answer
@@ -1421,6 +1427,75 @@ Short procedures now; expand into a full ops runbook before go-live.
   from the record leaves that node unable to lead.
 - **Restore from DB backup:** restore Postgres PITR → verify object store →
   start the engine (recovery scan re-reconciles) → run the divergence checker.
+- **Promote a range whose lineage cannot be proven (#636) - LAST RESORT,
+  only after restore from backup is ruled out.** A range that holds records
+  while none of its replicas has epoch history refuses every promotion with
+  `lineage_unproven` (see the #577 costs above), by design: an answer whose
+  history cannot be compared is a count of records whatever wrote them, and
+  counting it could expose another leadership's records or drop
+  acknowledged ones. The override is an explicit, audited, single-use
+  statement by an operator - the spirit of an unclean leader election, but
+  never automatic, never a configuration default, and never more than one
+  promotion:
+
+  ```bash
+  vtopctl node promote-unproven --meta-config meta-admin.yaml \
+    --topic <topic-uuid> --range <range-uuid> --replica <node-uuid> \
+    --operator "$USER" --i-accept-data-loss
+  ```
+
+  It records an attestation in metadata naming the replica whose log becomes
+  the range's history, the operator, and the time. Only that replica, at its
+  next promotion, counts the answers whose lineage is Unknown; metadata
+  accepts that promotion's report only while the attestation is live and
+  names its holder, records the attestation in the transition (`vtopctl
+  meta transitions` lists it as `ATTESTED` with operator and time, and
+  counts it under `attested`), and removes it in the same step, so a second
+  promotion needs a new attestation. A newer attestation replaces an unused
+  one; a promotion that proves its lineage without one retires it.
+  Everything else is still checked: the named replica must hold the
+  boundary the answers prove, a majority must be at or below it (otherwise
+  the refusal names the replica that holds more - attest that one instead),
+  and a published watermark still never regresses. Other replicas stand
+  aside for the named one.
+
+  **What it can lose.** Every record the named replica does not hold. That
+  includes records only other replicas hold above its tail, and records
+  other replicas hold at the SAME offsets with different content (an
+  offset is a count, not an identity, and without epoch history nothing
+  tells them apart). Records a producer was told were acknowledged can be
+  among them. Once metadata records the promotion, the promoted replica's
+  whole log becomes its epoch history, under the promotion's epoch, so it can
+  prove its lineage at the next failover. If metadata recorded it but the
+  answer was lost and that epoch ended first, the replica writes the history
+  at its next verification instead, once it finds the record as the newest
+  established promotion in the transition chain (the log says "answer was
+  lost"); it does not serve on it, since the others still cannot prove their
+  lineage. Repair every other replica from it
+  so none keeps records that history does not contain, one stopped replica
+  at a time:
+
+  ```bash
+  # stop the replica's data node first; repair refuses a live range
+  vtopctl node repair --config node-client.yaml \
+    --from <promoted replica> --into <the stopped replica's data dir> \
+    --fencing-epoch <the range's current epoch> --seal-tail
+  # then start the replica again
+  ```
+
+  (`--fencing-epoch` is the epoch metadata granted the promoted replica:
+  `vtopctl meta transitions` shows it as the last `ATTESTED` line.) Expect
+  `vtop_broker_promotions_attested_total` to have moved by one on the
+  promoted replica's data node (it is a per-process counter, so a restart
+  before the history was written counts it when it is), and alert on
+  any increase.
+
+  Needs metadata feature level 8: upgrade every metadata voter and every
+  data node, then `vtopctl meta enable-features --level 8`. Level 8 sits
+  above the data-node capability gate (level 7, #634), so the raise is
+  refused, naming the nodes, until every live range member reports it
+  supports 8 (`vtopctl meta node-versions`). Below level 8 the override is
+  refused before anything is recorded, and says so.
 - **Reconcile state store vs object storage:** list `SOURCE_COMMITTED` rows and
   confirm each object+manifest exists; flag orphan objects (no row) and missing
   objects (row but no object) for remediation.

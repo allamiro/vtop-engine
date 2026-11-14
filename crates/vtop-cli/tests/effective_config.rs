@@ -140,3 +140,29 @@ fn a_shadowed_stream_is_named_in_both_outputs() {
     );
     assert_eq!(json["effective"]["streams"].as_array().unwrap().len(), 1);
 }
+
+/// #671 release B: `--print-effective` shows the manifest version new
+/// batches are written in, and that the operator set it.
+#[test]
+fn the_manifest_write_version_is_shown_with_its_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    config(dir.path());
+    let path = dir.path().join("config.yaml");
+    let base = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        format!("{base}manifest:\n  write_version: \"0.4\"\n"),
+    )
+    .unwrap();
+    let text = String::from_utf8(run(dir.path(), false, true).stdout).unwrap();
+    assert!(
+        text.contains("  manifest.write_version: 0.4 (global)\n"),
+        "{text}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&run(dir.path(), true, true).stdout).unwrap();
+    assert_eq!(
+        json["effective"]["default"]["manifest.write_version"],
+        serde_json::json!({"origin": "global", "value": "0.4"})
+    );
+}

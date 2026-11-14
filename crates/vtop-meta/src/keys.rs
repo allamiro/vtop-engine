@@ -44,6 +44,7 @@ const CATEGORY_RANGE_TRANSITION: u8 = 18;
 const CATEGORY_LINEAGE_TRANSITION: u8 = 19;
 const CATEGORY_RANGE_REPLICA_SET: u8 = 20;
 const CATEGORY_NODE_VERSION: u8 = 21;
+const CATEGORY_PROMOTION_ATTESTATION: u8 = 22;
 
 /// Consumer-group names reuse the topic-name bound so group identity stays
 /// allocation-bounded on the wire and in snapshots.
@@ -163,6 +164,13 @@ pub enum MetaKey {
         topic_uuid: Uuid,
         range_uuid: Uuid,
     },
+    /// An operator's live attestation that a range may promote on answers
+    /// whose lineage cannot be proven (#636): at most one per range, removed
+    /// when a promotion uses it.
+    PromotionAttestation {
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    },
     /// What a data node last reported it runs (#634). Its own key rather
     /// than a wider node record, so a cluster whose nodes never report
     /// carries no record a release before the report can read.
@@ -218,6 +226,7 @@ impl MetaKey {
             MetaKey::RangeTransition { .. } => CATEGORY_RANGE_TRANSITION,
             MetaKey::LineageTransition { .. } => CATEGORY_LINEAGE_TRANSITION,
             MetaKey::RangeReplicaSet { .. } => CATEGORY_RANGE_REPLICA_SET,
+            MetaKey::PromotionAttestation { .. } => CATEGORY_PROMOTION_ATTESTATION,
             MetaKey::NodeVersion { .. } => CATEGORY_NODE_VERSION,
         }
     }
@@ -324,6 +333,10 @@ impl MetaKey {
                 put_uuid(&mut out, *transition_id);
             }
             MetaKey::RangeReplicaSet {
+                topic_uuid,
+                range_uuid,
+            }
+            | MetaKey::PromotionAttestation {
                 topic_uuid,
                 range_uuid,
             } => {
@@ -438,6 +451,10 @@ impl MetaKey {
                 transition_id: reader.uuid("transition id")?,
             },
             CATEGORY_RANGE_REPLICA_SET => MetaKey::RangeReplicaSet {
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+            },
+            CATEGORY_PROMOTION_ATTESTATION => MetaKey::PromotionAttestation {
                 topic_uuid: reader.uuid("topic uuid")?,
                 range_uuid: reader.uuid("range uuid")?,
             },
@@ -565,6 +582,13 @@ impl fmt::Display for MetaKey {
                 formatter,
                 "/meta/0/range-replica-set/{topic_uuid}/{range_uuid}"
             ),
+            MetaKey::PromotionAttestation {
+                topic_uuid,
+                range_uuid,
+            } => write!(
+                formatter,
+                "/meta/0/promotion-attestation/{topic_uuid}/{range_uuid}"
+            ),
             MetaKey::NodeVersion { node_uuid } => {
                 write!(formatter, "/meta/0/node-version/{node_uuid}")
             }
@@ -583,6 +607,10 @@ mod tests {
                 node_uuid: Uuid::from_u128(1),
             },
             MetaKey::RangeReplicaSet {
+                topic_uuid: Uuid::from_u128(2),
+                range_uuid: Uuid::from_u128(3),
+            },
+            MetaKey::PromotionAttestation {
                 topic_uuid: Uuid::from_u128(2),
                 range_uuid: Uuid::from_u128(3),
             },

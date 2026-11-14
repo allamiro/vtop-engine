@@ -1296,6 +1296,22 @@ impl InProcessFollower {
         kept.map_or(offset, |dispute| offset.min(dispute.from))
     }
 
+    /// Make this replica's log the range's history on an operator's
+    /// attestation (#636), as [`crate::LocalBroker::adopt_attested_history`]
+    /// does: a candidate promotes while it is still this follower, and the
+    /// leader built after it reopens the same journal.
+    ///
+    /// PRECONDITION: call it only once metadata has recorded a promotion of
+    /// this replica made under an attestation naming it. Nothing here can
+    /// check that; written earlier, the seed is lineage nobody authorized.
+    pub fn adopt_attested_history(&self, epoch: u64) -> crate::BrokerResult<bool> {
+        crate::fencing_epochs::FencingEpochJournal::seed_attested_history_in(
+            &self.fencing_epoch_journal,
+            &self.fencing_epoch_history_broken,
+            epoch,
+        )
+    }
+
     /// This replica's epoch history; empty means "unknown", never "no changes".
     pub fn epoch_starts(&self) -> Vec<crate::fencing_epochs::EpochStart> {
         // Flag read UNDER the lock; see LocalBroker::epoch_starts.

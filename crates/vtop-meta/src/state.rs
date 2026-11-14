@@ -13,10 +13,10 @@
 
 use crate::command::{
     decode_promotion_outcome, encode_promotion_outcome, MetadataCommand, MetadataError,
-    MetadataResponse, NodeState, PromotionOutcome, RangeAssignment, VerificationMethod,
-    MAX_ASSIGNED_RANGES, MAX_NODE_ADDR_BYTES, MAX_RELEASE_BYTES, MAX_TIER_BACKEND_ID_BYTES,
-    MAX_TIER_OBJECT_URI_BYTES, MAX_TIER_VERSION_ID_BYTES, MAX_TRANSITION_QUORUM,
-    NODE_VERSION_REPORTS_FEATURE_LEVEL,
+    MetadataResponse, NodeState, PromotionAttestation, PromotionOutcome, RangeAssignment,
+    VerificationMethod, MAX_ASSIGNED_RANGES, MAX_ATTESTATION_OPERATOR_BYTES, MAX_NODE_ADDR_BYTES,
+    MAX_RELEASE_BYTES, MAX_TIER_BACKEND_ID_BYTES, MAX_TIER_OBJECT_URI_BYTES,
+    MAX_TIER_VERSION_ID_BYTES, MAX_TRANSITION_QUORUM, NODE_VERSION_REPORTS_FEATURE_LEVEL,
 };
 use crate::keys::{validate_group_name, validate_topic_name, MetaKey};
 use crate::placement::{
@@ -94,6 +94,9 @@ const VALUE_TAG_RANGE_REPLICA_SET: u8 = 23;
 /// [`NODE_VERSION_REPORTS_FEATURE_LEVEL`], so a cluster below it carries no
 /// tag an older node cannot read.
 const VALUE_TAG_NODE_VERSION: u8 = 24;
+/// An operator's live promotion attestation (#636); written only by a
+/// command gated at feature level 8.
+const VALUE_TAG_PROMOTION_ATTESTATION: u8 = 25;
 
 /// The replica set a range's quorum is counted over (#553).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -572,6 +575,7 @@ pub enum MetaValue {
     ClusterConfig(ClusterConfigRecord),
     RangeReplicaSet(RangeReplicaSetRecord),
     NodeVersion(NodeVersionRecord),
+    PromotionAttestation(PromotionAttestation),
 }
 
 impl MetaValue {
@@ -890,6 +894,10 @@ impl MetaValue {
                 put_u64(&mut out, set.generation);
                 put_u64(&mut out, set.recorded_at_epoch);
                 encode_replica_nodes(&mut out, &set.members)?;
+            }
+            MetaValue::PromotionAttestation(attestation) => {
+                put_u8(&mut out, VALUE_TAG_PROMOTION_ATTESTATION);
+                attestation.encode_into(&mut out)?;
             }
             MetaValue::NodeVersion(report) => {
                 put_u8(&mut out, VALUE_TAG_NODE_VERSION);
@@ -1277,6 +1285,21 @@ impl MetaValue {
                     recorded_at_epoch,
                 })
             }
+            VALUE_TAG_PROMOTION_ATTESTATION => {
+                let attestation = PromotionAttestation::decode_from(&mut reader)?;
+                // Apply refuses a blank operator, so a record holding one was
+                // not written by it (#636 review), as with NodeVersion below.
+                // Only the stored record is checked: a logged command
+                // carrying one must still decode on replay, and apply
+                // refuses it there. Safe because the tag is new at level 8.
+                if attestation.operator.trim().is_empty() {
+                    return Err(CodecError::InvalidValue {
+                        what: "promotion attestation",
+                        reason: "names no operator",
+                    });
+                }
+                MetaValue::PromotionAttestation(attestation)
+            }
             VALUE_TAG_NODE_VERSION => {
                 let report = NodeVersionRecord {
                     release: reader.bounded_str(MAX_RELEASE_BYTES, "release")?,
@@ -1352,6 +1375,86 @@ impl MetaStateMachine {
         }) {
             Some(MetaValue::RangeReplicaSet(set)) => Some(set),
             _ => None,
+        }
+    }
+
+    /// The range's live promotion attestation, if an operator recorded one
+    /// that no promotion has used yet (#636).
+    pub fn promotion_attestation(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> Option<&PromotionAttestation> {
+        match self.record(&MetaKey::PromotionAttestation {
+            topic_uuid,
+            range_uuid,
+        }) {
+            Some(MetaValue::PromotionAttestation(attestation)) => Some(attestation),
+            _ => None,
+        }
+    }
+
+    /// Record an operator's attestation that `replica_node_uuid`'s log may
+    /// become the range's canonical history unproven (#636). Nothing is
+    /// promoted here: the attestation only lets the replica it names count
+    /// Unknown answers at ITS next promotion, which uses it up.
+    fn attest_unproven_promotion(
+        &mut self,
+        request_id: Uuid,
+        issued_at_ms: i64,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        replica_node_uuid: Uuid,
+        operator: &str,
+    ) -> MetadataResponse {
+        let Some(MetaValue::Range(range)) = self.record(&MetaKey::Range {
+            topic_uuid,
+            range_uuid,
+        }) else {
+            return reject(MetadataError::NotFound);
+        };
+        let fencing_epoch = range.fencing_epoch;
+        if operator.trim().is_empty() || operator.len() > MAX_ATTESTATION_OPERATOR_BYTES {
+            return reject(MetadataError::invalid_transition(format!(
+                "an attestation names the operator who made it, in 1 to \
+                 {MAX_ATTESTATION_OPERATOR_BYTES} bytes"
+            )));
+        }
+        if self
+            .record(&MetaKey::Node {
+                node_uuid: replica_node_uuid,
+            })
+            .is_none()
+        {
+            return reject(MetadataError::invalid_transition(format!(
+                "attested replica {replica_node_uuid} is not a registered node"
+            )));
+        }
+        if let Some(set) = self.range_replica_set(topic_uuid, range_uuid) {
+            if !set.members.contains(&replica_node_uuid) {
+                return reject(MetadataError::invalid_transition(format!(
+                    "attested replica {replica_node_uuid} is not in the range's recorded replica \
+                     set"
+                )));
+            }
+        }
+        // The newest statement replaces a live one: an operator who named
+        // the wrong replica corrects it by naming the right one.
+        self.records.insert(
+            MetaKey::PromotionAttestation {
+                topic_uuid,
+                range_uuid,
+            }
+            .encode(),
+            MetaValue::PromotionAttestation(PromotionAttestation {
+                attestation_id: request_id,
+                replica_node_uuid,
+                operator: operator.to_owned(),
+                attested_at_ms: issued_at_ms,
+            }),
+        );
+        MetadataResponse::Ack {
+            generation: fencing_epoch,
         }
     }
 
@@ -1940,6 +2043,20 @@ impl MetaStateMachine {
             } => {
                 self.set_range_replica_set(*topic_uuid, *range_uuid, members, *expected_generation)
             }
+            MetadataCommand::AttestUnprovenPromotion {
+                env,
+                topic_uuid,
+                range_uuid,
+                replica_node_uuid,
+                operator,
+            } => self.attest_unproven_promotion(
+                env.request_id,
+                env.issued_at_ms,
+                *topic_uuid,
+                *range_uuid,
+                *replica_node_uuid,
+                operator,
+            ),
             MetadataCommand::SplitRange {
                 env,
                 topic_uuid,
@@ -2755,6 +2872,65 @@ impl MetaStateMachine {
                  transition is final"
             )));
         }
+        // Whether this report is about the range's CURRENT epoch (#656
+        // review). A report for an epoch the range has moved past is
+        // evidence about history, but it is not the recovery an attestation
+        // was made for: an ordinary one is still recorded and retires
+        // nothing (it would erase the override the current recovery needs);
+        // an attested one is refused (it can never serve, so it may not use
+        // an attestation up).
+        let current = matches!(
+            self.record(&MetaKey::Range {
+                topic_uuid,
+                range_uuid,
+            }),
+            Some(MetaValue::Range(range)) if range.fencing_epoch == fencing_epoch
+        );
+        let attestation_key = MetaKey::PromotionAttestation {
+            topic_uuid,
+            range_uuid,
+        }
+        .encode();
+        let live = match self.records.get(&attestation_key) {
+            Some(MetaValue::PromotionAttestation(attestation)) => Some(attestation),
+            _ => None,
+        };
+        // THE OVERRIDE IS SINGLE-USE AND CHECKED HERE (#636). A promotion
+        // that counted Unknown answers is recorded only if the attestation
+        // it names is the range's live one, and names this holder. The
+        // same apply removes it, so the check and the use are one atomic
+        // step: no second promotion, of this replica or any other, can
+        // count Unknown answers on it. A report this refuses is never
+        // exposed, because a boundary is exposed only once its report
+        // lands.
+        if let Some(used) = outcome.attestation() {
+            if !current {
+                return reject(MetadataError::invalid_transition(format!(
+                    "promotion of epoch {fencing_epoch} counted answers of unproven lineage, but \
+                     the range has moved past that epoch; a superseded promotion may not use an \
+                     attestation"
+                )));
+            }
+            if live != Some(used) {
+                return reject(MetadataError::invalid_transition(format!(
+                    "promotion of epoch {fencing_epoch} counted answers of unproven lineage \
+                     under attestation {}, which is not the range's live attestation (it was \
+                     used by an earlier promotion, replaced, or never recorded); record a new \
+                     one with `vtopctl node promote-unproven`",
+                    used.attestation_id
+                )));
+            }
+            if used.replica_node_uuid != holder_node_uuid {
+                return reject(MetadataError::invalid_transition(format!(
+                    "attestation {} names {}, not the holder {holder_node_uuid}",
+                    used.attestation_id, used.replica_node_uuid
+                )));
+            }
+        }
+        let established = matches!(outcome, PromotionOutcome::Established { .. });
+        let Some(MetaValue::RangeTransition(transition)) = self.records.get_mut(&key) else {
+            unreachable!("the transition was read above and apply is single-threaded");
+        };
         let reported = TransitionOutcome::Reported {
             outcome: outcome.clone(),
             reported_at_ms: now_ms,
@@ -2788,6 +2964,14 @@ impl MetaStateMachine {
             }
         }
         transition.outcome = reported;
+        // An established promotion AT THE CURRENT EPOCH ends the
+        // attestation's life: the one that used it, or one that proved its
+        // lineage without it - a range that recovered on its own must not
+        // keep an override lying around for some later failure to pick up
+        // unasked. A report for a past epoch retires nothing (#656 review).
+        if established && current {
+            self.records.remove(&attestation_key);
+        }
         MetadataResponse::TransitionRecorded { fencing_epoch }
     }
 
@@ -5836,6 +6020,10 @@ fn key_matches_value(key: &MetaKey, value: &MetaValue) -> bool {
                 MetaKey::RangeReplicaSet { .. },
                 MetaValue::RangeReplicaSet(_)
             )
+            | (
+                MetaKey::PromotionAttestation { .. },
+                MetaValue::PromotionAttestation(_)
+            )
             | (MetaKey::NodeVersion { .. }, MetaValue::NodeVersion(_))
     )
 }
@@ -6639,6 +6827,7 @@ mod tests {
                 .collect(),
             votes,
             required,
+            attestation: None,
         }
     }
 
@@ -6735,6 +6924,528 @@ mod tests {
         .without_lineage();
         assert!(!legacy.records_lineage());
         assert!(!set_change_allowed_after(legacy));
+    }
+
+    fn attest(
+        machine: &mut MetaStateMachine,
+        index: u64,
+        request: u128,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        replica: Uuid,
+        operator: &str,
+    ) -> MetadataResponse {
+        machine.apply(
+            index,
+            &MetadataCommand::AttestUnprovenPromotion {
+                env: envelope_at(request, 1_700_000_000_000 + i64::from(index as u32)),
+                topic_uuid,
+                range_uuid,
+                replica_node_uuid: replica,
+                operator: operator.to_owned(),
+            },
+        )
+    }
+
+    /// A promotion over a range whose replicas have no epoch history (#636):
+    /// every answer Unknown, counted only under `attestation`.
+    fn unproven_established(
+        boundary: u64,
+        quorum: &[(u128, u64)],
+        attestation: Option<PromotionAttestation>,
+    ) -> PromotionOutcome {
+        PromotionOutcome::Established {
+            boundary_offset: Some(boundary),
+            sealed_prefix_end: None,
+            quorum: quorum
+                .iter()
+                .map(|(node, offset)| crate::command::QuorumAnswer {
+                    node_uuid: Uuid::from_u128(*node),
+                    offset: *offset,
+                    lineage: Some(crate::command::AnswerLineage::Unknown),
+                })
+                .collect(),
+            votes: quorum.len() as u32,
+            required: quorum.len() as u32,
+            attestation,
+        }
+    }
+
+    /// A range of three registered nodes, its lease held by node 1.
+    fn attestable_range() -> (MetaStateMachine, Uuid, Uuid, Uuid, impl FnMut() -> u64) {
+        let (mut machine, first, topic, range) = leaseable_range(1);
+        for (index, node) in [(3_u64, 2_u128), (4, 3)] {
+            machine.apply(
+                index,
+                &MetadataCommand::RegisterNode {
+                    env: envelope(u128::from(index)),
+                    node_uuid: Uuid::from_u128(node),
+                    addr: format!("n{node}:9200"),
+                    expected_generation: None,
+                },
+            );
+        }
+        let generation = range_of(&machine, topic, range).generation;
+        assert!(!is_rejected(&acquire(
+            &mut machine,
+            5,
+            5,
+            1_000,
+            first,
+            topic,
+            range,
+            generation,
+            10_000
+        )));
+        let mut index = 5;
+        let next = move || {
+            index += 1;
+            index
+        };
+        (machine, first, topic, range, next)
+    }
+
+    /// #636: an attestation names a registered replica of an existing range,
+    /// in the range's recorded set when it has one, and an operator; the
+    /// newest one replaces a live one; and it survives a snapshot.
+    #[test]
+    fn an_attestation_names_a_registered_replica_and_the_newest_one_stands() {
+        let (mut machine, first, topic, range, mut next) = attestable_range();
+        let second = Uuid::from_u128(2);
+        assert!(machine.promotion_attestation(topic, range).is_none());
+        // No such range, no such node, no operator: refused, nothing kept.
+        assert!(is_rejected(&attest(
+            &mut machine,
+            next(),
+            100,
+            topic,
+            Uuid::from_u128(0xdead),
+            first,
+            "oncall"
+        )));
+        assert!(is_rejected(&attest(
+            &mut machine,
+            next(),
+            101,
+            topic,
+            range,
+            Uuid::from_u128(0xdead),
+            "oncall"
+        )));
+        assert!(is_rejected(&attest(
+            &mut machine,
+            next(),
+            102,
+            topic,
+            range,
+            first,
+            "  "
+        )));
+        assert!(machine.promotion_attestation(topic, range).is_none());
+
+        let index = next();
+        assert!(!is_rejected(&attest(
+            &mut machine,
+            index,
+            103,
+            topic,
+            range,
+            second,
+            "oncall"
+        )));
+        assert_eq!(
+            machine.promotion_attestation(topic, range),
+            Some(&PromotionAttestation {
+                attestation_id: Uuid::from_u128(103),
+                replica_node_uuid: second,
+                operator: "oncall".to_owned(),
+                attested_at_ms: 1_700_000_000_000 + index as i64,
+            })
+        );
+        // The operator named the wrong replica: the newer one stands.
+        assert!(!is_rejected(&attest(
+            &mut machine,
+            next(),
+            104,
+            topic,
+            range,
+            first,
+            "oncall"
+        )));
+        let live = machine
+            .promotion_attestation(topic, range)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            (live.attestation_id, live.replica_node_uuid),
+            (Uuid::from_u128(104), first)
+        );
+        let restored =
+            MetaStateMachine::decode_snapshot(&machine.encode_snapshot().unwrap()).unwrap();
+        assert_eq!(restored.promotion_attestation(topic, range), Some(&live));
+
+        // With a recorded replica set, only a member may be named.
+        assert!(!is_rejected(&set_replica_set(
+            &mut machine,
+            next(),
+            topic,
+            range,
+            &[1, 2],
+            0
+        )));
+        assert!(is_rejected(&attest(
+            &mut machine,
+            next(),
+            105,
+            topic,
+            range,
+            Uuid::from_u128(3),
+            "oncall"
+        )));
+    }
+
+    /// #636, the safety rule: a promotion that counted Unknown answers is
+    /// recorded only under the range's LIVE attestation, only when it names
+    /// the holder, and only once. Without one - #607's rule - it is refused,
+    /// and an unrecorded promotion is never exposed (persist before expose).
+    #[test]
+    fn a_promotion_counts_unproven_answers_only_once_under_the_attestation_naming_its_holder() {
+        let (mut machine, first, topic, range, mut next) = attestable_range();
+        let second = Uuid::from_u128(2);
+        let epoch = range_of(&machine, topic, range).fencing_epoch;
+        let quorum = [(1, 500), (2, 500)];
+        let pending = |machine: &MetaStateMachine, epoch: u64| {
+            transitions_of(machine, topic, range)
+                .into_iter()
+                .find(|record| record.epoch_to == epoch)
+                .map(|record| record.outcome)
+                == Some(TransitionOutcome::Pending)
+        };
+        let forged = PromotionAttestation {
+            attestation_id: Uuid::from_u128(999),
+            replica_node_uuid: first,
+            operator: "nobody".to_owned(),
+            attested_at_ms: 0,
+        };
+
+        // No attestation at all: refused.
+        assert!(is_rejected(&report(
+            &mut machine,
+            next(),
+            200,
+            2_000,
+            first,
+            topic,
+            range,
+            epoch,
+            unproven_established(500, &quorum, Some(forged.clone()))
+        )));
+        assert!(pending(&machine, epoch));
+
+        // An attestation naming a DIFFERENT replica does not help: neither
+        // presented as it is, nor rewritten to name the holder.
+        assert!(!is_rejected(&attest(
+            &mut machine,
+            next(),
+            201,
+            topic,
+            range,
+            second,
+            "oncall"
+        )));
+        let for_second = machine
+            .promotion_attestation(topic, range)
+            .cloned()
+            .unwrap();
+        assert!(is_rejected(&report(
+            &mut machine,
+            next(),
+            202,
+            2_000,
+            first,
+            topic,
+            range,
+            epoch,
+            unproven_established(500, &quorum, Some(for_second.clone()))
+        )));
+        let rewritten = PromotionAttestation {
+            replica_node_uuid: first,
+            ..for_second.clone()
+        };
+        assert!(is_rejected(&report(
+            &mut machine,
+            next(),
+            203,
+            2_000,
+            first,
+            topic,
+            range,
+            epoch,
+            unproven_established(500, &quorum, Some(rewritten))
+        )));
+        assert!(pending(&machine, epoch));
+        assert_eq!(
+            machine.promotion_attestation(topic, range),
+            Some(&for_second),
+            "a refused report must not use the attestation up"
+        );
+
+        // One naming the holder: recorded, carried into the transition,
+        // and used up in the same apply.
+        assert!(!is_rejected(&attest(
+            &mut machine,
+            next(),
+            204,
+            topic,
+            range,
+            first,
+            "oncall"
+        )));
+        let for_first = machine
+            .promotion_attestation(topic, range)
+            .cloned()
+            .unwrap();
+        let used = unproven_established(500, &quorum, Some(for_first.clone()));
+        assert_eq!(
+            report(
+                &mut machine,
+                next(),
+                205,
+                2_000,
+                first,
+                topic,
+                range,
+                epoch,
+                used.clone()
+            ),
+            MetadataResponse::TransitionRecorded {
+                fencing_epoch: epoch
+            }
+        );
+        assert!(machine.promotion_attestation(topic, range).is_none());
+        let recorded = transitions_of(&machine, topic, range)
+            .into_iter()
+            .find(|record| record.epoch_to == epoch)
+            .unwrap();
+        let TransitionOutcome::Reported { outcome, .. } = &recorded.outcome else {
+            panic!("{recorded:?}")
+        };
+        assert_eq!(outcome.attestation(), Some(&for_first));
+        // The record, attestation and all, survives a snapshot.
+        let restored =
+            MetaStateMachine::decode_snapshot(&machine.encode_snapshot().unwrap()).unwrap();
+        assert_eq!(
+            transitions_of(&restored, topic, range),
+            transitions_of(&machine, topic, range)
+        );
+
+        // The next promotion needs a NEW attestation: the used one is gone.
+        release_and_reacquire(&mut machine, &mut next, first, topic, range);
+        let later = range_of(&machine, topic, range).fencing_epoch;
+        assert!(later > epoch);
+        assert!(is_rejected(&report(
+            &mut machine,
+            next(),
+            206,
+            3_000,
+            first,
+            topic,
+            range,
+            later,
+            used
+        )));
+        assert!(pending(&machine, later));
+        assert!(!is_rejected(&attest(
+            &mut machine,
+            next(),
+            207,
+            topic,
+            range,
+            first,
+            "oncall"
+        )));
+        let fresh = machine
+            .promotion_attestation(topic, range)
+            .cloned()
+            .unwrap();
+        assert!(!is_rejected(&report(
+            &mut machine,
+            next(),
+            208,
+            3_000,
+            first,
+            topic,
+            range,
+            later,
+            unproven_established(500, &quorum, Some(fresh))
+        )));
+    }
+
+    /// #657 / #636: the largest report an attested promotion can make - every
+    /// quorum answer with the largest verdict, and the attestation with the
+    /// operator name at its bound - passes the apply-time size refusal, is
+    /// recorded, uses the attestation up, and survives a snapshot.
+    #[test]
+    fn the_largest_attested_report_is_recorded_and_survives_a_snapshot() {
+        let (mut machine, first, topic, range, mut next) = attestable_range();
+        let epoch = range_of(&machine, topic, range).fencing_epoch;
+        assert!(!is_rejected(&attest(
+            &mut machine,
+            next(),
+            500,
+            topic,
+            range,
+            first,
+            &"o".repeat(MAX_ATTESTATION_OPERATOR_BYTES)
+        )));
+        let live = machine
+            .promotion_attestation(topic, range)
+            .cloned()
+            .unwrap();
+        let mut outcome = largest_outcome(true);
+        if let PromotionOutcome::Established { attestation, .. } = &mut outcome {
+            *attestation = Some(live);
+        }
+        assert_eq!(
+            report(
+                &mut machine,
+                next(),
+                501,
+                2_000,
+                first,
+                topic,
+                range,
+                epoch,
+                outcome
+            ),
+            MetadataResponse::TransitionRecorded {
+                fencing_epoch: epoch
+            }
+        );
+        assert!(machine.promotion_attestation(topic, range).is_none());
+        let restored =
+            MetaStateMachine::decode_snapshot(&machine.encode_snapshot().unwrap()).unwrap();
+        assert_eq!(
+            transitions_of(&restored, topic, range),
+            transitions_of(&machine, topic, range)
+        );
+    }
+
+    /// #656 review: a report for an epoch the range has moved past is
+    /// history, not recovery. Recorded as evidence, it must neither retire an
+    /// attestation recorded for the current recovery nor use one up - an
+    /// attested promotion at a superseded epoch can never serve.
+    #[test]
+    fn a_report_for_a_past_epoch_neither_retires_nor_uses_an_attestation() {
+        let (mut machine, first, topic, range, mut next) = attestable_range();
+        let past = range_of(&machine, topic, range).fencing_epoch;
+        release_and_reacquire(&mut machine, &mut next, first, topic, range);
+        let current = range_of(&machine, topic, range).fencing_epoch;
+        assert!(current > past);
+        assert!(!is_rejected(&attest(
+            &mut machine,
+            next(),
+            400,
+            topic,
+            range,
+            first,
+            "oncall"
+        )));
+        let live = machine
+            .promotion_attestation(topic, range)
+            .cloned()
+            .unwrap();
+
+        // The past epoch's attested report is refused, and uses nothing up.
+        assert!(is_rejected(&report(
+            &mut machine,
+            next(),
+            401,
+            2_000,
+            first,
+            topic,
+            range,
+            past,
+            unproven_established(500, &[(1, 500), (2, 500)], Some(live.clone()))
+        )));
+        assert_eq!(machine.promotion_attestation(topic, range), Some(&live));
+
+        // Its late, ordinary report is recorded, and retires nothing.
+        assert!(!is_rejected(&report(
+            &mut machine,
+            next(),
+            402,
+            2_000,
+            first,
+            topic,
+            range,
+            past,
+            established(500, &[(1, 500), (2, 500)], 2, 2)
+        )));
+        assert_eq!(
+            machine.promotion_attestation(topic, range),
+            Some(&live),
+            "a delayed report for a past epoch erased the current recovery's attestation"
+        );
+
+        // The current epoch still uses it.
+        assert!(!is_rejected(&report(
+            &mut machine,
+            next(),
+            403,
+            3_000,
+            first,
+            topic,
+            range,
+            current,
+            unproven_established(500, &[(1, 500), (2, 500)], Some(live))
+        )));
+        assert!(machine.promotion_attestation(topic, range).is_none());
+    }
+
+    /// #636: a promotion that PROVED its lineage ends a live attestation's
+    /// life too, so an override recorded for a range that then recovered on
+    /// its own cannot be picked up by some later failure unasked. A refusal
+    /// leaves it standing.
+    #[test]
+    fn a_proven_promotion_retires_a_live_attestation_and_a_refusal_does_not() {
+        let (mut machine, first, topic, range, mut next) = attestable_range();
+        let epoch = range_of(&machine, topic, range).fencing_epoch;
+        assert!(!is_rejected(&attest(
+            &mut machine,
+            next(),
+            300,
+            topic,
+            range,
+            first,
+            "oncall"
+        )));
+        assert!(!is_rejected(&report(
+            &mut machine,
+            next(),
+            301,
+            2_000,
+            first,
+            topic,
+            range,
+            epoch,
+            PromotionOutcome::Refused {
+                reason: crate::command::PromotionRefusal::LineageUnproven,
+            }
+        )));
+        assert!(machine.promotion_attestation(topic, range).is_some());
+        assert!(!is_rejected(&report(
+            &mut machine,
+            next(),
+            302,
+            2_000,
+            first,
+            topic,
+            range,
+            epoch,
+            established(500, &[(1, 500), (2, 500)], 2, 2)
+        )));
+        assert!(machine.promotion_attestation(topic, range).is_none());
     }
 
     /// Release the range's lease and take it again, for a fresh epoch.
@@ -6988,6 +7699,7 @@ mod tests {
             quorum: Vec::new(),
             votes: 0,
             required: 0,
+            attestation: None,
         };
         assert!(!is_rejected(&report(
             &mut machine,
@@ -7748,6 +8460,7 @@ mod tests {
                 .collect(),
             votes,
             required,
+            attestation: None,
         }
     }
 
@@ -9907,7 +10620,32 @@ mod tests {
                 .collect(),
             votes: u32::MAX,
             required: u32::MAX,
+            attestation: None,
         }
+    }
+
+    /// The largest attestation (#636): the operator name at its bound.
+    fn largest_attestation() -> PromotionAttestation {
+        PromotionAttestation {
+            attestation_id: Uuid::from_u128(u128::MAX),
+            replica_node_uuid: Uuid::from_u128(u128::MAX - 1),
+            operator: "o".repeat(MAX_ATTESTATION_OPERATOR_BYTES),
+            attested_at_ms: i64::MAX,
+        }
+    }
+
+    /// The largest transition an attested promotion records (#636): the
+    /// largest verdict-carrying outcome plus the attestation it used.
+    fn largest_attested_transition() -> RangeTransitionRecord {
+        let mut record = largest_transition(true);
+        if let TransitionOutcome::Reported {
+            outcome: PromotionOutcome::Established { attestation, .. },
+            ..
+        } = &mut record.outcome
+        {
+            *attestation = Some(largest_attestation());
+        }
+        record
     }
 
     fn largest_transition(with_lineage: bool) -> RangeTransitionRecord {
@@ -9930,7 +10668,7 @@ mod tests {
     /// Every [`MetaValue`] kind, numbered by an exhaustive match: a new
     /// kind does not compile until it is numbered here, and is then missing
     /// from the largest-record test below until a record is added for it.
-    const META_VALUE_KINDS: usize = 20;
+    const META_VALUE_KINDS: usize = 21;
     fn meta_value_kind(value: &MetaValue) -> usize {
         match value {
             MetaValue::Node(_) => 0,
@@ -9953,6 +10691,7 @@ mod tests {
             MetaValue::ClusterConfig(_) => 17,
             MetaValue::RangeReplicaSet(_) => 18,
             MetaValue::NodeVersion(_) => 19,
+            MetaValue::PromotionAttestation(_) => 20,
         }
     }
 
@@ -10197,6 +10936,20 @@ mod tests {
                 73,
                 false,
             ),
+            // The attested form (#636, feature level 8): the verdict-carrying
+            // record above with outcome tag 4 instead of 3, plus the
+            // attestation - id 16 + replica 16 + operator (2 + 128) + at 8.
+            (
+                MetaValue::RangeTransition(largest_attested_transition()),
+                1339,
+                false,
+            ),
+            // tag 1 + the attestation 170 (#636, feature level 8).
+            (
+                MetaValue::PromotionAttestation(largest_attestation()),
+                171,
+                false,
+            ),
         ]
     }
 
@@ -10232,6 +10985,41 @@ mod tests {
                     })
                 ),
                 "release {release:?} protocol {protocol} level {level}: {refused:?}"
+            );
+        }
+    }
+
+    /// #636 review, as #634 with #657 above: apply never records an
+    /// attestation with a blank operator, so the value decoder refuses one,
+    /// and `encode_snapshot` with it. Safe because value tag 25 is new at
+    /// feature level 8: no older snapshot holds one.
+    #[test]
+    fn an_attestation_apply_never_writes_is_refused_by_the_snapshot() {
+        for operator in ["", "   "] {
+            let mut machine = MetaStateMachine::new();
+            machine.records.insert(
+                MetaKey::PromotionAttestation {
+                    topic_uuid: Uuid::from_u128(1),
+                    range_uuid: Uuid::from_u128(2),
+                }
+                .encode(),
+                MetaValue::PromotionAttestation(PromotionAttestation {
+                    attestation_id: Uuid::from_u128(3),
+                    replica_node_uuid: Uuid::from_u128(4),
+                    operator: operator.to_owned(),
+                    attested_at_ms: 1,
+                }),
+            );
+            let refused = machine.encode_snapshot();
+            assert!(
+                matches!(
+                    refused,
+                    Err(CodecError::InvalidValue {
+                        what: "promotion attestation",
+                        ..
+                    })
+                ),
+                "operator {operator:?}: {refused:?}"
             );
         }
     }
@@ -10451,6 +11239,7 @@ mod tests {
             mut quorum,
             votes,
             required,
+            attestation,
         } = largest_outcome(true)
         else {
             unreachable!()
@@ -10462,6 +11251,7 @@ mod tests {
             quorum,
             votes,
             required,
+            attestation,
         };
         let response = report(
             &mut machine,
