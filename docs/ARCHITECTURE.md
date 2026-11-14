@@ -260,6 +260,41 @@ is a real and silent condition.
   last case the ledger is not consulted for that run, and the protection
   against a stale engine's commit does not apply to it.
 
+While running, the partition list changes in ways a restart never sees, and
+`latest` must not skip what arrived meanwhile (#675):
+
+- **A partition added to a topic being read**, **a topic that listed no
+  partitions when first asked for** (created moments later, or not yet known to
+  the broker), or **a topic first read after the engine started** (discovery
+  lists every topic each cycle, so it was created since) starts from the
+  group's committed offset, else, under `latest`, from its **beginning**:
+  every record in it is newer than the start `latest` promised when the engine
+  began reading. Partition counts are re-checked every cycle from discovery's
+  own listing (with no listing, one metadata request every 30s), so a new
+  partition is assigned within a cycle. An answer with no partitions is never
+  cached. When the start cannot be established, the partition waits, never
+  assigned at `Offset::Stored`.
+- **A whole re-assign** (the topic set or a partition count changed, a record
+  was rejected, a poll failed) first pins every partition that stays assigned
+  and is still waiting at `Offset::Stored` under `latest` where it started. A
+  partition whose start cannot be established is left out and asked again
+  10s later; every other partition is assigned and read. A partition whose
+  records in a pass were all rejected or discarded is pinned at the first of
+  them.
+- **A failed partition lookup**, or a topic answer carrying an error other
+  than "unknown topic", serves the topic's last known list.
+- **A deleted and recreated topic** (fewer partitions than before, a topic that
+  lists partitions again after listing none, or an end offset below the
+  position held) is reported, not acted on: the ledger cannot tell the two
+  topics apart, and offsets alone cannot tell a recreate from a truncated log.
+  Where the new log is shorter than the old position, the broker answers out
+  of range and `auto.offset.reset` applies; where it already reaches past it,
+  the records below are skipped without an error, which the warning says.
+
+Each of these logs what happened, what the engine did and what the operator
+should check, with the topic, partition and offsets as fields, and counts in
+`vtop_kafka_partition_events_total{event}`.
+
 When retention has already removed records past that position, `auto.offset.reset`
 applies by two different routes, and both end the same way:
 
@@ -827,7 +862,7 @@ On startup, the `replay` module inspects `vtop-state` and maps each incomplete b
    **A range the source has committed past is retired, not handed back (#567).** Before the rewind is planned, recovery asks the row's adapter for the committed point of the row's unit (`SourceAdapter::committed_through`). At startup that is the ledger's newest committed row for the unit, newest by `(created_at, batch_id)` as in both stores and in pruning, the same row the restart cursor is seeded from, which retention never prunes. For Kafka it is the ledger frontier the adapter trusts (#614). For files and spools it is the cursor's committed byte, answered only when the row's marker is PROVEN to be the cursor's file: the same inode (a legacy marker without one is never retired), and the same content - both fingerprints matching the first bytes of the file now at the path, equal ones too, since equal fingerprints say only that the marker and the cursor read the same content, not that the file still holds it - and, for a marker with a tail fingerprint, the same bytes below its end, and for a cursor with one, the same bytes below its position; and the file no shorter than any length or position either recorded. This is one test (`continuity::proves`), shared with the choice of the restart seed and the re-read of a rotated file (#621, section 7.2). Anything less keeps the replay path, because `SUPERSEDED` is terminal. If that point is at or past the end of the row's range, the rewind would land there and read nothing again. So the row moves to `SUPERSEDED` (from `FAILED` or `REPLAY_REQUIRED`; an in-flight row is written `FAILED` first), it is counted in the summary as superseded, not as a replay, and no rewind is planned for it. `SUPERSEDED` is terminal. Neither the claim nor the incomplete listing returns it, so later restarts never touch it, and retention deletes it with committed history, digesting it first. If a write fails, nothing is rewound: a row that was `FAILED` or `REPLAY_REQUIRED` stays as it was, and an in-flight row whose `FAILED` write landed but whose `SUPERSEDED` write did not is left `FAILED`. Nothing below the committed point would be read anyway, and the next recovery decides again. A row whose range spans two files, or whose adapter cannot say, keeps the replay path. Before this, every such row was claimed at every restart, written `FAILED` and `REPLAY_REQUIRED` again, counted in `replay_required_total`, and given a no-op rewind, and retention never removed it.
 
    `SUPERSEDED` claims only that the source committed past the range. It does not claim that a committed range covers the range's bytes. A ledger written before #552 can hold a committed range above a failed one, and that row is now retired like any other, because its rewind was already clamped to nothing. The coverage audit (#560) still judges a `SUPERSEDED` range exactly as a `FAILED` one and names it in any hole.
-3. **A replay that produces the same bytes resolves to the object already stored (#626).** The object key, under the partition prefix (`vtop_core::batch::build_object_name`), is `vtop-<engine>-<source>-<range>[-i<inode>]-<digest>.<format>[.<compression>]` for a file or spool range and `vtop-<source>-<range>-<digest>.<format>[.<compression>]` for a Kafka range: the source name, the batch's whole range (`ProgressMarker::spanning`) and the first 32 hex digits of the object's checksum, plus, for a file or spool file, the engine name and the inode. An object is shared only by attempts at one unit's range. A file or spool file is one host's unit, so two engines archiving byte-identical windows of their own files, or a new file at a path holding the old file's bytes, get separate objects. A Kafka topic-partition is one unit wherever it is read, so an engine that replays a range another engine sharing the ledger uploaded finds that object. The name does not carry the topic's ID: a topic deleted and recreated under the same name restarts its offsets at 0, and a new incarnation whose records are byte-identical at the same offsets would reuse the old incarnation's object, so a reader deduping by object URI would drop them. Only byte-identical records can do this; adding the topic ID to the name is left for later. Compression output is a function of the records and the level within one build (gzip writes no timestamp; a compression library upgrade may change the bytes and so the key, which costs one more object, nothing else), so the same range of the same source re-read with the same settings gives the same key. Before the put, the engine looks at that key:
+3. **A replay that produces the same bytes resolves to the object already stored (#626).** The object key, under the partition prefix (`vtop_core::batch::build_object_name`), is `vtop-<engine>-<source>-<range>[-i<inode>]-<digest>.<format>[.<compression>]` for a file or spool range and `vtop-<source>-<range>-<digest>.<format>[.<compression>]` for a Kafka range: the source name, the batch's whole range (`ProgressMarker::spanning`) and the first 32 hex digits of the object's checksum, plus, for a file or spool file, the engine name and the inode. An object is shared only by attempts at one unit's range. A file or spool file is one host's unit, so two engines archiving byte-identical windows of their own files, or a new file at a path holding the old file's bytes, get separate objects. A Kafka topic-partition is one unit wherever it is read, so an engine that replays a range another engine sharing the ledger uploaded finds that object. The name does not carry the topic's ID: a topic deleted and recreated under the same name restarts its offsets at 0, and a new incarnation whose records are byte-identical at the same offsets would reuse the old incarnation's object, so a reader deduping by object URI would drop them. Only byte-identical records can do this, and the Kafka source reports a recreated topic as `recreated_or_truncated` in `vtop_kafka_partition_events_total` (#675); adding the topic ID to the name is left for later. Compression output is a function of the records and the level within one build (gzip writes no timestamp; a compression library upgrade may change the bytes and so the key, which costs one more object, nothing else), so the same range of the same source re-read with the same settings gives the same key. Before the put, the engine looks at that key:
    - **absent** (the backend's HEAD answers `NotFound`): the batch is put there;
    - **holds an object that verifies strongly** against the batch's size and full digest: the put is skipped and the object is reused (`object_key_reused` in the log). The pipeline then verifies it again like any other, so `VERIFIED` still rests on a read of the stored bytes;
    - **anything else** (the object there does not verify, verifies by size only, or the probe failed with anything but a throttle): the key is left alone and the batch is written under its **attempt key**, named by its `batch_id` as before, with the reason logged as `object_key_fallback`. Nothing that is already stored is ever overwritten, so a damaged object stays for the scrub to report, and a key that would need an overwrite under Object Lock is never written. A throttled probe fails the batch like any other stage.

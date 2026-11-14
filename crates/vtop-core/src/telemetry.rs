@@ -182,6 +182,17 @@ pub struct Metrics {
     /// process-wide, so the account is too. Unshaped volume is
     /// `bytes_out_total`.
     pub upload_egress_bytes_total: IntCounterVec,
+
+    /// Changes to a Kafka topic's partition list seen while reading, and what
+    /// the source did about them (#675), by `event`: `no_partitions` (a topic
+    /// listed without partitions), `lookup_failed`, `grew`,
+    /// `new_partition_from_beginning`, `start_deferred` (where a partition
+    /// starts could not be established; asked again), `pinned_before_renewal`
+    /// and `recreated_or_truncated`. The last one is the one to alert on: the
+    /// ledger cannot tell a recreated topic from the old one. Labelled by
+    /// event only, a fixed set; the topic and partition are in the log line
+    /// beside it.
+    pub kafka_partition_events_total: IntCounterVec,
 }
 
 fn labels3() -> Vec<&'static str> {
@@ -294,6 +305,11 @@ impl Metrics {
             "Records source-side retention removed before the engine read them; any increase is data loss upstream of the archive (see logs for topic/partition)",
             vec!["tenant", "source_type"],
         )?;
+        let kafka_partition_events_total = cv(
+            "kafka_partition_events_total",
+            "Kafka partition-list changes seen while reading and what the source did (see logs for topic/partition): no_partitions, lookup_failed, grew, new_partition_from_beginning, start_deferred, pinned_before_renewal, recreated_or_truncated",
+            vec!["event"],
+        )?;
         let source_replay_refused_total = cv(
             "source_replay_refused_total",
             "Failed ranges the source refused to hand back for re-reading, or whose re-read it then refused; each is a range missing from the archive (see logs for the path). For a file: its file cannot be proven reachable - truncated, replaced or rewritten in place, or rotated away and then removed, compressed, copied by copytruncate, or truncated or rewritten before its re-read",
@@ -377,6 +393,7 @@ impl Metrics {
             upload_throttled_total,
             upload_egress_bytes_total,
             object_key_decisions_total,
+            kafka_partition_events_total,
         })
     }
 
