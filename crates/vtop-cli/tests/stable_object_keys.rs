@@ -734,7 +734,7 @@ async fn a_replay_over_a_grown_source_resolves_to_the_archived_object() {
         &format!("b0-{n}"),
         &[
             "rebuilt exactly as first cut (4 records)",
-            "not to the end of the source",
+            "names the object the earlier attempt uploaded",
         ],
     );
 }
@@ -1278,8 +1278,9 @@ async fn a_replay_sealed_in_a_later_hour_resolves_to_the_recorded_key() {
         &[
             &format!("failed earlier (batch {})", first[0].batch_id),
             "rebuilt exactly as first cut (4 records)",
-            "filed under the hour it was first sealed in",
-            "names the same key",
+            "sealed at the instant first recorded",
+            "filed under the same hour",
+            "names the object the earlier attempt uploaded, with the same bytes",
             "nothing to do",
         ],
     );
@@ -1495,15 +1496,22 @@ async fn two_failed_windows_are_each_rebuilt_after_a_restart_and_reuse_their_obj
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("app.log");
     write_lines(&input, "app", 4);
-    let backend = Arc::new(MockBackend::new().with_throttled_manifest_puts(2));
+    // Three manifest puts fail: window A, A's rebuild, and window B.
+    let backend = Arc::new(MockBackend::new().with_throttled_manifest_puts(3));
     let tenant = "two-windows-626";
     let mut cfg = config(dir.path(), "state.db", std::slice::from_ref(&input));
     cfg.engine.tenant = tenant.into();
     cfg.batching.max_records = 2;
     let orphans: Vec<String> = {
         let mut first = engine(cfg.clone(), &backend).await;
+        // A: two lines (the pass budget), fails.
+        let a = first.process_once(SourceType::File).await.unwrap();
+        assert_eq!(a.len(), 1, "{a:?}");
+        // A pass of four lines rebuilds A up to its cut and reads B on after
+        // it, as its own window; both fail.
+        first.config.batching.max_records = 4;
         let out = first.process_once(SourceType::File).await.unwrap();
-        assert_eq!(out.len(), 2, "two windows of two lines: {out:?}");
+        assert_eq!(out.len(), 2, "A rebuilt, then B: {out:?}");
         assert!(out.iter().all(|o| !o.committed), "{out:?}");
         let mut uris = Vec::new();
         for o in &out {
@@ -1512,13 +1520,18 @@ async fn two_failed_windows_are_each_rebuilt_after_a_restart_and_reuse_their_obj
         }
         uris
     };
+    cfg.batching.max_records = 4;
     write_lines(&input, "more", 1);
     let exact_before = rebuilds(tenant, "exact");
 
     let mut restarted = engine(cfg, &backend).await;
     let summary = restarted.recover().await.unwrap();
-    assert_eq!(summary.replay_required, 2, "{summary:?}");
-    let out = restarted.process_once(SourceType::File).await.unwrap();
+    assert_eq!(
+        summary.replay_required, 3,
+        "A, its rebuild, and B: {summary:?}"
+    );
+    let mut out = restarted.process_once(SourceType::File).await.unwrap();
+    out.extend(restarted.process_once(SourceType::File).await.unwrap());
     assert!(out.iter().all(|o| o.committed), "{out:?}");
     let reused: Vec<_> = out.iter().filter_map(|o| o.object_uri.clone()).collect();
     for orphan in &orphans {
@@ -1689,4 +1702,97 @@ async fn a_rebuild_that_takes_two_passes_is_sealed_once_at_its_recorded_end() {
     assert!(!put_twice(&backend, &orphan).await);
     let len = std::fs::metadata(&input).unwrap().len();
     assert_eq!(committed_ranges(&e).await, vec![(0, len)]);
+}
+
+/// Review of #755: a rebuild is reported once it is VERIFIED, not when its key
+/// is decided. During an outage every attempt decides a key and fails; counting
+/// each as a `fallback` made the alert on second objects fire although nothing
+/// was written.
+#[tokio::test]
+async fn a_rebuild_that_fails_before_verified_is_not_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 4);
+    // The probe is refused (fallback to the attempt key), and the first two
+    // puts are throttled: the first attempt and the first rebuild fail.
+    let backend = Arc::new(
+        MockBackend::new()
+            .with_head_fault(HeadFault::Refused)
+            .with_throttled_puts(2),
+    );
+    let tenant = "rebuild-outage-626";
+    let mut cfg = config(dir.path(), "state.db", std::slice::from_ref(&input));
+    cfg.engine.tenant = tenant.into();
+    let mut e = engine(cfg, &backend).await;
+    let before = rebuilds(tenant, "fallback");
+    for attempt in 0..2 {
+        let out = e.process_once(SourceType::File).await.unwrap();
+        assert!(!out[0].committed, "attempt {attempt}: {out:?}");
+    }
+    assert_eq!(
+        rebuilds(tenant, "fallback"),
+        before,
+        "a rebuild that did not reach VERIFIED wrote nothing and is not counted"
+    );
+    let out = e.process_once(SourceType::File).await.unwrap();
+    assert!(out[0].committed, "{out:?}");
+    assert_eq!(rebuilds(tenant, "fallback"), before + 1);
+}
+
+/// Review of #755: a row that recorded no seal instant (one a v0.9.0 engine
+/// wrote) is replayed in the hour it is read again, as before, and is not
+/// reported as rebuilt in its first hour.
+#[tokio::test]
+async fn a_row_without_a_seal_instant_is_not_reported_as_rebuilt() {
+    use sqlx::ConnectOptions;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 4);
+    let backend = Arc::new(MockBackend::new().with_throttled_manifest_puts(1));
+    let tenant = "no-instant-626";
+    let cfg = hourly_config(dir.path(), "state.db", &input, tenant);
+    let orphan = {
+        let mut first = engine(cfg.clone(), &backend).await;
+        first.set_seal_clock(|| at(SEALED));
+        let out = first.process_once(SourceType::File).await.unwrap();
+        assert!(!out[0].committed, "{out:?}");
+        first
+            .store
+            .get_batch(&out[0].batch_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .object_uri
+            .unwrap()
+    };
+    {
+        let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(dir.path().join("state.db"))
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query("UPDATE batches SET sealed_at = NULL")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    let (logs, _guard) = Logs::capture();
+    let exact_before = rebuilds(tenant, "exact");
+    let mut restarted = engine(cfg, &backend).await;
+    restarted.set_seal_clock(|| at(REPLAYED));
+    restarted.recover().await.unwrap();
+    let out = restarted.process_once(SourceType::File).await.unwrap();
+    assert!(out[0].committed, "{out:?}");
+    let written = out[0].object_uri.clone().unwrap();
+    assert!(
+        written.contains("hour=06"),
+        "filed in the hour it is replayed in: {written}"
+    );
+    assert_ne!(written, orphan);
+    assert_eq!(
+        rebuilds(tenant, "exact"),
+        exact_before,
+        "no instant, no claim"
+    );
+    assert!(logs.events("replay_rebuilt").is_empty());
 }

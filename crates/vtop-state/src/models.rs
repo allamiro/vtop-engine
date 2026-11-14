@@ -196,16 +196,51 @@ pub(crate) fn sealed_at_column(stored: Option<String>, batch_id: &str) -> Option
     if plausible_sealed_at(&text) {
         return Some(text);
     }
-    tracing::warn!(
-        batch_id,
-        column = "sealed_at",
-        stored_len = text.len(),
-        "state store: ledger row {batch_id} holds a sealed_at that is not an RFC 3339 instant; \
-         it is read as unknown, so a replay of the row is filed under the hour it runs in, as \
-         for a row from before the column existed (it may write a second object). Nothing to do \
-         unless this repeats; then check what else writes to the ledger"
-    );
+    // Every read of the row meets it again (each claim, `status`, a list),
+    // so the notice is rate-limited, with the count it held back.
+    if let Some(suppressed) = SEALED_AT_NOTICE.admit() {
+        tracing::warn!(
+            batch_id,
+            column = "sealed_at",
+            stored_len = text.len(),
+            suppressed,
+            "state store: ledger row {batch_id} holds a sealed_at that is not an RFC 3339 \
+             instant; it is read as unknown, so a replay of the row is filed under the hour it \
+             runs in, as for a row from before the column existed (it may write a second \
+             object). Nothing to do unless this repeats; then check what else writes to the \
+             ledger ({suppressed} more like this suppressed since the last notice)"
+        );
+    }
     None
+}
+
+/// At most one notice a minute about unreadable `sealed_at` values.
+static SEALED_AT_NOTICE: Notice = Notice::new();
+
+/// A process-wide rate limit for one notice: the first is let through, then at
+/// most one a minute, each with how many were held back since the last.
+struct Notice(std::sync::Mutex<(Option<std::time::Instant>, u64)>);
+
+impl Notice {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new((None, 0)))
+    }
+
+    fn admit(&self) -> Option<u64> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        match state.0 {
+            Some(last) if now.duration_since(last) < std::time::Duration::from_secs(60) => {
+                state.1 += 1;
+                None
+            }
+            _ => {
+                let suppressed = state.1;
+                *state = (Some(now), 0);
+                Some(suppressed)
+            }
+        }
+    }
 }
 
 /// Reads a serialized `sealed_at` leniently (#626): absent, not a string, or

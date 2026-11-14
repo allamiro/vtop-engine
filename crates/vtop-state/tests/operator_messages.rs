@@ -233,8 +233,15 @@ async fn a_seal_instant_that_is_not_one_is_read_as_unknown_and_says_so() {
     let before = said(logs).len();
     let row = store.get_batch("legacy-0").await.unwrap().unwrap();
     assert_eq!(row.sealed_at, None);
+    // Read again: rate-limited, not said again.
+    store.list_batches().await.unwrap();
+    store.get_batch("legacy-0").await.unwrap();
     let lines = said(logs);
-    assert_eq!(lines.len(), before + 1, "{lines:?}");
+    assert_eq!(
+        lines.len(),
+        before + 1,
+        "said once, not on every read: {lines:?}"
+    );
     let line = lines.last().unwrap();
     for part in [
         "is not an RFC 3339 instant",
@@ -244,6 +251,7 @@ async fn a_seal_instant_that_is_not_one_is_read_as_unknown_and_says_so() {
         r#""batch_id":"legacy-0""#,
         r#""column":"sealed_at""#,
         r#""stored_len":10"#,
+        r#""suppressed":0"#,
         r#""level":"WARN""#,
     ] {
         assert!(line.contains(part), "{part:?} missing from: {line}");

@@ -1060,19 +1060,6 @@ impl<'a> Pipeline<'a> {
             },
         };
         metrics.object_reused = reused;
-        if let Some(window) = &rebuild {
-            crate::rebuild::note_rebuilt(
-                window,
-                &batch_id,
-                source_name,
-                &range,
-                &object_uri,
-                object_checksum.as_deref(),
-                key_is_derived,
-                batch.record_count,
-                labels,
-            );
-        }
 
         // ONE PUT, OR RESUMABLE MULTIPART above the threshold (#482). The
         // retransmission unit for a single put is the whole batch — a lost
@@ -1547,6 +1534,22 @@ impl<'a> Pipeline<'a> {
         let t_write = Instant::now();
         self.store.mark_verified(&batch_id, class).await?;
         state_write += t_write.elapsed();
+        // What the rebuild came to (#626), reported once the batch is
+        // VERIFIED: an attempt that fails before is no rebuild, and counting
+        // it would count every retry of an outage as a second object.
+        if let Some(window) = &rebuild {
+            crate::rebuild::note_rebuilt(
+                window,
+                &batch_id,
+                source_name,
+                &range,
+                &object_uri,
+                object_checksum.as_deref(),
+                key_is_derived,
+                batch.record_count,
+                labels,
+            );
+        }
         // Counted only AFTER the store has persisted ManifestUploaded ->
         // Verified. Incrementing first would let a failed state write leave
         // verified_total claiming a verification the ledger never recorded -
@@ -3325,12 +3328,21 @@ impl Engine {
                         // The digest of an object this attempt uploaded, as
                         // the ledger recorded it: the object a rebuild of
                         // the window compares itself with.
-                        if let Ok(Some(row)) = self.store.get_batch(&outcome.batch_id).await {
-                            if let Some(digest) =
-                                crate::rebuild::recorded_digest(row.object_sha256.as_deref())
-                            {
-                                window.digest = Some(digest);
+                        match self.store.get_batch(&outcome.batch_id).await {
+                            Ok(Some(row)) => {
+                                if let Some(digest) =
+                                    crate::rebuild::recorded_digest(row.object_sha256.as_deref())
+                                {
+                                    window.digest = Some(digest);
+                                }
                             }
+                            Ok(None) => {}
+                            Err(e) => tracing::debug!(
+                                batch_id = %outcome.batch_id,
+                                error = %e,
+                                "could not read the failed batch's row; its replay is judged on \
+                                 its range alone"
+                            ),
                         }
                         window.batch_id = Some(outcome.batch_id.clone());
                         handed_back.push((*window).clone());
@@ -3407,6 +3419,8 @@ impl Engine {
                     // archive short of the source - and counted, so it can be
                     // alerted on rather than grepped for (#621).
                     self.count_refused_replay(source_type, marker);
+                    // Not re-read, so nothing will rebuild it (#626).
+                    self.recorded.forget(marker);
                     tracing::error!(
                         source_type = %source_type,
                         start = ?marker,
@@ -4114,6 +4128,7 @@ impl Engine {
                     // the rewind itself. Swallowing this made recovery report
                     // success for a range that was never going to be re-read.
                     self.count_refused_replay(&source_type, marker);
+                    self.recorded.forget(marker);
                     tracing::error!(
                         start = ?marker,
                         error = %e,

@@ -1208,6 +1208,50 @@ mod tests {
         );
     }
 
+    /// #626: a spool re-read bounded to a recorded range stops at its end,
+    /// and the lines after it are read on in the same pass as their own read.
+    #[tokio::test]
+    async fn a_bounded_spool_re_read_stops_at_the_recorded_end_and_reads_on() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "<13>one").unwrap();
+        writeln!(f, "<13>two").unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let mut s = SyslogSpoolSource::new(vec![path.clone()]);
+        let src = DiscoveredSource {
+            source_type: SourceType::SyslogSpool,
+            source_name: path.clone(),
+            format: TelemetryFormat::Syslog,
+        };
+        let first = s
+            .read_batch_candidates(&src, 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(first[0].records.len(), 2);
+        writeln!(f, "<13>three").unwrap();
+        f.flush().unwrap();
+        s.replay_from_marker(&first[0].progress_start)
+            .await
+            .unwrap();
+        let range = ReplayRange {
+            start: first[0].progress_start.clone(),
+            end: first[0].progress_end.clone(),
+        };
+        assert_eq!(s.bound_replays(&[range]), [true]);
+        let again = s
+            .read_batch_candidates(&src, 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.len(),
+            2,
+            "the rebuilt window, then the new line: {again:?}"
+        );
+        assert_eq!(again[0].records, first[0].records);
+        assert_eq!(again[1].records, vec![b"<13>three".to_vec()]);
+        assert!(s.take_refused_cuts().is_empty());
+    }
+
     #[tokio::test]
     async fn reads_spool_and_resumes() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
