@@ -18,6 +18,8 @@ path = "src/main.rs"
 default = ["kafka"]
 # Kafka is a compatibility/source adapter, not a native broker dependency.
 kafka = ["vtop-adapters/kafka", "dep:rdkafka"]
+# Opt-in Kerberos (SASL GSSAPI) for the Kafka source; see vtop-adapters.
+kafka-gssapi = ["kafka", "vtop-adapters/kafka-gssapi"]
 # Keep PostgreSQL optional in the CLI while providing a discoverable feature
 # for production builds and the separate `vtopctl migrate` deployment step.
 postgres = ["vtop-state/postgres"]

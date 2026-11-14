@@ -376,47 +376,95 @@ cargo run -p vtop-cli -- discover --config examples/config.yaml
 ### Native prerequisites
 
 The default build includes the Kafka source. Its `rdkafka` dependency compiles
-librdkafka with SSL and SASL, so it needs a C toolchain, CMake, OpenSSL 3 and
-Cyrus SASL. Without the Kafka source
-(`cargo build -p vtop-cli --no-default-features`), the file, spool and native
-paths need none of these.
+librdkafka with CMake, and OpenSSL from source with Perl. OpenSSL is linked
+into the binary, so the build never depends on the host's OpenSSL version, and
+the binaries load no OpenSSL or SASL library at run time (#677). You need a
+C/C++ toolchain, CMake, make and Perl, plus Rust from
+[rustup](https://rustup.rs). The minimum Rust version is `rust-version` in
+`Cargo.toml`.
 
-**Debian / Ubuntu** (the same packages CI and the release workflow install):
+| Platform | Install |
+|---|---|
+| Debian / Ubuntu | `sudo apt-get install -y build-essential cmake perl pkg-config libcurl4-openssl-dev zlib1g-dev` |
+| RHEL, AlmaLinux, Rocky Linux 8, 9 and 10 | `sudo dnf install -y gcc gcc-c++ make cmake perl-core libcurl-devel zlib-devel` |
+| Fedora | `sudo dnf install -y gcc gcc-c++ make cmake perl-core libcurl-devel zlib-devel` |
+| macOS 11 or later, Apple silicon or Intel | `xcode-select --install`, then `brew install cmake` |
 
-```bash
-sudo apt-get install -y --no-install-recommends \
-  cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
-```
+The `dnf` line was checked on AlmaLinux 8.10, 9.8 and 10.2, Rocky Linux 8.10
+and 9.8, and Fedora 45. A full build was run on AlmaLinux 8 (OpenSSL 1.1.1
+installed) and on Fedora 45 (OpenSSL 4 installed); neither touches the system
+OpenSSL. RHEL takes the same packages from its BaseOS and AppStream
+repositories. On a minimal image, `perl-core` matters: the OpenSSL build needs
+Perl modules (`FindBin`, `IPC::Cmd`) that bare `perl` doesn't carry. The curl
+package is needed for its header only. librdkafka includes `curl/curl.h` even
+with curl support switched off (its config always defines
+`WITH_OAUTHBEARER_OIDC`, and one file tests it with `#ifdef`). Nothing links
+libcurl. The macOS SDK ships that header already.
 
-**macOS** (Homebrew). `openssl@3` and `cyrus-sasl` are keg-only, so point
-pkg-config at them explicitly:
-
-```bash
-brew install cmake openssl@3 cyrus-sasl
-export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix cyrus-sasl)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-export OPENSSL_DIR="$(brew --prefix openssl@3)"
-```
-
-Add the two `export` lines to `~/.zshrc` to keep them in new terminals.
-
-- **Use OpenSSL 3, not 4.** If Homebrew's default `openssl` is 4.x and these
-  variables are unset, the build links `openssl@4` and fails at the link step,
-  because librdkafka uses APIs that OpenSSL 4 removed. If that happened, set
-  the variables above, then run `cargo clean -p rdkafka-sys` and build again.
-- `ld: warning: ... was built for newer 'macOS' version` lines are harmless.
-  `export MACOSX_DEPLOYMENT_TARGET=11.0` silences them.
-
-**macOS release binaries** load the same two Homebrew libraries at run time.
-Install them before running a downloaded `vtopctl` or `vtop-node`:
+Then build:
 
 ```bash
-brew install openssl@3 cyrus-sasl
+cargo build --release --locked
+./target/release/vtopctl --version
 ```
 
-Without them the binary stops at launch with
-`Library not loaded: .../libsasl2.3.dylib`. Bundling them into the release is
-tracked in #677. The Linux binaries and the container image need nothing
-extra.
+On macOS, `.cargo/config.toml` sets `MACOSX_DEPLOYMENT_TARGET=11.0`, so a
+binary built on any macOS release runs on macOS 11 and later. To target a
+different minimum, export that variable yourself.
+
+**Optional builds:**
+
+- **Without the Kafka source.** `cargo build -p vtop-cli --no-default-features`
+  skips librdkafka and OpenSSL entirely. The file, spool and native paths work
+  the same.
+- **Linking the system OpenSSL** instead of the built-in one. Packagers may want
+  this to pick up distribution security updates. Install the OpenSSL
+  development package (`libssl-dev`, `openssl-devel`, or Homebrew
+  `openssl@3`), then:
+
+  ```bash
+  export OPENSSL_NO_VENDOR=1
+  export OPENSSL_DIR="$(brew --prefix openssl@3)"   # macOS only
+  ```
+
+  Use OpenSSL 1.1.1 or 3.x. librdkafka calls the ENGINE API, which OpenSSL 4
+  removed, so a system OpenSSL 4 (Fedora 45, Homebrew's default `openssl`)
+  fails at the link step.
+- **Kerberos (SASL GSSAPI)** for the Kafka source:
+  `cargo build --release --features kafka-gssapi`. It links the system Cyrus
+  SASL, so install `libsasl2-dev` (Debian/Ubuntu), `cyrus-sasl-devel`
+  (RHEL family, Fedora) or Homebrew `cyrus-sasl`, and on macOS:
+
+  ```bash
+  export PKG_CONFIG_PATH="$(brew --prefix cyrus-sasl)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  ```
+
+  SASL PLAIN, SCRAM and OAUTHBEARER are built into librdkafka and need none of
+  this.
+
+**Running the release binaries.** From the release after v0.8.0, the Linux and
+macOS binaries need no extra libraries. The v0.8.0 binaries and earlier still
+link OpenSSL 3 and Cyrus SASL dynamically:
+
+- **macOS:** `brew install openssl@3 cyrus-sasl`.
+- **Debian/Ubuntu:** `sudo apt-get install -y libssl3 libsasl2-2`.
+- **RHEL family and Fedora:** `sudo dnf install -y openssl-libs cyrus-sasl-lib`.
+
+The container image always carries what it needs.
+
+**Troubleshooting:**
+
+| Symptom | Cause and fix |
+|---|---|
+| `Library not loaded: .../libsasl2.3.dylib` or `libssl.3.dylib` (macOS) | A v0.8.0 or earlier binary. Run `brew install openssl@3 cyrus-sasl`, or build from source. |
+| `error while loading shared libraries: libsasl2.so.3` or `libssl.so.3` (Linux) | A v0.8.0 or earlier binary. Install the run-time packages listed above. |
+| `Can't locate FindBin.pm` or `IPC/Cmd.pm` during the build | The OpenSSL build needs those Perl modules. Install `perl-core` (RHEL family, Fedora) or `perl` (Debian/Ubuntu). |
+| `failed to run custom build command for rdkafka-sys` mentioning `cmake` | Install CMake (see the table). |
+| `fatal error: curl/curl.h: No such file or directory` (Linux) | Install `libcurl4-openssl-dev` or `libcurl-devel` (header only; see above). |
+| Undefined `_ENGINE_*` symbols, or the link line names `openssl@4` | `OPENSSL_NO_VENDOR` is set and found OpenSSL 4. Unset it, or point `OPENSSL_DIR` at an OpenSSL 3. |
+| `No provider for SASL mechanism GSSAPI` when the engine starts | The binary was built without Kerberos. Rebuild with `--features kafka-gssapi`. |
+| `ld: warning: ... was built for newer 'macOS' version` | Something set `MACOSX_DEPLOYMENT_TARGET` higher than the build defaults. Unset it, or set it to the oldest macOS you want to support. |
+| A fix above changed nothing | Cargo cached the old build of the C libraries. Run `cargo clean -p openssl-sys -p rdkafka-sys` and build again. |
 
 ### Checks
 
