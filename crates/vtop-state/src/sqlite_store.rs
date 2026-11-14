@@ -1102,11 +1102,26 @@ fn create_owner_only(path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        // A symlink whose target does not exist yet (review): `create_new`
+        // refuses the link itself, and SQLite would then create the target
+        // under the umask. Create the target the link names instead.
+        let mut target = path.to_path_buf();
+        for _ in 0..40 {
+            match std::fs::read_link(&target) {
+                Ok(next) => {
+                    target = match target.parent() {
+                        Some(parent) if next.is_relative() => parent.join(next),
+                        _ => next,
+                    }
+                }
+                Err(_) => break,
+            }
+        }
         let _ = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(path);
+            .open(&target);
     }
     #[cfg(not(unix))]
     let _ = path;
@@ -1235,6 +1250,17 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with("file:"))
             .count();
         assert_eq!(stray, 0, "a file named after the URI text was created");
+
+        // A symlink to a ledger that does not exist yet: the target is
+        // created owner-only, not by SQLite under the umask (review).
+        let target = dir.path().join("target.db");
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink("target.db", &link).unwrap();
+        SqliteStateStore::connect(&format!("sqlite://{}", link.display()))
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the link's target was created {mode:04o}");
     }
 
     /// #557: two handles on one database file stand for two engines.

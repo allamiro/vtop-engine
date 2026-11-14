@@ -493,10 +493,15 @@ pub fn sqlite_ledger_file(conn: &str) -> Option<std::path::PathBuf> {
     };
     let uri = uri.split('#').next().unwrap_or_default();
     let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
-    if query
+    // SQLite takes the LAST `mode` parameter (review), with key and value
+    // percent-decoded and compared exactly; anything but `memory` is a file.
+    let mode = query
         .split('&')
-        .any(|parameter| parameter.eq_ignore_ascii_case("mode=memory"))
-    {
+        .filter_map(|parameter| parameter.split_once('='))
+        .filter(|(key, _)| percent_decode(key) == b"mode")
+        .map(|(_, value)| percent_decode(value))
+        .next_back();
+    if mode.as_deref() == Some(b"memory".as_slice()) {
         return None;
     }
     // `file:///abs` and `file://localhost/abs` name `/abs`; `file:rel` is
@@ -508,30 +513,49 @@ pub fn sqlite_ledger_file(conn: &str) -> Option<std::path::PathBuf> {
         }
         None => path,
     };
-    let path = percent_decode(path)?;
-    (!path.is_empty() && path != ":memory:").then(|| std::path::PathBuf::from(path))
+    let path = percent_decode(path);
+    if path.is_empty() || path == b":memory:" {
+        return None;
+    }
+    // The decoded bytes are the file name, UTF-8 or not (review): on Unix a
+    // name with byte 0xFF is a real file SQLite opens.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(path)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(path).ok().map(std::path::PathBuf::from)
+    }
 }
 
-/// `%XX` escapes as SQLite decodes them in a URI path; `None` for invalid
-/// UTF-8 after decoding.
-fn percent_decode(text: &str) -> Option<String> {
+/// `%XX` escapes as SQLite decodes them in a URI: the bytes, whatever their
+/// encoding.
+fn percent_decode(text: &str) -> Vec<u8> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         let hex = |b: u8| (b as char).to_digit(16);
         match (bytes[i], bytes.get(i + 1), bytes.get(i + 2)) {
-            (b'%', Some(&h), Some(&l)) if hex(h).is_some() && hex(l).is_some() => {
-                out.push((hex(h)? * 16 + hex(l)?) as u8);
-                i += 3;
-            }
+            (b'%', Some(&h), Some(&l)) => match (hex(h), hex(l)) {
+                (Some(h), Some(l)) => {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
             (b, _, _) => {
                 out.push(b);
                 i += 1;
             }
         }
     }
-    String::from_utf8(out).ok()
+    out
 }
 
 /// The database file a SQLite connection string names, or `None` for
@@ -3550,12 +3574,29 @@ upload:
             ("sqlite:file://localhost/data/x.db", some("/data/x.db")),
             ("sqlite:file:rel.db#frag", some("rel.db")),
             ("sqlite:file:state.db?cache=shared&mode=memory", None),
+            // SQLite takes the last `mode` (review).
+            (
+                "sqlite:file:/data/state.db?mode=memory&mode=rwc",
+                some("/data/state.db"),
+            ),
+            ("sqlite:file:/data/state.db?mode=rwc&mode=memory", None),
+            (
+                "sqlite:file:/data/state.db?mode=Memory",
+                some("/data/state.db"),
+            ),
             ("sqlite::memory:", None),
             (":memory:", None),
             ("sqlite://:memory:", None),
             ("postgres://u@h/db", None),
         ] {
             assert_eq!(sqlite_ledger_file(conn), want, "{conn}");
+        }
+        // A decoded name that is not UTF-8 is still a file (review).
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let path = sqlite_ledger_file("sqlite:file:/data/state%FF.db").unwrap();
+            assert_eq!(path.as_os_str().as_bytes(), b"/data/state\xFF.db");
         }
     }
 
