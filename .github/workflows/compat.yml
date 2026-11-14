@@ -14,8 +14,10 @@
 # and checks what the archive holds, before anything runs.
 #
 # How much runs (the #743 decision on hosted-runner cost):
-#   pull request  the newest released minor, plus every cell an exception
-#                 names, so a documented cutoff is checked on every PR;
+#   pull request  the newest released minor, plus each exception row's
+#                 boundary (the newest release it names and the first after
+#                 it), so a documented cutoff is checked on both sides on
+#                 every PR at two releases per row;
 #   nightly       every release since each cell applies, so a new tag or a
 #                 change on the runner is seen without a format change;
 #   push to main  the same as a pull request;
@@ -83,13 +85,16 @@ jobs:
         id: select
         env:
           EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # A push to main gets the pull request's cells: the nightly run
           # covers the rest.
           mode="full"
           if [[ "$EVENT" == pull_request || "$EVENT" == push ]]; then mode="pr"; fi
-          matrix="$(python scripts/compat/select_cells.py --mode "$mode" --tags-from-git)"
+          # Tags with a published release only: a tag whose release is still
+          # being built has no assets to run yet.
+          matrix="$(python scripts/compat/select_cells.py --mode "$mode" --tags-from-releases)"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "mode: $mode"
           python -m json.tool <<< "$matrix"
@@ -237,3 +242,32 @@ jobs:
           ok="$(cat results/*.tsv 2>/dev/null | awk -F'\t' '$5 == "success"' | wc -l)"
           echo "$ok of $expected cells succeeded; $got reported"
           [[ "$got" -eq "$expected" && "$ok" -eq "$expected" ]]
+
+  # A nightly failure mails only whoever last edited the schedule, so it
+  # files (or adds to) one issue instead: the nightly run is how a new tag
+  # or a change on the runners is seen.
+  alert:
+    name: report a nightly failure
+    needs: [select, provenance, build-head, cell, report]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: File or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="compat: the nightly compatibility matrix failed"
+          number="$(gh issue list --state open --search "\"$title\" in:title" --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -1)"
+          body="The nightly run of the compatibility matrix failed: $RUN"
+          if [[ -n "$number" ]]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body (#743)."
+          fi

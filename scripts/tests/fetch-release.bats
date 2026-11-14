@@ -68,6 +68,11 @@ make_release() {
     (cd "$RELEASE" && sha256sum "./$ASSET" "./$ASSET.sigstore.json" > SHA256SUMS)
 }
 
+# SHA256SUMS for the release as it now is.
+reseal() {
+    (cd "$RELEASE" && sha256sum "./$ASSET" "./$ASSET.sigstore.json" > SHA256SUMS)
+}
+
 @test "a release that checks out prints the directory holding both binaries" {
     make_release vtop-node vtopctl
     run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
@@ -127,24 +132,134 @@ make_release() {
 
 @test "an archive with a path outside its directory fails before extracting" {
     make_release vtop-node vtopctl
-    mkdir -p "$WORK/evil"
-    echo x > "$WORK/evil/outside"
-    tar -czf "$RELEASE/$ASSET" -C "$WORK/build" "vtop-engine-9.8.7-$TARGET" -C "$WORK/evil" outside
-    (cd "$RELEASE" && sha256sum "./$ASSET" > SHA256SUMS)
+    echo x > "$WORK/build/outside"
+    tar -czf "$RELEASE/$ASSET" -C "$WORK/build" "vtop-engine-9.8.7-$TARGET" outside
+    reseal
     run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
     [ "$status" -eq 1 ]
     [[ "$output" == *"outside vtop-engine-9.8.7-$TARGET/"* ]]
     [ ! -e "$CACHE/$TAG/extracted/outside" ]
 }
 
-@test "a cached download is checked again, not trusted" {
+@test "a cached download is checked again, and a bad one is fetched again" {
     make_release vtop-node vtopctl
     run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
     [ "$status" -eq 0 ]
     printf 'rot' >> "$CACHE/$TAG/$ASSET"
     run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 0 ]
     [[ "$output" == *"SHA256SUMS says"* ]]
+    [[ "$output" == *"downloading it again"* ]]
+}
+
+@test "a bad cached copy of a bad release still fails" {
+    make_release vtop-node vtopctl
+    run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
+    [ "$status" -eq 0 ]
+    printf 'swapped' >> "$RELEASE/$ASSET"
+    printf 'rot' >> "$CACHE/$TAG/$ASSET"
+    run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
+    [ "$status" -eq 1 ]
+}
+
+# raw_tar <name>...: a gzip tar of the good archive plus one regular file
+# under each <name>, written byte by byte, because tar itself strips leading
+# slashes and `..` when it writes.
+raw_tar() {
+    perl -e '
+        sub header {
+            my ($name, $mode, $size, $type) = @_;
+            my $h = pack("a100 a8 a8 a8 a12 a12 a8 a1 a100 a6 a2 a32 a32 a8 a8 a155 a12",
+                $name, sprintf("%07o", $mode), "0000000", "0000000",
+                sprintf("%011o", $size), "00000000000", " " x 8, $type, "",
+                "ustar", "00", "", "", "", "", "", "");
+            my $sum = unpack("%32C*", $h);
+            substr($h, 148, 8) = sprintf("%06o\0 ", $sum);
+            return $h;
+        }
+        sub entry {
+            my ($name, $mode, $body, $type) = @_;
+            my $out = header($name, $mode, length($body), $type) . $body;
+            my $pad = (512 - length($body) % 512) % 512;
+            return $out . ("\0" x $pad);
+        }
+        my $top = shift @ARGV;
+        my $tar = entry("$top/", 0755, "", "5");
+        for my $bin ("vtop-node", "vtopctl") {
+            $tar .= entry("$top/$bin", 0755, "#!/bin/sh\necho \"$bin 9.8.7\"\n", "0");
+        }
+        $tar .= entry($_, 0644, "x", "0") for @ARGV;
+        print $tar . ("\0" x 1024);
+    ' "vtop-engine-9.8.7-$TARGET" "$@" | gzip > "$RELEASE/$ASSET"
+    reseal
+}
+
+@test "an absolute path in the archive fails before extracting" {
+    make_release vtop-node vtopctl
+    raw_tar /etc/evil
+    run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
+    [ "$status" -eq 1 ]
+    # tar's own listing may already strip the prefix, which leaves the name
+    # outside the archive's directory: refused either way, unextracted.
+    [[ "$output" == *"absolute path"* || "$output" == *"outside vtop-engine-9.8.7-$TARGET/"* ]]
+    [ ! -e "$CACHE/$TAG/extracted" ]
+}
+
+@test "a parent path in the archive fails before extracting" {
+    make_release vtop-node vtopctl
+    raw_tar "vtop-engine-9.8.7-$TARGET/../evil"
+    run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
+    [ "$status" -eq 1 ]
+    # tar's own listing may already strip the prefix, which leaves the name
+    # outside the archive's directory: refused either way, unextracted.
+    [[ "$output" == *"parent path"* || "$output" == *"outside vtop-engine-9.8.7-$TARGET/"* ]]
+    [ ! -e "$CACHE/$TAG/extracted" ]
+}
+
+@test "the perl-written archive itself checks out" {
+    make_release vtop-node vtopctl
+    raw_tar "vtop-engine-9.8.7-$TARGET/extra"
+    run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
+    [ "$status" -eq 0 ]
+}
+
+@test "a symlinked binary fails" {
+    make_release vtop-node
+    ln -s /bin/sh "$WORK/build/vtop-engine-9.8.7-$TARGET/vtopctl"
+    tar -czf "$RELEASE/$ASSET" -C "$WORK/build" "vtop-engine-9.8.7-$TARGET"
+    reseal
+    run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"not files or directories"* ]]
+}
+
+@test "a binary that is not executable fails" {
+    make_release vtop-node vtopctl
+    chmod -x "$WORK/build/vtop-engine-9.8.7-$TARGET/vtopctl"
+    tar -czf "$RELEASE/$ASSET" -C "$WORK/build" "vtop-engine-9.8.7-$TARGET"
+    reseal
+    run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"is not executable"* ]]
+}
+
+@test "an archive listed twice in SHA256SUMS fails" {
+    make_release vtop-node vtopctl
+    (cd "$RELEASE" && sha256sum "./$ASSET" >> SHA256SUMS)
+    run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"not listed once"* ]]
+}
+
+@test "a binary that reports another version fails, where the host can run it" {
+    [[ "$(uname -m)-$(uname -s)" == x86_64-Linux ]] || skip "the binaries run only on x86_64 Linux"
+    make_release vtop-node vtopctl
+    printf '#!/bin/sh\necho "vtopctl 9.8.6"\n' > "$WORK/build/vtop-engine-9.8.7-$TARGET/vtopctl"
+    tar -czf "$RELEASE/$ASSET" -C "$WORK/build" "vtop-engine-9.8.7-$TARGET"
+    reseal
+    run bash "$FETCH" "$TAG" "$CACHE" "$TARGET"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"not version 9.8.7"* ]]
 }
 
 @test "a pre-release tag is refused" {

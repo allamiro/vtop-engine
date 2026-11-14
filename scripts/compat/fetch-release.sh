@@ -47,10 +47,10 @@ BUNDLE="$ASSET.sigstore.json"
 IDENTITY="https://github.com/$REPO/.github/workflows/release.yml@refs/tags/$TAG"
 ISSUER="https://token.actions.githubusercontent.com"
 
-dir="$CACHE/$TAG"
-mkdir -p "$dir"
+dir="$(mkdir -p "$CACHE/$TAG" && cd "$CACHE/$TAG" && pwd)"
 
-if [[ ! -s "$dir/$ASSET" || ! -s "$dir/$BUNDLE" || ! -s "$dir/SHA256SUMS" ]]; then
+download() {
+  local names
   names="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')" \
     || fail "cannot read the assets of $TAG"
   if ! grep -qxF "$ASSET" <<< "$names"; then
@@ -63,29 +63,54 @@ if [[ ! -s "$dir/$ASSET" || ! -s "$dir/$BUNDLE" || ! -s "$dir/SHA256SUMS" ]]; th
   gh release download "$TAG" --repo "$REPO" --dir "$dir" \
     --pattern "$ASSET" --pattern "$BUNDLE" --pattern SHA256SUMS >&2 \
     || fail "download failed"
-fi
+}
 
-# 2. SHA256SUMS. Its lines are `<hex>  ./<name>` (the release job runs
-# sha256sum over ./*); accept a bare name too.
-expected="$(awk -v a="$ASSET" '$2 == a || $2 == "./" a { print $1 }' "$dir/SHA256SUMS")"
-[[ "$expected" =~ ^[0-9a-f]{64}$ ]] || fail "$ASSET is not listed once in SHA256SUMS"
-if command -v sha256sum > /dev/null 2>&1; then
-  actual="$(sha256sum "$dir/$ASSET" | awk '{ print $1 }')"
+# 2 and 3: the digest and who built it. Prints why on failure and returns
+# non-zero, so a bad CACHED copy can be fetched once more before failing.
+verify() {
+  local expected actual
+  # SHA256SUMS lines are `<hex>  ./<name>` (the release job runs sha256sum
+  # over ./*); accept a bare name too.
+  expected="$(awk -v a="$ASSET" '$2 == a || $2 == "./" a { print $1 }' "$dir/SHA256SUMS")" \
+    || { echo "[fetch-release/$TAG] cannot read SHA256SUMS" >&2; return 1; }
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] \
+    || { echo "[fetch-release/$TAG] $ASSET is not listed once in SHA256SUMS" >&2; return 1; }
+  if command -v sha256sum > /dev/null 2>&1; then
+    actual="$(sha256sum "$dir/$ASSET" | awk '{ print $1 }')"
+  else
+    actual="$(shasum -a 256 "$dir/$ASSET" | awk '{ print $1 }')"
+  fi
+  [[ "$actual" =~ ^[0-9a-f]{64}$ ]] \
+    || { echo "[fetch-release/$TAG] cannot hash $ASSET" >&2; return 1; }
+  [[ "$actual" == "$expected" ]] \
+    || { echo "[fetch-release/$TAG] $ASSET has sha256 $actual; SHA256SUMS says $expected" >&2; return 1; }
+  log "sha256 $actual matches SHA256SUMS"
+  "$COSIGN" verify-blob "$dir/$ASSET" --bundle "$dir/$BUNDLE" \
+    --certificate-identity "$IDENTITY" --certificate-oidc-issuer "$ISSUER" >&2 \
+    || { echo "[fetch-release/$TAG] the Sigstore bundle does not verify against $IDENTITY" >&2; return 1; }
+  log "Sigstore bundle verified: $IDENTITY"
+}
+
+if [[ -s "$dir/$ASSET" && -s "$dir/$BUNDLE" && -s "$dir/SHA256SUMS" ]]; then
+  # A cached copy is checked like a fresh one. One that fails is fetched
+  # again once (a cache entry is never rewritten under its key, so a bad one
+  # would otherwise stay red forever); the fresh copy must then pass.
+  if ! verify; then
+    log "the cached copy failed its checks; downloading it again"
+    download
+    verify || fail "the release's own files fail the checks above"
+  fi
 else
-  actual="$(shasum -a 256 "$dir/$ASSET" | awk '{ print $1 }')"
+  download
+  verify || fail "the release's files fail the checks above"
 fi
-[[ "$actual" == "$expected" ]] \
-  || fail "$ASSET has sha256 $actual; SHA256SUMS says $expected"
-log "sha256 $actual matches SHA256SUMS"
-
-# 3. Who built it.
-"$COSIGN" verify-blob "$dir/$ASSET" --bundle "$dir/$BUNDLE" \
-  --certificate-identity "$IDENTITY" --certificate-oidc-issuer "$ISSUER" >&2 \
-  || fail "the Sigstore bundle does not verify against $IDENTITY"
-log "Sigstore bundle verified: $IDENTITY"
 
 # 4. What is inside, before anything is extracted.
 listing="$(tar -tzf "$dir/$ASSET")" || fail "$ASSET is not a readable gzip tar"
+# Regular files and directories only: no link, device or fifo.
+types="$(tar -tvzf "$dir/$ASSET" | cut -c1 | sort -u | tr -d '\n')" \
+  || fail "$ASSET is not a readable gzip tar"
+[[ "$types" =~ ^[-d]+$ ]] || fail "$ASSET holds members that are not files or directories ($types)"
 top="vtop-engine-$VERSION-$TARGET"
 while IFS= read -r entry; do
   [[ -n "$entry" ]] || continue
@@ -99,7 +124,7 @@ done <<< "$listing"
 out="$dir/extracted"
 rm -rf "$out"
 mkdir -p "$out"
-tar -xzf "$dir/$ASSET" -C "$out" --no-same-owner
+tar -xzf "$dir/$ASSET" -C "$out" --no-same-owner || fail "extracting $ASSET failed"
 bin="$out/$top"
 for name in vtop-node vtopctl; do
   [[ -f "$bin/$name" && ! -L "$bin/$name" ]] || fail "$ASSET has no $name file in $top/"

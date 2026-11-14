@@ -14,8 +14,10 @@ exception, so adding a refusal means editing a reviewed file.
 Modes:
 
 * ``full`` (nightly, and on demand): every release since each cell applies;
-* ``pr``: the newest released minor only, plus every cell an exception names,
-  so a documented cutoff is checked on every pull request.
+* ``pr``: the newest released minor, plus, for each exception row, its
+  boundary: the newest release the row names and the first release after it,
+  so a documented cutoff is checked on both sides on every pull request at
+  a cost of two releases per row.
 
 Usage::
 
@@ -76,6 +78,8 @@ def _exception_tags(row: dict, candidates: list[str]) -> list[str]:
     if "tags" in row:
         for tag in row["tags"]:
             version(tag)
+            if tag not in candidates:
+                raise ExpectedError(f"an exception names {tag}, which is not a release the cell runs: {row}")
         return [tag for tag in candidates if tag in row["tags"]]
     if "older_than" in row:
         bound = version(row["older_than"])
@@ -89,25 +93,34 @@ def matrix(expected: dict, tags: list[str], mode: str) -> list[dict]:
     cells = expected.get("cells") or {}
     if not cells:
         raise ExpectedError("expected.yaml lists no cells")
+    released = releases(tags)
     from_source = set()
     for row in expected.get("built_from_source") or []:
         if not row.get("why"):
             raise ExpectedError(f"a built_from_source entry needs a why: {row}")
         version(row["tag"])
+        if row["tag"] not in released:
+            raise ExpectedError(f"built_from_source names {row['tag']}, which is not a release")
         from_source.add(row["tag"])
 
-    available = [tag for tag in releases(tags) if tag not in from_source]
+    available = [tag for tag in released if tag not in from_source]
     newest_minor = available[-1] if available else None
 
     per_cell: dict[str, list[str]] = {}
     for name, cell in cells.items():
         since = version(cell["since"])
-        for direction in cell.get("directions") or []:
+        directions = cell.get("directions") or []
+        if not directions:
+            raise ExpectedError(f"cell {name}: no directions")
+        if len(set(directions)) != len(directions):
+            raise ExpectedError(f"cell {name}: a direction is listed twice")
+        for direction in directions:
             if direction not in DIRECTIONS:
                 raise ExpectedError(f"cell {name}: unknown direction {direction!r}")
         per_cell[name] = [tag for tag in available if version(tag) >= since]
 
     outcome: dict[tuple[str, str, str], dict] = {}
+    boundary: set[tuple[str, str, str]] = set()
     for row in expected.get("exceptions") or []:
         name = row.get("cell")
         if name not in cells:
@@ -129,13 +142,20 @@ def matrix(expected: dict, tags: list[str], mode: str) -> list[dict]:
             if key in outcome:
                 raise ExpectedError(f"{name} {tag} {direction} has an exception twice")
             outcome[key] = {"expect": row["expect"], "message": row.get("message", "")}
+        # The row's boundary: the newest release it names, and the first
+        # release after it (the first that must not need the row).
+        last = matched[-1]
+        boundary.add((name, last, direction))
+        after = per_cell[name].index(last) + 1
+        if after < len(per_cell[name]):
+            boundary.add((name, per_cell[name][after], direction))
 
     out = []
     for name, cell in cells.items():
         for direction in cell["directions"]:
             for tag in per_cell[name]:
                 key = (name, tag, direction)
-                if mode == "pr" and tag != newest_minor and key not in outcome:
+                if mode == "pr" and tag != newest_minor and key not in boundary:
                     continue
                 result = outcome.get(key, {"expect": "pass", "message": ""})
                 out.append({
@@ -146,6 +166,8 @@ def matrix(expected: dict, tags: list[str], mode: str) -> list[dict]:
                     "message": result["message"],
                     "source": "release",
                 })
+    if not out:
+        raise ExpectedError("no cell to run: every cell's since is newer than every release")
     return out
 
 
@@ -154,9 +176,19 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--mode", choices=("full", "pr"), required=True)
     parser.add_argument("--expected", type=pathlib.Path, default=DEFAULT_EXPECTED)
     parser.add_argument("--tags-from-git", action="store_true")
+    parser.add_argument("--tags-from-releases", action="store_true",
+                        help="the tags of published, non-draft GitHub releases (needs gh)")
     parser.add_argument("tags", nargs="*")
     args = parser.parse_args(argv)
     tags = list(args.tags)
+    if args.tags_from_releases:
+        # Only tags with a published, non-draft release: a tag whose release
+        # is still being built, or failed, has no assets to run (review).
+        tags += subprocess.run(
+            ["gh", "release", "list", "--limit", "1000", "--json", "tagName,isDraft",
+             "--jq", ".[] | select(.isDraft | not) | .tagName"],
+            check=True, capture_output=True, text=True,
+        ).stdout.split()
     if args.tags_from_git:
         tags += subprocess.run(
             ["git", "tag", "--list", "v[0-9]*"], check=True, capture_output=True, text=True

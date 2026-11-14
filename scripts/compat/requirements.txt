@@ -1,5 +1,5 @@
 # Pinned, hash-checked dependency of the compatibility matrix's Python
-# scripts (scripts/compat/*.py, scripts/check-format-registry.py): they read
+# scripts (scripts/compat/*.py, and the format registry check of #743): they read
 # YAML. Copied from docs/requirements.txt, which pins the same release for the
 # docs site, so one PyYAML is reviewed for both.
 #

@@ -1,4 +1,4 @@
-"""Tests for scripts/compat/select.py (#743): which releases each cell runs,
+"""Tests for scripts/compat/select_cells.py (#743): which releases each cell runs,
 and what each is expected to give.
 
 Run with: python3 -m unittest discover -s scripts/compat/tests
@@ -72,17 +72,35 @@ class Matrix(unittest.TestCase):
             ],
         )
 
-    def test_a_pull_request_runs_the_previous_minor_and_every_exception(self):
-        # The documented cutoffs stay checked on every pull request: a
-        # refusal that silently became a pass, or the reverse, is the change
-        # a reviewer most needs to see.
+    def test_a_pull_request_runs_the_newest_minor_and_each_cutoffs_boundary(self):
+        # A documented cutoff stays checked on every pull request, on both
+        # sides: the newest release it names and the first one after it. A
+        # refusal that silently became a pass, or the first passing reader
+        # starting to fail, is the change a reviewer most needs to see. The
+        # cost stays at two tags per exception row, whatever its range.
         self.assertEqual(
             rows(select.matrix(EXPECTED, TAGS, "pr")),
             [
                 ("ledger-sqlite", "v0.9.0", "forward", "pass"),
                 ("ledger-sqlite", "v0.9.0", "upgrade", "pass"),
                 ("manifest", "v0.7.0", "forward", "hash-failure"),
+                ("manifest", "v0.8.0", "forward", "pass"),
                 ("manifest", "v0.9.0", "forward", "pass"),
+            ],
+        )
+
+    def test_a_wide_exception_adds_only_its_boundary_to_a_pull_request(self):
+        expected = dict(EXPECTED, exceptions=[
+            {"cell": "ledger-sqlite", "direction": "forward", "older_than": "v0.9.0",
+             "expect": "refuse", "message": "newer", "why": "x"},
+        ])
+        got = rows(select.matrix(expected, TAGS, "pr"))
+        self.assertEqual(
+            [r for r in got if r[0] == "ledger-sqlite"],
+            [
+                ("ledger-sqlite", "v0.8.0", "forward", "refuse"),
+                ("ledger-sqlite", "v0.9.0", "forward", "pass"),
+                ("ledger-sqlite", "v0.9.0", "upgrade", "pass"),
             ],
         )
 
@@ -140,7 +158,7 @@ class Validation(unittest.TestCase):
         # nothing checks.
         self.check_refused(
             dict(EXPECTED, exceptions=[{"cell": "manifest", "direction": "forward",
-                                        "tags": ["v0.4.0"], "expect": "hash-failure",
+                                        "older_than": "v0.5.0", "expect": "hash-failure",
                                         "why": "x"}]),
             "matches no",
         )
@@ -149,6 +167,31 @@ class Validation(unittest.TestCase):
         row = {"cell": "manifest", "direction": "forward", "tags": ["v0.7.0"],
                "expect": "hash-failure", "why": "x"}
         self.check_refused(dict(EXPECTED, exceptions=[row, EXPECTED["exceptions"][0]]), "twice")
+
+    def test_a_listed_tag_that_is_not_a_release_the_cell_runs_is_refused(self):
+        self.check_refused(
+            dict(EXPECTED, exceptions=[{"cell": "manifest", "direction": "forward",
+                                        "tags": ["v0.7.0", "v0.4.0"], "expect": "hash-failure",
+                                        "why": "x"}]),
+            "v0.4.0",
+        )
+
+    def test_a_cell_without_directions_is_refused(self):
+        for directions in (None, [], ["forward", "forward"]):
+            cell = {"since": "v0.7.0"}
+            if directions is not None:
+                cell["directions"] = directions
+            self.check_refused(dict(EXPECTED, cells={"manifest": cell}, exceptions=[]), "direction")
+
+    def test_a_built_from_source_tag_that_is_not_a_release_is_refused(self):
+        self.check_refused(dict(EXPECTED, built_from_source=[{"tag": "v0.4.1", "why": "x"}]), "v0.4.1")
+
+    def test_an_empty_matrix_is_refused(self):
+        self.check_refused(
+            dict(EXPECTED, cells={"manifest": {"since": "v9.0.0", "directions": ["forward"]}},
+                 exceptions=[]),
+            "no cell",
+        )
 
     def test_an_unknown_direction_is_refused(self):
         self.check_refused(
@@ -159,7 +202,7 @@ class Validation(unittest.TestCase):
 
 
 class TheCommittedFile(unittest.TestCase):
-    def test_expected_yaml_is_valid_against_the_real_tags(self):
+    def test_expected_yaml_is_valid_against_the_released_tags(self):
         expected = select.load(select.DEFAULT_EXPECTED)
         full = select.matrix(expected, TAGS, "full")
         self.assertTrue(full)

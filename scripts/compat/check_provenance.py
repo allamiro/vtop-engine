@@ -16,10 +16,13 @@ binary wrote it and how:
       <name>: <sha256 of that fixture file>
 
 The check fails when a tag directory has no PROVENANCE, a field is missing,
-the asset is not that release's or its digest is not the one the release's
-SHA256SUMS lists, or a fixture file differs from (or is missing from, or is
-absent in) the ``files`` list: a fixture edited by hand is no longer the
-released binary's output.
+the asset is not that release's or its digest is not the one (listed once)
+in the release's SHA256SUMS, or a fixture file differs from the digest
+PROVENANCE recorded for it, or is missing from or absent in the ``files``
+list. So a fixture edited without its PROVENANCE is caught. What it does
+not prove on its own is that the recorded digests are what the released
+binary wrote: regenerate-fixtures.sh records them as it writes the fixture,
+and review of the PROVENANCE edit is what keeps them honest.
 
 Usage: check_provenance.py [repo-root]   (needs ``gh`` and GH_TOKEN)
 """
@@ -27,6 +30,7 @@ Usage: check_provenance.py [repo-root]   (needs ``gh`` and GH_TOKEN)
 from __future__ import annotations
 
 import hashlib
+import os
 import pathlib
 import re
 import subprocess
@@ -34,6 +38,7 @@ import sys
 from typing import Callable
 
 FINAL = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+REPO = os.environ.get("FETCH_RELEASE_REPO", "allamiro/vtop-engine")
 FIELDS = ("tag", "asset", "asset_sha256", "binary", "command", "input", "files")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -45,7 +50,7 @@ class ProvenanceError(RuntimeError):
 def release_sums(tag: str) -> str:
     """The release's SHA256SUMS, from GitHub."""
     result = subprocess.run(
-        ["gh", "release", "download", tag, "--pattern", "SHA256SUMS", "--output", "-"],
+        ["gh", "release", "download", tag, "--repo", REPO, "--pattern", "SHA256SUMS", "--output", "-"],
         capture_output=True,
         text=True,
     )
@@ -102,15 +107,16 @@ def check(root: pathlib.Path, sums_for: Callable[[str], str]) -> list[str]:
             except ProvenanceError as error:
                 problems.append(f"{where}: {error}")
                 continue
-        listed = {
-            parts[1].removeprefix("./"): parts[0]
-            for parts in (line.split() for line in cache[tag].splitlines())
-            if len(parts) == 2
-        }
-        if listed.get(asset) != digest:
+        listed: dict[str, list[str]] = {}
+        for parts in (line.split() for line in cache[tag].splitlines()):
+            if len(parts) == 2:
+                listed.setdefault(parts[1].removeprefix("./"), []).append(parts[0])
+        if len(listed.get(asset, [])) > 1:
+            problems.append(f"{where}/PROVENANCE: {asset} is listed more than once in {tag}'s SHA256SUMS")
+        elif listed.get(asset, [None])[0] != digest:
             problems.append(
                 f"{where}/PROVENANCE: {asset} sha256 {digest} is not what {tag}'s SHA256SUMS lists "
-                f"({listed.get(asset, 'nothing')})"
+                f"({(listed.get(asset) or ['nothing'])[0]})"
             )
         files = fields["files"]
         if not isinstance(files, dict):
@@ -123,8 +129,14 @@ def check(root: pathlib.Path, sums_for: Callable[[str], str]) -> list[str]:
         }
         for name in sorted(present - set(files)):
             problems.append(f"{where}/{name}: not listed in PROVENANCE files")
+        if not all(isinstance(name, str) for name in files):
+            problems.append(f"{where}/PROVENANCE: every files key must be a path string")
+            continue
         for name, want in sorted(files.items()):
             path = directory / name
+            if not path.resolve().is_relative_to(directory.resolve()):
+                problems.append(f"{where}/PROVENANCE: {name} is outside its fixture directory")
+                continue
             if not path.is_file():
                 problems.append(f"{where}/{name}: listed in PROVENANCE but missing")
             elif not HEX64.match(str(want)):

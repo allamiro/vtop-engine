@@ -95,6 +95,20 @@ class Provenance(unittest.TestCase):
                           "gone.db": "00" * 32})
         self.assertIn("gone.db", " ".join(self.problems()))
 
+    def test_an_asset_listed_twice_fails(self):
+        self.write()
+        twice = lambda tag: sums(tag) + f"{ASSET_SHA}  ./{ASSET}\n"
+        self.assertIn("more than once", " ".join(prov.check(self.root, twice)))
+
+    def test_a_files_entry_outside_the_fixture_fails(self):
+        self.write(files={"ledger.db": hashlib.sha256(b"sqlite bytes").hexdigest(),
+                          "../../../../../../outside": "00" * 32})
+        self.assertIn("outside its fixture directory", " ".join(self.problems()))
+
+    def test_a_files_key_that_is_not_a_path_fails(self):
+        self.write(files={1: "00" * 32})
+        self.assertIn("path string", " ".join(self.problems()))
+
     def test_directories_that_are_not_release_tags_are_not_fixtures_of_a_release(self):
         other = self.root / "crates/vtop-core/tests/fixtures/manifests"
         other.mkdir(parents=True)
