@@ -97,9 +97,10 @@ As of **August 2026** (repo at v0.3.0):
 - Phase 4: deterministic / content-addressed object keys + idempotent retry.
   **Objects done (#626):** the object key is derived from the source, the
   range and the content digest, and an existing object is reused only after
-  it verifies strongly. Remaining: batch boundaries are not reproduced after a
-  power loss, a seal-time partition moves a replay in a later hour, and
-  manifests stay per attempt ([ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3).
+  it verifies strongly, and a replay in a later hour is sealed at the
+  recorded instant of the window it rebuilds (v0.10.0). Remaining: batch
+  boundaries are not reproduced after a power loss, a row from before
+  v0.10.0 records no seal instant, and manifests stay per attempt ([ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3).
 - Phase 5: Kafka consumer-group fleet mode. The consumer still uses per-read
   `assign()`; no `VTOP_KAFKA_GROUP_MODE` toggle; no multi-writer recovery
   (`FOR UPDATE SKIP LOCKED` / leases, #93).
@@ -137,8 +138,9 @@ transfer engine, **without weakening the core guarantee**:
 - **Replay safety** — a crash at any stage is recoverable with **no data loss**.
 - **Delivery semantics (accurate):** today the system is **at-least-once**. A
   replay of the same bytes reuses the stored object (content-addressed keys,
-  #626); a replay with other batch boundaries, a later seal-time hour, no
-  checksum or a command backend can still leave a duplicate object (§2.5, §7).
+  #626); a replay with other batch boundaries, a later seal-time hour for a
+  row from before v0.10.0, no checksum or a command backend can still leave a
+  duplicate object (§2.5, §7).
   Protocol §15.1's deterministic naming MUST is narrowed by #626, not closed.
 
 ### 2.3 Non-goals
@@ -165,7 +167,7 @@ section calls out the consequence.
 | Property | Current code | Target for production HA |
 |---|---|---|
 | Object key | `vtop-<engine>-<source>-<range>[-i<inode>]-<digest>` for files and spools, `vtop-<source>-<range>-<digest>` for Kafka — **deterministic for the same bytes** (#626); falls back to the per-attempt `vtop-<UTCstamp>-<source>-<range>-<uuid8>` without a checksum, on a command backend, or when the derived key holds bytes that do not verify | **Deterministic or content-addressed** so retries are idempotent |
-| Replay outcome | Same bytes → **the stored object is reused** after strong verification; other boundaries, a later seal-time hour, or other bytes → **second object, no overwrite, no loss** | Retry resolves to the **same** object/version; duplicates impossible **[PROPOSED]** |
+| Replay outcome | Same bytes → **the stored object is reused** after strong verification; other boundaries, a later seal-time hour for a row from before v0.10.0, or other bytes → **second object, no overwrite, no loss** | Retry resolves to the **same** object/version; duplicates impossible **[PROPOSED]** |
 | File/syslog cursor | Lives **only in the state store** (rebuilt from `SOURCE_COMMITTED` rows) | Same, but **migrate/drain on backend switch** (§6.4) |
 | Kafka offset | Committed to the **broker** after VERIFIED (resumes broker-side) | Same; consumer-group mode for multi-instance **[PROPOSED]** |
 | Concurrency | Single process, **single-instance lock enforced at startup** (#66) | N replicas via Kafka consumer groups **[PROPOSED]** |
@@ -1627,9 +1629,9 @@ Short procedures now; expand into a full ops runbook before go-live.
   configuration is unsupported and warned about at startup. Do not scale
   replicas.
 - **Object keys are deterministic only for the same bytes** (#626) — a replay
-  with the same batch boundaries reuses the stored object; one whose
-  boundaries, seal-time hour or bytes differ still writes a second object (no
-  loss), and manifests stay per attempt. This narrows the gap against protocol
+  with the same batch boundaries reuses the stored object, in a later hour
+  too (v0.10.0); one whose boundaries or bytes differ still writes a second
+  object (no loss), and manifests stay per attempt. This narrows the gap against protocol
   §15.1 without closing it (ARCHITECTURE.md §13 item 3).
 - **Engine loop is single-process** — no horizontal scale until Kafka
   consumer-group fleet mode lands (Phase 5).

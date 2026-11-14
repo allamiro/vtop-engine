@@ -474,7 +474,10 @@ pub async fn dispatch(cli: Cli) -> i32 {
     if let Command::Tier { command } = cli.command {
         return crate::tier_tools::run(command, cli.json).await;
     }
-    let code = match run_command(&cli).await {
+    // Boxed: `run_command` holds every command's future, the engine's whole
+    // cycle among them, and a debug build polled it on a test thread's
+    // stack until that overflowed (#626 grew the cycle a little more).
+    let code = match Box::pin(run_command(&cli)).await {
         Ok(()) => 0,
         Err(e) => {
             // Errors are reported on stderr without leaking secrets.

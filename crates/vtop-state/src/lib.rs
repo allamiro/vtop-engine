@@ -23,7 +23,7 @@ macro_rules! batch_columns {
          progress_start_json, progress_end_json, object_uri, manifest_uri, \
          object_sha256, manifest_sha256, manifest_version_id, object_size_bytes, \
          verification_class, record_count, error_message, owner, lease_expires_at, \
-         created_at, updated_at, claim_gen"
+         created_at, updated_at, claim_gen, sealed_at"
     };
 }
 

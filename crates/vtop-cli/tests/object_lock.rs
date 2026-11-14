@@ -547,6 +547,105 @@ async fn a_damaged_object_at_the_derived_key_is_not_written_over_and_the_batch_l
 
 // ---- Multipart --------------------------------------------------------------
 
+// ---- Replays that rebuild the recorded window (#626) ------------------------
+
+fn at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
+fn rebuilds(tenant: &str, result: &str) -> u64 {
+    vtop_core::telemetry::init()
+        .unwrap()
+        .replay_rebuilds_total
+        .with_label_values(&[tenant, "file", "raw", result])
+        .get()
+}
+
+/// #626 under the profile, where a second object cannot be deleted before its
+/// retention ends: the failed attempt's object is locked, and a replay sealed
+/// in a later hour, with keys that carry the hour, reuses it instead of
+/// writing a second locked object.
+#[tokio::test]
+async fn a_replay_in_a_later_hour_reuses_the_locked_object_and_locks_nothing_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 3);
+    let tenant = "lock-rebuild-626";
+    let lock = governance();
+    let backend = Arc::new(locked_mock(&lock).with_throttled_manifest_puts(1));
+    let mut cfg = config(dir.path(), tenant, "telemetry-raw", &input);
+    cfg.partitioning.template = vtop_core::partitioning::DEFAULT_TEMPLATE.into();
+    let mut engine = engine(cfg, Some(lock), &backend).await;
+    let exact_before = rebuilds(tenant, "exact");
+
+    engine.set_seal_clock(|| at("2026-03-04T05:59:59.900Z"));
+    let first = engine.process_once(SourceType::File).await.unwrap();
+    assert!(!first[0].committed, "{first:?}");
+    let orphan = row(&engine, &first[0].batch_id).await.object_uri.unwrap();
+    assert!(
+        backend.stored_retention(&orphan, None).mode.is_some(),
+        "the failed attempt's object is locked"
+    );
+
+    engine.set_seal_clock(|| at("2026-03-04T06:00:30Z"));
+    let second = engine.process_once(SourceType::File).await.unwrap();
+    assert!(second[0].committed, "{second:?}");
+    assert_eq!(second[0].object_uri.as_deref(), Some(orphan.as_str()));
+    assert_eq!(
+        backend.version_count(&orphan),
+        1,
+        "no second locked version of the object"
+    );
+    let objects: Vec<_> = backend
+        .object_uris()
+        .into_iter()
+        .filter(|uri| !uri.ends_with(".manifest.json") && !uri.ends_with(".receipt.json"))
+        .collect();
+    assert_eq!(objects, vec![orphan], "and no second locked object");
+    assert_eq!(rebuilds(tenant, "exact"), exact_before + 1);
+}
+
+/// #626 under the profile: a replay whose bytes differ from the locked
+/// object the failed attempt wrote (compression changed) writes a second
+/// locked object, leaves the first as it is, and is counted `bytes_differ`:
+/// the counter that sizes what replays cost in retained storage.
+#[tokio::test]
+async fn a_replay_whose_bytes_differ_writes_a_second_locked_object_and_is_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 30);
+    let tenant = "lock-bytes-differ-626";
+    let lock = governance();
+    let backend = Arc::new(locked_mock(&lock).with_throttled_manifest_puts(1));
+    let mut cfg = config(dir.path(), tenant, "telemetry-raw", &input);
+    cfg.compression.level = 1;
+    let orphan = {
+        let mut first = engine(cfg.clone(), Some(lock.clone()), &backend).await;
+        let out = first.process_once(SourceType::File).await.unwrap();
+        assert!(!out[0].committed, "{out:?}");
+        row(&first, &out[0].batch_id).await.object_uri.unwrap()
+    };
+    let differ_before = rebuilds(tenant, "bytes_differ");
+
+    cfg.compression.level = 9;
+    let mut restarted = engine(cfg, Some(lock), &backend).await;
+    restarted.recover().await.unwrap();
+    let out = restarted.process_once(SourceType::File).await.unwrap();
+    assert!(out[0].committed, "{out:?}");
+    let written = out[0].object_uri.clone().unwrap();
+    assert_ne!(written, orphan);
+    assert_eq!(backend.version_count(&orphan), 1, "the first is untouched");
+    for uri in [&orphan, &written] {
+        assert!(
+            backend.stored_retention(uri, None).mode.is_some(),
+            "{uri} is locked"
+        );
+    }
+    assert_eq!(rebuilds(tenant, "bytes_differ"), differ_before + 1);
+}
+
 #[tokio::test]
 async fn a_multipart_object_carries_the_lock_its_create_asked_for() {
     let dir = tempfile::tempdir().unwrap();
