@@ -204,8 +204,12 @@ impl StateStore for Recorder {
         self.write(self.inner.mark_failed(batch_id, message), |_, _| {})
             .await
     }
-    async fn mark_verified(&self, batch_id: &str) -> Result<(), VtopError> {
-        self.write(self.inner.mark_verified(batch_id), |log, i| {
+    async fn mark_verified(
+        &self,
+        batch_id: &str,
+        class: vtop_state::VerificationClass,
+    ) -> Result<(), VtopError> {
+        self.write(self.inner.mark_verified(batch_id, class), |log, i| {
             note_transition(log, i, batch_id, BatchState::Verified)
         })
         .await

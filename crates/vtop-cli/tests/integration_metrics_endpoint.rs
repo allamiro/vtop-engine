@@ -54,6 +54,9 @@ fn populated() -> String {
     m.verification_backend_limited_total
         .with_label_values(&l)
         .inc_by(0);
+    m.recovery_rechecks_total
+        .with_label_values(&[l[0], l[1], l[2], "strong", "size_only"])
+        .inc_by(0);
     m.replay_required_total.with_label_values(&l).inc_by(0);
     m.failed_total.with_label_values(&l).inc_by(0);
     m.records_total.with_label_values(&l).inc_by(10);
@@ -147,7 +150,18 @@ fn unbounded_identifiers_are_never_labels() {
 fn every_exported_label_is_from_a_bounded_set() {
     // "le" is Prometheus's own histogram bucket label. It is bounded by the
     // bucket list defined in telemetry.rs, not free-form, so it is legitimate.
-    const BOUNDED: [&str; 6] = ["tenant", "source_type", "format", "state", "stage", "le"];
+    // `verification_class` (strong, size_only, unknown) and `result` (strong,
+    // size_only, failed, unsupported_version) are closed sets (#664).
+    const BOUNDED: [&str; 8] = [
+        "tenant",
+        "source_type",
+        "format",
+        "state",
+        "stage",
+        "le",
+        "verification_class",
+        "result",
+    ];
     let text = populated();
     let mut seen = std::collections::BTreeSet::new();
     for line in text.lines().filter(|l| !l.starts_with('#')) {
@@ -167,6 +181,20 @@ fn every_exported_label_is_from_a_bounded_set() {
         unexpected.is_empty(),
         "labels {unexpected:?} are not in the bounded set {BOUNDED:?}; if one is \
          genuinely low-cardinality add it there, otherwise it belongs in logs"
+    );
+}
+
+/// #664: the counter an alert on "verified strong, re-checked size-only" reads
+/// is exported under its name, with the class and result as labels.
+#[test]
+fn the_recovery_recheck_counter_is_exported() {
+    let text = populated();
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("vtop_recovery_rechecks_total{")
+                && line.contains(r#"verification_class="strong""#)
+                && line.contains(r#"result="size_only""#)),
+        "vtop_recovery_rechecks_total{{verification_class, result}} is missing:\n{text}"
     );
 }
 
