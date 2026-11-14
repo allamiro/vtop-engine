@@ -265,7 +265,7 @@ The limits that matter most when evaluating it:
   records per second in the comparison above, and a Kafka client cannot yet
   follow a VTOP failover.
 - **Not built yet:** manifest MAC key rotation, an S3 Object Lock profile,
-  OpenTelemetry traces, and a million-file benchmark.
+  and a million-file benchmark.
 
 The full table, with what is done and what is planned, is in
 [limitations.md](docs/reference/limitations.md). Per-release limits are in

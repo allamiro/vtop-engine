@@ -287,6 +287,25 @@ async fn serves_metrics_health_and_readiness() {
         metrics.contains("vtop_records_total"),
         "/metrics must serve the registry: {metrics}"
     );
+    // #683: the OpenTelemetry exporter's own counters are served too, from
+    // the first scrape and with export off, so an alert on them reads 0
+    // rather than "no data".
+    for series in [
+        "vtop_otel_spans_exported_total ",
+        "vtop_otel_spans_dropped_total{reason=\"queue_full\"} ",
+        "vtop_otel_spans_dropped_total{reason=\"export_failed\"} ",
+        "vtop_otel_spans_dropped_total{reason=\"shutdown\"} ",
+        "vtop_otel_export_failures_total{signal=\"traces\"} ",
+        "vtop_otel_export_failures_total{signal=\"metrics\"} ",
+        "vtop_otel_metric_points_exported_total ",
+        "vtop_otel_metric_points_dropped_total ",
+        "vtop_otel_export_queue_length ",
+    ] {
+        assert!(
+            metrics.contains(series),
+            "{series} is not served: {metrics}"
+        );
+    }
 
     assert!(get("/healthz").await.trim_end().ends_with("200"));
     assert!(get("/readyz").await.trim_end().ends_with("200"));
