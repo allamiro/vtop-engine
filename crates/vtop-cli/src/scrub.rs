@@ -531,6 +531,53 @@ impl RetentionResult {
     }
 }
 
+/// What one retention read found: a judgement, or why there is none.
+enum RetentionRead {
+    Judged(RetentionResult),
+    /// The store answered with an error, already redacted. `absent`: the
+    /// error, before redaction, said the key or version is not there.
+    Failed {
+        error: VtopError,
+        absent: bool,
+    },
+    /// The backend cannot read retention at all.
+    Unsupported,
+}
+
+/// The retention of `uri` (at `version`, or its current version when
+/// `None`), expected under `mode` until a date not yet past (#684).
+async fn read_retention(
+    backend: &dyn UploadBackend,
+    uri: &str,
+    version: Option<&str>,
+    mode: ObjectLockMode,
+) -> RetentionRead {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    let expected = RetentionExpectation {
+        mode,
+        retain_until_at_least_unix_secs: now,
+        legal_hold: false,
+    };
+    match backend.verify_retention(uri, version, &expected).await {
+        Ok(RetentionCheck::Ok { .. } | RetentionCheck::LegalHoldMissing) => {
+            RetentionRead::Judged(RetentionResult::Locked)
+        }
+        Ok(RetentionCheck::TooShort { .. }) => RetentionRead::Judged(RetentionResult::Elapsed),
+        Ok(RetentionCheck::Missing) => RetentionRead::Judged(RetentionResult::Missing),
+        Ok(RetentionCheck::ModeMismatch { .. }) => {
+            RetentionRead::Judged(RetentionResult::ModeMismatch)
+        }
+        Ok(RetentionCheck::Unsupported) => RetentionRead::Unsupported,
+        Err(e) => RetentionRead::Failed {
+            absent: looks_missing(&e),
+            error: VtopError::Upload(vtop_upload::multipart::redact_urls(&e.to_string())),
+        },
+    }
+}
+
 /// `--check-retention` for one batch (#684): the object at its current key
 /// (the bytes the content check just read) and the manifest at its pinned
 /// version, each expected under `mode` until a date not yet past; the worse
@@ -541,15 +588,6 @@ async fn retention_of(
     rec: &BatchRecord,
     mode: ObjectLockMode,
 ) -> Result<RetentionResult, BatchCheck> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0);
-    let expected = RetentionExpectation {
-        mode,
-        retain_until_at_least_unix_secs: now,
-        legal_hold: false,
-    };
     let targets = [
         (rec.object_uri.as_deref(), None),
         (
@@ -560,19 +598,12 @@ async fn retention_of(
     let mut worst = RetentionResult::Locked;
     for (uri, version) in targets {
         let Some(uri) = uri else { continue };
-        let found = match backend.verify_retention(uri, version, &expected).await {
-            Ok(found) => found,
-            Err(e) => {
-                let e = VtopError::Upload(vtop_upload::multipart::redact_urls(&e.to_string()));
-                return Err(read_failure("the retention of", uri, &e));
+        let result = match read_retention(backend, uri, version, mode).await {
+            RetentionRead::Judged(result) => result,
+            RetentionRead::Failed { error, .. } => {
+                return Err(read_failure("the retention of", uri, &error))
             }
-        };
-        let result = match found {
-            RetentionCheck::Ok { .. } | RetentionCheck::LegalHoldMissing => RetentionResult::Locked,
-            RetentionCheck::TooShort { .. } => RetentionResult::Elapsed,
-            RetentionCheck::Missing => RetentionResult::Missing,
-            RetentionCheck::ModeMismatch { .. } => RetentionResult::ModeMismatch,
-            RetentionCheck::Unsupported => {
+            RetentionRead::Unsupported => {
                 return Err(BatchCheck::new(
                     ScrubResult::Unreadable,
                     format!(
@@ -585,6 +616,78 @@ async fn retention_of(
         worst = worst.max(result);
     }
     Ok(worst)
+}
+
+/// What a batch's receipt check found (#671 release B), and, with
+/// `--check-retention` (#710), the receipt's own retention.
+struct ReceiptCheck {
+    result: ReceiptResult,
+    detail: String,
+    /// The receipt's key, when a receipt was read there: the only receipts
+    /// whose retention is read. A missing one has none to judge.
+    read_at: Option<String>,
+    retention: Option<RetentionResult>,
+}
+
+/// `--check-retention` for a batch's verification receipt (#710): the
+/// receipt at its current key, the one the receipt check just read. Receipts
+/// are not pinned in the ledger, and a GET returns no version id here, so
+/// there is no version to pin it to. `Ok(None)`: the receipt went between
+/// the two reads, which the next run counts as missing. `Err`: why the
+/// retention could not be read, for an `unreadable` receipt finding.
+async fn receipt_retention_of(
+    backend: &dyn UploadBackend,
+    receipt_uri: &str,
+    mode: ObjectLockMode,
+) -> Result<Option<RetentionResult>, String> {
+    match read_retention(backend, receipt_uri, None, mode).await {
+        RetentionRead::Judged(result) => Ok(Some(result)),
+        RetentionRead::Failed { absent: true, .. } => {
+            tracing::info!(
+                receipt_uri,
+                "verification receipt {receipt_uri} was deleted between its read and its \
+                 retention read; the scrub judged no retention for it, and the next run \
+                 counts it as missing; nothing to do unless it stays missing"
+            );
+            Ok(None)
+        }
+        RetentionRead::Failed { error: e, .. } => Err(format!(
+            "the retention of verification receipt {receipt_uri} could not be read: {e}; the \
+             receipt is reported unreadable and the batch's own result is left alone (nothing \
+             was proven about the receipt's lock; the scrub needs s3:GetObjectRetention)"
+        )),
+        RetentionRead::Unsupported => Err(format!(
+            "the retention of verification receipt {receipt_uri} cannot be read by the {} \
+             backend; the receipt is reported unreadable and the batch's own result is left \
+             alone",
+            backend.backend_name()
+        )),
+    }
+}
+
+/// The detail of a receipt retention finding (#710): what happened, what the
+/// scrub did, and what to do.
+fn receipt_retention_detail(receipt_uri: &str, found: RetentionResult, mode: &str) -> String {
+    let (what, remedy) = match found {
+        RetentionResult::Missing => (
+            "carries no retention",
+            "a receipt with no lock can be deleted or overwritten: re-apply the retention with \
+             PutObjectRetention on the receipt's current version if it should be kept (it is \
+             evidence from the engine, not a commit precondition), and check who could bypass \
+             it, or whether an engine older than v0.10.0 wrote it",
+        ),
+        _ => (
+            "is under another retention mode than the configured one",
+            "nothing to do if upload.object_lock.mode was changed on purpose (a stricter lock \
+             cannot be shortened); otherwise find who wrote or re-locked it in the store's \
+             access log",
+        ),
+    };
+    format!(
+        "verification receipt {receipt_uri} {what} (S3 Object Lock, expected {mode}); the scrub \
+         reported it and changed nothing, and the batch's object and manifest are checked \
+         separately and are unaffected by this finding; {remedy}"
+    )
 }
 
 /// What the receipt check found for one committed batch (#671 release B):
@@ -684,16 +787,47 @@ fn receipt_remedy(result: ReceiptResult) -> &'static str {
     }
 }
 
+/// [`receipt_of`], and with `retention` (#710) the retention of the receipt
+/// it read. A retention that cannot be read turns an `ok` receipt
+/// `unreadable` (a scrub that could not look did not pass), and is added to
+/// the detail of a receipt that is already a finding.
+async fn receipt_check(
+    backend: &dyn UploadBackend,
+    keyring: &ManifestKeyring,
+    rec: &BatchRecord,
+    retention: Option<ObjectLockMode>,
+) -> ReceiptCheck {
+    let (mut result, mut detail, read_at) = receipt_of(backend, keyring, rec).await;
+    let mut judged = None;
+    if let (Some(mode), Some(ruri)) = (retention, read_at.as_deref()) {
+        match receipt_retention_of(backend, ruri, mode).await {
+            Ok(found) => judged = found,
+            Err(why) if result == ReceiptResult::Ok => {
+                result = ReceiptResult::Unreadable;
+                detail = why;
+            }
+            Err(why) => detail = format!("{detail}; {why}"),
+        }
+    }
+    ReceiptCheck {
+        result,
+        detail,
+        read_at,
+        retention: judged,
+    }
+}
+
 /// Check the verification receipt beside `rec`'s manifest: read at its key
 /// (receipts are not pinned), authenticated with the key it names (#685),
 /// then bound to the ledger row: the batch, the manifest's URI, digest and
-/// pinned version, the object, and the class the ledger recorded.
+/// pinned version, the object, and the class the ledger recorded. The third
+/// value is the receipt's key when a receipt was read there.
 async fn receipt_of(
     backend: &dyn UploadBackend,
     keyring: &ManifestKeyring,
     rec: &BatchRecord,
-) -> (ReceiptResult, String) {
-    let mismatched = |why: String| (ReceiptResult::Mismatched, why);
+) -> (ReceiptResult, String, Option<String>) {
+    let mismatched = |why: String| (ReceiptResult::Mismatched, why, None);
     let Some(muri) = rec.manifest_uri.as_deref() else {
         return mismatched("the ledger row names no manifest, so no receipt key".into());
     };
@@ -702,12 +836,16 @@ async fn receipt_of(
             "manifest {muri} does not end in .manifest.json, so it has no receipt key"
         ));
     };
+    // From here on a receipt was read at `ruri`, whatever it turns out to be.
+    let read = Some(ruri.clone());
+    let mismatched = |why: String| (ReceiptResult::Mismatched, why, read.clone());
     let bytes = match backend.get_object_bounded(&ruri, MAX_RECEIPT_BYTES).await {
         Ok(bytes) => bytes,
         Err(e) if looks_missing(&e) => {
             return (
                 ReceiptResult::Missing,
                 format!("verification receipt {ruri} is not in the store"),
+                None,
             )
         }
         Err(e) => {
@@ -717,6 +855,7 @@ async fn receipt_of(
                     "verification receipt {ruri} could not be read: {}",
                     vtop_upload::multipart::redact_urls(&e.to_string())
                 ),
+                None,
             )
         }
     };
@@ -726,6 +865,7 @@ async fn receipt_of(
             return (
                 ReceiptResult::Invalid,
                 format!("verification receipt {ruri} does not parse: {e}"),
+                read,
             )
         }
     };
@@ -738,6 +878,7 @@ async fn receipt_of(
         return (
             result,
             format!("verification receipt {ruri} does not authenticate: {e}"),
+            read,
         );
     }
     let r = receipt.fields();
@@ -803,7 +944,7 @@ async fn receipt_of(
             ));
         }
     }
-    (ReceiptResult::Ok, String::new())
+    (ReceiptResult::Ok, String::new(), read)
 }
 
 // ---- What to check ----------------------------------------------------------
@@ -1167,6 +1308,10 @@ pub struct ScrubFinding {
     /// Set for a receipt finding (#671 release B); `result` is then the
     /// content check's.
     pub receipt: Option<ReceiptResult>,
+    /// Set for a receipt retention finding (#710): the verification
+    /// receipt's own S3 Object Lock retention, apart from the batch's object
+    /// and manifest (`retention`); `result` is then the content check's.
+    pub receipt_retention: Option<RetentionResult>,
     pub detail: String,
 }
 
@@ -1214,6 +1359,11 @@ pub struct ScrubReport {
     /// Receipt results by [`ReceiptResult`] (#671 release B), every one at
     /// zero when nothing had it; empty when receipts were not checked.
     pub receipts: BTreeMap<&'static str, u64>,
+    /// The verification receipts' own retention by [`RetentionResult`]
+    /// (#710), every one at zero when nothing had it; empty unless the run
+    /// both checked receipts and read retention (`--check-retention`). A
+    /// missing receipt is not counted here: it is `receipts["missing"]`.
+    pub receipt_retention: BTreeMap<&'static str, u64>,
     pub findings: Vec<ScrubFinding>,
     pub cursor: Option<CursorProgress>,
     pub sample_seed: Option<u64>,
@@ -1346,6 +1496,19 @@ pub async fn scrub_held(
     } else {
         BTreeMap::new()
     };
+    // The receipts' own retention (#710): only when the run both checks
+    // receipts and reads retention, in its own map so a receipt without a
+    // lock is never counted as an object without one.
+    let receipt_retention_mode = opts.check_retention.filter(|_| check_receipts);
+    let mut receipt_retention_counts: BTreeMap<&'static str, u64> =
+        if receipt_retention_mode.is_some() {
+            RetentionResult::ALL
+                .iter()
+                .map(|r| (r.as_str(), 0))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
     let mut checked_ids = Vec::with_capacity(selected.len());
     let selected_count = selected.len();
 
@@ -1381,8 +1544,20 @@ pub async fn scrub_held(
                 }
                 // The receipt beside the manifest (#671 release B),
                 // whatever the content check found: it is its own evidence.
+                // On the heap: the debug build's command future already
+                // outgrows a 2 MiB test stack with the receipt check
+                // (integration_scrub.rs), and the retention read adds an
+                // await to it (#710).
                 let receipt = if check_receipts {
-                    Some(receipt_of(backend, keyring, &row.record).await)
+                    Some(
+                        Box::pin(receipt_check(
+                            backend,
+                            keyring,
+                            &row.record,
+                            receipt_retention_mode,
+                        ))
+                        .await,
+                    )
                 } else {
                     None
                 };
@@ -1401,8 +1576,44 @@ pub async fn scrub_held(
             // checked batches.
             .buffered(concurrency);
         while let Some((row, check, retention, receipt)) = checks.next().await {
-            if let Some((found, detail)) = receipt {
+            if let Some(ReceiptCheck {
+                result: found,
+                detail,
+                read_at,
+                retention: receipt_retention,
+            }) = receipt
+            {
                 *receipt_counts.entry(found.as_str()).or_default() += 1;
+                if let (Some(judged), Some(ruri)) = (receipt_retention, read_at.as_deref()) {
+                    *receipt_retention_counts.entry(judged.as_str()).or_default() += 1;
+                    if judged.is_finding() {
+                        let detail = receipt_retention_detail(
+                            ruri,
+                            judged,
+                            opts.check_retention.map(|m| m.as_str()).unwrap_or_default(),
+                        );
+                        tracing::warn!(
+                            event = "scrub_receipt_retention_finding",
+                            batch_id = %row.record.batch_id,
+                            receipt_uri = ruri,
+                            receipt_retention = judged.as_str(),
+                            detail = %detail,
+                            "scrub receipt retention finding"
+                        );
+                        findings.push(ScrubFinding {
+                            batch_id: row.record.batch_id.clone(),
+                            result: check.result,
+                            origin: row.origin,
+                            object_uri: row.record.object_uri.clone(),
+                            manifest_uri: row.record.manifest_uri.clone(),
+                            manifest_version_id: row.record.manifest_version_id.clone(),
+                            retention: None,
+                            receipt: None,
+                            receipt_retention: Some(judged),
+                            detail,
+                        });
+                    }
+                }
                 if found.is_finding(opts.require_receipts) {
                     let detail = format!("{detail}; {}", receipt_remedy(found));
                     tracing::warn!(
@@ -1420,6 +1631,7 @@ pub async fn scrub_held(
                         manifest_version_id: row.record.manifest_version_id.clone(),
                         retention: None,
                         receipt: Some(found),
+                        receipt_retention: None,
                         detail,
                     });
                 }
@@ -1445,6 +1657,7 @@ pub async fn scrub_held(
                         manifest_version_id: row.record.manifest_version_id.clone(),
                         retention: Some(found),
                         receipt: None,
+                        receipt_retention: None,
                         detail: format!(
                             "the object or its manifest {what} (S3 Object Lock, expected {}); \
                              it can be deleted or overwritten. Re-apply the retention with \
@@ -1475,6 +1688,7 @@ pub async fn scrub_held(
                     manifest_version_id: row.record.manifest_version_id.clone(),
                     retention: None,
                     receipt: None,
+                    receipt_retention: None,
                     detail: check.detail,
                 });
             }
@@ -1533,6 +1747,7 @@ pub async fn scrub_held(
         manifest_keys,
         retention: retention_counts,
         receipts: receipt_counts,
+        receipt_retention: receipt_retention_counts,
         findings,
         cursor: progress,
         sample_seed,
@@ -1624,15 +1839,32 @@ impl ScrubReport {
                     .join(" ")
             ));
         }
+        if !self.receipt_retention.is_empty() {
+            out.push(format!(
+                "receipt retention: {}",
+                self.receipt_retention
+                    .iter()
+                    .map(|(result, n)| format!("{result}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
         for finding in &self.findings {
             let origin = match finding.origin {
                 RowOrigin::Ledger => "ledger",
                 RowOrigin::Digest => "prune digest",
             };
-            let result = match (finding.retention, finding.receipt) {
-                (Some(retention), _) => format!("retention {}", retention.as_str()),
-                (None, Some(receipt)) => format!("receipt {}", receipt.as_str()),
-                (None, None) => finding.result.as_str().to_owned(),
+            let result = match (
+                finding.retention,
+                finding.receipt,
+                finding.receipt_retention,
+            ) {
+                (Some(retention), _, _) => format!("retention {}", retention.as_str()),
+                (None, Some(receipt), _) => format!("receipt {}", receipt.as_str()),
+                (None, None, Some(retention)) => {
+                    format!("receipt retention {}", retention.as_str())
+                }
+                (None, None, None) => finding.result.as_str().to_owned(),
             };
             out.push(format!(
                 "FAIL {result} {} (row from the {origin}): {}",
@@ -1737,6 +1969,36 @@ impl ScrubReport {
                 ));
             }
         }
+        // The receipts' own retention (#710), in its own family so an
+        // operator can tell a receipt without a lock from an object without
+        // one; the same bounded result set as vtop_scrub_retention_total. A
+        // run that did not read it carries the totals forward.
+        let receipt_retention: BTreeMap<String, u64> = if self.receipt_retention.is_empty() {
+            carried.receipt_retention.clone()
+        } else {
+            self.receipt_retention
+                .iter()
+                .map(|(result, n)| {
+                    let total = carried.receipt_retention.get(*result).copied().unwrap_or(0) + n;
+                    ((*result).to_owned(), total)
+                })
+                .collect()
+        };
+        if !receipt_retention.is_empty() {
+            out.push_str(
+                "# HELP vtop_scrub_receipt_retention_total Committed batches whose verification \
+                 receipt's S3 Object Lock retention the scrub read (--check-retention with \
+                 receipts checked), by result: locked, elapsed (the retention has ended; not a \
+                 finding), missing and mode_mismatch (findings). A missing receipt is not \
+                 counted here\n\
+                 # TYPE vtop_scrub_receipt_retention_total counter\n",
+            );
+            for (result, total) in &receipt_retention {
+                out.push_str(&format!(
+                    "vtop_scrub_receipt_retention_total{{result=\"{result}\"}} {total}\n"
+                ));
+            }
+        }
         // By configured key only (#685): the labels are this run's keyring,
         // never an id read from storage, and a key no longer configured
         // drops out (its counter resets if it comes back).
@@ -1819,6 +2081,7 @@ struct Carried {
     key_counts: BTreeMap<String, u64>,
     retention: BTreeMap<String, u64>,
     receipts: BTreeMap<String, u64>,
+    receipt_retention: BTreeMap<String, u64>,
     last_success: i64,
     last_pass_complete: i64,
     last_finding: i64,
@@ -1840,6 +2103,14 @@ impl Carried {
                 if let Some((result, value)) = rest.split_once("\"} ") {
                     if let Ok(value) = value.trim().parse::<u64>() {
                         carried.retention.insert(result.to_owned(), value);
+                    }
+                }
+            } else if let Some(rest) =
+                line.strip_prefix("vtop_scrub_receipt_retention_total{result=\"")
+            {
+                if let Some((result, value)) = rest.split_once("\"} ") {
+                    if let Ok(value) = value.trim().parse::<u64>() {
+                        carried.receipt_retention.insert(result.to_owned(), value);
                     }
                 }
             } else if let Some(rest) = line.strip_prefix("vtop_scrub_receipts_total{result=\"") {
@@ -1962,6 +2233,7 @@ mod tests {
             manifest_keys: BTreeMap::new(),
             retention: BTreeMap::new(),
             receipts: BTreeMap::new(),
+            receipt_retention: BTreeMap::new(),
             findings: (0..findings)
                 .map(|i| ScrubFinding {
                     batch_id: format!("b{i}"),
@@ -1972,6 +2244,7 @@ mod tests {
                     manifest_version_id: None,
                     retention: None,
                     receipt: None,
+                    receipt_retention: None,
                     detail: String::new(),
                 })
                 .collect(),
@@ -2150,5 +2423,111 @@ mod tests {
             second.contains("vtop_scrub_retention_total{result=\"locked\"} 2\n"),
             "the totals survive a run that did not read retention: {second}"
         );
+    }
+
+    /// #710: the receipts' own retention family is carried over a run that
+    /// did not read it, whichever check that run left out, and the four
+    /// scrub families in one file keep their own numbers when it is parsed
+    /// and rewritten (`vtop_scrub_receipts_total{` and
+    /// `vtop_scrub_receipt_retention_total{` share a prefix up to `receipt`).
+    #[test]
+    fn a_run_that_read_no_receipt_retention_carries_its_totals_forward() {
+        let at = |pairs: &[(RetentionResult, u64)]| -> BTreeMap<&'static str, u64> {
+            RetentionResult::ALL
+                .iter()
+                .map(|r| {
+                    let n = pairs.iter().find(|(p, _)| p == r).map_or(0, |(_, n)| *n);
+                    (r.as_str(), n)
+                })
+                .collect()
+        };
+        let mut all_four = report(&[(ScrubResult::Ok, 5)], 0, true);
+        all_four.retention = at(&[(RetentionResult::Locked, 5)]);
+        all_four.receipts = ReceiptResult::ALL
+            .iter()
+            .map(|r| (r.as_str(), u64::from(*r == ReceiptResult::Ok) * 4))
+            .collect();
+        all_four.receipt_retention = at(&[
+            (RetentionResult::Locked, 2),
+            (RetentionResult::Missing, 1),
+            (RetentionResult::ModeMismatch, 1),
+        ]);
+        let first = all_four.prometheus_text(None, 100);
+        let family = |text: &str, name: &str| -> Vec<String> {
+            text.lines()
+                .filter(|l| l.starts_with(&format!("{name}{{")))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(
+            family(&first, "vtop_scrub_receipt_retention_total"),
+            [
+                "vtop_scrub_receipt_retention_total{result=\"elapsed\"} 0",
+                "vtop_scrub_receipt_retention_total{result=\"locked\"} 2",
+                "vtop_scrub_receipt_retention_total{result=\"missing\"} 1",
+                "vtop_scrub_receipt_retention_total{result=\"mode_mismatch\"} 1",
+            ],
+            "{first}"
+        );
+
+        // (a) neither check; (b) receipts without --check-retention; (c)
+        // --check-retention without receipts.
+        let neither = report(&[(ScrubResult::Ok, 1)], 0, true);
+        let mut receipts_only = report(&[(ScrubResult::Ok, 1)], 0, true);
+        receipts_only.receipts = ReceiptResult::ALL
+            .iter()
+            .map(|r| (r.as_str(), u64::from(*r == ReceiptResult::Ok)))
+            .collect();
+        let mut retention_only = report(&[(ScrubResult::Ok, 1)], 0, true);
+        retention_only.retention = at(&[(RetentionResult::Locked, 1)]);
+        for (case, run) in [
+            ("neither", neither),
+            ("receipts only", receipts_only),
+            ("retention only", retention_only),
+        ] {
+            assert!(run.receipt_retention.is_empty(), "{case}");
+            let next = run.prometheus_text(Some(&first), 200);
+            assert_eq!(
+                family(&next, "vtop_scrub_receipt_retention_total"),
+                family(&first, "vtop_scrub_receipt_retention_total"),
+                "{case}: {next}"
+            );
+        }
+
+        // (d) A run of all four adds each family to its own totals.
+        let second = all_four.prometheus_text(Some(&first), 300);
+        for (name, line) in [
+            ("vtop_scrub_objects_total", "{result=\"ok\"} 10"),
+            ("vtop_scrub_retention_total", "{result=\"locked\"} 10"),
+            ("vtop_scrub_receipts_total", "{result=\"ok\"} 8"),
+            (
+                "vtop_scrub_receipt_retention_total",
+                "{result=\"locked\"} 4",
+            ),
+            (
+                "vtop_scrub_receipt_retention_total",
+                "{result=\"missing\"} 2",
+            ),
+        ] {
+            assert!(
+                second.contains(&format!("{name}{line}\n")),
+                "{name}{line}: {second}"
+            );
+        }
+    }
+
+    /// #710: a receipt that is gone by the time its retention is read gets
+    /// no verdict, and is not a read failure; the next run counts it
+    /// missing.
+    #[tokio::test]
+    async fn a_receipt_gone_before_its_retention_read_gets_no_verdict() {
+        let backend = vtop_upload::MockBackend::new();
+        let found = receipt_retention_of(
+            &backend,
+            "s3://telemetry-raw/x/b.receipt.json",
+            ObjectLockMode::Governance,
+        )
+        .await;
+        assert_eq!(found, Ok(None));
     }
 }
