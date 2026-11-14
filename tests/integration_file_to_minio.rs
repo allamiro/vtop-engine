@@ -152,7 +152,7 @@ async fn configured_manifest_key_authenticates_the_stored_manifest() {
         engine.store.as_ref(),
         engine.backend.as_ref(),
         &manifest_uri,
-        Some(&key),
+        &vtop_core::manifest::ManifestKeyring::single(key.clone()),
     )
     .await
     .unwrap();
@@ -162,7 +162,7 @@ async fn configured_manifest_key_authenticates_the_stored_manifest() {
         engine.store.as_ref(),
         engine.backend.as_ref(),
         &manifest_uri,
-        Some(&wrong_key),
+        &vtop_core::manifest::ManifestKeyring::single(wrong_key.clone()),
     )
     .await
     .unwrap();
@@ -228,7 +228,7 @@ async fn verify_manifest_checks_content_not_just_existence() {
     let object_uri = row.object_uri.clone().expect("object uri recorded");
 
     // Intact store: every check passes.
-    let report = verify_manifest_deep(&store, backend.as_ref(), &manifest_uri, None)
+    let report = verify_manifest_deep(&store, backend.as_ref(), &manifest_uri, &Default::default())
         .await
         .expect("verification runs");
     assert!(
@@ -240,7 +240,7 @@ async fn verify_manifest_checks_content_not_just_existence() {
     // Corrupt ONE byte of the stored object, leaving size and recorded
     // metadata identical. A HEAD-based check still passes; content must fail.
     mock.corrupt(&object_uri);
-    let report = verify_manifest_deep(&store, backend.as_ref(), &manifest_uri, None)
+    let report = verify_manifest_deep(&store, backend.as_ref(), &manifest_uri, &Default::default())
         .await
         .expect("verification still runs");
     assert!(

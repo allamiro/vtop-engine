@@ -111,8 +111,8 @@ compression:
 # variable NAME; its value must be a 32-byte key encoded as 64 hex characters.
 # A configured-but-missing/malformed key is a startup error. Enabling it
 # deliberately rejects unsigned pre-cutover manifests during verification and
-# recovery, so verify any backlog before the cutover. Single-key rotation is
-# not implemented yet.
+# recovery, so verify any backlog before the cutover. This is one key with no
+# key id; to rotate keys, use manifest.mac below instead (not both).
 # manifest_mac_key_env: VTOP_MANIFEST_MAC_KEY
 
 # Manifest format (#671). "0.3" (the default) is readable by every release.
@@ -123,6 +123,18 @@ compression:
 # this release ignore the section and keep writing 0.3. Quote the value.
 # manifest:
 #   write_version: "0.4"
+#   # The manifest MAC keyring (#685), version 0.4 only. The active key signs
+#   # and its id is written in manifest.mac_key_id; every key verifies the
+#   # manifests that name it; the legacy key verifies manifests with no id.
+#   # A rotated-out key stays in keys (verify-only); only a withdrawn key goes
+#   # in retired. Every reader must run the keyring release before the active
+#   # key changes: docs/operate/manifest-key-rotation.md.
+#   mac:
+#     active: q4-2026
+#     keys:
+#       - {id: q3-2026, env: VTOP_MANIFEST_MAC_KEY, legacy: true}
+#       - {id: q4-2026, file: /run/secrets/vtop-manifest-mac-q4}
+#     retired: []
 
 # Global algorithm; streams.yaml may override it per stream via checksum.algorithm.
 # Keep this strong during rolling upgrades: older engines ignore the stream key.

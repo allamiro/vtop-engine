@@ -15,7 +15,7 @@ engine's HA status is in [PRODUCTION_HA.md](../PRODUCTION_HA.md).
 | Partial upload recovery | replays from source instead of resuming half-written local objects | add resumable local staging |
 | Command backend verification cost | `aws`, `s3cmd`, and `mc` download each stored object to hash it | prefer native S3 SHA-256 when read-back bandwidth is costly |
 | Syslog timestamps | `received_time_*` is not yet extracted into the spool marker | add timestamp extraction |
-| Manifest integrity | self-hash plus optional keyed-BLAKE3 authentication; key rotation not implemented | add multi-key rotation and public-key signatures if required |
+| Manifest integrity | self-hash plus optional keyed-BLAKE3 authentication; key rotation through key ids and a keyring (`manifest.mac`, version 0.4 manifests only, every reader on the keyring release first) | add public-key signatures if required |
 | Object immutability | manifest version pinning + bucket-versioning validation implemented (hardened profile, `upload.require_object_versioning`); Object Lock retention itself is deployment policy | document an Object Lock deployment profile |
 | Metrics and trace export | **Prometheus `/metrics` implemented** (opt-in via `VTOP_METRICS_ADDR`); **OpenTelemetry export implemented** (#683): traces of the batch lifecycle, recovery and scrub, the same metrics over OTLP, and trace ids in the JSON logs, built in and idle until `OTEL_EXPORTER_OTLP_ENDPOINT` is set (HTTP/protobuf only, no gRPC) | gRPC transport if a deployment needs it |
 | Kafka integration test | requires live broker and is ignored by default | add optional CI service profile |
@@ -74,6 +74,7 @@ engine's HA status is in [PRODUCTION_HA.md](../PRODUCTION_HA.md).
 
 ## Not implemented yet
 
-- [ ] manifest MAC key rotation / optional public-key signatures
+- [x] manifest MAC key rotation (#685)
+- [ ] optional public-key manifest signatures
 - [ ] S3 Object Lock profile
 - [ ] million-file benchmark suite
