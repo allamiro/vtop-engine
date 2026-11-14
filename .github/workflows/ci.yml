@@ -141,6 +141,8 @@ jobs:
               - 'crates/vtop-protocol/**'
               - 'crates/vtop-state/**'
               - 'crates/vtop-upload/**'
+              - 'crates/vtop-s3-testkit/**'
+              - 'tests/s3-compat/**'
               - 'docker/minio/**'
               - 'docker-compose.yml'
               - 'Cargo.toml'
@@ -1309,9 +1311,13 @@ jobs:
           docker compose run --rm minio-init
 
       # One test thread: the tests share the store, and the multipart ones
-      # count the requests a forwarder in front of it sees.
+      # count the requests a forwarder in front of it sees. The server and
+      # what it is expected to do come from tests/s3-compat/servers/minio.yaml
+      # (#722); every case appends a results line to VTOP_TEST_S3_RESULTS.
       - name: Run the live S3 tests
         env:
+          VTOP_TEST_S3_SERVER: minio
+          VTOP_TEST_S3_RESULTS: ${{ runner.temp }}/s3-compat/results-minio.jsonl
           VTOP_TEST_S3_ENDPOINT: http://127.0.0.1:9000
           AWS_ACCESS_KEY_ID: minioadmin
           AWS_SECRET_ACCESS_KEY: minioadmin
@@ -1332,6 +1338,8 @@ jobs:
       # read_back for a multipart object.
       - name: Run the live engine tests
         env:
+          VTOP_TEST_S3_SERVER: minio
+          VTOP_TEST_S3_RESULTS: ${{ runner.temp }}/s3-compat/results-minio.jsonl
           VTOP_TEST_S3_ENDPOINT: http://127.0.0.1:9000
           AWS_ACCESS_KEY_ID: minioadmin
           AWS_SECRET_ACCESS_KEY: minioadmin
@@ -1340,6 +1348,37 @@ jobs:
           cargo test -p vtop-cli --locked --test live_s3_object_lock_engine \
             --test live_s3_verification_receipts \
             -- --ignored --test-threads=1
+
+      # Every case, and any whose outcome is not what minio.yaml says, in the
+      # job summary; the lines themselves as an artifact (#722, D6).
+      - name: Summarise the S3 compatibility results
+        if: always()
+        env:
+          RESULTS: ${{ runner.temp }}/s3-compat/results-minio.jsonl
+        run: |
+          set -euo pipefail
+          if [ ! -s "$RESULTS" ]; then
+            echo "No results were written (the tests did not reach a case)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### S3 compatibility: minio"
+            echo
+            echo "| case | outcome | expected | method |"
+            echo "|---|---|---|---|"
+            jq -r '"| \(.case) | \(.outcome) | \(.expectation) | \(.method // "-") |"' "$RESULTS"
+            echo
+            jq -r 'select(.expected == false)
+              | "\(if .outcome == "unexpected_pass" then "UNEXPECTED PASS" else "UNEXPECTED FAIL" end) \(.case) (\(.deciding_capability // "every capability"), expected \(.expectation)): edit tests/s3-compat/servers/\(.server).yaml or fix the cause"' "$RESULTS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the S3 compatibility results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: s3-compat-results-minio
+          path: ${{ runner.temp }}/s3-compat/results-minio.jsonl
+          if-no-files-found: ignore
 
       # minio-init ran as a one-off `compose run` container, removed when it
       # exited; its output is in the "Start MinIO" step above.

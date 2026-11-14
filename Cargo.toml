@@ -13,6 +13,7 @@ members = [
   "crates/vtop-state",
   "crates/vtop-cli",
   "crates/vtop-kafka",
+  "crates/vtop-s3-testkit",
 ]
 
 [workspace.package]
@@ -144,6 +145,8 @@ vtop-kafka = { path = "crates/vtop-kafka", version = "0.9.0" }
 vtop-adapters = { path = "crates/vtop-adapters", version = "0.9.0", default-features = false }
 vtop-upload = { path = "crates/vtop-upload", version = "0.9.0" }
 vtop-state = { path = "crates/vtop-state", version = "0.9.0" }
+# Test support for the live S3 tests (#722): never published, so no version.
+vtop-s3-testkit = { path = "crates/vtop-s3-testkit" }
 
 [profile.release]
 opt-level = 3

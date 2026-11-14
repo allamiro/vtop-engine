@@ -63,6 +63,8 @@ aws-sdk-s3 = { workspace = true }
 # `PgStateStore::execute_raw` resets the Postgres ledger between the recovery
 # tests that run on one when VTOP_TEST_POSTGRES is set (#664).
 vtop-state = { workspace = true, features = ["test-support"] }
+# Which S3 server a live test runs against, and what it expects of it (#722).
+vtop-s3-testkit = { workspace = true }
 
 # Integration tests live in the repo-root tests/ directory and are compiled as
 # integration tests of this package.

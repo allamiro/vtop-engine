@@ -16,6 +16,7 @@
 //! The objects it writes are under a one-day governance retention; the test
 //! deletes them with `x-amz-bypass-governance-retention`, which the lab's
 //! root credentials may use. CI runs it in the `minio-integration` job.
+//! `VTOP_TEST_S3_SERVER` names the server and its capability file (#722).
 #![cfg(unix)]
 
 use std::io::Write;
@@ -26,18 +27,19 @@ use vtop_cli::testkit::file_config;
 use vtop_cli::Engine;
 use vtop_core::config::{ObjectLockConfig, ObjectLockMode, StreamsConfig, VtopConfig};
 use vtop_core::types::SourceType;
+use vtop_s3_testkit::{Capability, LiveS3, S3Settings};
 
-fn endpoint() -> String {
-    std::env::var("VTOP_TEST_S3_ENDPOINT")
-        .expect("VTOP_TEST_S3_ENDPOINT must name the live endpoint")
+/// How to reach the store, from `VTOP_TEST_S3_*` (#722).
+fn settings() -> S3Settings {
+    LiveS3::from_env().settings
 }
 
 fn locked_bucket() -> String {
-    std::env::var("VTOP_TEST_S3_LOCKED_BUCKET").unwrap_or_else(|_| "telemetry-locked".into())
+    settings().locked_bucket
 }
 
 fn plain_bucket() -> String {
-    std::env::var("VTOP_TEST_S3_BUCKET").unwrap_or_else(|_| "telemetry-raw".into())
+    settings().bucket
 }
 
 fn unix_now() -> i64 {
@@ -61,9 +63,11 @@ fn config(dir: &Path, bucket: &str, prefix: &str) -> VtopConfig {
     );
     cfg.upload.bucket = bucket.into();
     cfg.upload.prefix = prefix.into();
-    cfg.upload.endpoint_url = Some(endpoint());
-    cfg.upload.force_path_style = true;
-    cfg.upload.verify_tls = false;
+    let s = settings();
+    cfg.upload.endpoint_url = s.endpoint;
+    cfg.upload.region = s.region;
+    cfg.upload.force_path_style = s.force_path_style;
+    cfg.upload.verify_tls = s.verify_tls;
     cfg.upload.require_object_versioning = true;
     cfg.upload.object_lock = Some(ObjectLockConfig {
         mode: ObjectLockMode::Governance,
@@ -78,11 +82,15 @@ fn config(dir: &Path, bucket: &str, prefix: &str) -> VtopConfig {
 async fn s3_client() -> aws_sdk_s3::Client {
     use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
     let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"));
-    let conf = aws_sdk_s3::Config::builder()
+    let s = settings();
+    let mut conf = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
-        .region(Region::new("us-east-1"))
-        .endpoint_url(endpoint())
-        .force_path_style(true)
+        .region(Region::new(s.region))
+        .force_path_style(s.force_path_style);
+    if let Some(endpoint) = s.endpoint {
+        conf = conf.endpoint_url(endpoint);
+    }
+    let conf = conf
         .credentials_provider(Credentials::new(
             env("AWS_ACCESS_KEY_ID"),
             env("AWS_SECRET_ACCESS_KEY"),
@@ -97,86 +105,102 @@ async fn s3_client() -> aws_sdk_s3::Client {
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_the_engine_refuses_a_bucket_without_object_lock_at_startup() {
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = config(dir.path(), &plain_bucket(), "vtop-it-684-engine");
-    let err = match Engine::new_exclusive(cfg, StreamsConfig { streams: vec![] }).await {
-        Ok(_) => panic!("an engine must not start against a bucket without Object Lock"),
-        Err(e) => e.to_string(),
-    };
-    for part in [
-        format!(
-            "bucket {} does not have Object Lock enabled",
-            plain_bucket()
-        ),
-        "the engine did not start".to_owned(),
-        "point upload.bucket at it".to_owned(),
-    ] {
-        assert!(err.contains(&part), "{err:?} should say {part:?}");
-    }
+    let live = LiveS3::from_env();
+    live.case(
+        "engine.object_lock.refuses_a_plain_bucket_at_startup",
+        &[Capability::ObjectLock],
+        || async {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config(dir.path(), &plain_bucket(), "vtop-it-684-engine");
+            let err = match Engine::new_exclusive(cfg, StreamsConfig { streams: vec![] }).await {
+                Ok(_) => panic!("an engine must not start against a bucket without Object Lock"),
+                Err(e) => e.to_string(),
+            };
+            for part in [
+                format!(
+                    "bucket {} does not have Object Lock enabled",
+                    plain_bucket()
+                ),
+                "the engine did not start".to_owned(),
+                "point upload.bucket at it".to_owned(),
+            ] {
+                assert!(err.contains(&part), "{err:?} should say {part:?}");
+            }
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "requires an S3-compatible endpoint with Object Lock"]
 async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
-    let dir = tempfile::tempdir().unwrap();
-    let bucket = locked_bucket();
-    let prefix = format!("vtop-it-684-engine-{}", unix_now());
-    let mut engine = Engine::new_exclusive(
-        config(dir.path(), &bucket, &prefix),
-        StreamsConfig { streams: vec![] },
-    )
-    .await
-    .expect("a locked bucket passes the startup check");
-    let before = unix_now();
-    let out = engine.process_once(SourceType::File).await.unwrap();
-    assert_eq!(out.len(), 1, "{out:?}");
-    assert!(out[0].committed, "{out:?}");
-    let row = engine
-        .store
-        .get_batch(&out[0].batch_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let live = LiveS3::from_env();
+    live.case(
+        "engine.object_lock.archives_a_batch_locked",
+        &[Capability::Versioning, Capability::ObjectLock],
+        || async {
+            let dir = tempfile::tempdir().unwrap();
+            let bucket = locked_bucket();
+            let prefix = format!("vtop-it-684-engine-{}", unix_now());
+            let mut engine = Engine::new_exclusive(
+                config(dir.path(), &bucket, &prefix),
+                StreamsConfig { streams: vec![] },
+            )
+            .await
+            .expect("a locked bucket passes the startup check");
+            let before = unix_now();
+            let out = engine.process_once(SourceType::File).await.unwrap();
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert!(out[0].committed, "{out:?}");
+            let row = engine
+                .store
+                .get_batch(&out[0].batch_id)
+                .await
+                .unwrap()
+                .unwrap();
 
-    let client = s3_client().await;
-    let receipt =
-        vtop_core::partitioning::receipt_uri(row.manifest_uri.as_deref().unwrap()).unwrap();
-    for uri in [
-        row.object_uri.clone().unwrap(),
-        row.manifest_uri.clone().unwrap(),
-        receipt,
-    ] {
-        let key = uri
-            .strip_prefix(&format!("s3://{bucket}/"))
-            .unwrap()
-            .to_owned();
-        let head = client
-            .head_object()
-            .bucket(&bucket)
-            .key(&key)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            head.object_lock_mode().map(|m| m.as_str()),
-            Some("GOVERNANCE"),
-            "{uri}"
-        );
-        let until = head.object_lock_retain_until_date().unwrap().secs();
-        assert!(
-            until >= before + 86_400 && until <= unix_now() + 86_400 + 1,
-            "{uri} is retained one day from its write: {until}"
-        );
-        // Clean up: the lab's root credentials may bypass governance.
-        let version = head.version_id().unwrap().to_owned();
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key(&key)
-            .version_id(&version)
-            .bypass_governance_retention(true)
-            .send()
-            .await
-            .unwrap_or_else(|e| panic!("cleaning up {uri}: {e:?}"));
-    }
+            let client = s3_client().await;
+            let receipt =
+                vtop_core::partitioning::receipt_uri(row.manifest_uri.as_deref().unwrap()).unwrap();
+            for uri in [
+                row.object_uri.clone().unwrap(),
+                row.manifest_uri.clone().unwrap(),
+                receipt,
+            ] {
+                let key = uri
+                    .strip_prefix(&format!("s3://{bucket}/"))
+                    .unwrap()
+                    .to_owned();
+                let head = client
+                    .head_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    head.object_lock_mode().map(|m| m.as_str()),
+                    Some("GOVERNANCE"),
+                    "{uri}"
+                );
+                let until = head.object_lock_retain_until_date().unwrap().secs();
+                assert!(
+                    until >= before + 86_400 && until <= unix_now() + 86_400 + 1,
+                    "{uri} is retained one day from its write: {until}"
+                );
+                // Clean up: the lab's root credentials may bypass governance.
+                let version = head.version_id().unwrap().to_owned();
+                client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .version_id(&version)
+                    .bypass_governance_retention(true)
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| panic!("cleaning up {uri}: {e:?}"));
+            }
+        },
+    )
+    .await;
 }
