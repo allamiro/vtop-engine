@@ -139,7 +139,8 @@ async fn live_the_engine_archives_a_batch_under_the_configured_lock() {
         .unwrap();
 
     let client = s3_client().await;
-    let receipt = vtop_core::partitioning::receipt_uri(row.manifest_uri.as_deref().unwrap()).unwrap();
+    let receipt =
+        vtop_core::partitioning::receipt_uri(row.manifest_uri.as_deref().unwrap()).unwrap();
     for uri in [
         row.object_uri.clone().unwrap(),
         row.manifest_uri.clone().unwrap(),

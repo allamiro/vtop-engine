@@ -121,10 +121,8 @@ async fn live_a_receipt_names_the_check_the_store_ran() {
             "{case}"
         );
 
-        let rows = vtop_cli::scrub::committed_rows(
-            engine.store.list_batches().await.unwrap(),
-            Vec::new(),
-        );
+        let rows =
+            vtop_cli::scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
         let report = engine
             .scrub(
                 rows,
