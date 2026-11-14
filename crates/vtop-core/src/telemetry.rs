@@ -143,6 +143,12 @@ pub struct Metrics {
     /// confirm.
     pub recovery_rechecks_total: IntCounterVec,
 
+    /// Manifests stored, by the version they were written in (#671 release
+    /// B): `version` is `0.3` or `0.4`, from `manifest.write_version`. A
+    /// `0.4` sample is the signal that every reader of this archive must run
+    /// v0.8.0 or later; an earlier one reports those manifests as tampered.
+    pub manifests_written_total: IntCounterVec,
+
     /// Volume. Rates are derived from these in PromQL, never exported directly.
     pub records_total: IntCounterVec,
     pub bytes_in_total: IntCounterVec,
@@ -330,6 +336,11 @@ impl Metrics {
             "VERIFIED batches recovery re-checked against storage, by the class they were verified with (strong, size_only; unknown for a row from before #664 or with a newer release's class) and the re-check's result (strong, size_only, failed, unsupported_version). verification_class=strong with result=size_only: the store can no longer confirm content verified strongly; restore checksum support on the backend, then run vtopctl scrub",
             vec!["tenant", "source_type", "format", "verification_class", "result"],
         )?;
+        let manifests_written_total = cv(
+            "manifests_written_total",
+            "Manifests stored, by manifest version (manifest.write_version); readers before v0.8.0 report version 0.4 manifests as tampered",
+            vec!["tenant", "version"],
+        )?;
         let failed_total = cv(
             "failed_total",
             "Batches that reached the FAILED state",
@@ -473,6 +484,7 @@ impl Metrics {
             failed_total,
             recovery_unsupported_manifest_total,
             recovery_rechecks_total,
+            manifests_written_total,
             records_total,
             bytes_in_total,
             bytes_out_total,

@@ -22,6 +22,7 @@ stream /data/input/auth.cef.log:
   batching.max_records: 10000 (global)
   checksum.algorithm: blake3 (stream)
   format: cef (stream)
+  manifest.write_version: 0.3 (built-in default)
   manifest_mac: disabled (built-in default)
   path_template: tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/ (global)
   resolved_upload_width: 8 (global)
@@ -51,6 +52,7 @@ as JSON, with `effective_version: 1`, `status` and `warnings` beside it.
 | `path_template` | The object key layout; see [`partitioning`](reference.md#partitioning). |
 | `upload.require_strong_verification` | The global verification floor no stream can lower. |
 | `manifest_mac` | `enabled` or `disabled`, never the key. |
+| `manifest.write_version` | The manifest version new batches are written in, `0.3` or `0.4`; see [`manifest`](reference.md#manifest). |
 
 The output is an allowlist: it never includes a secret, a secret reference's
 value, or a setting outside the list.

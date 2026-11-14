@@ -657,3 +657,107 @@ async fn a_newer_manifest_holds_a_later_verified_range_of_the_same_source() {
         );
     }
 }
+
+/// #671 release B: one ledger holding VERIFIED-but-uncommitted batches whose
+/// manifests the engine wrote at 0.3 and at 0.4 (the source commit failed
+/// after VERIFIED, as in a crash). Recovery re-checks both against storage
+/// and commits both, with no replay; scrub and `verify-manifest` pass them.
+#[tokio::test]
+async fn recovery_commits_engine_written_03_and_04_batches_from_one_ledger() {
+    use std::sync::Arc;
+    use vtop_adapters::base::SourceAdapter;
+    use vtop_adapters::FileSource;
+    use vtop_cli::testkit::{pipeline, FailCommitAdapter};
+    use vtop_core::manifest::{ManifestWriteVersion, ParsedManifest};
+    use vtop_upload::UploadBackend;
+
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let url = format!("sqlite://{}", dir.path().join("mixed.db").display());
+    let inputs: Vec<String> = ["v03.log", "v04.log"]
+        .iter()
+        .map(|name| {
+            let path = dir.path().join(name);
+            let mut f = std::fs::File::create(&path).unwrap();
+            for i in 0..3 {
+                writeln!(f, "{name} line {i}").unwrap();
+            }
+            path.to_string_lossy().into_owned()
+        })
+        .collect();
+    let mut cfg = file_config(work.to_str().unwrap(), &url, inputs.clone(), "mock");
+    let mock = Arc::new(vtop_upload::MockBackend::new());
+    let backend: Arc<dyn vtop_upload::UploadBackend> = mock.clone();
+
+    let mut batches = Vec::new();
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        for (input, version) in inputs
+            .iter()
+            .zip([ManifestWriteVersion::V0_3, ManifestWriteVersion::V0_4])
+        {
+            cfg.manifest.write_version = version;
+            let inner = FileSource::new(vec![input.clone()], TelemetryFormat::Raw, false);
+            let mut adapter = FailCommitAdapter::new(inner, 1);
+            let source = adapter.discover_sources().await.unwrap().pop().unwrap();
+            let read = adapter
+                .read_batch_candidates(&source, 1000, 1 << 20, std::time::Duration::ZERO)
+                .await
+                .unwrap()
+                .remove(0);
+            let outcome = pipeline(&store, backend.clone(), &cfg)
+                .process(&mut adapter, &source, read, None)
+                .await
+                .unwrap();
+            assert_eq!(outcome.final_state, BatchState::Verified, "{version}");
+            assert!(!outcome.committed);
+            let row = store.get_batch(&outcome.batch_id).await.unwrap().unwrap();
+            let bytes = mock
+                .get_manifest_pinned(
+                    row.manifest_uri.as_deref().unwrap(),
+                    row.manifest_version_id.as_deref().unwrap(),
+                    1 << 20,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                ParsedManifest::from_slice(&bytes).unwrap().fields().version,
+                version.as_str()
+            );
+            batches.push(row);
+        }
+    }
+
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    engine.backend = backend;
+    for row in &batches {
+        let check = vtop_cli::scrub::check_stored_batch(engine.backend.as_ref(), None, row).await;
+        assert_eq!(check.result.as_str(), "ok", "{check:?}");
+        let report = vtop_cli::commands::verify_manifest_deep(
+            engine.store.as_ref(),
+            engine.backend.as_ref(),
+            row.manifest_uri.as_deref().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(report.passed, "{:?}", report.lines);
+    }
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(summary.committed, 2, "{summary:?}");
+    assert_eq!(summary.replay_required, 0, "{summary:?}");
+    for row in &batches {
+        assert_eq!(
+            engine
+                .store
+                .get_batch(&row.batch_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            BatchState::SourceCommitted
+        );
+    }
+}

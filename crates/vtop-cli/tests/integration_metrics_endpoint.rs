@@ -135,6 +135,31 @@ fn histograms_expose_buckets_for_quantiles() {
     }
 }
 
+/// #671 release B: manifests are counted by the version they were written
+/// in, labelled by tenant and version only (two values, never a batch id or
+/// URI), so an alert can see the first 0.4 manifest before any reader trips
+/// on it.
+#[test]
+fn manifests_written_are_counted_by_version() {
+    let m = telemetry::init().expect("registry must initialize");
+    for version in ["0.3", "0.4"] {
+        m.manifests_written_total
+            .with_label_values(&["metrics-endpoint", version])
+            .inc_by(0);
+    }
+    let text = m.encode().expect("encode must succeed");
+    assert!(
+        text.contains("# TYPE vtop_manifests_written_total counter"),
+        "{text}"
+    );
+    for version in ["0.3", "0.4"] {
+        let series = format!(
+            r#"vtop_manifests_written_total{{tenant="metrics-endpoint",version="{version}"}}"#
+        );
+        assert!(text.contains(&series), "missing {series}");
+    }
+}
+
 /// The label set is a contract too: dashboards group by these.
 #[test]
 fn expected_labels_are_present() {
@@ -187,8 +212,10 @@ fn every_exported_label_is_from_a_bounded_set() {
     // "outcome" those of FILE_DELETE_OUTCOMES (#619), never the path,
     // "event" the seven of KAFKA_PARTITION_EVENTS (#675), and
     // `verification_class` (strong, size_only, unknown) and `result` (strong,
-    // size_only, failed, unsupported_version) are closed sets (#664).
-    const BOUNDED: [&str; 11] = [
+    // size_only, failed, unsupported_version) are closed sets (#664), and
+    // "version" is the manifest version, "0.3" or "0.4", the values
+    // `manifest.write_version` accepts (#671 release B).
+    const BOUNDED: [&str; 12] = [
         "tenant",
         "source_type",
         "format",
@@ -200,6 +227,7 @@ fn every_exported_label_is_from_a_bounded_set() {
         "event",
         "verification_class",
         "result",
+        "version",
     ];
     let text = populated();
     let mut seen = std::collections::BTreeSet::new();

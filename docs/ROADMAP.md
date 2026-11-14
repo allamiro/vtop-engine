@@ -879,15 +879,40 @@ document so fields they do not know stay authenticated, and report anything
 newer as newer rather than as tampered: recovery leaves such a batch VERIFIED
 and pending, and `vtopctl scrub` reports `unsupported_version`. Both act on
 that only for the row's pinned manifest version carrying the ledger's
-self-hash; anything else is unauthenticated, as before. It still writes
-`0.3`. A later release adds the `0.4` fields (the verification plan, then
-optional receipts, after #664), opt-in, and only once every engine and
-auditor runs a reader release. Known limitations until then:
+self-hash; anything else is unauthenticated, as before.
 
-- **Readers before v0.8.0 cannot read `0.4`.** v0.7.0 and earlier
-  re-encode a manifest without the fields they do not know, so a `0.4`
-  manifest fails their self-hash: recovery replays the batch, the scrub
-  reports it, `verify-manifest` calls it corrupt. Upgrade every reader first.
+Release B (v0.10.0) adds the `0.4` writer behind an opt-in setting:
+`manifest.write_version: "0.4"` in a new top-level `manifest:` section
+(default `"0.3"`). A `0.4` manifest carries `verification_plan` (the
+configured verification method and `require_strong`), is hashed and MAC'd
+over the canonical form v0.8.0 verifies, and still says
+`verification_status: not_verified`, which v0.8.0 requires. With the setting
+off, manifests are byte for byte what v0.8.0 writes. Startup logs the version
+written and why, `vtopctl validate --print-effective` shows
+`manifest.write_version`, and `vtop_manifests_written_total{tenant,version}`
+counts manifests by version. Verification receipts follow in a later PR, now
+that #664 has landed. Known
+limitations:
+
+- **Every reader must run v0.8.0 or later before `0.4` is enabled.** That
+  means every engine sharing the ledger, every `vtopctl scrub` and
+  `verify-manifest`, and every downstream consumer or auditor of the archive.
+  The engine cannot check this: archive engines do not report their release
+  the way data nodes do (#634), so the setting is the operator's
+  acknowledgement.
+- **v0.7.0 and earlier report a `0.4` manifest as tampered.** They re-encode
+  it without the fields they do not know, so the self-hash (and MAC) fail:
+  `verify-manifest` reports a failed self-hash and authentication, the scrub
+  reports it, and recovery replays the batch (duplicates, not loss). This was
+  checked with the released v0.7.0 and v0.8.0 `vtopctl verify-manifest`
+  against a `0.4` archive written by release B: v0.8.0 passes it, v0.7.0
+  fails it.
+- **Older engines ignore the `manifest:` section.** An engine before release
+  B keeps writing `0.3` whatever the key says, which is the safe direction:
+  setting it on a fleet that is not yet upgraded changes nothing there. A typo
+  inside the section is ignored too, and leaves `0.3`.
+- **Going back.** Set `"0.3"` again. `0.4` manifests already written stay
+  readable by v0.8.0 and later. Downgrading the binary stays unsupported.
 - **A pending newer-release range is still re-read.** An engine older than a
   batch's writer leaves its VERIFIED row alone, but its next read of that
   source starts at the committed point, below that range, and archives those
@@ -897,8 +922,11 @@ auditor runs a reader release. Known limitations until then:
   writer's, so an older engine treats it as unauthenticated and replays it
   (duplicates), as before #671.
 - **`scripts/upgrade-compat.sh` does not cover manifests.** The old-release
-  coverage is the committed v0.7.0 fixtures in
-  `crates/vtop-core/tests/fixtures/manifests/`.
+  coverage is the committed fixtures in
+  `crates/vtop-core/tests/fixtures/manifests/`: v0.7.0 and v0.8.0 output, and
+  the first `0.4` documents release B wrote. A CI step that runs the released
+  v0.8.0 and v0.7.0 binaries against a `0.4` archive is the next change
+  (#671, PR 2).
 
 ---
 

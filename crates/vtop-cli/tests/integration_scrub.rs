@@ -1222,3 +1222,113 @@ async fn a_pinned_newer_manifest_not_bound_to_the_ledger_is_unauthenticated() {
         );
     }
 }
+
+/// #671 release B: one archive holding manifests written at 0.3 and, after
+/// `manifest.write_version` was switched, at 0.4 scrubs clean, signed or not.
+/// A tampered 0.4 manifest is reported like a tampered 0.3 one, and only it.
+#[tokio::test]
+async fn a_mixed_03_and_04_archive_scrubs_clean_and_a_tampered_04_manifest_is_reported() {
+    use vtop_core::manifest::{ManifestWriteVersion, ParsedManifest};
+    for signed in [false, true] {
+        let env = format!("VTOP_TEST_SCRUB_MIXED_MAC_{}", std::process::id());
+        let dir = tempfile::tempdir().unwrap();
+        let inputs: Vec<PathBuf> = (0..2)
+            .map(|i| write_input(dir.path(), &format!("mixed-{i}.log"), 3))
+            .collect();
+        let mut cfg = config(dir.path(), &inputs, "mock");
+        if signed {
+            std::env::set_var(&env, "7c".repeat(32));
+            cfg.manifest_mac_key_env = Some(env.clone());
+        }
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        std::env::remove_var(&env);
+        let mock = Arc::new(MockBackend::new());
+        engine.backend = mock.clone();
+        assert_eq!(
+            engine.config.manifest.write_version,
+            ManifestWriteVersion::V0_3
+        );
+        let first = engine.process_once(SourceType::File).await.unwrap();
+        assert!(first.iter().all(|o| o.committed), "{first:?}");
+        for input in &inputs {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(input)
+                .unwrap();
+            writeln!(f, "appended after the switch").unwrap();
+        }
+        engine.config.manifest.write_version = ManifestWriteVersion::V0_4;
+        let second = engine.process_once(SourceType::File).await.unwrap();
+        assert_eq!(second.len(), 2, "{second:?}");
+        assert!(second.iter().all(|o| o.committed), "{second:?}");
+        let a = Archive { dir, engine, mock };
+
+        let ledger = a.ledger().await;
+        assert_eq!(ledger.len(), 4);
+        let mut by_version = std::collections::BTreeMap::<String, Vec<BatchRecord>>::new();
+        for row in &ledger {
+            let bytes = a
+                .mock
+                .get_manifest_pinned(
+                    row.manifest_uri.as_deref().unwrap(),
+                    row.manifest_version_id.as_deref().unwrap(),
+                    1 << 20,
+                )
+                .await
+                .unwrap();
+            let parsed = ParsedManifest::from_slice(&bytes).unwrap();
+            assert_eq!(parsed.fields().manifest.mac.is_some(), signed);
+            by_version
+                .entry(parsed.fields().version.clone())
+                .or_default()
+                .push(row.clone());
+        }
+        assert_eq!(
+            by_version
+                .iter()
+                .map(|(v, r)| (v.as_str(), r.len()))
+                .collect::<Vec<_>>(),
+            vec![("0.3", 2), ("0.4", 2)],
+            "a mixed archive"
+        );
+        let report = a.scrub(&opts()).await;
+        assert!(report.passed, "signed={signed}: {report:#?}");
+        assert_eq!(count(&report, ScrubResult::Ok), 4, "{report:#?}");
+
+        // Tamper with one 0.4 manifest at its (unpinned) key: an edited
+        // field without the key, or a well-formed wrong MAC with it.
+        let victim = &by_version["0.4"][0];
+        let uri = victim.manifest_uri.as_deref().unwrap();
+        let stored = a
+            .mock
+            .get_manifest_pinned(uri, victim.manifest_version_id.as_deref().unwrap(), 1 << 20)
+            .await
+            .unwrap();
+        let mut doc: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        if signed {
+            doc["manifest"]["mac"] = serde_json::json!("00".repeat(32));
+        } else {
+            doc["verification_plan"]["method"] = serde_json::json!("store_checksum");
+        }
+        a.overwrite(uri, &serde_json::to_vec_pretty(&doc).unwrap(), true)
+            .await;
+        let rows: Vec<ScrubRow> = a
+            .rows()
+            .await
+            .into_iter()
+            .map(|mut row| {
+                row.record.manifest_version_id = None;
+                row
+            })
+            .collect();
+        let report = a.scrub_rows(rows, &opts()).await;
+        assert_eq!(
+            findings(&report),
+            vec![(victim.batch_id.clone(), ScrubResult::Unauthenticated)],
+            "signed={signed}: {report:#?}"
+        );
+        assert_eq!(count(&report, ScrubResult::Ok), 3, "{report:#?}");
+    }
+}

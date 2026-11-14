@@ -115,6 +115,15 @@ compression:
 # not implemented yet.
 # manifest_mac_key_env: VTOP_MANIFEST_MAC_KEY
 
+# Manifest format (#671). "0.3" (the default) is readable by every release.
+# "0.4" adds verification_plan (the configured verification method and
+# require_strong) and is hashed over the stored document. Enable it only once
+# every engine, `vtopctl scrub` and auditor reading this archive runs v0.8.0 or
+# later: v0.7.0 and earlier report 0.4 manifests as tampered. Engines before
+# this release ignore the section and keep writing 0.3. Quote the value.
+# manifest:
+#   write_version: "0.4"
+
 # Global algorithm; streams.yaml may override it per stream via checksum.algorithm.
 # Keep this strong during rolling upgrades: older engines ignore the stream key.
 checksum:

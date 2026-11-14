@@ -28,6 +28,7 @@ Default column means the key is unset unless you set it.
 | `compression` | **Required** (may be `{}`) | Codec for sealed batches. |
 | `checksum` | `algorithm: sha256` | Global object checksum. |
 | `manifest_mac_key_env` | - | Name of an environment variable holding the manifest MAC key. |
+| `manifest` | `{}` | How manifests are written; see [`manifest`](#manifest). |
 | `sources` | **Required** (may be `{}`) | Kafka, file and syslog spool sources. |
 | `upload` | **Required** | Object storage target and upload limits. |
 | `partitioning` | See [partitioning](#partitioning) | Object key layout. |
@@ -91,6 +92,21 @@ or invalid MAC fails verification and recovery. A configured but missing or
 malformed key is a startup error. Unsigned manifests written before the
 cutover are rejected, so verify any backlog first. Key rotation is not
 implemented. See [Security model §8](../SECURITY_MODEL.md#8-manifest-authentication).
+
+## `manifest`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `write_version` | `"0.3"` | The manifest version new batches get: `"0.3"` or `"0.4"`, quoted. Anything else, an unquoted number included, fails config load. `"0.4"` adds `verification_plan` (the configured verification method and `require_strong`) and is hashed over the stored document. |
+
+Set `"0.4"` only once every engine, `vtopctl scrub` and auditor that reads the
+archive runs v0.8.0 or later: v0.7.0 and earlier report `0.4` manifests as
+tampered, and recovery on such an engine replays their batches. An engine
+before this release ignores the section and keeps writing `0.3`, and so does
+a misspelled key inside it, so check the startup line or
+`validate --print-effective`. Setting `"0.3"` again goes back; `0.4`
+manifests already written stay readable. See the protocol draft,
+[§11.2](../VTOP_PROTOCOL_DRAFT.md#112-field-reference).
 
 ## `sources`
 
