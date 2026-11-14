@@ -72,6 +72,7 @@ impl Stage {
                 parent: batch,
                 "upload_object",
                 multipart = Empty,
+                reused = Empty,
                 otel.status_code = Empty,
                 otel.status_description = Empty
             ),

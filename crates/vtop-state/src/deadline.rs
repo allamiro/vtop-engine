@@ -198,11 +198,15 @@ impl StateStore for DeadlineStore {
         .await
     }
 
-    async fn mark_verified(&self, batch_id: &str) -> Result<(), VtopError> {
+    async fn mark_verified(
+        &self,
+        batch_id: &str,
+        class: crate::VerificationClass,
+    ) -> Result<(), VtopError> {
         self.within(
             "mark_verified",
             self.point,
-            self.inner.mark_verified(batch_id),
+            self.inner.mark_verified(batch_id, class),
         )
         .await
     }
@@ -327,7 +331,11 @@ mod tests {
         async fn mark_failed(&self, _: &str, _: &str) -> Result<(), VtopError> {
             never!()
         }
-        async fn mark_verified(&self, _: &str) -> Result<(), VtopError> {
+        async fn mark_verified(
+            &self,
+            _: &str,
+            _: crate::VerificationClass,
+        ) -> Result<(), VtopError> {
             never!()
         }
         async fn mark_source_committed(&self, _: &str) -> Result<(), VtopError> {
@@ -371,7 +379,12 @@ mod tests {
         );
         expired(store.get_batch("b").await, "get_batch");
         expired(store.mark_failed("b", "x").await, "mark_failed");
-        expired(store.mark_verified("b").await, "mark_verified");
+        expired(
+            store
+                .mark_verified("b", crate::VerificationClass::Strong)
+                .await,
+            "mark_verified",
+        );
         expired(
             store.mark_source_committed("b").await,
             "mark_source_committed",

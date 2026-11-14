@@ -754,8 +754,10 @@ test that failed first.
 **Upgrading from v0.7.0.** Downgrade is not supported.
 
 - **Upgrade every engine and data node first, then raise the feature level**
-  with `vtopctl node-versions` and `vtopctl enable-features`. Level 7 is
-  finalized only when every node reports it (#634).
+  with `vtopctl node-versions` and `vtopctl enable-features`. Level 7
+  turns node version reports on and is judged by the metadata tier alone;
+  every level above it is finalized only when every node reports it can run
+  it (#634).
 - **One-way changes:**
   - Once a SUPERSEDED row is written, the state store carries schema marker
     3 and v0.7.0 refuses it (#567).
@@ -776,7 +778,59 @@ test that failed first.
   - #668: resuming a failed multipart upload.
   - #671 release B.
 
-## v0.9.0 and beyond
+## v0.9.0 — bug fixes: deletes that wait for proof, Kafka partitions that are never left unread, portable builds
+
+A bug-fix release: only issues labelled `bug`, and the PRs that fix them. Features wait for v0.10.0.
+
+- **File source: `delete_after_commit` deletes only on proof (#619, #689).**
+  - On Linux the engine takes a write lease before moving a file aside, so a file that any process still holds open is kept. The lease is trusted only on local filesystems.
+  - Identity goes through `continuity::proves`.
+  - A change of mtime or ctime keeps the file.
+  - Symlinks are never deleted, and a failed rename keeps the file.
+  - A file a crash left under its hidden name is archived, then deleted.
+  - Every decision is logged and counted in `vtop_file_delete_decisions_total{outcome}`.
+- **Kafka source: every partition-metadata condition handled (#675, #687).**
+  - A topic listed with no partitions is asked again next pass, not cached.
+  - A failed lookup serves the last known list.
+  - A topic that grows is noticed every cycle.
+  - A deleted topic no longer stalls the others.
+  - A recreated or truncated topic is reported.
+  - All of these are counted in `vtop_kafka_partition_events_total{event}`.
+- **Recovery counts by the stored verification class (#664, #691).** A VERIFIED row records whether it was verified strongly or by size only. Recovery and the settle pass count from that record, in `vtop_recovery_rechecks_total`. Engines and `vtopctl migrate` refuse a state-store schema newer than they support.
+- **Replays reuse the object already archived (#626, partly, #688).** Object keys are content-addressed within a source unit's range. A replay of the same bytes reuses the stored object, and the engine never overwrites one that does not verify. Decisions are counted in `vtop_object_key_decisions_total{decision}`.
+- **Portable builds and binaries (#677, #679).**
+  - OpenSSL is compiled in.
+  - Cyrus SASL is only needed for the opt-in `kafka-gssapi` feature.
+  - macOS binaries target macOS 11 and load only system libraries; the release checks this.
+- **Docs.**
+  - A documentation site at https://allamiro.github.io/vtop-engine/ (#692).
+  - A README with charts drawn from committed measurements (#690).
+  - Native prerequisites for Debian/Ubuntu, RHEL/AlmaLinux/Rocky 8–10, Fedora and macOS (#678).
+  - CITATION.cff (#686).
+  - Issue forms and a PR template (#682).
+
+**Upgrading from v0.8.0.** Downgrade is not supported.
+
+- **`delete_after_commit` keeps files it can't prove are closed.** That covers macOS, NFS or FUSE, another user's file, and any container without `CAP_LEASE`. **The shipped Helm chart runs as uid 10001 with all capabilities dropped, so with `delete_after_commit` it now keeps files**: watch disk use, and the `vtop_file_delete_decisions_total{outcome}` counter. `delete_without_open_check: true` restores deletion where no lease is possible. It brings back the two windows a writer can lose lines in, and the engine warns about it at startup and in `vtopctl validate`.
+- **PostgreSQL: run `vtopctl migrate` before starting v0.9.0 engines.** It adds the nullable `verification_class` column. The schema marker stays 3, so v0.8.0 engines keep working against the migrated database. **Restart any v0.8.0 engine that was running during the migration**: until its connections are replaced, its whole-row reads (startup recovery and the settle pass) fail. SQLite migrates on connect and now records `PRAGMA user_version = 1`.
+- **Kafka with `auto.offset.reset: latest`:** a partition or topic that appears while the engine runs is now read from the group's commit, or else its beginning. Before, it could start at the end and skip what was written before the engine noticed it.
+- **Kerberos (SASL GSSAPI) for the Kafka source is no longer in the default build.** The release binaries and image don't carry it. If you use `sasl_mechanism: GSSAPI`, build with `--features kafka-gssapi` (it needs Cyrus SASL). PLAIN, SCRAM and OAUTHBEARER are unchanged.
+- **Release binaries need no extra libraries.** v0.8.0's macOS binaries needed Homebrew `openssl@3` and `cyrus-sasl`; these don't.
+- **New key older engines silently ignore:** `sources.file.delete_without_open_check`. An older engine ignores it and deletes as v0.8.0 did, so upgrade every engine before relying on the new delete rules.
+- **Object keys:** new objects get content-addressed keys, and objects archived under the older random keys still recover, scrub and audit as before. The command backends (`awscli`, `s3cmd`, `minio`) and `checksum.algorithm: none` keep per-attempt keys.
+
+**Known open, moved to v0.10.0:**
+- #626: a replay over a source that grew still writes a second object.
+- #619: narrow residuals, listed on the issue.
+- #671 release B: the manifest 0.4 writer and receipts.
+- #683: OpenTelemetry export.
+- #636: the unproven-range override.
+- #684: the Object Lock profile.
+- #685: MAC key rotation.
+- #694: the audit trail.
+- #668: multipart resume.
+
+## v0.10.0 and beyond
 
 The theme is **the gateway at the speed its durability allows**: wire the
 broker's group commit into the gateway path and close the compatibility

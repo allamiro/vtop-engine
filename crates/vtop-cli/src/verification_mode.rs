@@ -10,7 +10,7 @@
 
 use vtop_core::config::{effective_algorithm, StreamsConfig, VtopConfig};
 use vtop_core::telemetry;
-use vtop_state::BatchRecord;
+use vtop_state::{BatchRecord, VerificationClass};
 use vtop_upload::verification_method;
 
 /// Called once when an engine starts for mutating work (`run`,
@@ -73,14 +73,79 @@ pub(crate) enum Recheck {
 }
 
 impl Recheck {
-    /// The span attribute value (#683).
+    /// The re-check's result, as the logs name it.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Recheck::Failed => "failed",
-            Recheck::UnsupportedVersion => "unsupported_version",
-            Recheck::Strong => "strong",
-            Recheck::SizeOnly => "size_only",
+            Self::Failed => "failed",
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::Strong => "strong",
+            Self::SizeOnly => "size_only",
         }
+    }
+}
+
+/// The class a row was verified with, as the logs name it: `unknown` for a
+/// row with none (#664).
+pub(crate) fn class_name(rec: &BatchRecord) -> &'static str {
+    rec.verification_class
+        .map_or("unknown", VerificationClass::as_str)
+}
+
+/// Count one recovery re-check of a VERIFIED row in
+/// `vtop_recovery_rechecks_total`, by the class the row was verified with and
+/// the re-check's result (#664). Bounded labels: three classes, four results.
+pub(crate) fn count_recheck(rec: &BatchRecord, recheck: Recheck) {
+    if let Some(mx) = telemetry::metrics() {
+        mx.recovery_rechecks_total
+            .with_label_values(&[
+                rec.tenant.as_str(),
+                rec.source_type.as_str(),
+                rec.format.extension(),
+                class_name(rec),
+                recheck.as_str(),
+            ])
+            .inc();
+    }
+}
+
+/// Recovery re-checked a VERIFIED row and may commit it (#664): say how its
+/// commit will be counted when the recorded class cannot speak for itself -
+/// it has none, or the re-check found something else - and what, if
+/// anything, to do. A row whose class and re-check agree is not logged here;
+/// its commit is logged as before.
+pub(crate) fn note_stored_class(rec: &BatchRecord, recheck: Recheck) {
+    let found = recheck.as_str();
+    match rec.verification_class {
+        None => tracing::info!(
+            batch_id = %rec.batch_id,
+            verification_class = "unknown",
+            recheck = found,
+            "verification class unknown for batch {}: it was verified by a release before the \
+             ledger recorded classes (or one newer than this). Recovery re-checked the stored \
+             object ({found}) and counts its commit by that when it commits, as before. Nothing \
+             to do",
+            rec.batch_id
+        ),
+        Some(VerificationClass::Strong) if recheck == Recheck::SizeOnly => tracing::warn!(
+            batch_id = %rec.batch_id,
+            verification_class = "strong",
+            recheck = found,
+            "batch {} was verified strong, but recovery's re-check could confirm only its size \
+             (upload.require_strong_verification: false lets it commit). Its commit is counted \
+             as strong, the class that admitted it. The store can no longer show its content \
+             matches: restore checksum support (checksums enabled, a backend that can hash the \
+             stored bytes), then run `vtopctl scrub` to re-check committed batches",
+            rec.batch_id
+        ),
+        Some(VerificationClass::SizeOnly) if recheck == Recheck::Strong => tracing::info!(
+            batch_id = %rec.batch_id,
+            verification_class = "size_only",
+            recheck = found,
+            "batch {} was verified size-only, and recovery's re-check now matched its content. \
+             Its commit is counted as size-only, the class that admitted it. Nothing to do",
+            rec.batch_id
+        ),
+        Some(_) => {}
     }
 }
 
@@ -109,15 +174,38 @@ pub(crate) fn recheck_size_only(config: &VtopConfig, rec: &BatchRecord, why: &st
     Recheck::SizeOnly
 }
 
-/// Recovery committed a row whose re-check was size-only: count it in
+/// Whether a commit recovery makes of `rec` counts as a size-only one: by
+/// the class the row was verified with, as the ledger recorded it with the
+/// VERIFIED transition (#664).
+///
+/// The re-check decides only whether the row may commit. Its class can
+/// differ from the verification that admitted the row: a strong row whose
+/// re-check confirms size alone, which the opt-out lets commit, or a
+/// size-only one whose re-check finds a digest. Counting by the re-check
+/// called the first a size-only commit and the second a strong one. A row
+/// with no class (verified by a release before #664, or a class this build
+/// does not know) is counted by the re-check, as before.
+pub(crate) fn counts_as_size_only(rec: &BatchRecord, recheck: Recheck) -> bool {
+    match rec.verification_class {
+        Some(VerificationClass::SizeOnly) => true,
+        Some(VerificationClass::Strong) => false,
+        None => recheck == Recheck::SizeOnly,
+    }
+}
+
+/// Recovery committed a row that was verified size-only (see
+/// [`counts_as_size_only`]): count it in
 /// `vtop_verification_backend_limited_total` with the running engine's labels,
-/// beside the `verified_total` recovery counts for the same commit.
+/// beside the `verified_total` recovery counts for the same commit. `rec`
+/// must be the row as the ledger holds it, class included.
 pub(crate) fn count_size_only_commit(recheck: Recheck, rec: &BatchRecord) {
-    if recheck != Recheck::SizeOnly {
+    if !counts_as_size_only(rec, recheck) {
         return;
     }
     tracing::warn!(
         batch_id = %rec.batch_id,
+        verification_class = class_name(rec),
+        recheck = recheck.as_str(),
         "recovered: source_committed on a size-only verification"
     );
     if let Some(mx) = telemetry::metrics() {

@@ -58,6 +58,11 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # Decoding what the fake collector receives (tests/otel_messages.rs).
 opentelemetry-proto = { workspace = true }
 prost = { workspace = true }
+# s3_native_object_keys (#626) counts stored object versions on a live store.
+aws-sdk-s3 = { workspace = true }
+# `PgStateStore::execute_raw` resets the Postgres ledger between the recovery
+# tests that run on one when VTOP_TEST_POSTGRES is set (#664).
+vtop-state = { workspace = true, features = ["test-support"] }
 
 # Integration tests live in the repo-root tests/ directory and are compiled as
 # integration tests of this package.

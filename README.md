@@ -254,10 +254,13 @@ Kafka is an optional edge adapter; see
 
 The limits that matter most when evaluating it:
 
-- **A replay writes a new object key.** `batch_id` ends in a random suffix, so
-  a replayed batch leaves a duplicate object (no data is lost). The protocol's
-  deterministic naming rule ([§15.1](docs/VTOP_PROTOCOL_DRAFT.md#151-object-key))
-  is not met yet.
+- **A replay reuses the stored object only when it produces the same bytes.**
+  Objects are named by source, range and content digest (#626), so a replay of
+  the same bytes reuses what is stored and never overwrites anything. A replay
+  over a source that grew, in a later hour under seal-time partitioning, with
+  no checksum, or on a command backend still writes a second object (no data
+  is lost), so the protocol's deterministic naming rule
+  ([§15.1](docs/VTOP_PROTOCOL_DRAFT.md#151-object-key)) is narrowed, not met.
 - **Size-only verification is an opt-out, and it accepts same-size
   corruption.** Strong verification is the default; the opt-out is reported at
   startup, by `vtopctl validate`, and in the metrics.

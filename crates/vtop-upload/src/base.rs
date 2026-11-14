@@ -740,6 +740,20 @@ pub trait UploadBackend: Send + Sync {
     /// HEAD/stat an object.
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError>;
 
+    /// Whether [`head_object`](Self::head_object) answers an absent object
+    /// with [`VtopError::NotFound`], and answers it with that ONLY when the
+    /// store said the key holds nothing (#626).
+    ///
+    /// The engine writes a batch under its derived object key only when the
+    /// key is free or already holds this batch's verified bytes; anything it
+    /// cannot tell apart from "free" could be an object it would overwrite. A
+    /// backend that relays a tool's words (the command backends) or cannot
+    /// separate a missing key from a refused request answers `false`, and the
+    /// engine names that backend's objects per attempt, as before.
+    fn reports_absent_objects(&self) -> bool {
+        false
+    }
+
     /// Download an object's full content.
     ///
     /// Used by explicit deep-verification tooling. Recovery and archiving use
