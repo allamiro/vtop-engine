@@ -86,6 +86,7 @@ fn kafka_client_never_auto_commits() {
 // them explicitly with `-- --ignored` against a seeded broker.
 // ---------------------------------------------------------------------------
 
+use std::collections::HashMap;
 use vtop_adapters::base::{DiscoveredSource, SourceAdapter};
 use vtop_adapters::KafkaSource;
 use vtop_core::types::{ProgressMarker, TelemetryFormat};
@@ -553,25 +554,27 @@ impl Drop for TopicCleanup {
     }
 }
 
-/// A NEW single-partition topic holding `records` records at offsets
-/// `0..records`, so every offset a test names is exact. The topic is deleted
-/// when the returned guard is dropped.
-async fn fresh_topic(tag: &str, records: usize) -> (String, TopicCleanup) {
-    use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
-    use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
-
+/// A unique topic name for `tag`; the topic itself is not created.
+fn fresh_topic_name(tag: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let topic = format!("it_{tag}_{nanos}");
+    format!("it_{tag}_{nanos}")
+}
+
+/// Create the single-partition topic `topic`; it is deleted when the
+/// returned guard is dropped.
+async fn create_topic(topic: &str) -> TopicCleanup {
+    use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+
     let admin: AdminClient<_> = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-admin"))
         .unwrap()
         .create()
         .expect("admin client");
     admin
         .create_topics(
-            &[NewTopic::new(&topic, 1, TopicReplication::Fixed(1))],
+            &[NewTopic::new(topic, 1, TopicReplication::Fixed(1))],
             &AdminOptions::new(),
         )
         .await
@@ -579,7 +582,17 @@ async fn fresh_topic(tag: &str, records: usize) -> (String, TopicCleanup) {
         .pop()
         .expect("one topic result")
         .expect("topic creation failed");
-    let cleanup = TopicCleanup(topic.clone());
+    TopicCleanup(topic.to_string())
+}
+
+/// A NEW single-partition topic holding `records` records at offsets
+/// `0..records`, so every offset a test names is exact. The topic is deleted
+/// when the returned guard is dropped.
+async fn fresh_topic(tag: &str, records: usize) -> (String, TopicCleanup) {
+    use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+
+    let topic = fresh_topic_name(tag);
+    let cleanup = create_topic(&topic).await;
     let producer: BaseProducer = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-producer"))
         .unwrap()
         .create()
@@ -1124,11 +1137,27 @@ fn kafka_source(name: &str) -> DiscoveredSource {
     }
 }
 
+/// Route the adapter's warnings into the test's captured output (#675). The
+/// stall check, its re-assign fallback and the rebuild report only through
+/// `tracing`, and without a subscriber a live failure showed none of them, so
+/// which path it took could not be read from the CI log.
+fn capture_adapter_warnings() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new("vtop_adapters=info"))
+            .try_init();
+    });
+}
+
 /// One pass at the engine's default 250ms window; records read per source.
 /// A failed pass reads nothing, as in the engine, which retries next cycle: a
 /// broker whose group coordinator is still being created fails the first
 /// pass that asks it for a committed offset.
 async fn read_pass(adapter: &mut KafkaSource, sources: &[DiscoveredSource]) -> Vec<usize> {
+    capture_adapter_warnings();
     let report = match adapter
         .read_all_batch_candidates(
             sources,
@@ -1538,9 +1567,364 @@ async fn recovering_one_partition_does_not_move_another_that_started_at_the_end(
         adapter.stall_recoveries()
     );
     assert_eq!(
-        quiet_read, 3,
+        quiet_read,
+        3,
         "recovering another partition skipped records written to one that started at \
-         the end of the log"
+         the end of the log, or it was never read (within 30s of the recovery; stall \
+         recoveries: {})",
+        adapter.stall_recoveries()
+    );
+}
+
+/// #675: the first metadata answer for a topic can list no partitions - the
+/// broker has not applied a topic created moments before. The adapter cached
+/// that answer for five minutes, so the topic was in no assignment and none of
+/// its records were read; the stall check, which watches assigned partitions,
+/// never saw it. That gives the signature of the CI failure of the
+/// stall-isolation test above: its quiet topic, created last, read 0 of 3 for
+/// the whole 30s while the victim recovered. Here the first pass asks before
+/// the topic exists, which gets that answer every time.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_topic_the_broker_did_not_list_at_the_first_pass_is_read_once_it_does() {
+    let late = fresh_topic_name("late");
+    let group = unique_group("late-topic");
+    // `latest`: the adapter was reading the topic before it existed, so every
+    // record in it is newer than the start `latest` promises, and none may be
+    // skipped (#675 follow-up).
+    let mut cfg = kafka_cfg(&bootstrap(), &group);
+    cfg.auto_offset_reset = "latest".into();
+    let mut adapter = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
+    let sources = vec![kafka_source(&late)];
+
+    // The pass asks the broker for the topic's partitions, gets none, and
+    // reads nothing: with nothing to assign it returns before any poll, so
+    // the group coordinator cannot fail it.
+    let first = adapter
+        .read_all_batch_candidates(
+            &sources,
+            1000,
+            1 << 20,
+            std::time::Duration::from_millis(250),
+        )
+        .await
+        .expect("precondition: a pass over a topic the broker does not list succeeds");
+    assert!(
+        first.outcomes[0].result.as_ref().is_ok_and(Vec::is_empty),
+        "precondition: nothing is read from a topic that does not exist yet"
+    );
+    let _late_cleanup = create_topic(&late).await;
+    produce(&late, 3);
+
+    let started = std::time::Instant::now();
+    let mut late_read = 0;
+    while late_read < 3 && started.elapsed() < std::time::Duration::from_secs(30) {
+        late_read += read_pass(&mut adapter, &sources).await[0];
+    }
+    assert_eq!(
+        late_read,
+        3,
+        "a topic the broker did not list at the first pass was not read within {:?}",
+        started.elapsed()
+    );
+}
+
+/// Records read per (source index, partition) in one 250ms pass; a failed
+/// pass reads nothing, as in `read_pass`.
+async fn read_pass_by_partition(
+    adapter: &mut KafkaSource,
+    sources: &[DiscoveredSource],
+) -> HashMap<(usize, i32), usize> {
+    capture_adapter_warnings();
+    let mut counts = HashMap::new();
+    let Ok(report) = adapter
+        .read_all_batch_candidates(
+            sources,
+            1000,
+            1 << 20,
+            std::time::Duration::from_millis(250),
+        )
+        .await
+    else {
+        return counts;
+    };
+    for outcome in &report.outcomes {
+        for read in outcome.result.as_ref().expect("per-source result ok") {
+            if let ProgressMarker::Kafka { partition, .. } = &read.progress_end {
+                *counts
+                    .entry((outcome.source_index, *partition))
+                    .or_default() += read.records.len();
+            }
+        }
+    }
+    counts
+}
+
+/// Raise `topic` to `partitions` partitions.
+async fn add_partitions(topic: &str, partitions: usize) {
+    use rdkafka::admin::{AdminClient, AdminOptions, NewPartitions};
+
+    let admin: AdminClient<_> = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-admin"))
+        .unwrap()
+        .create()
+        .expect("admin client");
+    admin
+        .create_partitions(
+            &[NewPartitions::new(topic, partitions)],
+            &AdminOptions::new(),
+        )
+        .await
+        .expect("create_partitions call failed")
+        .pop()
+        .expect("one topic result")
+        .expect("adding partitions failed");
+}
+
+/// Wait until the broker lists `partitions` partitions for `topic`, so a
+/// producer or consumer that asks next sees them: like a new topic, new
+/// partitions reach the broker's metadata a moment after the admin call
+/// returns (review of #675).
+fn wait_for_partitions(topic: &str, partitions: usize) {
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    let probe: BaseConsumer = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-probe"))
+        .unwrap()
+        .create()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let listed = probe
+            .fetch_metadata(Some(topic), std::time::Duration::from_secs(5))
+            .ok()
+            .and_then(|md| {
+                md.topics()
+                    .iter()
+                    .find(|t| t.name() == topic)
+                    .map(|t| t.partitions().len())
+            })
+            .unwrap_or_default();
+        if listed >= partitions {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "precondition: the broker lists {partitions} partitions for {topic} (it lists {listed})"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Wait until the broker no longer lists `topic`.
+fn wait_for_partitions_gone(topic: &str) {
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    let probe: BaseConsumer = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-probe"))
+        .unwrap()
+        .create()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let listed = probe
+            .fetch_metadata(Some(topic), std::time::Duration::from_secs(5))
+            .ok()
+            .and_then(|md| {
+                md.topics()
+                    .iter()
+                    .find(|t| t.name() == topic)
+                    .map(|t| t.partitions().len())
+            })
+            .unwrap_or_default();
+        if listed == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "precondition: the broker stops listing {topic} once it is deleted"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Write `n` records to one partition of `topic`.
+fn produce_to(topic: &str, partition: i32, n: usize) {
+    use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+    let producer: BaseProducer = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-producer"))
+        .unwrap()
+        .create()
+        .expect("producer");
+    for i in 0..n {
+        let payload = format!("CEF:0|VTOP|IT|1.0|{i}|Grow|3|src=10.0.0.{}", i % 250);
+        producer
+            .send(
+                BaseRecord::<(), str>::to(topic)
+                    .partition(partition)
+                    .payload(&payload),
+            )
+            .expect("enqueue produce");
+    }
+    producer
+        .flush(std::time::Duration::from_secs(10))
+        .expect("flush produce");
+}
+
+/// #675 follow-up: a partition added to a topic the adapter is already
+/// reading. The partition list was cached for five minutes, so the new
+/// partition was in no assignment and the stall check never saw it; and when
+/// it was finally assigned at `Offset::Stored` under `latest`, it started at
+/// its end and skipped every record written to it in between. It must be
+/// found within the re-check interval and read from its beginning.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn a_partition_added_while_the_topic_is_read_is_read_from_its_start() {
+    let (topic, _cleanup) = fresh_topic("grow", 0).await;
+    let group = unique_group("grow");
+    let mut cfg = kafka_cfg(&bootstrap(), &group);
+    cfg.auto_offset_reset = "latest".into();
+    let mut adapter = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
+    let sources = vec![kafka_source(&topic)];
+
+    let mut first_read = 0;
+    let warmup = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while first_read == 0 {
+        assert!(
+            std::time::Instant::now() < warmup,
+            "precondition: partition 0 is read"
+        );
+        produce_to(&topic, 0, 2);
+        first_read += read_pass_by_partition(&mut adapter, &sources)
+            .await
+            .get(&(0, 0))
+            .copied()
+            .unwrap_or_default();
+    }
+    add_partitions(&topic, 2).await;
+    wait_for_partitions(&topic, 2);
+    produce_to(&topic, 1, 3);
+
+    let started = std::time::Instant::now();
+    let mut added_read = 0;
+    while added_read < 3 && started.elapsed() < std::time::Duration::from_secs(60) {
+        added_read += read_pass_by_partition(&mut adapter, &sources)
+            .await
+            .get(&(0, 1))
+            .copied()
+            .unwrap_or_default();
+    }
+    assert_eq!(
+        added_read,
+        3,
+        "a partition added while the topic was read was not read from its start within {:?}",
+        started.elapsed()
+    );
+}
+
+/// #675 follow-up: a whole re-assign (here a new topic joins the read set)
+/// assigned every partition still waiting at `Offset::Stored` again. Under
+/// `latest`, a partition that had not delivered yet resolved at the NEW end
+/// and skipped what was written to it since its first assign, and nothing
+/// recovered it: its new start was the new end. It must be pinned where it
+/// started first.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn renewing_the_assignment_does_not_move_a_partition_that_started_at_the_end() {
+    let (busy, _busy_cleanup) = fresh_topic("renew_busy", 0).await;
+    let (quiet, _quiet_cleanup) = fresh_topic("renew_quiet", 0).await;
+    let group = unique_group("renew");
+    let mut cfg = kafka_cfg(&bootstrap(), &group);
+    cfg.auto_offset_reset = "latest".into();
+    let mut adapter = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
+    let sources = vec![kafka_source(&busy), kafka_source(&quiet)];
+
+    let mut busy_read = 0;
+    let warmup = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while busy_read == 0 {
+        assert!(
+            std::time::Instant::now() < warmup,
+            "precondition: the busy topic is read"
+        );
+        produce(&busy, 2);
+        busy_read += read_pass(&mut adapter, &sources).await[0];
+    }
+    // Quiet has delivered nothing; its fetcher stops before the records
+    // arrive, so they are still waiting when the assignment is renewed.
+    adapter
+        .stop_fetcher_behind_the_adapter(&quiet, 0)
+        .expect("stop quiet's fetcher");
+    produce(&quiet, 3);
+
+    let (extra, _extra_cleanup) = fresh_topic("renew_extra", 0).await;
+    // Listed before it joins, so the next pass really renews the assignment
+    // (a topic listed without partitions would leave the set unchanged).
+    wait_for_partitions(&extra, 1);
+    let sources = vec![
+        kafka_source(&busy),
+        kafka_source(&quiet),
+        kafka_source(&extra),
+    ];
+    let started = std::time::Instant::now();
+    let mut quiet_read = 0;
+    while quiet_read < 3 && started.elapsed() < std::time::Duration::from_secs(30) {
+        quiet_read += read_pass(&mut adapter, &sources).await[1];
+    }
+    assert_eq!(
+        quiet_read,
+        3,
+        "renewing the assignment skipped records written to a partition that started at \
+         the end of the log (within {:?}; stall recoveries: {})",
+        started.elapsed(),
+        adapter.stall_recoveries()
+    );
+    assert_eq!(
+        adapter.stall_recoveries(),
+        0,
+        "quiet was recovered by the stall check, not read through the renewal"
+    );
+}
+
+/// Review of #675: a topic deleted while one of its partitions still waited
+/// at the end of the log (`latest`, nothing delivered). The next pass renews
+/// the assignment without it; the renewal pinned every waiting partition of
+/// the LAST assignment first, the deleted one included, and asking the
+/// broker about a deleted topic fails, so every pass failed and no topic was
+/// read again until a restart. Only partitions that stay are pinned.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn deleting_a_topic_with_a_waiting_partition_does_not_stop_the_others() {
+    let (busy, _busy_cleanup) = fresh_topic("deleted_busy", 0).await;
+    let (gone, gone_cleanup) = fresh_topic("deleted_gone", 0).await;
+    let group = unique_group("deleted");
+    let mut cfg = kafka_cfg(&bootstrap(), &group);
+    cfg.auto_offset_reset = "latest".into();
+    let mut adapter = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
+    let sources = vec![kafka_source(&busy), kafka_source(&gone)];
+
+    let mut busy_read = 0;
+    let warmup = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while busy_read == 0 {
+        assert!(
+            std::time::Instant::now() < warmup,
+            "precondition: the busy topic is read"
+        );
+        produce(&busy, 2);
+        busy_read += read_pass(&mut adapter, &sources).await[0];
+    }
+    // Drain what the warm-up wrote, so the count below is exactly what is
+    // written after the deletion.
+    while read_pass(&mut adapter, &sources).await[0] > 0 {}
+    // Gone from the broker's metadata, as discovery would then see it.
+    drop(gone_cleanup);
+    wait_for_partitions_gone(&gone);
+    let sources = vec![kafka_source(&busy)];
+    produce(&busy, 3);
+
+    let started = std::time::Instant::now();
+    let mut after = 0;
+    while after < 3 && started.elapsed() < std::time::Duration::from_secs(20) {
+        after += read_pass(&mut adapter, &sources).await[0];
+    }
+    assert_eq!(
+        after,
+        3,
+        "after {gone} was deleted, {busy} was not read again within {:?}",
+        started.elapsed()
     );
 }
 
