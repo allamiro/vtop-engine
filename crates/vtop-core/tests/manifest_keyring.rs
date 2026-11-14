@@ -461,9 +461,36 @@ fn the_single_key_shorthand_behaves_as_before() {
         text,
         "manifest error: manifest MAC is required because manifest_mac_key_env is configured"
     );
-    // A named manifest is not this key's to verify.
+    // A manifest that names a key id, signed with this one key, verifies,
+    // as on v0.8.0 (review of #703): the shorthand holds one key and ignores
+    // the id, so an engine still on `manifest_mac_key_env` mid-rollout keeps
+    // verifying what keyring engines sign with the same key. One key is not
+    // a search.
+    let same_key = keyring("q3", &[("q3", Q3_HEX, true)], &[]);
+    let named_by_its_key = signed("named-q3", &same_key);
+    assert_eq!(
+        check(&named_by_its_key, &single),
+        (KEY_LABEL_NONE.into(), KeyResult::Ok, String::new())
+    );
+    assert!(parse(&named_by_its_key)
+        .verify_authentication(Some(&key(Q3_HEX)))
+        .is_ok());
+    // Signed with another key: unauthenticated, naming the id and saying
+    // the one key does not verify it.
     let named = signed("named", &rotated());
-    assert_eq!(check(&named, &single).1, KeyResult::UnknownKey);
+    let (label, result, text) = check(&named, &single);
+    assert_eq!(
+        (label.as_str(), result),
+        (KEY_LABEL_OTHER, KeyResult::UnknownKey)
+    );
+    for needle in [
+        "unauthenticated",
+        r#"key id "q4""#,
+        "manifest_mac_key_env",
+        "manifest.mac",
+    ] {
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
     // No key: no MAC check, as before.
     let none = parse(&named).authenticate(&ManifestKeyring::default());
     assert!(none.key.is_none() && none.result.is_ok());
@@ -582,7 +609,10 @@ fn the_committed_keyring_fixtures_verify_under_their_key_ids() {
         let parsed = parse(bytes);
         assert_eq!(parsed.fields().version, "0.4");
         assert_eq!(parsed.fields().manifest.mac_key_id.as_deref(), Some(id));
-        assert_eq!(check(bytes, &rotated()).0, id);
+        assert_eq!(
+            check(bytes, &rotated()),
+            (id.to_string(), KeyResult::Ok, String::new())
+        );
     }
     let only_q4 = keyring("q4", &[("q4", Q4_HEX, false)], &[]);
     assert_eq!(check(KEYRING_Q3, &only_q4).1, KeyResult::UnknownKey);

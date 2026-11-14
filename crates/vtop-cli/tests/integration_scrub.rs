@@ -1607,3 +1607,73 @@ async fn a_key_rotation_verify_only_then_switch_then_scrub_keeps_every_manifest_
         assert_eq!(seen, want, "the check says which key, by bounded label");
     }
 }
+
+/// Review of #703: an engine still on `manifest_mac_key_env` during a
+/// rotation's rollout reads what keyring engines write with the same key.
+/// The shorthand holds one key and ignores the id, as v0.8.0 does, so the
+/// runbook's step 1 holds: an engine not yet moved to the keyring keeps
+/// verifying. A different single key still fails, and `verify-manifest`
+/// keeps its single-key wording.
+#[tokio::test]
+async fn the_single_key_setting_verifies_a_keyring_manifest_signed_with_its_key() {
+    use vtop_core::manifest::ManifestWriteVersion;
+    let dir = tempfile::tempdir().unwrap();
+    let inputs = vec![write_input(dir.path(), "shorthand.log", 2)];
+    let mock = Arc::new(MockBackend::new());
+    let mut cfg = config(dir.path(), &inputs, "mock");
+    cfg.manifest.write_version = ManifestWriteVersion::V0_4;
+    cfg.manifest.mac = Some(keyring_config(
+        dir.path(),
+        "q3",
+        &[("q3", true), ("q4", false)],
+        &[],
+    ));
+    let mut engine = engine_over(&mock, cfg).await;
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert!(out.len() == 1 && out[0].committed, "{out:?}");
+    assert_eq!(key_ids(&engine, &mock).await, [Some("q3".to_string())]);
+    drop(engine);
+
+    for (hex, passes) in [(Q3_HEX, true), (Q4_HEX, false)] {
+        let env = format!("VTOP_TEST_SHORTHAND_READS_{}_{passes}", std::process::id());
+        std::env::set_var(&env, hex);
+        let mut cfg = config(dir.path(), &inputs, "mock");
+        cfg.manifest_mac_key_env = Some(env.clone());
+        let engine = engine_over(&mock, cfg).await;
+        let keyring = engine.config.resolve_manifest_keyring().unwrap();
+        std::env::remove_var(&env);
+        let rows = scrub::committed_rows(engine.store.list_batches().await.unwrap(), vec![]);
+        let muri = rows[0].record.manifest_uri.clone().unwrap();
+        let report = engine.scrub(rows, &opts()).await.unwrap();
+        assert_eq!(report.passed, passes, "{report:#?}");
+        let verify = vtop_cli::commands::verify_manifest_deep(
+            engine.store.as_ref(),
+            engine.backend.as_ref(),
+            &muri,
+            &keyring,
+        )
+        .await
+        .unwrap();
+        let line = verify
+            .lines
+            .iter()
+            .find(|l| l.starts_with("authentication"))
+            .unwrap()
+            .clone();
+        if passes {
+            assert_eq!(report.manifest_keys, [("none".to_string(), 1)].into());
+            assert!(line.ends_with(": OK (keyed BLAKE3)"), "{line}");
+        } else {
+            assert_eq!(count(&report, ScrubResult::Unauthenticated), 1);
+            assert!(
+                report.findings[0].detail.contains("key id \"q3\""),
+                "{}",
+                report.findings[0].detail
+            );
+            assert!(
+                line.ends_with(": FAILED (MAC missing or invalid)"),
+                "{line}"
+            );
+        }
+    }
+}

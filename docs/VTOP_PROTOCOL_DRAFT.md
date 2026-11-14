@@ -371,12 +371,17 @@ to `manifest.mac` because they are read together.
   manifest with no id is verified with the one key the reader marks
   `legacy`.
 - **Outcomes.** A named id the reader holds: verified with it, and a
-  mismatch is "MAC verification failed for key id X". A named id the reader
-  has tombstoned: unauthenticated, "key id X is retired". A named id the
-  reader does not hold: unauthenticated, "signed with key id X, which is not
-  in this keyring". No id and no legacy key: unauthenticated, saying so. No
+  mismatch is `MAC verification failed for key id "X"`. A named id the
+  reader has tombstoned: unauthenticated, `it names key id "X", which is
+  retired`. A named id the reader does not hold: unauthenticated, `it names
+  key id "X", which is not in this keyring`. No id and no legacy key:
+  unauthenticated, `it names no key id and no key ... is marked legacy`. No
   MAC where a key is configured: refused, as before. None of these is
   reported as a corrupt manifest: the bytes may be intact.
+- **A reader with one key and no ids** (the `manifest_mac_key_env` setting)
+  ignores the id and verifies with that key, as a v0.8.0 reader does. One
+  key is not a search, and this keeps such a reader verifying, mid-rotation,
+  what its key signed.
 - **An id is a label, and storage is untrusted.** A reader quotes an id from
   a manifest escaped and bounded, and never uses it as a metric label.
 - **Readers that predate key ids** (v0.8.0 and earlier) authenticate the id

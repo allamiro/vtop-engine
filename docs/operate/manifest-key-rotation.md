@@ -73,9 +73,14 @@ manifest:
 Remove `manifest_mac_key_env`: setting both is refused. Roll this out to
 every engine, scrub job and auditor. Nothing signs with the new key yet, so
 an engine that has not been rolled out yet still verifies everything the
-others write.
+others write: a process still on `manifest_mac_key_env` holds one key and
+ignores key ids, as v0.8.0 does, so it verifies any manifest that key signed,
+with an id or without.
 
-Check each process before going on:
+Check each process before going on. `validate` reads the config only: it
+does not read the variables or files, so a missing or malformed key passes it
+and stops the engine at startup, naming the key id and the variable or file.
+Check the startup line too.
 
 ```bash
 vtopctl validate --config /etc/vtop/config.yaml --print-effective | grep manifest_mac
@@ -162,8 +167,9 @@ decision: the engine never re-signs a stored manifest.
 |---|---|---|---|
 | `MAC verification failed for key id "X"` | The manifest names a key this process holds, and the MAC does not match. | Unauthenticated: recovery replays, the scrub reports it. | Check that `X` holds the same key on every process. Otherwise the manifest was altered. |
 | `it names key id "X", which is not in this keyring` | Signed with a key this process was not given. The bytes may be intact. | Unauthenticated, not corrupt: recovery replays, the scrub reports it. Recovery logs an ERROR with `key_id="other"`. | Add `X` to `manifest.mac.keys` as a verify-only entry on every process. |
+| `it names key id "X", and the one manifest_mac_key_env key does not verify it` | A process on `manifest_mac_key_env` met a manifest signed by another key. | As above. | Move that process to `manifest.mac` with `X` as a verify-only entry. |
 | `it names key id "X", which is retired` | `X` is in `manifest.mac.retired`. | Unauthenticated: recovery replays (WARN), the scrub reports it. | Expected if `X` was withdrawn. Otherwise move it back to `keys`. |
-| `it names no key id and no key ... is marked legacy: true` | A manifest from before key ids, and no key is `legacy`. | Unauthenticated. | Mark the key that signed before key ids (the old `manifest_mac_key_env` key) `legacy: true`. |
+| `it names no key id and no key ... is marked legacy: true` | A manifest from before key ids, and no key is `legacy`. | Unauthenticated: recovery replays (ERROR with `key_id="none"`), the scrub reports it. | Mark the key that signed before key ids (the old `manifest_mac_key_env` key) `legacy: true`. |
 | `manifest MAC is required ...` | A key is configured and the manifest has no MAC. | Refused, as before key ids. | Unsigned manifests from before MACs were enabled must be verified, or migrated, separately. |
 
 None of these says the manifest is corrupt, and none of them adds a scrub
@@ -173,7 +179,7 @@ result: they are all `unauthenticated`, and the detail names the key.
 
 | Metric | Labels | Meaning |
 |---|---|---|
-| `vtop_manifest_authentications_total` | `key_id`, `result` | Every manifest MAC check by the engine (its read-back of each stored manifest, and recovery's re-check) and by `verify-manifest`. `key_id` is a configured id, `none` (a key with no id, or no id and no legacy key) or `other` (an id this process does not hold). `result` is `ok`, `failed`, `unknown_key` or `retired_key`. |
+| `vtop_manifest_authentications_total` | `key_id`, `result` | Every manifest MAC check by the engine: its read-back of each stored manifest, and recovery's re-check. Exported by `vtopctl run` with `VTOP_METRICS_ADDR` set, like the engine's other series. Each configured key's series, and `other`/`unknown_key`, exist at zero from startup, so `increase()` sees the first unknown key. `key_id` is a configured id, `none` (a key with no id, or no id and no legacy key) or `other` (an id this process does not hold). `result` is `ok`, `failed`, `unknown_key` or `retired_key`. |
 | `vtop_scrub_manifest_keys_total` | `key_id` | In the scrub's `--metrics-file`: manifests the scrub authenticated, by the configured key that verified them. |
 
 `key_id` is never an id read from a manifest: that comes from storage and

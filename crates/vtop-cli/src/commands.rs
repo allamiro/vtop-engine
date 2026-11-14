@@ -973,19 +973,31 @@ pub async fn verify_manifest_deep(
     // keyring's own text: it names key ids, never key material.
     let authentication = parsed.authenticate(keyring);
     authentication.count();
-    let key_id = authentication.key.as_ref().map(|k| k.key_id.clone());
+    // The bounded label of the key that verified it: a configured id, or
+    // `none` for the manifest_mac_key_env key. Never the manifest's own id.
+    let verified_with = authentication
+        .key
+        .as_ref()
+        .filter(|k| k.result == vtop_core::manifest::KeyResult::Ok)
+        .map(|k| k.key_id.clone());
     let authentication_ok = authentication.is_ok();
     failed |= !authentication_ok;
+    // The manifest_mac_key_env key keeps its wording from before key ids.
+    let single_key = keyring.is_configured() && keyring.active_id().is_none();
+    let names_an_id = parsed.fields().manifest.mac_key_id.is_some();
     let authentication_status = match (
         keyring.is_configured(),
         parsed.fields().manifest.mac.as_deref(),
         authentication.result,
     ) {
-        (true, _, Ok(())) => match key_id.as_deref() {
-            Some(vtop_core::manifest::KEY_LABEL_NONE) | None => "OK (keyed BLAKE3)".to_string(),
-            Some(id) => format!("OK (keyed BLAKE3, key id {id})"),
+        (true, _, Ok(())) => match verified_with.as_deref() {
+            Some(label) if !single_key && names_an_id => {
+                format!("OK (keyed BLAKE3, key id {label})")
+            }
+            Some(label) if !single_key => format!("OK (keyed BLAKE3, legacy key {label})"),
+            _ => "OK (keyed BLAKE3)".to_string(),
         },
-        (true, _, Err(VtopError::Manifest(why))) => format!("FAILED ({why})"),
+        (true, _, Err(VtopError::Manifest(why))) if !single_key => format!("FAILED ({why})"),
         (true, _, Err(_)) => "FAILED (MAC missing or invalid)".to_string(),
         (false, Some(_), _) => "PRESENT (not checked: no key configured)".to_string(),
         (false, None, _) => "NOT CONFIGURED (self-hash only)".to_string(),
@@ -1086,7 +1098,7 @@ pub async fn verify_manifest_deep(
         "self_hash_ok": self_hash_ok,
         "manifest_authentication": authentication_status,
         "manifest_authentication_required": keyring.is_configured(),
-        "manifest_key_id": key_id,
+        "manifest_verified_with_key": verified_with,
         "object_size_ok": size_ok,
         "object_content": checksum_status,
         "ledger": ledger_status,

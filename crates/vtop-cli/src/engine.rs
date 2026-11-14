@@ -2889,30 +2889,27 @@ impl Engine {
                 verification_mode::recheck_size_only(&self.config, rec, &check.detail)
             }
             result => {
-                use vtop_core::manifest::KeyResult;
-                match check.key.as_ref().map(|k| (k.key_id.as_str(), k.result)) {
-                    // Signed with a key this engine was not given (#685): the
-                    // bytes may be intact, so this is named apart from damage.
-                    Some((key_id, KeyResult::UnknownKey)) => tracing::error!(
+                // Signed with a key this engine cannot use (#685): the bytes
+                // may be intact, so this is named apart from damage, with
+                // the remedy for its case.
+                match check.key.as_ref().and_then(|k| {
+                    verification_mode::key_recheck_notice(k).map(|n| (k.key_id.as_str(), n))
+                }) {
+                    Some((key_id, (level, message))) if level == tracing::Level::ERROR => {
+                        tracing::error!(
                         batch_id = %rec.batch_id,
                         key_id,
                         detail = %check.detail,
-                        "recovery: a VERIFIED batch's manifest is signed with a key this engine \
-                         does not hold, so it is unauthenticated (not corrupt); the range is \
-                         replayed instead of committed (duplicates, never a gap). Add the key \
-                         to manifest.mac.keys as a verify-only entry on every engine before the \
-                         next restart"
-                    ),
-                    Some((key_id, KeyResult::RetiredKey)) => tracing::warn!(
+                        "{message}"
+                        )
+                    }
+                    Some((key_id, (_, message))) => tracing::warn!(
                         batch_id = %rec.batch_id,
                         key_id,
                         detail = %check.detail,
-                        "recovery: a VERIFIED batch's manifest is signed with a retired key \
-                         (manifest.mac.retired), so it is unauthenticated; the range is \
-                         replayed instead of committed and archived again under the active \
-                         key. Expected only if that key was withdrawn"
+                        "{message}"
                     ),
-                    _ => tracing::warn!(
+                    None => tracing::warn!(
                         batch_id = %rec.batch_id,
                         result = result.as_str(),
                         detail = %check.detail,

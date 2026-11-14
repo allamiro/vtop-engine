@@ -328,6 +328,11 @@ impl ManifestKeyring {
             };
         }
         let named = manifest.manifest.mac_key_id.as_deref();
+        if let (Some(id), [only]) = (named, self.entries.as_slice()) {
+            if only.id.is_none() {
+                return self.check_with_the_one_key(only, id, manifest, bytes);
+            }
+        }
         let entry = match named {
             Some(id) => match self.by_id(id) {
                 Some(entry) => entry,
@@ -410,6 +415,49 @@ impl ManifestKeyring {
             },
             Err(why) => Authentication::failed(label, KeyResult::Failed, why),
         }
+    }
+
+    /// The `manifest_mac_key_env` key meets a manifest that names a key id
+    /// (review of #703). It holds one key and no ids, so it verifies with
+    /// that key and ignores the id, exactly as v0.8.0 does: an engine still
+    /// on the single-key setting mid-rotation keeps verifying what keyring
+    /// engines sign with the same key. One key is not a search. When it
+    /// does not verify, the likely cause is another key, so it is reported
+    /// as an unknown key, naming the id.
+    fn check_with_the_one_key(
+        &self,
+        only: &Entry,
+        id: &str,
+        manifest: &VtopManifest,
+        bytes: &[u8],
+    ) -> Authentication {
+        let verified = manifest
+            .manifest
+            .mac
+            .as_deref()
+            .ok_or(())
+            .and_then(|hex| decode_mac(hex).map_err(drop))
+            .is_ok_and(|actual| constant_time_eq(only.key.authenticate(bytes).as_bytes(), &actual));
+        if verified {
+            return Authentication {
+                key: Some(KeyOutcome {
+                    key_id: KEY_LABEL_NONE.to_owned(),
+                    result: KeyResult::Ok,
+                }),
+                result: Ok(()),
+            };
+        }
+        Authentication::failed(
+            KEY_LABEL_OTHER.to_owned(),
+            KeyResult::UnknownKey,
+            format!(
+                "manifest is unauthenticated: it names key id {}, and the one \
+                 manifest_mac_key_env key does not verify it; if {} is another of your keys, \
+                 configure manifest.mac with it as a verify-only entry",
+                shown_id(id),
+                shown_id(id)
+            ),
+        )
     }
 
     fn held_ids(&self) -> String {

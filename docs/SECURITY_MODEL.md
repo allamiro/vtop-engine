@@ -476,7 +476,9 @@ key-aware:
   **MUST NOT** try every key it holds: that would make retiring a key
   meaningless and hide which key signed what. A manifest with no id (every
   manifest before key ids, and any written with `manifest_mac_key_env`) is
-  verified with the one key marked `legacy: true`.
+  verified with the one key marked `legacy: true`. A process configured with
+  `manifest_mac_key_env` holds one key and no ids: it verifies with that key
+  whatever id a manifest names, as v0.8.0 does. One key is not a search.
 - **Unknown and retired ids are unauthenticated, not corrupt.** A manifest
   naming an id the reader does not hold, or a tombstoned one
   (`manifest.mac.retired`), or naming none where no key is legacy, fails

@@ -847,6 +847,9 @@ async fn recovery_across_a_key_rotation_commits_old_key_batches_and_replays_unkn
         let backend: Arc<dyn vtop_upload::UploadBackend> = mock.clone();
 
         let mut batches = Vec::new();
+        // The engine's read-back of each stored manifest is counted by the
+        // key that verified it (review of #703).
+        let written_ok = (auths("q3", "ok"), auths("q4", "ok"));
         {
             let store = SqliteStateStore::connect(&url).await.unwrap();
             for (input, active) in inputs.iter().zip(["q3", "q4"]) {
@@ -869,6 +872,7 @@ async fn recovery_across_a_key_rotation_commits_old_key_batches_and_replays_unkn
             }
         }
 
+        assert!(auths("q3", "ok") > written_ok.0 && auths("q4", "ok") > written_ok.1);
         cfg.manifest.mac = Some(mac(dir.path(), "q4", recover_keys, retired));
         let mut engine = Engine::new(cfg.clone(), StreamsConfig { streams: vec![] })
             .await
