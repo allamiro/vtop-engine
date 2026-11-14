@@ -663,4 +663,4 @@ Adding any extension **MUST NOT** weaken the commit rule (§13) or the replay ru
 - [SECURITY_MODEL.md](SECURITY_MODEL.md) — security model and normative security rules.
 - [INVENTION_DISCLOSURE_DRAFT.md](INVENTION_DISCLOSURE_DRAFT.md) — candidate-invention disclosure draft.
 - [PRIOR_ART_SEARCH_PLAN.md](PRIOR_ART_SEARCH_PLAN.md) — prior-art search plan.
-- Project [README](../README.md) — setup, CLI, and Docker lab.
+- Project [README](../README.md), the [quick start](getting-started/quickstart.md) (Docker lab) and [the CLI](reference/cli.md).

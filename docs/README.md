@@ -8,8 +8,9 @@ manifest-driven telemetry object transfer engine — plus the distributed VTOP
 > **Status:** prototype / candidate-invention disclosure support package. Not
 > patented or patent-pending.
 
-Start with the [project README](../README.md) for setup, the CLI, and the
-Docker lab.
+Start with the [project README](../README.md) for what the engine guarantees and the
+measurements behind it, then the [quick start](getting-started/quickstart.md),
+[building from source](install/from-source.md) and [the CLI](reference/cli.md).
 
 ## The one rule everything serves
 
@@ -23,7 +24,7 @@ durably written **and verified** in object storage. The normative statement is
 the commit rule, [VTOP_PROTOCOL_DRAFT.md §13](VTOP_PROTOCOL_DRAFT.md#13-commit-rule);
 its enforcement is described in
 [ARCHITECTURE.md](ARCHITECTURE.md#engine-runtime-flow) and the
-[README](../README.md#core-rule).
+[README](../README.md#the-one-rule).
 
 ## Two planes, one repository
 
