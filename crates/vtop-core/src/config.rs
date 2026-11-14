@@ -4,7 +4,7 @@
 //! environment variables or mounted secrets and are never serialized.
 
 use crate::errors::VtopError;
-use crate::manifest::ManifestMacKey;
+use crate::manifest::{ManifestMacKey, ManifestWriteVersion};
 use crate::types::{ChecksumAlgorithm, CompressionType, SourceType, TelemetryFormat};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
@@ -31,10 +31,28 @@ pub struct VtopConfig {
     /// key. The secret itself is never part of this serializable config.
     #[serde(default)]
     pub manifest_mac_key_env: Option<String>,
+    /// How manifests are written (#671 release B). Absent means every
+    /// default. An engine before release B ignores the whole section (this
+    /// struct has no `deny_unknown_fields`) and keeps writing `0.3`, which
+    /// is the safe direction.
+    #[serde(default)]
+    pub manifest: ManifestConfig,
     pub sources: SourcesConfig,
     pub upload: UploadConfig,
     #[serde(default)]
     pub partitioning: PartitioningConfig,
+}
+
+/// The `manifest:` section (#671 release B).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ManifestConfig {
+    /// The manifest version new batches get: `"0.3"` (default) or `"0.4"`,
+    /// which adds `verification_plan`. Anything else is refused at load,
+    /// naming the accepted values. Enable `"0.4"` only once every engine,
+    /// `vtopctl scrub` and auditor reading the archive runs v0.8.0 or later:
+    /// an earlier reader reports a `0.4` manifest as tampered.
+    #[serde(default)]
+    pub write_version: ManifestWriteVersion,
 }
 
 /// Object integrity checksum configuration.
@@ -2001,6 +2019,52 @@ upload:
         assert!(recorded
             .configured_fields
             .contains("upload.transports.tcp_tls.max_concurrency"));
+    }
+
+    /// #671 release B: `manifest.write_version` is "0.3" when absent, "0.4"
+    /// only when set, and anything else is refused at load, naming the key
+    /// and the accepted values. An unquoted YAML number is refused too, so
+    /// `0.40` can never pass for a version.
+    #[test]
+    fn manifest_write_version_defaults_to_03_and_refuses_other_values() {
+        let base = tuning_base();
+        let parsed = VtopConfig::from_yaml_str(base).unwrap();
+        assert_eq!(parsed.manifest.write_version, ManifestWriteVersion::V0_3);
+        assert!(!parsed.configured_fields.contains("manifest.write_version"));
+        for (value, expected) in [
+            (r#""0.3""#, ManifestWriteVersion::V0_3),
+            (r#""0.4""#, ManifestWriteVersion::V0_4),
+            ("'0.4'", ManifestWriteVersion::V0_4),
+        ] {
+            let cfg =
+                VtopConfig::from_yaml_str(&format!("{base}manifest:\n  write_version: {value}\n"))
+                    .unwrap();
+            cfg.validate().unwrap();
+            assert_eq!(cfg.manifest.write_version, expected, "{value}");
+            assert!(cfg.configured_fields.contains("manifest.write_version"));
+        }
+        // An empty section is every default.
+        let cfg = VtopConfig::from_yaml_str(&format!("{base}manifest: {{}}\n")).unwrap();
+        assert_eq!(cfg.manifest.write_version, ManifestWriteVersion::V0_3);
+        for value in [
+            r#""0.5""#,
+            r#""0.2""#,
+            r#""""#,
+            r#""0.4.0""#,
+            r#"" 0.4""#,
+            "latest",
+            "0.4",
+            "0.40",
+            "4",
+            "[0.4]",
+        ] {
+            let err =
+                VtopConfig::from_yaml_str(&format!("{base}manifest:\n  write_version: {value}\n"))
+                    .expect_err(value)
+                    .to_string();
+            assert!(err.contains("manifest.write_version"), "{value}: {err}");
+            assert!(err.contains(r#""0.3" or "0.4""#), "{value}: {err}");
+        }
     }
 
     fn tuning_base() -> &'static str {

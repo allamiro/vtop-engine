@@ -267,7 +267,7 @@ A conformant manifest:
 | Field | Type | Requirement | Description |
 |-------|------|-------------|-------------|
 | `protocol` | string | MUST | Constant `"VTOP"`. |
-| `version` | string | MUST | Protocol version (e.g. `"0.3"`). See the `source_progress` note below for what `0.3` changed. |
+| `version` | string | MUST | Protocol version (e.g. `"0.3"`). See the `source_progress` note below for what `0.3` changed, and "Writing `0.4`" for what `0.4` adds. |
 | `batch_id` | string | MUST | Unique batch identifier. |
 | `tenant` | string | MUST | Tenant/source-owner identity. |
 | `source_type` | enum | MUST | `kafka` \| `file` \| `syslog_spool`. |
@@ -285,8 +285,11 @@ A conformant manifest:
 | `manifest.uri` | string | MUST | Manifest storage URI/key. |
 | `manifest.sha256` (self-hash) | string | MUST | Reproducible SHA-256 computed with both embedded hash/MAC values blanked. |
 | `manifest.mac` | string | MAY | 32-byte keyed BLAKE3 authenticator (lowercase hex), computed over the same canonical bytes. |
-| `state` | enum | SHOULD | Lifecycle state at manifest-write time. |
-| `verification_status` | enum | SHOULD | Status at manifest-write time. |
+| `state` | enum | SHOULD | Lifecycle state at manifest-write time (`manifest_uploaded`). |
+| `verification_status` | enum | SHOULD | Status at manifest-write time, so always `not_verified`. **Deprecated** in favour of `verification_plan` plus the ledger; still written in `0.4` because v0.8.0 readers require it. |
+| `verification_plan` | object | `0.4`: MUST; earlier: MUST NOT | How the object will be verified, as configured when the manifest was written (`0.4`, #671). `method` and `require_strong` below. |
+| `verification_plan.method` | string | MUST | `store_checksum`, `read_back` or `size_only`: the method for the configured backend and the object's `checksum_algorithm`, the same value `vtopctl validate --print-effective` and the startup log print. A reader accepts any string. |
+| `verification_plan.require_strong` | boolean | MUST | `upload.require_strong_verification` when the manifest was written. |
 | `partition` / retention metadata | object | SHOULD | Time/retention partitioning context. |
 | `signature` | string | MAY | Manifest signature when signing enabled. |
 
@@ -320,9 +323,36 @@ down what the document says:
 - **`-0`**. It is not the integer `0`, and two stored forms would share one
   canonical form.
 
-A `0.4` writer stays within these rules. The reader release writes no `0.4`
-manifest; it only reads them. In every version, a second `protocol` or
-`version` key at the top level is malformed.
+A `0.4` writer stays within these rules. In every version, a second
+`protocol` or `version` key at the top level is malformed.
+
+**Writing `0.4` (#671 release B).** An engine writes `0.3` unless
+`manifest.write_version: "0.4"` is set (any other value is refused when the
+config loads, naming `"0.3"` and `"0.4"`). A `0.4` manifest is the `0.3`
+document with `"version": "0.4"` and one more object:
+
+```json
+"verification_plan": { "method": "read_back", "require_strong": true }
+```
+
+- **It is a plan, not an outcome.** The manifest is uploaded before
+  verification and its digest is pinned (`manifest_version_id`), so it cannot
+  record a result. The result is in the state-store ledger.
+  `verification_status` stays `not_verified` and `state` stays
+  `manifest_uploaded`.
+- **`method`** is the method for the configured `upload.backend` and the
+  object's `checksum_algorithm`. Native S3 may fall back from
+  `store_checksum` to `read_back` for a multipart object, which is the same
+  (strong) class. A backend with no known method fails the batch, naming the
+  backend, rather than writing `unknown`. `checksum_algorithm` is not
+  repeated in the plan: `object.checksum_algorithm` already records it.
+- **The writer hashes and MACs the canonical form above** and stores the same
+  document pretty-printed. Both parse to one document, so they have one
+  canonical form, and the stored bytes verify on every reader of `0.4`.
+- **A `0.1`-`0.3` manifest never carries `verification_plan`.** The legacy
+  scheme drops fields its release does not know, so there the plan would be
+  unauthenticated. A reader ignores one found in such a document.
+- **`0.3` output is unchanged** byte for byte while the setting is off.
 
 **Version grammar.** A version is dotted digits, `MAJOR.MINOR` or
 `MAJOR.MINOR.PATCH`, each part with no leading zero (`0` itself is fine). A
@@ -372,16 +402,21 @@ SECURITY_MODEL.md §8.2). The readers:
 - **`vtopctl verify-manifest`** has no ledger to bind the bytes to. It fails
   with "manifest URI claims version X, which this build cannot authenticate".
 
-**Upgrade order.** The reader release (release A in #671) reads `0.1`-`0.4`
-and **still writes `0.3`**, so engines before and after it can share a ledger
-and an archive during a rolling upgrade: everything written is a format both
-read. A later release that writes `0.4` needs every engine, scrub, auditor and
-other manifest consumer on the reader release or later first: an earlier
-reader re-encodes a `0.4` manifest without the fields it does not know, gets a
-different hash, reports it as tampered, and recovery replays the batch. The
-plan in #671 is for that release to keep `0.3` as its default and write `0.4`
-only when configured to. The manifest is not part of the native protocol or
-the Raft log, so the cluster upgrade procedure is unchanged. Downgrade remains
+**Upgrade order.** The reader release (v0.8.0, release A in #671) reads
+`0.1`-`0.4` and writes `0.3`, so engines before and after it can share a
+ledger and an archive during a rolling upgrade. Release B writes `0.4` only
+when `manifest.write_version: "0.4"` is set, and **every engine, `vtopctl
+scrub`, auditor and other manifest consumer must run v0.8.0 or later first**:
+a v0.7.0 or earlier reader re-encodes a `0.4` manifest without the fields it
+does not know, gets a different hash and reports it as tampered
+(`verify-manifest` fails the self-hash and MAC, the scrub reports it, and
+recovery replays the batch: duplicates, not loss). The engine cannot see which
+releases read its archive, so setting the key is the operator's
+acknowledgement, and the startup log says so. An engine before release B
+ignores the `manifest:` section and keeps writing `0.3`, which is the safe
+direction. Setting `"0.3"` again stops new `0.4` manifests; those already
+written stay readable. The manifest is not part of the native protocol or the
+Raft log, so the cluster upgrade procedure is unchanged. Downgrade remains
 unsupported.
 
 **`source_progress` spans the whole batch (version `0.3`, #622).** A batch is
@@ -410,7 +445,7 @@ row was pruned, from the prune digest that replaced it, not from the manifest;
 their end is correct. The field's shape did not change, so every released
 verifier verifies manifests of both versions.
 
-> The manifest is written at the `MANIFEST_UPLOADED` step, before storage-side verification, so its embedded `state`/`verification_status` reflect that point in time and its hash stays stable. The authoritative post-verification state (`VERIFIED` → `SOURCE_COMMITTED`) lives in the state store.
+> The manifest is written at the `MANIFEST_UPLOADED` step, before storage-side verification, so its embedded `state`/`verification_status` reflect that point in time and its hash stays stable. The authoritative post-verification state (`VERIFIED` → `SOURCE_COMMITTED`) lives in the state store. A `0.4` manifest also states the verification method it was written to expect (`verification_plan`), which is likewise true at write time.
 
 ---
 
@@ -586,6 +621,9 @@ silently downgrade verification.
 A reader **MUST** check `protocol` and `version` before verifying, select the
 hash scheme from the version, and report a version newer than it supports as
 such, never as a failed self-hash or MAC (§11.2, "Reading a manifest").
+A writer of `0.4` **MUST** compute the self-hash and MAC over the canonical
+form of the document it stores, and verifies those stored bytes the way a
+reader will before the batch may reach `VERIFIED` (§11.2, "Writing `0.4`").
 
 ---
 

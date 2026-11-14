@@ -74,6 +74,7 @@ GET /readyz    readiness
 | `vtop_replay_required_total` | counter | Work being repeated |
 | `vtop_recovery_unsupported_manifest_total` | counter | VERIFIED batches whose manifest recovery found to be from a newer release than the engine reads (#671), proven to be the writer's pinned version. They are left VERIFIED (or retired SUPERSEDED once their source has committed past them), never replayed. Non-zero means an engine is older than a writer sharing its ledger, which the upgrade order rules out: upgrade that engine |
 | `vtop_failed_total` | counter | Batches that hit FAILED |
+| `vtop_manifests_written_total{tenant,version}` | counter | Manifests stored, by the version written (`manifest.write_version`, #671): `0.3` or `0.4`. A `0.4` sample means every reader of the archive must run v0.8.0 or later; v0.7.0 and earlier report those manifests as tampered. The startup INFO line names the version and why |
 | `vtop_records_total`, `vtop_bytes_in_total`, `vtop_bytes_out_total` | counters | Volume; rates via `rate()` |
 | `vtop_stage_duration_seconds{stage}` | histogram | Per-stage latency, p95-able |
 | `vtop_batch_duration_seconds` | histogram | End to end |

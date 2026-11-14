@@ -27,7 +27,10 @@ use vtop_core::batch::{AdaptiveBatcher, BatchLimits, SealReason, TelemetryBatch}
 use vtop_core::compression::compress_batch;
 use vtop_core::config::{ResolvedStateStore, StreamConfig, StreamsConfig, VtopConfig};
 use vtop_core::errors::VtopError;
-use vtop_core::manifest::{ManifestBuilder, ManifestMacKey, ParsedManifest, MAX_MANIFEST_BYTES};
+use vtop_core::manifest::{
+    ManifestBuilder, ManifestFormat, ManifestMacKey, ManifestWriteVersion, ParsedManifest,
+    VerificationPlan, MAX_MANIFEST_BYTES,
+};
 use vtop_core::metrics::BatchMetrics;
 use vtop_core::partitioning::{self, PartitionContext};
 use vtop_core::replay::{next_recovery_action, RecoveryAction};
@@ -695,6 +698,21 @@ impl<'a> Pipeline<'a> {
         tracing::info!(batch_id, uri = %object_uri, "object_uploaded");
 
         // ---- Build + upload manifest ------------------------------------
+        // `manifest.write_version` (#671 release B): 0.3 unless opted in.
+        // A 0.4 plan names the method `validate --print-effective` and the
+        // startup log print for this backend and algorithm; a backend with
+        // none fails the batch rather than promising an unknown check.
+        let manifest_format = match self.config.manifest.write_version {
+            ManifestWriteVersion::V0_3 => ManifestFormat::V0_3,
+            ManifestWriteVersion::V0_4 => match VerificationPlan::for_backend(
+                &self.config.upload.backend,
+                algo,
+                self.config.upload.require_strong_verification,
+            ) {
+                Ok(plan) => ManifestFormat::V0_4 { plan },
+                Err(e) => fail!(format!("manifest build failed: {e}")),
+            },
+        };
         let manifest = ManifestBuilder {
             batch_id: batch_id.clone(),
             tenant: tenant.clone(),
@@ -718,7 +736,8 @@ impl<'a> Pipeline<'a> {
             upload_backend: self.backend.backend_name().to_string(),
             created_at: now.clone(),
         }
-        .build_with_mac(self.manifest_mac_key.as_ref())?;
+        .build_written(manifest_format, self.manifest_mac_key.as_ref())?;
+        let manifest_version = manifest.fields().version.clone();
 
         // Track the expected path before writing so even a short/failed write
         // is removed on unwind through this function.
@@ -765,7 +784,7 @@ impl<'a> Pipeline<'a> {
         metrics.manifest_upload_ms = t.elapsed().as_millis() as u64;
         let man_patch = BatchPatch {
             manifest_uri: Some(manifest_uri.clone()),
-            manifest_sha256: Some(manifest.manifest.sha256.clone()),
+            manifest_sha256: Some(manifest.fields().manifest.sha256.clone()),
             manifest_version_id: stored_manifest.version_id.clone(),
             ..Default::default()
         };
@@ -775,7 +794,17 @@ impl<'a> Pipeline<'a> {
             .await?;
         state_write += t_write.elapsed();
         mark_state!(BatchState::ManifestUploaded);
-        tracing::info!(batch_id, uri = %manifest_uri, "manifest_uploaded");
+        if let Some(mx) = telemetry::metrics() {
+            mx.manifests_written_total
+                .with_label_values(&[tenant.as_str(), manifest_version.as_str()])
+                .inc();
+        }
+        tracing::info!(
+            batch_id,
+            uri = %manifest_uri,
+            version = %manifest_version,
+            "manifest_uploaded"
+        );
 
         // ---- MANIFEST_UPLOADED -> VERIFIED (or FAILED) ------------------
         let t = Instant::now();

@@ -99,6 +99,31 @@ fn histograms_expose_buckets_for_quantiles() {
     }
 }
 
+/// #671 release B: manifests are counted by the version they were written
+/// in, labelled by tenant and version only (two values, never a batch id or
+/// URI), so an alert can see the first 0.4 manifest before any reader trips
+/// on it.
+#[test]
+fn manifests_written_are_counted_by_version() {
+    let m = telemetry::init().expect("registry must initialize");
+    for version in ["0.3", "0.4"] {
+        m.manifests_written_total
+            .with_label_values(&["metrics-endpoint", version])
+            .inc_by(0);
+    }
+    let text = m.encode().expect("encode must succeed");
+    assert!(
+        text.contains("# TYPE vtop_manifests_written_total counter"),
+        "{text}"
+    );
+    for version in ["0.3", "0.4"] {
+        let series = format!(
+            r#"vtop_manifests_written_total{{tenant="metrics-endpoint",version="{version}"}}"#
+        );
+        assert!(text.contains(&series), "missing {series}");
+    }
+}
+
 /// The label set is a contract too: dashboards group by these.
 #[test]
 fn expected_labels_are_present() {
@@ -147,7 +172,17 @@ fn unbounded_identifiers_are_never_labels() {
 fn every_exported_label_is_from_a_bounded_set() {
     // "le" is Prometheus's own histogram bucket label. It is bounded by the
     // bucket list defined in telemetry.rs, not free-form, so it is legitimate.
-    const BOUNDED: [&str; 6] = ["tenant", "source_type", "format", "state", "stage", "le"];
+    // "version" is the manifest version (#671 release B): "0.3" or "0.4",
+    // the values `manifest.write_version` accepts.
+    const BOUNDED: [&str; 7] = [
+        "tenant",
+        "source_type",
+        "format",
+        "state",
+        "stage",
+        "le",
+        "version",
+    ];
     let text = populated();
     let mut seen = std::collections::BTreeSet::new();
     for line in text.lines().filter(|l| !l.starts_with('#')) {

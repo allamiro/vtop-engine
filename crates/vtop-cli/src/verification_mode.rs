@@ -9,6 +9,7 @@
 //! outside `engine.rs` to keep the engine's own diff to its call sites.
 
 use vtop_core::config::{effective_algorithm, StreamsConfig, VtopConfig};
+use vtop_core::manifest::ManifestWriteVersion;
 use vtop_core::telemetry;
 use vtop_state::BatchRecord;
 use vtop_upload::verification_method;
@@ -46,6 +47,11 @@ pub(crate) fn announce(config: &VtopConfig, streams: &StreamsConfig) {
             "stream verification settings"
         );
     }
+    tracing::info!(
+        manifest_version = config.manifest.write_version.as_str(),
+        "{}",
+        manifest_version_notice(config)
+    );
     if let Some(mx) = telemetry::metrics() {
         let size_only = !config.upload.require_strong_verification;
         let tenant = config.engine.tenant.as_str();
@@ -55,6 +61,33 @@ pub(crate) fn announce(config: &VtopConfig, streams: &StreamsConfig) {
         mx.verification_mode
             .with_label_values(&[tenant, "strong"])
             .set(i64::from(!size_only));
+    }
+}
+
+/// The startup line naming the manifest version new batches are written in,
+/// and why (#671 release B): what it adds, who can read it, and how to go
+/// back. `0.4` is never the default because a reader before v0.8.0 reports
+/// it as tampered, and the engine cannot see which releases read the
+/// archive, so the setting is the operator's acknowledgement.
+pub(crate) fn manifest_version_notice(config: &VtopConfig) -> String {
+    match config.manifest.write_version {
+        ManifestWriteVersion::V0_3 => {
+            let origin = if config.configured_fields.contains("manifest.write_version") {
+                "set by manifest.write_version"
+            } else {
+                "the default"
+            };
+            format!(
+                "manifest.write_version = \"0.3\" ({origin}): new manifests are readable by every \
+                 release and carry no verification_plan. Set \"0.4\" to record the verification \
+                 plan, once every engine, scrub and auditor of this archive runs v0.8.0 or later"
+            )
+        }
+        ManifestWriteVersion::V0_4 => "manifest.write_version = \"0.4\": new manifests carry \
+             verification_plan; every engine, scrub and auditor of this archive must run v0.8.0 \
+             or later (older readers report these manifests as tampered). Set \"0.3\" to go back; \
+             0.4 manifests already written stay readable"
+            .to_owned(),
     }
 }
 
@@ -116,5 +149,43 @@ pub(crate) fn count_size_only_commit(recheck: Recheck, rec: &BatchRecord) {
                 rec.format.extension(),
             ])
             .inc();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(manifest: &str) -> VtopConfig {
+        VtopConfig::from_yaml_str(&format!(
+            "engine: {{name: t, state_store: 'sqlite::memory:', work_dir: /unused}}\n\
+             batching: {{}}\ncompression: {{}}\nsources: {{}}\nupload: {{bucket: b}}\n{manifest}"
+        ))
+        .unwrap()
+    }
+
+    /// #671 release B: the startup line names the version new manifests get
+    /// and why: where 0.3 came from and how to opt in, or, for 0.4, the
+    /// minimum reader release, what older readers do, and how to go back.
+    #[test]
+    fn the_startup_notice_names_the_manifest_version_and_why() {
+        let default = manifest_version_notice(&config(""));
+        assert!(default.contains("\"0.3\" (the default)"), "{default}");
+        assert!(default.contains("v0.8.0"), "{default}");
+        let explicit = manifest_version_notice(&config("manifest:\n  write_version: \"0.3\"\n"));
+        assert!(
+            explicit.contains("set by manifest.write_version"),
+            "{explicit}"
+        );
+        let opted_in = manifest_version_notice(&config("manifest:\n  write_version: \"0.4\"\n"));
+        for needle in [
+            "\"0.4\"",
+            "verification_plan",
+            "v0.8.0 or later",
+            "tampered",
+            "Set \"0.3\" to go back",
+        ] {
+            assert!(opted_in.contains(needle), "{needle}: {opted_in}");
+        }
     }
 }

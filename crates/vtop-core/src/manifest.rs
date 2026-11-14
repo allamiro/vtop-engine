@@ -22,6 +22,11 @@ pub const VTOP_PROTOCOL: &str = "VTOP";
 /// unchanged, so every released verifier reads both: the bump tells a reader
 /// which meaning a manifest's start has.
 pub const VTOP_VERSION: &str = "0.3";
+/// The manifest version a writer emits when `manifest.write_version` opts in
+/// (#671 release B). It adds `verification_plan` and is hashed over the
+/// stored document ([`HashScheme::Canonical`]), which only v0.8.0 and later
+/// readers verify, so it is never the default.
+pub const VTOP_VERSION_04: &str = "0.4";
 /// Maximum serialized manifest size accepted from storage.
 ///
 /// Manifests contain metadata only and are normally a few KiB. A hard 1 MiB
@@ -74,6 +79,133 @@ pub enum VerificationStatus {
     BackendLimited,
 }
 
+/// What a version 0.4 manifest says about how its object will be verified
+/// (#671 release B). It is the plan in force when the manifest was written,
+/// never an outcome: the manifest is uploaded before verification runs and
+/// its digest is pinned, so the outcome lives in the ledger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationPlan {
+    /// [`crate::effective_config::verification_method`] for the configured
+    /// `upload.backend` and the object's algorithm: `store_checksum`,
+    /// `read_back` or `size_only`, the value `validate --print-effective`
+    /// and the startup log print. Native S3 may fall back from
+    /// `store_checksum` to `read_back` for a multipart object, which is the
+    /// same (strong) class. A string, not a closed enum, so a later writer's
+    /// method still reads here.
+    pub method: String,
+    /// `upload.require_strong_verification` when the manifest was written.
+    pub require_strong: bool,
+}
+
+impl VerificationPlan {
+    /// The plan for an object of `algorithm` stored through the configured
+    /// `backend`. A backend with no known method is refused, naming it,
+    /// rather than written as `unknown`: a manifest must not promise a check
+    /// nobody can say will run.
+    pub fn for_backend(
+        backend: &str,
+        algorithm: crate::types::ChecksumAlgorithm,
+        require_strong: bool,
+    ) -> Result<Self, VtopError> {
+        use crate::effective_config::{verification_method, VerificationMethod};
+        match verification_method(backend, algorithm) {
+            VerificationMethod::Unknown => Err(VtopError::Manifest(format!(
+                "upload.backend {backend:?} has no known verification method, so a version \
+                 {VTOP_VERSION_04} manifest cannot state its verification plan"
+            ))),
+            method => Ok(Self {
+                method: method.as_str().to_owned(),
+                require_strong,
+            }),
+        }
+    }
+}
+
+/// The manifest version an engine writes: `manifest.write_version` in the
+/// config (#671 release B). `0.3` unless the operator opts in, because a
+/// reader before v0.8.0 reports a `0.4` manifest as tampered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ManifestWriteVersion {
+    #[default]
+    V0_3,
+    V0_4,
+}
+
+impl ManifestWriteVersion {
+    /// Every value `manifest.write_version` accepts, in the order the
+    /// refusal names them.
+    pub const ACCEPTED: [&'static str; 2] = [VTOP_VERSION, VTOP_VERSION_04];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V0_3 => VTOP_VERSION,
+            Self::V0_4 => VTOP_VERSION_04,
+        }
+    }
+}
+
+impl std::fmt::Display for ManifestWriteVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ManifestWriteVersion {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ManifestWriteVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct WriteVersionVisitor;
+        impl serde::de::Visitor<'_> for WriteVersionVisitor {
+            type Value = ManifestWriteVersion;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(r#""0.3" or "0.4""#)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v {
+                    VTOP_VERSION => Ok(ManifestWriteVersion::V0_3),
+                    VTOP_VERSION_04 => Ok(ManifestWriteVersion::V0_4),
+                    // Bounded: the value lands in an error message.
+                    other => Err(E::custom(format_args!(
+                        r#"must be "0.3" or "0.4", got {:?}"#,
+                        other.chars().take(32).collect::<String>()
+                    ))),
+                }
+            }
+
+            // YAML reads an unquoted `0.4` as a number. It is refused, not
+            // converted, so `0.40` or `4e-1` can never pass for a version.
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                Err(E::custom(format_args!(
+                    r#"must be the string "0.3" or "0.4", got the number {v}; quote it"#
+                )))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                self.visit_f64(v as f64)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                self.visit_f64(v as f64)
+            }
+        }
+        deserializer.deserialize_any(WriteVersionVisitor)
+    }
+}
+
+/// What [`ManifestBuilder::build_written`] writes: version 0.3, exactly as
+/// every earlier release, or version 0.4 with its verification plan.
+#[derive(Debug, Clone)]
+pub enum ManifestFormat {
+    V0_3,
+    V0_4 { plan: VerificationPlan },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectMetadata {
     pub uri: String,
@@ -123,7 +255,15 @@ pub struct VtopManifest {
     pub partitioning: PartitionMetadata,
     pub upload_backend: String,
     pub state: BatchState,
+    /// Always `not_verified`: the manifest is written before verification
+    /// (protocol draft §11.2). Kept in 0.4 because v0.8.0's reader requires
+    /// it; `verification_plan` and the ledger say what it cannot.
     pub verification_status: VerificationStatus,
+    /// Version 0.4 only (#671 release B). Never part of a 0.1-0.3 manifest:
+    /// a legacy reader drops it before hashing, so in one it would be
+    /// unauthenticated, and [`ParsedManifest`] discards it there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_plan: Option<VerificationPlan>,
     pub created_at: String,
 }
 
@@ -202,8 +342,11 @@ impl ParsedManifest {
         match header.scheme()? {
             HashScheme::Legacy => {
                 // Decoded straight from the bytes, as every earlier reader
-                // did, and hashed by re-encoding the struct: unchanged.
-                let decoded: VtopManifest = serde_json::from_slice(bytes)?;
+                // did, and hashed by re-encoding the struct: unchanged. A
+                // `verification_plan` in a legacy document is dropped, as
+                // v0.8.0 dropped it: no hash covers it there.
+                let mut decoded: VtopManifest = serde_json::from_slice(bytes)?;
+                decoded.verification_plan = None;
                 let auth_bytes = decoded.legacy_auth_bytes()?;
                 Ok(Self {
                     decoded,
@@ -534,14 +677,69 @@ impl ManifestBuilder {
         self.build_with_mac(None)
     }
 
-    /// Build a manifest, authenticating it when a runtime key is configured.
+    /// Build a version 0.3 manifest, authenticating it when a runtime key is
+    /// configured. Byte for byte what every earlier release wrote.
     pub fn build_with_mac(
         self,
         mac_key: Option<&ManifestMacKey>,
     ) -> Result<VtopManifest, VtopError> {
-        let mut manifest = VtopManifest {
+        let mut manifest = self.assemble(VTOP_VERSION, None, mac_key);
+        manifest.manifest.sha256 = manifest.self_hash()?;
+        if let Some(key) = mac_key {
+            manifest.manifest.mac = Some(
+                key.authenticate(&manifest.legacy_auth_bytes()?)
+                    .to_hex()
+                    .to_string(),
+            );
+        }
+        Ok(manifest)
+    }
+
+    /// Build the manifest `format` names and the exact bytes to store
+    /// (#671 release B). Version 0.3 is [`ManifestBuilder::build_with_mac`]
+    /// and [`VtopManifest::to_json_bytes`], unchanged. Version 0.4 is hashed
+    /// and MAC'd over its canonical form (the document with `manifest.sha256`
+    /// and `manifest.mac` blanked, keys sorted, compact), the bytes every
+    /// v0.8.0 and later reader authenticates, and stored pretty-printed:
+    /// both parse to one document, so they share that canonical form.
+    pub fn build_written(
+        self,
+        format: ManifestFormat,
+        mac_key: Option<&ManifestMacKey>,
+    ) -> Result<WrittenManifest, VtopError> {
+        let manifest = match format {
+            ManifestFormat::V0_3 => {
+                let manifest = self.build_with_mac(mac_key)?;
+                let bytes = manifest.to_json_bytes()?;
+                return Ok(WrittenManifest { manifest, bytes });
+            }
+            ManifestFormat::V0_4 { plan } => self.assemble(VTOP_VERSION_04, Some(plan), mac_key),
+        };
+        let mut manifest = manifest;
+        let auth = canonical_auth_bytes(serde_json::to_value(&manifest)?)?;
+        manifest.manifest.sha256 = sha256_bytes(&auth);
+        if let Some(key) = mac_key {
+            manifest.manifest.mac = Some(key.authenticate(&auth).to_hex().to_string());
+        }
+        let bytes = serde_json::to_vec_pretty(&manifest)?;
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(VtopError::Manifest(format!(
+                "manifest exceeds the {MAX_MANIFEST_BYTES}-byte limit"
+            )));
+        }
+        Ok(WrittenManifest { manifest, bytes })
+    }
+
+    /// The document with both embedded values still blank.
+    fn assemble(
+        self,
+        version: &str,
+        verification_plan: Option<VerificationPlan>,
+        mac_key: Option<&ManifestMacKey>,
+    ) -> VtopManifest {
+        VtopManifest {
             protocol: VTOP_PROTOCOL.to_string(),
-            version: VTOP_VERSION.to_string(),
+            version: version.to_string(),
             batch_id: self.batch_id,
             tenant: self.tenant,
             source_type: self.source_type,
@@ -571,20 +769,62 @@ impl ManifestBuilder {
             },
             upload_backend: self.upload_backend,
             state: BatchState::ManifestUploaded,
+            // Written before verification runs, in every version (D3 of the
+            // #671 plan): v0.8.0's reader requires the field.
             verification_status: VerificationStatus::NotVerified,
+            verification_plan,
             created_at: self.created_at,
-        };
-
-        manifest.manifest.sha256 = manifest.self_hash()?;
-        if let Some(key) = mac_key {
-            manifest.manifest.mac = Some(
-                key.authenticate(&manifest.legacy_auth_bytes()?)
-                    .to_hex()
-                    .to_string(),
-            );
         }
-        Ok(manifest)
     }
+}
+
+/// A manifest this build wrote, with the exact bytes to upload. The bytes
+/// are kept, not re-encoded, so what is stored, hashed and verified is one
+/// document; [`ParsedManifest`] is the reader-side counterpart.
+#[derive(Debug, Clone)]
+pub struct WrittenManifest {
+    manifest: VtopManifest,
+    bytes: Vec<u8>,
+}
+
+impl WrittenManifest {
+    /// The fields written.
+    pub fn fields(&self) -> &VtopManifest {
+        &self.manifest
+    }
+
+    /// The bytes to store.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Verify the bytes about to be stored the way every reader will: parsed
+    /// from those bytes, by their version's scheme.
+    pub fn verify_authentication(&self, mac_key: Option<&ManifestMacKey>) -> Result<(), VtopError> {
+        ParsedManifest::from_slice(&self.bytes)?.verify_authentication(mac_key)
+    }
+
+    /// Persist the bytes to `work_dir` as `<batch_id>.manifest.json`,
+    /// returning the local path.
+    pub fn write_to_file(&self, work_dir: &Path) -> Result<PathBuf, VtopError> {
+        write_manifest_file(work_dir, &self.manifest.batch_id, &self.bytes)
+    }
+}
+
+fn write_manifest_file(
+    work_dir: &Path,
+    batch_id: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, VtopError> {
+    std::fs::create_dir_all(work_dir)?;
+    let path = work_dir.join(format!("{batch_id}.manifest.json"));
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(VtopError::Manifest(format!(
+            "manifest exceeds the {MAX_MANIFEST_BYTES}-byte limit"
+        )));
+    }
+    std::fs::write(&path, bytes)?;
+    Ok(path)
 }
 
 impl VtopManifest {
@@ -593,6 +833,14 @@ impl VtopManifest {
     /// decoded fields would lose the fields this build does not know.
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, VtopError> {
         self.require_legacy_scheme()?;
+        if self.verification_plan.is_some() {
+            // The legacy hash cannot cover it (see `legacy_auth_bytes`).
+            return Err(VtopError::Manifest(format!(
+                "verification_plan is a version {VTOP_VERSION_04} field; a version {} manifest \
+                 cannot carry it",
+                self.version
+            )));
+        }
         Ok(serde_json::to_vec_pretty(self)?)
     }
 
@@ -601,6 +849,9 @@ impl VtopManifest {
     /// calculation is circular.
     fn legacy_auth_bytes(&self) -> Result<Vec<u8>, VtopError> {
         let mut clone = self.clone();
+        // Never covered by the legacy scheme: v0.8.0 and earlier do not know
+        // the field and drop it before hashing.
+        clone.verification_plan = None;
         clone.manifest.sha256 = String::new();
         if clone.manifest.mac.is_some() {
             clone.manifest.mac = Some(String::new());
@@ -656,16 +907,7 @@ impl VtopManifest {
 
     /// Persist the manifest JSON to `work_dir`, returning the local path.
     pub fn write_to_file(&self, work_dir: &Path) -> Result<PathBuf, VtopError> {
-        std::fs::create_dir_all(work_dir)?;
-        let path = work_dir.join(format!("{}.manifest.json", self.batch_id));
-        let bytes = self.to_json_bytes()?;
-        if bytes.len() > MAX_MANIFEST_BYTES {
-            return Err(VtopError::Manifest(format!(
-                "manifest exceeds the {MAX_MANIFEST_BYTES}-byte limit"
-            )));
-        }
-        std::fs::write(&path, bytes)?;
-        Ok(path)
+        write_manifest_file(work_dir, &self.batch_id, &self.to_json_bytes()?)
     }
 
     /// Mark verification outcome and advance state accordingly.
