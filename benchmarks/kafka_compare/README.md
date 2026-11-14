@@ -41,7 +41,8 @@ python3 benchmarks/kafka_compare/run.py --check benchmarks/kafka_compare/results
 # The cells, row count and projected hours of a matrix (or an environment.json).
 python3 benchmarks/kafka_compare/plan.py matrix.json --max-hours 30
 ```
- A run writes `results/<run-id>/` and never overwrites another. Unlike
+
+A run writes `results/<run-id>/` and never overwrites another. Unlike
 `benchmarks/results/` (git-ignored by `benchmarks/.gitignore`, whose `results/*` is anchored to that
 directory), `kafka_compare/results/<run-id>/` is committed on purpose: the published reports are generated
 from it, and a reader can check every number against it.
@@ -116,8 +117,11 @@ only when the run finished.
 missing, the run did not finish, a row is malformed or a `failed`/`refused` row gives no reason, any expected
 row is missing or duplicated, rows come from more than one environment, commit, image or client (or, in a
 schema-1 run, profile), the run varies along a dimension this report does not draw yet (partitions,
-producers, compression, acks, profile, or a load basis other than `kafka`; the grouped charts are #600's),
-the CSV's run id, commit, image, client, profile or `acks` differ from what `environment.json` records, or
+producers, compression, acks, profile, or a load basis other than `kafka`; the grouped charts are #600's)
+or holds a value its text does not say (a codec other than none, acks other than all, a profile other
+than the environment's, end-to-end rows), a row that repeats another profile's measurement does not match
+a measured row under that profile, the CSV's run id, commit, image, client or `acks` (and, in a schema-1
+run, profile) differ from what `environment.json` records, or
 the CSV's fingerprint does not match `environment.json` (rule 9). A cell that did not run is a row with
 status `refused` (or `failed`, if it ran and gave no usable result); the report accepts such a row, does not
 refuse the run over it, and the chart shows "no result" in its place.

@@ -66,7 +66,8 @@ def complete_rows(env):
             "mib_per_sec": 0.1, "started_at": "2026-11-14T00:00:00+00:00", "wall_seconds": 1.0, "note": "",
             "same_config_as": "",
         }
-        if system == "vtop" and profile == "fsync-parity":
+        if (system == "vtop" and profile == "fsync-parity" and mode in ("saturation", "consume")
+                and "defaults" in env["matrix"]["profiles"]):
             row["same_config_as"] = "defaults"
         if mode in ("saturation", "fixed_rate", "e2e"):
             row.update(lat_p50_ms=1.0, lat_p95_ms=2.0, lat_p99_ms=3.0, lat_p999_ms=4.0,
@@ -393,19 +394,23 @@ def test_the_check_command_refuses_rows_from_another_environment(run_dir, capsys
 
 
 def test_the_report_refuses_dimensions_it_does_not_draw(run_dir):
-    with pytest.raises(schema.ReportRefused, match="values of compression"):
-        report.check_drawable(schema.load_run(run_dir).rows)
+    loaded = schema.load_run(run_dir)
+    with pytest.raises(schema.ReportRefused, match="compression is none, zstd"):
+        report.check_drawable(loaded.rows, loaded.environment)
 
 
 def test_the_report_refuses_common_basis_rates_it_does_not_draw(tmp_path):
-    env = environment({**SMALL, "compressions": ["none"], "profiles": ["defaults"]})
+    env = environment({**SMALL, "compressions": ["none"], "profiles": ["defaults"], "e2e": None})
+    env["comparable"]["profile"] = "defaults"
     directory = write_run(str(tmp_path / "one"), env, complete_rows(env))
+    loaded = schema.load_run(directory)
     with pytest.raises(schema.ReportRefused, match="load bases"):
-        report.check_drawable(schema.load_run(directory).rows)
+        report.check_drawable(loaded.rows, loaded.environment)
 
 
 def test_the_report_draws_the_phase_1_run():
-    report.check_drawable(schema.load_run(PHASE_1).rows)
+    loaded = schema.load_run(PHASE_1)
+    report.check_drawable(loaded.rows, loaded.environment)
 
 
 def test_the_projection_charges_each_fixed_rate_run_its_configured_duration():
@@ -426,3 +431,105 @@ def test_kafka_rates_must_be_the_load_pcts_the_report_draws():
     with pytest.raises(plan.PlanRefused, match="differs from matrix.load_pcts"):
         plan.check_matrix({**SMALL, "load_bases": {"kafka": [25, 50, 75, 90]}})
     plan.check_matrix({**SMALL, "load_bases": {"kafka": [25, 50, 75], "common": [90]}})
+
+
+# ----------------------------------------------------------------------- review of 66670fb
+
+
+def test_a_repeat_must_match_a_measured_row_under_the_named_profile(run_dir):
+    def changed(rows):
+        first(rows, system="vtop", profile="fsync-parity", mode="saturation")["records_per_sec"] = "1.5"
+        return rows
+
+    rewrite(run_dir, changed)
+    refused(run_dir, "differs from it in records_per_sec")
+
+
+def test_two_repeats_naming_each_other_are_not_a_measurement(run_dir):
+    def circular(rows):
+        first(rows, system="vtop", profile="defaults", mode="saturation", repetition="1",
+              compression="none")["same_config_as"] = "fsync-parity"
+        return rows
+
+    rewrite(run_dir, circular)
+    refused(run_dir, "not in the run as a measured row")
+
+
+def test_a_rated_row_cannot_repeat_another_profile(run_dir):
+    def rated(rows):
+        first(rows, system="vtop", profile="fsync-parity", mode="fixed_rate")["same_config_as"] = "defaults"
+        return rows
+
+    rewrite(run_dir, rated)
+    refused(run_dir, "rated rows are run per profile")
+
+
+@pytest.mark.parametrize("producers, basis, ok", [
+    ("1", "worst-of-7", False), ("4", "single", False), ("4", "worst-of-4", True), ("12", "worst-of-12", True),
+])
+def test_lat_basis_names_the_producers(run_dir, producers, basis, ok):
+    def poke(rows):
+        row = first(rows, mode="saturation", system="kafka")
+        row.update(producers=producers, lat_basis=basis)
+        return rows
+
+    rewrite(run_dir, poke)
+    if ok:
+        with pytest.raises(schema.ReportRefused) as raised:
+            schema.load_run(run_dir)
+        assert "lat_basis" not in str(raised.value)  # refused later, as a key outside the matrix
+    else:
+        refused(run_dir, "lat_basis is")
+
+
+def test_the_report_refuses_one_value_its_text_does_not_say(tmp_path):
+    env = environment({**SMALL, "compressions": ["zstd"], "profiles": ["fsync-parity"], "e2e": None,
+                       "load_bases": {"kafka": [25, 50, 75]}})
+    env["comparable"]["profile"] = "defaults"
+    directory = write_run(str(tmp_path / "zstd"), env, complete_rows(env))
+    loaded = schema.load_run(directory)
+    with pytest.raises(schema.ReportRefused, match="compression is zstd"):
+        report.check_drawable(loaded.rows, loaded.environment)
+
+
+def test_the_report_refuses_e2e_rows_it_does_not_draw(tmp_path):
+    env = environment({**SMALL, "compressions": ["none"], "profiles": ["defaults"],
+                       "load_bases": {"kafka": [25, 50, 75]}})
+    env["comparable"]["profile"] = "defaults"
+    directory = write_run(str(tmp_path / "e2e"), env, complete_rows(env))
+    loaded = schema.load_run(directory)
+    with pytest.raises(schema.ReportRefused, match="end-to-end"):
+        report.check_drawable(loaded.rows, loaded.environment)
+
+
+def test_check_says_a_run_with_every_row_but_not_complete_is_not_done(run_dir, capsys):
+    with open(os.path.join(run_dir, "environment.json")) as handle:
+        env = json.load(handle)
+    env["run_state"] = "running"
+    with open(os.path.join(run_dir, "environment.json"), "w") as handle:
+        json.dump(env, handle)
+    assert run.main(["--check", run_dir]) == 2
+    assert "run_state is 'running'" in capsys.readouterr().err
+
+
+def test_a_record_count_run_is_charged_the_bytes_it_moves():
+    small = {**SMALL, "sat_records": {"100": 1000}}
+    big = {**SMALL, "sat_records": {"100": 300_000_000}}
+    assert plan.projected_seconds(big) > plan.projected_seconds(small) + 3600
+    with pytest.raises(plan.PlanRefused, match="over --max-hours"):
+        plan.check_budget(big, 30)
+
+
+def test_the_committed_phase_1_matrix_projects_at_least_its_real_duration():
+    """Phase 1 ran from 23:23 to 01:02, 1.65 hours."""
+    with open(os.path.join(PHASE_1, "environment.json")) as handle:
+        matrix = json.load(handle)["matrix"]
+    assert plan.projected_seconds(matrix) / 3600 >= 1.65
+
+
+@pytest.mark.parametrize("key, value", [("load_bases", {"kafka": 5}), ("acks_slice", 5), ("fixed_seconds", None),
+                                        ("acks", ["all", "all"]), ("vtop_profiles_share_config", "yes"),
+                                        ("record_sizes", None)])
+def test_a_malformed_matrix_is_a_refusal_not_a_traceback(key, value):
+    with pytest.raises(plan.PlanRefused):
+        plan.check_matrix({**SMALL, key: value})

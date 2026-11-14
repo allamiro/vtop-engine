@@ -128,7 +128,16 @@ _NUMERIC_OK = {
 }
 # Modes whose ok rows carry percentiles, and so say how they were combined.
 _HAS_LATENCY = ("saturation", "fixed_rate", "e2e")
-_LAT_BASIS = re.compile(r"^(single|worst-of-[2-9][0-9]*)$")
+# Measurement columns a repeated row (`same_config_as`) must carry
+# unchanged from the row it repeats.
+_MEASURED = ("status", "sustained", "records", "records_per_sec", "mib_per_sec", "lat_avg_ms", "lat_max_ms",
+             "lat_p50_ms", "lat_p95_ms", "lat_p99_ms", "lat_p999_ms", "lat_basis", "started_at",
+             "window_start_ms", "window_end_ms", "wall_seconds", "note")
+
+
+def expected_lat_basis(producers: str) -> str:
+    """`single` for one producer; the worst of N producers' percentiles for N."""
+    return "single" if producers == "1" else f"worst-of-{producers}"
 
 
 class ReportRefused(Exception):
@@ -278,6 +287,11 @@ def _validate_v2_columns(row: dict[str, str], line: int) -> None:
         if row["system"] != "vtop":
             raise ReportRefused(f"results.csv line {line}: a {row['system']} row repeats another profile's "
                                 "measurement; only VTOP, whose configuration the profiles do not change, may")
+        if row["mode"] not in ("saturation", "consume"):
+            # A rated row's offered rate is a share of THAT profile's
+            # saturation, so it cannot be another profile's measurement.
+            raise ReportRefused(f"results.csv line {line}: a {row['mode']} row repeats another profile's "
+                                "measurement; only saturation and consume rows may, rated rows are run per profile")
     basis = row["load_basis"]
     if row["mode"] in ("fixed_rate", "e2e") and basis not in LOAD_BASES:
         raise ReportRefused(f"results.csv line {line}: a {row['mode']} row has load_basis {basis!r}")
@@ -323,9 +337,10 @@ def validate_rows(rows: list[dict[str, str]], version: int = 2) -> None:
             if row["mode"] in ("fixed_rate", "e2e"):
                 if row["sustained"] not in ("true", "false"):
                     raise ReportRefused(f"results.csv line {line}: sustained is {row['sustained']!r}")
-            if row["mode"] in _HAS_LATENCY and not _LAT_BASIS.match(row["lat_basis"]):
-                raise ReportRefused(f"results.csv line {line}: lat_basis is {row['lat_basis']!r}, "
-                                    "not single or worst-of-N")
+            if row["mode"] in _HAS_LATENCY and row["lat_basis"] != expected_lat_basis(row["producers"]):
+                raise ReportRefused(f"results.csv line {line}: lat_basis is {row['lat_basis']!r} with "
+                                    f"{row['producers']} producer(s); it must be "
+                                    f"{expected_lat_basis(row['producers'])!r}")
             if row["mode"] == "e2e" and row["records"] != row["records_produced"]:
                 # Fewer consumed than produced is a gap the CDF would hide: the
                 # run writes such a row as failed, saying how many are missing.
@@ -335,6 +350,7 @@ def validate_rows(rows: list[dict[str, str]], version: int = 2) -> None:
             raise ReportRefused(
                 f"results.csv line {line}: a {row['status']} row must say why in `note`"
             )
+    check_repeats(rows)
     for column in (RUN_CONSTANT_V1 if version == 1 else RUN_CONSTANT):
         values = sorted({row[column] for row in rows})
         if len(values) != 1:
@@ -342,6 +358,30 @@ def validate_rows(rows: list[dict[str, str]], version: int = 2) -> None:
                 f"results.csv mixes {len(values)} values of {column} ({', '.join(values)}): "
                 "one chart must come from one environment and one commit"
             )
+
+
+def check_repeats(rows: list[dict[str, str]]) -> None:
+    """Every row that repeats another profile's measurement (`same_config_as`)
+    has that measured row, itself measured rather than repeated, and carries
+    its measurement unchanged (review)."""
+    by_key = {}
+    for row in rows:
+        by_key.setdefault(_text_key(row), row)
+    for line, row in enumerate(rows, start=2):
+        if not row["same_config_as"]:
+            continue
+        source = by_key.get(_text_key({**row, "profile": row["same_config_as"]}))
+        if source is None or source["same_config_as"]:
+            raise ReportRefused(f"results.csv line {line}: it repeats a {row['same_config_as']} measurement "
+                                "that is not in the run as a measured row")
+        changed = [c for c in _MEASURED if row[c] != source[c]]
+        if changed:
+            raise ReportRefused(f"results.csv line {line}: it repeats a {row['same_config_as']} measurement but "
+                                f"differs from it in {', '.join(changed)}")
+
+
+def _text_key(row: dict[str, str]) -> tuple:
+    return tuple(row[column] for column in KEY)
 
 
 def expected_keys(matrix: dict[str, Any]) -> set[tuple]:

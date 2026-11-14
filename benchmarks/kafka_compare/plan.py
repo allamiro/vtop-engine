@@ -122,12 +122,32 @@ def check_matrix(matrix: dict[str, Any]) -> None:
                 or any(v not in allowed for v in values)):
             raise PlanRefused(f"matrix.{key} is {values!r}, not a list of distinct values from {list(allowed)}")
 
+    for key in ("record_sizes", "partitions", "producers"):
+        values = matrix.get(key)
+        if (not isinstance(values, list) or not values
+                or any(not _is_int(v) or v < 1 for v in values) or len(set(values)) != len(values)):
+            raise PlanRefused(f"matrix.{key} is {values!r}, not a list of distinct positive integers")
+    if not _is_int(matrix.get("repetitions")) or matrix["repetitions"] < 1:
+        raise PlanRefused(f"matrix.repetitions is {matrix.get('repetitions')!r}, not a positive integer")
+    acks = matrix.get("acks")
+    if not isinstance(acks, list) or not acks or len(set(acks)) != len(acks):
+        raise PlanRefused(f"matrix.acks is {matrix.get('acks')!r}, not a list of distinct acknowledgement modes")
+    fixed = matrix.get("fixed_seconds", 30.0)
+    if isinstance(fixed, bool) or not isinstance(fixed, (int, float)) or not fixed > 0:
+        raise PlanRefused(f"matrix.fixed_seconds is {fixed!r}, not a positive number of seconds")
+    share = matrix.get("vtop_profiles_share_config", False)
+    if not isinstance(share, bool):
+        raise PlanRefused(f"matrix.vtop_profiles_share_config is {share!r}, not true or false")
+    if not isinstance(matrix.get("acks_slice", []), list):
+        raise PlanRefused(f"matrix.acks_slice is {matrix.get('acks_slice')!r}, not a list of cells")
+    if not isinstance(matrix.get("load_bases", {}), dict):
+        raise PlanRefused(f"matrix.load_bases is {matrix.get('load_bases')!r}, not a map of bases to rates")
     strings("compressions", COMPRESSIONS)
     strings("profiles", PROFILES)
-    if "acks" in matrix and any(a not in ACKS for a in matrix["acks"]):
+    if any(a not in ACKS for a in matrix["acks"]):
         raise PlanRefused(f"matrix.acks is {matrix['acks']!r}; acknowledgement modes are {list(ACKS)}")
     bases = matrix.get("load_bases")
-    if isinstance(bases, dict) and "kafka" in bases and "load_pcts" in matrix \
+    if isinstance(bases, dict) and isinstance(bases.get("kafka"), list) and "load_pcts" in matrix \
             and list(bases["kafka"]) != list(matrix["load_pcts"]):
         # The report draws the Kafka-relative rows by `load_pcts`; two lists
         # that disagree would leave measured rows out of it, or show cells
@@ -158,10 +178,16 @@ def check_matrix(matrix: dict[str, Any]) -> None:
 
 # ----------------------------------------------------------------------------- cost
 
-# Seconds per step, from phase 1 (run 20261109T232328Z: 99 minutes for four
-# system-cells) and the plan on #596. An estimate to refuse an impossible
-# matrix before any Docker work, not a measurement; the rehearsal's first
-# cells calibrate it, and `--timing` overrides any value.
+# Seconds per step: estimates from the plan on #596, for duration-targeted
+# runs. An estimate to refuse an impossible matrix before any Docker work,
+# not a measurement; the rehearsal's first cells calibrate it.
+#
+# A matrix that sizes saturation and consume runs by record count
+# (`sat_records`, the runner today) is charged by the bytes they move at
+# SLOWEST_BYTES_PER_SECOND instead, when that is longer: phase 1's VTOP
+# moved about 2.3 MiB/s at both record sizes (run 20261109T232328Z), so 2 MiB/s
+# keeps a record-count run from passing the budget on a duration it never
+# had (review).
 DEFAULT_TIMING = {
     "bring_up": 90.0,        # cluster up, smoke read-back, cluster down
     "warm_up": 30.0,         # the unrecorded warm-up run
@@ -170,6 +196,7 @@ DEFAULT_TIMING = {
     "consume": 20.0,
     "e2e": 40.0,
 }
+SLOWEST_BYTES_PER_SECOND = 2 * 1024 * 1024
 
 
 def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = None) -> float:
@@ -185,11 +212,16 @@ def projected_seconds(matrix: dict[str, Any], timing: dict[str, float] | None = 
     t["fixed_rate"] += float(matrix.get("fixed_seconds", 30.0))
     a = axes(matrix)
     fixed = sum(len(p) for p in a.load_bases.values())
+    sat_records = {int(k): int(v) for k, v in (matrix.get("sat_records") or {}).items()}
     total = 0.0
     for cell in a.cells:
+        sized = {mode: t[mode] for mode in ("saturation", "consume")}
+        if cell.record_size in sat_records:
+            moved = sat_records[cell.record_size] * cell.record_size / SLOWEST_BYTES_PER_SECOND
+            sized = {mode: max(seconds, moved) for mode, seconds in sized.items()}
         per_rep = 0.0
         for mode in cell.modes:
-            per_rep += t[mode] * (fixed if mode == "fixed_rate" else 1)
+            per_rep += sized.get(mode, t[mode]) * (fixed if mode == "fixed_rate" else 1)
         one = t["bring_up"] + t["warm_up"] + a.repetitions * per_rep
         kafka_runs = len(a.profiles)
         vtop_runs = 1 if matrix.get("vtop_profiles_share_config") else len(a.profiles)
