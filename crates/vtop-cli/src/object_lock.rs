@@ -316,7 +316,8 @@ pub(crate) fn judge_reuse(
          read ({why}); it was neither reused nor replaced by a fresh object, since a check the \
          store did not answer says nothing about the lock, and no object or manifest was \
          written; the batch was marked failed and will be replayed; check the store's health \
-         and the credentials' s3:GetObjectRetention permission"
+         and the credentials' s3:GetObjectRetention permission (and s3:GetObjectLegalHold \
+         with upload.object_lock.legal_hold)"
     );
     tracing::error!(
         event = "object_lock_check_failed",

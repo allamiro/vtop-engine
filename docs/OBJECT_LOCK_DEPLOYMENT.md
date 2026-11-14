@@ -62,7 +62,12 @@ may bypass a governance retention are yours to set up.
   sets. A retention the store cannot report (a 5xx, a timeout, a refused
   `s3:GetObjectRetention`) is **not** a reason to fall back, since during an
   outage every replay would write another object: the batch fails, writes
-  nothing, and is replayed. Before #709 such a range failed on every replay
+  nothing, and is replayed. Because S3 answers a HEAD from a caller without
+  `s3:GetObjectRetention` (or `s3:GetObjectLegalHold`) with no lock headers
+  at all, a missing lock or hold is confirmed with `GetObjectRetention` (or
+  `GetObjectLegalHold`) before the engine acts on it; those answer a missing
+  permission with `AccessDenied`, which fails the batch, and an object
+  without a lock with `NoSuchObjectLockConfiguration`, which falls back. Before #709 such a range failed on every replay
   until an operator extended the old object's retention or deleted it.
 - **A fallback is not repeated on every replay.** The engine remembers, per
   process, the attempt key it last wrote for each such range. A replay

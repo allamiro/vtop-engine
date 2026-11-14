@@ -328,13 +328,50 @@ impl<'a> Pipeline<'a> {
         labels: [&str; 3],
     ) -> crate::object_lock::Reuse {
         let expected = crate::object_lock::reuse_expectation(lock, unix_now_secs());
-        let read = note_store_request(
+        let mut read = note_store_request(
             self.backend.verify_retention(uri, None, &expected).await,
             "object_retention_probe",
             labels,
             &self.attempts,
             &self.throttles,
         );
+        // A HEAD answers a caller without s3:GetObjectRetention (or
+        // s3:GetObjectLegalHold) with no lock headers at all, which reads as
+        // no lock. Writing a new object on that would repeat for every
+        // replay while the permission is missing (review of #757), so an
+        // absence is confirmed with a request that is refused instead.
+        let part = match &read {
+            Ok(vtop_upload::RetentionCheck::Missing) => Some(vtop_upload::LockPart::Retention),
+            Ok(vtop_upload::RetentionCheck::LegalHoldMissing) => {
+                Some(vtop_upload::LockPart::LegalHold)
+            }
+            _ => None,
+        };
+        if let Some(part) = part {
+            let confirmed = note_store_request(
+                self.backend.confirm_lock_absent(uri, None, part).await,
+                "object_retention_probe",
+                labels,
+                &self.attempts,
+                &self.throttles,
+            );
+            match confirmed {
+                Ok(true) => {}
+                Ok(false) => {
+                    read = Err(VtopError::Upload(format!(
+                        "a HEAD of it reported no {part:?}, but {} reports one",
+                        part.permission()
+                    )))
+                }
+                Err(e) => {
+                    read = Err(VtopError::Upload(format!(
+                        "a HEAD of it reported no {part:?}, and confirming that was refused or \
+                         failed: {e}; without {} a store answers a HEAD with no lock at all",
+                        part.permission()
+                    )))
+                }
+            }
+        }
         crate::object_lock::judge_reuse(read, batch_id, tenant, uri, lock)
     }
 

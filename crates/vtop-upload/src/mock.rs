@@ -5,9 +5,9 @@
 //! committed" path without any external service.
 
 use crate::base::{
-    judge_retention, CreatedUpload, ObjectChecksum, ObjectHead, ObjectLockMode, ObjectLockPolicy,
-    RequestedRetention, RetentionCheck, RetentionExpectation, StoredManifest, StoredObject,
-    StoredRetention, UploadBackend, UploadedPart, VerificationResult,
+    judge_retention, CreatedUpload, LockPart, ObjectChecksum, ObjectHead, ObjectLockMode,
+    ObjectLockPolicy, RequestedRetention, RetentionCheck, RetentionExpectation, StoredManifest,
+    StoredObject, StoredRetention, UploadBackend, UploadedPart, VerificationResult,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -142,6 +142,10 @@ pub struct MockBackend {
     shadow_writes: bool,
     /// When set, every `verify_retention` fails with this message.
     retention_error: Option<String>,
+    /// The engine's credentials lack `s3:GetObjectRetention` and
+    /// `s3:GetObjectLegalHold` (#709): a HEAD answers with no lock headers,
+    /// and `confirm_lock_absent` is refused, as S3 does.
+    lock_read_denied: bool,
     /// Whether the bucket answers that Object Lock is enabled. True unless a
     /// test says otherwise.
     bucket_object_lock: bool,
@@ -251,6 +255,14 @@ impl MockBackend {
     /// Another writer re-puts every object, unlocked, right after it lands.
     pub fn with_shadow_writes(mut self) -> Self {
         self.shadow_writes = true;
+        self
+    }
+
+    /// The credentials lack the permissions to read a lock (#709): every
+    /// object reads as unlocked through a HEAD, and the requests that can
+    /// tell a refusal from an absence are refused.
+    pub fn without_lock_read_permission(mut self) -> Self {
+        self.lock_read_denied = true;
         self
     }
 
@@ -419,6 +431,7 @@ impl MockBackend {
             lock_fault: Mutex::new(None),
             shadow_writes: false,
             retention_error: None,
+            lock_read_denied: false,
             bucket_object_lock: true,
             lock_config_calls: AtomicUsize::new(0),
             lock_config_buckets: Mutex::new(Vec::new()),
@@ -1063,10 +1076,34 @@ impl UploadBackend for MockBackend {
                 "{object_uri} (version {version})"
             )));
         }
-        Ok(judge_retention(
-            &self.stored_retention(object_uri, Some(&version)),
-            expected,
-        ))
+        let kept = if self.lock_read_denied {
+            StoredRetention::default()
+        } else {
+            self.stored_retention(object_uri, Some(&version))
+        };
+        Ok(judge_retention(&kept, expected))
+    }
+
+    async fn confirm_lock_absent(
+        &self,
+        object_uri: &str,
+        version_id: Option<&str>,
+        part: LockPart,
+    ) -> Result<bool, VtopError> {
+        if self.lock_read_denied {
+            return Err(VtopError::Upload(format!(
+                "mock get_object_{} {object_uri}: AccessDenied (http 403)",
+                match part {
+                    LockPart::Retention => "retention",
+                    LockPart::LegalHold => "legal_hold",
+                }
+            )));
+        }
+        let kept = self.stored_retention(object_uri, version_id);
+        Ok(match part {
+            LockPart::Retention => kept.mode.is_none() && kept.retain_until_unix_secs.is_none(),
+            LockPart::LegalHold => kept.legal_hold != Some(true),
+        })
     }
 
     /// Overrides the default no-op only to count: the trait's default would

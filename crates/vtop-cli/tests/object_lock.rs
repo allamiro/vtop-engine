@@ -619,6 +619,63 @@ async fn a_retention_read_that_fails_at_the_reuse_decision_writes_nothing_and_do
     assert_eq!(Snapshot::of(&backend, &derived).await, old);
 }
 
+/// Review of #757: credentials that lost s3:GetObjectRetention get a HEAD
+/// with no lock headers, which reads as an unlocked object. That must not
+/// authorize a fresh object: the absence is confirmed with a request the
+/// store refuses, and a refusal fails the batch with nothing written, on
+/// every replay, rather than writing an object per cooldown window.
+#[tokio::test]
+async fn a_lost_lock_read_permission_never_writes_a_fallback_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 3);
+    let tenant = "lock-reuse-denied";
+    let lock = governance();
+    let (mut engine, backend, derived) = first_attempt_leaves_the_derived_object(
+        dir.path(),
+        tenant,
+        &input,
+        &lock,
+        locked_mock(&lock)
+            .without_lock_read_permission()
+            .with_throttled_manifest_puts(1),
+    )
+    .await;
+    // The object IS locked; the engine just cannot see it.
+    assert_eq!(
+        backend.stored_retention(&derived, None).mode.as_deref(),
+        Some("GOVERNANCE")
+    );
+    engine.set_lock_fallback_cooldown(Duration::ZERO);
+    let error_before = checks(tenant, "error");
+
+    for attempt in 2..=3 {
+        let out = engine.process_once(SourceType::File).await.unwrap();
+        assert!(!out[0].committed, "[{attempt}] {out:?}");
+        let failed = row(&engine, &out[0].batch_id).await;
+        assert!(
+            failed.object_uri.is_none() && failed.manifest_uri.is_none(),
+            "[{attempt}] nothing written: {failed:?}"
+        );
+        assert_says(
+            &failed.error_message.unwrap_or_default(),
+            &[
+                &derived,
+                "could not be read",
+                "confirming that was refused or failed",
+                "AccessDenied",
+                "s3:GetObjectRetention",
+                "it was neither reused nor replaced by a fresh object",
+            ],
+        );
+    }
+    for decision in FALLBACKS.iter().chain(["reused", "lock_withheld"].iter()) {
+        assert_eq!(decisions(tenant, decision), 0, "no {decision}");
+    }
+    assert_eq!(checks(tenant, "error"), error_before + 2);
+    assert_eq!(backend.version_count(&derived), 1);
+}
+
 /// The commit rule is unchanged by the fallback (#709): nothing commits
 /// before the retention check passes on the object the manifest names. A
 /// fresh object the store does not keep under the lock asked for (no lock,

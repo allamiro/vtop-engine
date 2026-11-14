@@ -28,8 +28,8 @@ use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use vtop_upload::s3_native::{S3NativeBackend, S3NativeConfig};
 use vtop_upload::{
-    upload_resumable, MultipartFence, MultipartUploadConfig, ObjectChecksum, ObjectLockMode,
-    ObjectLockPolicy, RetentionCheck, RetentionExpectation, UploadBackend,
+    upload_resumable, LockPart, MultipartFence, MultipartUploadConfig, ObjectChecksum,
+    ObjectLockMode, ObjectLockPolicy, RetentionCheck, RetentionExpectation, UploadBackend,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -373,6 +373,65 @@ async fn live_a_multipart_object_carries_the_lock_its_create_asked_for() {
         .await
         .unwrap()
         .passed());
+    tokio::time::sleep(retain + Duration::from_secs(2)).await;
+    clean_up(&client, &bucket, &prefix).await;
+}
+
+/// Review of #757 (#709): against a real store, `confirm_lock_absent` says a
+/// version written without a lock has none (S3 and MinIO answer
+/// NoSuchObjectLockConfiguration), and a locked, held version has both.
+#[tokio::test]
+#[ignore = "requires an S3-compatible endpoint with Object Lock"]
+async fn live_an_absent_lock_is_confirmed_and_a_present_one_is_not() {
+    let bucket = locked_bucket();
+    let prefix = unique("confirm");
+    let client = s3_client().await;
+    let plain = backend(None).await;
+    let unlocked_uri = format!("s3://{bucket}/{prefix}/unlocked.raw");
+    let f = file(b"written without a lock");
+    let unlocked = plain
+        .put_object(f.path(), &unlocked_uri, None)
+        .await
+        .unwrap();
+    for part in [LockPart::Retention, LockPart::LegalHold] {
+        assert!(
+            plain
+                .confirm_lock_absent(&unlocked_uri, unlocked.version_id.as_deref(), part)
+                .await
+                .unwrap_or_else(|e| panic!("{part:?} of an unlocked version: {e}")),
+            "{part:?}: an unlocked version has none"
+        );
+    }
+
+    let retain = Duration::from_secs(4);
+    let locked = backend(Some(ObjectLockPolicy::with_retention_for_tests(
+        ObjectLockMode::Governance,
+        retain,
+        true,
+    )))
+    .await;
+    let locked_uri = format!("s3://{bucket}/{prefix}/locked.raw");
+    let bytes = b"written under a lock and a hold";
+    let f = file(bytes);
+    let sha = vtop_core::checksum::sha256_bytes(bytes);
+    let stored = locked
+        .put_object(
+            f.path(),
+            &locked_uri,
+            Some(ObjectChecksum::new("sha256", &sha)),
+        )
+        .await
+        .unwrap();
+    for part in [LockPart::Retention, LockPart::LegalHold] {
+        assert!(
+            !locked
+                .confirm_lock_absent(&locked_uri, stored.version_id.as_deref(), part)
+                .await
+                .unwrap_or_else(|e| panic!("{part:?} of a locked version: {e}")),
+            "{part:?}: a locked, held version has it"
+        );
+    }
+
     tokio::time::sleep(retain + Duration::from_secs(2)).await;
     clean_up(&client, &bucket, &prefix).await;
 }

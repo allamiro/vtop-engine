@@ -178,6 +178,26 @@ pub struct RetentionExpectation {
     pub legal_hold: bool,
 }
 
+/// One part of an object's Object Lock state, for
+/// [`UploadBackend::confirm_lock_absent`] (#709).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockPart {
+    /// The retention mode and date (S3 `GetObjectRetention`).
+    Retention,
+    /// The legal hold (S3 `GetObjectLegalHold`).
+    LegalHold,
+}
+
+impl LockPart {
+    /// The permission a store checks before it answers for this part.
+    pub fn permission(self) -> &'static str {
+        match self {
+            Self::Retention => "s3:GetObjectRetention",
+            Self::LegalHold => "s3:GetObjectLegalHold",
+        }
+    }
+}
+
 /// The outcome of [`UploadBackend::verify_retention`] (#684). Its
 /// [`label`](Self::label) is the `result` of `vtop_object_lock_checks_total`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1023,6 +1043,29 @@ pub trait UploadBackend: Send + Sync {
         _expected: &RetentionExpectation,
     ) -> Result<RetentionCheck, VtopError> {
         Ok(RetentionCheck::Unsupported)
+    }
+
+    /// Confirm that one object version really has no retention, or no legal
+    /// hold, with a request that answers a refused permission with an error
+    /// rather than with silence (#709). S3 omits the lock headers from a
+    /// HEAD to a caller without `s3:GetObjectRetention` (the legal hold
+    /// without `s3:GetObjectLegalHold`), so
+    /// [`verify_retention`](Self::verify_retention) reads a lost permission
+    /// as a missing lock;
+    /// the engine asks this before it acts on a missing one by writing a new
+    /// object. `Ok(true)`: the store says there is none. `Ok(false)`: there
+    /// is one after all. `Err`: it could not be read. The default fails
+    /// closed.
+    async fn confirm_lock_absent(
+        &self,
+        object_uri: &str,
+        _version_id: Option<&str>,
+        part: LockPart,
+    ) -> Result<bool, VtopError> {
+        Err(VtopError::Upload(format!(
+            "backend {} cannot confirm the {part:?} of {object_uri}",
+            self.backend_name()
+        )))
     }
 
     /// HEAD/stat an object.

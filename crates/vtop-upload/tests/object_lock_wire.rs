@@ -27,7 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use vtop_upload::s3_native::{S3NativeBackend, S3NativeConfig};
 use vtop_upload::{
-    ObjectChecksum, ObjectLockMode, ObjectLockPolicy, RequestedRetention, RetentionCheck,
+    LockPart, ObjectChecksum, ObjectLockMode, ObjectLockPolicy, RequestedRetention, RetentionCheck,
     RetentionExpectation, UploadBackend,
 };
 
@@ -59,6 +59,9 @@ impl Seen {
 struct Answers {
     head_headers: Vec<(String, String)>,
     lock_config: Option<(&'static str, &'static str)>,
+    /// GetObjectRetention and GetObjectLegalHold (#709).
+    retention: Option<(&'static str, &'static str)>,
+    legal_hold: Option<(&'static str, &'static str)>,
 }
 
 #[derive(Clone, Default)]
@@ -82,6 +85,12 @@ impl Store {
     }
     fn answer_lock_config(&self, status: &'static str, body: &'static str) {
         self.answers.lock().unwrap().lock_config = Some((status, body));
+    }
+    fn answer_retention(&self, status: &'static str, body: &'static str) {
+        self.answers.lock().unwrap().retention = Some((status, body));
+    }
+    fn answer_legal_hold(&self, status: &'static str, body: &'static str) {
+        self.answers.lock().unwrap().legal_hold = Some((status, body));
     }
 
     async fn start(&self) -> String {
@@ -174,6 +183,19 @@ impl Store {
             ];
             h.extend(answers.head_headers.clone());
             ("200 OK", h, String::new())
+        } else if method == "GET" && (target.contains("retention") || target.contains("legal-hold"))
+        {
+            let answer = if target.contains("retention") {
+                answers.retention
+            } else {
+                answers.legal_hold
+            };
+            let (status, body) = answer.unwrap_or(("500 Internal Server Error", ""));
+            (
+                status,
+                vec![("content-type".into(), "application/xml".into())],
+                body.into(),
+            )
         } else if method == "GET" && target.contains("object-lock") {
             let (status, body) = answers
                 .lock_config
@@ -619,4 +641,84 @@ async fn a_locked_blake3_write_carries_a_checksum_value_even_when_calculation_is
             || request.header("x-amz-trailer").is_some(),
         "a locked write carries a checksum value, not only an algorithm name: {request:#?}"
     );
+}
+
+/// Review of #757 (#709): S3 answers a HEAD from a caller without
+/// `s3:GetObjectRetention` with no lock headers, so a lost permission reads
+/// as an unlocked object. Before the engine writes a fresh object for one,
+/// it confirms the absence with GetObjectRetention (GetObjectLegalHold for a
+/// hold), which answers a refused permission with AccessDenied and an object
+/// without a lock with NoSuchObjectLockConfiguration.
+#[tokio::test]
+async fn an_absent_lock_is_confirmed_with_a_request_that_refuses_rather_than_omits() {
+    let store = Store::default();
+    let endpoint = store.start().await;
+    let backend = backend(endpoint, None).await;
+    let uri = "s3://telemetry-locked/a/obj.raw";
+    let denied = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code>\
+                  <Message>Access Denied</Message></Error>";
+    let none = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error>\
+                <Code>NoSuchObjectLockConfiguration</Code>\
+                <Message>The specified object does not have a ObjectLock configuration</Message>\
+                </Error>";
+
+    // Retention: refused, absent, present.
+    store.answer_retention("403 Forbidden", denied);
+    let err = backend
+        .confirm_lock_absent(uri, Some("ver-1"), LockPart::Retention)
+        .await
+        .expect_err("a refused read proves nothing about the lock");
+    assert!(err.to_string().contains("403"), "{err}");
+    let request = store.seen().pop().unwrap();
+    assert_eq!(request.method, "GET");
+    assert!(
+        request.target.contains("retention") && request.target.contains("versionId=ver-1"),
+        "GetObjectRetention of the version given: {}",
+        request.target
+    );
+    store.answer_retention("404 Not Found", none);
+    assert!(backend
+        .confirm_lock_absent(uri, Some("ver-1"), LockPart::Retention)
+        .await
+        .unwrap());
+    store.answer_retention(
+        "200 OK",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Retention><Mode>GOVERNANCE</Mode>\
+         <RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate></Retention>",
+    );
+    assert!(!backend
+        .confirm_lock_absent(uri, Some("ver-1"), LockPart::Retention)
+        .await
+        .unwrap());
+
+    // The legal hold: refused, absent, off, on.
+    store.answer_legal_hold("403 Forbidden", denied);
+    assert!(backend
+        .confirm_lock_absent(uri, None, LockPart::LegalHold)
+        .await
+        .is_err());
+    let request = store.seen().pop().unwrap();
+    assert!(request.target.contains("legal-hold"), "{}", request.target);
+    assert!(!request.target.contains("versionId"), "{}", request.target);
+    store.answer_legal_hold("404 Not Found", none);
+    assert!(backend
+        .confirm_lock_absent(uri, None, LockPart::LegalHold)
+        .await
+        .unwrap());
+    store.answer_legal_hold(
+        "200 OK",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LegalHold><Status>OFF</Status></LegalHold>",
+    );
+    assert!(backend
+        .confirm_lock_absent(uri, None, LockPart::LegalHold)
+        .await
+        .unwrap());
+    store.answer_legal_hold(
+        "200 OK",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LegalHold><Status>ON</Status></LegalHold>",
+    );
+    assert!(!backend
+        .confirm_lock_absent(uri, None, LockPart::LegalHold)
+        .await
+        .unwrap());
 }
