@@ -19,15 +19,82 @@ use std::io::Cursor;
 #[derive(Clone)]
 pub struct MetaRaftStateMachine {
     store: MetaRaftStore,
+    /// This metadata node, named in its applied audit records (#694).
+    node_id: Option<NodeId>,
 }
 
 impl MetaRaftStateMachine {
     pub fn new(store: MetaRaftStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            node_id: None,
+        }
+    }
+
+    /// Name this replica in its applied audit records.
+    pub fn with_node_id(mut self, node_id: NodeId) -> Self {
+        self.node_id = Some(node_id);
+        self
     }
 
     pub fn store(&self) -> &MetaRaftStore {
         &self.store
+    }
+}
+
+impl MetaRaftStateMachine {
+    /// The applied record of an audited command (#694): every replica writes
+    /// one, with the request id and the log index, so the record comes from
+    /// the applied command and not only from the client. At least once: a
+    /// reader dedupes on the log index.
+    fn applied_record(
+        &self,
+        entry: &Entry<MetaRaftTypeConfig>,
+        command: &crate::command::MetadataCommand,
+        response: &crate::command::MetadataResponse,
+    ) -> Option<crate::audit::AuditRecord> {
+        let audit = crate::audit::command_audit(command)?;
+        let mut record = crate::audit::AuditRecord::for_command(
+            crate::audit::AuditStage::Applied,
+            crate::audit::AuditActor::Replica(self.node_id),
+            command,
+            audit,
+            crate::audit::AuditOutcome::Success,
+        );
+        let index = to_meta_index(entry.log_id.index);
+        record.log_index = Some(index);
+        if let crate::command::MetadataResponse::Rejected(error) = response {
+            record.outcome = crate::audit::AuditOutcome::Failure;
+            record.reason = Some(format!(
+                "rejected by the state machine at index {index}: {error}"
+            ));
+        }
+        Some(record)
+    }
+
+    fn membership_record(
+        &self,
+        entry: &Entry<MetaRaftTypeConfig>,
+        membership: &crate::MetaMembership,
+    ) -> crate::audit::AuditRecord {
+        let voters = membership
+            .voters
+            .iter()
+            .map(|id| id.0.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        crate::audit::AuditRecord {
+            stage: crate::audit::AuditStage::Applied,
+            action: crate::audit::AuditAction::ClusterMembership,
+            actor: crate::audit::AuditActor::Replica(self.node_id),
+            target_kind: "cluster",
+            target_id: None,
+            params: vec![("voters", voters)],
+            outcome: crate::audit::AuditOutcome::Success,
+            reason: None,
+            request_id: None,
+            log_index: Some(to_meta_index(entry.log_id.index)),
+        }
     }
 }
 
@@ -90,9 +157,10 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
 
         let mut resp_iter = responses.into_iter();
         let mut out = Vec::with_capacity(entries.len());
+        let mut applied = Vec::new();
         for entry in &entries {
             match &entry.payload {
-                EntryPayload::Normal(_) => {
+                EntryPayload::Normal(command) => {
                     let response = resp_iter.next().ok_or_else(|| {
                         sto_err_apply(
                             entry.log_id,
@@ -102,14 +170,18 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
                     let bytes = response.encode().map_err(|error| {
                         sto_err_apply(entry.log_id, format!("encode response: {error}"))
                     })?;
+                    if let Some(record) = self.applied_record(entry, command, &response) {
+                        applied.push(record);
+                    }
                     out.push(bytes);
                 }
                 EntryPayload::Membership(membership) => {
                     // apply_through already updated MetaStorage membership and
                     // flushed meta.membership_log_id; keep the openraft view.
-                    membership_to_meta(membership)?;
+                    let meta = membership_to_meta(membership)?;
                     guard.last_membership =
                         StoredMembership::new(Some(entry.log_id), membership.clone());
+                    applied.push(self.membership_record(entry, &meta));
                     out.push(Vec::new());
                 }
                 EntryPayload::Blank => out.push(Vec::new()),
@@ -120,6 +192,13 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
                 *last.get_log_id(),
                 "apply_through returned more Normal responses than Normal entries",
             ));
+        }
+        // After the store lock is released, and only for entries this call
+        // applied: a log replayed when the store opens is applied inside
+        // `MetaStorage`, never through here, so it writes no records.
+        drop(guard);
+        for record in &applied {
+            crate::audit::emit(record);
         }
         Ok(out)
     }

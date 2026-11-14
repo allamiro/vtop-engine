@@ -368,6 +368,33 @@ pub trait StateStore: Send + Sync {
     /// and a listed row that has since become the newest of its path stays.
     /// Returns the number deleted.
     async fn prune_listed(&self, older_than: &str, batch_ids: &[String]) -> Result<u64, VtopError>;
+
+    /// Append an audit record row to `audit_events` (#694), chained to the
+    /// row before it ([`crate::audit`]); keyed with a key derived from `key`
+    /// when one is given. Append only: no method updates or deletes a row,
+    /// and pruning never touches the table.
+    ///
+    /// The default refuses: a store that keeps no audit table (a test
+    /// double) must not pass for one that wrote the row.
+    async fn append_audit(
+        &self,
+        row: &crate::audit::AuditInsert,
+        key: Option<&vtop_core::manifest::ManifestMacKey>,
+    ) -> Result<crate::audit::AuditRow, VtopError> {
+        let _ = (row, key);
+        Err(crate::audit::unsupported())
+    }
+
+    /// Audit rows with `seq` above `after_seq`, in `seq` order, at most
+    /// `limit`.
+    async fn list_audit(
+        &self,
+        after_seq: i64,
+        limit: u32,
+    ) -> Result<Vec<crate::audit::AuditRow>, VtopError> {
+        let _ = (after_seq, limit);
+        Err(crate::audit::unsupported())
+    }
 }
 
 #[cfg(test)]

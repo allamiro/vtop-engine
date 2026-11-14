@@ -96,6 +96,16 @@ fn populated() -> String {
             .with_label_values(&[o])
             .inc_by(0);
     }
+    for a in telemetry::AUDIT_ACTIONS {
+        for o in telemetry::AUDIT_OUTCOMES {
+            m.audit_events_total.with_label_values(&[a, o]).inc_by(0);
+        }
+    }
+    for sink in telemetry::AUDIT_SINKS {
+        m.audit_write_failures_total
+            .with_label_values(&[sink])
+            .inc_by(0);
+    }
     m.inflight_batches.set(2);
     m.encode().expect("encode must succeed")
 }
@@ -211,7 +221,10 @@ fn every_exported_label_is_from_a_bounded_set() {
     // `manifest.write_version` accepts (#671 release B).
     // "reason" and "signal" label the OpenTelemetry exporter's own counters
     // (#683): three drop reasons and two signals, fixed in vtop-observe.
-    const BOUNDED: [&str; 14] = [
+    // "action" is the closed set of audit actions and "sink" one of log,
+    // file, ledger (#694); `outcome` there is attempt, success, failure or
+    // refused.
+    const BOUNDED: [&str; 16] = [
         "tenant",
         "source_type",
         "format",
@@ -226,6 +239,8 @@ fn every_exported_label_is_from_a_bounded_set() {
         "reason",
         "signal",
         "version",
+        "action",
+        "sink",
     ];
     let text = populated();
     let mut seen = std::collections::BTreeSet::new();
@@ -247,6 +262,54 @@ fn every_exported_label_is_from_a_bounded_set() {
         "labels {unexpected:?} are not in the bounded set {BOUNDED:?}; if one is \
          genuinely low-cardinality add it there, otherwise it belongs in logs"
     );
+}
+
+/// #694: the audit trail's counters are exported under their names, labelled
+/// by the closed sets only (never the actor, target or a path), and their
+/// action set is the one the audit records use.
+#[test]
+fn the_audit_counters_are_exported_with_bounded_labels() {
+    let text = populated();
+    for (name, labels) in [
+        ("vtop_audit_events_total", &["action=", "outcome="][..]),
+        ("vtop_audit_write_failures_total", &["sink="][..]),
+    ] {
+        assert!(
+            text.contains(&format!("# TYPE {name} counter")),
+            "{name} is not exported:\n{text}"
+        );
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with(&format!("{name}{{")))
+            .collect();
+        assert!(!series.is_empty(), "{name} has no series");
+        for line in series {
+            for label in labels {
+                assert!(line.contains(label), "{line} lacks {label}");
+            }
+        }
+    }
+    assert!(text.contains(r#"vtop_audit_events_total{action="ledger.prune",outcome="refused"}"#));
+    assert!(text.contains(r#"vtop_audit_write_failures_total{sink="ledger"}"#));
+    let actions: Vec<_> = vtop_observe::audit::Action::ALL
+        .iter()
+        .map(|a| a.as_str())
+        .collect();
+    assert_eq!(
+        actions,
+        telemetry::AUDIT_ACTIONS,
+        "the metric's action label set must be the audit record's action set"
+    );
+    let outcomes: Vec<_> = vtop_observe::audit::Outcome::ALL
+        .iter()
+        .map(|o| o.as_str())
+        .collect();
+    assert_eq!(outcomes, telemetry::AUDIT_OUTCOMES);
+    let sinks: Vec<_> = vtop_observe::audit::Sink::ALL
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    assert_eq!(sinks, telemetry::AUDIT_SINKS);
 }
 
 /// #664: the counter an alert on "verified strong, re-checked size-only" reads

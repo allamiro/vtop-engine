@@ -32,6 +32,7 @@ pub fn init_tracing(level: &str, json: bool, instance: Option<&str>) -> Result<(
         // exists only when `/metrics` is served.
         match telemetry::init() {
             Ok(m) => {
+                crate::audit::bind_counters(m);
                 if let Err(e) = otel::register_registry(&m.registry) {
                     tracing::warn!(error = %e, "OpenTelemetry counters could not be registered");
                 }

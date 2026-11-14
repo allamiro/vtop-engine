@@ -38,6 +38,8 @@ pub async fn serve(
 ) -> Result<(), String> {
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
+    // The metadata plane's audit records (#694) are written by this node.
+    crate::audit::install_meta(config.node_id);
 
     // PEERS GO IN BY NAME, NOT BY THE ADDRESS THE NAME HAPPENS TO HOLD NOW
     // (#367). This used to resolve each peer once, here, and store the

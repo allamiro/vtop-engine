@@ -595,7 +595,7 @@ async fn run_inner(command: NodeCommand, json: bool) -> Result<i32, String> {
             timeout_seconds,
         } => {
             let config = load_config(&common.config)?;
-            repair(
+            let repaired = repair(
                 &config,
                 from,
                 &into,
@@ -604,7 +604,37 @@ async fn run_inner(command: NodeCommand, json: bool) -> Result<i32, String> {
                 Duration::from_secs(timeout_seconds),
                 json,
             )
-            .await
+            .await;
+            // The repair writes a range into a local directory from another
+            // node: who ran it, from where, into what, and how it ended
+            // (#694). The serving leader records its side.
+            let mut event = vtop_observe::audit::AuditEvent::new(
+                vtop_observe::audit::Action::NodeRepair,
+                vtop_observe::audit::Stage::Local,
+                vtop_observe::audit::Actor::local(),
+                vtop_observe::audit::Target::new(
+                    "range",
+                    Some(format!("{}/{}", config.range.topic, config.range.range_id)),
+                ),
+                match &repaired {
+                    Ok(0) => vtop_observe::audit::Outcome::Success,
+                    _ => vtop_observe::audit::Outcome::Failure,
+                },
+            )
+            .param("side", "client")
+            .param("from", from)
+            .param("into", into.display())
+            .param("fencing_epoch", fencing_epoch)
+            .param("seal_tail", seal_tail);
+            match &repaired {
+                Err(error) => event = event.reason(error),
+                Ok(code) if *code != 0 => {
+                    event = event.reason(format!("the repair exited {code}"));
+                }
+                Ok(_) => {}
+            }
+            crate::audit::record_best_effort(&event);
+            repaired
         }
         NodeCommand::PromoteUnproven {
             meta_config,
@@ -615,14 +645,34 @@ async fn run_inner(command: NodeCommand, json: bool) -> Result<i32, String> {
             i_accept_data_loss,
             request_id,
         } => {
-            let operator = attesting_operator(
+            let request_id = request_id.unwrap_or_else(Uuid::new_v4);
+            let operator = match attesting_operator(
                 i_accept_data_loss,
                 operator,
                 std::env::var("USER")
                     .ok()
                     .or_else(|| std::env::var("LOGNAME").ok()),
-            )?;
-            let request_id = request_id.unwrap_or_else(Uuid::new_v4);
+            ) {
+                Ok(operator) => operator,
+                Err(refusal) => {
+                    // Refused before anything was sent: a refused
+                    // destructive action is itself on the record (#694).
+                    let event = vtop_observe::audit::AuditEvent::new(
+                        vtop_observe::audit::Action::PromotionAttest,
+                        vtop_observe::audit::Stage::Client,
+                        vtop_observe::audit::Actor::local(),
+                        vtop_observe::audit::Target::new("range", Some(format!("{topic}/{range}"))),
+                        vtop_observe::audit::Outcome::Refused,
+                    )
+                    .request_id(request_id)
+                    .param("topic_uuid", topic)
+                    .param("range_uuid", range)
+                    .param("replica_node_uuid", replica)
+                    .reason(format!("refused before sending: {refusal}"));
+                    crate::audit::record_best_effort(&event);
+                    return Err(refusal);
+                }
+            };
             // On stderr in both modes, so a --json run still learns the id it
             // must retry with.
             eprintln!(
@@ -659,16 +709,46 @@ async fn run_inner(command: NodeCommand, json: bool) -> Result<i32, String> {
             max_group_bytes,
             max_segment_bytes,
             max_segment_records,
-        } => reconfigure_range(
-            &data_dir,
-            vtop_log::RollThresholds {
-                max_record_bytes,
-                max_group_bytes,
-                max_segment_bytes,
-                max_segment_records,
-            },
-            json,
-        ),
+        } => {
+            let reconfigured = reconfigure_range(
+                &data_dir,
+                vtop_log::RollThresholds {
+                    max_record_bytes,
+                    max_group_bytes,
+                    max_segment_bytes,
+                    max_segment_records,
+                },
+                json,
+            );
+            // Rewrites the thresholds every later segment of the range is
+            // rolled by (#694).
+            let mut event = vtop_observe::audit::AuditEvent::new(
+                vtop_observe::audit::Action::NodeReconfigureRange,
+                vtop_observe::audit::Stage::Local,
+                vtop_observe::audit::Actor::local(),
+                vtop_observe::audit::Target::new("data_dir", Some(data_dir.display().to_string())),
+                match &reconfigured {
+                    Ok(0) => vtop_observe::audit::Outcome::Success,
+                    _ => vtop_observe::audit::Outcome::Failure,
+                },
+            )
+            .param("data_dir", data_dir.display());
+            for (name, value) in [
+                ("max_record_bytes", max_record_bytes.map(u64::from)),
+                ("max_group_bytes", max_group_bytes),
+                ("max_segment_bytes", max_segment_bytes),
+                ("max_segment_records", max_segment_records),
+            ] {
+                if let Some(value) = value {
+                    event = event.param(name, value);
+                }
+            }
+            if let Err(error) = &reconfigured {
+                event = event.reason(error);
+            }
+            crate::audit::record_best_effort(&event);
+            reconfigured
+        }
     }
 }
 

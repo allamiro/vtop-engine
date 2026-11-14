@@ -4,6 +4,7 @@
 //! logic lives in [`engine`] so it can be exercised directly by integration
 //! tests; [`commands`] wires it to the CLI.
 
+pub mod audit;
 pub mod commands;
 pub mod coverage;
 pub mod engine;

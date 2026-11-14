@@ -26,6 +26,7 @@
 //!
 //! Compiled only with `--features postgres`.
 
+use crate::audit::{AuditInsert, AuditRow};
 use crate::models::{
     BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset, VerificationClass,
 };
@@ -268,7 +269,7 @@ fn map_schema_check(error: sqlx::Error) -> VtopError {
             None => schema_migration_required(),
         },
         Some("42501") => VtopError::State(
-            "PostgreSQL runtime identity lacks schema/table access; grant USAGE on the state-store schema and SELECT, INSERT, UPDATE on batches"
+            "PostgreSQL runtime identity lacks schema/table access; grant USAGE on the state-store schema, SELECT, INSERT, UPDATE on batches, and SELECT, INSERT on audit_events with USAGE on its sequence audit_events_seq_seq"
                 .into(),
         ),
         _ => map_sqlx(error),
@@ -455,6 +456,19 @@ impl PgStateStore {
         if !admits_every_state {
             return Err(schema_migration_required());
         }
+
+        // The audit table (#694): `prune-ledger`, `replay` and `migrate`
+        // refuse to run without it, so an engine of this release refuses a
+        // schema that lacks it, naming it, rather than leave the first
+        // replay to find out.
+        sqlx::query(concat!(
+            "SELECT ",
+            audit_columns!(),
+            " FROM audit_events WHERE FALSE"
+        ))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_schema_check)?;
         Ok(())
     }
 
@@ -983,6 +997,100 @@ impl StateStore for PgStateStore {
         })
         .await?;
         Ok(result.rows_affected())
+    }
+
+    async fn append_audit(
+        &self,
+        row: &AuditInsert,
+        key: Option<&vtop_core::manifest::ManifestMacKey>,
+    ) -> Result<AuditRow, VtopError> {
+        // One transaction, under an advisory lock every writer takes, from
+        // reading the last link to inserting the next: two writers cannot
+        // chain to the same row. An advisory lock rather than LOCK TABLE,
+        // which the runtime role (SELECT, INSERT) may not take in a mode
+        // that excludes another inserter.
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('vtop-audit-chain'))")
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        let previous: Option<String> =
+            sqlx::query_scalar("SELECT hash FROM audit_events ORDER BY seq DESC LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+        let (hash, chain) = crate::audit::link_for(previous.as_deref(), &row.record, key);
+        let version = i32::try_from(row.audit_version).map_err(|_| {
+            VtopError::State(format!(
+                "audit_version {} is out of range",
+                row.audit_version
+            ))
+        })?;
+        let seq: i64 = sqlx::query_scalar(
+            "INSERT INTO audit_events (audit_id, time, action, outcome, actor, target, \
+             audit_version, record, prev_hash, hash, chain) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING seq",
+        )
+        .bind(&row.audit_id)
+        .bind(&row.time)
+        .bind(&row.action)
+        .bind(&row.outcome)
+        .bind(&row.actor)
+        .bind(&row.target)
+        .bind(version)
+        .bind(&row.record)
+        .bind(&previous)
+        .bind(&hash)
+        .bind(chain)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(AuditRow {
+            seq,
+            audit_id: row.audit_id.clone(),
+            time: row.time.clone(),
+            action: row.action.clone(),
+            outcome: row.outcome.clone(),
+            actor: row.actor.clone(),
+            target: row.target.clone(),
+            audit_version: row.audit_version,
+            record: row.record.clone(),
+            prev_hash: previous,
+            hash,
+            chain: chain.to_owned(),
+        })
+    }
+
+    async fn list_audit(&self, after_seq: i64, limit: u32) -> Result<Vec<AuditRow>, VtopError> {
+        let rows = with_retry(|| {
+            sqlx::query(concat!(
+                "SELECT ",
+                audit_columns!(),
+                " FROM audit_events WHERE seq > $1 ORDER BY seq LIMIT $2"
+            ))
+            .bind(after_seq)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+        })
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| AuditRow {
+                seq: row.get("seq"),
+                audit_id: row.get("audit_id"),
+                time: row.get("time"),
+                action: row.get("action"),
+                outcome: row.get("outcome"),
+                actor: row.get("actor"),
+                target: row.get("target"),
+                audit_version: i64::from(row.get::<i32, _>("audit_version")),
+                record: row.get("record"),
+                prev_hash: row.get("prev_hash"),
+                hash: row.get("hash"),
+                chain: row.get("chain"),
+            })
+            .collect())
     }
 }
 

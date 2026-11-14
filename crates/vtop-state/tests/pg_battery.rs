@@ -84,6 +84,22 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         "missing schema must give migration guidance: {err}"
     );
 
+    // #694: a schema without the audit table is not runtime-ready either,
+    // and the refusal names the table, so the operator knows which release's
+    // migration has not run. Owned by the migration identity, the table can
+    // be dropped by it.
+    PgStateStore::migrate(&migrator_conn).await.unwrap();
+    let admin = PgStateStore::connect(&migrator_conn).await.unwrap();
+    admin.execute_raw("DROP TABLE audit_events").await.unwrap();
+    let err = match PgStateStore::connect(&migrator_conn).await {
+        Ok(_) => panic!("runtime connect must refuse a schema without audit_events"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("audit_events") && err.contains("vtopctl migrate"),
+        "a missing audit table must be named, with migration guidance: {err}"
+    );
+
     // A table without the database invariant is also not runtime-ready.
     PgStateStore::migrate(&migrator_conn).await.unwrap();
     let admin = PgStateStore::connect(&migrator_conn).await.unwrap();
@@ -450,7 +466,9 @@ $fn$ LANGUAGE plpgsql;",
              REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM vtop_runtime_test; \
              REVOKE CREATE ON SCHEMA public FROM vtop_runtime_test; \
              GRANT USAGE ON SCHEMA public TO vtop_runtime_test; \
-             GRANT SELECT, INSERT, UPDATE ON TABLE batches TO vtop_runtime_test;",
+             GRANT SELECT, INSERT, UPDATE ON TABLE batches TO vtop_runtime_test; \
+             GRANT SELECT, INSERT ON TABLE audit_events TO vtop_runtime_test; \
+             GRANT USAGE ON SEQUENCE audit_events_seq_seq TO vtop_runtime_test;",
         )
         .await
         .unwrap();
@@ -473,6 +491,13 @@ $fn$ LANGUAGE plpgsql;",
         ),
         ("DELETE FROM batches WHERE FALSE", "DELETE"),
         ("TRUNCATE batches", "TRUNCATE"),
+        // #694: the runtime role appends audit rows and can change none.
+        (
+            "UPDATE audit_events SET outcome = 'success' WHERE FALSE",
+            "UPDATE audit",
+        ),
+        ("DELETE FROM audit_events WHERE FALSE", "DELETE audit"),
+        ("TRUNCATE audit_events", "TRUNCATE audit"),
     ] {
         let err = match store.execute_raw(sql).await {
             Ok(()) => panic!("runtime identity unexpectedly gained {operation}"),
@@ -490,6 +515,34 @@ $fn$ LANGUAGE plpgsql;",
 
     // ---- 2. Same behavioural contract as every backend, using DML only ----
     test_battery::run_all(&store).await;
+    // The audit table (#694), as the runtime role writes it.
+    test_battery::run_audit_battery(&store).await;
+
+    // Append only as a database property, not only a grant: a role that is
+    // GRANTED update and delete on the table (as a maintenance role granted
+    // DELETE for prune-ledger might be) is still refused by the trigger.
+    admin
+        .execute_raw("GRANT UPDATE, DELETE, TRUNCATE ON TABLE audit_events TO vtop_runtime_test")
+        .await
+        .unwrap();
+    for (sql, operation) in [
+        ("UPDATE audit_events SET outcome = 'success'", "UPDATE"),
+        ("DELETE FROM audit_events", "DELETE"),
+        ("TRUNCATE audit_events", "TRUNCATE"),
+    ] {
+        let err = match store.execute_raw(sql).await {
+            Ok(()) => panic!("audit_events allowed {operation} to a non-owner"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("append-only"),
+            "the trigger must refuse {operation}: {err}"
+        );
+    }
+    admin
+        .execute_raw("REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_events FROM vtop_runtime_test")
+        .await
+        .unwrap();
 
     // ---- 2a. The claim fence (#557): two runtime connections stand for two
     // engines on one shared ledger.

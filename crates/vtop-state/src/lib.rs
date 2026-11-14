@@ -27,6 +27,16 @@ macro_rules! batch_columns {
     };
 }
 
+/// The columns of an `audit_events` row, by name, as `batch_columns!` names
+/// the ledger's (#694).
+macro_rules! audit_columns {
+    () => {
+        "seq, audit_id, time, action, outcome, actor, target, audit_version, record, \
+         prev_hash, hash, chain"
+    };
+}
+
+pub mod audit;
 pub mod deadline;
 mod fence;
 pub mod models;
@@ -41,6 +51,7 @@ pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_battery;
 
+pub use audit::{verify_chain, AuditInsert, AuditRow, ChainReport};
 pub use models::{
     BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset, VerificationClass,
 };

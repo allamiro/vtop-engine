@@ -63,6 +63,8 @@ pub async fn maybe_start() -> Option<SocketAddr> {
     let tls = vtop_observe::tls_from_env_or_disabled()?;
     match telemetry::init() {
         Ok(m) => {
+            // The audit trail's counters (#694) count from here on.
+            crate::audit::bind_counters(m);
             // The OpenTelemetry exporter's counters (#683) are served here
             // too, so a broken collector shows on the scrape; they read 0 with
             // export off.

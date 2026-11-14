@@ -68,6 +68,48 @@ impl ManifestMacKey {
     fn authenticate(&self, bytes: &[u8]) -> blake3::Hash {
         blake3::keyed_hash(&self.0, bytes)
     }
+
+    /// The keyed link of the audit table's hash chain (#694), under a key
+    /// derived from this one for that purpose alone: an audit link can never
+    /// be presented as a manifest MAC, nor a manifest MAC as a link.
+    fn audit_link(&self, bytes: &[u8]) -> blake3::Hash {
+        let key = blake3::derive_key(AUDIT_CHAIN_CONTEXT, &self.0);
+        blake3::keyed_hash(&key, bytes)
+    }
+}
+
+/// The BLAKE3 key-derivation context of the audit chain's key.
+const AUDIT_CHAIN_CONTEXT: &str = "vtop-engine 2026 audit_events chain v1";
+
+/// The chain's name for an unkeyed link.
+pub const AUDIT_CHAIN_UNKEYED: &str = "blake3";
+/// The chain's name for a link keyed with (a key derived from) the manifest
+/// MAC key.
+pub const AUDIT_CHAIN_KEYED: &str = "blake3-keyed";
+
+/// One link of the audit table's hash chain (#694): the hash of the previous
+/// row's link and this row's record, exactly as stored. Keyed when `key` is
+/// given, so a writer who can edit the table cannot recompute the chain
+/// without the key. Returns the link (lowercase hex) and the chain's name.
+pub fn audit_chain_link(
+    previous: Option<&str>,
+    record: &str,
+    key: Option<&ManifestMacKey>,
+) -> (String, &'static str) {
+    let mut bytes = Vec::with_capacity(record.len() + 72);
+    bytes.extend_from_slice(previous.unwrap_or("").as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(record.as_bytes());
+    match key {
+        Some(key) => (
+            key.audit_link(&bytes).to_hex().to_string(),
+            AUDIT_CHAIN_KEYED,
+        ),
+        None => (
+            blake3::hash(&bytes).to_hex().to_string(),
+            AUDIT_CHAIN_UNKEYED,
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
