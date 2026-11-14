@@ -153,8 +153,12 @@ pub(crate) struct DeliveryState {
     pub(crate) sink: Option<Arc<dyn Auditor>>,
     /// Every record this replica owes at or below this index was accepted.
     pub(crate) delivered: u64,
-    /// A gap record a sink refused; delivered first, next time.
-    pending_gap: Option<AuditRecord>,
+    /// A snapshot's gap record a sink refused, and the snapshot index it
+    /// covers: delivered first next time, and only then does the frontier
+    /// move to that index. In memory only on purpose: the frontier was not
+    /// moved, so a restart re-derives the same gap from the log (#767
+    /// review).
+    pending_gap: Option<(AuditRecord, u64)>,
 }
 
 impl DeliveryState {
@@ -313,10 +317,16 @@ impl MetaRaftStore {
 
     /// A snapshot install moved this replica to `snapshot_index` without
     /// applying the entries below it one by one: their records cannot be
-    /// re-derived here. One gap record says so, and the frontier moves to
-    /// the snapshot - even if the sink refuses the gap record, so a later
-    /// replay never reads entries the snapshot replaced (they may be a
-    /// stale branch). A refused gap record is delivered first next time.
+    /// re-derived here. One gap record says so, and once the sink accepts
+    /// it the frontier moves to the snapshot.
+    ///
+    /// If the sink refuses it, the frontier stays where it was (#767
+    /// review): moving it would lose the gap at the next restart, since the
+    /// pending record is in memory only. The record is delivered first next
+    /// time, which then moves the frontier. A restart before that re-derives
+    /// the same range as a gap from the log: `readable_from` never reads
+    /// below a snapshot the log does not agree with, so the stale branch the
+    /// snapshot replaced is never read either way.
     pub(crate) fn snapshot_installed(&self, delivery: &mut DeliveryState, snapshot_index: u64) {
         if snapshot_index <= delivery.delivered {
             return;
@@ -335,30 +345,35 @@ impl MetaRaftStore {
             describe_node(delivery.node_id)
         );
         self.progress.count_gap(GapReason::SnapshotInstall);
-        if let Err(error) = delivery.send(&gap) {
-            self.sink_failed(delivery, from, &error);
-            delivery.pending_gap = Some(gap);
+        match delivery.send(&gap) {
+            Ok(()) => delivery.delivered = snapshot_index,
+            Err(error) => {
+                self.sink_failed(delivery, from, &error);
+                delivery.pending_gap = Some((gap, snapshot_index));
+            }
         }
-        delivery.delivered = snapshot_index;
         self.save_frontier(delivery, true);
     }
 
     /// Deliver `(delivered, applied]` from the log, in order, marked
     /// `replayed`. A range the log no longer holds gets one gap record.
     fn catch_up(&self, delivery: &mut DeliveryState, reason: ReplayReason) -> bool {
-        if let Some(gap) = delivery.pending_gap.take() {
+        if let Some((gap, through)) = delivery.pending_gap.take() {
             if let Err(error) = delivery.send(&gap) {
                 self.sink_failed(delivery, delivery.delivered, &error);
-                delivery.pending_gap = Some(gap);
+                delivery.pending_gap = Some((gap, through));
                 return false;
             }
+            delivery.delivered = delivery.delivered.max(through);
         }
         let (applied, gap, records) = {
             let guard = self.lock();
             let storage = &guard.storage;
             let applied = storage.last_applied();
             if delivery.delivered >= applied {
-                self.progress.applied.store(applied, Ordering::Relaxed);
+                drop(guard);
+                // A refused gap delivered just now moved the frontier.
+                self.save_frontier(delivery, true);
                 return true;
             }
             let from = delivery.delivered + 1;

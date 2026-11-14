@@ -342,8 +342,8 @@ async fn a_snapshot_install_writes_one_gap_record_and_moves_the_frontier() {
         .unwrap();
     assert_eq!(
         audited_frontier(&store),
-        Some(10),
-        "the frontier moves past entries the snapshot replaced, even unrecorded"
+        Some(0),
+        "a refused gap record leaves the frontier where it was"
     );
     assert_eq!(store.audit_progress().gaps[0], 1);
 
@@ -362,6 +362,77 @@ async fn a_snapshot_install_writes_one_gap_record_and_moves_the_frontier() {
         .unwrap()
         .contains("dedupe on the log index"));
     assert_eq!(sink.indexes(), Vec::<u64>::new(), "nothing re-derived");
+    assert_eq!(audited_frontier(&store), Some(10), "delivered, so moved");
+}
+
+/// #767 review: a sink that refuses the snapshot's gap record and a restart
+/// before it recovers must not lose the gap. The frontier did not move, so
+/// the restarted replica re-derives the range as a gap from the log - and
+/// reads none of the stale branch the snapshot replaced.
+#[tokio::test]
+async fn a_refused_snapshot_gap_survives_a_restart() {
+    let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/leader"));
+    sim.create_dir_all(Path::new("/n"));
+    let env = sim.env(0x70a);
+    let mut leader = MetaStorage::open_in(&env, "/leader", cluster()).unwrap();
+    let mut entries = workload(10);
+    entries[0] = MetaLogEntry {
+        term: 2,
+        index: 1,
+        payload: MetaLogPayload::Membership(MetaMembership {
+            voters: vec![MetaNodeId(1), MetaNodeId(2)],
+            learners: vec![],
+            joint_outgoing: None,
+        }),
+    };
+    for entry in &mut entries {
+        entry.term = 2;
+    }
+    leader.append(&entries).unwrap();
+    leader.apply_through(10).unwrap();
+    let snapshot = leader.write_snapshot().unwrap();
+    let bytes = env.storage.read(&snapshot.path).unwrap();
+
+    // The follower holds a stale branch of term 1 it never applied.
+    append(&env, &workload(4));
+    let refusing = Sink::refusing();
+    let (store, mut machine) = open(&env, &refusing);
+    let membership = openraft::Membership::new(
+        vec![std::collections::BTreeSet::from([1u64, 2u64])],
+        None::<BTreeSet<u64>>,
+    );
+    let meta = SnapshotMeta {
+        last_log_id: Some(LogId::new(CommittedLeaderId::new(2, 0), 9)),
+        last_membership: StoredMembership::new(
+            Some(LogId::new(CommittedLeaderId::new(2, 0), 0)),
+            membership,
+        ),
+        snapshot_id: snapshot.snapshot_id.clone(),
+    };
+    machine
+        .install_snapshot(&meta, Box::new(Cursor::new(bytes)))
+        .await
+        .unwrap();
+    assert_eq!(audited_frontier(&store), Some(0));
+    drop((store, machine));
+    sim.crash();
+    sim.reboot();
+
+    let sink = Arc::new(Sink::default());
+    let (store, _machine) = open(&env, &sink);
+    assert!(store.deliver_pending(ReplayReason::Restart));
+    let gaps = sink.gaps();
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    let params: BTreeMap<_, _> = gaps[0].params.iter().cloned().collect();
+    assert_eq!(params["from_index"], "1");
+    assert_eq!(params["through_index"], "10");
+    assert!(
+        sink.indexes().is_empty(),
+        "the stale branch was read: {:?}",
+        sink.indexes()
+    );
+    assert_eq!(audited_frontier(&store), Some(10));
 }
 
 /// A store written by a release before #706 has no audit frontier: its
