@@ -347,10 +347,18 @@ def test_projected_hours_over_the_limit_refuses_before_any_docker_call(monkeypat
     assert calls == []
 
 
-def test_vtop_running_once_per_cell_halves_its_share_of_the_projection():
+def test_vtop_sharing_its_configuration_saves_one_bring_up_and_its_unrated_runs_per_extra_profile():
+    """#596: VTOP brings its cluster up and makes its saturation, consume and
+    e2e runs once per cell; its fixed-rate runs are per profile, because their
+    rates come from that profile's Kafka saturation."""
+    t = plan.DEFAULT_TIMING
     shared = plan.projected_seconds(FULL)
     separate = plan.projected_seconds({**FULL, "vtop_profiles_share_config": False})
-    assert shared == pytest.approx(separate * 3 / 4)
+    main_cells, slice_cells, reps = 3 * 2 * 2 * 2, 1, 3
+    unrated_main = t["saturation"] + t["consume"] + t["e2e"]
+    saved = (main_cells * (t["bring_up"] + t["warm_up"] + reps * unrated_main)
+             + slice_cells * (t["bring_up"] + t["warm_up"] + reps * t["saturation"]))
+    assert separate - shared == pytest.approx(saved)
 
 
 # ------------------------------------------------------------------- --check
@@ -413,9 +421,9 @@ def test_the_projection_charges_each_fixed_rate_run_its_configured_duration():
     fixed-rate runs, and must not pass a 30-hour budget."""
     short = {**SMALL, "fixed_seconds": 30}
     long = {**SMALL, "fixed_seconds": 7200}
-    fixed_runs = 2 * 2 * 2 * 3 * 4  # cells x profiles x systems x reps x rates, VTOP once per profile pair
+    fixed_runs = 2 * 2 * 2 * 3 * 4  # cells x profiles x systems x reps x rates: every system runs every profile's
     assert plan.projected_seconds(long) - plan.projected_seconds(short) == pytest.approx(
-        fixed_runs * 3 / 4 * (7200 - 30))
+        fixed_runs * (7200 - 30))
     with pytest.raises(plan.PlanRefused, match="over --max-hours 30"):
         plan.check_budget(long, 30)
 

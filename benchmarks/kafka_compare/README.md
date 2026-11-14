@@ -31,7 +31,9 @@ python3 benchmarks/kafka_compare/regenerate.py
 Useful knobs: `--sizes 100,1024`, `--reps 3`, `--sat-records 100:3000000,1024:1000000` (records per
 saturation run AND per consume run, per record size), `--fixed-seconds 30` (a fixed-rate run sends rate x this many records),
 `--smoke-records`, `--no-consume`, `--rebuild`, `--run-id` (one path component), `--max-hours 30`.
-Every one is checked before any Docker work, and so is the matrix's projected run time (`plan.py`):
+The cell shape is set with `--partitions 1,6`, `--producers 1,4`, `--compressions none,zstd` and
+`--profiles defaults,fsync-parity` (#596); the defaults are the phase-1 shape. Every one is checked before
+any Docker work, and so is the matrix's projected run time (`plan.py`):
 a matrix projected past `--max-hours` is refused before the first container starts.
 
 ```bash
@@ -71,6 +73,32 @@ For each record size, Kafka first and then VTOP:
 6. **Consume.** `kafka-consumer-perf-test` reads `--sat-records` records from the start of the log with a
    fresh group, `--reps` times; the recorded rates are its `fetch.*` columns, which exclude the group join.
 7. **Down.** The leader's log is saved under `logs/`, the cluster is removed with its volumes.
+
+## Cells, topology and profiles (#596)
+
+- **Partitions.** Kafka's topic is created with the cell's partition count (RF 3, `min.insync.replicas=2`).
+  For VTOP each partition is one range, replicated to all three containers, so N partitions are 3N
+  `vtop-node data` processes in the same three containers and cgroups Kafka's brokers get.
+  `topology.py` writes every process's config for the cell into the run directory
+  (`vtop-config/p<N>/vtop-<c>/p<p>-<role>.yaml`, hashes in `environment.json`). Partition p is led by
+  container (p mod 3) + 1, so at six partitions each container leads two ranges and follows four, and a
+  client's Metadata shows six brokers where Kafka's shows three (the report states it).
+  `vtop/run-node.sh` is the containers' entrypoint: it starts the followers, starts each leader once its
+  followers in the other containers answer `/readyz`, and stops the container if any process exits.
+- **Producers.** N `kafka-producer-perf-test` processes run at once in the one client container, each
+  sending records/N at rate/N. Throughput is their sum; percentiles cannot be merged, so the row carries
+  the worst producer's (`lat_basis=worst-of-N`).
+- **Compression.** The producer's `compression.type` is the cell's codec, for the timed runs and the smoke.
+- **Profiles.** `fsync-parity` sets `log.flush.interval.messages=1` on every broker and
+  `flush.messages=1` on the topic, so Kafka flushes before it acknowledges. VTOP's node configuration is
+  the same under both profiles (it acknowledges at a quorum of 2 of 3 whose appends are fsynced), so its
+  cluster is brought up once per cell. Its saturation and consume rows are measured once and repeated
+  under the other profile with `same_config_as`. Its fixed-rate rows are measured per profile, because
+  their rates are a share of that profile's Kafka saturation.
+- **Smoke gate.** Before any timing, keyed records of the cell's size and codec are produced with
+  `acks=all` and read back partition by partition. The union must be exactly the produced set, each
+  record once, each partition in produced order, every partition written, and every `CreateTime`
+  inside the smoke's own produce window. A failed gate writes `refused` rows for the whole cell.
 
 ## Output
 

@@ -120,6 +120,14 @@ fetch.time.ms, fetch.MB.sec, fetch.nMsg.sec
 """
 
 
+def fake_ctx(tmp_path, **cell):
+    return {"cell": {"partitions": 1, "producers": 1, "compression": "none", "profile": "defaults", **cell},
+            "run_id": "r", "run_dir": str(tmp_path), "csv": str(tmp_path / "results.csv"), "fingerprint": "f",
+            "env": {"comparable": {"vtop_commit": "a" * 40}, "observed": {}, "events": []},
+            "vtop_image": "vtop-bench:x", "reps": 1, "sat_records": {100: 150447}, "fixed_seconds": 1.0,
+            "smoke_records": 1, "sat_timeout": 10.0, "consume": True}
+
+
 @pytest.mark.parametrize("returncode, status", [(0, "ok"), (1, "failed")])
 def test_a_consumer_that_exits_nonzero_is_failed_even_with_a_summary(monkeypatch, tmp_path, returncode, status):
     rows = []
@@ -132,12 +140,94 @@ def test_a_consumer_that_exits_nonzero_is_failed_even_with_a_summary(monkeypatch
     monkeypatch.setattr(run, "client", lambda *_a, **_k: subprocess.CompletedProcess([], returncode,
                                                                                     CONSUMER_OUTPUT, ""))
     monkeypatch.setattr(run.schema, "append_row", lambda _path, row: rows.append(dict(row)))
-    ctx = {"run_id": "r", "run_dir": str(tmp_path), "csv": str(tmp_path / "results.csv"), "fingerprint": "f",
-           "env": {"comparable": {"vtop_commit": "a" * 40}, "observed": {}, "events": []},
-           "vtop_image": "vtop-bench:x", "reps": 1, "sat_records": {100: 150447}, "fixed_seconds": 1.0,
-           "smoke_records": 1, "sat_timeout": 10.0, "consume": True}
+    ctx = fake_ctx(tmp_path)
     run.run_cell(ctx, "vtop", 100, {25: 100, 50: 200, 75: 300})
     consume = [row for row in rows if row["mode"] == "consume"]
     assert [row["status"] for row in consume] == [status]
     if status == "failed":
         assert "exited nonzero" in consume[0]["note"]
+
+
+def fake_cluster(monkeypatch, rows, calls):
+    produced = perftool.ProducerResult(1000, 1000.0, 1.0, 1.0, 2.0, 1.0, 1.0, 1.0, 1.0, True)
+    monkeypatch.setattr(run, "cluster_up", lambda ctx, system: calls.append(("up", system, ctx["cell"]["profile"])))
+    monkeypatch.setattr(run, "cluster_down", lambda *_a: None)
+    monkeypatch.setattr(run, "smoke", lambda *_a: None)
+    monkeypatch.setattr(run, "_save_leader_log", lambda *_a: None)
+
+    def producer(ctx, system, records, size, rate, timeout, **_k):
+        calls.append(("produce", system, ctx["cell"]["profile"], rate))
+        return produced, "", 1.0, ""
+
+    monkeypatch.setattr(run, "run_producer", producer)
+    monkeypatch.setattr(run, "client", lambda *_a, **_k: subprocess.CompletedProcess([], 0, CONSUMER_OUTPUT, ""))
+    monkeypatch.setattr(run.schema, "append_row", lambda _path, row: rows.append(dict(row)))
+
+
+def test_vtop_runs_once_per_cell_and_its_rows_repeat_under_the_other_profile(monkeypatch, tmp_path):
+    """#596 decision 2: one VTOP cluster for both profiles. Saturation and
+    consume are measured once and repeated with same_config_as; fixed-rate
+    rows are measured per profile, at that profile's Kafka rates."""
+    rows, calls = [], []
+    fake_cluster(monkeypatch, rows, calls)
+    ctx = fake_ctx(tmp_path)
+    run.run_vtop_cell(ctx, 100, {"defaults": {25: 100, 50: 200, 75: 300},
+                                 "fsync-parity": {25: 10, 50: 20, 75: 30}})
+    assert [c for c in calls if c[0] == "up"] == [("up", "vtop", "defaults")]
+    rated = sorted((c[2], c[3]) for c in calls if c[0] == "produce" and c[3] > 0)
+    assert rated == [("defaults", 100), ("defaults", 200), ("defaults", 300),
+                     ("fsync-parity", 10), ("fsync-parity", 20), ("fsync-parity", 30)]
+    copies = [r for r in rows if r.get("same_config_as")]
+    assert {(r["mode"], r["profile"], r["same_config_as"]) for r in copies} == {
+        ("saturation", "fsync-parity", "defaults"), ("consume", "fsync-parity", "defaults")}
+    fixed = [r for r in rows if r["mode"] == "fixed_rate"]
+    assert {r["profile"] for r in fixed} == {"defaults", "fsync-parity"}
+    assert not any(r.get("same_config_as") for r in fixed)
+
+
+def test_the_cell_shape_reaches_every_row(monkeypatch, tmp_path):
+    rows, calls = [], []
+    fake_cluster(monkeypatch, rows, calls)
+    ctx = fake_ctx(tmp_path, partitions=6, producers=4, compression="zstd", profile="fsync-parity")
+    run.run_cell(ctx, "kafka", 100, None)
+    assert {(r["partitions"], r["producers"], r["compression"], r["profile"]) for r in rows} == {
+        (6, 4, "zstd", "fsync-parity")}
+    ok = [r for r in rows if r["status"] == "ok" and r["mode"] != "consume"]
+    assert ok and {r["lat_basis"] for r in ok} == {"worst-of-4"}
+
+
+def test_kafka_is_brought_up_with_the_cells_partitions_and_profile(monkeypatch, tmp_path):
+    commands = []
+    monkeypatch.setattr(run, "compose", lambda *a, **k: commands.append(("compose", a)))
+    monkeypatch.setattr(run, "client", lambda system, command, **_k: commands.append(("client", command)))
+    run.cluster_up(fake_ctx(tmp_path, partitions=6, profile="fsync-parity"), "kafka")
+    assert run._compose_env["KAFKA_FLUSH_MESSAGES"] == "1"
+    create = next(c for kind, c in commands if kind == "client")
+    assert create[create.index("--partitions") + 1] == "6"
+    assert "flush.messages=1" in create
+    commands.clear()
+    run.cluster_up(fake_ctx(tmp_path, partitions=1, profile="defaults"), "kafka")
+    assert run._compose_env["KAFKA_FLUSH_MESSAGES"] == run.KAFKA_FLUSH_MESSAGES["defaults"]
+    assert "flush.messages=1" not in next(c for kind, c in commands if kind == "client")
+
+
+def test_vtop_is_brought_up_with_generated_configs(monkeypatch, tmp_path):
+    monkeypatch.setattr(run, "compose", lambda *a, **k: None)
+    ctx = fake_ctx(tmp_path, partitions=6)
+    run.cluster_up(ctx, "vtop")
+    config_dir = run._compose_env["VTOP_CONFIG_DIR"]
+    assert config_dir == str(tmp_path / "vtop-config" / "p6")
+    assert len(ctx["env"]["observed"]["vtop_topology"]["6"]["config_sha256"]) == 18
+
+
+@pytest.mark.parametrize("flag, value, match", [
+    ("--partitions", "1,1", "distinct counts"), ("--partitions", "12", "1 to 9"),
+    ("--producers", "x", "not a comma-separated"), ("--compressions", "none,brotli", "distinct values"),
+    ("--profiles", "fast", "distinct values"),
+])
+def test_matrix_flags_are_refused_before_any_docker_call(monkeypatch, flag, value, match):
+    calls = []
+    monkeypatch.setattr(run, "sh", lambda args, **_: calls.append(args))
+    with pytest.raises(SystemExit, match=match):
+        run.main([flag, value])
+    assert calls == []

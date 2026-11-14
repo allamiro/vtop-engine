@@ -1,6 +1,11 @@
-# VTOP for the head-to-head comparison (#595, #596): three data nodes from the
-# image docker/Dockerfile builds, one range replicated to all three with a
-# write quorum of 2 of 3, and the Kafka gateway on the range's leader.
+# VTOP for the head-to-head comparison (#595, #596): three containers from the
+# image docker/Dockerfile builds. Each Kafka partition is one range replicated
+# to all three with a write quorum of 2 of 3, its Kafka gateway on the range's
+# leader. topology.py generates every process's config for the cell into
+# VTOP_CONFIG_DIR; vtop/run-node.sh starts a container's processes (one per
+# range it hosts), followers before leaders, and stops the container when any
+# of them exits. One partition is the shape vtop/leader.yaml and the two
+# follower configs describe.
 #
 # Fairness rule 1: EXACTLY the per-node limits compose.kafka.yml gives each
 # Kafka broker (2 CPUs, 2 GiB, no swap, a named volume on the same Docker VM
@@ -13,7 +18,7 @@ name: kc-vtop
 
 x-node: &node
   image: ${VTOP_IMAGE:?set VTOP_IMAGE to the vtop-bench image run.py built}
-  entrypoint: ["vtop-node", "data", "--config", "/etc/vtop/node.yaml"]
+  entrypoint: ["bash", "/usr/local/bin/vtop-run-node.sh"]
   cpus: 2
   mem_limit: 2g
   memswap_limit: 2g
@@ -27,19 +32,30 @@ x-node: &node
   security_opt: ["no-new-privileges:true"]
   networks: [bench]
   healthcheck:
-    test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9600/readyz > /dev/null"]
+    test: ["CMD", "bash", "/usr/local/bin/vtop-run-node.sh", "health"]
     interval: 2s
     timeout: 5s
     retries: 60
     start_period: 2s
 
 services:
-  # Followers first: the leader's quorum needs them listening.
+  # No depends_on: every container leads some ranges and follows others, and
+  # run-node.sh starts a leader only once its followers answer /readyz.
+  vtop-1:
+    <<: *node
+    hostname: vtop-1
+    volumes:
+      - "${VTOP_CONFIG_DIR:?set VTOP_CONFIG_DIR to the configs topology.py wrote}/vtop-1:/etc/vtop:ro"
+      - "./vtop/run-node.sh:/usr/local/bin/vtop-run-node.sh:ro"
+      # Mounted at the image's home (owned by the unprivileged `vtop` user), so
+      # a fresh named volume inherits that ownership.
+      - "vtop-1-data:/home/vtop"
   vtop-2:
     <<: *node
     hostname: vtop-2
     volumes:
-      - "./vtop/follower-1.yaml:/etc/vtop/node.yaml:ro"
+      - "${VTOP_CONFIG_DIR:?set VTOP_CONFIG_DIR to the configs topology.py wrote}/vtop-2:/etc/vtop:ro"
+      - "./vtop/run-node.sh:/usr/local/bin/vtop-run-node.sh:ro"
       # Mounted at the image's home (owned by the unprivileged `vtop` user), so
       # a fresh named volume inherits that ownership.
       - "vtop-2-data:/home/vtop"
@@ -47,17 +63,11 @@ services:
     <<: *node
     hostname: vtop-3
     volumes:
-      - "./vtop/follower-2.yaml:/etc/vtop/node.yaml:ro"
+      - "${VTOP_CONFIG_DIR:?set VTOP_CONFIG_DIR to the configs topology.py wrote}/vtop-3:/etc/vtop:ro"
+      - "./vtop/run-node.sh:/usr/local/bin/vtop-run-node.sh:ro"
+      # Mounted at the image's home (owned by the unprivileged `vtop` user), so
+      # a fresh named volume inherits that ownership.
       - "vtop-3-data:/home/vtop"
-  vtop-1:
-    <<: *node
-    hostname: vtop-1
-    depends_on:
-      vtop-2: { condition: service_healthy }
-      vtop-3: { condition: service_healthy }
-    volumes:
-      - "./vtop/leader.yaml:/etc/vtop/node.yaml:ro"
-      - "vtop-1-data:/home/vtop"
 
 volumes:
   vtop-1-data:

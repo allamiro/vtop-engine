@@ -6,8 +6,12 @@
 # VM disk). Change one file, change the other; run.py records both in
 # environment.json and refuses to start when they differ.
 #
-# Everything else is Kafka as shipped (profile `defaults`, #595 rule 4): no
-# flush.messages, so a broker acknowledges on replication, not on fsync.
+# Everything else is Kafka as shipped, except the one setting a profile
+# changes (#595 rule 4, #596). Under `defaults`, log.flush.interval.messages
+# is its shipped value (Long.MAX_VALUE), so a broker acknowledges on
+# replication, not on fsync. Under `fsync-parity`, run.py sets it to 1 here
+# and creates the topic with flush.messages=1, so every append is flushed
+# before it is acknowledged.
 #
 # The image is pinned by tag AND digest (rule 8); KAFKA_IMAGE overrides both.
 name: kc-kafka
@@ -53,6 +57,8 @@ x-env: &env
   # The benchmark topic is created explicitly by run.py with these settings;
   # a typo'd topic must not be auto-created with others.
   KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  # The profile's flush setting (see the header); unset, Kafka's own default.
+  KAFKA_LOG_FLUSH_INTERVAL_MESSAGES: "${KAFKA_FLUSH_MESSAGES:-9223372036854775807}"
 
 services:
   kafka-1:

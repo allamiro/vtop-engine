@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hashlib
 import json
 import math
 import os
@@ -30,7 +29,7 @@ from typing import Any
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from kafka_compare import perftool, plan, schema, stats  # noqa: E402
+from kafka_compare import cellshape, perftool, plan, schema, stats, topology  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(HERE))
 KAFKA_IMAGE = "apache/kafka:4.3.2@sha256:852a0d49fc4e656b022e7f23785411802c9a088c78a7c5e39f33969de9c227a7"
@@ -43,7 +42,14 @@ CLIENT_MEMORY = "4g"
 CLIENT_HEAP = "-Xms1g -Xmx1g"
 # Explicit on the command line for both systems; every other producer setting
 # is the client's default, and the client's own dump of them is recorded.
-PRODUCER_PROPS = ("acks=all", "compression.type=none")
+# `compression.type` is the cell's (#596), appended per run.
+PRODUCER_PROPS = ("acks=all",)
+# What each profile changes on Kafka (#595 rule 4, #596 D8). VTOP's node
+# configs are the same under both: it acknowledges at a quorum of 2 of 3
+# whose appends are fsynced, so its rows under the second profile repeat
+# the first's measurement and say so (`same_config_as`), except the
+# fixed-rate rows, whose rates come from that profile's Kafka saturation.
+KAFKA_FLUSH_MESSAGES = {"defaults": "9223372036854775807", "fsync-parity": "1"}
 # Offset commits are off for both: the gateway without a metadata plane
 # refuses OffsetCommit (a listed gap), and a consumer measurement should not
 # hinge on it either way.
@@ -182,6 +188,8 @@ def capture_environment(run_id: str, matrix: dict[str, Any], vtop_image: str, li
         "client": client_name(),
         "client_java": java.splitlines()[0] if java else "",
         "profile": PROFILE,
+        "profiles": list(matrix.get("profiles") or [PROFILE]),
+        "kafka_flush_messages": {k: KAFKA_FLUSH_MESSAGES[k] for k in matrix.get("profiles") or [PROFILE]},
         "producer_props": list(PRODUCER_PROPS),
         "consumer_props": list(CONSUMER_PROPS),
     }
@@ -230,23 +238,50 @@ def save_environment(run_dir: str, environment: dict) -> None:
 # --------------------------------------------------------------------------- clusters
 
 
+# The cell a cluster is brought up for; `compose down` needs the same
+# variables the `up` was given, so they are kept here between the two.
+_compose_env: dict[str, str] = {"VTOP_CONFIG_DIR": os.path.join(HERE, "vtop"),
+                                "KAFKA_FLUSH_MESSAGES": KAFKA_FLUSH_MESSAGES["defaults"]}
+
+
 def compose(system: str, *args: str, vtop_image: str, timeout: float = 600) -> subprocess.CompletedProcess:
     spec = SYSTEM_SPEC[system]
     return sh(["docker", "compose", "-f", os.path.join(HERE, spec["compose"]), *args],
-              env={"VTOP_IMAGE": vtop_image, "KAFKA_IMAGE": KAFKA_IMAGE}, timeout=timeout, cwd=HERE)
+              env={"VTOP_IMAGE": vtop_image, "KAFKA_IMAGE": KAFKA_IMAGE, **_compose_env}, timeout=timeout,
+              cwd=HERE)
 
 
 def cluster_down(system: str, vtop_image: str) -> None:
     compose(system, "down", "-v", "--remove-orphans", vtop_image=vtop_image)
 
 
-def cluster_up(system: str, vtop_image: str) -> None:
-    cluster_down(system, vtop_image)
-    compose(system, "up", "-d", "--wait", "--wait-timeout", "300", vtop_image=vtop_image, timeout=400)
+def vtop_config_dir(ctx: dict) -> str:
+    """The cell's generated VTOP configs, written once per partition count
+    into the run directory, their hashes recorded."""
+    partitions = ctx["cell"]["partitions"]
+    directory = os.path.join(ctx["run_dir"], "vtop-config", f"p{partitions}")
+    if not os.path.isdir(directory):
+        hashes = topology.write(topology.vtop_configs(partitions), directory)
+        ctx["env"]["observed"].setdefault("vtop_topology", {})[str(partitions)] = {
+            "leaders": topology.leader_map(partitions), "config_sha256": hashes}
+    return directory
+
+
+def cluster_up(ctx: dict, system: str) -> None:
+    cell = ctx["cell"]
+    cluster_down(system, ctx["vtop_image"])
+    if system == "vtop":
+        _compose_env["VTOP_CONFIG_DIR"] = vtop_config_dir(ctx)
+    else:
+        _compose_env["KAFKA_FLUSH_MESSAGES"] = KAFKA_FLUSH_MESSAGES[cell["profile"]]
+    compose(system, "up", "-d", "--wait", "--wait-timeout", "300", vtop_image=ctx["vtop_image"], timeout=400)
     if system == "kafka":
-        client(system, ["/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", SYSTEM_SPEC[system]["bootstrap"],
-                        "--create", "--topic", TOPIC, "--partitions", "1", "--replication-factor", "3",
-                        "--config", "min.insync.replicas=2"], timeout=120)
+        command = ["/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", SYSTEM_SPEC[system]["bootstrap"],
+                   "--create", "--topic", TOPIC, "--partitions", str(cell["partitions"]),
+                   "--replication-factor", "3", "--config", "min.insync.replicas=2"]
+        if cell["profile"] == "fsync-parity":
+            command += ["--config", "flush.messages=1"]
+        client(system, command, timeout=120)
 
 
 _client_seq = 0
@@ -276,54 +311,59 @@ def client(system: str, command: list[str], *, timeout: float, input_text: str |
 # ------------------------------------------------------------------------------ smoke
 
 
-def smoke_records(count: int, size: int) -> list[str]:
-    """`count` distinct printable records of exactly `size` bytes, reproducible."""
-    records = []
-    for index in range(count):
-        head = f"smoke-{index:08d}-"
-        body = hashlib.sha256(f"kc-smoke-{index}".encode()).hexdigest()
-        while len(head) + len(body) < size:
-            body += hashlib.sha256(body.encode()).hexdigest()
-        records.append((head + body)[:size])
-    return records
-
-
-def smoke(system: str, count: int, size: int) -> None:
-    """Produce `count` records with acks=all and read every one back, byte-exact
-    and in order, through the same client; raise on any difference (#596)."""
-    records = smoke_records(count, size)
+def smoke(ctx: dict, system: str, count: int, size: int) -> None:
+    """The smoke gate in the cell's own shape (#596): `count` keyed records of
+    the cell's size, compression and partition count, produced with acks=all
+    and read back partition by partition through the same client. Raises
+    unless every record comes back exactly once, each partition in produced
+    order, with the CreateTime it was produced with (cellshape.check_smoke)."""
+    cell = ctx["cell"]
+    records = cellshape.smoke_records(count, size)
     bootstrap = SYSTEM_SPEC[system]["bootstrap"]
+    started = int(time.time() * 1000)
     client(system, ["/opt/kafka/bin/kafka-console-producer.sh", "--bootstrap-server", bootstrap, "--topic", TOPIC,
-                    "--command-property", "acks=all"], timeout=300, input_text="\n".join(records) + "\n")
-    read = client(system, ["/opt/kafka/bin/kafka-console-consumer.sh", "--bootstrap-server", bootstrap,
-                           "--topic", TOPIC, "--partition", "0", "--offset", "earliest",
-                           "--max-messages", str(count), "--timeout-ms", "60000"], timeout=300, check=False)
-    got = read.stdout.split("\n")
-    if got and got[-1] == "":
-        got.pop()
-    if len(got) != count:
-        raise RuntimeError(f"smoke read back {len(got)} records, produced {count}: {read.stderr.strip()[-400:]}")
-    for index, (want, have) in enumerate(zip(records, got)):
-        if want != have:
-            raise RuntimeError(f"smoke record {index} differs: produced {want[:40]!r}..., read {have[:40]!r}...")
+                    "--compression-codec", cell["compression"],
+                    "--reader-property", "parse.key=true", "--reader-property", "key.separator=\t",
+                    "--command-property", "acks=all"],
+                timeout=300, input_text="".join(f"{key}\t{value}\n" for key, value in records))
+    finished = int(time.time() * 1000)
+    reads = []
+    for partition in range(cell["partitions"]):
+        read = client(system, ["/opt/kafka/bin/kafka-console-consumer.sh", "--bootstrap-server", bootstrap,
+                               "--topic", TOPIC, "--partition", str(partition), "--offset", "earliest",
+                               "--timeout-ms", "15000", "--property", "print.timestamp=true",
+                               "--property", "print.key=true"], timeout=300, check=False)
+        reads += cellshape.parse_smoke_read(partition, read.stdout)
+    # A second either side: the client's clock and this process's are the
+    # same host's, read a few milliseconds apart.
+    cellshape.check_smoke(records, reads, cell["partitions"], (started - 1000, finished + 1000))
 
 
 # ------------------------------------------------------------------------------- runs
 
 
-def producer_command(system: str, records: int, size: int, rate: int, warmup: int) -> list[str]:
+def producer_command(system: str, records: int, size: int, rate: int, warmup: int,
+                     compression: str = "none") -> list[str]:
     return ["/opt/kafka/bin/kafka-producer-perf-test.sh", "--bootstrap-server", SYSTEM_SPEC[system]["bootstrap"],
             "--topic", TOPIC, "--num-records", str(records), "--record-size", str(size), "--throughput", str(rate),
-            "--warmup-records", str(warmup), "--command-property", *PRODUCER_PROPS]
+            "--warmup-records", str(warmup), "--command-property", *PRODUCER_PROPS,
+            f"compression.type={compression}"]
 
 
-def run_producer(system: str, records: int, size: int, rate: int, timeout: float,
+def run_producer(ctx: dict, system: str, records: int, size: int, rate: int, timeout: float,
                  info_logging: bool = False) -> tuple[perftool.ProducerResult | None, str, float, str]:
-    """(result or None, note, wall seconds, raw output)."""
+    """(result or None, note, wall seconds, raw output). With N producers in
+    the cell, N tool processes run at once in the one client container, each
+    sending records/N at rate/N (#596 D11), combined by `cellshape.combine`;
+    the row's `lat_basis` is then `worst-of-N` (set by the caller)."""
+    producers = ctx["cell"]["producers"]
+    compression = ctx["cell"]["compression"]
+    if producers > 1:
+        return _run_producers(ctx, system, records, size, rate, timeout)
     warmup = max(1, records // 5)
     started = time.monotonic()
     try:
-        done = client(system, producer_command(system, records, size, rate, warmup), timeout=timeout,
+        done = client(system, producer_command(system, records, size, rate, warmup, compression), timeout=timeout,
                       check=False, info_logging=info_logging)
     except subprocess.TimeoutExpired:
         return None, f"timed out after {int(timeout)} s", time.monotonic() - started, ""
@@ -341,15 +381,51 @@ def run_producer(system: str, records: int, size: int, rate: int, timeout: float
     return result, "", wall, output
 
 
+def _run_producers(ctx: dict, system: str, records: int, size: int, rate: int,
+                   timeout: float) -> tuple[perftool.ProducerResult | None, str, float, str]:
+    producers = ctx["cell"]["producers"]
+    each = max(1, records // producers)
+    each_rate = rate if rate < 0 else max(1, rate // producers)
+    commands = [producer_command(system, each, size, each_rate, max(1, each // 5), ctx["cell"]["compression"])
+                for _ in range(producers)]
+    started = time.monotonic()
+    try:
+        done = client(system, ["sh", "-c", cellshape.multi_producer_script(commands)], timeout=timeout,
+                      check=False)
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {int(timeout)} s", time.monotonic() - started, ""
+    wall = time.monotonic() - started
+    output = done.stdout + "\n" + done.stderr
+    try:
+        parts = cellshape.split_outputs(done.stdout, producers)
+        results = []
+        for index, (code, text) in enumerate(parts):
+            if code != 0:
+                return None, f"producer {index} of {producers} exited {code}", wall, output
+            results.append(perftool.parse_producer(text, expect_steady_state=True))
+    except perftool.PerfParseError as exc:
+        return None, f"{exc}; exit {done.returncode}", wall, output
+    return cellshape.combine(results).result, "", wall, output
+
+
 def base_row(ctx: dict, system: str, mode: str, size: int, rep: int) -> dict[str, Any]:
+    cell = ctx["cell"]
     return {
         "run_id": ctx["run_id"], "env_fingerprint": ctx["fingerprint"],
         "vtop_commit": ctx["env"]["comparable"]["vtop_commit"], "kafka_image": KAFKA_IMAGE,
-        "client": client_name(), "profile": PROFILE, "system": system, "mode": mode,
-        "record_size": size, "partitions": 1, "producers": 1, "compression": "none", "acks": "all",
+        "client": client_name(), "profile": cell["profile"], "system": system, "mode": mode,
+        "record_size": size, "partitions": cell["partitions"], "producers": cell["producers"],
+        "compression": cell["compression"], "acks": "all",
         "repetition": rep, "load_basis": "kafka" if mode == "fixed_rate" else "",
         "started_at": utc_now(),
     }
+
+
+def emit(ctx: dict, row: dict[str, Any]) -> None:
+    """Write one row, and remember it for the copies a shared configuration
+    owes under the other profiles."""
+    schema.append_row(ctx["csv"], row)
+    ctx.setdefault("emitted", []).append(dict(row))
 
 
 def producer_row(row: dict, result: perftool.ProducerResult | None, note: str, wall: float) -> dict:
@@ -360,7 +436,8 @@ def producer_row(row: dict, result: perftool.ProducerResult | None, note: str, w
     row.update(status="ok", records=result.records, records_per_sec=result.records_per_sec,
                mib_per_sec=result.mib_per_sec, lat_avg_ms=result.lat_avg_ms, lat_max_ms=result.lat_max_ms,
                lat_p50_ms=result.lat_p50_ms, lat_p95_ms=result.lat_p95_ms, lat_p99_ms=result.lat_p99_ms,
-               lat_p999_ms=result.lat_p999_ms, lat_basis="single", note=note)
+               lat_p999_ms=result.lat_p999_ms,
+               lat_basis="single" if row["producers"] == 1 else f"worst-of-{row['producers']}", note=note)
     return row
 
 
@@ -373,27 +450,69 @@ def refuse_rows(ctx: dict, system: str, size: int, reason: str, load_pcts: list[
         for mode, pct in modes:
             row = base_row(ctx, system, mode, size, rep)
             row.update(status="refused", note=reason, load_pct=pct)
-            schema.append_row(ctx["csv"], row)
+            emit(ctx, row)
 
 
-def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | None) -> dict[int, int] | None:
-    """Every measurement of one system in one cell. Returns Kafka's derived rates."""
+def cell_tag(ctx: dict, system: str, size: int) -> str:
+    cell = ctx["cell"]
+    return (f"{system}-{cell['profile']}-p{cell['partitions']}-n{cell['producers']}-{cell['compression']}"
+            f"-{size}B")
+
+
+def repeat_under(ctx: dict, rows: list[dict[str, Any]], profile: str, measured_under: str) -> None:
+    """Write `rows` again under `profile`, each naming the profile it was
+    measured under (#596 decision 2: VTOP's configuration is the same under
+    both, so its saturation and consume runs are made once)."""
+    for row in rows:
+        emit(ctx, {**row, "profile": profile, "same_config_as": measured_under})
+
+
+def run_vtop_cell(ctx: dict, size: int, rates_by_profile: dict[str, dict[int, int] | None]) -> None:
+    """VTOP in one cell, its cluster brought up once for every profile.
+
+    Saturation and consume are measured once, under the first profile, and
+    repeated under the others with `same_config_as`. The fixed-rate rows are
+    measured for every profile, because their offered rates are a percentage
+    of THAT profile's Kafka saturation.
+    """
+    profiles = list(rates_by_profile)
+    first = profiles[0]
+    ctx["cell"]["profile"] = first
+    mark = len(ctx.get("emitted", []))
+    run_cell(ctx, "vtop", size, rates_by_profile[first], extra_rates={p: rates_by_profile[p] for p in profiles[1:]})
+    measured = [row for row in ctx["emitted"][mark:]
+                if row["profile"] == first and row["mode"] in ("saturation", "consume")]
+    for profile in profiles[1:]:
+        repeat_under(ctx, measured, profile, first)
+    ctx["cell"]["profile"] = first
+
+
+def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | None,
+             extra_rates: dict[str, dict[int, int] | None] | None = None) -> dict[int, int] | None:
+    """Every measurement of one system in one cell. Returns Kafka's derived
+    rates. `extra_rates` (VTOP only) are further profiles' Kafka rates, run as
+    fixed-rate rows in the same cluster after the first profile's."""
     sat_records = ctx["sat_records"][size]
     load_pcts = list(stats.LOAD_FRACTIONS)
     logs = os.path.join(ctx["run_dir"], "logs")
     os.makedirs(logs, exist_ok=True)
-    tag = f"{system}-{size}B"
+    tag = cell_tag(ctx, system, size)
     try:
         log(f"{tag}: bringing the cluster up fresh")
-        cluster_up(system, ctx["vtop_image"])
+        cluster_up(ctx, system)
         log(f"{tag}: smoke - {ctx['smoke_records']} records of {size} B, produced and read back byte-exact")
-        smoke(system, ctx["smoke_records"], size)
+        smoke(ctx, system, ctx["smoke_records"], size)
     except (RuntimeError, subprocess.TimeoutExpired) as exc:
         reason = f"cluster refused before timing: {exc}"[:900]
         log(f"{tag}: {reason}")
         ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size, "event": reason})
         _save_leader_log(system, logs, tag, ctx["vtop_image"])
         refuse_rows(ctx, system, size, reason, load_pcts)
+        first = ctx["cell"]["profile"]
+        for profile in extra_rates or {}:
+            ctx["cell"]["profile"] = profile
+            refuse_rows(ctx, system, size, reason, load_pcts)
+        ctx["cell"]["profile"] = first
         cluster_down(system, ctx["vtop_image"])
         return None
     ctx["env"]["events"].append({"at": utc_now(), "system": system, "record_size": size,
@@ -403,7 +522,7 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
 
     # Unrecorded warm-up run: JIT, page cache, segment creation on both sides.
     log(f"{tag}: warm-up run (not recorded)")
-    result, note, _, output = run_producer(system, max(sat_records // 4, 1000), size, -1, ctx["sat_timeout"],
+    result, note, _, output = run_producer(ctx, system, max(sat_records // 4, 1000), size, -1, ctx["sat_timeout"],
                                            info_logging=True)
     try:
         ctx["env"]["observed"].setdefault("producer_config", {})[f"{system}-{size}"] = \
@@ -417,11 +536,11 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
     for rep in range(1, ctx["reps"] + 1):
         log(f"{tag}: saturation rep {rep}/{ctx['reps']} ({sat_records} records)")
         row = base_row(ctx, system, "saturation", size, rep)
-        result, note, wall, output = run_producer(system, sat_records, size, -1, ctx["sat_timeout"])
+        result, note, wall, output = run_producer(ctx, system, sat_records, size, -1, ctx["sat_timeout"])
         _save_output(logs, f"{tag}-saturation-{rep}.log", output)
         if result is not None:
             saturation.append(result.records_per_sec)
-        schema.append_row(ctx["csv"], producer_row(row, result, note, wall))
+        emit(ctx, producer_row(row, result, note, wall))
         log(f"{tag}: -> {row.get('records_per_sec', row.get('note'))} records/s")
 
     if system == "kafka":
@@ -430,28 +549,43 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
         except ValueError as exc:
             kafka_rates = None
             ctx["env"]["events"].append({"at": utc_now(), "event": f"no offered rates for {size} B: {exc}"})
-        ctx["env"]["observed"].setdefault("offered_rates", {})[str(size)] = kafka_rates
+        ctx["env"]["observed"].setdefault("offered_rates", {})[tag] = kafka_rates
+    first_profile = ctx["cell"]["profile"]
+    for profile, rates in [(first_profile, kafka_rates), *(extra_rates or {}).items()]:
+        ctx["cell"]["profile"] = profile
+        run_fixed_rates(ctx, system, size, rates, load_pcts, logs, cell_tag(ctx, system, size))
+    ctx["cell"]["profile"] = first_profile
+    run_consume(ctx, system, size, sat_records, logs, tag)
+    _save_leader_log(system, logs, tag, ctx["vtop_image"])
+    cluster_down(system, ctx["vtop_image"])
+    return kafka_rates
+
+
+def run_fixed_rates(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | None, load_pcts: list[int],
+                    logs: str, tag: str) -> None:
     for rep in range(1, ctx["reps"] + 1):
         for pct in load_pcts:
             row = base_row(ctx, system, "fixed_rate", size, rep)
             row["load_pct"] = pct
             if not kafka_rates:
                 row.update(status="refused", note="no Kafka saturation for this cell to derive the offered rate from")
-                schema.append_row(ctx["csv"], row)
+                emit(ctx, row)
                 continue
             rate = kafka_rates[pct]
             records = stats.records_for_duration(rate, ctx["fixed_seconds"])
             row["offered_rate"] = rate
             log(f"{tag}: fixed rate {pct}% = {rate} records/s, rep {rep}/{ctx['reps']}")
             timeout = max(ctx["sat_timeout"], 6 * records / rate)
-            result, note, wall, output = run_producer(system, records, size, rate, timeout)
+            result, note, wall, output = run_producer(ctx, system, records, size, rate, timeout)
             _save_output(logs, f"{tag}-fixed-{pct}-{rep}.log", output)
             if result is not None:
                 row["sustained"] = stats.sustained(rate, result.records_per_sec)
-            schema.append_row(ctx["csv"], producer_row(row, result, note, wall))
+            emit(ctx, producer_row(row, result, note, wall))
             log(f"{tag}: -> p50 {row.get('lat_p50_ms')} ms p99 {row.get('lat_p99_ms')} ms "
                 f"achieved {row.get('records_per_sec')} sustained={row.get('sustained')}")
 
+
+def run_consume(ctx: dict, system: str, size: int, sat_records: int, logs: str, tag: str) -> None:
     if ctx["consume"]:
         for rep in range(1, ctx["reps"] + 1):
             row = base_row(ctx, system, "consume", size, rep)
@@ -459,7 +593,7 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
             started = time.monotonic()
             command = ["/opt/kafka/bin/kafka-consumer-perf-test.sh", "--bootstrap-server",
                        SYSTEM_SPEC[system]["bootstrap"], "--topic", TOPIC, "--num-records", str(sat_records),
-                       "--group", f"kc-{ctx['run_id']}-{system}-{size}-{rep}", "--timeout", "60000",
+                       "--group", f"kc-{ctx['run_id']}-{tag}-{rep}", "--timeout", "60000",
                        "--command-property", *CONSUMER_PROPS]
             try:
                 done = client(system, command, timeout=ctx["sat_timeout"], check=False)
@@ -477,12 +611,8 @@ def run_cell(ctx: dict, system: str, size: int, kafka_rates: dict[int, int] | No
             except perftool.PerfParseError as exc:
                 row.update(status="failed", note=f"{exc}; exit {done.returncode}")
             row["wall_seconds"] = round(time.monotonic() - started, 1)
-            schema.append_row(ctx["csv"], row)
+            emit(ctx, row)
             log(f"{tag}: -> {row.get('records_per_sec', row.get('note'))} records/s consumed")
-
-    _save_leader_log(system, logs, tag, ctx["vtop_image"])
-    cluster_down(system, ctx["vtop_image"])
-    return kafka_rates
 
 
 def _save_output(logs: str, name: str, output: str) -> None:
@@ -605,13 +735,36 @@ def check_args(args: argparse.Namespace) -> tuple[list[int], dict[int, int]]:
     return sizes, sat_records
 
 
+def parse_list(text: str, flag: str, allowed: tuple[str, ...]) -> list[str]:
+    values = [v.strip() for v in text.split(",")]
+    if not values or len(set(values)) != len(values) or any(v not in allowed for v in values):
+        raise SystemExit(f"{flag} {text!r}: distinct values from {', '.join(allowed)}")
+    return values
+
+
+def parse_counts(text: str, flag: str, ceiling: int) -> list[int]:
+    try:
+        values = [int(v) for v in text.split(",")]
+    except ValueError:
+        raise SystemExit(f"{flag} {text!r} is not a comma-separated list of counts") from None
+    if len(set(values)) != len(values) or any(not 1 <= v <= ceiling for v in values):
+        raise SystemExit(f"{flag} {text!r}: distinct counts from 1 to {ceiling}")
+    return values
+
+
 def build_matrix(args: argparse.Namespace, sizes: list[int], sat_records: dict[int, int]) -> dict[str, Any]:
     """The matrix this invocation runs, as environment.json records it. The
     schema-2 axes say what the phase-1 shape does: one compression, one
     profile, Kafka-relative rates."""
     load_pcts = list(stats.LOAD_FRACTIONS)
-    return {"record_sizes": sizes, "partitions": [1], "producers": [1], "compressions": ["none"],
-            "acks": ["all"], "profile": PROFILE, "profiles": [PROFILE], "repetitions": args.reps,
+    profiles = parse_list(args.profiles, "--profiles", plan.PROFILES)
+    return {"record_sizes": sizes, "partitions": parse_counts(args.partitions, "--partitions", 9),
+            "producers": parse_counts(args.producers, "--producers", 16),
+            "compressions": parse_list(args.compressions, "--compressions", plan.COMPRESSIONS),
+            "acks": ["all"], "profile": profiles[0], "profiles": profiles,
+            # VTOP's node configs are the same under every profile (#596 D8),
+            # so its saturation and consume runs are made once per cell.
+            "vtop_profiles_share_config": len(profiles) > 1, "repetitions": args.reps,
             "load_pcts": load_pcts, "load_bases": {"kafka": load_pcts}, "consume": not args.no_consume,
             "sat_records": {str(k): v for k, v in sat_records.items()},
             "fixed_seconds": args.fixed_seconds, "warmup_fraction": 0.2, "smoke_records": args.smoke_records}
@@ -662,6 +815,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sat-timeout", type=float, default=1800.0, help="seconds before a run is failed")
     parser.add_argument("--no-consume", action="store_true")
     parser.add_argument("--rebuild", action="store_true", help="rebuild the vtop image even if it exists")
+    parser.add_argument("--partitions", default="1", help="partition counts, e.g. 1,6 (VTOP: one range each)")
+    parser.add_argument("--producers", default="1", help="producer processes per cell, e.g. 1,4")
+    parser.add_argument("--compressions", default="none", help="producer codecs, e.g. none,zstd")
+    parser.add_argument("--profiles", default=PROFILE, help="durability profiles: defaults,fsync-parity")
     parser.add_argument("--max-hours", type=float, default=30.0,
                         help="refuse a matrix projected to take longer, before any Docker work")
     parser.add_argument("--check", metavar="RUN_DIR", default=None,
@@ -690,7 +847,9 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"{run_dir} exists; runs never overwrite each other")
     os.makedirs(run_dir)
     env = capture_environment(run_id, matrix, vtop_image, limits)
-    ctx = {"run_id": run_id, "run_dir": run_dir, "csv": os.path.join(run_dir, "results.csv"), "env": env,
+    ctx = {"cell": {"partitions": matrix["partitions"][0], "producers": matrix["producers"][0],
+                    "compression": matrix["compressions"][0], "profile": matrix["profiles"][0]},
+           "run_id": run_id, "run_dir": run_dir, "csv": os.path.join(run_dir, "results.csv"), "env": env,
            "fingerprint": schema.fingerprint(env), "vtop_image": vtop_image, "reps": args.reps,
            "sat_records": sat_records, "fixed_seconds": args.fixed_seconds,
            "smoke_records": args.smoke_records, "sat_timeout": args.sat_timeout, "consume": not args.no_consume}
@@ -698,10 +857,15 @@ def main(argv: list[str] | None = None) -> int:
     save_environment(run_dir, env)
     log(f"run {run_id} -> {run_dir} (fingerprint {ctx['fingerprint']})")
     try:
-        for size in sizes:
-            rates = run_cell(ctx, "kafka", size, None)
-            save_environment(run_dir, env)
-            run_cell(ctx, "vtop", size, rates)
+        for cell in plan.axes(matrix).cells:
+            ctx["cell"] = {"partitions": cell.partitions, "producers": cell.producers,
+                           "compression": cell.compression, "profile": matrix["profiles"][0]}
+            rates = {}
+            for profile in matrix["profiles"]:
+                ctx["cell"]["profile"] = profile
+                rates[profile] = run_cell(ctx, "kafka", cell.record_size, None)
+                save_environment(run_dir, env)
+            run_vtop_cell(ctx, cell.record_size, rates)
             save_environment(run_dir, env)
     except BaseException as exc:
         env["run_state"] = "interrupted"
