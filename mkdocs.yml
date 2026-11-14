@@ -137,11 +137,26 @@ markdown_extensions:
       emoji_index: !!python/name:material.extensions.emoji.twemoji
       emoji_generator: !!python/name:material.extensions.emoji.to_svg
 
+
+# The nav is the reading order: Material's footer and the "Next:" link the
+# hooks add at the end of every page both follow it. The long design
+# documents sit at the end of Reference so the guided path never detours
+# through them.
 nav:
   - Home: index.md
+  - Introduction:
+      - introduction/index.md
+      - What VTOP is: introduction/what-is-vtop.md
+      - When to use it: introduction/when-to-use.md
+  - Concepts:
+      - concepts/index.md
+      - How it works: concepts/how-it-works.md
+      - Architecture: concepts/architecture.md
+      - Security: concepts/security.md
   - Getting started:
       - getting-started/index.md
       - Quick start (Docker lab): getting-started/quickstart.md
+      - Your first real archive: getting-started/first-archive.md
   - Install:
       - install/index.md
       - Release binaries: install/binaries.md
@@ -152,31 +167,38 @@ nav:
   - Deploy:
       - deploy/index.md
       - Single engine with SQLite: deploy/single-node.md
-      - PostgreSQL ledger: POSTGRES_DEPLOYMENT.md
+      - Single engine with PostgreSQL: deploy/postgresql.md
+      - PostgreSQL in depth: POSTGRES_DEPLOYMENT.md
+      - Several engines (HA): deploy/ha.md
       - Kubernetes with Helm: deploy/kubernetes.md
-      - Production HA: PRODUCTION_HA.md
-      - Cluster plane: deploy/cluster-plane.md
+      - Native cluster plane: deploy/cluster-plane.md
   - Configure:
       - configure/index.md
-      - Streams (streams.yaml): configure/streams.md
+      - Config basics: configure/basics.md
+      - Streams and per-stream checksum: configure/streams.md
+      - Effective settings: configure/print-effective.md
+      - config.yaml reference: configure/reference.md
   - Operate:
       - operate/index.md
       - Metrics and alerts: operate/monitoring.md
       - Node endpoints and metrics: NODE_OBSERVABILITY.md
+      - Logs and auditing: operate/logs-and-auditing.md
       - Scrub and coverage audit: operate/scrub-and-audit.md
       - Upgrades: operate/upgrades.md
+      - Backup and recovery: operate/backup-and-recovery.md
       - Troubleshooting: operate/troubleshooting.md
   - Reference:
+      - reference/index.md
       - CLI (vtopctl): reference/cli.md
-      - Configuration (config.yaml): configure/reference.md
       - Archive path: reference/archive-path.md
       - Known limitations: reference/limitations.md
-  - Concepts:
-      - Architecture: ARCHITECTURE.md
       - Protocol (normative draft): VTOP_PROTOCOL_DRAFT.md
-      - Security model: SECURITY_MODEL.md
-      - Native broker architecture: NATIVE_BROKER_ARCHITECTURE.md
-      - Comparison: COMPARISON.md
+      - Design documents:
+          - Architecture: ARCHITECTURE.md
+          - Production HA (design and status): PRODUCTION_HA.md
+          - Security model: SECURITY_MODEL.md
+          - Native broker architecture: NATIVE_BROKER_ARCHITECTURE.md
+          - Comparison: COMPARISON.md
   - Benchmarks:
       - benchmarks/index.md
       - Kafka comparison: benchmarks/kafka-comparison.md

@@ -59,11 +59,15 @@ VTOP is a prototype and reference implementation. Read the
 
 ## Start here
 
-- New to VTOP: [Getting started](getting-started/index.md), then the
-  [Docker lab](getting-started/quickstart.md).
-- Writing a config: [Configure](configure/index.md) and the
-  [`config.yaml` reference](configure/reference.md).
-- How it works: [Architecture](ARCHITECTURE.md) and the
-  [protocol](VTOP_PROTOCOL_DRAFT.md).
-- How it measures up, with every condition: [Measured results](benchmarks/index.md).
-- What is shipped and what is not: the [roadmap](ROADMAP.md).
+The docs read in order, and every page ends with a link to the next one.
+
+1. [Introduction](introduction/index.md): what VTOP is, and when to use it.
+2. [Concepts](concepts/index.md): how a batch is archived, and the parts of a
+   deployment.
+3. [Getting started](getting-started/index.md): the Docker lab, then your
+   first real archive.
+4. [Install](install/index.md), [Deploy](deploy/index.md),
+   [Configure](configure/index.md) and [Operate](operate/index.md).
+
+Measurements, with every condition: [Measured results](benchmarks/index.md).
+What is shipped and what is not: the [roadmap](ROADMAP.md).

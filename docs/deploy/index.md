@@ -6,6 +6,8 @@ it, what to monitor, and upgrade notes. The status of each shape comes from
 [Production HA](../PRODUCTION_HA.md), which also covers the designs not built
 yet.
 
+<div class="comparison" markdown>
+
 | Option | What it gives | What it needs | When it fails | When to use it |
 |---|---|---|---|---|
 | [Single engine, SQLite](single-node.md) | The full archive path, with the ledger in a local file. | One host, a bucket, `vtopctl`. | Archiving stops while the engine is down and data waits at the source; a restart resumes from the ledger. Losing the host's disk loses the ledger. | A first deployment, an edge site, one host you already back up. |
@@ -13,6 +15,8 @@ yet.
 | [Several engines, one PostgreSQL ledger](ha.md) | Not available yet. | Fleet mode (Production HA Phase 5), not built. | Host-local locks cannot see an engine on another host; the engine warns at every start on PostgreSQL. | Not yet. Run one engine per ledger. |
 | [Kubernetes with Helm](kubernetes.md) | The cluster plane (`vtop-node`) as a StatefulSet. Not the archive engine. | Kubernetes 1.25 or later, TLS Secrets you mint, cluster identities. | One voter may be down at a time; with `replicated`, a surviving pod takes over the range in place. | Evaluating the cluster plane on Kubernetes. |
 | [Native cluster plane on hosts](cluster-plane.md) | The same cluster plane, as processes you run. | A config and certificates per node; three or five metadata voters. | Raft keeps metadata while a majority of voters is up; a range fails over to a fenced quorum. | Evaluating the cluster plane outside Kubernetes. |
+
+</div>
 
 !!! note "The archive engine on Kubernetes"
 
