@@ -82,6 +82,31 @@ def measured_nothing(success: int, failed: int, errors: int,
     return success == 0 and failed == 0 and (errors > 0 or files_seeded > 0)
 
 
+def unmet_commit_requirement(scenario, success: int, failed: int,
+                             files_seeded: int) -> str:
+    """Why a run that must commit every object did not, or "" when it did (#663).
+
+    A scenario with `require_all_committed: true` asserts the outcome, not just
+    records it: the policed-uplink regression (scenario 24) exists because the
+    shipped defaults once committed nothing there, and a summary that files
+    zero commits as a measurement would let that come back unnoticed. The run
+    fails it when any batch failed, when nothing committed, or — for
+    whole-file input, where each seeded file is exactly one object — when
+    fewer objects committed than files were seeded. Line-oriented input packs
+    files into batches, so there only the first two can be checked.
+    """
+    if not scenario.get("require_all_committed", False):
+        return ""
+    if failed > 0:
+        return f"{failed} batch(es) failed"
+    if success == 0:
+        return "no object committed"
+    whole_file = scenario.get("whole_file", False) or scenario.get("format") == "binary"
+    if whole_file and success < files_seeded:
+        return f"{success} of {files_seeded} seeded object(s) committed"
+    return ""
+
+
 def uncounted_batches(rc: int, outcomes: list[dict]) -> int:
     """How many things one `process_once` did that its committed bytes cannot
     account for on the wire (#478, review).
@@ -305,6 +330,9 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
             return 2
 
     start = time.time()
+    # The same instant on the monotonic clock the cycles are stamped with, so
+    # `cycle_metrics.csv` can place each cycle on the run's clock (#483).
+    start_mono = time.monotonic()
     start_iso = iso_now()
     # Read at the engine's two boundaries on a contended run; None elsewhere,
     # where the rows' own first and last samples bound the monitored period.
@@ -385,6 +413,7 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
         # keeps the clock it has always been measured on.
         if contention is not None:
             start = time.time()
+            start_mono = time.monotonic()
             start_iso = iso_now()
             # The counters' baseline is read AT the boundary, not inferred from
             # the last sample before it (review): with a two-second sampling
@@ -567,6 +596,7 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
             produced = 0
             cycle_success = 0
             cycle_fail = 0
+            cycle_committed_bytes = 0
             for o in outcomes:
                 if not o.get("batch_id"):
                     continue
@@ -583,6 +613,7 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
                     cycle_success += 1
                     out_objects += 1
                     out_bytes += cbytes
+                    cycle_committed_bytes += cbytes
                     # Count input bytes only for committed batches so failed and
                     # re-read (sustained-mode) batches don't inflate throughput.
                     in_bytes += ubytes
@@ -646,6 +677,21 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
                     })
 
             cycle += 1
+            # The engine's busy time, per cycle (#483): a goodput read against
+            # a link's rate divides by this, not by a wall clock that also
+            # holds the seeding and the recovery pass. Stamped from the two
+            # clock reads around the `process_once` call, never after the
+            # bookkeeping — so in container mode it also holds the
+            # `docker compose exec` that launches the engine (roughly
+            # 0.1-0.2 s), which a reader of a short cycle has to allow for.
+            writer.row("cycle_metrics.csv", {
+                "run_id": run_id, "cycle": cycle,
+                "started_seconds": round(cycle_started_at - start_mono, 3),
+                "cycle_seconds": round(cycle_returned_at - cycle_started_at, 3),
+                "exit_code": rc, "batches": produced,
+                "committed_batches": cycle_success,
+                "committed_bytes": cycle_committed_bytes,
+            })
             # NOTED WHERE THE TOTAL HAS JUST MOVED (#478, review). The engine's
             # committed-byte total is only updated as a cycle's outcomes are
             # parsed, just above, so the cycle that closes here is the finest
@@ -1021,6 +1067,12 @@ def _measure(args, sc, mode, engine_mode, shape, contention_spec, emulator_valid
               f"{files_seen} seeded file(s) ({errors} error(s)); nothing was "
               f"measured. Engine stderr: {stderr_log}", file=sys.stderr)
         return 4
+    unmet = unmet_commit_requirement(sc, success, failed, files_seen)
+    if unmet:
+        print(f"[bench] FAILED: the scenario requires every object to commit, and "
+              f"{unmet}. Summary: {os.path.join(writer.dir, 'summary.md')}",
+              file=sys.stderr)
+        return 6
     return 0
 
 

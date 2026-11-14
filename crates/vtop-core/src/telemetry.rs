@@ -24,7 +24,8 @@
 //!   panel at all.
 
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    TextEncoder,
 };
 use std::sync::OnceLock;
 
@@ -61,13 +62,32 @@ pub struct Metrics {
     pub verification_failures_total: IntCounterVec,
 
     /// Verified by size/existence only. The default policy refuses to commit;
-    /// this counter records explicit compatibility/lab opt-outs.
+    /// this counter records explicit compatibility/lab opt-outs. It is
+    /// counted where `verified_total` is: when the running engine marks a
+    /// batch VERIFIED on a size-only result, and when recovery commits a
+    /// VERIFIED row whose storage re-check confirmed only size. A row recovery
+    /// re-checks but holds back is not counted.
     pub verification_backend_limited_total: IntCounterVec,
+
+    /// Which verification results this engine will commit on, set once at
+    /// startup (#629): `mode="size_only"` reads 1 when
+    /// `upload.require_strong_verification` is false, `mode="strong"` reads 1
+    /// otherwise. The counter above only moves when a batch does; this can be
+    /// alerted on before any traffic. Exported only by `vtopctl run` with
+    /// `VTOP_METRICS_ADDR` set, the one process that builds a registry.
+    pub verification_mode: IntGaugeVec,
 
     /// Batches sent back to be re-read from source. Safe by design, but a
     /// sustained rate means work is being repeated.
     pub replay_required_total: IntCounterVec,
     pub failed_total: IntCounterVec,
+
+    /// VERIFIED batches whose stored manifest recovery found to be from a
+    /// newer release than this engine reads (#671): left VERIFIED for an
+    /// upgraded engine, or retired once their source has committed past them.
+    /// Non-zero means an engine is older than a writer sharing its ledger,
+    /// which the upgrade order rules out: upgrade this engine.
+    pub recovery_unsupported_manifest_total: IntCounterVec,
 
     /// Volume. Rates are derived from these in PromQL, never exported directly.
     pub records_total: IntCounterVec,
@@ -110,6 +130,18 @@ pub struct Metrics {
     /// the same reason: the topic and partition are in the warn line beside
     /// this counter, where unbounded detail belongs.
     pub retention_lost_records_total: IntCounterVec,
+
+    /// Ranges handed back for re-reading (a batch that did not reach
+    /// VERIFIED, or an incomplete row at recovery) that the source REFUSED to
+    /// rewind, or whose re-read it then had to refuse (#621). For a file, the
+    /// file the range was read from cannot be proven reachable: truncated or
+    /// replaced in place, or rotated away and then removed, compressed, copied
+    /// by `copytruncate`, or truncated before its re-read. Each is a range
+    /// missing from the archive; recovery counts it again at every restart
+    /// while the row stays incomplete. Labelled by tenant and source_type,
+    /// like `source_read_errors_total`, never by path: the path is in the
+    /// error line beside it.
+    pub source_replay_refused_total: IntCounterVec,
 
     /// Uploads the object store answered with a THROTTLE — HTTP 429 or 503,
     /// or an S3 `SlowDown`/`Throttling` code — after the backend's own
@@ -177,12 +209,25 @@ impl Metrics {
         )?;
         let verification_backend_limited_total = cv(
             "verification_backend_limited_total",
-            "Size-only verifications committed under an explicit require_strong_verification=false opt-out",
+            "Size-only verifications accepted under an explicit require_strong_verification=false opt-out, counted where vtop_verified_total is (the running engine at VERIFIED, recovery at its commit); each accepts same-size corruption",
             labels3(),
         )?;
+        let verification_mode = IntGaugeVec::new(
+            Opts::new(
+                "verification_mode",
+                "1 for the verification mode this engine started in: size_only means upload.require_strong_verification is false and same-size corruption is accepted",
+            ),
+            &["tenant", "mode"],
+        )?;
+        registry.register(Box::new(verification_mode.clone()))?;
         let replay_required_total = cv(
             "replay_required_total",
             "Batches marked REPLAY_REQUIRED and re-read from source",
+            labels3(),
+        )?;
+        let recovery_unsupported_manifest_total = cv(
+            "recovery_unsupported_manifest_total",
+            "VERIFIED batches whose manifest recovery found to be from a newer release than this engine reads (#671); upgrade the engine",
             labels3(),
         )?;
         let failed_total = cv(
@@ -226,6 +271,11 @@ impl Metrics {
         let retention_lost_records_total = cv(
             "retention_lost_records_total",
             "Records source-side retention removed before the engine read them; any increase is data loss upstream of the archive (see logs for topic/partition)",
+            vec!["tenant", "source_type"],
+        )?;
+        let source_replay_refused_total = cv(
+            "source_replay_refused_total",
+            "Failed ranges the source refused to hand back for re-reading, or whose re-read it then refused; each is a range missing from the archive (see logs for the path). For a file: its file cannot be proven reachable - truncated, replaced or rewritten in place, or rotated away and then removed, compressed, copied by copytruncate, or truncated or rewritten before its re-read",
             vec!["tenant", "source_type"],
         )?;
 
@@ -288,8 +338,10 @@ impl Metrics {
             commits_total,
             verification_failures_total,
             verification_backend_limited_total,
+            verification_mode,
             replay_required_total,
             failed_total,
+            recovery_unsupported_manifest_total,
             records_total,
             bytes_in_total,
             bytes_out_total,
@@ -300,6 +352,7 @@ impl Metrics {
             upload_width,
             source_read_errors_total,
             retention_lost_records_total,
+            source_replay_refused_total,
             upload_throttled_total,
             upload_egress_bytes_total,
         })

@@ -175,10 +175,11 @@ jobs:
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
-        # rdkafka is built with features ["cmake-build", "ssl", "sasl"], so
-        # librdkafka needs BOTH OpenSSL and Cyrus SASL headers here, mirroring
-        # libssl-dev + libsasl2-dev on the Linux legs. Without cyrus-sasl the
-        # librdkafka cmake configure step can fail and block the release.
+        # Since #677, rdkafka builds OpenSSL from source (`ssl-vendored`) and
+        # leaves Cyrus SASL out (Kerberos is the opt-in `kafka-gssapi`
+        # feature). The macOS legs need only cmake, plus the perl and make
+        # the runner image already has, and no Homebrew library ends up
+        # linked into the binaries.
         env:
           # Deterministic release builds: install exactly what is asked for,
           # without a mid-release formula update ride-along.
@@ -188,33 +189,37 @@ jobs:
           # Homebrew's tap-trust model warns on every invocation while an
           # untrusted tap is present. Nothing here uses them — REMOVE rather
           # than trust: a tap delivers arbitrary code, and trusting one this
-          # build never reads would be pure attack surface. (Setting
-          # HOMEBREW_NO_REQUIRE_TAP_TRUST is the discouraged escape hatch and
-          # is slated for removal upstream.)
+          # build never reads would be pure attack surface.
           brew untap aws/tap 2>/dev/null || true
-          brew install cmake openssl@3 cyrus-sasl
-          # Homebrew prefix differs by arch (/opt/homebrew on arm64,
-          # /usr/local on x86_64), so resolve it rather than hardcoding.
-          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
-          # OPENSSL_ROOT_DIR is read by librdkafka's cmake (headers) only;
-          # openssl-sys, which emits the -l ssl/-l crypto the final link
-          # uses, reads OPENSSL_DIR. Without it the macos-15 arm64 runner
-          # linked a libcrypto with no ENGINE API (an OpenSSL 4 on the
-          # default path) against openssl@3 headers: undefined _ENGINE_*
-          # from rdkafka_ssl.c. Pin both to the same keg.
-          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
-          # Evidence for the next runner-image change: which OpenSSL builds
-          # this image carries, and where a default -L would find them.
-          brew list --versions | grep -i -E '^openssl' || true
-          for lib in "$(brew --prefix)"/lib/libssl.* "$(brew --prefix)"/lib/libcrypto.*; do
-            if [ -e "$lib" ] || [ -L "$lib" ]; then ls -l "$lib"; fi
-          done
-          echo "LIBRARY_PATH=${LIBRARY_PATH:-<unset>}"
-          # cyrus-sasl is keg-only: expose it to pkg-config/cmake explicitly.
-          echo "PKG_CONFIG_PATH=$(brew --prefix cyrus-sasl)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+          brew install cmake
+          # The oldest macOS the binaries support. .cargo/config.toml sets the
+          # same value; it is set here as well so the workflow log shows it.
+          echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --release --bin vtop-node --bin vtopctl --target ${{ matrix.target }} --locked
+
+      - name: Check macOS binaries load only system libraries (#677)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A dylib outside /usr/lib or /System (a Homebrew keg, say) is a
+          # library users must install, at a path that differs between arm64
+          # (/opt/homebrew) and x86_64 (/usr/local). Fail the release instead
+          # of shipping a binary that stops at launch.
+          bad=0
+          for bin in vtop-node vtopctl; do
+            f="target/${{ matrix.target }}/release/$bin"
+            otool -L "$f"
+            if otool -L "$f" | tail -n +2 | awk '{print $1}' | grep -vE '^(/usr/lib/|/System/)'; then
+              echo "::error::$bin links a non-system library (listed above)"
+              bad=1
+            fi
+            # The minimum macOS version recorded in the binary.
+            otool -l "$f" | grep -A3 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' | grep -E 'minos|version' | head -2
+          done
+          exit "$bad"
 
       - name: Package
         id: pkg

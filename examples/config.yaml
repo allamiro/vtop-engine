@@ -1,5 +1,9 @@
 # VTOP Engine configuration (prototype / reference implementation).
 #
+# Explain the static per-stream settings, origins and preferred verification:
+#   vtopctl validate --config examples/config.yaml --print-effective
+# Add --json for effective_version: 1. No service is contacted or secret resolved.
+#
 # Secrets (access keys, passwords) are NEVER placed in this file. They are read
 # from environment variables or mounted secrets. See docs/SECURITY_MODEL.md.
 
@@ -111,6 +115,11 @@ compression:
 # not implemented yet.
 # manifest_mac_key_env: VTOP_MANIFEST_MAC_KEY
 
+# Global algorithm; streams.yaml may override it per stream via checksum.algorithm.
+# Keep this strong during rolling upgrades: older engines ignore the stream key.
+checksum:
+  algorithm: sha256
+
 sources:
   kafka:
     enabled: true
@@ -207,8 +216,16 @@ upload:
   # command_timeout_seconds: 300
   # Wall-clock limit for ONE attempt of ONE request on the native S3 backend
   # (#556). Without it a store that accepts a connection and never answers
-  # blocks the engine forever. Size it for the slowest link a part crosses.
+  # blocks the engine forever.
   # request_timeout_seconds: 300
+  # A request that carries a body (an object, a part, a manifest) is allowed
+  # request_timeout_seconds PLUS its size at this rate, per attempt (#663):
+  # the slowest rate one request's body may cross the link at and still be
+  # waited for. Every upload in flight shares the uplink, so this is a
+  # per-request rate: at the default width (8 batches x 4 parts) 4 KiB/s each
+  # is about 1 Mbit/s for the whole link. Lower it for a slower uplink or a
+  # wider configuration. Must be > 0.
+  # request_min_bytes_per_second: 4096
   # command_max_output_bytes: 1048576
   # command_env_allowlist:
   #   - AWS_CONFIG_FILE
@@ -216,7 +233,8 @@ upload:
   create_bucket: true           # auto-create per-format buckets on first use
   # Default true: VERIFIED requires a digest derived from stored content (or a
   # storage-service-computed digest). Set false only for explicit size-only
-  # compatibility/lab operation.
+  # compatibility/lab operation: it accepts same-size corruption, and the
+  # engine says so at startup and in `vtopctl validate`.
   require_strong_verification: true
 
 partitioning:

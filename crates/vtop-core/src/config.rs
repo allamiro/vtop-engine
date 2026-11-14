@@ -14,6 +14,14 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VtopConfig {
+    /// Dotted paths of the keys the YAML document set (#670), filled in by
+    /// [`VtopConfig::from_path`] / [`VtopConfig::from_yaml_str`]; empty for a
+    /// config built any other way, which then explains every setting as a
+    /// built-in default. Only `vtopctl validate --print-effective` reads it,
+    /// to say where a value came from. Never serialized, and holds key names
+    /// only, never values.
+    #[serde(skip)]
+    pub configured_fields: std::collections::BTreeSet<String>,
     pub engine: EngineConfig,
     pub batching: BatchingConfig,
     pub compression: CompressionConfig,
@@ -444,14 +452,48 @@ pub struct FileSourceConfig {
     #[serde(default)]
     pub enabled: bool,
     pub paths: Vec<String>,
-    /// If true, the source file may be deleted *after* the batch is committed.
+    /// If true, a source file is deleted once a committed batch covers it to
+    /// its end AND it has then stayed unwritten - same inode, first page,
+    /// length and mtime - for `delete_quiet_seconds` (#619).
+    ///
+    /// Safe for files nothing writes to any more: whole-file drops, and
+    /// rotated logs once the writer has reopened its new file. The quiet
+    /// period is what keeps a live log that a writer still holds open from
+    /// being deleted when the engine catches up with it - a deleted file keeps
+    /// taking that writer's lines into an inode no path names. It is a
+    /// heuristic, not a proof: no portable check shows that no process holds
+    /// a file open, so a writer that keeps the file open, is silent for longer
+    /// than the quiet period and then writes again loses those lines - as does
+    /// one whose write, after that silence, lands between the delete's final
+    /// check and the unlink. Point this option at files that are finished, not
+    /// at a live log.
     #[serde(default)]
     pub delete_after_commit: bool,
+    /// How long, in seconds, a fully archived file must stay unwritten before
+    /// `delete_after_commit` deletes it (#619). Timed on the engine's own
+    /// clock from the commit that covered the file, so a restart starts the
+    /// wait again; the file's mtime is compared, never trusted as a clock. 0
+    /// deletes as soon as a commit covers the file - still through the
+    /// rename-and-check, which puts the file back if a write landed before
+    /// the move - but with no quiet-period protection: a writer that still
+    /// has the file open loses every line it writes after the delete.
+    /// Default 3600.
+    #[serde(default = "default_delete_quiet_seconds")]
+    pub delete_quiet_seconds: u64,
     /// Read each file as a single whole-file record instead of line by line.
     /// Required for binary / already-compressed source files (which have no
     /// line structure). Default false (line-oriented).
     #[serde(default)]
     pub whole_file: bool,
+}
+
+/// Default for [`FileSourceConfig::delete_quiet_seconds`]: an hour. A
+/// fully archived file costs only its disk space while it waits, and a live
+/// log is far less often silent for an hour than for a few minutes.
+pub const DEFAULT_DELETE_QUIET_SECONDS: u64 = 3600;
+
+fn default_delete_quiet_seconds() -> u64 {
+    DEFAULT_DELETE_QUIET_SECONDS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -491,11 +533,35 @@ pub struct UploadConfig {
     /// answers blocks the engine forever with the process alive and no error:
     /// the AWS SDK's defaults bound connecting but not waiting for a response.
     /// The SDK's own retries still apply, so one request is bounded by three
-    /// of these. An upload part or object body counts: size it for the
-    /// slowest link a part must cross (a 64 MiB part at 1 MiB/s needs about a
-    /// minute). Compatibility backends use `command_timeout_seconds` instead.
+    /// of these. A request that carries an object or part body is allowed
+    /// this PLUS the time its body takes at
+    /// [`request_min_bytes_per_second`](Self::request_min_bytes_per_second)
+    /// (#663), so a slow link stretches the deadline instead of failing every
+    /// body that cannot cross it in a fixed time. Compatibility backends use
+    /// `command_timeout_seconds` instead.
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: u64,
+    /// The slowest rate, in bytes per second, at which ONE request's body may
+    /// cross the link and still be waited for (native S3 backend, #663). A
+    /// request that carries a body (an object, a multipart part, a manifest)
+    /// gets `request_timeout_seconds` plus its size at this rate for each
+    /// attempt: an 8 MiB part at the default 4 KiB/s is allowed 300 + 2048 s.
+    ///
+    /// The fixed per-attempt deadline it replaces for bodies failed every
+    /// object on a policed 10 Mbit/s uplink: the engine's default width puts
+    /// two dozen part uploads on the link at once, each got about 11 KB/s, and
+    /// an 8 MiB part needs about 760 s at that share — so every attempt was
+    /// cut at 300 s, re-sent from its first byte, and cut again. The width
+    /// times the parts in flight divides the link, so this is a per-REQUEST
+    /// rate: at the default 32 requests, 4 KiB/s each is about 1 Mbit/s for
+    /// the whole uplink. Lower it for a slower uplink or a wider
+    /// configuration; a value at or above the link's rate restores the fixed
+    /// deadline. A store that stops reading a body is still caught within
+    /// seconds by the SDK's stalled-upload protection; what this lengthens is
+    /// only how long a store that has read a body may take to answer before
+    /// the attempt is abandoned. Must be > 0.
+    #[serde(default = "default_request_min_bytes_per_second")]
+    pub request_min_bytes_per_second: u64,
     /// Optional named profile / alias for command-based backends.
     #[serde(default)]
     pub profile: Option<String>,
@@ -979,6 +1045,9 @@ fn default_command_timeout_seconds() -> u64 {
 fn default_request_timeout_seconds() -> u64 {
     300
 }
+fn default_request_min_bytes_per_second() -> u64 {
+    4 * 1024
+}
 fn default_command_max_output_bytes() -> usize {
     1024 * 1024
 }
@@ -1041,13 +1110,57 @@ fn default_template() -> String {
     crate::partitioning::DEFAULT_TEMPLATE.to_string()
 }
 
+/// What `upload.require_strong_verification: false` costs, in the words the
+/// startup log and `vtopctl validate` both print (#629). Before this, the only
+/// sign of the opt-out was a WARN per batch, so an engine left in lab mode in
+/// production said nothing until traffic flowed, and then said it among the
+/// INFO lines.
+pub const SIZE_ONLY_VERIFICATION_WARNING: &str =
+    "upload.require_strong_verification is false: a batch the object store can only \
+     confirm by size and existence is committed as verified, so this engine accepts \
+     same-size corruption (a corrupted or replaced object of the recorded size is \
+     archived and its source progress committed). Set \
+     upload.require_strong_verification: true unless this is a lab or a backend \
+     with no content digest";
+
 impl VtopConfig {
+    /// Settings that are valid but unsafe enough to say so on every start
+    /// and in `vtopctl validate` (#629). Never a reason to refuse: each one
+    /// is an explicit, documented opt-out.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if !self.upload.require_strong_verification {
+            let mut w = SIZE_ONLY_VERIFICATION_WARNING.to_string();
+            if !self.checksum.algorithm.is_enabled() {
+                // With no digest at all, the weak path is not a fallback
+                // for an awkward backend: it is every batch.
+                w.push_str(
+                    "; checksum.algorithm is none, so EVERY batch is verified by size alone",
+                );
+            }
+            warnings.push(w);
+        }
+        warnings
+    }
+
     /// Load and validate config from a YAML file.
     pub fn from_path(path: &Path) -> Result<Self, VtopError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| VtopError::Config(format!("reading {}: {e}", path.display())))?;
-        let cfg: VtopConfig = serde_yaml::from_str(&text)?;
+        let cfg = Self::from_yaml_str(&text)?;
         cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Parse a YAML document without validating it, recording which keys it
+    /// set in [`VtopConfig::configured_fields`] (#670).
+    ///
+    /// The typed parse runs first and alone decides acceptance and every
+    /// error's text; presence is recorded only after it succeeded, so a refused
+    /// file reads exactly as it did before presence was recorded.
+    pub fn from_yaml_str(text: &str) -> Result<Self, VtopError> {
+        let mut cfg: VtopConfig = serde_yaml::from_str(text)?;
+        cfg.configured_fields = crate::effective_config::present_keys(text);
         Ok(cfg)
     }
 
@@ -1058,6 +1171,15 @@ impl VtopConfig {
         if self.upload.backend == "s3_native" && self.upload.request_timeout_seconds == 0 {
             return Err(VtopError::Config(
                 "upload.request_timeout_seconds must be > 0".into(),
+            ));
+        }
+        // Zero would divide a body by nothing: an attempt with no deadline.
+        if self.upload.backend == "s3_native" && self.upload.request_min_bytes_per_second == 0 {
+            return Err(VtopError::Config(
+                "upload.request_min_bytes_per_second must be > 0: it is the slowest rate a \
+                 request body may cross the link at, and zero would leave a body upload \
+                 with no deadline at all"
+                    .into(),
             ));
         }
         if self.engine.state_store_timeout_seconds == 0 {
@@ -1338,6 +1460,15 @@ impl VtopConfig {
 /// A single configured stream mapping from `streams.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamConfig {
+    /// Override the global checksum for this stream. The strong-verification
+    /// floor stays global and cannot be lowered by a stream.
+    #[serde(default)]
+    pub checksum: Option<StreamChecksumConfig>,
+    /// Keys this entry set in `streams.yaml` (#670), filled in by
+    /// [`StreamsConfig::from_path`] / [`StreamsConfig::from_yaml_str`]. Key
+    /// names only; never serialized.
+    #[serde(skip)]
+    pub configured_fields: std::collections::BTreeSet<String>,
     pub source_name: String,
     pub source_type: SourceType,
     pub format: TelemetryFormat,
@@ -1350,19 +1481,122 @@ pub struct StreamConfig {
     pub retention_class: Option<String>,
 }
 
+/// A stream's own `checksum` block (#669). The shape mirrors the global
+/// [`ChecksumConfig`], but `algorithm` is required and no other key is
+/// accepted: an empty block or a misspelled key would otherwise read as an
+/// explicit sha256 override of the global algorithm (#480: a misspelled
+/// knob fails loudly). Omit the block, or set it to null, to inherit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamChecksumConfig {
+    pub algorithm: ChecksumAlgorithm,
+}
+
+/// Resolve the algorithm at the point a new batch is written. Recovery and
+/// scrub instead use the algorithm persisted in that batch's manifest.
+pub fn effective_algorithm(
+    config: &VtopConfig,
+    stream: Option<&StreamConfig>,
+) -> ChecksumAlgorithm {
+    stream
+        .and_then(|stream| stream.checksum.as_ref())
+        .map_or(config.checksum.algorithm, |checksum| checksum.algorithm)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamsConfig {
     pub streams: Vec<StreamConfig>,
 }
 
 impl StreamsConfig {
+    /// Validate cross-file invariants before any source or store is opened.
+    ///
+    /// A stream cannot lower the global strong-verification floor (#669): an
+    /// explicit per-stream `checksum.algorithm: none` while
+    /// `upload.require_strong_verification` is on is refused here, naming the
+    /// stream. A stream that merely inherits the global algorithm is judged
+    /// exactly as before this setting existed. Only applied entries are
+    /// judged ([`StreamsConfig::applied`]): a shadowed one never runs.
+    pub fn validate(&self, config: &VtopConfig) -> Result<(), VtopError> {
+        for stream in self.applied() {
+            let lowers_floor = stream
+                .checksum
+                .as_ref()
+                .is_some_and(|checksum| !checksum.algorithm.is_enabled());
+            if lowers_floor && config.upload.require_strong_verification {
+                return Err(VtopError::Config(format!(
+                    "stream {:?}: checksum.algorithm is none but upload.require_strong_verification is true",
+                    stream.source_name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Global warnings with stream overrides accounted for, followed by each
+    /// applied stream's explicit opt-out. Existing configurations keep their
+    /// old text.
+    pub fn warnings(&self, config: &VtopConfig) -> Vec<String> {
+        let mut warnings = config.warnings();
+        if !config.checksum.algorithm.is_enabled()
+            && self
+                .applied()
+                .any(|stream| effective_algorithm(config, Some(stream)).is_enabled())
+        {
+            for warning in &mut warnings {
+                *warning = warning.replace(
+                    "EVERY batch is verified by size alone",
+                    "every batch inheriting the global algorithm is verified by size alone",
+                );
+            }
+        }
+        warnings.extend(
+            self.applied()
+                .filter(|stream| {
+                    stream.checksum.is_some()
+                        && !effective_algorithm(config, Some(stream)).is_enabled()
+                })
+                .map(|stream| {
+                    format!(
+                        "stream {:?}: checksum.algorithm is none, so EVERY batch of this \
+                         stream is verified by size alone; same-size corruption is not detected",
+                        stream.source_name
+                    )
+                }),
+        );
+        warnings
+    }
+
     pub fn from_path(path: &Path) -> Result<Self, VtopError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| VtopError::Config(format!("reading {}: {e}", path.display())))?;
-        Ok(serde_yaml::from_str(&text)?)
+        Self::from_yaml_str(&text)
+    }
+
+    /// Parse a `streams.yaml` document, recording which keys each stream set
+    /// in its [`StreamConfig::configured_fields`] (#670). As for
+    /// [`VtopConfig::from_yaml_str`], the typed parse alone decides acceptance
+    /// and error text.
+    pub fn from_yaml_str(text: &str) -> Result<Self, VtopError> {
+        let mut streams: StreamsConfig = serde_yaml::from_str(text)?;
+        let present = crate::effective_config::present_keys(text);
+        for (index, stream) in streams.streams.iter_mut().enumerate() {
+            stream.configured_fields = crate::effective_config::stream_keys(&present, index);
+        }
+        Ok(streams)
     }
 
     /// Find the stream definition that matches a discovered source name.
+    /// The entries the engine applies: the first per `source_name`, as
+    /// [`StreamsConfig::lookup`] resolves them. A later entry with the same
+    /// name is shadowed and never used (#670 lists it as shadowed).
+    pub fn applied(&self) -> impl Iterator<Item = &StreamConfig> {
+        let mut seen = std::collections::HashSet::new();
+        self.streams
+            .iter()
+            .filter(move |s| seen.insert(s.source_name.as_str()))
+    }
+
     pub fn lookup(&self, source_name: &str) -> Option<&StreamConfig> {
         self.streams.iter().find(|s| s.source_name == source_name)
     }
@@ -1371,6 +1605,186 @@ impl StreamsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #629: the size-only opt-out is a warning, never an error, and the
+    /// warning names its consequence and the key that turns it off.
+    #[test]
+    fn size_only_verification_is_warned_about_not_refused() {
+        let yaml = r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources: {}
+upload:
+  bucket: telemetry-data
+"#;
+        let strong: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            strong.warnings().is_empty(),
+            "the default is strong verification and warns about nothing: {:?}",
+            strong.warnings()
+        );
+
+        let mut weak = strong.clone();
+        weak.upload.require_strong_verification = false;
+        weak.validate().expect("the opt-out stays valid config");
+        let warnings = weak.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("accepts same-size corruption")
+                && warnings[0].contains("upload.require_strong_verification"),
+            "{}",
+            warnings[0]
+        );
+        assert!(!warnings[0].contains("EVERY batch"), "{}", warnings[0]);
+
+        weak.checksum.algorithm = ChecksumAlgorithm::None;
+        assert!(
+            weak.warnings()[0].contains("EVERY batch"),
+            "with checksums off every batch is size-only: {:?}",
+            weak.warnings()
+        );
+    }
+
+    /// #669: a stream's own algorithm wins, else the global one; only an
+    /// explicit per-stream `none` is refused under the strong floor, and with
+    /// the floor off it is a warning naming the stream.
+    #[test]
+    fn stream_checksum_resolves_and_cannot_lower_the_floor() {
+        let yaml = r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources: {}
+upload:
+  bucket: telemetry-data
+checksum:
+  algorithm: blake3
+"#;
+        let mut cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        let streams: StreamsConfig = serde_yaml::from_str(
+            r#"
+streams:
+  - {source_name: inherits, source_type: file, format: raw}
+  - {source_name: strong, source_type: file, format: raw, checksum: {algorithm: sha256}}
+  - {source_name: lowers, source_type: file, format: raw, checksum: {algorithm: none}}
+"#,
+        )
+        .unwrap();
+        let algo = |i: usize, cfg: &VtopConfig| effective_algorithm(cfg, Some(&streams.streams[i]));
+        assert_eq!(algo(0, &cfg), ChecksumAlgorithm::Blake3);
+        assert_eq!(algo(1, &cfg), ChecksumAlgorithm::Sha256);
+        assert_eq!(algo(2, &cfg), ChecksumAlgorithm::None);
+        assert_eq!(effective_algorithm(&cfg, None), ChecksumAlgorithm::Blake3);
+
+        let err = streams.validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("\"lowers\"") && err.contains("none"), "{err}");
+
+        // Inheriting a global `none` is not a stream lowering the floor: that
+        // case is judged as it was before #669 (refused per batch at run time).
+        let inheriting = StreamsConfig {
+            streams: streams.streams[..2].to_vec(),
+        };
+        cfg.checksum.algorithm = ChecksumAlgorithm::None;
+        inheriting.validate(&cfg).unwrap();
+
+        cfg.checksum.algorithm = ChecksumAlgorithm::Blake3;
+        cfg.upload.require_strong_verification = false;
+        streams.validate(&cfg).unwrap();
+        let warnings = streams.warnings(&cfg);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("\"lowers\"") && w.contains("size alone")),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("\"inherits\"")),
+            "{warnings:?}"
+        );
+    }
+
+    /// #669 review: a stream's `checksum` must name its algorithm. An empty
+    /// block or a misspelled key used to deserialize to sha256 and override
+    /// the global algorithm as if the operator had chosen it (#480: a
+    /// misspelled knob fails loudly).
+    #[test]
+    fn a_stream_checksum_block_must_name_a_known_algorithm() {
+        for block in [
+            "{}",
+            "{algoritm: blake3}",
+            "{algorithm: blake3, read_back: true}",
+        ] {
+            let yaml = format!(
+                "streams:\n  - {{source_name: a, source_type: file, format: raw, checksum: {block}}}\n"
+            );
+            assert!(
+                StreamsConfig::from_yaml_str(&yaml).is_err(),
+                "checksum: {block} must be refused, not read as an override"
+            );
+        }
+        let ok = StreamsConfig::from_yaml_str(
+            "streams:\n  - {source_name: a, source_type: file, format: raw, checksum: {algorithm: blake3}}\n  - {source_name: b, source_type: file, format: raw, checksum: null}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ok.streams[0].checksum.as_ref().map(|c| c.algorithm),
+            Some(ChecksumAlgorithm::Blake3)
+        );
+        assert!(ok.streams[1].checksum.is_none(), "null inherits");
+    }
+
+    /// #669 review: the engine applies only the first entry per
+    /// `source_name` ([`StreamsConfig::lookup`]), so a shadowed later entry
+    /// must neither refuse the config nor produce a warning about a stream
+    /// that in fact runs with the first entry's algorithm.
+    #[test]
+    fn a_shadowed_stream_entry_neither_warns_nor_refuses() {
+        let mut cfg: VtopConfig = serde_yaml::from_str(
+            r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources: {}
+upload:
+  bucket: telemetry-data
+"#,
+        )
+        .unwrap();
+        let streams = StreamsConfig::from_yaml_str(
+            "streams:\n  - {source_name: a, source_type: file, format: raw}\n  - {source_name: a, source_type: kafka, format: raw, checksum: {algorithm: none}}\n",
+        )
+        .unwrap();
+        assert_eq!(streams.applied().count(), 1);
+        assert!(streams.applied().next().unwrap().checksum.is_none());
+        streams.validate(&cfg).unwrap();
+        cfg.upload.require_strong_verification = false;
+        let warnings = streams.warnings(&cfg);
+        assert!(
+            !warnings.iter().any(|w| w.contains("stream \"a\"")),
+            "{warnings:?}"
+        );
+    }
+
+    /// The shipped examples load and pass the cross-file check together, so
+    /// the per-stream keys they document stay valid (#669 review).
+    #[test]
+    fn the_example_streams_file_validates_against_the_example_config() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
+        let cfg = VtopConfig::from_path(Path::new(&format!("{dir}/config.yaml"))).unwrap();
+        let streams = StreamsConfig::from_path(Path::new(&format!("{dir}/streams.yaml"))).unwrap();
+        streams.validate(&cfg).unwrap();
+        assert!(streams.streams.iter().any(|s| s.checksum.is_some()));
+    }
 
     #[test]
     fn rejects_kafka_auto_commit() {
@@ -1510,6 +1924,84 @@ upload:
     // ----------------------------------------------------------------------
     // Per-transport egress tuning shape (#480)
     // ----------------------------------------------------------------------
+
+    /// `validate` without `--print-effective` must stay byte-identical (#670),
+    /// and that includes a refused file: recording which keys were present must
+    /// not change a single parse error's text, its path or its line/column.
+    /// The expected strings are what `main` printed before presence existed.
+    #[test]
+    fn recording_present_keys_leaves_every_parse_error_unchanged() {
+        let base = tuning_base();
+        let cases = [
+            (
+                base.replace("  work_dir: /tmp/work\n", ""),
+                "engine: missing field `work_dir` at line 3 column 3",
+            ),
+            (
+                base.replace("batching: {}", "batching: {max_records: lots}"),
+                "batching.max_records: invalid type: string \"lots\", expected usize at line 6 column 25",
+            ),
+            (
+                format!("{base}  transports:\n    tcp_tls:\n      max_concurrancy: 4\n"),
+                "upload.transports.tcp_tls: unknown field `max_concurrancy`, expected one of \
+                 `target_rate_bytes_per_second`, `max_concurrency`, `part_size_bytes`, \
+                 `parts_in_flight`, `redundancy` at line 16 column 7",
+            ),
+            (
+                base.replace("  name: vtop-engine", "  name: vtop-engine\n  name: twice"),
+                "engine: duplicate field `name` at line 3 column 3",
+            ),
+            (
+                base.replace("batching: {}", "batching: [1, 2]"),
+                "batching: invalid type: sequence, expected struct BatchingConfig at line 6 column 11",
+            ),
+            (String::new(), "missing field `engine`"),
+        ];
+        for (doc, expected) in &cases {
+            let err = VtopConfig::from_yaml_str(doc).expect_err("each document is invalid");
+            assert_eq!(err.to_string(), format!("serde_yaml error: {expected}"));
+        }
+        let stream_cases = [
+            (
+                "streams:\n- source_name: a\n  source_type: file\n",
+                "streams[0]: missing field `format` at line 2 column 3",
+            ),
+            (
+                "streams:\n- source_name: a\n  source_type: nope\n  format: raw\n",
+                "streams[0].source_type: unknown variant `nope`, expected one of `kafka`, `file`, \
+                 `syslog_spool` at line 3 column 16",
+            ),
+            (
+                "streams:\n- source_name: a\n  source_type: file\n  format: raw\n  tenant: [x]\n",
+                "streams[0].tenant: invalid type: sequence, expected a string at line 5 column 11",
+            ),
+        ];
+        for (doc, expected) in stream_cases {
+            let err = StreamsConfig::from_yaml_str(doc).expect_err("each document is invalid");
+            assert_eq!(err.to_string(), format!("serde_yaml error: {expected}"));
+        }
+    }
+
+    /// A document the engine accepts is never refused because its keys were
+    /// being recorded: a duplicate key inside a map-typed field is let through
+    /// by the typed parse (last one wins), and a `serde_yaml::Value` walk would
+    /// have refused it.
+    #[test]
+    fn recording_present_keys_never_refuses_an_accepted_document() {
+        let doc = format!(
+            "{}  transports:\n    tcp_tls:\n      max_concurrency: 2\n    tcp_tls:\n      max_concurrency: 3\n",
+            tuning_base()
+        );
+        let typed: VtopConfig = serde_yaml::from_str(&doc).expect("accepted today");
+        let recorded = VtopConfig::from_yaml_str(&doc).expect("still accepted");
+        assert_eq!(
+            format!("{:?}", typed.upload.transports),
+            format!("{:?}", recorded.upload.transports)
+        );
+        assert!(recorded
+            .configured_fields
+            .contains("upload.transports.tcp_tls.max_concurrency"));
+    }
 
     fn tuning_base() -> &'static str {
         r#"
@@ -2083,6 +2575,34 @@ upload:
         let other = yaml.replace(
             "  backend: s3_native",
             "  backend: mock\n  request_timeout_seconds: 0",
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&other).unwrap();
+        cfg.validate().unwrap();
+
+        // The body floor (#663): 4 KiB/s unless set, settable, and never zero
+        // on the backend that divides by it.
+        let cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.upload.request_min_bytes_per_second, 4096);
+        let set = yaml.replace(
+            "  backend: s3_native",
+            "  backend: s3_native\n  request_min_bytes_per_second: 1024",
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&set).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.upload.request_min_bytes_per_second, 1024);
+        let zero = yaml.replace(
+            "  backend: s3_native",
+            "  backend: s3_native\n  request_min_bytes_per_second: 0",
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&zero).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("upload.request_min_bytes_per_second") && err.contains("> 0"),
+            "{err}"
+        );
+        let other = yaml.replace(
+            "  backend: s3_native",
+            "  backend: mock\n  request_min_bytes_per_second: 0",
         );
         let cfg: VtopConfig = serde_yaml::from_str(&other).unwrap();
         cfg.validate().unwrap();

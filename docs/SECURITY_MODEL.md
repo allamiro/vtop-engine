@@ -363,7 +363,7 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 - A source progress marker **MUST NOT** be committed unless both object and manifest verification succeed (the commit rule, [VTOP_PROTOCOL_DRAFT.md §13](VTOP_PROTOCOL_DRAFT.md#13-commit-rule)).
 - The manifest binds the object hash to the covered source progress markers. Its unkeyed **self-hash** is reproducible corruption detection, not authenticity: a writer who can replace the document can recompute it.
 - When `manifest_mac_key_env` is configured, the stored manifest **MUST** carry a valid keyed BLAKE3 `manifest.mac`; missing or invalid MACs fail pipeline, CLI, and recovery verification.
-- Where only size/existence can be confirmed, verification is **backend-limited** and the engine **MUST** report it as such rather than as cryptographic verification. The engine defaults to rejecting this result; accepting it requires the explicit `require_strong_verification: false` compatibility opt-out.
+- Where only size/existence can be confirmed, verification is **backend-limited** and the engine **MUST** report it as such rather than as cryptographic verification. The engine defaults to rejecting this result; accepting it requires the explicit `require_strong_verification: false` compatibility opt-out. That opt-out accepts same-size corruption, so the engine announces it: one WARN at startup and a `vtopctl validate` warning naming the key, `vtop_verification_mode{mode="size_only"} 1` from `vtopctl run`'s metrics endpoint, and a WARN with the batch id for every size-only verification, counted in `vtop_verification_backend_limited_total` where `vtop_verified_total` counts it (at VERIFIED in the running engine, at the commit in recovery) (#629).
 - A keyed MAC authenticates data among key holders but does not provide public verification or non-repudiation.
 
 ## 7. Data at rest and object immutability
@@ -421,6 +421,40 @@ complementary.
   with ledger hash binding; the hardened profile refuses to run on them.
   Rows written before this feature (no recorded version) are verified the
   same legacy way.
+
+### 8.2 A manifest that claims a newer version (#671)
+
+A reader checks a manifest's `version` before it authenticates anything,
+so it can tell a newer writer's manifest from a damaged one. The version is
+read from bytes nothing has authenticated yet, so it is only a **claim**: a
+storage tamperer can overwrite a manifest with `{"protocol": "VTOP",
+"version": "0.9"}`. Acted on unchecked, that claim would turn an integrity
+finding into "upgrade the binary". Worse, recovery would hold the batch
+VERIFIED for good, when it should replay it. So the claim counts only for
+bytes proven to be what the batch's writer stored:
+
+- The bytes **MUST** be the row's pinned, immutable `manifest_version_id`
+  (§8.1). An overwrite of the key cannot change a pinned version.
+- They **MUST** carry the batch id and the self-hash the ledger recorded.
+  On its own that binds nothing, because the self-hash was computed by a
+  scheme this build cannot reproduce and a tamperer can copy it into a
+  forgery. What it adds is that the pinned version is this batch's.
+
+When both hold, recovery leaves the row VERIFIED and pending. It counts the
+row in `vtop_recovery_unsupported_manifest_total`, and retires it as
+SUPERSEDED once its source has committed past it. The scrub reports
+`unsupported_version`.
+
+When either fails (no pin, or a pin that does not carry the ledger's
+binding), the manifest is **unauthenticated**, exactly as before #671:
+recovery marks the row FAILED and then REPLAY_REQUIRED, and the scrub reports
+`unauthenticated`. A deployment without object versions therefore replays a
+genuine newer-release batch rather than trusting it. That costs duplicates,
+never a gap.
+
+`vtopctl verify-manifest`, run standalone with no ledger to bind the bytes
+to, reports that the manifest at that URI claims a version this build cannot
+authenticate. It never reports it as intact.
 
 ## 9. Resource exhaustion controls
 

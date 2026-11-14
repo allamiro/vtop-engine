@@ -63,10 +63,24 @@ For every batch, VTOP:
 
 ---
 
+## Measured against Apache Kafka
+
+[![Produce throughput at saturation, VTOP's Kafka gateway vs Apache Kafka, same JVM client, profile defaults, single host](docs/benchmarks/img/kafka-compare-produce-throughput.png)](docs/benchmarks/kafka-comparison.md)
+
+On one host (an Apple M5 Max laptop; each three-node cluster in turn in the same Docker Desktop VM, 2 CPUs
+and `2g` of memory per node; profile `defaults`), the same JVM producer reached a higher saturation throughput against
+Apache Kafka than against VTOP's Kafka gateway at both record sizes measured, where under `defaults` a Kafka
+`acks=all` acknowledgement does not wait for an fsync and a VTOP quorum acknowledgement does. Indicative, not
+a production benchmark: the method, the latency and consume results, the raw CSV and every condition are in
+[docs/benchmarks/kafka-comparison.md](docs/benchmarks/kafka-comparison.md).
+
+---
+
 ## Table of contents
 
 - [Overview](#overview)
 - [Status](#status)
+- [Measured against Apache Kafka](#measured-against-apache-kafka)
 - [Why VTOP exists](#why-vtop-exists)
 - [Core rule](#core-rule)
 - [How it works](#how-it-works)
@@ -348,7 +362,7 @@ docker compose up -d
 docker compose logs -f vtop-engine
 ```
 
-Or build and run locally:
+Or build and run locally (install the [native prerequisites](#native-prerequisites) first):
 
 ```bash
 cargo build --release
@@ -358,6 +372,101 @@ cargo run -p vtop-cli -- discover --config examples/config.yaml
 ---
 
 ## Build and test
+
+### Native prerequisites
+
+The default build includes the Kafka source. Its `rdkafka` dependency compiles
+librdkafka with CMake, and OpenSSL from source with Perl. OpenSSL is linked
+into the binary, so the build never depends on the host's OpenSSL version, and
+the binaries load no OpenSSL or SASL library at run time (#677). You need a
+C/C++ toolchain, CMake, make and Perl, plus Rust from
+[rustup](https://rustup.rs). The minimum Rust version is `rust-version` in
+`Cargo.toml`.
+
+| Platform | Install |
+|---|---|
+| Debian / Ubuntu | `sudo apt-get install -y build-essential cmake perl pkg-config libcurl4-openssl-dev zlib1g-dev` |
+| RHEL, AlmaLinux, Rocky Linux 8, 9 and 10 | `sudo dnf install -y gcc gcc-c++ make cmake perl-core libcurl-devel zlib-devel` |
+| Fedora | `sudo dnf install -y gcc gcc-c++ make cmake perl-core libcurl-devel zlib-devel` |
+| macOS 11 or later, Apple silicon or Intel | `xcode-select --install`, then `brew install cmake` |
+
+The `dnf` line was checked on AlmaLinux 8.10, 9.8 and 10.2, Rocky Linux 8.10
+and 9.8, and Fedora 45. A full build was run on AlmaLinux 8 (OpenSSL 1.1.1
+installed) and on Fedora 45 (OpenSSL 4 installed); neither touches the system
+OpenSSL. RHEL takes the same packages from its BaseOS and AppStream
+repositories. On a minimal image, `perl-core` matters: the OpenSSL build needs
+Perl modules (`FindBin`, `IPC::Cmd`) that bare `perl` doesn't carry. The curl
+package is needed for its header only. librdkafka includes `curl/curl.h` even
+with curl support switched off (its config always defines
+`WITH_OAUTHBEARER_OIDC`, and one file tests it with `#ifdef`). Nothing links
+libcurl. The macOS SDK ships that header already.
+
+Then build:
+
+```bash
+cargo build --release --locked
+./target/release/vtopctl --version
+```
+
+On macOS, `.cargo/config.toml` sets `MACOSX_DEPLOYMENT_TARGET=11.0`, so a
+binary built on any macOS release runs on macOS 11 and later. To target a
+different minimum, export that variable yourself.
+
+**Optional builds:**
+
+- **Without the Kafka source.** `cargo build -p vtop-cli --no-default-features`
+  skips librdkafka and OpenSSL entirely. The file, spool and native paths work
+  the same.
+- **Linking the system OpenSSL** instead of the built-in one. Packagers may want
+  this to pick up distribution security updates. Install the OpenSSL
+  development package (`libssl-dev`, `openssl-devel`, or Homebrew
+  `openssl@3`), then:
+
+  ```bash
+  export OPENSSL_NO_VENDOR=1
+  export OPENSSL_DIR="$(brew --prefix openssl@3)"   # macOS only
+  ```
+
+  Use OpenSSL 1.1.1 or 3.x. librdkafka calls the ENGINE API, which OpenSSL 4
+  removed, so a system OpenSSL 4 (Fedora 45, Homebrew's default `openssl`)
+  fails at the link step.
+- **Kerberos (SASL GSSAPI)** for the Kafka source:
+  `cargo build --release --features kafka-gssapi`. It links the system Cyrus
+  SASL, so install `libsasl2-dev` (Debian/Ubuntu), `cyrus-sasl-devel`
+  (RHEL family, Fedora) or Homebrew `cyrus-sasl`, and on macOS:
+
+  ```bash
+  export PKG_CONFIG_PATH="$(brew --prefix cyrus-sasl)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  ```
+
+  SASL PLAIN, SCRAM and OAUTHBEARER are built into librdkafka and need none of
+  this.
+
+**Running the release binaries.** From the release after v0.8.0, the Linux and
+macOS binaries need no extra libraries. The v0.8.0 binaries and earlier still
+link OpenSSL 3 and Cyrus SASL dynamically:
+
+- **macOS:** `brew install openssl@3 cyrus-sasl`.
+- **Debian/Ubuntu:** `sudo apt-get install -y libssl3 libsasl2-2`.
+- **RHEL family and Fedora:** `sudo dnf install -y openssl-libs cyrus-sasl-lib`.
+
+The container image always carries what it needs.
+
+**Troubleshooting:**
+
+| Symptom | Cause and fix |
+|---|---|
+| `Library not loaded: .../libsasl2.3.dylib` or `libssl.3.dylib` (macOS) | A v0.8.0 or earlier binary. Run `brew install openssl@3 cyrus-sasl`, or build from source. |
+| `error while loading shared libraries: libsasl2.so.3` or `libssl.so.3` (Linux) | A v0.8.0 or earlier binary. Install the run-time packages listed above. |
+| `Can't locate FindBin.pm` or `IPC/Cmd.pm` during the build | The OpenSSL build needs those Perl modules. Install `perl-core` (RHEL family, Fedora) or `perl` (Debian/Ubuntu). |
+| `failed to run custom build command for rdkafka-sys` mentioning `cmake` | Install CMake (see the table). |
+| `fatal error: curl/curl.h: No such file or directory` (Linux) | Install `libcurl4-openssl-dev` or `libcurl-devel` (header only; see above). |
+| Undefined `_ENGINE_*` symbols, or the link line names `openssl@4` | `OPENSSL_NO_VENDOR` is set and found OpenSSL 4. Unset it, or point `OPENSSL_DIR` at an OpenSSL 3. |
+| `No provider for SASL mechanism GSSAPI` when the engine starts | The binary was built without Kerberos. Rebuild with `--features kafka-gssapi`. |
+| `ld: warning: ... was built for newer 'macOS' version` | Something set `MACOSX_DEPLOYMENT_TARGET` higher than the build defaults. Unset it, or set it to the oldest macOS you want to support. |
+| A fix above changed nothing | Cargo cached the old build of the C libraries. Run `cargo clean -p openssl-sys -p rdkafka-sys` and build again. |
+
+### Checks
 
 ```bash
 cargo fmt --all --check
@@ -389,6 +498,11 @@ Workflow file:
 The CLI binary is `vtopctl`.
 
 ```bash
+# Check a config without contacting anything. Exits non-zero only for an
+# invalid config; a risky opt-out is printed as a WARNING and still passes.
+cargo run -p vtop-cli -- validate \
+  --config examples/config.yaml
+
 cargo run -p vtop-cli -- run \
   --config examples/config.yaml
 
@@ -776,6 +890,7 @@ VTOP is currently a prototype. The following limits are known and intentional.
 | Binary / pre-compressed inputs | **supported** via the file source `whole_file` mode (archived verbatim, byte-exact) | streaming for very large files |
 | Local filesystem backend | **available** (`backend: localfs`, objects under `local_path/<bucket>/<key>`; sidecars are inventory hints only) | — |
 | Checksums | **SHA-256 and BLAKE3**, or disabled (size-only); strong verification defaults on and `require_strong_verification: false` is an explicit weak-mode opt-out | — |
+| Size-only verification | `upload.require_strong_verification: false` **accepts same-size corruption**: a corrupted or replaced object of the recorded size is committed as verified. It is announced, not refused: one WARN at engine startup and a `vtopctl validate` warning naming the key, `vtop_verification_mode{mode="size_only"} 1` from startup (exported by `vtopctl run` with `VTOP_METRICS_ADDR`), and a WARN with the batch id for every size-only verification, counted in `vtop_verification_backend_limited_total` where `vtop_verified_total` counts it: at VERIFIED in the running engine, at the commit in recovery (#629) | — |
 
 ---
 

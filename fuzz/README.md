@@ -16,7 +16,7 @@ which requires a nightly toolchain.
 |---|---|---|
 | `detect_record` | `detect_record(&[u8])` | never panics on any byte string |
 | `detect_batch` | `detect_batch(&[Vec<u8>])` (input split on newlines) | never panics on any set of records |
-| `manifest_parse` | `serde_json::from_slice::<VtopManifest>` + `self_hash` / `verify_self_hash` / `to_json_bytes` on anything that parses | deserialization returns `Err`, never panics; downstream helpers don't panic on a hostile manifest |
+| `manifest_parse` | `ParsedManifest::from_slice` (version check first, strict 0.4 parse and canonical form) + `verify_self_hash` / `verify_authentication`; `serde_json::from_slice::<VtopManifest>` + `self_hash` / `verify_self_hash` / `to_json_bytes` | parsing returns `Err`, never panics; the verification helpers don't panic on a hostile manifest. Seeds include the released v0.7.0 manifests, a 0.4 document with unknown fields, and newer, duplicate-key and fractional-number cases |
 
 ## Run
 

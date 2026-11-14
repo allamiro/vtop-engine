@@ -888,14 +888,22 @@ pub async fn serve(
     let _version_task = match config.lease.as_ref() {
         Some(lease) => {
             let interval = Duration::from_millis(lease.renew_interval_ms.max(100));
+            // A round's RPC budget is the lease duration, as the lease
+            // watcher's reads have, not the cadence (review): a cadence
+            // under the admin client's per-candidate allowance would cancel
+            // every round before it could pass a stalled endpoint.
+            let budget = Duration::from_millis(lease.lease_duration_ms).max(interval);
             let level = crate::version_report::cluster_level_for(config.node_uuid);
             let admin = lease_admin_client(lease)?;
+            // The startup read stays within one interval: it is best effort,
+            // and the loop's first round has the full budget.
             crate::version_report::read_level(&admin, &level, interval).await;
             Some(Aborting(tokio::spawn(crate::version_report::run(
                 admin,
                 config.node_uuid,
                 level,
                 interval,
+                budget,
                 shutdown.clone(),
             ))))
         }
@@ -1322,6 +1330,15 @@ async fn run_leader(
         )
         .map_err(|error| error.to_string())?,
     );
+    // Every follower session opens reconciled against this leader's history
+    // (#641), so a deposed leader that missed the election discards what it
+    // wrote under its old epoch before it acks anything. After the journal:
+    // the history is what the session fence carries.
+    if let Some(replicas) = &observed_replicas {
+        replicas
+            .reconcile_followers_against(Arc::downgrade(&broker)
+                as std::sync::Weak<dyn vtop_broker::replication::LeaderLineage>);
+    }
     if let Some(retention) = &config.retention {
         broker.set_retention(Some(vtop_log::RetentionPolicy {
             max_total_bytes: retention.max_total_bytes,
@@ -3040,6 +3057,12 @@ async fn build_leader_phase(
             config.data_dir.join("fencing-epochs"),
         )
         .map_err(|error| error.to_string())?,
+    );
+    // As in `run_leader` (#641): sessions open reconciled against this
+    // leader. Until the supervisor adopts the granted epoch the broker holds
+    // none, and its sessions wait for it rather than fence at nothing.
+    replicas.reconcile_followers_against(
+        Arc::downgrade(&broker) as std::sync::Weak<dyn vtop_broker::replication::LeaderLineage>
     );
     if let Some(retention) = &config.retention {
         broker.set_retention(Some(vtop_log::RetentionPolicy {

@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS batches (
     CONSTRAINT state_enum CHECK (state IN (
         'discovered','batching','sealed','compressed','checksummed',
         'object_uploaded','manifest_uploaded','verified','source_committed',
-        'failed','replay_required'))
+        'failed','replay_required','superseded'))
 );
 
 -- Upgrade databases created before ownership leases and object sizes shipped.
@@ -41,6 +41,37 @@ ALTER TABLE batches ADD COLUMN IF NOT EXISTS manifest_version_id TEXT;
 -- stalled old engine can still overwrite a new claimant: drain every older
 -- engine before relying on it.
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS claim_gen BIGINT NOT NULL DEFAULT 0;
+
+-- SUPERSEDED (#567): the terminal state of a handed-back range its source has
+-- since committed past. A table created before it carries the CHECK above
+-- without it, and CREATE TABLE IF NOT EXISTS does not touch an existing
+-- table, so the constraint is replaced - only when it lacks the state, so a
+-- re-run of migrate neither rescans the table nor takes its lock again.
+-- Engine startup refuses a CHECK without 'superseded' (PgStateStore::
+-- check_schema), so engines of this release need this migration first.
+--
+-- Older engines keep working on the widened CHECK: they never write the
+-- state. One that READS a superseded row fails closed - its recovery claim
+-- and `vtopctl status` stop with "unknown batch state: superseded" - so once
+-- an engine of this release has run, an older engine on the same ledger
+-- refuses to start rather than misreading the row. Drain older engines first.
+DO $sup$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_constraint
+        WHERE conrelid = 'batches'::regclass
+          AND conname = 'state_enum'
+          AND contype = 'c'
+          AND pg_catalog.pg_get_constraintdef(oid) LIKE '%''superseded''%'
+    ) THEN
+        ALTER TABLE batches DROP CONSTRAINT IF EXISTS state_enum;
+        ALTER TABLE batches ADD CONSTRAINT state_enum CHECK (state IN (
+            'discovered','batching','sealed','compressed','checksummed',
+            'object_uploaded','manifest_uploaded','verified','source_committed',
+            'failed','replay_required','superseded'));
+    END IF;
+END
+$sup$;
 
 CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
 CREATE INDEX IF NOT EXISTS idx_batches_source ON batches(source_type, source_name);
@@ -85,11 +116,17 @@ CREATE INDEX IF NOT EXISTS idx_batches_commit_newest ON batches(
 -- CREATE OR REPLACE installs its own, unmarked or lower-marked body) is
 -- reported as needing `vtopctl migrate`. It is in the body, not a COMMENT ON
 -- FUNCTION, because CREATE OR REPLACE keeps a comment. Version 2 is the first
--- with the #625 insert check; bodies before it carry no marker. ANY change to
--- the trigger or its function MUST bump this number and MIN_SCHEMA_VERSION
--- together.
+-- with the #625 insert check; bodies before it carry no marker. Version 3 is
+-- the migration that also widens the state_enum CHECK to admit 'superseded'
+-- (#567, above): the body is unchanged, but the marker names the schema this
+-- migration leaves, so an older release's migrate - which installs its own
+-- marker-2 body and leaves the CHECK as it found it - is refused. Startup
+-- checks the CHECK itself as well, so a CHECK replaced or restored on its own
+-- is refused under a current marker too. ANY change to the trigger, its
+-- function, or the schema this migration leaves MUST bump this number and
+-- MIN_SCHEMA_VERSION together.
 CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$
--- vtop-state-schema 2
+-- vtop-state-schema 3
 BEGIN
     IF NEW.state = 'source_committed' THEN
         IF TG_OP = 'INSERT' THEN

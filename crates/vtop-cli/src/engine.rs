@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use futures::StreamExt;
 use vtop_adapters::base::{DiscoveredSource, ReadResult, SourceAdapter};
+use vtop_adapters::file_source::ArchivedEnd;
 #[cfg(feature = "kafka")]
 use vtop_adapters::KafkaSource;
 use vtop_adapters::{FileSource, SyslogSpoolSource};
@@ -26,17 +27,19 @@ use vtop_core::batch::{AdaptiveBatcher, BatchLimits, SealReason, TelemetryBatch}
 use vtop_core::compression::compress_batch;
 use vtop_core::config::{ResolvedStateStore, StreamConfig, StreamsConfig, VtopConfig};
 use vtop_core::errors::VtopError;
-use vtop_core::manifest::{ManifestBuilder, ManifestMacKey, VtopManifest, MAX_MANIFEST_BYTES};
+use vtop_core::manifest::{ManifestBuilder, ManifestMacKey, ParsedManifest, MAX_MANIFEST_BYTES};
 use vtop_core::metrics::BatchMetrics;
 use vtop_core::partitioning::{self, PartitionContext};
 use vtop_core::replay::{next_recovery_action, RecoveryAction};
 use vtop_core::state_machine::BatchState;
 use vtop_core::telemetry;
-use vtop_core::types::{ChecksumAlgorithm, ContentFingerprint, ProgressMarker, SourceType};
+use vtop_core::types::{ContentFingerprint, ProgressMarker, SourceType};
 use vtop_core::work_dir::cleanup_work_dir;
 use vtop_state::{connect_state_store_with_deadline, BatchPatch, BatchRecord, StateStore};
 use vtop_upload::multipart::{self, MultipartFence, MultipartUploadConfig};
 use vtop_upload::{ObjectChecksum, UploadBackend};
+
+use crate::verification_mode::{self, Recheck};
 
 /// How long a batch claim stays exclusive without renewal (#93). Batches
 /// complete in seconds; the lease only has to outlive the slowest healthy
@@ -447,8 +450,11 @@ impl<'a> Pipeline<'a> {
         );
 
         // ---- COMPRESSED -> CHECKSUMMED ----------------------------------
-        // Algorithm is configurable: sha256, blake3, or disabled (None).
-        let algo = self.config.checksum.algorithm;
+        // Algorithm is configurable: sha256, blake3, or disabled (None), per
+        // stream with the global value as the default (#669). This is the
+        // only place a new batch's algorithm is chosen; recovery and scrub
+        // re-verify with the algorithm recorded in each batch's manifest.
+        let algo = vtop_core::config::effective_algorithm(self.config, stream);
         let t = Instant::now();
         let object_checksum = match vtop_core::checksum::digest_file(algo, &compressed.path).await {
             Ok(d) => d,
@@ -866,14 +872,14 @@ impl<'a> Pipeline<'a> {
                 Ok(bytes) => bytes,
                 Err(e) => fail!(format!("stored manifest download failed: {e}")),
             };
-            let stored: VtopManifest = match serde_json::from_slice(&stored_bytes) {
+            let stored = match ParsedManifest::from_slice(&stored_bytes) {
                 Ok(stored) => stored,
                 Err(e) => fail!(format!("stored manifest parse failed: {e}")),
             };
             if stored.verify_authentication(Some(key)).is_err()
-                || stored.batch_id != batch_id
-                || stored.manifest.uri != manifest_uri
-                || stored.object.uri != object_uri
+                || stored.fields().batch_id != batch_id
+                || stored.fields().manifest.uri != manifest_uri
+                || stored.fields().object.uri != object_uri
             {
                 fail!("stored manifest authentication or batch binding failed".to_string());
             }
@@ -1321,6 +1327,12 @@ pub struct Engine {
     /// Last committed-history prune attempt (#128); pruning is idle-cycle
     /// only and rate-limited, so a busy pipeline never pays for it.
     last_ledger_prune: Option<std::time::Instant>,
+    /// VERIFIED rows this process holds and has not committed (#624): held
+    /// back by recovery above a range of the same unit that is being read
+    /// again, or whose source commit failed. Each is re-checked after every
+    /// later pass of its source type ([`Engine::settle_verified`]). Before,
+    /// only the next restart looked at them again.
+    unsettled: Vec<Unsettled>,
     /// Exclusive work-dir lock held for the engine's lifetime (#66).
     /// Held only by [`Engine::new_exclusive`] instances; empty for read-only
     /// construction (#66).
@@ -1451,6 +1463,7 @@ impl Engine {
         streams: StreamsConfig,
     ) -> Result<Self, VtopError> {
         config.validate()?;
+        streams.validate(&config)?;
         let state_store = config.engine.state_store.resolve()?;
         let locks = acquire_instance_locks(&config, &state_store)?;
         let cleanup = cleanup_work_dir(
@@ -1473,6 +1486,7 @@ impl Engine {
                  Do not run replicas against this database (see #66/#93)"
             );
         }
+        verification_mode::announce(&config, &streams);
         let mut engine = Self::new_with_state_store(config, streams, state_store).await?;
         engine._instance_locks = locks;
         // Reclaim multipart sessions no source will replay (#482, review):
@@ -1501,6 +1515,7 @@ impl Engine {
     /// Anything that mutates goes through [`Engine::new_exclusive`].
     pub async fn new(config: VtopConfig, streams: StreamsConfig) -> Result<Self, VtopError> {
         config.validate()?;
+        streams.validate(&config)?;
         let state_store = config.engine.state_store.resolve()?;
         Self::new_with_state_store(config, streams, state_store).await
     }
@@ -1549,12 +1564,15 @@ impl Engine {
                 let fmt = default_format_for(&streams, SourceType::File);
                 adapters.insert(
                     SourceType::File,
-                    Box::new(FileSource::with_mode(
-                        f.paths.clone(),
-                        fmt,
-                        f.delete_after_commit,
-                        f.whole_file,
-                    )),
+                    Box::new(
+                        FileSource::with_mode(
+                            f.paths.clone(),
+                            fmt,
+                            f.delete_after_commit,
+                            f.whole_file,
+                        )
+                        .with_delete_quiet_period(Duration::from_secs(f.delete_quiet_seconds)),
+                    ),
                 );
             }
         }
@@ -1601,6 +1619,7 @@ impl Engine {
             cycle_had_failure: false,
             failure_streak: 0,
             last_ledger_prune: None,
+            unsettled: Vec::new(),
             _instance_locks: Vec::new(),
         })
     }
@@ -1655,6 +1674,50 @@ impl Engine {
         self.manifest_mac_key.as_ref()
     }
 
+    /// Scrub committed `rows` against this engine's store, authenticating
+    /// manifests with its key (#628). The key stays inside the engine: a
+    /// caller gets the report, never the secret it could forge manifests
+    /// with. The guard below fails to compile if the key accessor is ever
+    /// made public again (review of #652):
+    ///
+    /// ```compile_fail
+    /// fn leak(engine: &vtop_cli::Engine) {
+    ///     let _ = engine.manifest_mac_key();
+    /// }
+    /// ```
+    pub async fn scrub(
+        &self,
+        rows: Vec<crate::scrub::ScrubRow>,
+        opts: &crate::scrub::ScrubOptions,
+    ) -> Result<crate::scrub::ScrubReport, VtopError> {
+        crate::scrub::scrub(
+            self.backend.as_ref(),
+            self.manifest_mac_key.as_ref(),
+            rows,
+            opts,
+        )
+        .await
+    }
+
+    /// [`Engine::scrub`] under locks the caller holds until it has published
+    /// (`vtopctl scrub`, review of #652); the cursor's final position past a
+    /// finding comes back pending, for the caller to commit after publishing.
+    pub(crate) async fn scrub_held(
+        &self,
+        rows: Vec<crate::scrub::ScrubRow>,
+        opts: &crate::scrub::ScrubOptions,
+        held: &crate::scrub::RunLock,
+    ) -> Result<crate::scrub::ScrubReport, VtopError> {
+        crate::scrub::scrub_held(
+            self.backend.as_ref(),
+            self.manifest_mac_key.as_ref(),
+            rows,
+            opts,
+            held,
+        )
+        .await
+    }
+
     /// Enumerate all sources across all enabled adapters.
     pub async fn discover(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
         let mut all = Vec::new();
@@ -1693,11 +1756,184 @@ impl Engine {
                 "no enabled adapter for source type {source_type}"
             )));
         };
+        // Rows left uncommitted by EARLIER passes are re-checked after this
+        // one (#624): after, so a held-back range is settled by the pass whose
+        // re-read committed past it; only earlier ones, so a commit that has
+        // just failed is not retried at once against a source that just
+        // refused it.
+        let earlier = self
+            .unsettled
+            .iter()
+            .filter(|row| row.source_type == source_type)
+            .count();
         let result = self
             .run_cycle(adapter.as_mut(), &source_type, force_flush)
             .await;
+        if earlier > 0 {
+            self.settle_verified(adapter.as_mut(), &source_type, earlier)
+                .await;
+        }
         self.adapters.insert(source_type, adapter);
         result
+    }
+
+    /// Re-check the VERIFIED rows of `source_type` this process left
+    /// uncommitted - the first `count` of them, the ones recorded before the
+    /// pass that just ran - and commit those that may commit now (#624).
+    ///
+    /// Recovery ran only at startup, so a VERIFIED row it held back, or one
+    /// whose source commit failed, stayed VERIFIED until the next restart.
+    /// That restart then committed it after newer ranges had committed past
+    /// it: the Kafka group offset went backwards (#614, #617), and the file
+    /// adapter's cursor - its read head too, for a range read before the
+    /// restart - went back to the stale end and read everything since again.
+    ///
+    /// Nothing is claimed. Every row here is this process's own: created by
+    /// its pipeline, or claimed by its recovery, and in both cases it still
+    /// holds the fence token (VERIFIED releases none) and has finished with
+    /// it - the pass that produced it committed or gave up on it before
+    /// returning. So no in-flight batch, of this engine or another, is ever
+    /// touched: `claim_incomplete_batches` would claim this engine's own
+    /// in-flight rows. A row can outlive its lease, so the claim is renewed -
+    /// fenced, in one write - before the source is touched (review of #624);
+    /// a refused renewal means another engine owns the row now, and it is
+    /// dropped here without moving the source; that engine's recovery
+    /// commits it.
+    ///
+    /// - A row recovery held back waits until its source has committed past
+    ///   its END - by then the re-read below it has archived and committed its
+    ///   bytes again, and committing it moves no source: the Kafka adapter
+    ///   skips a commit at or below its frontier (#617), the file and spool
+    ///   adapters one at or below a committed point they confirmed. Committing
+    ///   it any earlier could move the committed point past bytes still being
+    ///   re-read, which is what the hold-back is for.
+    /// - A row whose commit failed is retried as the pipeline left it: the
+    ///   pipeline had already decided it may commit. A newer range committed
+    ///   since makes the retry the same superseded no-op.
+    async fn settle_verified(
+        &mut self,
+        adapter: &mut dyn SourceAdapter,
+        source_type: &SourceType,
+        count: usize,
+    ) {
+        let mut earlier = Vec::new();
+        let mut kept = Vec::new();
+        for row in std::mem::take(&mut self.unsettled) {
+            if &row.source_type == source_type && earlier.len() < count {
+                earlier.push(row);
+            } else {
+                kept.push(row);
+            }
+        }
+        for row in earlier {
+            if !self.settle_one(adapter, &row).await {
+                kept.push(row);
+            }
+        }
+        self.unsettled = kept;
+    }
+
+    /// Settle one row; `true` when it needs no more attention (committed, or
+    /// no longer this process's to commit).
+    async fn settle_one(&self, adapter: &mut dyn SourceAdapter, row: &Unsettled) -> bool {
+        let rec = match self.store.get_batch(&row.batch_id).await {
+            Ok(Some(rec)) if rec.state == BatchState::Verified => rec,
+            // Gone, or moved on: nothing left for this process to commit.
+            Ok(_) => return true,
+            Err(e) => {
+                tracing::warn!(batch_id = %row.batch_id, error = %e, "could not re-read an uncommitted VERIFIED row; retried after the next pass");
+                return false;
+            }
+        };
+        if row.held_back
+            && !held_row_may_settle(
+                adapter.committed_through(&rec.progress_end),
+                row.committed_at_hold,
+                end_position(&rec.progress_end),
+            )
+        {
+            return false;
+        }
+        // Renew the claim, fenced, BEFORE the source is touched (review of
+        // #624). The row may have been held for longer than its lease, and an
+        // engine that claimed it since may be about to re-read a range below
+        // it; moving the source now would clamp that re-read, or with
+        // `delete_after_commit` delete the file. A refusal at the ledger write
+        // afterwards comes too late to undo either. After a renewal no other
+        // engine can claim the row until the new lease runs out.
+        let lease_until = (Utc::now() + chrono::Duration::seconds(LEASE_TTL_SECS)).to_rfc3339();
+        match self.store.renew_claim(&rec.batch_id, &lease_until).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    batch_id = %rec.batch_id,
+                    "an uncommitted VERIFIED row is no longer this engine's (another engine claimed it); \
+                     its new owner commits it"
+                );
+                return true;
+            }
+            Err(e) => {
+                tracing::warn!(batch_id = %rec.batch_id, error = %e, "could not renew the claim on an uncommitted VERIFIED row; retried after the next pass");
+                return false;
+            }
+        }
+        if let Err(e) = adapter.commit_progress(&rec.progress_end).await {
+            tracing::warn!(batch_id = %rec.batch_id, error = %e, "source commit still failing; retried after the next pass");
+            return false;
+        }
+        match self.store.mark_source_committed(&rec.batch_id).await {
+            Ok(()) => {
+                if let Some(mx) = telemetry::metrics() {
+                    let l = [
+                        rec.tenant.as_str(),
+                        rec.source_type.as_str(),
+                        rec.format.extension(),
+                    ];
+                    // A row recovery left (held back, or its commit failed)
+                    // was verified by the process that crashed; count it
+                    // here, as `commit_recovered` does, so commits_total never
+                    // exceeds verified_total. A pipeline row's verification
+                    // was counted by the pipeline (review of #624).
+                    if row.count_verified {
+                        mx.verified_total.with_label_values(&l).inc();
+                        mx.batches_total
+                            .with_label_values(&[l[0], l[1], l[2], BatchState::Verified.as_str()])
+                            .inc();
+                    }
+                    mx.commits_total.with_label_values(&l).inc();
+                    mx.batches_total
+                        .with_label_values(&[
+                            l[0],
+                            l[1],
+                            l[2],
+                            BatchState::SourceCommitted.as_str(),
+                        ])
+                        .inc();
+                }
+                // A size-only acceptance at recovery's re-check is counted at
+                // the commit, as `commit_recovered` counts it (#651).
+                if let Some(recheck) = row.recheck {
+                    verification_mode::count_size_only_commit(recheck, &rec);
+                }
+                tracing::info!(
+                    batch_id = %rec.batch_id,
+                    held_back = row.held_back,
+                    "source_committed (an earlier pass left it VERIFIED)"
+                );
+                true
+            }
+            Err(e) => {
+                let lost = e.to_string().contains("claimed by another engine")
+                    || e.to_string().contains("not claimed by this engine");
+                tracing::warn!(
+                    batch_id = %rec.batch_id,
+                    error = %e,
+                    lost,
+                    "could not record the commit of an earlier VERIFIED row"
+                );
+                lost
+            }
+        }
     }
 
     async fn run_cycle(
@@ -1901,6 +2137,16 @@ impl Engine {
                 }
             }
         }
+        // A range handed back to a file rotated away that its re-read then had
+        // to refuse (the rotated file was truncated, or no longer starts with
+        // the bytes it was held for) is missing from the archive just as a
+        // refused rewind is, and is counted the same way (review of #621). The
+        // read error above only says a read failed.
+        if let Some(files) = adapter.as_any_mut().downcast_mut::<FileSource>() {
+            for path in files.take_refused_rereads() {
+                self.count_refused_replay_of(source_type, &path);
+            }
+        }
 
         let read_phase_ms = cycle_started.elapsed().as_millis() as u64;
         // Logged once per cycle per source type. The ratio that matters is
@@ -2081,11 +2327,24 @@ impl Engine {
                 Ok(VerifyStep::Verified(v)) => {
                     let batch_id = v.batch_id.clone();
                     match self.pipeline().commit_verified(adapter, v).await {
-                        Ok(outcome) => outcomes.push(outcome),
+                        Ok(outcome) => {
+                            // The source commit failed: the row stays VERIFIED,
+                            // and a later pass retries it (#624).
+                            if !outcome.committed {
+                                self.unsettled
+                                    .push(Unsettled::commit_failed(&batch_id, source_type));
+                            }
+                            outcomes.push(outcome)
+                        }
                         Err(e) => {
-                            // Already VERIFIED and durable; recovery retries the
-                            // commit. Keep going so siblings still commit.
+                            // Already VERIFIED and durable (the source may
+                            // have committed, the ledger write did not); a
+                            // later pass retries it (#624), and recovery
+                            // after a restart. Keep going so siblings still
+                            // commit.
                             tracing::error!(batch_id, error = %e, "commit failed after verify");
+                            self.unsettled
+                                .push(Unsettled::commit_failed(&batch_id, source_type));
                             first_err.get_or_insert(e);
                         }
                     }
@@ -2128,7 +2387,9 @@ impl Engine {
                     // The adapter could not rewind (a spool file that was
                     // rotated away, say). The range is NOT being re-read, so
                     // this must be loud: it is the one outcome that leaves the
-                    // archive short of the source.
+                    // archive short of the source - and counted, so it can be
+                    // alerted on rather than grepped for (#621).
+                    self.count_refused_replay(source_type, marker);
                     tracing::error!(
                         source_type = %source_type,
                         start = ?marker,
@@ -2150,128 +2411,56 @@ impl Engine {
     /// manifest, binds it to the ledger, then asks the backend to verify the
     /// stored object content using the manifest's algorithm. HEAD metadata and
     /// uploader-written sidecars are never sufficient for a strong result.
-    async fn storage_still_verified(&self, rec: &BatchRecord) -> bool {
-        let Some(uri) = rec.object_uri.as_deref() else {
-            // A VERIFIED row without an object URI is corrupt bookkeeping;
-            // never commit source progress on it.
-            return false;
-        };
-        let Some(muri) = rec.manifest_uri.as_deref() else {
-            // VERIFIED covers both the object and its manifest. A row that
-            // cannot identify the manifest cannot safely advance its source.
-            return false;
-        };
-        // A recorded version pins recovery to the immutable manifest this
-        // batch actually verified (#135). Overwriting the current key cannot
-        // roll the batch back to an older validly-authenticated manifest, and
-        // deleting the pinned version fails closed here rather than falling
-        // back to whatever replaced it.
-        let read = match rec.manifest_version_id.as_deref() {
-            Some(version) => {
-                self.backend
-                    .get_manifest_pinned(muri, version, MAX_MANIFEST_BYTES)
-                    .await
-            }
-            None => {
-                self.backend
-                    .get_object_bounded(muri, MAX_MANIFEST_BYTES)
-                    .await
-            }
-        };
-        let bytes = match read {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::warn!(
-                    muri,
-                    version_id = rec.manifest_version_id.as_deref().unwrap_or("<current>"),
-                    error = %e,
-                    "recovery re-check: manifest download failed"
+    async fn storage_still_verified(&self, rec: &BatchRecord) -> Recheck {
+        // The check itself is shared with `vtopctl scrub` (#628), which runs
+        // it on committed rows, so the two cannot drift apart. Its `Limited`
+        // is exactly what this re-check calls size-only (#629): the backend
+        // passed the object with `backend_limited`, having confirmed size and
+        // existence but no digest. Whether that may commit, and how it is
+        // logged, stays #651's decision.
+        let check = crate::scrub::check_stored_batch(
+            self.backend.as_ref(),
+            self.manifest_mac_key.as_ref(),
+            rec,
+        )
+        .await;
+        match check.result {
+            crate::scrub::ScrubResult::Ok => Recheck::Strong,
+            crate::scrub::ScrubResult::UnsupportedVersion => {
+                // Loud: only an engine older than the batch's writer gets
+                // here (the check has proven the bytes are the writer's
+                // pinned version), and the upgrade order says that should not
+                // happen.
+                if let Some(mx) = telemetry::metrics() {
+                    mx.recovery_unsupported_manifest_total
+                        .with_label_values(&[
+                            rec.tenant.as_str(),
+                            rec.source_type.as_str(),
+                            rec.format.extension(),
+                        ])
+                        .inc();
+                }
+                tracing::error!(
+                    batch_id = %rec.batch_id,
+                    detail = %check.detail,
+                    "recovery: a VERIFIED batch's manifest is from a newer release; it stays VERIFIED, \
+                     neither committed nor replayed, until an upgraded engine recovers it - upgrade this engine"
                 );
-                return false;
+                Recheck::UnsupportedVersion
             }
-        };
-        let manifest: VtopManifest = match serde_json::from_slice(&bytes) {
-            Ok(manifest) => manifest,
-            Err(e) => {
-                tracing::warn!(muri, error = %e, "recovery re-check: manifest parse failed");
-                return false;
+            crate::scrub::ScrubResult::Limited => {
+                verification_mode::recheck_size_only(&self.config, rec, &check.detail)
             }
-        };
-
-        let ledger_manifest_hash_matches = rec.manifest_sha256.as_deref().is_some_and(|want| {
-            !want.is_empty() && want.eq_ignore_ascii_case(&manifest.manifest.sha256)
-        });
-        if manifest
-            .verify_authentication(self.manifest_mac_key.as_ref())
-            .is_err()
-            || manifest.batch_id != rec.batch_id
-            || manifest.manifest.uri != muri
-            || manifest.object.uri != uri
-            || !ledger_manifest_hash_matches
-        {
-            tracing::warn!(
-                muri,
-                batch_id = %rec.batch_id,
-                "recovery re-check: manifest authentication or ledger binding failed"
-            );
-            return false;
+            result => {
+                tracing::warn!(
+                    batch_id = %rec.batch_id,
+                    result = result.as_str(),
+                    detail = %check.detail,
+                    "recovery re-check: the stored batch does not check out"
+                );
+                Recheck::Failed
+            }
         }
-
-        // Bind the manifest back to the durable ledger before trusting it as
-        // recovery input. The column retains its historical object_sha256 name
-        // but may contain a BLAKE3 digest.
-        if rec
-            .object_size_bytes
-            .is_some_and(|want| want < 0 || want as u64 != manifest.object.size_bytes)
-            || rec.object_sha256.as_deref().is_some_and(|want| {
-                !want.is_empty() && !want.eq_ignore_ascii_case(&manifest.object.checksum)
-            })
-        {
-            tracing::warn!(
-                batch_id = %rec.batch_id,
-                "recovery re-check: manifest and ledger object metadata disagree"
-            );
-            return false;
-        }
-
-        let algo = match manifest
-            .object
-            .checksum_algorithm
-            .parse::<ChecksumAlgorithm>()
-        {
-            Ok(algo) => algo,
-            Err(e) => {
-                tracing::warn!(batch_id = %rec.batch_id, error = %e, "recovery re-check: unsupported checksum");
-                return false;
-            }
-        };
-        let expected = if algo.is_enabled() {
-            if manifest.object.checksum.is_empty() {
-                return false;
-            }
-            Some(ObjectChecksum::new(
-                algo.as_str(),
-                &manifest.object.checksum,
-            ))
-        } else {
-            None
-        };
-        let result = match self
-            .backend
-            .verify_object(uri, manifest.object.size_bytes, expected)
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::warn!(uri, error = %e, "recovery re-check: content verification failed");
-                return false;
-            }
-        };
-        if !result.passed {
-            tracing::warn!(uri, reason = %result.message, "recovery re-check: stored content mismatch");
-            return false;
-        }
-        !result.backend_limited || !self.config.upload.require_strong_verification
     }
 
     /// Recovery scan run at startup. Seeds adapters from committed batches and
@@ -2303,7 +2492,7 @@ impl Engine {
         let mut rewinds = RewindPlan::default();
         // VERIFIED rows that still check out against storage. Their source
         // commits wait until every replay decision is known (see below).
-        let mut verified: Vec<BatchRecord> = Vec::new();
+        let mut verified: Vec<(BatchRecord, Recheck)> = Vec::new();
         for rec in incomplete {
             let action = next_recovery_action(rec.state);
             tracing::info!(batch_id = %rec.batch_id, state = %rec.state, ?action, "recovery_scan");
@@ -2316,7 +2505,31 @@ impl Engine {
                     // verified (#69). Re-check the store before committing;
                     // anything less trusts a stale claim about a system this
                     // process has never observed.
-                    if !self.storage_still_verified(&rec).await {
+                    let recheck = self.storage_still_verified(&rec).await;
+                    if recheck == Recheck::UnsupportedVersion {
+                        // Written by a newer release (#671): not stale, only
+                        // unreadable here. It is neither committed nor marked
+                        // for replay - the row stays VERIFIED for an upgraded
+                        // engine to commit - and nothing is rewound for it.
+                        if self.committed_past(&rec) {
+                            // Its source has committed past it, proven as
+                            // for any range #567 retires: nothing of it can be
+                            // re-read and an upgraded engine's commit would be
+                            // a no-op. Left VERIFIED, it was claimed,
+                            // downloaded and counted pending at every restart
+                            // and never pruned (review of #674). Retiring it
+                            // makes no source commit.
+                            self.retire_unsupported(&rec, &mut summary).await;
+                            continue;
+                        }
+                        // Held (#639) otherwise: its range is not committed,
+                        // so a VERIFIED range of the same unit above it must
+                        // not commit past it.
+                        rewinds.hold(&rec.progress_start);
+                        summary.still_pending += 1;
+                        continue;
+                    }
+                    if recheck == Recheck::Failed {
                         tracing::warn!(
                             batch_id = %rec.batch_id,
                             object_uri = rec.object_uri.as_deref().unwrap_or(""),
@@ -2382,9 +2595,49 @@ impl Engine {
                         summary.replay_required += 1;
                         continue;
                     }
-                    verified.push(rec);
+                    verified.push((rec, recheck));
                 }
                 RecoveryAction::None => {}
+                _ if self.committed_past(&rec) => {
+                    // Its source has committed past it (#567): a rewind would
+                    // land at or above its end and read nothing again, so
+                    // the row is retired instead of being marked for replay
+                    // again. Before SUPERSEDED existed it was claimed,
+                    // rewritten twice and re-planned at every restart, and
+                    // retention, which deletes only terminal rows, kept it.
+                    // A failed write rewinds nothing: there is nothing below
+                    // the committed point to read, and the next recovery
+                    // decides again.
+                    match self.retire_superseded(&rec).await {
+                        Ok(()) => {
+                            summary.superseded += 1;
+                            if let Some(mx) = telemetry::metrics() {
+                                mx.batches_total
+                                    .with_label_values(&[
+                                        rec.tenant.as_str(),
+                                        rec.source_type.as_str(),
+                                        rec.format.extension(),
+                                        BatchState::Superseded.as_str(),
+                                    ])
+                                    .inc();
+                            }
+                            tracing::info!(
+                                batch_id = %rec.batch_id,
+                                state = %rec.state,
+                                "recovered: SUPERSEDED (its source has committed past it; nothing to re-read)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                batch_id = %rec.batch_id,
+                                error = %e,
+                                "recovery: could not retire a range its source has committed past; \
+                                 it stays as it is, and nothing below the committed point is re-read"
+                            );
+                            summary.still_pending += 1;
+                        }
+                    }
+                }
                 _ => {
                     // Any other incomplete state has no durable, replayable
                     // object we can finish from in this prototype: mark for
@@ -2472,10 +2725,19 @@ impl Engine {
         // are reported by the second pass.
         let mut landed: HashMap<String, i128> = HashMap::new();
         for (source_type, markers) in &by_source {
-            let Some(adapter) = self.adapters.get_mut(source_type) else {
+            if let Some(adapter) = self.adapters.get_mut(source_type) {
+                let _ = adapter.replay_from_markers(markers).await;
+            }
+        }
+        // A range handed back to a file that was rotated away is re-read from
+        // where it was rotated to (#621) - and its FAILED row is rewound again
+        // at every restart, so the re-read must start above what a later
+        // batch already archived of that file.
+        self.floor_rotated_replays().await;
+        for (source_type, markers) in &by_source {
+            let Some(adapter) = self.adapters.get(source_type) else {
                 continue;
             };
-            let _ = adapter.replay_from_markers(markers).await;
             for marker in markers {
                 if let Some(position) = adapter.read_position(marker) {
                     landed.insert(rewind_key(marker), position);
@@ -2492,7 +2754,7 @@ impl Engine {
         // commits it once the source has caught up. A lower range whose replay
         // decision could not be recorded holds it back too, though nothing
         // rewinds for it (#639).
-        for rec in verified {
+        for (rec, recheck) in verified {
             if rewinds.holds_back(&rec.progress_start) {
                 tracing::warn!(
                     batch_id = %rec.batch_id,
@@ -2500,9 +2762,15 @@ impl Engine {
                      it stays VERIFIED until the lower range has been re-read"
                 );
                 summary.still_pending += 1;
+                let at_hold = self
+                    .adapters
+                    .get(&rec.source_type)
+                    .and_then(|adapter| adapter.committed_through(&rec.progress_end));
+                self.unsettled
+                    .push(Unsettled::held_back(&rec, at_hold, recheck));
                 continue;
             }
-            self.commit_recovered(&rec, &mut summary).await?;
+            self.commit_recovered(&rec, recheck, &mut summary).await?;
         }
         // Second pass: the commits above moved committed points up, and the
         // first pass's rewinds are not clamped to them. Rewind again so no
@@ -2527,6 +2795,7 @@ impl Engine {
                     // The decision to replay is already durable; what failed is
                     // the rewind itself. Swallowing this made recovery report
                     // success for a range that was never going to be re-read.
+                    self.count_refused_replay(&source_type, marker);
                     tracing::error!(
                         start = ?marker,
                         error = %e,
@@ -2539,11 +2808,153 @@ impl Engine {
         Ok(summary)
     }
 
+    /// Start each re-read of a rotated file (#621) above what the ledger says
+    /// is already archived of that file. Failing to ask costs a duplicate of
+    /// what was archived, never a skip, so it is a warning, not an error.
+    async fn floor_rotated_replays(&mut self) {
+        let Some(files) = self
+            .adapters
+            .get_mut(&SourceType::File)
+            .and_then(|adapter| adapter.as_any_mut().downcast_mut::<FileSource>())
+        else {
+            return;
+        };
+        let paths = files.rotated_replay_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let rows = match self.store.committed_cursors_by_file(SourceType::File).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    paths = ?paths,
+                    error = %e,
+                    "recovery could not read what is already archived of rotated files; their \
+                     failed ranges are re-read from their start, which may archive part of them \
+                     again"
+                );
+                return;
+            }
+        };
+        for path in paths {
+            let archived: Vec<ArchivedEnd> = rows
+                .iter()
+                .filter(|row| row.path == path)
+                .map(archived_end)
+                .collect();
+            files.raise_rotated_replay_floor(&path, &archived);
+        }
+    }
+
+    /// A source refused to hand a failed range back (#621): counted under the
+    /// tenant the range's source is charged to, like a read error.
+    fn count_refused_replay(&self, source_type: &SourceType, marker: &ProgressMarker) {
+        let source_name = match marker {
+            ProgressMarker::Kafka { topic, .. } => topic.as_str(),
+            ProgressMarker::File { path, .. } | ProgressMarker::SyslogSpool { path, .. } => {
+                path.as_str()
+            }
+        };
+        self.count_refused_replay_of(source_type, source_name);
+    }
+
+    fn count_refused_replay_of(&self, source_type: &SourceType, source_name: &str) {
+        let Some(mx) = telemetry::metrics() else {
+            return;
+        };
+        let tenant = tenant_for_source(&self.streams, &self.config.engine.tenant, source_name);
+        mx.source_replay_refused_total
+            .with_label_values(&[tenant.as_str(), source_type.as_str()])
+            .inc();
+    }
+
+    /// Whether `rec`'s source has committed past the end of its range, in the
+    /// same file (#567): the adapter's committed point for the unit - at
+    /// startup, the ledger's newest committed row, which retention never
+    /// prunes - is at or above where the range ends. A rewind to the range
+    /// would then land at that point and re-read none of it.
+    ///
+    /// A range whose start and end name different units (a window across a
+    /// rotation) is not judged: no one committed point describes both files.
+    /// Nor is one whose adapter cannot say, which keeps the replay path.
+    fn committed_past(&self, rec: &BatchRecord) -> bool {
+        let (start, end) = (&rec.progress_start, &rec.progress_end);
+        if unit_key(start) != unit_key(end) {
+            return false;
+        }
+        let Some(adapter) = self.adapters.get(&start.source_type()) else {
+            return false;
+        };
+        let range_end = end_position(end);
+        [start, end].into_iter().all(|marker| {
+            adapter
+                .committed_through(marker)
+                .is_some_and(|committed| committed >= range_end)
+        })
+    }
+
+    /// Retire a VERIFIED row whose manifest is from a newer release and whose
+    /// source has committed past it (#671): SUPERSEDED, as the
+    /// `committed_past` branch of [`Engine::recover`] retires any range. A
+    /// failed write leaves it as it was, pending, and nothing is rewound.
+    async fn retire_unsupported(&self, rec: &BatchRecord, summary: &mut RecoverySummary) {
+        match self.retire_superseded(rec).await {
+            Ok(()) => {
+                summary.superseded += 1;
+                if let Some(mx) = telemetry::metrics() {
+                    mx.batches_total
+                        .with_label_values(&[
+                            rec.tenant.as_str(),
+                            rec.source_type.as_str(),
+                            rec.format.extension(),
+                            BatchState::Superseded.as_str(),
+                        ])
+                        .inc();
+                }
+                tracing::warn!(
+                    batch_id = %rec.batch_id,
+                    "recovered: SUPERSEDED (its manifest is from a newer release and its source has committed past it)"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    batch_id = %rec.batch_id,
+                    error = %e,
+                    "recovery: could not retire a newer-release range its source has committed past; it stays as it is"
+                );
+                summary.still_pending += 1;
+            }
+        }
+    }
+
+    /// Retire a range its source has committed past (#567): SUPERSEDED, the
+    /// terminal state no claim or recovery visits again. Legal only from a
+    /// handed-back range, so a row a crashed engine left in flight is
+    /// recorded as FAILED first. Neither write moves any source progress.
+    async fn retire_superseded(&self, rec: &BatchRecord) -> Result<(), VtopError> {
+        if !matches!(rec.state, BatchState::Failed | BatchState::ReplayRequired) {
+            self.store
+                .mark_failed(
+                    &rec.batch_id,
+                    "recovered: superseded (its source committed past it)",
+                )
+                .await?;
+        }
+        self.store
+            .update_batch_state(
+                &rec.batch_id,
+                BatchState::Superseded,
+                &BatchPatch::default(),
+            )
+            .await
+    }
+
     /// Commit the source progress of a VERIFIED batch that was just re-checked
     /// against storage, and record it.
     async fn commit_recovered(
         &mut self,
         rec: &BatchRecord,
+        recheck: Recheck,
         summary: &mut RecoverySummary,
     ) -> Result<(), VtopError> {
         if let Some(adapter) = self.adapters.get_mut(&rec.source_type) {
@@ -2586,12 +2997,18 @@ impl Engine {
                             ])
                             .inc();
                     }
+                    // Counted at the commit, like verified_total above, not
+                    // at the re-check: a held-back row passes the re-check on
+                    // every restart without committing (#629 review).
+                    verification_mode::count_size_only_commit(recheck, rec);
                     summary.committed += 1;
                     tracing::info!(batch_id = %rec.batch_id, "recovered: source_committed");
                 }
                 Err(e) => {
                     tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery commit failed");
                     summary.still_pending += 1;
+                    self.unsettled
+                        .push(Unsettled::recovered_commit_failed(rec, recheck));
                 }
             }
         } else {
@@ -2611,22 +3028,39 @@ impl Engine {
         // fingerprint of its first bytes, for a replacement that kept the
         // inode (#578), and of the bytes below the offset, for one that also
         // kept the first page (#620).
-        let file_cursors = self.store.committed_cursors(SourceType::File).await?;
+        //
+        // Per FILE, not per path, for file sources (review of #621): a range
+        // re-read from a rotated file commits under the path after the batches
+        // of the file now there, so the path's newest row can name the rotated
+        // file. The seed is then the row of the file at the path, when that
+        // file is positively identified (`FileSource::seed_choice`); otherwise
+        // the newest row, as before.
+        let file_rows = self
+            .store
+            .committed_cursors_by_file(SourceType::File)
+            .await?;
         let spool_cursors = self
             .store
             .committed_cursors(SourceType::SyslogSpool)
             .await?;
         if let Some(a) = self.adapters.get_mut(&SourceType::File) {
             if let Some(fs) = a.as_any_mut().downcast_mut::<FileSource>() {
-                for c in file_cursors {
+                // The store answers each path's files together, newest first.
+                for files in file_rows.chunk_by(|a, b| a.path == b.path) {
+                    let archived: Vec<ArchivedEnd> = files.iter().map(archived_end).collect();
+                    let c = &files[FileSource::seed_choice(&files[0].path, &archived)];
                     fs.seed_committed_from(
                         &c.path,
                         c.end_byte,
                         c.inode,
                         c.observed_size,
-                        c.content_fingerprint,
-                        c.tail_fingerprint,
+                        c.content_fingerprint.clone(),
+                        c.tail_fingerprint.clone(),
                     );
+                    // A file archived but not yet deleted before the restart
+                    // (#619): re-armed only if it still has the mtime the
+                    // committed batch saw.
+                    fs.arm_delete_from_seed(&c.path, c.observed_mtime.as_deref());
                 }
             }
         }
@@ -3335,6 +3769,90 @@ fn unit_key(marker: &ProgressMarker) -> String {
     }
 }
 
+/// A VERIFIED row this process left uncommitted (#624); see
+/// [`Engine::settle_verified`].
+#[derive(Debug, Clone)]
+struct Unsettled {
+    batch_id: String,
+    source_type: SourceType,
+    /// Held back by recovery above a range being read again, rather than
+    /// left by a source commit that failed.
+    held_back: bool,
+    /// The adapter's committed point for the row when recovery held it back:
+    /// the restart seed. Settling waits for the point to move past it
+    /// (review of #624).
+    committed_at_hold: Option<i128>,
+    /// Whether settling it counts its verification too: a row recovery left
+    /// was verified by the process that crashed, and this one has not counted
+    /// it; a pipeline row's verification is counted already.
+    count_verified: bool,
+    /// What recovery's storage re-check of the row concluded (#651), for a
+    /// row recovery left: a size-only acceptance is counted when the row
+    /// commits, as `commit_recovered` counts it, never at the hold.
+    recheck: Option<Recheck>,
+}
+
+impl Unsettled {
+    fn held_back(rec: &BatchRecord, committed_at_hold: Option<i128>, recheck: Recheck) -> Self {
+        Self {
+            batch_id: rec.batch_id.clone(),
+            source_type: rec.source_type.clone(),
+            held_back: true,
+            committed_at_hold,
+            count_verified: true,
+            recheck: Some(recheck),
+        }
+    }
+
+    /// Recovery re-checked the row and its source commit failed.
+    fn recovered_commit_failed(rec: &BatchRecord, recheck: Recheck) -> Self {
+        Self {
+            batch_id: rec.batch_id.clone(),
+            source_type: rec.source_type.clone(),
+            held_back: false,
+            committed_at_hold: None,
+            count_verified: true,
+            recheck: Some(recheck),
+        }
+    }
+
+    /// The pipeline verified the row in this process and its commit failed.
+    fn commit_failed(batch_id: &str, source_type: &SourceType) -> Self {
+        Self {
+            batch_id: batch_id.to_owned(),
+            source_type: source_type.clone(),
+            held_back: false,
+            committed_at_hold: None,
+            count_verified: false,
+            recheck: None,
+        }
+    }
+}
+
+/// Whether a VERIFIED row recovery held back may settle now (#624): its
+/// source's committed point is at or past the row's end, AND has moved up
+/// since the hold. At the hold that point is the restart seed; recovery holds
+/// the row back because a range below it is to be read again - or is held
+/// with no rewind at all (#639) - and the seed alone says nothing about
+/// whether that has happened (review of #624). Only a point this process
+/// moved does. A point that went down (a rotation restarted the cursor) is
+/// not that either.
+fn held_row_may_settle(committed: Option<i128>, at_hold: Option<i128>, end: i128) -> bool {
+    committed.is_some_and(|now| now >= end && at_hold.is_none_or(|held| now > held))
+}
+
+/// One past where a range ends within its unit, in the unit
+/// `SourceAdapter::committed_through` answers in: a byte offset, or for
+/// Kafka the offset after the last one read (`end_offset` is inclusive).
+fn end_position(marker: &ProgressMarker) -> i128 {
+    match marker {
+        ProgressMarker::Kafka { end_offset, .. } => i128::from(*end_offset) + 1,
+        ProgressMarker::File { end_byte, .. } | ProgressMarker::SyslogSpool { end_byte, .. } => {
+            i128::from(*end_byte)
+        }
+    }
+}
+
 /// Where a range begins within its unit.
 fn start_position(marker: &ProgressMarker) -> i128 {
     match marker {
@@ -3419,6 +3937,17 @@ fn source_for_marker(requested: &DiscoveredSource, marker: &ProgressMarker) -> D
     }
 }
 
+/// What the file adapter needs of a committed row to judge which file it was
+/// read from (#621): its inode, end, first page and the page below its end.
+fn archived_end(row: &vtop_state::CommittedCursor) -> ArchivedEnd {
+    ArchivedEnd {
+        inode: row.inode,
+        end_byte: row.end_byte,
+        content: row.content_fingerprint.clone(),
+        tail: row.tail_fingerprint.clone(),
+    }
+}
+
 /// The tenant a source's per-source metrics are charged to: the stream
 /// override when the source name matches a configured stream, the engine
 /// default otherwise — the same resolution the pipeline applies to batches.
@@ -3463,6 +3992,7 @@ fn prime_source_counters<'a>(
             let labels = [tenant, source_type.as_str()];
             let _ = mx.source_read_errors_total.with_label_values(&labels);
             let _ = mx.retention_lost_records_total.with_label_values(&labels);
+            let _ = mx.source_replay_refused_total.with_label_values(&labels);
         }
     }
 }
@@ -3486,6 +4016,9 @@ pub struct RecoverySummary {
     pub committed: usize,
     pub replay_required: usize,
     pub still_pending: usize,
+    /// Handed-back ranges whose source had already committed past them,
+    /// retired as SUPERSEDED instead of rewound (#567).
+    pub superseded: usize,
 }
 
 #[cfg(test)]
@@ -3709,12 +4242,14 @@ mod tests {
     fn a_retention_loss_on_an_overridden_stream_is_charged_to_that_streams_tenant() {
         let streams = StreamsConfig {
             streams: vec![StreamConfig {
+                configured_fields: Default::default(),
                 source_name: "app_events".into(),
                 source_type: SourceType::Kafka,
                 format: vtop_core::types::TelemetryFormat::Raw,
                 tenant: "acme".into(),
                 s3_source_name: None,
                 retention_class: None,
+                checksum: None,
             }],
         };
         assert_eq!(
@@ -4423,6 +4958,407 @@ mod tests {
         );
     }
 
+    /// Every committed file batch as (inode, start byte, end byte, records).
+    async fn committed_file_ranges(engine: &Engine) -> Vec<(Option<u64>, u64, u64, Option<i64>)> {
+        let mut got: Vec<_> = engine
+            .store
+            .list_batches()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.state == BatchState::SourceCommitted)
+            .map(|b| {
+                let (
+                    ProgressMarker::File {
+                        inode, start_byte, ..
+                    },
+                    ProgressMarker::File { end_byte, .. },
+                ) = (&b.progress_start, &b.progress_end)
+                else {
+                    panic!("a file batch carries file markers");
+                };
+                (*inode, *start_byte, *end_byte, b.record_count)
+            })
+            .collect();
+        got.sort();
+        got
+    }
+
+    /// #621: a batch fails and its range is handed back while the file is
+    /// still at its path - then logrotate renames it, compresses it and
+    /// removes the original before the re-read. The next read found another
+    /// inode at the path and restarted on the new file; the failed range was
+    /// never archived and nothing said so. It is now re-read through the
+    /// descriptor the adapter kept on the old file, under the old inode, and
+    /// the new file is archived from its first byte.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_range_whose_file_is_rotated_before_the_re_read_is_archived_from_the_old_file()
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        std::fs::write(&input, "old 1\nold 2\n").unwrap(); // 12 bytes
+        let old_inode = std::fs::metadata(&input).unwrap().ino();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 3_600;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        engine.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(1));
+        let first = engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(first[0].final_state, BatchState::Failed);
+
+        let rotated = dir.path().join("app.log.1");
+        std::fs::rename(&input, &rotated).unwrap();
+        std::fs::write(&input, "new 1\n").unwrap(); // 6 bytes
+        std::fs::remove_file(&rotated).unwrap();
+        let new_inode = std::fs::metadata(&input).unwrap().ino();
+
+        for _ in 0..3 {
+            engine.run_source(SourceType::File, true).await.unwrap();
+        }
+        assert_eq!(
+            committed_file_ranges(&engine).await,
+            {
+                let mut want = vec![
+                    (Some(old_inode), 0, 12, Some(2)),
+                    (Some(new_inode), 0, 6, Some(1)),
+                ];
+                want.sort();
+                want
+            },
+            "the failed range once, from the old file, and the new file whole"
+        );
+    }
+
+    /// #621 across a restart: the batch failed, the engine stopped before the
+    /// re-read, and the file was rotated by rename while it was down. Recovery
+    /// refused the rewind at every start and the range was never archived. It
+    /// now finds the rotated file beside the path (same inode, same first
+    /// bytes) and re-reads the range from it - once: a later restart, which
+    /// still sees the old FAILED row, finds the range archived and does not
+    /// archive it again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_range_rotated_away_while_the_engine_was_down_is_archived_once_by_recovery() {
+        use std::os::unix::fs::MetadataExt;
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        std::fs::write(&input, "old 1\nold 2\n").unwrap(); // 12 bytes
+        let old_inode = std::fs::metadata(&input).unwrap().ino();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let config = |work: &str| {
+            let mut cfg = file_config(
+                dir.path().join(work).to_str().unwrap(),
+                &url,
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            cfg.batching.max_batch_age_seconds = 3_600;
+            cfg
+        };
+
+        {
+            let mut first = Engine::new(config("work-1"), StreamsConfig { streams: vec![] })
+                .await
+                .unwrap();
+            first.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(1));
+            let done = first.run_source(SourceType::File, true).await.unwrap();
+            assert_eq!(done[0].final_state, BatchState::Failed);
+        } // the engine stops before the re-read
+
+        std::fs::rename(&input, dir.path().join("app.log.1")).unwrap();
+        std::fs::write(&input, "new 1\n").unwrap(); // 6 bytes
+        let new_inode = std::fs::metadata(&input).unwrap().ino();
+
+        let want = {
+            let mut want = vec![
+                (Some(old_inode), 0, 12, Some(2)),
+                (Some(new_inode), 0, 6, Some(1)),
+            ];
+            want.sort();
+            want
+        };
+        {
+            let mut second = Engine::new(config("work-2"), StreamsConfig { streams: vec![] })
+                .await
+                .unwrap();
+            let summary = second.recover().await.unwrap();
+            assert_eq!(summary.still_pending, 0, "{summary:?}");
+            for _ in 0..3 {
+                second.run_source(SourceType::File, true).await.unwrap();
+            }
+            assert_eq!(
+                committed_file_ranges(&second).await,
+                want,
+                "the failed range from the rotated file, and the new file whole"
+            );
+        }
+        let mut third = Engine::new(config("work-3"), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        third.recover().await.unwrap();
+        for _ in 0..3 {
+            third.run_source(SourceType::File, true).await.unwrap();
+        }
+        assert_eq!(
+            committed_file_ranges(&third).await,
+            want,
+            "a later restart finds the range archived and archives nothing again"
+        );
+    }
+
+    /// Review of #621 (Codex): a re-read of a rotated file must not become the
+    /// path's restart position. One cycle sees the rotation: the old file's
+    /// buffered window is sealed and fails, and the new file's window commits.
+    /// The old range is then re-read from the rotated file and commits, after
+    /// the new file's batch. The restart seed was the newest committed row of
+    /// the path, by creation, so it named the rotated file. The restart then
+    /// took the new file for a rotation and archived it again from byte 0.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_re_read_of_a_rotated_file_does_not_take_over_the_paths_restart_position() {
+        use std::os::unix::fs::MetadataExt;
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        std::fs::write(&input, "old 1\nold 2\n").unwrap(); // 12 bytes
+        let old_inode = std::fs::metadata(&input).unwrap().ino();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let config = |work: &str| {
+            let mut cfg = file_config(
+                dir.path().join(work).to_str().unwrap(),
+                &url,
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            cfg.batching.max_records = 10_000;
+            cfg.batching.max_bytes = 104_857_600;
+            cfg.batching.max_batch_age_seconds = 3_600;
+            // One upload at a time, in the order the windows were sealed: the
+            // old file's window goes first, so the one throttled put below is
+            // its upload, whatever the pipeline does between puts.
+            cfg.batching.max_concurrent_batches = 1;
+            cfg
+        };
+        let new_inode;
+        {
+            let mut first = Engine::new(config("work-1"), StreamsConfig { streams: vec![] })
+                .await
+                .unwrap();
+            let held = first.run_source(SourceType::File, false).await.unwrap();
+            assert!(
+                held.is_empty(),
+                "the old file's window is buffered, not flushed"
+            );
+
+            std::fs::rename(&input, dir.path().join("app.log.1")).unwrap();
+            std::fs::write(&input, "new 1\nnew 2\nnew 3\n").unwrap(); // 18 bytes
+            new_inode = std::fs::metadata(&input).unwrap().ino();
+
+            // One cycle: the rotation seals the old window, the new file is
+            // read and flushed. The old window's upload is throttled; the new
+            // one's goes through.
+            first.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(1));
+            let rotated = first.run_source(SourceType::File, true).await.unwrap();
+            let failed: Vec<_> = rotated
+                .iter()
+                .filter(|o| o.final_state == BatchState::Failed)
+                .collect();
+            assert_eq!(failed.len(), 1, "the old window fails: {rotated:?}");
+            assert_eq!(
+                committed_file_ranges(&first).await,
+                vec![(Some(new_inode), 0, 18, Some(3))],
+                "and the new file's window commits in the same cycle"
+            );
+            // The old range is re-read from the rotated file and commits
+            // later, under the same path.
+            for _ in 0..3 {
+                first.run_source(SourceType::File, true).await.unwrap();
+            }
+            let mut want = vec![
+                (Some(old_inode), 0, 12, Some(2)),
+                (Some(new_inode), 0, 18, Some(3)),
+            ];
+            want.sort();
+            assert_eq!(committed_file_ranges(&first).await, want);
+        } // the engine stops
+
+        let mut second = Engine::new(config("work-2"), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        second.recover().await.unwrap();
+        for _ in 0..3 {
+            second.run_source(SourceType::File, true).await.unwrap();
+        }
+        let new_batches: Vec<_> = committed_file_ranges(&second)
+            .await
+            .into_iter()
+            .filter(|(inode, ..)| *inode == Some(new_inode))
+            .collect();
+        assert_eq!(
+            new_batches,
+            vec![(Some(new_inode), 0, 18, Some(3))],
+            "the new file resumes at its committed 18 after the restart; it is not \
+             archived again from byte 0"
+        );
+
+        // And it resumes there: a line appended now is archived on its own.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&input)
+            .unwrap()
+            .write_all(b"new 4\n")
+            .unwrap();
+        second.run_source(SourceType::File, true).await.unwrap();
+        assert!(
+            committed_file_ranges(&second)
+                .await
+                .contains(&(Some(new_inode), 18, 24, Some(1))),
+            "the restart position kept: {:?}",
+            committed_file_ranges(&second).await
+        );
+    }
+
+    /// `vtop_source_replay_refused_total` for one tenant's file sources, read
+    /// back through the registry as a scrape would.
+    fn refused_so_far(tenant: &str) -> u64 {
+        let mx = telemetry::init().unwrap();
+        mx.registry
+            .gather()
+            .iter()
+            .filter(|f| f.name().ends_with("source_replay_refused_total"))
+            .flat_map(|f| f.get_metric().iter())
+            .find(|m| {
+                let labels = m.get_label();
+                labels
+                    .iter()
+                    .any(|l| l.name() == "tenant" && l.value() == tenant)
+                    && labels
+                        .iter()
+                        .any(|l| l.name() == "source_type" && l.value() == "file")
+            })
+            .map_or(0, |m| m.get_counter().get_value() as u64)
+    }
+
+    /// #621 (review): the batch fails, its range is handed back, the file is
+    /// rotated away - and the rotated file is then truncated above its first
+    /// page, so its fingerprint still matches. The re-read through the held
+    /// descriptor archived the shortened prefix as though it were the range.
+    /// It is refused instead, and counted like any refused rewind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotated_file_truncated_before_its_re_read_is_refused_and_counted() {
+        use std::os::unix::fs::MetadataExt;
+        let _serial = THROTTLE_TESTS.lock().await;
+        let tenant = "truncated-621";
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        let old: String = (0..200)
+            .map(|i| format!("line {i:04} of the old file\n"))
+            .collect();
+        std::fs::write(&input, &old).unwrap();
+        let old_inode = std::fs::metadata(&input).unwrap().ino();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 3_600;
+        cfg.engine.tenant = tenant.into();
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        engine.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(1));
+        let first = engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(first[0].final_state, BatchState::Failed);
+
+        let rotated = dir.path().join("app.log.1");
+        std::fs::rename(&input, &rotated).unwrap();
+        std::fs::write(&input, "new 1\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&rotated)
+            .unwrap()
+            .set_len(4_500)
+            .unwrap();
+
+        let before = refused_so_far(tenant);
+        for _ in 0..3 {
+            engine.run_source(SourceType::File, true).await.unwrap();
+        }
+        assert_eq!(
+            refused_so_far(tenant) - before,
+            1,
+            "the refused re-read is counted under the engine's tenant"
+        );
+        let committed = committed_file_ranges(&engine).await;
+        assert!(
+            committed
+                .iter()
+                .all(|(inode, ..)| *inode != Some(old_inode)),
+            "nothing of the shortened file is archived as the range: {committed:?}"
+        );
+        assert_eq!(committed.len(), 1, "the new file is: {committed:?}");
+    }
+
+    /// #621: when the rotated file is gone (compressed and removed while the
+    /// engine was down), the range cannot be re-read. That stays loud - and is
+    /// counted, not only logged, so it can be alerted on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_range_whose_file_is_gone_is_refused_and_counted() {
+        let _serial = THROTTLE_TESTS.lock().await;
+        let tenant = "refused-621";
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        std::fs::write(&input, "old 1\nold 2\n").unwrap();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let config = |work: &str| {
+            let mut cfg = file_config(
+                dir.path().join(work).to_str().unwrap(),
+                &url,
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            cfg.batching.max_batch_age_seconds = 3_600;
+            cfg.engine.tenant = tenant.into();
+            cfg
+        };
+        {
+            let mut first = Engine::new(config("work-1"), StreamsConfig { streams: vec![] })
+                .await
+                .unwrap();
+            first.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(1));
+            let done = first.run_source(SourceType::File, true).await.unwrap();
+            assert_eq!(done[0].final_state, BatchState::Failed);
+        }
+        std::fs::rename(&input, dir.path().join("app.log.1")).unwrap();
+        std::fs::write(&input, "new 1\n").unwrap();
+        std::fs::remove_file(dir.path().join("app.log.1")).unwrap();
+
+        let before = refused_so_far(tenant);
+        let mut second = Engine::new(config("work-2"), StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let summary = second.recover().await.unwrap();
+        assert_eq!(summary.still_pending, 1, "{summary:?}");
+        assert_eq!(
+            refused_so_far(tenant) - before,
+            1,
+            "the refused rewind is counted under the engine's tenant"
+        );
+    }
+
     /// A ledger write [`FaultyLedger`] can refuse: a row's insert, or a
     /// transition to the named state. `mark_failed`, `mark_verified` and
     /// `mark_source_committed` count as transitions to theirs.
@@ -4495,6 +5431,9 @@ mod tests {
                 .claim_incomplete_batches(owner, now, lease_until)
                 .await
         }
+        async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError> {
+            self.inner.renew_claim(batch_id, lease_until).await
+        }
         async fn max_committed_end_bytes(
             &self,
             source_type: SourceType,
@@ -4506,6 +5445,12 @@ mod tests {
             source_type: SourceType,
         ) -> Result<Vec<vtop_state::CommittedCursor>, VtopError> {
             self.inner.committed_cursors(source_type).await
+        }
+        async fn committed_cursors_by_file(
+            &self,
+            source_type: SourceType,
+        ) -> Result<Vec<vtop_state::CommittedCursor>, VtopError> {
+            self.inner.committed_cursors_by_file(source_type).await
         }
         async fn committed_kafka_offsets(
             &self,
@@ -4672,13 +5617,14 @@ mod tests {
                 Some(Failed),
             ),
             // After VERIFIED nothing is handed back: the range is archived,
-            // the row stays VERIFIED, and recovery retries the commit.
+            // the row stays VERIFIED, and the next pass retries the commit
+            // (#624) - superseded by then, so the source does not move back.
             (
                 "SOURCE_COMMITTED",
                 &[To(SourceCommitted)],
                 false,
                 true,
-                Some(Verified),
+                Some(SourceCommitted),
             ),
         ];
         for &(case, refused, throttled, first_errs, first_row) in cases {
@@ -4732,8 +5678,10 @@ mod tests {
     /// #627, end to end: the FAILED write of a batch that failed after its
     /// object landed fails too. The range is handed back anyway, so the cost
     /// is the one object the failed attempt left in the store, never a gap;
-    /// and the stale row the restart then finds re-reads nothing, because
-    /// recovery clamps its rewind to the committed point.
+    /// and the stale row the restart then finds re-reads nothing: its source
+    /// has committed past it, so recovery retires it as SUPERSEDED (#567)
+    /// instead of planning a rewind the committed point would clamp to
+    /// nothing.
     #[tokio::test]
     async fn a_failed_failed_write_costs_one_duplicate_object_and_no_gap() {
         let _serial = THROTTLE_TESTS.lock().await;
@@ -4778,20 +5726,24 @@ mod tests {
         );
         drop(engine);
 
-        // The restart finds the stale row, records the replay decision, and
-        // its rewind lands on the committed point: nothing is read again.
+        // The restart finds the stale row below the committed point and
+        // retires it: nothing is read again.
         let mut restarted = Engine::new(cfg, StreamsConfig { streams: vec![] })
             .await
             .unwrap();
         let summary = restarted.recover().await.unwrap();
-        assert_eq!(summary.replay_required, 1);
+        assert_eq!(
+            (summary.superseded, summary.replay_required),
+            (1, 0),
+            "{summary:?}"
+        );
         let row = restarted
             .store
             .get_batch(&stale.batch_id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.state, BatchState::ReplayRequired);
+        assert_eq!(row.state, BatchState::Superseded);
         let after = restarted.run_source(SourceType::File, true).await.unwrap();
         assert!(after.is_empty(), "nothing is re-archived: {after:?}");
         assert_eq!(archived_ranges(&restarted).await, vec![(0, len)]);
@@ -4832,12 +5784,346 @@ mod tests {
         }
     }
 
+    /// #624 (review): a held-back row settles only on a committed point this
+    /// process has moved since it held the row back, and only one at or past
+    /// the row's end. The point at the hold is the restart seed - and when a
+    /// held range (#639) lies below it, the seed alone is no evidence the
+    /// re-read has passed anything.
+    #[test]
+    fn a_held_back_row_settles_only_once_the_committed_point_has_moved_past_it() {
+        // Nothing known, or below the end: wait.
+        assert!(!held_row_may_settle(None, None, 20));
+        assert!(!held_row_may_settle(Some(15), Some(10), 20));
+        // At or past the end, having moved since the hold: settle.
+        assert!(held_row_may_settle(Some(20), Some(10), 20));
+        assert!(held_row_may_settle(Some(40), None, 20));
+        // At or past the end only because the seed already was: wait.
+        assert!(!held_row_may_settle(Some(30), Some(30), 20));
+        // A committed point that went DOWN since (a rotation restarted the
+        // cursor) is not progress either.
+        assert!(!held_row_may_settle(Some(25), Some(30), 20));
+    }
+
+    /// #624 (review): a VERIFIED row whose source commit failed during
+    /// recovery was verified by the process that crashed, so this process
+    /// has not counted it. Settling it later counts the verification with
+    /// the commit, as `commit_recovered` does - or commits_total runs ahead
+    /// of verified_total, the one alarm that must not cry wolf.
+    #[tokio::test]
+    async fn settling_a_row_whose_recovered_commit_failed_counts_its_verification() {
+        let tenant = "settle-counts-624";
+        let counter = |family: &str| -> u64 {
+            let mx = telemetry::init().unwrap();
+            mx.registry
+                .gather()
+                .iter()
+                .filter(|f| f.name().ends_with(family))
+                .flat_map(|f| f.get_metric().iter())
+                .filter(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "tenant" && l.value() == tenant)
+                })
+                .map(|m| m.get_counter().get_value() as u64)
+                .sum()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\n").unwrap();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let backend = Arc::new(vtop_upload::MockBackend::new());
+        let engine = |work: &str| {
+            let mut cfg = file_config(
+                dir.path().join(work).to_str().unwrap(),
+                &url,
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            cfg.engine.tenant = tenant.into();
+            let backend = backend.clone();
+            async move {
+                let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+                    .await
+                    .unwrap();
+                engine.backend = backend;
+                engine
+            }
+        };
+        let fail_commits = |engine: &mut Engine, failures: usize| {
+            let inner = engine.adapters.remove(&SourceType::File).unwrap();
+            engine.adapters.insert(
+                SourceType::File,
+                Box::new(FailingCommits { inner, failures }),
+            );
+        };
+
+        // A process verifies the batch, cannot commit it, and crashes.
+        let mut first = engine("work-1").await;
+        fail_commits(&mut first, usize::MAX);
+        let outcomes = first.process_once(SourceType::File).await.unwrap();
+        assert!(!outcomes[0].committed, "{outcomes:?}");
+        drop(first);
+
+        // The restart re-checks it, and its commit fails once more.
+        let mut second = engine("work-2").await;
+        fail_commits(&mut second, 1);
+        let verified_before = counter("verified_total");
+        let commits_before = counter("commits_total");
+        let summary = second.recover().await.unwrap();
+        assert_eq!(
+            (summary.committed, summary.still_pending),
+            (0, 1),
+            "{summary:?}"
+        );
+        // A later pass settles it.
+        second.process_once(SourceType::File).await.unwrap();
+        let rows = second.store.list_batches().await.unwrap();
+        assert!(
+            rows.iter().all(|r| r.state == BatchState::SourceCommitted),
+            "{rows:?}"
+        );
+        // Every commit this process made is matched by a verification it
+        // counted - the re-read's batch and the settled row alike.
+        let commits = counter("commits_total") - commits_before;
+        assert!(commits >= 1, "nothing was committed");
+        assert_eq!(
+            counter("verified_total") - verified_before,
+            commits,
+            "commits_total ran ahead of verified_total: the settled row's verification was not counted"
+        );
+    }
+
+    /// Counts the source commits that reach the real adapter.
+    struct CountsCommits {
+        inner: Box<dyn SourceAdapter>,
+        failures: usize,
+        reached: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SourceAdapter for CountsCommits {
+        async fn discover_sources(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
+            self.inner.discover_sources().await
+        }
+        async fn read_batch_candidates(
+            &mut self,
+            source: &DiscoveredSource,
+            max_records: usize,
+            max_bytes: usize,
+            max_wait: Duration,
+        ) -> Result<Vec<ReadResult>, VtopError> {
+            self.inner
+                .read_batch_candidates(source, max_records, max_bytes, max_wait)
+                .await
+        }
+        async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            if self.failures > 0 {
+                self.failures -= 1;
+                return Err(VtopError::Source("source commit refused".into()));
+            }
+            self.reached.fetch_add(1, Ordering::SeqCst);
+            self.inner.commit_progress(marker).await
+        }
+        async fn replay_from_marker(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            self.inner.replay_from_marker(marker).await
+        }
+        fn committed_through(&self, marker: &ProgressMarker) -> Option<i128> {
+            self.inner.committed_through(marker)
+        }
+        fn source_type(&self) -> SourceType {
+            self.inner.source_type()
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self.inner.as_any_mut()
+        }
+    }
+
+    /// #624 (review, P1): a row this process left uncommitted can be claimed
+    /// by another engine once its lease runs out - and that engine may be
+    /// about to re-read a range below it. Settling must not move the source
+    /// for it: a commit moves the committed point, and with
+    /// `delete_after_commit` can delete the file. Detecting the lost claim at
+    /// the ledger write afterwards is too late, so the claim is renewed,
+    /// fenced, BEFORE the source is touched; a refused renewal drops the row.
+    #[tokio::test]
+    async fn a_row_another_engine_has_claimed_is_never_committed_to_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\n").unwrap();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            &url,
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 3_600;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let reached = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inner = engine.adapters.remove(&SourceType::File).unwrap();
+        engine.adapters.insert(
+            SourceType::File,
+            Box::new(CountsCommits {
+                inner,
+                failures: 1,
+                reached: reached.clone(),
+            }),
+        );
+        let first = engine.run_source(SourceType::File, true).await.unwrap();
+        assert!(!first[0].committed, "{first:?}");
+
+        // The lease runs out and another engine claims the row.
+        let other = vtop_state::SqliteStateStore::connect(&url).await.unwrap();
+        let later = Utc::now() + chrono::Duration::days(1);
+        let claimed = other
+            .claim_incomplete_batches(
+                "engine-b",
+                &later.to_rfc3339(),
+                &(later + chrono::Duration::days(1)).to_rfc3339(),
+            )
+            .await
+            .unwrap();
+        assert!(claimed.iter().any(|r| r.batch_id == first[0].batch_id));
+
+        engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            0,
+            "the source was committed for a row another engine has claimed"
+        );
+        assert_eq!(
+            engine
+                .store
+                .get_batch(&first[0].batch_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            BatchState::Verified,
+            "the new owner's row"
+        );
+        assert!(
+            engine.unsettled.is_empty(),
+            "a row claimed away is dropped, not retried for ever"
+        );
+    }
+
+    /// Delegates to the real adapter, but its next `failures` source commits
+    /// fail (a Kafka coordinator that is unavailable, say).
+    struct FailingCommits {
+        inner: Box<dyn SourceAdapter>,
+        failures: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl SourceAdapter for FailingCommits {
+        async fn discover_sources(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
+            self.inner.discover_sources().await
+        }
+        async fn read_batch_candidates(
+            &mut self,
+            source: &DiscoveredSource,
+            max_records: usize,
+            max_bytes: usize,
+            max_wait: Duration,
+        ) -> Result<Vec<ReadResult>, VtopError> {
+            self.inner
+                .read_batch_candidates(source, max_records, max_bytes, max_wait)
+                .await
+        }
+        async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            if self.failures > 0 {
+                self.failures -= 1;
+                return Err(VtopError::Source("source commit refused".into()));
+            }
+            self.inner.commit_progress(marker).await
+        }
+        async fn replay_from_marker(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
+            self.inner.replay_from_marker(marker).await
+        }
+        fn read_position(&self, marker: &ProgressMarker) -> Option<i128> {
+            self.inner.read_position(marker)
+        }
+        fn committed_through(&self, marker: &ProgressMarker) -> Option<i128> {
+            self.inner.committed_through(marker)
+        }
+        fn source_type(&self) -> SourceType {
+            self.inner.source_type()
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self.inner.as_any_mut()
+        }
+    }
+
+    /// #624: a batch whose source commit failed after VERIFIED stayed
+    /// VERIFIED until the next restart: nothing in the running loop looked
+    /// at it again. It is retried after a later pass of its source - and,
+    /// because a newer range has committed past it by then, retried without
+    /// moving the committed point back.
+    #[tokio::test]
+    async fn a_verified_batch_whose_commit_failed_is_committed_on_a_later_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\n").unwrap();
+        let store = format!("sqlite://{}", dir.path().join("state.db").display());
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            &store,
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 3_600;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let inner = engine.adapters.remove(&SourceType::File).unwrap();
+        engine.adapters.insert(
+            SourceType::File,
+            Box::new(FailingCommits { inner, failures: 1 }),
+        );
+
+        let first = engine.run_source(SourceType::File, true).await.unwrap();
+        assert!(!first[0].committed, "{first:?}");
+        let stuck = first[0].batch_id.clone();
+        assert_eq!(
+            engine.store.get_batch(&stuck).await.unwrap().unwrap().state,
+            BatchState::Verified
+        );
+
+        append_line(&input, "line 2");
+        let second = engine.run_source(SourceType::File, true).await.unwrap();
+        assert!(second.iter().all(|o| o.committed), "{second:?}");
+        let newer = engine
+            .store
+            .get_batch(&second[0].batch_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            engine.store.get_batch(&stuck).await.unwrap().unwrap().state,
+            BatchState::SourceCommitted,
+            "the batch whose commit failed is committed by a later pass, without a restart"
+        );
+        let len = std::fs::metadata(&input).unwrap().len();
+        assert_eq!(
+            engine.adapters[&SourceType::File].committed_through(&newer.progress_end),
+            Some(i128::from(len)),
+            "committing the older range moved the committed point back"
+        );
+        assert_gap_free("commit retried", &archived_ranges(&engine).await, len);
+        let after = engine.run_source(SourceType::File, true).await.unwrap();
+        assert!(after.is_empty(), "nothing is read again: {after:?}");
+    }
+
     /// #627, the other direction, and why it is not taken: had the running
     /// engine followed recovery's rule and withheld the rewind when FAILED
     /// could not be written, the range it had already read past would be
     /// lost for good. The next cycle reads on, a later batch commits past the
-    /// range, and the restart that marks the row for replay clamps its rewind
-    /// to that commit.
+    /// range, and at the restart its rewind would be clamped to that commit -
+    /// so recovery retires the row as SUPERSEDED (#567). That is no cover
+    /// for the loss: the coverage audit still names the row in the hole.
     #[tokio::test]
     async fn withholding_the_rewind_on_an_unrecorded_failure_would_lose_the_range() {
         let _serial = THROTTLE_TESTS.lock().await;
@@ -4880,16 +6166,39 @@ mod tests {
             .await
             .unwrap();
         let summary = restarted.recover().await.unwrap();
-        assert_eq!(summary.replay_required, 1, "recovery records the decision");
-        let after = restarted.run_source(SourceType::File, true).await.unwrap();
-        assert!(
-            after.is_empty(),
-            "but its rewind is clamped to the committed point: {after:?}"
+        assert_eq!(
+            (summary.superseded, summary.replay_required),
+            (1, 0),
+            "the source committed past the range: nothing could re-read it ({summary:?})"
         );
+        let after = restarted.run_source(SourceType::File, true).await.unwrap();
+        assert!(after.is_empty(), "nothing is read again: {after:?}");
         assert_eq!(
             archived_ranges(&restarted).await,
             vec![(line_1, len)],
             "line 1 is never archived"
+        );
+        let rows = restarted.store.list_batches().await.unwrap();
+        let retired: Vec<String> = rows
+            .iter()
+            .filter(|row| row.state == BatchState::Superseded)
+            .map(|row| row.batch_id.clone())
+            .collect();
+        let holes: Vec<_> = crate::coverage::audit(rows)
+            .into_iter()
+            .flat_map(|report| report.failed_holes)
+            .collect();
+        assert_eq!(
+            holes
+                .iter()
+                .map(|hole| (hole.start, hole.end))
+                .collect::<Vec<_>>(),
+            vec![(0, line_1)],
+            "the audit still reports the lost range: {holes:?}"
+        );
+        assert_eq!(
+            holes[0].failed_batches, retired,
+            "and names the retired row"
         );
     }
 
@@ -5634,7 +6943,7 @@ mod tests {
             .get_object(row.manifest_uri.as_deref().unwrap())
             .await
             .unwrap();
-        let manifest: VtopManifest = serde_json::from_slice(&bytes).unwrap();
+        let manifest: vtop_core::manifest::VtopManifest = serde_json::from_slice(&bytes).unwrap();
         manifest.verify_self_hash().unwrap();
         let ProgressMarker::File {
             start_byte,
@@ -6723,7 +8032,14 @@ mod tests {
         } else {
             To(Sealed)
         };
-        FaultyLedger::install(first, &[a_stops_at, To(SourceCommitted)]).await;
+        // A VERIFIED A whose commit write failed is retried by the running
+        // engine after its next pass (#624); the crash this fixture stands
+        // for comes first, so that retry is refused as well.
+        let mut refused = vec![a_stops_at, To(SourceCommitted)];
+        if fault.lower_verified() {
+            refused.push(To(SourceCommitted));
+        }
+        FaultyLedger::install(first, &refused).await;
         assert!(
             first.process_once(source.clone()).await.is_err(),
             "A's write fails"
@@ -6851,6 +8167,141 @@ mod tests {
             "{case}: the hold on B is released once A is archived"
         );
         assert_committed_without_a_gap(&case, &fourth, 14).await;
+    }
+
+    /// #671: a VERIFIED range whose manifest is from a newer release stays
+    /// pending - not committed, not replayed - and holds back a VERIFIED range
+    /// above it like any uncommitted range (#639). Once the file has committed
+    /// past it, though (proven as for any range retired by #567), nothing
+    /// below the committed point can be re-read: it holds nothing back, and
+    /// it is retired SUPERSEDED instead of being claimed, downloaded and
+    /// counted pending at every restart (review of #674). No source commit is
+    /// made for it. Each meeting with a newer manifest is counted.
+    #[tokio::test]
+    async fn a_newer_release_range_the_file_committed_past_is_superseded() {
+        use BatchState::*;
+        let tenant = "newer-release-671";
+        let unsupported = || -> u64 {
+            let mx = telemetry::init().unwrap();
+            mx.registry
+                .gather()
+                .iter()
+                .filter(|f| f.name() == "vtop_recovery_unsupported_manifest_total")
+                .flat_map(|f| f.get_metric().iter())
+                .filter(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "tenant" && l.value() == tenant)
+                })
+                .map(|m| m.get_counter().get_value() as u64)
+                .sum()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "line 1\n").unwrap(); // A: [0, 7)
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let backend = Arc::new(vtop_upload::MockBackend::new());
+        let engine = |work: &str| {
+            let mut cfg = file_config(
+                dir.path().join(work).to_str().unwrap(),
+                &url,
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            cfg.engine.tenant = tenant.into();
+            cfg.batching.max_batch_age_seconds = 3_600;
+            let backend = backend.clone();
+            async move {
+                let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+                    .await
+                    .unwrap();
+                engine.backend = backend;
+                engine
+            }
+        };
+
+        let mut first = engine("work-1").await;
+        first.process_once(SourceType::File).await.unwrap();
+        let a = row_at(&first, 0).await;
+        assert_eq!(a.state, SourceCommitted);
+        // N: the same bytes, left VERIFIED by a newer release's engine, its
+        // manifest pinned and carrying the self-hash the ledger recorded.
+        let newer_uri = "s3://telemetry-data/newer.manifest.json";
+        let newer_hash = "ab".repeat(32);
+        let staged = dir.path().join("newer-671.json");
+        std::fs::write(
+            &staged,
+            serde_json::to_vec(&serde_json::json!({
+                "protocol": "VTOP",
+                "version": "0.9",
+                "batch_id": "newer-release",
+                "manifest": {"uri": newer_uri, "sha256": newer_hash},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let stored = backend
+            .put_manifest(&staged, newer_uri, None)
+            .await
+            .unwrap();
+        let newer = BatchRecord {
+            batch_id: "newer-release".into(),
+            state: Batching,
+            manifest_uri: Some(newer_uri.into()),
+            manifest_sha256: Some(newer_hash.clone()),
+            manifest_version_id: stored.version_id,
+            owner: None,
+            lease_expires_at: None,
+            ..a.clone()
+        };
+        first.store.save_batch_state(&newer).await.unwrap();
+        for state in [
+            Sealed,
+            Compressed,
+            Checksummed,
+            ObjectUploaded,
+            ManifestUploaded,
+            Verified,
+        ] {
+            first
+                .store
+                .update_batch_state(&newer.batch_id, state, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+        // B: [7, 14), VERIFIED, its commit refused.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&input)
+            .unwrap();
+        writeln!(f, "line 2").unwrap();
+        FaultyLedger::install(&mut first, &[LedgerWrite::To(SourceCommitted)]).await;
+        assert!(
+            first.process_once(SourceType::File).await.is_err(),
+            "B verifies and its commit write fails"
+        );
+        assert_eq!(row_at(&first, 7).await.state, Verified);
+        drop(first);
+
+        let before = unsupported();
+        let mut second = engine("work-2").await;
+        let summary = second.recover().await.unwrap();
+        assert_eq!(
+            row_at(&second, 7).await.state,
+            SourceCommitted,
+            "B is held back by a range its file has committed past: {summary:?}"
+        );
+        let newer = second
+            .store
+            .get_batch("newer-release")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(newer.state, Superseded, "{summary:?}");
+        assert_eq!(summary.superseded, 1, "{summary:?}");
+        assert_eq!(summary.still_pending, 0, "{summary:?}");
+        assert_eq!(summary.replay_required, 0, "{summary:?}");
+        assert_eq!(unsupported() - before, 1, "the newer manifest is counted");
     }
 
     /// #639, `Engine::recover`'s stale-VERIFIED path: FAILED is refused.

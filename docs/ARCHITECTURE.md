@@ -133,7 +133,7 @@ The engine drives each batch stage-by-stage; each stage advances the batch to a 
 | 8 | **Verify** | Both stored object and manifest are verified against expected checksums/metadata. | `VERIFIED` |
 | 9 | **Commit** | Only after verification, the source marker is committed via the adapter. | `SOURCE_COMMITTED` |
 
-If any stage fails, the batch transitions to `FAILED`, then `REPLAY_REQUIRED`, and its range is handed back to the source at the end of the cycle, whether or not those writes land (§13, item 5). If verification fails, `commit_progress(...)` is never called. If the commit itself fails after verification, the batch stays `VERIFIED` (not lost) and recovery retries the commit.
+If any stage fails, the batch transitions to `FAILED`, then `REPLAY_REQUIRED`, and its range is handed back to the source at the end of the cycle, whether or not those writes land (§13, item 5). If verification fails, `commit_progress(...)` is never called. If the commit itself fails after verification, the batch stays `VERIFIED` (not lost). The running engine retries the commit after each later pass of the same source type, and recovery retries it after a restart (#624, §13 item 1).
 
 ### 5.1 State machine
 
@@ -142,7 +142,7 @@ DISCOVERED -> BATCHING -> SEALED -> COMPRESSED -> CHECKSUMMED ->
 OBJECT_UPLOADED -> MANIFEST_UPLOADED -> VERIFIED -> SOURCE_COMMITTED
 ```
 
-Recovery states: `FAILED`, `REPLAY_REQUIRED`.
+Recovery states: `FAILED`, `REPLAY_REQUIRED`. Terminal states: `SOURCE_COMMITTED`, and `SUPERSEDED` for a handed-back range that its source has since committed past (#567, §13).
 
 Legal transitions:
 
@@ -159,6 +159,8 @@ Legal transitions:
 | ANY_STATE | FAILED |
 | FAILED | REPLAY_REQUIRED |
 | REPLAY_REQUIRED | BATCHING |
+| FAILED | SUPERSEDED |
+| REPLAY_REQUIRED | SUPERSEDED |
 
 The `state_machine` module rejects any transition not in this table (`IllegalStateTransition` / `CommitBeforeVerified`).
 
@@ -328,7 +330,9 @@ What follows from that, in the engine:
   range's start, or (file sources, whose markers record the length at read
   time) when it is shorter than it was when the range was read. A spool marker
   without an inode keeps the older size-only check, and a spool truncated and
-  regrown past the range's start cannot be told from the original. How the
+  regrown past the range's start cannot be told from the original. A file
+  source then looks for the file the range WAS read from, and re-reads the
+  range from it when it can prove it is that file (#621, below). How the
   engine reports a refused rewind is described in section 13.
 - **Commits are applied in the order the windows were read**, not the order
   their uploads finish. A rotation seals the old file's window and starts a new
@@ -381,14 +385,98 @@ What follows from that, in the engine:
   it. Before, a same-length replacement at the
   same inode satisfied every test of `delete_after_commit`
   (`end_byte >= size`) and was deleted unread.
+- **`delete_after_commit` deletes only a file that has stopped being
+  written** (#619). A commit that covers a file to its end starts a wait
+  instead of deleting it. It records what the file looked like (inode, first
+  page, length, mtime), and the file is deleted only once it has stayed
+  exactly like that for `delete_quiet_seconds` (default 3600), timed on the
+  engine's monotonic clock from that commit. With `delete_quiet_seconds: 0`
+  there is no wait: the covering commit deletes the file at once, still
+  through the rename-and-check below, but with no quiet-period protection
+  for a writer that holds the file open. The check runs again at the next commit or
+  read pass. Until then the file is kept and read as usual. Before, the
+  engine deleted the path the moment it caught up. Most appenders hold their
+  log open with `O_APPEND`, so every later line went into the unlinked
+  inode, which no path names, and was lost. That happened every time the
+  engine caught up on a live file. The delete itself renames the file to a
+  hidden name in the same directory (`.vtop-delete.<nanos>.<n>`, bounded
+  and independent of the file's own name, so a name near the 255-byte limit
+  still fits). The rename never replaces a file already at that name
+  (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on
+  Apple platforms; elsewhere, or on a filesystem without the flag, an
+  existence check first), and a taken name is skipped for the next. It then
+  checks the renamed file again, and unlinks it only if it is still
+  unchanged. A line appended between the decision and the rename is
+  caught there, and the file is hard-linked back under its name and kept.
+  Before, a check-then-unlink lost that line. A writer that opens the path
+  for each write creates a new file once the rename has happened, and that
+  file is read as a new source. A delete that fails (the open, the rename or
+  the unlink) keeps the wait's result and is retried on the next pass.
+- **"Unchanged" is one identity test**, shared with #620's delete guard
+  (`delete_identity_ok`): the same inode, the first page (#578) and the
+  page below the committed end (#620's tail fingerprint), plus the exact
+  length and mtime. Both the delete decision and the final check before the
+  unlink make it. A file that is gone, or that fails it in any way, is no
+  longer a candidate, and is kept until a new commit covers it.
+- **A moved mtime restarts the wait only when the tail proves it a touch.**
+  With the inode, first page, tail and length all unchanged, a new mtime
+  (a producer stamping a finished drop, a `touch`) restarts the quiet
+  period, and the file is deleted once it has stayed quiet. A rewrite that
+  reaches the first or the last page fails the identity test instead.
+  Without a tail (a range from before #620), a same-length rewrite past
+  the first page looks exactly like a touch, so a moved mtime ends the
+  candidate: never deleting changed data was chosen over deleting touched
+  files. What neither page sees - a same-length change confined between
+  them, with the old length - is #620's documented limit, here too. The
+  deletes run on the blocking pool, as many at once as the reads.
+- **The wait is in memory, so a restart starts it again.** The seed re-arms
+  it with a fresh clock, but only from a row that names the inode and the
+  first page, and whose batch saw the file end at the committed offset. A
+  batch that read part of a longer file never arms a delete from the seed:
+  a same-inode rewrite cut back to the committed offset would otherwise be
+  deleted before the first read's continuity check could see it. A row
+  with a tail fingerprint arms it from the file's current state, since the
+  delete checks that tail. A row without one arms it only if the file still
+  has the mtime the batch recorded (`CommittedCursor::observed_mtime`, the
+  marker's `mtime`); otherwise a same-inode, same-length rewrite past the
+  first page while the engine was down would agree with everything else
+  the seed records. Such a row with no mtime leaves the delete unarmed.
 
 Limits, stated plainly:
+
+- **No portable check proves that no process holds a file open**, so
+  `delete_after_commit` cannot prove it either. Two windows remain for a
+  writer that keeps the file open:
+  - it is silent for longer than `delete_quiet_seconds` and then writes
+    again: it writes into a deleted file, and those lines are lost;
+  - after that same silence, its write lands between the delete's final
+    check of the renamed file and the unlink: that write is lost the same
+    way.
+
+  Scanning `/proc/*/fd` was considered and rejected: it is Linux-only, it
+  needs privileges to see other users' descriptors, and it cannot see
+  writers in other containers' PID namespaces, which is exactly where a
+  sidecar deployment puts them. The option is meant for files that are
+  finished: whole-file drops, and rotated logs after the writer has
+  reopened.
+- A crash between the rename and the unlink leaves the file under its
+  hidden name; it is never deleted unchecked. It holds the archived bytes,
+  plus any write that landed after the decision to delete it - one the
+  crash kept the engine from putting back, or one through a held descriptor
+  after the final check - which is not archived. If a configured pattern
+  matches the hidden name, the file is archived again from byte 0 (a
+  duplicate of what was archived, with the late write). If not, it stays
+  until it is removed by hand. If the hard link back fails (a new file
+  already has the name, or the filesystem has no hard links), the file is
+  left under the hidden name and an error names both paths.
 
 - The **unread tail of a rotated-away file** is not read through the old path.
   If the rotated name (`app.log.1`) also matches a configured pattern it is
   discovered as its own source, with a fresh cursor, and is archived again from
   byte 0 — a duplicate, never a hole. Archiving the unread tail without the
-  duplicate would need cursors keyed by inode rather than path.
+  duplicate would need cursors keyed by inode rather than path. (A failed
+  range re-read from the rotated file, below, reads on to its end, as a rewind
+  of a file still at its path does: in that case the tail is archived.)
 - `copytruncate` is racy by nature: lines written between the copy and the
   truncate are lost by the rotation tool before the engine can see them. If the
   file also regrows beyond the old read position before the next read, the
@@ -428,6 +516,122 @@ Tracked as #361, which also carries the question of whether the adapter should
 refuse rather than resume when it detects the jump — a refusal is only useful
 if an operator can act on it, and a source that stops archiving because it fell
 behind may be worse than one that archives what remains.
+
+#### A failed range from a file rotated away since it was read (#621)
+
+A batch that fails hands its range back to the source, and the file adapter
+re-reads it from the path. When the file has been rotated in the meantime -
+`app.log` renamed to `app.log.1`, a new `app.log` created - the file at the
+path is not the range's, and the rewind used to be refused: an ERROR, the row
+left FAILED, refused again at every restart, and the range never archived
+unless the rotated name happened to match a source pattern. Worse, a rewind
+that was *accepted* while the file was still at its path, followed by a
+rotation before the re-read, restarted the cursor on the new file and never
+re-read the range at all, with no error.
+
+The adapter (`crates/vtop-adapters/src/rotated.rs`) now reaches the file the
+range was read from, in this order:
+
+1. **A held descriptor.** While a range read from a file is not committed, the
+   adapter keeps a descriptor open on that file. A rotation by rename moves the
+   descriptor to a list of rotated files instead of closing it, and a rename or
+   an unlink does not affect what an open descriptor reads, so this works even
+   when logrotate has already compressed and removed `app.log.1`. It does not
+   survive a restart. A rewind accepted before the rotation is honoured the
+   same way: the rewound range is re-read through the descriptor before the
+   new file is read.
+2. **The rotated-to path.** Across a restart there is no descriptor, so
+   recovery's rewind looks for the file among the entries of the path's own
+   directory and the files the source's patterns match, on the same
+   filesystem, by inode.
+
+Either way nothing is read from a file until it is **proven** to be the one
+the range was read from: the inode the marker recorded, the first page its
+fingerprint covers (#578), the page that ends where the marker's position is
+when it recorded one (its tail fingerprint, #620 - so a rotated file rewritten
+in place below an unchanged first page is not taken for the range's), and no
+shorter than when the range was read. The descriptor is proven again before
+every re-read, against the same first page, the page below where it was last
+read, and the longest the file has been seen to be: a rotated file truncated above
+its first page keeps its fingerprint, and reading on would archive a
+shortened prefix as the range (or nothing, and call the re-read done). Such a
+re-read is refused. For rotated-file recovery, a marker without an inode or a
+fingerprint cannot prove the old file and is refused as before (its rewind of
+the file at its own path keeps the inode-and-length check described above).
+
+The re-read starts at the range's start and reads on to the end of the rotated
+file, as a rewind of a file still at its path reads on to the path's end. A
+rewind of it never goes below what is committed from that file, as a rewind of
+a file at its path never goes below its committed point. Its markers carry the
+source path and the rotated file's inode. Wherever the identity checks tell the
+rotated file from the file now at the path - another inode, or other first
+bytes - its commit does not move the current file's cursor, and
+`delete_after_commit` (which judges the file at the path) deletes neither file.
+A replacement those checks cannot tell apart (the blind spots below) is the
+exception. A
+re-read in progress keeps its path a source even if nothing is at the path
+yet - and so does a rewind accepted before its file was renamed away with
+nothing created in its place, whose range only a read of the path moves onto
+the rotated list. A FAILED row stays in the ledger and is rewound again at every restart, so
+recovery asks the ledger for the newest committed batch of each file that has
+lived at that path (`StateStore::committed_cursors_by_file`) and starts the re-read
+above what is already archived of the rotated file - counting only a row whose
+first page, and page below its end, the rotated file still holds. A commit
+in a running engine raises that floor by the same test: a window of a file's
+old content, committed after the file was rewritten in place at the same
+inode, does not count as archiving the new content. Without that, a range
+re-read once was archived again at every restart while the rotated file
+existed.
+
+A rewind that still cannot be honoured stays loud: an ERROR naming the path,
+and `vtop_source_replay_refused_total{tenant,source_type}` counts it, so it
+can be alerted on. A re-read refused after the rewind was accepted (the
+rotated file truncated, or no longer starting with its first page) is counted
+there too, not only as a read error.
+
+Limits:
+
+- **`copytruncate` is not handled.** The copy has a new inode, and a matching
+  fingerprint and length are not proof of identity, so a range read before a
+  `copytruncate` is refused (and counted) unless the copy also matches a
+  configured pattern and is archived as its own source.
+- **A rotated file that is gone** - compressed (`app.log.1.gz` holds other
+  bytes, so it never matches) or removed - can be re-read only through a held
+  descriptor, so only within the process that read it. After a restart its
+  ranges are refused and counted.
+- **The descriptors are bounded.** At most 128 in all (`MAX_HELD_FILES`); past
+  that a file is not held, and a failed range falls back to the search. A
+  descriptor on a rotated file with no re-read in progress is closed one hour
+  after it was last used (`HOLD_FOR`) - it keeps a removed file's disk space
+  allocated until it is closed. A descriptor being re-read through is kept
+  while that re-read is in progress, and is never closed to make room. The
+  search looks at no more than 10,000 entries of the directory.
+- **Identity is the inode, the first page and the page below the marker's
+  position** (#620), with the same blind spots as every other check in this
+  section (above): a replacement matching both sampled pages, or a change
+  confined between them. A range starting at byte 0 has no page below its
+  start, so its proof is the inode and the first page alone.
+- **The restart seed is chosen per file, and needs proof.** A re-read batch
+  is created after the current file's batches - a window of it read in the
+  cycle whose rotation sealed the failed window, or batches committed before
+  a restart whose recovery then re-reads the range - so it becomes the path's
+  newest committed row. Seeded from that row, a restart took the current file
+  for a rotation and archived it again from byte 0 (review of #621). The seed
+  is therefore chosen from the newest committed row of EACH file that has
+  lived at the path (`StateStore::committed_cursors_by_file`): the newest, as
+  before, unless it names a file no longer at the path; then the row of the
+  file that is, when that file is positively identified - the same inode,
+  the first page and the page below the row's end (#620). A current file
+  whose row lacks either fingerprint (written before #578/#620), or whose
+  bytes no longer match them, is not proven, and the newest row stands: the
+  current file is read from byte 0 again, a duplicate bounded by the file,
+  never a skip. So does a current file whose rows pruning removed (pruning
+  keeps the newest row per path, which can be the re-read's). Likewise, if
+  pruning removes the re-read's rows while the rotated file still exists,
+  the next restart re-reads it.
+- Without inodes (non-Unix platforms) nothing can be proven, and the rewind is
+  refused as before. Syslog-spool sources are unchanged: a spool rotated away
+  is still refused.
 
 #### Ledger format note: content fingerprints (#578)
 
@@ -610,9 +814,19 @@ On startup, the `replay` module inspects `vtop-state` and maps each incomplete b
 1. A batch in **`VERIFIED`** but not yet committed (object and manifest durably stored and verified) has its **source commit retried** (`VERIFIED → SOURCE_COMMITTED`). The verified object is never discarded.
 2. A batch in any state **before `VERIFIED`** is transitioned `... → FAILED → REPLAY_REQUIRED` and its range is handed back to the source adapter (`replay_from_marker`) so it is read again. The replay decision is persisted first — if the `FAILED` or the `REPLAY_REQUIRED` write fails, no rewind is recorded for the row and it is counted as pending (a failure of the second write leaves the row `FAILED`, not untouched; the next recovery decides again). Recovery then collects the rewinds and applies the **lowest start per source unit** (one file or spool file at one inode, or one Kafka topic-partition) once, after the scan: each rewind overwrites the adapter's read position, so applying them row by row let the last row visited decide where the source resumed and skipped every earlier range. A rewind that fails, or that has no adapter to apply it to, is logged as an error and counted in the summary as still pending.
 
-   A `VERIFIED` row is committed only after that, and not at all while a range of the same source unit that **starts below it** is about to be re-read: a commit moves the unit's committed point to the end of the committed range, the file adapters clamp a rewind to the committed point, and a `VERIFIED` range archives only its own bytes — so pending bytes below its start would be skipped. Such a row stays `VERIFIED` (its object is in the archive) until a later pass commits it. A `VERIFIED` row that starts where the pending range starts — the object that replaced a stale row for the same bytes — commits normally. A marker with no inode (a legacy row) is compared against every inode at its path.
+   A `VERIFIED` row is committed only after that, and not at all while a range of the same source unit that **starts below it** is about to be re-read: a commit moves the unit's committed point to the end of the committed range, the file adapters clamp a rewind to the committed point, and a `VERIFIED` range archives only its own bytes — so pending bytes below its start would be skipped. Such a row stays `VERIFIED` (its object is in the archive) until a later pass commits it.
 
-   **A rewind never goes below what the source has already committed.** The file and spool adapters have always clamped to their committed byte; the Kafka adapter clamps to the ledger's committed frontier for the partition (its newest committed batch, or what the process committed since it started) or, for a partition the ledger does not know, to where an earlier rewind in this process landed. It asks the broker for the consumer group's committed offset only for a partition it has none of these for (#614) — a stale engine's commit can move the group's offset past a range recovery is about to re-read, and clamping to it skipped that range for good. Either way, a stale `FAILED` row left behind by a failure that has since been repaired no longer rewinds the group to its start and re-archives everything since on each restart. The stale rows themselves stay in the ledger and are re-visited at every restart (a no-op rewind and a ledger write each); retiring them needs a new durable state and is tracked in #567.
+   **That later pass is the running engine's, not the next restart's (#624).** The engine keeps the `VERIFIED` rows it left uncommitted: the rows its recovery held back, and the rows whose source commit failed, at recovery or in a pass. After each later pass of the same source type, it reads each row again. A row that is no longer `VERIFIED` is dropped. A held-back row is committed once the adapter's committed point is at or past its **end**. By then the re-read below it has archived and committed its bytes again, so committing it moves no source. A row whose commit failed is retried as the pipeline left it.
+
+   Nothing is claimed. Every one of these rows is this process's own (created by its pipeline or claimed by its recovery), it still holds the fence token, and the pass that produced the row has finished with it. So no in-flight batch, of this engine or another, is ever touched. A row can outlive its lease, though, and an engine that claims it then may be about to re-read a range below it. So before the source is touched, the engine renews its claim in one fenced write (`StateStore::renew_claim`, conditional on the claim generation it holds). After a renewal no other engine can claim the row until the new lease runs out. A refused renewal means another engine owns the row: it is dropped without moving the source, and that engine's recovery commits it. Detecting the lost claim at the ledger write after the source commit would come too late, since a source commit cannot be undone and with `delete_after_commit` it can delete the file.
+
+   Committing a range its source has already passed must not move the source back. The Kafka adapter skips a commit at or below its frontier (#617). The file and spool adapters skip one at or below a committed point that this process confirmed, and only when `continuity::proves` (#647) shows that the file now at the path is both the confirmed file and the one the lower commit's marker was read from: the same inode, no shorter than any recorded length, both first-page fingerprints known and matching, and every recorded tail holding. Unknown content never proves (review of #659). Otherwise the commit moves the cursor as before. Before, they set the cursor to the stale end, and for a range read before a restart they moved the read head back too. The seed alone is not trusted for this: it can be a previous generation's (#564). Such a row is recorded `SOURCE_COMMITTED`: it is `VERIFIED`, and its source has committed through its end. A `VERIFIED` row that starts where the pending range starts — the object that replaced a stale row for the same bytes — commits normally. A marker with no inode (a legacy row) is compared against every inode at its path.
+
+   **A rewind never goes below what the source has already committed.** The file and spool adapters have always clamped to their committed byte; the Kafka adapter clamps to the ledger's committed frontier for the partition (its newest committed batch, or what the process committed since it started) or, for a partition the ledger does not know, to where an earlier rewind in this process landed. It asks the broker for the consumer group's committed offset only for a partition it has none of these for (#614) — a stale engine's commit can move the group's offset past a range recovery is about to re-read, and clamping to it skipped that range for good. Either way, a stale `FAILED` row left behind by a failure that has since been repaired no longer rewinds the group to its start and re-archives everything since on each restart.
+
+   **A range the source has committed past is retired, not handed back (#567).** Before the rewind is planned, recovery asks the row's adapter for the committed point of the row's unit (`SourceAdapter::committed_through`). At startup that is the ledger's newest committed row for the unit, newest by `(created_at, batch_id)` as in both stores and in pruning, the same row the restart cursor is seeded from, which retention never prunes. For Kafka it is the ledger frontier the adapter trusts (#614). For files and spools it is the cursor's committed byte, answered only when the row's marker is PROVEN to be the cursor's file: the same inode (a legacy marker without one is never retired), and the same content - both fingerprints matching the first bytes of the file now at the path, equal ones too, since equal fingerprints say only that the marker and the cursor read the same content, not that the file still holds it - and, for a marker with a tail fingerprint, the same bytes below its end, and for a cursor with one, the same bytes below its position; and the file no shorter than any length or position either recorded. This is one test (`continuity::proves`), shared with the choice of the restart seed and the re-read of a rotated file (#621, section 7.2). Anything less keeps the replay path, because `SUPERSEDED` is terminal. If that point is at or past the end of the row's range, the rewind would land there and read nothing again. So the row moves to `SUPERSEDED` (from `FAILED` or `REPLAY_REQUIRED`; an in-flight row is written `FAILED` first), it is counted in the summary as superseded, not as a replay, and no rewind is planned for it. `SUPERSEDED` is terminal. Neither the claim nor the incomplete listing returns it, so later restarts never touch it, and retention deletes it with committed history, digesting it first. If a write fails, nothing is rewound: a row that was `FAILED` or `REPLAY_REQUIRED` stays as it was, and an in-flight row whose `FAILED` write landed but whose `SUPERSEDED` write did not is left `FAILED`. Nothing below the committed point would be read anyway, and the next recovery decides again. A row whose range spans two files, or whose adapter cannot say, keeps the replay path. Before this, every such row was claimed at every restart, written `FAILED` and `REPLAY_REQUIRED` again, counted in `replay_required_total`, and given a no-op rewind, and retention never removed it.
+
+   `SUPERSEDED` claims only that the source committed past the range. It does not claim that a committed range covers the range's bytes. A ledger written before #552 can hold a committed range above a failed one, and that row is now retired like any other, because its rewind was already clamped to nothing. The coverage audit (#560) still judges a `SUPERSEDED` range exactly as a `FAILED` one and names it in any hole.
 3. Replay currently produces a **new** object key: the `batch_id` is derived from wall-clock time plus a random suffix, and the `year/…/hour` path components from the replayed batch's own partition time (§11, `partitioning.time_source`) - under `seal`, the hour the replay was sealed in, so a replay of yesterday's range is filed under today; under `event`, the earliest record time, so a Kafka replay usually lands in the original hour but under a new key. Either way a replayed batch writes a duplicate object (at-least-once, no data loss). A power loss on the SQLite ledger no longer adds to these beyond what a process crash leaves (§12, #626). Protocol §14/§15.1/§16 specify deterministic naming so that replay is idempotent — this is the open gap tracked as [PRODUCTION_HA.md](PRODUCTION_HA.md) Phase 4.
 4. A state/storage mismatch (e.g., an object present but unverified) is resolved by re-verifying or re-uploading **before** any commit.
 5. **While the engine is running, a failed range is handed back at once, and the hand-back does not wait on the ledger.** Adapters advance their read position when they *read*, not when a batch commits, so a batch that fails (or errors before `VERIFIED`) is handed back to its source at the end of the cycle that failed it, not at the next restart. Otherwise the next cycle reads on from the end of the failed range and the first later range to verify commits past it, leaving those bytes unarchived (#552).
@@ -626,7 +840,7 @@ On startup, the `replay` module inspects `vtop-state` and maps each incomplete b
 
    A cycle in which a batch failed waits before reading again — the idle interval, doubling per consecutive failing cycle up to a minute, plus jitter — because the failed range is now read again and a tight loop would hammer a store that is down.
 
-   Limits, stated rather than implied: a ledger written by a build *before* #552 can already contain a committed range above a failed one. Replay does not repair that for file and spool sources — their rewind is clamped to the committed point so a superseded failed row cannot re-archive committed data on every restart — and the ledger cannot say whether the older range was later covered, because committed history may be pruned. Finding such holes is the job of an archive coverage audit (#560), not of recovery. A spool whose identity changed since the batch was read cannot be rewound; that is reported as an error and the range is not re-read — but only for a marker that recorded an inode: a legacy marker without one keeps the old size-only check and can rewind a replacement. The file adapter checks identity on replay the same way: a range whose file now has another inode (rotation, #558), is shorter than when the range was read, or keeps the inode but has different first bytes (a same-inode replacement, #578) is refused rather than re-read. The inode and content checks apply only to a marker that recorded them; a legacy marker keeps the size-only check.
+   Limits, stated rather than implied: a ledger written by a build *before* #552 can already contain a committed range above a failed one. Replay does not repair that for file and spool sources — their rewind is clamped to the committed point so a superseded failed row cannot re-archive committed data on every restart — and the ledger cannot say whether the older range was later covered, because committed history may be pruned. Finding such holes is the job of an archive coverage audit (#560), not of recovery. A spool whose identity changed since the batch was read cannot be rewound; that is reported as an error and the range is not re-read — but only for a marker that recorded an inode: a legacy marker without one keeps the old size-only check and can rewind a replacement. The file adapter checks identity on replay the same way: a range whose file now has another inode (rotation, #558), is shorter than when the range was read, or keeps the inode but has different first bytes (a same-inode replacement, #578) is refused rather than re-read - unless the file it was read from can still be reached and is proven to be that file, in which case the range is re-read from it (section 7.2, #621): through a descriptor the adapter kept on it in the same process, or, after a restart, under whatever name it has by then, found by inode among the entries of the path's directory and the files the source's patterns match. A range read before a `copytruncate` is still refused - the copy has a new inode, so it cannot be proven to be the file - as is one whose rotated file was compressed or removed before a restart. The inode and content checks apply only to a marker that recorded them; a legacy marker keeps the size-only check against the file at its path, and is never re-read from a rotated file. Every refused rewind, in a cycle or in recovery, is counted in `vtop_source_replay_refused_total{tenant,source_type}` as well as logged.
 
 This guarantees: no source progress marker is committed unless its object and manifest are durably stored and verified, and no committed marker is double-committed. Source progress is **never** advanced for unverified data.
 
@@ -652,7 +866,7 @@ These per-batch records feed the aggregate Prometheus-style counters that are de
 - Adaptive sealing (records/bytes/age) bounds in-flight batch size and provides natural backpressure: a slow upload stage delays sealing of the next batch rather than growing memory unboundedly.
 - Source adapters **may** signal backpressure to the batching layer (protocol §6).
 - The Kafka adapter's manual offset commit (auto-commit disabled) ensures the broker's notion of progress tracks the engine's verified-and-committed progress, not its in-memory read position.
-- **Every call the engine makes to its object store and state store has a deadline** (#556). A store that accepts a connection and never answers would otherwise block the awaiting cycle forever, with the process alive and the health endpoint green. The native S3 backend sets the SDK's first-byte (read), per-attempt and whole-operation limits from `upload.request_timeout_seconds` (default 300 s per attempt; the whole operation is allowed the SDK's three attempts); its connect limit is a fixed 10 s, not configurable — the SDK's own defaults bound connecting but not waiting for a response, which the `request_deadline` test shows against a socket that accepts and stays silent. Those SDK limits end when the response headers arrive, so every response BODY the engine reads afterwards (verification, manifest recovery) is bounded separately, by the whole-operation allowance; a store that sends headers and then drips the body fails the read rather than holding it open. The compatibility backends use `upload.command_timeout_seconds`. The state store is wrapped so every request is bounded by `engine.state_store_timeout_seconds` (default 30 s; whole-ledger scans such as startup recovery get ten times it), and opening a Postgres store (connect plus schema check) is bounded by the same value. An expired request is an ordinary failure to the engine — a failed upload fails the batch, and recovery re-reads its range — but it is an **unknown outcome**, not a failed one: the store may have applied it. That is safe here because every ledger transition is checked against the state machine and recovery re-reads rows it finds incomplete; the worst case is a range archived twice, never one lost. Size `request_timeout_seconds` for the slowest link a part must cross (a 64 MiB part at 1 MiB/s needs about a minute). Not covered: `vtopctl migrate`, an operator-run one-shot command whose Postgres connection and schema statements carry no deadline (a schema change on a large ledger can legitimately be slow) — an operator who sees it hang interrupts it, and the migration's statements are idempotent, so running it again is safe.
+- **Every call the engine makes to its object store and state store has a deadline** (#556). A store that accepts a connection and never answers would otherwise block the awaiting cycle forever, with the process alive and the health endpoint green. The native S3 backend sets the SDK's first-byte (read), per-attempt and whole-operation limits from `upload.request_timeout_seconds` (default 300 s per attempt; the whole operation is allowed the SDK's three attempts); its connect limit is a fixed 10 s, not configurable — the SDK's own defaults bound connecting but not waiting for a response, which the `request_deadline` test shows against a socket that accepts and stays silent. Those SDK limits end when the response headers arrive, so every response BODY the engine reads afterwards (verification, manifest recovery) is bounded separately, by the whole-operation allowance; a store that sends headers and then drips the body fails the read rather than holding it open. The compatibility backends use `upload.command_timeout_seconds`. The state store is wrapped so every request is bounded by `engine.state_store_timeout_seconds` (default 30 s; whole-ledger scans such as startup recovery get ten times it), and opening a Postgres store (connect plus schema check) is bounded by the same value. An expired request is an ordinary failure to the engine — a failed upload fails the batch, and recovery re-reads its range — but it is an **unknown outcome**, not a failed one: the store may have applied it. That is safe here because every ledger transition is checked against the state machine and recovery re-reads rows it finds incomplete; the worst case is a range archived twice, never one lost. A request that carries a body — an object, a multipart part, a manifest — is allowed `request_timeout_seconds` plus its size at `upload.request_min_bytes_per_second` (default 4 KiB/s) for each attempt, and its connector read timeout is disabled so the attempt timeout alone bounds it (#663). A fixed deadline on a body is a deadline on the request's share of the link: on a policed 10 Mbit/s uplink at 100 ms the shipped width put 24 part uploads on the link at once, each moved about 11 KB/s, and an 8 MiB part could not cross in 300 s, so every attempt was cut and re-sent from its first byte and the default configuration committed nothing. The floor is per request because the width times the parts in flight share the uplink. A store that stops reading a body is still caught within seconds by the SDK's stalled-upload protection; what the scaled allowance lengthens is how long a store that has read a body may take to answer. Not covered: `vtopctl migrate`, an operator-run one-shot command whose Postgres connection and schema statements carry no deadline (a schema change on a large ledger can legitimately be slow) — an operator who sees it hang interrupts it, and the migration's statements are idempotent, so running it again is safe.
 ---
 
 ## 16. Benchmark harness

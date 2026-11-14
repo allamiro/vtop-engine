@@ -74,6 +74,19 @@ pub enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Check a config file (and a `streams.yaml` beside it) without starting
+    /// anything: no state store, object store or source is contacted. Exits
+    /// non-zero only for an invalid config; a valid but risky setting, such
+    /// as `upload.require_strong_verification: false`, is printed as a
+    /// warning and still passes.
+    Validate {
+        #[arg(long)]
+        config: PathBuf,
+        /// Explain effective per-stream settings and their origin, without
+        /// resolving secrets or contacting any service.
+        #[arg(long)]
+        print_effective: bool,
+    },
     /// Apply state-store schema migrations with a deployment identity.
     Migrate {
         #[arg(long)]
@@ -98,6 +111,56 @@ pub enum Command {
         check_storage: bool,
         /// Also write the results as a Prometheus text file (for a node
         /// exporter's textfile collector).
+        #[arg(long)]
+        metrics_file: Option<PathBuf>,
+    },
+    /// Read committed objects back and verify them again (#628). For each
+    /// committed batch, in the ledger or in a prune digest: download the
+    /// manifest at its pinned version, check its self-hash and MAC and that
+    /// it binds to the ledger row, verify the object's stored content against
+    /// the manifest's digest, and check the manifest's current key still
+    /// holds the pinned version. Reports missing, mismatched, unauthenticated
+    /// and unreadable batches, and manifests from a newer release
+    /// (unsupported_version), and exits non-zero on any. Read-only; it can
+    /// run beside a live engine, bounded by the limits below.
+    Scrub {
+        #[arg(long)]
+        config: PathBuf,
+        /// Where prune digests are read from [default: as audit-coverage].
+        #[arg(long)]
+        digest_dir: Option<PathBuf>,
+        /// Batches checked at once.
+        #[arg(long, default_value_t = crate::scrub::DEFAULT_CONCURRENCY as u32,
+              value_parser = clap::value_parser!(u32).range(1..=256))]
+        concurrency: u32,
+        /// Start at most this many batches per second (fractions allowed, down
+        /// to one a day).
+        #[arg(long, value_parser = positive_rate)]
+        max_objects_per_sec: Option<f64>,
+        /// Read at most this many object bytes per second, by each object's
+        /// recorded size.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        max_bytes_per_sec: Option<u64>,
+        /// Check at most this many batches this run.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        limit: Option<u64>,
+        /// Resume after the batch this file names, and record progress in it
+        /// as each batch completes. With --limit, successive runs walk the
+        /// archive a slice at a time; the run that reaches the end completes
+        /// the pass and the next one starts again from the beginning.
+        #[arg(long, conflicts_with = "sample")]
+        cursor_file: Option<PathBuf>,
+        /// Check this many batches chosen at random instead of walking in
+        /// order.
+        #[arg(long, conflicts_with = "limit",
+              value_parser = clap::value_parser!(u64).range(1..))]
+        sample: Option<u64>,
+        /// The sample's seed (random when not given; printed either way).
+        #[arg(long, requires = "sample")]
+        seed: Option<u64>,
+        /// Also write the results as a Prometheus text file (for a node
+        /// exporter's textfile collector). Totals carry forward from the file
+        /// it replaces.
         #[arg(long)]
         metrics_file: Option<PathBuf>,
     },
@@ -208,7 +271,45 @@ fn load(config: &Path) -> Result<(VtopConfig, StreamsConfig), VtopError> {
     } else {
         StreamsConfig { streams: vec![] }
     };
+    streams.validate(&cfg)?;
     Ok((cfg, streams))
+}
+
+/// Render only the dedicated allowlist; never walk the configuration model.
+fn print_effective_block(
+    name: &str,
+    stream: &vtop_core::effective_config::EffectiveStream,
+) -> Result<(), VtopError> {
+    println!("{name}:");
+    let value = serde_json::to_value(stream)?;
+    if let Some(fields) = value.as_object() {
+        for (key, setting) in fields {
+            let value = &setting["value"];
+            // Strings bare, except an empty one, which would otherwise read
+            // as a missing value; anything else as its JSON literal.
+            let rendered = match value.as_str() {
+                Some("") => "\"\"".to_owned(),
+                Some(text) => text.to_owned(),
+                None => value.to_string(),
+            };
+            let origin = setting["origin"].as_str().unwrap_or("built-in default");
+            println!("  {key}: {rendered} ({origin})");
+        }
+    }
+    Ok(())
+}
+
+/// A rate that is a finite number above zero.
+/// An object rate: finite, and at least one a day (a slower rate's interval
+/// would exceed the pacer's one-day cap anyway, so it is refused here rather
+/// than silently raised).
+fn positive_rate(value: &str) -> Result<f64, String> {
+    const MIN: f64 = 1.0 / 86_400.0;
+    match value.parse::<f64>() {
+        Ok(rate) if rate.is_finite() && rate >= MIN => Ok(rate),
+        Ok(_) => Err(format!("must be a number of at least {MIN} (one a day)")),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn print_receipts(file: &Path, json: bool) -> i32 {
@@ -387,8 +488,11 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             }
             let summary = engine.recover().await?;
             println!(
-                "recovery complete: committed={} replay_required={} still_pending={}",
-                summary.committed, summary.replay_required, summary.still_pending
+                "recovery complete: committed={} replay_required={} superseded={} still_pending={}",
+                summary.committed,
+                summary.replay_required,
+                summary.superseded,
+                summary.still_pending
             );
             Ok(())
         }
@@ -480,6 +584,63 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 )))
             }
         }
+        Command::Validate {
+            config,
+            print_effective,
+        } => {
+            // `load` parses and validates both files; an error is the
+            // non-zero exit. Warnings never fail the check (#629): each is a
+            // documented opt-out, and refusing it here would only push
+            // operators to skip the check.
+            let (cfg, streams) = load(config)?;
+            let warnings = streams.warnings(&cfg);
+            if *print_effective {
+                let effective =
+                    vtop_core::effective_config::effective_streams(&cfg, Some(&streams));
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"status": "ok", "warnings": warnings, "effective_version": 1, "effective": effective})
+                    );
+                } else {
+                    for warning in &warnings {
+                        println!("WARNING: {warning}");
+                    }
+                    for shadowed in &effective.shadowed {
+                        println!(
+                            "WARNING: streams[{}] repeats source_name {}; the engine applies only \
+                             the first entry with that name, so this one is never used",
+                            shadowed.index, shadowed.source_name
+                        );
+                    }
+                    println!("effective_version: 1");
+                    print_effective_block("default", &effective.default)?;
+                    for stream in &effective.streams {
+                        print_effective_block(
+                            &format!("stream {}", stream.source_name.value),
+                            stream,
+                        )?;
+                    }
+                }
+                return Ok(());
+            }
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "ok", "warnings": warnings})
+                );
+            } else {
+                for warning in &warnings {
+                    println!("WARNING: {warning}");
+                }
+                println!(
+                    "{}: config is valid ({} warning(s))",
+                    config.display(),
+                    warnings.len()
+                );
+            }
+            Ok(())
+        }
         Command::Migrate { config } => {
             let cfg = VtopConfig::from_path(config)?;
             cfg.validate()?;
@@ -555,6 +716,135 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 Err(VtopError::Other(
                     "coverage audit FAILED (see the report above)".into(),
                 ))
+            }
+        }
+        Command::Scrub {
+            config,
+            digest_dir,
+            concurrency,
+            max_objects_per_sec,
+            max_bytes_per_sec,
+            limit,
+            cursor_file,
+            sample,
+            seed,
+            metrics_file,
+        } => {
+            let (cfg, streams) = load(config)?;
+            init_tracing(
+                cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
+                cli.json,
+            );
+            let digest_dir = digest_dir
+                .clone()
+                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
+            let retention_days = cfg.engine.ledger_retention_days;
+            // Read-only construction, as for audit-coverage: a scrub may run
+            // beside a live engine.
+            let engine = Engine::new(cfg, streams).await?;
+            let ledger = engine.store.list_batches().await?;
+            let (digested, digest_files) = crate::coverage::read_digests(&digest_dir)?;
+            let digest_warning =
+                crate::scrub::missing_digests_warning(retention_days, &digest_dir, digest_files);
+            if let Some(warning) = &digest_warning {
+                tracing::warn!("{warning}");
+            }
+            let sources = crate::scrub::RowSources {
+                ledger_rows: ledger.len(),
+                digest_rows: digested.len(),
+                digest_files,
+            };
+            let to_usize = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+            let opts = crate::scrub::ScrubOptions {
+                concurrency: *concurrency as usize,
+                max_objects_per_sec: *max_objects_per_sec,
+                max_bytes_per_sec: *max_bytes_per_sec,
+                limit: limit.map(to_usize),
+                cursor_file: cursor_file.clone(),
+                sample: sample.map(to_usize),
+                seed: *seed,
+            };
+            // The run's locks, from before anything it will replace is read
+            // until it has published or rolled back (review of #652): an
+            // overlapping run that published in between would otherwise be
+            // overwritten from this run's older snapshot. Held to the end of
+            // this arm.
+            let lock = crate::scrub::lock_run(cursor_file.as_deref(), metrics_file.as_deref())?;
+            // Read BEFORE the scrub, and only an absent file is a first run:
+            // the totals and last-success time carry forward from it, so a
+            // file that exists and cannot be read would otherwise be replaced
+            // with counters reset and a success time of "never" (review).
+            let previous = match metrics_file {
+                Some(path) => match std::fs::read_to_string(path) {
+                    Ok(text) => Some(text),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        return Err(VtopError::Other(format!(
+                            "metrics file {} cannot be read ({e}); the scrub's totals carry \
+                             forward from it",
+                            path.display()
+                        )))
+                    }
+                },
+                None => None,
+            };
+            // Taken before the run moves the cursor: with --metrics-file, a run
+            // counts only once its metrics are published (review of #652).
+            let snapshot = match (cursor_file, metrics_file) {
+                (Some(cursor), Some(_)) => Some(crate::scrub::CursorSnapshot::take(cursor)?),
+                _ => None,
+            };
+            let mut report = engine
+                .scrub_held(crate::scrub::committed_rows(ledger, digested), &opts, &lock)
+                .await?;
+            report.sources = sources;
+            report.warnings.extend(digest_warning);
+            // The report first, so the findings reach stdout whatever happens
+            // to the metrics file.
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for line in report.lines() {
+                    println!("{line}");
+                }
+            }
+            if let Some(path) = metrics_file {
+                let written = crate::coverage::write_textfile(
+                    path,
+                    &report.prometheus_text(previous.as_deref(), chrono::Utc::now().timestamp()),
+                );
+                if let Err(error) = written {
+                    // Unpublished, the run's findings are in no metric the
+                    // alerts read. Put the cursor back, so the next run checks
+                    // this slice again and publishes what it finds.
+                    let undone = match &snapshot {
+                        Some(snapshot) => match snapshot.restore(&lock) {
+                            Ok(()) => "; the cursor was put back, so the next run checks \
+                                       this slice again"
+                                .to_string(),
+                            Err(e) => format!("; the cursor could NOT be put back ({e})"),
+                        },
+                        None => String::new(),
+                    };
+                    return Err(VtopError::Other(format!(
+                        "scrub metrics file {} could not be written ({error}){undone}",
+                        path.display()
+                    )));
+                }
+            }
+            // Published (the report, and the metrics file when asked for):
+            // only now may the cursor pass this run's findings.
+            if let Some(pending) = report.pending_cursor.take() {
+                pending.commit(&lock)?;
+            }
+            drop(lock);
+            if report.passed {
+                Ok(())
+            } else {
+                Err(VtopError::Other(format!(
+                    "scrub FAILED: {} finding(s) (see the report above)",
+                    report.findings.len()
+                )))
             }
         }
         Command::PruneLedger {
@@ -640,13 +930,26 @@ pub async fn verify_manifest_deep(
     let manifest_bytes = backend
         .get_object_bounded(manifest_uri, vtop_core::manifest::MAX_MANIFEST_BYTES)
         .await?;
-    let parsed: vtop_core::manifest::VtopManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| VtopError::Other(format!("manifest {manifest_uri} does not parse: {e}")))?;
+    // The version is checked before anything else: a manifest from a newer
+    // release is reported as that, never as a failed self-hash (#671).
+    let parsed = match vtop_core::manifest::ParsedManifest::from_slice(&manifest_bytes) {
+        Ok(parsed) => parsed,
+        // Standalone, with no ledger to bind the bytes to, the claim is all
+        // there is: reported as a claim this build cannot authenticate.
+        Err(e @ VtopError::UnsupportedManifestVersion { .. }) => {
+            return Err(e.at_manifest_uri(manifest_uri))
+        }
+        Err(e) => {
+            return Err(VtopError::Other(format!(
+                "manifest {manifest_uri} does not parse: {e}"
+            )))
+        }
+    };
     lines.push(format!(
         "manifest        : {} ({} bytes, batch {})",
         manifest_uri,
         manifest_bytes.len(),
-        parsed.batch_id
+        parsed.fields().batch_id
     ));
 
     // 2. Self-hash: is the manifest itself intact?
@@ -666,7 +969,7 @@ pub async fn verify_manifest_deep(
     // key, retain legacy behavior but do not claim an unverified MAC is valid.
     let authentication_ok = parsed.verify_authentication(manifest_mac_key).is_ok();
     failed |= !authentication_ok;
-    let authentication_status = match (manifest_mac_key, parsed.manifest.mac.as_deref()) {
+    let authentication_status = match (manifest_mac_key, parsed.fields().manifest.mac.as_deref()) {
         (Some(_), _) if authentication_ok => "OK (keyed BLAKE3)".to_string(),
         (Some(_), _) => "FAILED (MAC missing or invalid)".to_string(),
         (None, Some(_)) => "PRESENT (not checked: no key configured)".to_string(),
@@ -675,14 +978,14 @@ pub async fn verify_manifest_deep(
     lines.push(format!("authentication  : {authentication_status}"));
 
     // 3. The stored object's actual content.
-    let object_bytes = backend.get_object(&parsed.object.uri).await?;
-    let size_ok = object_bytes.len() as u64 == parsed.object.size_bytes;
+    let object_bytes = backend.get_object(&parsed.fields().object.uri).await?;
+    let size_ok = object_bytes.len() as u64 == parsed.fields().object.size_bytes;
     failed |= !size_ok;
     lines.push(format!(
         "object size     : {} ({} bytes stored, {} expected)",
         if size_ok { "OK" } else { "FAILED" },
         object_bytes.len(),
-        parsed.object.size_bytes
+        parsed.fields().object.size_bytes
     ));
 
     // LIMITED is reserved for an EXPLICIT `none` algorithm (the operator chose
@@ -691,6 +994,7 @@ pub async fn verify_manifest_deep(
     // algorithm with no recorded digest — is a hard failure: reporting it as
     // "limited" would hand a PASSED verdict to a same-sized replacement.
     let algo = parsed
+        .fields()
         .object
         .checksum_algorithm
         .parse::<ChecksumAlgorithm>();
@@ -703,21 +1007,25 @@ pub async fn verify_manifest_deep(
             failed = true;
             format!("FAILED (cannot verify content: {e})")
         }
-        (Ok(_), Some(actual)) if parsed.object.checksum.is_empty() => {
+        (Ok(_), Some(actual)) if parsed.fields().object.checksum.is_empty() => {
             failed = true;
             format!(
                 "FAILED (algorithm declared but no digest recorded; content hashes to {actual})"
             )
         }
         (Ok(_), Some(actual)) => {
-            let ok = actual.eq_ignore_ascii_case(&parsed.object.checksum);
+            let ok = actual.eq_ignore_ascii_case(&parsed.fields().object.checksum);
             failed |= !ok;
             if ok {
-                format!("OK ({} {})", parsed.object.checksum_algorithm, actual)
+                format!(
+                    "OK ({} {})",
+                    parsed.fields().object.checksum_algorithm,
+                    actual
+                )
             } else {
                 format!(
                     "FAILED (stored content hashes to {actual}, manifest says {})",
-                    parsed.object.checksum
+                    parsed.fields().object.checksum
                 )
             }
         }
@@ -726,7 +1034,7 @@ pub async fn verify_manifest_deep(
     lines.push(format!("object content  : {checksum_status}"));
 
     // 4. Ledger reconciliation.
-    let row = store.get_batch(&parsed.batch_id).await?;
+    let row = store.get_batch(&parsed.fields().batch_id).await?;
     let ledger_status = match &row {
         None => "ABSENT (not a failure: manifest may belong to another engine's store)".to_string(),
         Some(r) => {
@@ -758,8 +1066,8 @@ pub async fn verify_manifest_deep(
 
     let json = serde_json::json!({
         "manifest": manifest_uri,
-        "batch_id": parsed.batch_id,
-        "object_uri": parsed.object.uri,
+        "batch_id": parsed.fields().batch_id,
+        "object_uri": parsed.fields().object.uri,
         "self_hash_ok": self_hash_ok,
         "manifest_authentication": authentication_status,
         "manifest_authentication_required": manifest_mac_key.is_some(),
@@ -781,8 +1089,11 @@ fn describe_recovery(state: BatchState) -> &'static str {
     use vtop_core::replay::{next_recovery_action, RecoveryAction};
     match next_recovery_action(state) {
         RecoveryAction::RetrySourceCommit => "retry the source commit",
-        RecoveryAction::None => "do nothing (already committed)",
-        _ => "mark REPLAY_REQUIRED (source progress preserved)",
+        RecoveryAction::None => "do nothing (committed, or superseded by a later commit)",
+        _ => {
+            "mark REPLAY_REQUIRED (source progress preserved), or SUPERSEDED if its source \
+             has already committed past it"
+        }
     }
 }
 
@@ -823,6 +1134,50 @@ mod tests {
         match cli.command {
             Command::PruneLedger { limit, .. } => assert_eq!(limit, 500),
             other => panic!("parsed wrong command: {other:?}"),
+        }
+    }
+
+    /// The scrub's bounds are refused at parsing when they could not bound
+    /// anything (zero concurrency would never run a check; a zero or
+    /// negative rate never admits one), and a cursor walk and a random
+    /// sample are different runs, not one.
+    #[test]
+    fn scrub_rejects_bounds_that_bound_nothing_and_conflicting_modes() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["vtopctl", "scrub", "--config", "vtop.yaml"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        match parse(&[]).unwrap().command {
+            Command::Scrub {
+                concurrency,
+                limit,
+                cursor_file,
+                sample,
+                ..
+            } => {
+                assert_eq!(concurrency as usize, crate::scrub::DEFAULT_CONCURRENCY);
+                assert!(limit.is_none() && cursor_file.is_none() && sample.is_none());
+            }
+            other => panic!("parsed wrong command: {other:?}"),
+        }
+        assert!(parse(&["--cursor-file", "c", "--limit", "500"]).is_ok());
+        assert!(parse(&["--sample", "10", "--seed", "7"]).is_ok());
+        assert!(parse(&["--max-objects-per-sec", "0.5"]).is_ok());
+        for bad in [
+            &["--concurrency", "0"][..],
+            &["--limit", "0"],
+            &["--sample", "0"],
+            &["--max-objects-per-sec", "0"],
+            &["--max-objects-per-sec", "-1"],
+            &["--max-objects-per-sec", "NaN"],
+            &["--max-objects-per-sec", "1e-300"],
+            &["--max-bytes-per-sec", "0"],
+            &["--sample", "5", "--cursor-file", "c"],
+            &["--sample", "5", "--limit", "5"],
+            &["--seed", "7"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} must be refused");
         }
     }
 

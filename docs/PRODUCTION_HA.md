@@ -243,6 +243,95 @@ under the default, batches produced with checksums disabled **refuse to
 commit**, and running that way requires both opt-outs deliberately: the
 algorithm choice and the strength opt-out, each visible in configuration.
 
+**The opt-out is announced, not hidden (#629).** A size-only check
+**accepts same-size corruption**: a corrupted or replaced object of the
+recorded size is committed as verified. With
+`upload.require_strong_verification: false`, an engine started for `run`,
+`process-once` or `replay` logs one WARN at startup naming that consequence
+and the key. `vtopctl run` with `VTOP_METRICS_ADDR` set, the one process
+that serves metrics, also sets `vtop_verification_mode{mode="size_only"}` to
+1 (the `strong` series reads 0), so an alert can fire before any batch
+moves; the one-shot commands build no registry and export nothing.
+`vtopctl validate --config <file>` prints the same warning and still exits 0;
+there is no strict or production profile for it to refuse in. Every
+size-only verification logs a WARN with its batch id, and
+`vtop_verification_backend_limited_total` counts it where
+`vtop_verified_total` counts verifications: when the running engine marks the
+batch VERIFIED, and when recovery commits a VERIFIED row whose storage
+re-check confirmed only size. A row recovery re-checks but holds back under
+a lower incomplete range is logged, not counted, so a restart does not count
+it again. Under the strong default, the re-check logs the size-only result it
+refuses. The per-batch WARN
+is not rate-limited: it replaces that batch's INFO `verification_passed`
+line, so it is no more frequent than the batch log itself.
+
+**Per-stream checksum selection (#669).** An entry in `streams.yaml` may set
+`checksum: { algorithm: sha256 }`, `blake3`, or `none`. An omitted (or null)
+checksum inherits `config.yaml`'s algorithm; a block without `algorithm`, or
+with any other key, is refused at load rather than read as an override. Only
+the first entry per `source_name` applies, as everywhere in `streams.yaml`. The global
+`upload.require_strong_verification` floor applies to every stream: a stream
+that sets `none` is rejected at config load when the floor is on, and warns by
+stream name when it is off. The runtime floor still refuses any size-only
+backend result. `validate --print-effective` shows each stream's resolved
+`checksum.algorithm` and `verification_method`, with origin `stream` when the
+entry sets its own; at startup the engine logs one INFO
+`stream verification settings` line per stream with its algorithm, origin and
+method.
+
+On native S3, SHA-256 uses a service-computed checksum from HEAD, falling
+back to read-back if no usable whole-object checksum is supplied; BLAKE3
+always reads the stored body back and hashes it. Read-back consumes download traffic
+and hashing work. Local filesystem and command compatibility backends check
+stored content for either enabled algorithm. Choose explicitly for the
+backend and workload; there is no automatic cost-based selection and no
+per-stream `read_back` setting in this release.
+
+**Upgrade note:** engines predating this setting silently ignore a stream's
+`checksum` key and use the global algorithm. Upgrade every engine before
+relying on per-stream settings, retain a strong global algorithm during the
+upgrade, and run the new `validate` afterward. Existing batches retain their
+manifest-recorded algorithm: recovery and scrub use it even after config
+changes. Sharing a ledger does not change that rule. Downgrade remains
+unsupported.
+
+### Explain effective configuration before starting
+
+`vtopctl validate --config <file> --print-effective` prints a `default` block
+for unmatched discovered sources and one block per configured stream. The
+`default` block is also present without `streams.yaml`. Every setting identifies
+its origin: `stream`, `global`, or `built-in default`. This is a static explanation:
+no source, state store or object store is contacted, and secret references are
+not resolved. A stream whose tenant is omitted uses the built-in `default`
+tenant, matching the engine; unmatched sources use `engine.tenant`.
+
+Add `--json` for the versioned shape
+`{"status":"ok","warnings":[],"effective_version":1,"effective":{"default":{},"streams":[]}}`.
+Each setting in a block has `value` and `origin` fields. The explicit allowlist
+covers identity, evidence, placement and batching; it omits secret values and
+references, including the manifest MAC key's environment-variable name. The MAC
+setting reports only `enabled` or `disabled`.
+
+The verification method is the backend's preferred path: native S3 with SHA-256
+uses `store_checksum` when a service whole-object checksum is available, falling
+back to `read_back` otherwise (including multipart objects). Native S3 with
+BLAKE3, localfs, and the command backends use `read_back`; disabled checksums use
+`size_only`. An `upload.backend` that names no registered backend reports
+`unknown`: validate accepts the name, but the engine refuses it at startup.
+A batch whose compressed object exceeds `upload.multipart_threshold_bytes` is
+uploaded multipart and therefore read back even under `store_checksum`.
+
+The engine applies the first `streams.yaml` entry for each `source_name`. A
+later entry with the same name is listed under `shadowed_streams` (and as a
+`WARNING` line in text) instead of being printed as if it were in effect. A key
+written with no value or `~` counts as set: a string setting then takes that
+literal text.
+
+The resolved upload width is the configured ceiling after active transport
+tuning, before the adaptive controller reacts to live throttles.
+Without `--print-effective`, validate's existing output and exit codes are
+unchanged.
+
 **ETag caveat:** S3 multipart ETags are **not** reliable MD5 checksums. The
 authoritative integrity value is VTOP's own **SHA-256/BLAKE3 manifest checksum**,
 never the ETag.
@@ -406,7 +495,7 @@ CREATE TABLE batches (
   CONSTRAINT state_enum CHECK (state IN (
     'DISCOVERED','BATCHING','SEALED','COMPRESSED','CHECKSUMMED',
     'OBJECT_UPLOADED','MANIFEST_UPLOADED','VERIFIED','SOURCE_COMMITTED',
-    'FAILED','REPLAY_REQUIRED')),
+    'FAILED','REPLAY_REQUIRED','SUPERSEDED')),
 
   -- THE INVARIANT (two equivalent guards, keep both):
   CONSTRAINT commit_needs_verify_state CHECK (
@@ -432,7 +521,7 @@ CREATE UNIQUE INDEX uq_file_range
 CREATE INDEX ix_state        ON batches (state);
 CREATE INDEX ix_source_time  ON batches (source_type, source_name, updated_at);
 CREATE INDEX ix_incomplete   ON batches (state)
-  WHERE state NOT IN ('SOURCE_COMMITTED','FAILED');   -- hot incomplete set
+  WHERE state NOT IN ('SOURCE_COMMITTED','SUPERSEDED');   -- hot incomplete set (= the recovery work-list)
 ```
 
 **Multi-writer recovery [PROPOSED]:** claim incomplete rows with
@@ -442,6 +531,8 @@ instances never recover the same batch. Required before fleet mode.
 ### 6.6 Ledger retention / pruning **[IMPLEMENTED — incremental delete, #128]**
 ```text
 - keep ACTIVE, FAILED, REPLAY_REQUIRED, and recent SOURCE_COMMITTED rows hot;
+- delete old SUPERSEDED rows (#567: handed-back ranges the source has since
+  committed past) on age alone - none is ever a restart cursor;
 - delete old SOURCE_COMMITTED rows incrementally, always retaining the
   per-path NEWEST committed row (by `(created_at, batch_id)`) so recovery cursor seeding
   is unchanged - the newest, not the highest end_byte, which after a
@@ -457,7 +548,8 @@ only: the PostgreSQL runtime identity is deliberately denied DELETE, so the
 engine refuses the setting there and pruning runs as a scheduled `vtopctl
 prune-ledger --older-than-days N` under a maintenance identity (see
 [`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md)).
-Rows in any non-committed state are never touched.
+Rows in any other state (in flight, VERIFIED, FAILED, REPLAY_REQUIRED) are
+never touched.
 
 **Pruning keeps an anchor (#560).** Every prune pass, the engine's and
 `vtopctl prune-ledger`'s alike, lists its CANDIDATE rows, writes them to a
@@ -481,8 +573,10 @@ PostgreSQL deployment a durable directory.
 ledger and the digests and checks, per source unit (a Kafka topic-partition
 under one consumer group, a file or spool file at one inode), that committed
 ranges tile:
-- a stretch a FAILED or REPLAY_REQUIRED row names, below a later commit, is a
-  range that failed and was never re-archived (the #552 shape);
+- a stretch a FAILED, REPLAY_REQUIRED or SUPERSEDED row names, below a later
+  commit, is a range that failed and was never re-archived (the #552 shape);
+  a SUPERSEDED row above the last commit is such a hole too, never pending
+  (#567: nothing reads it again);
 - a stretch nothing names is lost data for a file or spool (bytes are
   contiguous, e.g. the #558 rotation shape), and is reported but not failed
   for Kafka (compaction and transaction markers occupy offsets with no
@@ -496,7 +590,7 @@ ranges tile:
 present, and an object must be of the size the ledger recorded (a manifest has
 no recorded size). A committed row that names no object or manifest, and an
 object whose size the store does not report, are findings. Content is
-`verify-manifest`'s job. `--metrics-file`
+`vtopctl scrub`'s job (§7.5), or `verify-manifest`'s for one manifest. `--metrics-file`
 writes the result as a Prometheus text file, with counts by source type and
 never by path, for a node exporter's textfile collector. The command exits
 non-zero on lost data, so it can gate a cron job. Below a unit's first
@@ -592,6 +686,188 @@ the archive layer** and the delivery guarantee may be described that way.
 ### 7.4 ETag caveat (repeat)
 Never treat an S3 ETag as the integrity checksum (multipart ETags aren't MD5). The
 manifest SHA-256/BLAKE3 is the source of truth.
+
+### 7.5 Re-verifying committed objects: `vtopctl scrub` **[IMPLEMENTED, #628]**
+Verification gates the commit; after the commit nothing used to read the object
+again. An object overwritten with same-size bytes, deleted by a lifecycle rule
+or a bucket-policy mistake, or corrupted by the store, and a manifest rewritten
+in place, went unnoticed until someone fetched the data, by when the source has
+usually aged out and the batch cannot be archived again.
+`audit-coverage --check-storage` HEADs each object, which sees presence and
+size only; recovery's storage re-check reads content, but only for VERIFIED
+rows not yet committed, at startup.
+
+`vtopctl scrub --config ...` walks the committed rows of the ledger and of the
+prune digests (§6.6; `--digest-dir` as for `audit-coverage`). For each batch it
+runs recovery's own check (the same function): download the manifest at its
+pinned `manifest_version_id` (the current key only on a row that pinned none;
+a deleted pinned version fails closed, never falls back), verify its self-hash
+and, when `manifest_mac_key_env` is set, its MAC, bind it to the ledger row
+(batch id, URIs, the manifest digest and the object's size and digest the
+ledger recorded), then have the backend verify the object's stored content
+against the manifest's digest. Then, on a row that pinned a version, it reads
+the manifest's current key and requires it to hold the same bytes as the pinned
+version, because a reader fetching the archive by key reads that. This is a byte
+comparison, not a version-id check: an identical re-upload under a new version
+id passes, and any other content at the current key does not. Each batch gets
+one result:
+
+| Result | Meaning | Finding |
+|---|---|---|
+| `ok` | content matches the authenticated manifest, which matches the ledger | no |
+| `limited` | size-only: present at its size, but no digest compared (`checksum.algorithm: none`, or a backend that cannot hash); the same result recovery's re-check calls size-only and counts in `vtop_verification_backend_limited_total` (#629) | no |
+| `missing` | the object, the pinned manifest version or the manifest's current key is gone | yes |
+| `mismatched` | something is stored, and it is not what was committed (object content or size, the manifest's current key, the ledger's record of the object) | yes |
+| `unauthenticated` | the manifest does not parse, fails its self-hash or MAC, or does not bind to the ledger row | yes |
+| `unreadable` | the store answered with an error other than absence (timeout, throttle, permission); nothing was proven | yes |
+| `unsupported_version` | the row's pinned manifest version, carrying the self-hash the ledger recorded, is from a newer release than this binary reads (#671): not checked, so a finding; upgrade the scrub's binary and run it again. The same claim at a key no version pins is `unauthenticated`: a tamperer can write any version | yes |
+
+It exits non-zero on any finding; `--json` prints the report (each finding with
+its batch id, URIs, version and whether its row came from the ledger or a
+digest), and `--metrics-file` writes the counts as a Prometheus text file
+([observability README](../observability/README.md#archive-scrub) has the
+metrics and an example alert rule set). It repairs nothing: a finding can only
+alert, and the remedy is a restore from a replica or backup, or recording the
+loss. An S3 backend reports absence as `http 404`; a command backend's words
+for it may not be recognised, which turns `missing` into `unreadable` (still a
+finding).
+
+**Bounds.** Each batch costs a manifest GET, the object read the backend's
+`verify_object` does (native S3 over SHA-256 uses the service-computed checksum
+when the store kept one, and otherwise reads the body back), and, on a row that
+pinned a manifest version, a second manifest GET for the current key (a row
+without a pinned version reads the current key once, as its only manifest
+GET). To run it beside a live engine against a large archive without
+saturating the store:
+- `--concurrency N` (default 4) batches at once;
+- `--max-objects-per-sec R` (fractions allowed, down to one a day) and
+  `--max-bytes-per-sec B` (by each object's recorded size) space the starts,
+  whichever is slower;
+- `--cursor-file F` with `--limit N`: each run resumes after the batch the file
+  names and checks the next N in batch-id order (which is archive order: a
+  batch id starts with its UTC timestamp). Results are taken in that order, and
+  the cursor moves past each batch as its result is taken. With
+  `--concurrency` above 1, a batch that finishes ahead of an earlier one is
+  recorded only once the earlier one is, so a run killed part-way never skips a
+  batch but may check again up to concurrency - 1 batches it had already
+  finished. The run that reaches the end completes the pass; the next run
+  starts again from the first batch.
+
+  A finding holds the saved cursor until it is published. Saving stops
+  before the first finding, and the run's final position is saved only
+  after the report is printed and, with `--metrics-file`, the metrics file
+  is written. A run killed in between, or one whose metrics file cannot be
+  written (that run is undone to where it started), leaves the cursor
+  before the damage, so the next run finds it again rather than resuming
+  past damage nobody was told about. Once published, the cursor moves on;
+  the next pass checks the batch again. That is why the example alert reads
+  `vtop_scrub_last_finding_timestamp_seconds` and fires for a pass window
+  after it, rather than reading the latest run alone.
+
+  A run holds locks beside the cursor and the metrics file
+  (`<path>.lock`) from before it reads either until it has published, so an
+  overlapping run (a cron run that outlasts its hour) is refused, not
+  interleaved: two runs sharing a metrics file, cursor or not, would each
+  replace it from what they read before the other wrote. A missing metrics
+  directory is refused at that lock, before any reads;
+- or `--sample N [--seed S]`: N batches chosen at random; the seed is printed,
+  and the same seed picks the same batches.
+
+Scrub reads are ingress to the scrub's host. The operator ceilings of #481
+bound uploads: `upload.max_egress_bytes_per_second` shapes the bodies of
+`s3_native` object, manifest and part PUTs, and `upload.max_concurrency_ceiling`
+caps the upload concurrency knobs. The scrub uploads nothing, so neither
+applies to it, and its own `--max-bytes-per-sec` and `--concurrency` are what
+bound its reads. A config that sets the egress ceiling is still accepted with
+an `s3_native` backend, as for the engine.
+
+**Schedule.** There is no periodic mode inside the engine: its loop is single
+threaded, housekeeping such as the ledger prune runs on idle cycles, and one
+slice of full-object reads would stall archiving for as long as it takes.
+Listing the committed rows also reads the whole ledger, which a separate
+process can afford once per run. Run the command on a schedule instead, under
+an identity that can read the state store and the bucket (and nothing more):
+size `--limit` so that hourly runs cover the archive within the pass window,
+e.g. 1,000,000 committed batches once a week is about 6,000 per hourly run.
+
+crontab ends a command at the newline (a trailing `\` does not continue it), so
+keep the options in a script and schedule the script on one line:
+
+```bash
+#!/bin/sh
+# /usr/local/bin/vtop-scrub: a slice of the archive per run; a full pass about once a week.
+exec vtopctl scrub --config /etc/vtop/config.yaml \
+  --digest-dir /var/lib/vtop/ledger-digests \
+  --cursor-file /var/lib/vtop/scrub.cursor --limit 6000 \
+  --concurrency 4 --max-bytes-per-sec 20000000 \
+  --metrics-file /var/lib/node_exporter/textfile/vtop_scrub.prom --json \
+  > /var/log/vtop/scrub.json
+```
+
+```text
+0 * * * * /usr/local/bin/vtop-scrub
+```
+
+As a Kubernetes CronJob, give the cursor and the metrics file a persistent
+volume (the counters carry forward from the file each run replaces), set
+`concurrencyPolicy: Forbid`, and mount the config, the bucket credentials and
+the prune-digest directory, passing it as `--digest-dir`: without the digests a
+scrub checks only the rows still in the ledger and passes over the pruned ones.
+It warns (a WARN log line, and `warnings` in the JSON) when
+`engine.ledger_retention_days` is set and the directory holds no digests, but
+a deployment that prunes only with `vtopctl prune-ledger` sets no retention,
+so there it cannot tell. Run `vtopctl` directly (`command: [vtopctl]`), not through
+the image's entrypoint: `docker/entrypoint.sh` prepends `--config` from
+`VTOP_CONFIG` itself, so a second `--config` in the arguments is refused, and it
+exits unless `/data/work` and `/data/state` are writable, which a read-only
+scrub has no use for. With PostgreSQL the job connects like any other client;
+with SQLite the database file lives on the engine's volume, so run the scrub
+where that volume is mounted (a sidecar running the same schedule, or
+`kubectl exec`). The node exporter's textfile collector is node-local; from a
+CronJob, push the file to a Pushgateway instead
+(`curl --data-binary @vtop_scrub.prom http://pushgateway:9091/metrics/job/vtop_scrub`),
+or alert on the Job's own failure (`kube_job_status_failed`), which a finding
+causes.
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vtop-scrub
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: scrub
+              image: <the engine image>
+              # vtopctl itself, not the entrypoint (which adds its own --config
+              # and requires writable /data/work and /data/state).
+              command: [vtopctl]
+              args: [scrub, --config, /etc/vtop/config.yaml,
+                     --digest-dir, /var/lib/vtop/ledger-digests,
+                     --cursor-file, /var/lib/vtop-scrub/scrub.cursor, --limit, "6000",
+                     --concurrency, "4", --max-bytes-per-sec, "20000000",
+                     --metrics-file, /var/lib/vtop-scrub/vtop_scrub.prom, --json]
+              envFrom:
+                - secretRef: {name: vtop-object-store}   # read access to the bucket
+              volumeMounts:
+                - {name: config, mountPath: /etc/vtop, readOnly: true}
+                - {name: ledger-digests, mountPath: /var/lib/vtop/ledger-digests, readOnly: true}
+                - {name: scrub-state, mountPath: /var/lib/vtop-scrub}
+          volumes:
+            - name: config
+              configMap: {name: vtop-engine}
+            - name: ledger-digests   # where prune-ledger writes them (§6.6)
+              persistentVolumeClaim: {claimName: vtop-ledger-digests, readOnly: true}
+            - name: scrub-state
+              persistentVolumeClaim: {claimName: vtop-scrub}
+```
 
 ---
 
@@ -775,16 +1051,18 @@ path needed by the distributed options is already implemented (§6.3).
 | `engine.work_dir` / `log_level` | scratch dir; verbosity |
 | `engine.ledger_retention_days` / `ledger_prune_batch` | committed-row retention (§6.6; SQLite engine-side only) |
 | `engine.state_store_timeout_seconds` | wall-clock bound on every state-store request (default 30 s; whole-ledger scans get 10x) — a blackholed Postgres fails the request instead of hanging the engine (#556) |
-| `upload.request_timeout_seconds` | wall-clock bound on one attempt of one object-store request on the native S3 backend (default 300 s; the SDK's retries apply) (#556) |
+| `upload.request_timeout_seconds` | wall-clock bound on one attempt of one object-store request on the native S3 backend (default 300 s; the SDK's retries apply) (#556); a request that carries a body gets this plus its size at `request_min_bytes_per_second` |
+| `upload.request_min_bytes_per_second` | the slowest rate one request's body may cross the link at and still be waited for, native S3 backend (default 4096, must be > 0) (#663): each attempt of an object, part or manifest upload is allowed `request_timeout_seconds` plus its size at this rate, so a slow or policed uplink stretches the deadline instead of failing every body. Per request: the width times the parts in flight share the link |
 | `engine.ledger_digest_dir` | where prune digests are written and read (default: beside a SQLite database file; else under `work_dir`, which is scratch) |
 | `batching.max_records` / `max_bytes` / `max_batch_age_seconds` | seal thresholds |
 | `batching.max_concurrent_batches` | uploads kept in flight per cycle (default 8); the ceiling when the adaptive width is on |
 | `batching.adaptive_width.enabled` / `min_width` | AIMD upload width (#102): a cycle the store throttled halves the next cycle's width, a clean cycle grows it by one, never below `min_width` (default 1) nor above the ceiling. Off by default; `vtop_upload_width` shows the width in use |
 | `compression.type` / `level` | `gzip` \| `zstd` \| `none` |
-| `checksum.algorithm` | `sha256` \| `blake3` \| disabled |
+| `checksum.algorithm` | global `sha256` \| `blake3` \| `none`; inherited by streams without an override |
+| `streams.yaml`: `streams[].checksum.algorithm` | per-stream override with the same shape; `none` requires the global strong floor to be off, otherwise config load fails naming the stream |
 | `manifest_mac_key_env` | optional env-var name for the 32-byte hex manifest MAC key; the secret is not serialized |
 | `sources.kafka.*` | brokers, group, include/exclude, `enable_auto_commit:false` |
-| `sources.file.*` | paths, `delete_after_commit`, `whole_file`. Two directory entries naming one file — a symlink beside its target, two hard links — are **two sources** by ruling (#378): each is archived under its own name, so the file's records are archived twice, and discovery warns once per alias group naming every spelling. Narrow the patterns to one spelling if one source is meant. There is no merge and no knob, because a merge needs a cursor identity that survives an alias being removed and none is safe: keyed by the surviving spelling, `delete_after_commit` removes it and the target is re-read from zero; keyed by inode, a freed inode reused by a new file inherits the old cursor and that file's opening records are skipped. A duplicate costs storage; a merge risks data. |
+| `sources.file.*` | paths, `delete_after_commit`, `delete_quiet_seconds`, `whole_file`. `delete_after_commit` is for files nothing writes to any more: whole-file drops, and rotated logs once the writer has reopened its new file. A fully archived file is deleted only after it has stayed unwritten for `delete_quiet_seconds` (default 3600) from the commit that covered it, so the engine catching up on a live log does not delete it out from under a writer that still holds it open (#619). A file whose mtime moves while it waits (a producer stamping a finished drop) restarts the wait when its first page, the page below the committed end (#620) and its length still match, and is kept when the range predates that tail fingerprint. The wait is kept in memory: a restart starts it again, from the newest committed row, and only when that row names the file's inode and first page, its batch read the file to its end, and either the row carries the tail fingerprint or the file still has the mtime that batch recorded; otherwise the file stays until a new commit covers it. `delete_quiet_seconds: 0` deletes immediately at the covering commit, still through the rename-and-check (a write that lands before the move puts the file back), but with no quiet-period protection: a writer that still holds the file open loses every line it writes after the delete. The wait is a heuristic, because no portable check proves that no process holds a file open. A writer that keeps the file open loses lines in two cases: it is silent for longer than the quiet period and then writes again, or its write lands between the delete's final check and the unlink (after the same silence). Do not point the option at a live log. Two directory entries naming one file — a symlink beside its target, two hard links — are **two sources** by ruling (#378): each is archived under its own name, so the file's records are archived twice, and discovery warns once per alias group naming every spelling. Narrow the patterns to one spelling if one source is meant. There is no merge and no knob, because a merge needs a cursor identity that survives an alias being removed and none is safe: keyed by the surviving spelling, `delete_after_commit` removes it and the target is re-read from zero; keyed by inode, a freed inode reused by a new file inherits the old cursor and that file's opening records are skipped. A duplicate costs storage; a merge risks data. |
 | `sources.syslog_spool.*` | spool paths |
 | `upload.backend` | `s3_native` \| `s3cmd` \| `awscli` \| `minio` \| `localfs` \| `mock` |
 | `upload.bucket` | bucket (supports `telemetry-{format}`) |
@@ -792,7 +1070,7 @@ path needed by the distributed options is already implemented (§6.3).
 | `upload.command_binary` / `command_timeout_seconds` / `command_max_output_bytes` | hardened external-tool path and invocation bounds (compatibility backends only) |
 | `upload.command_env_allowlist` | exact runtime environment names copied into an otherwise empty command environment |
 | `upload.create_bucket` | auto-create per-format buckets |
-| `upload.require_strong_verification` | defaults true — false explicitly permits size-only commit |
+| `upload.require_strong_verification` | defaults true — false explicitly permits size-only commit, which accepts same-size corruption; warned at startup and by `vtopctl validate` (#629) |
 | `upload.max_egress_bytes_per_second` | operator ceiling on the process's total upload body bytes per second (#481), unset by default. One token bucket per process, shared by every backend in it, in front of each `s3_native` object, manifest and multipart-part body — application-layer rate policy over kernel TCP, not a network-aware mechanism; no one-second window admits more than the cap, retries included. Headers and the small XML bodies of `CreateMultipartUpload`, `CompleteMultipartUpload` and `CreateBucket` are neither shaped nor counted. Other backends refuse it at startup. Accounted in `vtop_upload_egress_bytes_total`, exported only when set |
 | `upload.max_concurrency_ceiling` | operator maximum above the concurrency knobs (#481), unset by default: `batching.max_concurrent_batches`, `batching.adaptive_width.min_width` and `upload.transports.*.max_concurrency` above it are refused naming both numbers, and the adaptive width controller's ceiling and floor are clamped to it |
 | `partitioning.template` | object key layout |
@@ -841,6 +1119,11 @@ path needed by the distributed options is already implemented (§6.3).
   Grafana/Loki/Mimir/Tempo/Alloy compose stack
   (`docker-compose.observability.yml`) and generated dashboards for the
   pipeline, Kafka, and flow views.
+- **Archive scrub metrics** — `vtopctl scrub --metrics-file` (§7.5) writes
+  `vtop_scrub_objects_total{result}` and the last-success, last-pass and
+  last-finding times
+  as a textfile; the [observability README](../observability/README.md#archive-scrub)
+  has an example alert rule set.
 
 **Still needed for production [PROPOSED]:**
 - **Alerting rules** (Alertmanager): verification failures > 0; replay-rate
@@ -940,6 +1223,13 @@ Short procedures now; expand into a full ops runbook before go-live.
 - **Audit archive coverage:** run `vtopctl audit-coverage --config ...
   [--check-storage] [--metrics-file ...]` on a schedule (§6.6); a non-zero
   exit names the source units with lost ranges.
+- **Scrub the archive:** run `vtopctl scrub --config ... --cursor-file ...
+  --limit N [--metrics-file ...]` on a schedule (§7.5) so every committed
+  object is read back once per pass; a non-zero exit lists the batches whose
+  object or manifest is missing, mismatched, unauthenticated or unreadable.
+  It cannot repair them: restore from a replica or backup, or record the loss.
+  A manifest from a newer release (`unsupported_version`) is a finding too;
+  its remedy is a scrub binary of that release or later.
 - **Upgrade the metadata tier (#554):** roll the voters one at a time, and
   confirm each has CAUGHT UP before the next. The chart's `RollingUpdate`
   replaces one pod at a time, but it waits only for `/readyz`, which on a

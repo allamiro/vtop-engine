@@ -1,0 +1,3 @@
+verify_done records=475000 next_offset=475000 gaps=0 high_watermark=475000
+
+--- stderr ---

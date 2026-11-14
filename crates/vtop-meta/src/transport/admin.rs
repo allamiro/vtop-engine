@@ -1027,6 +1027,21 @@ impl AdminClient {
         }
     }
 
+    /// Start the next request at the candidate after the preferred one.
+    ///
+    /// For a caller whose request was CANCELLED at its own deadline (#634
+    /// review): the preferred candidate moves only on an answer, so an
+    /// endpoint that accepts and then never answers would be asked first by
+    /// every later request, and a caller that always times out there would
+    /// never reach the healthy members listed after it.
+    pub fn prefer_next_candidate(&self) {
+        use std::sync::atomic::Ordering;
+        let candidates = self.candidates.len();
+        let current = self.preferred.load(Ordering::Relaxed);
+        self.preferred
+            .store((current % candidates + 1) % candidates, Ordering::Relaxed);
+    }
+
     /// Linearizable read of the cluster's feature level and, with
     /// `include_nodes`, every registered node and what it reported it runs
     /// (#634).

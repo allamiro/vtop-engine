@@ -9,6 +9,10 @@ description = "Source adapters (Kafka, file, syslog spool) for the VTOP Engine."
 [features]
 default = []
 kafka = ["dep:rdkafka"]
+# Kerberos (SASL GSSAPI) for the Kafka source. It links the system Cyrus SASL,
+# so it needs its development headers at build time and its library at run
+# time. PLAIN, SCRAM and OAUTHBEARER don't need it.
+kafka-gssapi = ["kafka", "rdkafka/sasl"]
 
 [dependencies]
 vtop-core = { workspace = true }
@@ -23,6 +27,11 @@ chrono = { workspace = true }
 glob = { workspace = true }
 regex = { workspace = true }
 futures = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# renameat2(RENAME_NOREPLACE) / renameatx_np(RENAME_EXCL): delete_after_commit
+# moves a file aside without ever replacing another (#619).
+rustix = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

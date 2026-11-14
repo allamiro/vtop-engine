@@ -25,6 +25,7 @@ pub fn file_config(
     backend: &str,
 ) -> VtopConfig {
     VtopConfig {
+        configured_fields: Default::default(),
         engine: EngineConfig {
             name: "vtop-test".into(),
             tenant: "default".into(),
@@ -61,6 +62,7 @@ pub fn file_config(
                 enabled: true,
                 paths,
                 delete_after_commit: false,
+                delete_quiet_seconds: vtop_core::config::DEFAULT_DELETE_QUIET_SECONDS,
                 whole_file: false,
             }),
             syslog_spool: None,
@@ -75,6 +77,7 @@ pub fn file_config(
             verify_tls: false,
             transport: "tcp_tls".into(),
             request_timeout_seconds: 300,
+            request_min_bytes_per_second: 4 * 1024,
             profile: None,
             command_binary: None,
             command_timeout_seconds: 300,

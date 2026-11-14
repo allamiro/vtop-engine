@@ -2262,6 +2262,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "openssl-src"
+version = "300.6.1+3.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46eb8fb9fb3b61ce1c0f8a026c4c1a0714d3a9e138e7fbde78753ce2babc3846"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "openssl-sys"
 version = "0.9.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2269,6 +2278,7 @@ checksum = "b47e7e6bb2c38cd930d25a23b40fa52e068c10e85f3e03a7f5ba5aaca5713695"
 dependencies = [
  "cc",
  "libc",
+ "openssl-src",
  "pkg-config",
  "vcpkg",
 ]
@@ -3942,7 +3952,7 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vtop-adapters"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3950,6 +3960,7 @@ dependencies = [
  "glob",
  "rdkafka",
  "regex",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -3961,7 +3972,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-broker"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "rcgen",
@@ -3979,7 +3990,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4010,7 +4021,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -4034,7 +4045,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-kafka"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "sha2 0.11.1",
@@ -4051,7 +4062,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-log"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "libc",
@@ -4064,7 +4075,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-meta"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4085,7 +4096,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-node"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -4110,7 +4121,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-observe"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "http-body-util",
  "hyper",
@@ -4126,7 +4137,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-protocol"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "thiserror 2.0.21",
@@ -4136,7 +4147,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-state"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4152,7 +4163,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-upload"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "aws-config",

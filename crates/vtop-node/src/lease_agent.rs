@@ -389,7 +389,30 @@ impl ReplicaPlaneProbe {
         // cannot vouch for its own history, in which case no replica truncates
         // anything — the honest outcome, since there is nothing to reconcile
         // against.
-        let candidate_lineage = self.view.epoch_starts();
+        let mut candidate_lineage = self.view.epoch_starts();
+        // The history names the new epoch at the candidate's tail (#640,
+        // #648 review). A follower view adopted it in `fence_for_probe`; a
+        // standing leader's broker adopts its grant only when the publisher
+        // promotes it, after this probe, and records it at its tail then.
+        // Sent without that entry, a follower could not learn where this
+        // leader's records under the new epoch begin, and would file them
+        // under an older one. The entry is the one the broker records at
+        // promotion: the epoch at its next offset, which its stopped log
+        // keeps until then. A view that could not be stopped, cannot say
+        // where its log ends, or has no history to extend sends what it has.
+        if local_committed_offset.is_some() {
+            if let (Some(last), Some(tail)) = (
+                candidate_lineage.last().copied(),
+                self.view.local_next_offset(),
+            ) {
+                if last.epoch < fencing_epoch && last.start_offset <= tail {
+                    candidate_lineage.push(vtop_broker::fencing_epochs::EpochStart {
+                        epoch: fencing_epoch,
+                        start_offset: tail,
+                    });
+                }
+            }
+        }
         // The candidate's own answer is its own history by definition - when
         // it HAS one. A candidate holding records it cannot vouch for cannot
         // prove anyone else's lineage either (#577), itself included: its
@@ -6250,6 +6273,108 @@ mod tests {
                 required: 2,
                 most_complete: (Uuid::from_u128(2), 8),
             }
+        );
+    }
+
+    /// #640 on the lease-driven path (#648 review). The candidate is a
+    /// `LocalBroker`, as `run_leader` probes it: its view stops nothing and
+    /// adopts the new epoch only when the publisher promotes it, after the
+    /// probe. So its own history does not yet name the new epoch when it
+    /// fences. The follower behind it must still end with the leader's
+    /// history once the leader catches it up: the leader writes under the new
+    /// epoch from its tail, 10, and records 5..10 stay epoch 18's.
+    #[tokio::test]
+    async fn a_lease_driven_leaders_follower_ends_with_the_leaders_history() {
+        // The candidate's directory: ten records under 18, written while it
+        // was a follower, then reopened as a broker (the role flip).
+        let candidate_dir = tempfile::tempdir().unwrap();
+        drop(lineage_replica(
+            candidate_dir.path(),
+            Uuid::from_u128(1),
+            10,
+        ));
+        let candidate = Arc::new(
+            LocalBroker::new(
+                vtop_log::ActiveSegment::recover(candidate_dir.path().join("range.active"))
+                    .unwrap(),
+                vtop_broker::ProducerEpochJournal::open(candidate_dir.path().join("epochs"))
+                    .unwrap(),
+                lineage_range(),
+                LINEAGE_OLD_EPOCH,
+            )
+            .unwrap(),
+        );
+        candidate.set_fencing_epoch_journal(
+            vtop_broker::fencing_epochs::FencingEpochJournal::open(
+                candidate_dir.path().join("fencing-epochs"),
+            )
+            .unwrap(),
+        );
+        let follower_dir = tempfile::tempdir().unwrap();
+        let (follower, meta) = lineage_replica(follower_dir.path(), Uuid::from_u128(2), 5);
+        meta.set(LINEAGE_NEW_EPOCH);
+        let follower_view = follower.clone();
+
+        let (probes, _stop) = probe_with_one_reachable_follower(
+            candidate.clone() as Arc<dyn CandidateLocalView>,
+            follower,
+        )
+        .await;
+        assert_eq!(
+            probes
+                .iter()
+                .find(|probe| probe.node_id == Uuid::from_u128(2))
+                .and_then(|probe| probe.local_committed_offset),
+            Some(5),
+            "precondition: the follower was fenced"
+        );
+        // The publisher's promotion, after the probe.
+        candidate.adopt_fencing_epoch(LINEAGE_NEW_EPOCH);
+        // The leader catches the follower up on its own records 5..10, then
+        // sends its first record under the new epoch.
+        for offset in 5..11 {
+            let written_under = if offset < 10 {
+                LINEAGE_OLD_EPOCH
+            } else {
+                LINEAGE_NEW_EPOCH
+            };
+            follower_view
+                .apply_append(&vtop_protocol::ReplicaAppendRequest {
+                    range: lineage_range(),
+                    fencing_epoch: LINEAGE_NEW_EPOCH,
+                    leader_node_id: Uuid::from_u128(1),
+                    expected_base_offset: offset,
+                    producer_id: Uuid::from_u128(0xB1),
+                    producer_epoch: 1,
+                    first_sequence: offset,
+                    records: vec![vtop_protocol::ProduceRecord {
+                        timestamp_millis: 1_000,
+                        key: b"k".to_vec(),
+                        value: format!("e{written_under}v{offset}").into_bytes(),
+                    }],
+                })
+                .unwrap();
+        }
+        let leader_history = candidate.epoch_starts();
+        assert_eq!(
+            leader_history,
+            vec![
+                vtop_broker::fencing_epochs::EpochStart {
+                    epoch: LINEAGE_OLD_EPOCH,
+                    start_offset: 0,
+                },
+                vtop_broker::fencing_epochs::EpochStart {
+                    epoch: LINEAGE_NEW_EPOCH,
+                    start_offset: 10,
+                },
+            ],
+            "precondition: the leader adopted the new epoch at its tail"
+        );
+        assert_eq!(
+            follower_view.epoch_starts(),
+            leader_history,
+            "the follower must file 5..10 under 18 and 10 on under the new epoch, as the \
+             leader does"
         );
     }
 

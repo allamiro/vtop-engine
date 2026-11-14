@@ -176,8 +176,9 @@ pub trait StateStore: Send + Sync {
     /// Atomically claim every incomplete batch this `owner` may work on, and
     /// return the claimed rows (#93).
     ///
-    /// Claimable = not SOURCE_COMMITTED, and (already owned by `owner`, OR
-    /// never owned, OR the previous owner's lease has expired as of `now`).
+    /// Claimable = in neither terminal state (SOURCE_COMMITTED, SUPERSEDED -
+    /// #567), and (already owned by `owner`, OR never owned, OR the previous
+    /// owner's lease has expired as of `now`).
     /// The claim is ONE update — set owner and a fresh lease on exactly the
     /// claimable rows — so two engines recovering concurrently cannot both
     /// claim the same batch: a live engine's in-flight work is never touched,
@@ -192,6 +193,21 @@ pub trait StateStore: Send + Sync {
         now: &str,
         lease_until: &str,
     ) -> Result<Vec<BatchRecord>, VtopError>;
+
+    /// Extend this process's lease on `batch_id` to `lease_until` (RFC3339),
+    /// if it still holds the claim: `true` when it does (the lease is
+    /// extended), `false` when it holds no claim on the row or another engine
+    /// has claimed it since (nothing is changed) (#624).
+    ///
+    /// ONE conditional write on the claim generation this process holds, so
+    /// it is atomic with any competing claim: whichever lands first wins. A
+    /// caller that is about to move a source for a row it has held a while
+    /// renews first - after a `true`, no other engine can claim the row until
+    /// the new lease runs out, so the move cannot race a new owner's re-read.
+    /// Detecting the lost claim at the ledger write AFTER the move is too
+    /// late: a source commit cannot be undone, and with `delete_after_commit`
+    /// it can delete the file.
+    async fn renew_claim(&self, batch_id: &str, lease_until: &str) -> Result<bool, VtopError>;
 
     /// Highest committed `end_byte` per source path for a byte-offset source
     /// type (file / syslog spool), computed IN THE STORE.
@@ -231,11 +247,40 @@ pub trait StateStore: Send + Sync {
     /// any prune.
     async fn committed_kafka_offsets(&self) -> Result<Vec<CommittedKafkaOffset>, VtopError>;
 
+    /// The newest committed batch of EACH FILE (inode) that has lived at each
+    /// path, computed in the store like [`StateStore::committed_cursors`]:
+    /// newest by `(created_at, batch_id)`, the order the windows were read and
+    /// the order pruning keeps the newest row by, so equal timestamps break
+    /// the same way everywhere. Ordered by path, and within a path newest
+    /// first, so the first row of each path is the one
+    /// [`StateStore::committed_cursors`] answers.
+    ///
+    /// For a byte-offset source whose failed range can be re-read from a file
+    /// rotated away from its path (#621). That re-read commits under the path
+    /// AFTER the batches of the file now at the path, so the newest row of the
+    /// path is not always the current file's, and the restart seed picks the
+    /// row of the file at the path from these. A FAILED row stays in the
+    /// ledger and is rewound again at every restart, so recovery also starts
+    /// such a re-read above what a later batch already archived of that file.
+    ///
+    /// Rows that recorded no inode (legacy, or a platform without inodes)
+    /// cannot be told apart by file, so they are answered TOGETHER as one
+    /// entry per path with `inode: None`: the newest of them. No caller may
+    /// attribute that entry to a particular file.
+    ///
+    /// History pruning keeps one row per path, so older files' rows can be
+    /// gone; the caller then falls back to the newest row, or re-reads, which
+    /// costs a duplicate, never a skip.
+    async fn committed_cursors_by_file(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<CommittedCursor>, VtopError>;
+
     /// All batches, newest first.
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError>;
 
-    /// Batches that have entered the store but not yet reached
-    /// `SOURCE_COMMITTED` — the recovery work-list.
+    /// Batches that have entered the store but reached neither terminal state
+    /// (`SOURCE_COMMITTED`, `SUPERSEDED`) — the recovery work-list.
     async fn list_incomplete_batches(&self) -> Result<Vec<BatchRecord>, VtopError>;
 
     /// Batches in the `FAILED` terminal state.
@@ -250,12 +295,15 @@ pub trait StateStore: Send + Sync {
     /// Commit source progress (legal only from `VERIFIED`).
     async fn mark_source_committed(&self, batch_id: &str) -> Result<(), VtopError>;
 
-    /// Incrementally delete old `SOURCE_COMMITTED` history rows (#128).
+    /// Incrementally delete old `SOURCE_COMMITTED` and `SUPERSEDED` history
+    /// rows (#128, #567).
     ///
     /// Deletes at most `limit` rows whose `updated_at` is lexicographically
     /// below `older_than` (RFC3339 UTC, the format every writer uses) and
-    /// returns the number deleted. Three protections are non-negotiable:
-    /// rows in any other state are never touched; rows at or after the
+    /// returns the number deleted. A SUPERSEDED row is never a restart
+    /// cursor, so it needs no newer row to be deleted. Three protections are
+    /// non-negotiable: rows in any other state are never touched; rows at or
+    /// after the
     /// cutoff are never touched; and for every source path (falling back to
     /// `source_name` when the progress marker carries no path), and for a
     /// Kafka row every (topic, partition, consumer group), the NEWEST

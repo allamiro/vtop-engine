@@ -9,6 +9,21 @@ what each release does **not** yet do.
 
 ---
 
+## Next release — per-stream checksum selection
+
+- **[#669](https://github.com/allamiro/vtop-engine/issues/669)** — choose
+  `checksum.algorithm` per stream, inheriting the global value by default.
+  This is the manual selection step motivated by the paper's cost-aware
+  future work (Eq. 4), recorded in the
+  [implementation plan](https://github.com/allamiro/vtop-engine/issues/669#issuecomment-6806355703).
+  Automatic selection still needs a measured cost model and is future work.
+- **Upgrade note:** older engines silently ignore the new stream key and
+  use the global algorithm. Upgrade all engines before relying on it; keep
+  the global algorithm strong during mixed-version operation. Recovery and
+  scrub continue checking each old batch with its manifest's algorithm.
+  No manifest format or ledger migration is introduced. Downgrade remains
+  unsupported.
+
 ## v0.1.0 — a range that fails over
 
 Metadata leases, a lease agent on the data node, verified promotion, and the
@@ -256,7 +271,30 @@ reopen quietly.
   leader's first append or committed high-water mark past its start,
   instead of acking a record it does not hold (#261) or exposing the kept
   records as committed. Until it is settled, that dispute caps the replica's
-  acks and reconnect status at its start.
+  acks and reconnect status at its start. A replica absent from the fence,
+  such as a deposed leader that missed the election, is no longer left
+  unreconciled (#641). Once a leader is attached to its replica set, every
+  session it opens with a follower starts with the probe's own fence frame,
+  at the leader's epoch and with its history, before the status read and
+  before any record or mark. A session opened before the attachment is
+  dropped before it carries a record or a mark. The fence reconciles the
+  returning replica exactly as it reconciles a voter. Histories that agree
+  leave the log as it is. A suffix the leader provably supersedes is
+  truncated at once. A suffix the leader cannot yet prove superseded is kept
+  in dispute, from the divergence (or, below the replica's high-water mark,
+  from past both the mark and the leader's tail), and settled as above; the
+  replica then catches up and never reports a disputed suffix as held, takes
+  it under the new mark, or acks the leader's records over it. Nothing at or
+  below a replica's own mark is touched. A replica that holds records but
+  whose own history cannot be compared (no journal, or a broken one) gets no
+  session at all (#649 review): the leader cannot tell which of its records
+  match, so it sends it nothing and takes no ack from it, leaves its log as
+  it is, and reports that it needs `vtopctl node repair`. Its answers never
+  count toward a promotion either. An empty replica with no history is not
+  in that position: it holds nothing to dispute, the candidate judges its
+  answer Agreed, and it counts. A leader with no history of its own cannot
+  reconcile anyone; its fences leave every log as it is. Plaintext planes
+  skip the session fence, since they refuse fences and do not fail over.
   **The protection is the fenced replica's, so it holds only on upgraded
   replicas.** There is no wire or feature-level change and the fence frames
   are identical, so nothing tells a candidate which replicas run this
@@ -295,6 +333,40 @@ reopen quietly.
   the directory, which lowers it. A crash sweep
   (`kept_dispute_crash_sweep.rs`) cuts the fence and the settlement at every
   storage operation and every byte of every write.
+- **#640** - a follower filed the records a new leader caught it up on under
+  the wrong epoch. It recorded an epoch it adopted at its own tail, so when
+  it was behind, the records the new leader then sent it were filed under the
+  new epoch, while the leader filed the same bytes under the epoch that wrote
+  them. The two histories diverged below both tails, every later fence answer
+  between them was Unknown (#577), and after a second failover no candidate
+  could be established, though no acknowledged record was lost. The fence
+  that installs a leader already carries that leader's history; a fenced
+  follower whose own history agrees with it below its tail now keeps it (in a
+  `fencing-epochs.leader` sidecar, so a restart keeps it too) and files every
+  record that leader sends under the leader's entries. After a catch-up its
+  vector equals the leader's for the caught-up range (after a partial
+  catch-up, only that far). A crash between an append and that filing is
+  repaired when the replica next opens, before it answers anything, provided
+  the `fencing-epochs.leader` sidecar survived intact; a missing or torn
+  sidecar reads as "no lineage" and repairs nothing, leaving those records
+  filed as before #640 (an Unknown answer later, never a counted one). A
+  follower that kept a dispute (#611) holds the fence's history in the same
+  sidecar, as #635 holds the dispute, and takes it only once the dispute
+  settles, at the tail the settlement leaves; a newer fence or the node's
+  own candidate fence drops it, as they retire the dispute. A follower the
+  fence did not reach adopts at its tail as before.
+  **Compatibility:** the lineage changes nothing in the journal's own format
+  (its header gate is #635's), so an older binary that may open it reads it
+  as its own and simply resumes adopting at its tail. The sidecar is
+  a name older binaries never open, and this release reads a missing, torn or
+  newer-version sidecar as "no lineage", the old behaviour. **Journals
+  mislabelled by an earlier release are not rewritten**: nothing on a replica
+  tells a record it was caught up on under an epoch from one that epoch's
+  leader wrote, so such a replica's answer stays Unknown against a correctly
+  labelled history (and is never counted) until it is repaired with `vtopctl
+  node repair` from a replica whose history is right (#315). No wire or
+  feature-level change: an older follower keeps mislabelling until upgraded,
+  which costs elections availability, never an acknowledged record.
 - **#634** - a data node's release was invisible to the cluster, so a
   feature level was raised on the metadata tier's word alone, and the
   replica plane had no version on the wire. Data nodes now report
@@ -650,13 +722,108 @@ in a state replay can explain.
 - **Transactions remain out of scope**, and the v0.6.0 RemoteBridge
   limitations still hold.
 
-## v0.8.0 and beyond
+## v0.8.0 — the engine proves what it archived, and the cluster survives its own failovers
+
+Most of what `main` gathered after v0.7.0 is the same work at two layers:
+find the edge where a claim could outrun its evidence, and close it with a
+test that failed first.
+
+- **Archive engine.**
+  - A range whose source has already committed past it is retired as
+    SUPERSEDED, but only on positive proof of the file's identity (#567).
+  - A VERIFIED row left uncommitted is settled by a later pass, not only at
+    the next restart (#624).
+  - A failed range from a rotated-away file is re-read from that file (#621).
+  - A range whose replay decision can't be recorded holds back the VERIFIED
+    ranges above it (#639).
+  - `delete_after_commit` waits until a file stops being written (#619).
+  - The Kafka source resumes from the ledger (#614), and a stalled partition
+    is re-assigned instead of going silent (#623).
+  - Committed objects can be re-read and checked with `vtopctl scrub` (#628).
+  - Size-only verification is announced at startup, in `validate` and in
+    recovery (#629).
+- **Upload.**
+  - A request body's deadline grows with its size, so a policed uplink
+    commits instead of timing out (#663).
+  - An operator egress ceiling (#481).
+  - Each stream may choose its checksum algorithm, with
+    `require_strong_verification` as a floor (#669).
+  - `vtopctl validate --print-effective` shows what each stream runs with
+    (#670).
+  - The #483 gate kept TCP as the only egress path (#475 is closed).
+- **Manifests (#671, release A).** Readers check the version first and
+  verify `0.4` over the stored document. Writers still write `0.3`.
+- **Cluster plane.**
+  - A follower files caught-up records under the epoch that wrote them (#640).
+  - A returning deposed leader is reconciled at session start (#641).
+  - A fence holds the meta lock through its outcome (#660).
+  - A snapshot never holds a record it can't read back (#657).
+  - Data nodes report their release, and a feature level is finalized only
+    when every node can run it (#634).
+  - The promotion crash sweep runs with no known issue open.
+- **Measured.**
+  - Failover under load against Apache Kafka (#597, partly).
+  - The Kafka comparison's charts are regenerated on CI with no drift (#600).
+
+**Upgrading from v0.7.0.** Downgrade is not supported.
+
+- **Upgrade every engine and data node first, then raise the feature level**
+  with `vtopctl node-versions` and `vtopctl enable-features`. Level 7 is
+  finalized only when every node reports it (#634).
+- **One-way changes:**
+  - Once a SUPERSEDED row is written, the state store carries schema marker
+    3 and v0.7.0 refuses it (#567).
+  - An older binary refuses to start while a kept dispute is pending (#635).
+  - Fencing journal and sidecar rewrites stage through `<file>.rewrite` and
+    a rename (#640).
+- **Older engines silently ignore new keys:**
+  - `upload.request_min_bytes_per_second` (#663);
+  - `upload.max_egress_bytes_per_second` (#481);
+  - a stream's `checksum` block (#669).
+
+  Upgrade every engine before relying on them, and keep the global checksum
+  algorithm strong during a rolling upgrade.
+- **Known open:**
+  - #675: a Kafka stall-recovery test failed once in CI.
+  - #626: replay object keys.
+  - #664: the verification class of recovered commits.
+  - #668: resuming a failed multipart upload.
+  - #671 release B.
+
+## v0.9.0 and beyond
 
 The theme is **the gateway at the speed its durability allows**: wire the
 broker's group commit into the gateway path and close the compatibility
 gaps the Kafka comparison found (#596), measure failover and crash
 durability against Kafka (#597, #599), serve split children as Kafka
 partitions (#473), and ship the egress ceiling once measured (#481).
+
+**Manifest format evolution (#671).** v0.8.0's readers check a
+manifest's `version` first, read `0.1`-`0.4`, verify `0.4` over the stored
+document so fields they do not know stay authenticated, and report anything
+newer as newer rather than as tampered: recovery leaves such a batch VERIFIED
+and pending, and `vtopctl scrub` reports `unsupported_version`. Both act on
+that only for the row's pinned manifest version carrying the ledger's
+self-hash; anything else is unauthenticated, as before. It still writes
+`0.3`. A later release adds the `0.4` fields (the verification plan, then
+optional receipts, after #664), opt-in, and only once every engine and
+auditor runs a reader release. Known limitations until then:
+
+- **Readers before v0.8.0 cannot read `0.4`.** v0.7.0 and earlier
+  re-encode a manifest without the fields they do not know, so a `0.4`
+  manifest fails their self-hash: recovery replays the batch, the scrub
+  reports it, `verify-manifest` calls it corrupt. Upgrade every reader first.
+- **A pending newer-release range is still re-read.** An engine older than a
+  batch's writer leaves its VERIFIED row alone, but its next read of that
+  source starts at the committed point, below that range, and archives those
+  bytes again: a duplicate, not a gap.
+- **Without object versions, a genuine newer manifest is replayed.** A
+  row with no pinned manifest version cannot prove its manifest is the
+  writer's, so an older engine treats it as unauthenticated and replays it
+  (duplicates), as before #671.
+- **`scripts/upgrade-compat.sh` does not cover manifests.** The old-release
+  coverage is the committed v0.7.0 fixtures in
+  `crates/vtop-core/tests/fixtures/manifests/`.
 
 ---
 
