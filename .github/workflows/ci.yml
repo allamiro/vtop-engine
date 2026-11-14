@@ -313,13 +313,11 @@ jobs:
               - 'scripts/live-chaos/scenarios/22-meta-rolling-upgrade.sh'
               - '.github/workflows/ci.yml'
             manifest_compat:
-              # Released readers over an archive HEAD writes (#671): the
-              # manifest and receipt writers, the engine that drives them,
-              # the localfs backend the archive is written to, and the script.
-              - 'crates/vtop-core/**'
-              - 'crates/vtop-cli/**'
-              - 'crates/vtop-upload/**'
-              - 'crates/vtop-state/**'
+              # Released readers over an archive HEAD writes (#671). Every
+              # crate: vtopctl depends on nearly all of them (the file
+              # adapter that archives, the ledger, the observe crate), and a
+              # hand-kept list is a gate with a hole in it (review of #711).
+              - 'crates/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -1610,7 +1608,9 @@ jobs:
             | sort -V \
             | awk -F. '{ maj = substr($1, 2) + 0; min = $2 + 0; if (maj > 0 || min >= 7) print }' \
             | tr '\n' ' ')"
-          [[ "$tags" == *v0.7.0* && "$tags" == *v0.8.0* ]] || { echo "expected v0.7.0 and v0.8.0 among: $tags"; exit 1; }
+          # The newest patch of each series: v0.8.1 replaces v0.8.0 the day it
+          # is tagged (review of #711).
+          [[ "$tags" == *v0.7.* && "$tags" == *v0.8.* ]] || { echo "expected a v0.7 and a v0.8 release among: $tags"; exit 1; }
           echo "list=$tags" >> "$GITHUB_OUTPUT"
           echo "replaying: $tags"
       - name: Download the released vtopctl, checked against SHA256SUMS
@@ -1634,8 +1634,10 @@ jobs:
           set -euo pipefail
           for tag in ${{ steps.tags.outputs.list }}; do
             v="${tag#v}"
+            # Every release before v0.8.0, the 0.4 reader, reports the
+            # self-hash failure.
             expect=pass
-            [[ "$tag" == v0.7.0 ]] && expect=hash-failure
+            [[ "$tag" == v0.7.* ]] && expect=hash-failure
             MANIFEST_COMPAT_KEEP=1 MANIFEST_COMPAT_WORKDIR="$GITHUB_WORKSPACE/manifest-compat-$tag" \
               scripts/manifest-compat.sh target/debug/vtopctl "$tag" \
                 "released/$tag/vtop-engine-$v-x86_64-unknown-linux-gnu/vtopctl" "$expect"

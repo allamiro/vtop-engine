@@ -158,6 +158,12 @@ pub struct MockBackend {
     /// (#671 release B): a store refusing verification receipts. Settable on
     /// a shared mock, so one attempt can fail and the next succeed.
     failing_put_suffix: Mutex<Option<String>>,
+    /// Every put to a key ending with this suffix never answers: a store
+    /// that accepts the request and goes quiet (review of #711).
+    hanging_put_suffix: Mutex<Option<String>>,
+    /// When set, `lock_fault` applies only to keys ending with this suffix
+    /// (review of #711), so one kind of object can be left unlocked.
+    lock_fault_suffix: Mutex<Option<String>>,
 }
 
 /// How [`MockBackend::with_part_fault`] makes `upload_part` fail (#668).
@@ -361,14 +367,20 @@ impl MockBackend {
     }
 
     /// What the store keeps of a lock it was asked for, after `lock_fault`.
-    fn kept(&self, asked: Option<RequestedRetention>) -> Option<StoredRetention> {
+    fn kept(&self, uri: &str, asked: Option<RequestedRetention>) -> Option<StoredRetention> {
         let asked = asked?;
         let mut kept = StoredRetention {
             mode: Some(asked.mode.as_s3().to_owned()),
             retain_until_unix_secs: Some(asked.retain_until_unix_secs),
             legal_hold: Some(asked.legal_hold),
         };
-        let fault = *self.lock_fault.lock().unwrap();
+        let applies = self
+            .lock_fault_suffix
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_none_or(|suffix| uri.ends_with(suffix));
+        let fault = applies.then(|| *self.lock_fault.lock().unwrap()).flatten();
         match fault {
             None => {}
             Some(LockFault::Ignored) => return None,
@@ -413,6 +425,8 @@ impl MockBackend {
             lock_config_errors: AtomicUsize::new(0),
             retention: Mutex::new(HashMap::new()),
             failing_put_suffix: Mutex::new(None),
+            hanging_put_suffix: Mutex::new(None),
+            lock_fault_suffix: Mutex::new(None),
             multipart_fail_after_parts: Arc::new(AtomicUsize::new(usize::MAX)),
             multipart_parts_uploaded: Arc::new(AtomicUsize::new(0)),
             bucket_ensures: AtomicUsize::new(0),
@@ -470,6 +484,30 @@ impl MockBackend {
     /// lets every put through again.
     pub fn set_failing_put_suffix(&self, suffix: Option<&str>) {
         *self.failing_put_suffix.lock().unwrap() = suffix.map(str::to_owned);
+    }
+
+    /// Every put to a key ending with `suffix` never answers; `None` lets
+    /// them through again.
+    pub fn set_hanging_put_suffix(&self, suffix: Option<&str>) {
+        *self.hanging_put_suffix.lock().unwrap() = suffix.map(str::to_owned);
+    }
+
+    /// Apply `lock_fault` only to keys ending with `suffix`; `None` applies
+    /// it to every key, as before.
+    pub fn set_lock_fault_only_for(&self, suffix: Option<&str>) {
+        *self.lock_fault_suffix.lock().unwrap() = suffix.map(str::to_owned);
+    }
+
+    async fn hang_put(&self, uri: &str) {
+        let hangs = self
+            .hanging_put_suffix
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|suffix| uri.ends_with(suffix));
+        if hangs {
+            std::future::pending::<()>().await;
+        }
     }
 
     fn refuse_put(&self, uri: &str) -> Result<(), VtopError> {
@@ -686,7 +724,7 @@ impl MockBackend {
         history.next += 1;
         let version_id = format!("v{}", history.next);
         history.entries.push((version_id.clone(), data));
-        if let Some(kept) = self.kept(asked) {
+        if let Some(kept) = self.kept(uri, asked) {
             self.retention
                 .lock()
                 .unwrap()
@@ -713,6 +751,7 @@ impl UploadBackend for MockBackend {
         checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<StoredObject, VtopError> {
         self.refuse_put(object_uri)?;
+        self.hang_put(object_uri).await;
         self.take_throttle(&self.throttled_object_puts, object_uri)?;
         let asked = self.asked();
         let version_id = self
@@ -735,6 +774,7 @@ impl UploadBackend for MockBackend {
         checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<StoredManifest, VtopError> {
         self.refuse_put(manifest_uri)?;
+        self.hang_put(manifest_uri).await;
         self.take_throttle(&self.throttled_manifest_puts, manifest_uri)?;
         let asked = self.asked();
         let version_id = self

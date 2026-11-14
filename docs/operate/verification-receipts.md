@@ -74,8 +74,10 @@ After a batch reaches `VERIFIED`, the engine writes
 ## A receipt never holds a batch back
 
 Writing a receipt is not part of the commit. If it cannot be written (the
-store refuses it, a deadline passes, or under the S3 Object Lock profile the
-store did not keep the retention asked for), the batch commits anyway, the
+store refuses it, it does not answer within the receipt's deadline, which is
+`upload.request_timeout_seconds` and never more than 30 s, or under the S3
+Object Lock profile the store did not keep the retention asked for), the
+batch commits anyway, the
 engine counts `vtop_verification_receipts_total{result="failed"}`, and logs,
 at most once a minute per source with the number suppressed since:
 
@@ -107,7 +109,12 @@ before committing it. If that batch has no receipt, recovery writes one from
 what its re-check verified, with `"origin": "recovery"` and the class the
 ledger recorded, and counts `vtop_verification_receipts_total{result="repaired"}`.
 It asks the store first and writes only when no receipt is there: an existing
-receipt is never replaced.
+receipt is never replaced. The receipt is written before the commit, so a
+batch recovery then holds back, and that is later replayed rather than
+committed, keeps its receipt; the scrub checks committed batches only and
+never reports it. A batch verified `strong` whose re-check could only
+confirm size (under `upload.require_strong_verification: false`) is
+receipted `class: strong, method: size_only`.
 
 A batch that was committed without a receipt keeps none. The receipt records
 the verification the batch was committed on; re-reading the object later
@@ -120,7 +127,8 @@ With `upload.object_lock` set ([S3 Object Lock](../OBJECT_LOCK_DEPLOYMENT.md)),
 a receipt is written through the same path as the manifest, so it carries the
 same retention, and the engine reads its retention back the way it reads the
 manifest's. A receipt the store did not lock is a failed receipt, not a
-failed batch. Because recovery never writes over an existing receipt, no
+failed batch, and is not counted in `vtop_object_lock_checks_total`, whose
+failures are failed batches. Because recovery never writes over an existing receipt, no
 second locked version appears beside the first. `vtopctl scrub
 --check-retention` does not read receipts' retention yet
 ([#710](https://github.com/allamiro/vtop-engine/issues/710)).

@@ -232,15 +232,21 @@ async fn a_resumed_multipart_object_is_receipted_with_the_method_that_ran() {
     let first = engine.process_once(SourceType::File).await.unwrap();
     assert_eq!(first[0].final_state, BatchState::Failed, "{first:?}");
     let failed = row(&engine, &first[0].batch_id).await;
-    if let Some(manifest) = failed.manifest_uri.as_deref() {
-        assert!(
-            !backend.contains(&receipt_uri(manifest).unwrap()),
-            "a failed batch gets no receipt"
-        );
-    }
+    assert!(
+        failed.manifest_uri.is_none(),
+        "the upload failed before any manifest (or receipt) was written: {failed:?}"
+    );
+    let sends = |b: &MockBackend| [1, 2, 3, 4].map(|n| b.part_sends(n));
+    assert_eq!(sends(&backend), [1, 2, 1, 1], "part 2 had two attempts");
 
     let second = engine.process_once(SourceType::File).await.unwrap();
     assert!(second[0].committed, "{second:?}");
+    // Resumed, not uploaded again: only part 2 was sent once more (#668).
+    assert_eq!(
+        sends(&backend),
+        [1, 3, 1, 1],
+        "the replay resumed the session"
+    );
     let row = row(&engine, &second[0].batch_id).await;
     let receipt = stored_receipt(&backend, &row, &ManifestKeyring::default()).await;
     assert_binds(&receipt, &row);
@@ -404,4 +410,91 @@ async fn under_object_lock_a_receipt_carries_the_manifests_retention() {
         "at least as long as its manifest: {kept:?} {manifest_kept:?}"
     );
     assert_eq!(receipts("receipts-locked", "written"), written + 1);
+}
+
+/// Review of #711: a receipt the store did not lock is a failed RECEIPT, not
+/// an Object Lock check failure. `vtop_object_lock_checks_total` counts the
+/// object and manifest checks that fail batches, and its alert pages; the
+/// batch here committed.
+#[tokio::test]
+async fn a_receipt_the_store_does_not_lock_is_a_failed_receipt_not_a_lock_check_failure() {
+    let tenant = "receipts-unlocked";
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 3);
+    let lock = ObjectLockConfig {
+        mode: ObjectLockMode::Governance,
+        retain_days: 30,
+        legal_hold: false,
+    };
+    let backend = Arc::new(
+        MockBackend::new()
+            .with_object_lock(ObjectLockPolicy::from_config(&lock))
+            .with_lock_fault(vtop_upload::LockFault::Ignored),
+    );
+    backend.set_lock_fault_only_for(Some(".receipt.json"));
+    let mut engine = engine(config(dir.path(), tenant, &input), &backend).await;
+    engine.config.upload.require_object_versioning = true;
+    engine.config.upload.object_lock = Some(lock);
+    let lock_checks = |result: &str| {
+        telemetry::metrics()
+            .map(|m| {
+                m.object_lock_checks_total
+                    .with_label_values(&[tenant, result])
+                    .get()
+            })
+            .unwrap_or(0)
+    };
+    let not_ok_before: Vec<u64> = telemetry::OBJECT_LOCK_CHECK_RESULTS
+        .iter()
+        .filter(|r| **r != "ok")
+        .map(|r| lock_checks(r))
+        .collect();
+    let (failed, ok_before) = (receipts(tenant, "failed"), lock_checks("ok"));
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert!(out[0].committed, "{out:?}");
+    assert_eq!(receipts(tenant, "failed"), failed + 1);
+    let not_ok_after: Vec<u64> = telemetry::OBJECT_LOCK_CHECK_RESULTS
+        .iter()
+        .filter(|r| **r != "ok")
+        .map(|r| lock_checks(r))
+        .collect();
+    assert_eq!(
+        not_ok_after, not_ok_before,
+        "no lock-check failure is counted"
+    );
+    assert_eq!(
+        lock_checks("ok"),
+        ok_before + 2,
+        "the object's and the manifest's checks only"
+    );
+}
+
+/// Review of #711: a receipt PUT the store never answers is abandoned at the
+/// receipt's own deadline (at most the request timeout, and never more than
+/// 30 s), so it cannot hold the batch's commit for the SDK's whole retry
+/// budget.
+#[tokio::test]
+async fn a_receipt_put_that_never_answers_is_abandoned_at_its_deadline() {
+    let tenant = "receipts-hang";
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 3);
+    let mut cfg = config(dir.path(), tenant, &input);
+    cfg.upload.request_timeout_seconds = 1;
+    let backend = Arc::new(MockBackend::new());
+    backend.set_hanging_put_suffix(Some(".receipt.json"));
+    let failed = receipts(tenant, "failed");
+    let mut engine = engine(cfg, &backend).await;
+    let started = std::time::Instant::now();
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        engine.process_once(SourceType::File),
+    )
+    .await
+    .expect("the receipt's deadline must end the wait")
+    .unwrap();
+    assert!(out[0].committed, "{out:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(receipts(tenant, "failed"), failed + 1);
 }

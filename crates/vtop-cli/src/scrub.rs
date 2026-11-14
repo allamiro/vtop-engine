@@ -647,6 +647,43 @@ impl ReceiptResult {
     }
 }
 
+/// A string read from a stored receipt, as a finding may quote it: URL query
+/// strings and user info stripped, quoted, and cut at 128 characters (review
+/// of #711). With no MAC key, anyone who can write the bucket chooses it.
+fn shown(stored: &str) -> String {
+    let redacted = vtop_upload::multipart::redact_urls(stored);
+    if redacted.chars().count() > 128 {
+        let cut: String = redacted.chars().take(128).collect();
+        format!("{cut:?}...")
+    } else {
+        format!("{redacted:?}")
+    }
+}
+
+/// What to do about a receipt finding: the third part of the message. The
+/// batch's own object and manifest are checked separately, so a receipt
+/// finding is about the evidence, never the data.
+fn receipt_remedy(result: ReceiptResult) -> &'static str {
+    match result {
+        ReceiptResult::Missing => {
+            "the batch's data is checked separately; a batch committed without a receipt keeps \
+             none, so drop --require-receipts for archives written before receipts were \
+             enabled, or find why the engine logged verification_receipt_failed"
+        }
+        ReceiptResult::Invalid | ReceiptResult::Mismatched => {
+            "the receipt is not this batch's as the ledger recorded it: the batch's data is \
+             checked separately; keep the receipt as evidence and find who wrote it in the \
+             store's access log"
+        }
+        ReceiptResult::Unauthenticated => {
+            "add the key it names to manifest.mac.keys as verify-only, or accept that it was \
+             retired"
+        }
+        ReceiptResult::Unreadable => "check the store's health and the scrub's read permission",
+        ReceiptResult::Ok => "",
+    }
+}
+
 /// Check the verification receipt beside `rec`'s manifest: read at its key
 /// (receipts are not pinned), authenticated with the key it names (#685),
 /// then bound to the ledger row: the batch, the manifest's URI, digest and
@@ -707,14 +744,15 @@ async fn receipt_of(
     if r.batch_id != rec.batch_id {
         return mismatched(format!(
             "verification receipt {ruri} is batch {}'s, not {}",
-            r.batch_id, rec.batch_id
+            shown(&r.batch_id),
+            rec.batch_id
         ));
     }
     if r.manifest.uri != muri || Some(r.object.uri.as_str()) != rec.object_uri.as_deref() {
         return mismatched(format!(
             "verification receipt {ruri} names manifest {} and object {}, the ledger {muri} and {}",
-            r.manifest.uri,
-            r.object.uri,
+            shown(&r.manifest.uri),
+            shown(&r.object.uri),
             rec.object_uri.as_deref().unwrap_or("nothing")
         ));
     }
@@ -725,17 +763,20 @@ async fn receipt_of(
     if !digest_bound {
         return mismatched(format!(
             "verification receipt {ruri} binds manifest digest {}, the ledger recorded {}",
-            r.manifest.sha256,
+            shown(&r.manifest.sha256),
             rec.manifest_sha256.as_deref().unwrap_or("nothing")
         ));
     }
-    if let (Some(want), Some(got)) = (
-        rec.manifest_version_id.as_deref(),
-        r.manifest.version_id.as_deref(),
-    ) {
-        if want != got {
+    // A pinned row binds the version: a receipt naming none, or another,
+    // is not this batch's (review of #711).
+    if let Some(want) = rec.manifest_version_id.as_deref() {
+        if r.manifest.version_id.as_deref() != Some(want) {
             return mismatched(format!(
-                "verification receipt {ruri} names manifest version {got}, the ledger pinned {want}"
+                "verification receipt {ruri} names manifest version {}, the ledger pinned {want}",
+                r.manifest
+                    .version_id
+                    .as_deref()
+                    .map_or_else(|| "none".to_owned(), shown)
             ));
         }
     }
@@ -749,7 +790,7 @@ async fn receipt_of(
     {
         return mismatched(format!(
             "verification receipt {ruri} and the ledger disagree on object {}'s size or digest",
-            r.object.uri
+            shown(&r.object.uri)
         ));
     }
     if let Some(class) = rec.verification_class {
@@ -757,7 +798,7 @@ async fn receipt_of(
             return mismatched(format!(
                 "verification receipt {ruri} says the batch was verified {}, the ledger \
                  recorded class {}",
-                r.verification.class,
+                shown(&r.verification.class),
                 class.as_str()
             ));
         }
@@ -1363,6 +1404,7 @@ pub async fn scrub_held(
             if let Some((found, detail)) = receipt {
                 *receipt_counts.entry(found.as_str()).or_default() += 1;
                 if found.is_finding(opts.require_receipts) {
+                    let detail = format!("{detail}; {}", receipt_remedy(found));
                     tracing::warn!(
                         batch_id = %row.record.batch_id,
                         receipt = found.as_str(),

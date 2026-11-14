@@ -2021,3 +2021,62 @@ async fn the_command_checks_receipts_and_require_receipts_fails_on_a_missing_one
     let text = std::fs::read_to_string(&metrics).unwrap();
     assert_eq!(metric_value(&text, "vtop_scrub_last_run_findings"), 1.0);
 }
+
+/// Review of #711: the ledger pinned the manifest's version, and a receipt
+/// that names none is not bound to it.
+#[tokio::test]
+async fn a_receipt_without_the_pinned_manifest_version_is_mismatched() {
+    let a = receipted_archive(1, None).await;
+    let ledger = a.ledger().await;
+    assert!(
+        ledger[0].manifest_version_id.is_some(),
+        "the mock pins versions"
+    );
+    let unpinned = a
+        .rebuilt_receipt(&ledger[0], &ManifestKeyring::default(), |b| {
+            b.manifest_version_id = None
+        })
+        .await;
+    a.overwrite(&a.receipt_uri_of(&ledger[0]), &unpinned, true)
+        .await;
+    let report = a.scrub(&with_receipts(false)).await;
+    assert_eq!(
+        receipt_findings(&report),
+        vec![(ledger[0].batch_id.clone(), ReceiptResult::Mismatched)],
+        "{report:#?}"
+    );
+    assert!(report.findings[0].detail.contains("version"), "{report:#?}");
+}
+
+/// Review of #711: a finding quotes strings read from the stored receipt,
+/// which anyone who can write the bucket can set when no key is configured:
+/// they are cut short and stripped of URL query strings, and the finding
+/// says what to do.
+#[tokio::test]
+async fn a_receipt_finding_quotes_stored_strings_bounded_and_redacted() {
+    let a = receipted_archive(1, None).await;
+    let ledger = a.ledger().await;
+    let hostile = format!(
+        "https://store.example/x?X-Amz-Signature=deadbeef{}",
+        "y".repeat(10_000)
+    );
+    let forged = a
+        .rebuilt_receipt(&ledger[0], &ManifestKeyring::default(), |b| {
+            b.batch_id = hostile.clone()
+        })
+        .await;
+    a.overwrite(&a.receipt_uri_of(&ledger[0]), &forged, true)
+        .await;
+    let report = a.scrub(&with_receipts(false)).await;
+    assert_eq!(
+        receipt_findings(&report),
+        vec![(ledger[0].batch_id.clone(), ReceiptResult::Mismatched)]
+    );
+    let detail = &report.findings[0].detail;
+    assert!(!detail.contains("X-Amz-Signature"), "{detail}");
+    assert!(detail.len() < 2_000, "bounded: {} bytes", detail.len());
+    assert!(
+        detail.contains("not this batch's as the ledger recorded it"),
+        "what to do: {detail}"
+    );
+}

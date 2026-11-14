@@ -440,7 +440,7 @@ impl Metrics {
         )?;
         let verification_receipts_total = cv(
             "verification_receipts_total",
-            "Verification receipts by result: written (by the engine after VERIFIED), failed (could not be written; the batch committed regardless and vtopctl scrub reports the receipt missing once it is committed), repaired (written by recovery for a VERIFIED batch that had none)",
+            "Verification receipts by result: written (by the engine after VERIFIED), failed (could not be written, or under Object Lock not stored locked; the batch committed regardless, and the WARN verification_receipt_failed says why), repaired (written by recovery for a VERIFIED batch that had none)",
             vec!["tenant", "result"],
         )?;
         let manifest_authentications_total = cv(

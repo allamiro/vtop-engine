@@ -69,10 +69,37 @@ fn redacted(error: &impl std::fmt::Display) -> String {
     redact_urls(&error.to_string())
 }
 
+/// The longest a receipt's writes (and recovery's look first) may take: the
+/// request timeout, and never more than 30 s (review of #711). The store
+/// client alone allows its whole retry budget, several request timeouts, and
+/// the receipt is awaited before the batch's commit, so a store that accepts
+/// the request and never answers would hold the commit that long.
+pub(crate) fn deadline(config: &VtopConfig) -> std::time::Duration {
+    std::time::Duration::from_secs(config.upload.request_timeout_seconds.clamp(1, 30))
+}
+
+/// [`write_unbounded`] under [`deadline`].
+pub(crate) async fn write(
+    backend: &dyn UploadBackend,
+    keyring: &ManifestKeyring,
+    config: &VtopConfig,
+    facts: &Facts<'_>,
+) -> Result<String, String> {
+    let limit = deadline(config);
+    tokio::time::timeout(limit, write_unbounded(backend, keyring, config, facts))
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "the store did not answer within the receipt's {}s deadline",
+                limit.as_secs()
+            ))
+        })
+}
+
 /// Build the receipt, stage it in the work directory, store it beside the
 /// manifest and, under the Object Lock profile, read its retention back.
 /// `Err` is why not, already redacted.
-pub(crate) async fn write(
+async fn write_unbounded(
     backend: &dyn UploadBackend,
     keyring: &ManifestKeyring,
     config: &VtopConfig,
@@ -107,10 +134,18 @@ pub(crate) async fn write(
     let path = written
         .write_to_file(Path::new(&config.engine.work_dir))
         .map_err(|e| format!("it could not be staged in the work directory ({e})"))?;
-    let stored = store(backend, config, facts, &uri, &path).await;
-    // Staged only for the upload; removed whatever became of it.
-    let _ = std::fs::remove_file(&path);
-    stored.map(|()| uri)
+    // Removed whatever becomes of the upload, a cancelled one included (the
+    // deadline drops this future at an await).
+    struct Staged<'a>(&'a Path);
+    impl Drop for Staged<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+    let _staged = Staged(&path);
+    store(backend, config, facts, &uri, &path)
+        .await
+        .map(|()| uri)
 }
 
 async fn store(
@@ -141,8 +176,10 @@ async fn store(
     };
     // Checked like the manifest beside it (#684): the version written, the
     // retention asked for.
+    // Not counted in vtop_object_lock_checks_total (review of #711): that
+    // family counts the object and manifest checks that fail batches, and
+    // its alert pages. A receipt's is a failed receipt, counted as one.
     let Some(expected) = stored.retention.map(|r| r.expectation()) else {
-        crate::object_lock::count(facts.tenant, "error");
         return Err(format!(
             "it was written without the retention upload.object_lock sets (mode {})",
             lock.mode
@@ -153,7 +190,6 @@ async fn store(
         .await
     {
         Ok(found) => {
-            crate::object_lock::count(facts.tenant, found.label());
             if found.passed() {
                 Ok(())
             } else {
@@ -163,13 +199,10 @@ async fn store(
                 ))
             }
         }
-        Err(e) => {
-            crate::object_lock::count(facts.tenant, "error");
-            Err(format!(
-                "it is stored, and its retention could not be read ({})",
-                redacted(&e)
-            ))
-        }
+        Err(e) => Err(format!(
+            "it is stored, and its retention could not be read ({})",
+            redacted(&e)
+        )),
     }
 }
 
@@ -244,7 +277,16 @@ pub(crate) async fn repair(
          the receipt"
             .to_owned()
     })?;
-    match backend.head_object(&uri).await {
+    let limit = deadline(config);
+    let head = tokio::time::timeout(limit, backend.head_object(&uri))
+        .await
+        .unwrap_or_else(|_| {
+            Err(vtop_core::errors::VtopError::Upload(format!(
+                "no answer within the receipt's {}s deadline",
+                limit.as_secs()
+            )))
+        });
+    match head {
         Ok(_) => return Ok(Repair::AlreadyThere),
         Err(e) if crate::scrub::looks_missing(&e) => {}
         Err(e) => {

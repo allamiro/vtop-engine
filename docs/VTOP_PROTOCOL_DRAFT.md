@@ -543,6 +543,22 @@ version). A batch committed without one keeps none: a later re-read would be
 a different statement, so an audit reports it missing rather than writing
 one.
 
+**Receipts recovery writes.** Recovery writes the receipt when its re-check
+of a `VERIFIED` batch passes, before it decides to commit, as the engine
+writes one before its own commit. Two consequences, both intended:
+
+- the receipt's `class` is the one the state store recorded and its `method`
+  is what the re-check ran, so a batch verified `strong` whose re-check could
+  only confirm size (accepted under the size-only opt-out) reads
+  `class: strong, method: size_only`;
+- a batch recovery holds back, and that is later replayed instead of
+  committed, keeps a receipt for a batch that never committed. Audits check
+  committed batches only, so such a receipt is never reported; the state
+  store says the batch was not committed.
+
+A writer bounds each receipt write by its own deadline, so a store that
+does not answer cannot hold a commit for long.
+
 **Checking a receipt.** Against the state store's row for its batch: the
 batch id, the manifest URI, digest and pinned version, the object URI, size
 and digest, and the class. Any difference means the receipt is not this

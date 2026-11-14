@@ -3359,6 +3359,14 @@ impl Engine {
             rec.manifest_sha256.as_deref(),
             checked.object.as_ref(),
         ) else {
+            // Not expected after a passing re-check; said, never skipped
+            // silently.
+            tracing::warn!(
+                batch_id = %rec.batch_id,
+                "recovery: no verification receipt written for a VERIFIED batch: the ledger row or \
+                 its re-check names no manifest or object; the batch is committed regardless, \
+                 and vtopctl scrub reports the receipt missing"
+            );
             return;
         };
         let class = rec
