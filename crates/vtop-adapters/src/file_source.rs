@@ -200,6 +200,10 @@ struct DeleteJob {
     hook: Option<DeleteHook>,
     #[cfg(test)]
     first_aside: Option<PathBuf>,
+    #[cfg(test)]
+    after_lease: Option<DeleteHook>,
+    #[cfg(test)]
+    before_unlink: Option<DeleteHook>,
 }
 
 impl DeleteJob {
@@ -261,6 +265,10 @@ impl DeleteJob {
         if let Some(hook) = &self.hook {
             hook(path);
         }
+        #[cfg(test)]
+        if let Some(hook) = &self.after_lease {
+            hook(path);
+        }
         if path.file_name().is_none() {
             return DeleteAttempt::Changed("the path names no file to move aside");
         }
@@ -292,7 +300,13 @@ impl DeleteJob {
             );
         };
         match candidate.compare(&md, &head, &tail) {
-            Compared::Unchanged => match std::fs::remove_file(&aside) {
+            Compared::Unchanged => match {
+                #[cfg(test)]
+                if let Some(hook) = &self.before_unlink {
+                    hook(&aside);
+                }
+                std::fs::remove_file(&aside)
+            } {
                 Ok(()) => DeleteAttempt::Deleted,
                 Err(error) => {
                     put_back(&aside, path);
@@ -354,6 +368,22 @@ pub struct FileSource {
     /// is already taken.
     #[cfg(test)]
     first_aside: Option<PathBuf>,
+    /// Runs once the delete holds its proof that no other process has the
+    /// file open, before the file is moved aside (#619).
+    #[cfg(test)]
+    after_lease: Option<DeleteHook>,
+    /// Runs after the final check of the file moved aside, just before the
+    /// unlink (#619).
+    #[cfg(test)]
+    before_unlink: Option<DeleteHook>,
+    /// Makes the open-file check answer "cannot tell", as it does on a
+    /// platform, filesystem or permission that offers none (#619).
+    #[cfg(test)]
+    no_open_check: bool,
+    /// Delete on the quiet period alone where the engine cannot check that no
+    /// other process holds the file open (#619,
+    /// `sources.file.delete_without_open_check`).
+    delete_without_open_check: bool,
     /// Per path, a descriptor on the file its cursor reads, kept while a
     /// range read from it is not committed (#621): when the file is rotated
     /// away, it is the way back to those ranges if one fails.
@@ -416,6 +446,13 @@ impl FileSource {
             before_delete: None,
             #[cfg(test)]
             first_aside: None,
+            #[cfg(test)]
+            after_lease: None,
+            #[cfg(test)]
+            before_unlink: None,
+            #[cfg(test)]
+            no_open_check: false,
+            delete_without_open_check: false,
         }
     }
 
@@ -426,6 +463,14 @@ impl FileSource {
     /// hold the file open for writing.
     pub fn with_delete_quiet_period(mut self, quiet: Duration) -> Self {
         self.delete_quiet = quiet;
+        self
+    }
+
+    /// Whether `delete_after_commit` may delete a file on the quiet period
+    /// alone where it cannot check that no other process holds the file open
+    /// (#619).
+    pub fn with_delete_without_open_check(mut self, allow: bool) -> Self {
+        self.delete_without_open_check = allow;
         self
     }
 
@@ -632,6 +677,10 @@ impl FileSource {
             hook: self.before_delete.clone(),
             #[cfg(test)]
             first_aside: self.first_aside.clone(),
+            #[cfg(test)]
+            after_lease: self.after_lease.clone(),
+            #[cfg(test)]
+            before_unlink: self.before_unlink.clone(),
         })
     }
 
@@ -6759,6 +6808,254 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from(".vtop-delete.taken")]);
+    }
+
+    // ---- #619 after #631: whether a process holds the file open ------------
+
+    /// #631's first residual (#619): a writer that holds the log open with
+    /// `O_APPEND` and is silent for longer than the quiet period. The file
+    /// looks finished - same length, same mtime - so the quiet period ran out
+    /// and the file was deleted; the writer's next line went into the unlinked
+    /// inode, which nothing reads. How long a file has been quiet cannot say
+    /// whether a process still holds it open.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_writer_silent_for_longer_than_the_quiet_period_keeps_the_file_it_holds_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"one\ntwo\n").unwrap();
+        let quiet = Duration::from_millis(50);
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(quiet);
+        let pass = fs
+            .read_all_batch_candidates(&[src(&path)], 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let reads = pass.outcomes[0].result.as_ref().unwrap();
+        assert_eq!(reads[0].records.len(), 2);
+        fs.commit_progress(&reads[0].progress_end).await.unwrap();
+
+        // Silent for twice the quiet period, the descriptor still open; the
+        // engine's next pass finds the quiet period over.
+        std::thread::sleep(quiet * 2);
+        fs.read_all_batch_candidates(&[src(&path)], 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        writer.write_all(b"three\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("one\ntwo\nthree\n"),
+            "deleted while a writer still held it open; \"three\" went into an unlinked \
+             inode that nothing will read"
+        );
+        let next = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            next[0].records,
+            vec![b"three".to_vec()],
+            "the line the writer wrote after its silence is read for archiving"
+        );
+    }
+
+    /// #631's second residual (#619): a writer that holds the file open, and
+    /// whose write lands after the delete's final check of the file moved
+    /// aside but before the unlink. The check saw the file unchanged, so the
+    /// unlink took the write with it. The seam writes exactly there, through
+    /// the writer's own descriptor.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_between_the_final_check_and_the_unlink_is_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"one\ntwo\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let late = std::sync::Mutex::new(Some(writer.try_clone().unwrap()));
+        fs.before_unlink = Some(std::sync::Arc::new(move |_| {
+            if let Some(mut w) = late.lock().unwrap().take() {
+                w.write_all(b"three\n").unwrap();
+            }
+        }));
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(read[0].records.len(), 2);
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("one\ntwo\nthree\n"),
+            "the write that landed between the final check and the unlink was unlinked \
+             with the file, unarchived"
+        );
+        let next = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(next[0].records, vec![b"three".to_vec()]);
+    }
+
+    /// #619: a writer that OPENS the file while the delete is under way -
+    /// after the decision, before the move aside - holds a descriptor on the
+    /// inode about to be unlinked. Every check of the file still passes,
+    /// since it has not written yet; it writes once the delete is over, into
+    /// a file no path names. The seam opens the file from another thread,
+    /// as another process would, and the write comes after the delete.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_writer_that_opens_the_file_while_it_is_being_deleted_keeps_it() {
+        use std::sync::{mpsc, Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let (go, wait_for_go) = mpsc::channel::<()>();
+        let wait_for_go = Arc::new(Mutex::new(Some(wait_for_go)));
+        let opener: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+        let (seam_opener, seam_path) = (opener.clone(), path.clone());
+        fs.after_lease = Some(Arc::new(move |_| {
+            let Some(wait_for_go) = wait_for_go.lock().unwrap().take() else {
+                return;
+            };
+            let (started, wait_for_start) = mpsc::channel::<()>();
+            let path = seam_path.clone();
+            *seam_opener.lock().unwrap() = Some(std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let mut w = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                wait_for_go.recv().unwrap();
+                w.write_all(b"late\n").unwrap();
+            }));
+            wait_for_start.recv().unwrap();
+            // Long enough for the open to reach the file.
+            std::thread::sleep(Duration::from_millis(300));
+        }));
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        let opener = opener.lock().unwrap().take().expect(
+            "the seam never ran, so the delete never got that far and this test proves nothing",
+        );
+        go.send(()).unwrap();
+        opener.join().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("one\ntwo\nlate\n"),
+            "a writer opened the file while it was being deleted, and \"late\" went into \
+             the unlinked inode"
+        );
+        let next = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(next[0].records, vec![b"late".to_vec()]);
+    }
+
+    /// #619: where the engine cannot check whether another process holds the
+    /// file open - a platform without write leases, a filesystem that does
+    /// not support them (NFS, FUSE), or a file owned by another user without
+    /// CAP_LEASE - the quiet period is all that is left, and it is a guess. The
+    /// delete is refused, loudly, rather than risk a writer's lines; the
+    /// candidate is dropped so the refusal is not retried every pass. An
+    /// operator who sets `delete_without_open_check` gets the quiet period
+    /// alone, by choice.
+    #[tokio::test]
+    async fn a_delete_is_refused_where_no_open_check_is_possible_unless_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        fs.no_open_check = true;
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("one\ntwo\n"),
+            "deleted on the quiet period alone, with no way to tell whether a writer holds it \
+             open"
+        );
+        assert!(
+            fs.cursors[&path].delete_candidate.is_none(),
+            "a refusal that cannot change is not retried on every pass"
+        );
+
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO)
+            .with_delete_without_open_check(true);
+        fs.no_open_check = true;
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "with delete_without_open_check the operator chose the quiet period alone"
+        );
+    }
+
+    /// The identity behind a delete is `continuity::proves` (#647): positive
+    /// proof, where anything unknown answers no. The delete path had its own
+    /// test, which passed a marker with no first-page fingerprint on the
+    /// inode and the length alone. A same-inode rewrite of the same length
+    /// that landed before the commit was then deleted, unread.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_commit_that_names_no_first_page_never_deletes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let mut end = read[0].progress_end.clone();
+        if let ProgressMarker::File {
+            content_fingerprint,
+            tail_fingerprint,
+            ..
+        } = &mut end
+        {
+            *content_fingerprint = None;
+            *tail_fingerprint = None;
+        }
+        // Rewritten in place before the commit lands: same inode and length.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"ONE\nTWO\n")
+            .unwrap();
+        fs.commit_progress(&end).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("ONE\nTWO\n"),
+            "a commit naming no first page cannot prove the file at the path is the one it \
+             read, and the rewrite was deleted unread"
+        );
     }
 
     /// #620: a fixed header longer than one page. Every file that starts with
