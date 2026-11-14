@@ -85,23 +85,57 @@ async fn collector(mode: Collector) -> (String, mpsc::UnboundedReceiver<Received
     (base, rx)
 }
 
+/// batch_id -> trace id (hex) of every `batch` span in the exports.
+fn batch_traces(requests: &[&Received]) -> std::collections::HashMap<String, String> {
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    use prost::Message;
+    let mut traced = std::collections::HashMap::new();
+    for r in requests {
+        let request = ExportTraceServiceRequest::decode(r.body.as_slice()).unwrap();
+        for span in request
+            .resource_spans
+            .iter()
+            .flat_map(|rs| &rs.scope_spans)
+            .flat_map(|ss| &ss.spans)
+            .filter(|s| s.name == "batch")
+        {
+            let batch_id = span
+                .attributes
+                .iter()
+                .find(|kv| kv.key == "batch_id")
+                .and_then(|kv| match kv.value.as_ref()?.value.as_ref()? {
+                    Value::StringValue(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .expect("a batch span without a batch_id");
+            let hex: String = span.trace_id.iter().map(|b| format!("{b:02x}")).collect();
+            traced.insert(batch_id, hex);
+        }
+    }
+    traced
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// A config archiving one file to a local directory.
+/// A config archiving two files to a local directory: two batches, which
+/// run through the verify phase together.
 fn config(dir: &Path) -> std::path::PathBuf {
     std::fs::create_dir_all(dir.join("in")).unwrap();
-    std::fs::write(
-        dir.join("in").join("app.log"),
-        format!("{RECORD} 1\n{RECORD} 2\n{RECORD} 3\n"),
-    )
-    .unwrap();
+    for name in ["app", "other"] {
+        std::fs::write(
+            dir.join("in").join(format!("{name}.log")),
+            format!("{name} {RECORD} 1\n{name} {RECORD} 2\n"),
+        )
+        .unwrap();
+    }
     let path = dir.join("config.yaml");
     std::fs::write(
         &path,
         format!(
-            "engine:\n  name: vtop-otel-test\n  tenant: default\n  state_store: \"sqlite://{d}/state.db\"\n  work_dir: {d}/work\n  log_level: INFO\nbatching: {{}}\ncompression: {{}}\nchecksum:\n  algorithm: sha256\nsources:\n  file:\n    enabled: true\n    paths:\n      - {d}/in/*.log\nupload:\n  backend: localfs\n  local_path: {d}/objects\n  bucket: telemetry\n  prefix: \"\"\n  create_bucket: true\n",
+            "engine:\n  name: vtop-otel-test\n  tenant: default\n  state_store: \"sqlite://{d}/state.db\"\n  work_dir: {d}/work\n  log_level: INFO\nbatching: {{}}\ncompression: {{}}\nchecksum:\n  algorithm: sha256\nsources:\n  file:\n    enabled: true\n    paths:\n      - {d}/in/app.log\n      - {d}/in/other.log\nupload:\n  backend: localfs\n  local_path: {d}/objects\n  bucket: telemetry\n  prefix: \"\"\n  create_bucket: true\n",
             d = dir.display()
         ),
     )
@@ -227,14 +261,6 @@ async fn export_on_sends_traces_and_metrics_and_says_so() {
         !log.contains(HEADER_SECRET),
         "a header value was logged: {log}"
     );
-    let correlated = log
-        .lines()
-        .filter(|l| l.contains("\"trace_id\":") && l.contains("batch_sealed"))
-        .count();
-    assert_eq!(
-        correlated, 1,
-        "the batch's log line carries no trace id: {log}"
-    );
 
     let all = received(&mut requests).await;
     let traces: Vec<_> = all
@@ -267,6 +293,24 @@ async fn export_on_sends_traces_and_metrics_and_says_so() {
             "record content was exported"
         );
     }
+    // Each batch's log line carries ITS batch's trace id: the two batches
+    // run together, and a line filed under the other's trace would pass a
+    // check for "has a trace id" (review of #693).
+    let traced = batch_traces(&traces);
+    assert_eq!(traced.len(), 2, "two batch spans expected: {traced:?}");
+    let mut sealed = 0;
+    for line in log.lines().filter(|l| l.contains("batch_sealed")) {
+        let value: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("not a JSON line ({e}): {line}"));
+        let batch_id = value["fields"]["batch_id"].as_str().unwrap();
+        assert_eq!(
+            value["trace_id"].as_str(),
+            traced.get(batch_id).map(String::as_str),
+            "the log line of {batch_id} carries another trace id: {line}"
+        );
+        sealed += 1;
+    }
+    assert_eq!(sealed, 2, "{log}");
     let spans: Vec<u8> = traces.iter().flat_map(|r| r.body.clone()).collect();
     for name in [
         &b"batch"[..],

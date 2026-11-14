@@ -371,7 +371,10 @@ inside a batch or a scrub check starts with that span's ids:
 {"trace_id":"2cba1c10e3e5dfef29fd793316c31b82","span_id":"dd6d32e18d43faad","timestamp":"...","level":"INFO","fields":{"message":"batch_sealed",...}}
 ```
 
-Lines outside a span are unchanged. In Grafana, Loki's derived field on
+Lines outside a span, and lines of a trace the sampler did not keep, are
+unchanged: an id that was never exported would link to nothing. Recovery's
+lines carry no ids (its row spans are never entered); find them by
+`batch_id`. In Grafana, Loki's derived field on
 `trace_id` and Tempo's trace-to-logs link connect the two.
 
 ### What is never exported or logged
@@ -399,7 +402,7 @@ the variable and what it accepts; `vtopctl validate` reports the same, and
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset: export off | Collector base URL; `/v1/traces` and `/v1/metrics` are appended. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset: export off | Collector base URL; `/v1/traces` and `/v1/metrics` are appended. With no endpoint set, no other `OTEL_*` variable is read or checked. Put a token in a header, not in the URL: the URL's host and path are printed at startup. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `..._METRICS_ENDPOINT` | unset | Full URL for one signal, used as given; wins over the base URL. Either alone turns on that signal only. |
 | `OTEL_TRACES_EXPORTER` / `OTEL_METRICS_EXPORTER` | `otlp` | `none` turns that signal off. |
 | `OTEL_SDK_DISABLED` | `false` | `true` turns all export off. |
@@ -407,11 +410,11 @@ the variable and what it accepts; `vtopctl validate` reports the same, and
 | `OTEL_RESOURCE_ATTRIBUTES` | none | Extra resource attributes, `key=value,...`. |
 | `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | `always_on`, `always_off`, `traceidratio`, `parentbased_always_on`, `parentbased_always_off`, `parentbased_traceidratio`. |
 | `OTEL_TRACES_SAMPLER_ARG` | `1.0` | The ratio, 0 to 1, for the ratio samplers. |
-| `OTEL_EXPORTER_OTLP_HEADERS` / `..._TRACES_HEADERS` / `..._METRICS_HEADERS` | none | `key=value,...` request headers (values percent-decoded), e.g. a collector token. A secret: supply it like the storage keys; it is never logged or printed. |
-| `OTEL_EXPORTER_OTLP_TIMEOUT` / `..._TRACES_TIMEOUT` | `10000` | Per trace export request, ms. |
+| `OTEL_EXPORTER_OTLP_HEADERS` / `..._TRACES_HEADERS` / `..._METRICS_HEADERS` | none | `key=value,...` request headers (values percent-decoded), e.g. a collector token; each must be a valid HTTP header. A secret: supply it like the storage keys; it is never logged or printed. |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` / `..._TRACES_TIMEOUT` | `10000` | Per trace export request, ms. `OTEL_EXPORTER_OTLP_TIMEOUT` also sets the metric export timeout when `OTEL_METRIC_EXPORT_TIMEOUT` is unset. |
 | `OTEL_METRIC_EXPORT_INTERVAL` | `60000` | Between metric exports, ms. |
 | `OTEL_METRIC_EXPORT_TIMEOUT` | `30000` | Per metric export, ms. |
-| `OTEL_BSP_MAX_QUEUE_SIZE` | `2048` | Spans the export queue holds. The memory bound: a span that finds it full is dropped and counted. |
+| `OTEL_BSP_MAX_QUEUE_SIZE` | `2048` | Spans the export queue holds, at most 1 000 000. The memory bound: a span that finds it full is dropped and counted. |
 | `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` | `512` | Spans per export request; at most the queue size. |
 | `OTEL_BSP_SCHEDULE_DELAY` | `5000` | The longest a span waits before its batch is sent, ms. |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` (and per signal) | `http/protobuf` | The only value accepted. |
@@ -430,7 +433,7 @@ cannot be switched off.
 | Collector unreachable, refusing, or slow past the timeout | WARN `OpenTelemetry trace export failed: ... batches are unaffected`, with the error and `dropped_since_last_warning`; at most one a minute (likewise for metrics) | Drops that export's spans or points, counts them, carries on. |
 | Collector slower than the engine | WARN `OpenTelemetry export queue full ... batches are unaffected ... raise OTEL_BSP_MAX_QUEUE_SIZE`, at most one a minute | Drops new spans while the queue is full, counts them. |
 | Shutdown, collector answering | INFO `OpenTelemetry trace flush: flushed N spans`, `OpenTelemetry metrics flush: exported N data points` | Exits. |
-| Shutdown, collector not answering | WARN `OpenTelemetry trace flush gave up after 5s, N spans dropped` | Exits after at most 5 s more. |
+| Shutdown, collector not answering | WARN `OpenTelemetry trace flush gave up after 5s, N spans dropped` | Exits after 5 s more (6 s at the outside). |
 | Another SIGINT/SIGTERM during that flush | WARN `stop signal during the OpenTelemetry flush` | Exits at once. |
 
 The exporter's own counters are on `/metrics` (and in the OTLP metrics), 0
@@ -449,8 +452,8 @@ bounded queue, or drops the span when it is full; one thread sends. Against a
 collector that accepts the connection and never answers, batches commit at the
 rate they commit with export off and memory stays flat
 (`crates/vtop-cli/tests/otel_hung_collector.rs` measures both). On a stop, the
-process waits at most **5 s** for the last spans and points after its own
-shutdown flush.
+process waits **5 s** for the last spans and points after its own shutdown
+flush (6 s at the outside: a 1 s backstop over the queue's own bound).
 
 ### Tempo in this lab
 

@@ -23,6 +23,7 @@ pub fn init_tracing(level: &str, json: bool, instance: Option<&str>) -> Result<(
         Process {
             service: SERVICE_NAME,
             instance,
+            traces: true,
         },
     )
     .map_err(|e| VtopError::Config(format!("OpenTelemetry: {e}")))?;
@@ -539,6 +540,7 @@ mod tests {
             Process {
                 service: SERVICE_NAME,
                 instance: Some("vtop-test"),
+                traces: true,
             },
         )
         .unwrap()

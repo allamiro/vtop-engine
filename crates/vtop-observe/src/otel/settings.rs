@@ -35,6 +35,9 @@ pub const PROTOCOL: &str = "http/protobuf";
 pub const DEFAULT_MAX_QUEUE: usize = 2048;
 /// Spans per export request (`OTEL_BSP_MAX_EXPORT_BATCH_SIZE`).
 pub const DEFAULT_MAX_BATCH: usize = 512;
+/// The most `OTEL_BSP_MAX_QUEUE_SIZE` and `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`
+/// accept: a typo must not reserve gigabytes (review of #693).
+pub const MAX_QUEUE: usize = 1_000_000;
 /// The longest a span waits in the queue (`OTEL_BSP_SCHEDULE_DELAY`).
 pub const DEFAULT_SCHEDULE_DELAY: Duration = Duration::from_millis(5_000);
 /// Per-request timeout (`OTEL_EXPORTER_OTLP_TIMEOUT`).
@@ -205,6 +208,15 @@ pub fn settings_from(
             .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty())
     };
+    // No endpoint, no export, and nothing else is read: a fleet that sets
+    // OTEL_* variables for other software must not stop starting because
+    // this one would refuse them (review of #693).
+    if [ENDPOINT_ENV, TRACES_ENDPOINT_ENV, METRICS_ENDPOINT_ENV]
+        .iter()
+        .all(|var| set(var).is_none())
+    {
+        return Ok(Settings::Off(format!("{ENDPOINT_ENV} unset")));
+    }
     if let Some(v) = set(SDK_DISABLED_ENV) {
         match v.to_ascii_lowercase().as_str() {
             "true" => return Ok(Settings::Off(format!("{SDK_DISABLED_ENV}=true"))),
@@ -284,12 +296,14 @@ pub fn settings_from(
             Some(v) => v
                 .parse::<usize>()
                 .ok()
-                .filter(|n| *n > 0)
-                .ok_or_else(|| invalid(var, "must be a whole number above 0")),
+                .filter(|n| (1..=MAX_QUEUE).contains(n))
+                .ok_or_else(|| {
+                    invalid(var, format!("must be a whole number from 1 to {MAX_QUEUE}"))
+                }),
         }
     };
     let shared_timeout = millis("OTEL_EXPORTER_OTLP_TIMEOUT")?;
-    let shared_headers = headers("OTEL_EXPORTER_OTLP_HEADERS", &env)?;
+    let shared_headers = headers("OTEL_EXPORTER_OTLP_HEADERS", &env, true)?;
 
     let traces = match (traces_on, traces_url) {
         (true, Some(endpoint)) => Some(Signal {
@@ -297,7 +311,7 @@ pub fn settings_from(
             timeout: millis("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT")?
                 .or(shared_timeout)
                 .unwrap_or(DEFAULT_TIMEOUT),
-            headers: headers("OTEL_EXPORTER_OTLP_TRACES_HEADERS", &env)?
+            headers: headers("OTEL_EXPORTER_OTLP_TRACES_HEADERS", &env, true)?
                 .unwrap_or_else(|| shared_headers.clone().unwrap_or_default()),
         }),
         _ => None,
@@ -309,7 +323,7 @@ pub fn settings_from(
                 .or(millis("OTEL_EXPORTER_OTLP_METRICS_TIMEOUT")?)
                 .or(shared_timeout)
                 .unwrap_or(DEFAULT_METRIC_TIMEOUT),
-            headers: headers("OTEL_EXPORTER_OTLP_METRICS_HEADERS", &env)?
+            headers: headers("OTEL_EXPORTER_OTLP_METRICS_HEADERS", &env, true)?
                 .unwrap_or_else(|| shared_headers.clone().unwrap_or_default()),
         }),
         _ => None,
@@ -328,7 +342,7 @@ pub fn settings_from(
             format!("must not exceed OTEL_BSP_MAX_QUEUE_SIZE ({max_queue})"),
         ));
     }
-    let resource_attributes = headers(RESOURCE_ATTRIBUTES_ENV, &env)?.unwrap_or_default();
+    let resource_attributes = headers(RESOURCE_ATTRIBUTES_ENV, &env, false)?.unwrap_or_default();
     let service_name = set(SERVICE_NAME_ENV)
         .or_else(|| {
             resource_attributes
@@ -371,10 +385,13 @@ fn check_url(variable: &'static str, url: &str) -> Result<String, ConfigError> {
 
 /// `key=value,...` with percent-encoded values (the W3C baggage form the
 /// spec uses). `None` when the variable is unset. An error names the
-/// variable only: the values are credentials.
+/// variable only: the values are credentials. With `http`, each pair must
+/// also be a valid HTTP header, which the exporters would otherwise drop or
+/// refuse on every request (review of #693).
 fn headers(
     variable: &'static str,
     env: &impl Fn(&str) -> Option<String>,
+    http: bool,
 ) -> Result<Option<Vec<(String, String)>>, ConfigError> {
     let Some(raw) = env(variable).filter(|v| !v.trim().is_empty()) else {
         return Ok(None);
@@ -394,7 +411,18 @@ fn headers(
                 "a header name is empty or not a valid token (value not shown)",
             ));
         }
-        parsed.push((key.to_owned(), percent_decode(value.trim())));
+        let value = percent_decode(value.trim());
+        if http
+            && (hyper::header::HeaderName::from_bytes(key.as_bytes()).is_err()
+                || hyper::header::HeaderValue::from_str(&value).is_err())
+        {
+            return Err(invalid(
+                variable,
+                "a header name or value is not valid in HTTP: names are ASCII tokens, \
+                 values visible ASCII (value not shown)",
+            ));
+        }
+        parsed.push((key.to_owned(), value));
     }
     Ok(Some(parsed))
 }
@@ -647,6 +675,60 @@ mod tests {
         ]);
         assert_eq!(e.variable, "OTEL_EXPORTER_OTLP_HEADERS");
         assert!(!e.to_string().contains("s3cret"), "{e}");
+    }
+
+    /// Review of #693: with no endpoint, export is off whatever else is
+    /// set. A fleet that sets these for other software must not stop
+    /// starting because this release reads them.
+    #[test]
+    fn without_an_endpoint_other_otel_settings_are_not_checked() {
+        for vars in [
+            &[(METRICS_EXPORTER_ENV, "prometheus")][..],
+            &[(TRACES_EXPORTER_ENV, "otlp,console")][..],
+            &[("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")][..],
+            &[("OTEL_EXPORTER_OTLP_COMPRESSION", "gzip")][..],
+            &[(SAMPLER_ENV, "sometimes")][..],
+        ] {
+            assert_eq!(
+                settings_from(env(vars), "vtop-engine"),
+                Ok(Settings::Off("OTEL_EXPORTER_OTLP_ENDPOINT unset".into())),
+                "{vars:?}"
+            );
+        }
+    }
+
+    /// Review of #693: a header the HTTP client would drop or refuse is a
+    /// startup error, not a 401 on every export.
+    #[test]
+    fn a_header_that_is_not_valid_http_is_refused_without_its_value() {
+        for raw in ["x(y=1", "k=a%0Ab-s3cret", "k=a%7Fb-s3cret"] {
+            let e = error(&[
+                (ENDPOINT_ENV, "http://c:4318"),
+                ("OTEL_EXPORTER_OTLP_HEADERS", raw),
+            ]);
+            assert_eq!(e.variable, "OTEL_EXPORTER_OTLP_HEADERS", "{raw}");
+            assert!(!e.to_string().contains("s3cret"), "{e}");
+        }
+        // Resource attributes are not headers: any UTF-8 value is fine.
+        assert_eq!(
+            on(&[
+                (ENDPOINT_ENV, "http://c:4318"),
+                (RESOURCE_ATTRIBUTES_ENV, "deployment.region=s%C3%A3o-paulo"),
+            ])
+            .resource_attributes,
+            vec![("deployment.region".to_owned(), "são-paulo".to_owned())]
+        );
+    }
+
+    /// Review of #693: the queue and batch sizes are bounded, so a typo
+    /// cannot allocate gigabytes at startup.
+    #[test]
+    fn an_absurd_queue_size_is_refused() {
+        for var in ["OTEL_BSP_MAX_QUEUE_SIZE", "OTEL_BSP_MAX_EXPORT_BATCH_SIZE"] {
+            let e = error(&[(ENDPOINT_ENV, "http://c:4318"), (var, "100000000")]);
+            assert_eq!(e.variable, var);
+            assert!(e.message.contains("1000000"), "{e}");
+        }
     }
 
     #[test]

@@ -22,6 +22,9 @@ fn export_threads() -> usize {
 #[test]
 fn without_an_endpoint_nothing_is_built_and_nothing_runs() {
     // Set before any other thread exists: the environment is process-wide.
+    // RUST_LOG too: a CI that raised it to debug would enable the spans for
+    // the log output and fail the check below for a reason not under test.
+    std::env::remove_var("RUST_LOG");
     for var in [
         otel::ENDPOINT_ENV,
         otel::TRACES_ENDPOINT_ENV,

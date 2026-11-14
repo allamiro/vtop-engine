@@ -55,6 +55,9 @@ tempfile = { workspace = true }
 # The in-memory span exporter the trace tests assert against (#683).
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# Decoding what the fake collector receives (tests/otel_messages.rs).
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
 
 # Integration tests live in the repo-root tests/ directory and are compiled as
 # integration tests of this package.

@@ -68,6 +68,9 @@ pub struct Process<'a> {
     pub service: &'a str,
     /// `service.instance.id` (the engine's name). The host name when `None`.
     pub instance: Option<&'a str>,
+    /// Whether the process opens spans. `vtop-node` does not yet, so it builds
+    /// no trace pipeline and says so.
+    pub traces: bool,
 }
 
 /// What is running, for [`shutdown`].
@@ -99,7 +102,21 @@ pub fn init(level: &str, json: bool, process: Process<'_>) -> Result<(), ConfigE
             tracing::info!("OpenTelemetry export disabled ({reason})");
             return Ok(());
         }
-        Ok(Settings::On(export)) => export,
+        Ok(Settings::On(mut export)) => {
+            if !process.traces {
+                export.traces = None;
+            }
+            if export.traces.is_none() && export.metrics.is_none() {
+                crate::logging::init(level, json);
+                tracing::info!(
+                    "OpenTelemetry export disabled ({} opens no spans and {} is none)",
+                    process.service,
+                    settings::METRICS_EXPORTER_ENV
+                );
+                return Ok(());
+            }
+            export
+        }
     };
     let runtime = match tokio::runtime::Handle::try_current() {
         Ok(runtime) => runtime,
@@ -318,7 +335,9 @@ pub fn current_ids() -> Option<(String, String)> {
     let cx = opentelemetry::Context::current();
     let span = cx.span();
     let sc = span.span_context();
-    sc.is_valid()
+    // Only a sampled trace reaches the collector; a sampled-out one's id
+    // would link a log line to nothing (review of #693).
+    (sc.is_valid() && sc.is_sampled())
         .then(|| (sc.trace_id().to_string(), sc.span_id().to_string()))
 }
 
@@ -439,4 +458,33 @@ async fn stop_signal() {
     }
     #[cfg(not(unix))]
     interrupt.await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    fn ids_inside_a_span(sampler: Sampler) -> Option<(String, String)> {
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter)
+            .with_sampler(sampler.to_sdk())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(layer(&provider));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::debug_span!(target: "vtop_test", "batch").in_scope(current_ids)
+    }
+
+    /// Review of #693: a log line carries a trace id only when that trace is
+    /// exported; a sampled-out trace's id would link to nothing in Tempo.
+    #[test]
+    fn log_lines_carry_ids_of_sampled_traces_only() {
+        let (trace_id, span_id) =
+            ids_inside_a_span(Sampler::AlwaysOn).expect("a sampled span gives its ids");
+        assert_eq!(trace_id.len(), 32);
+        assert_eq!(span_id.len(), 16);
+        assert_eq!(ids_inside_a_span(Sampler::AlwaysOff), None);
+        assert_eq!(current_ids(), None, "no ids outside a span");
+    }
 }

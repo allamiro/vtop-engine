@@ -187,6 +187,7 @@ async fn main() {
         vtop_observe::otel::Process {
             service: "vtop-node",
             instance: None,
+            traces: false,
         },
     ) {
         eprintln!("error: OpenTelemetry: {e}");

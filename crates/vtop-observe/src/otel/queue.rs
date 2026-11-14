@@ -60,6 +60,10 @@ struct Shared {
     pending: AtomicUsize,
     capacity: usize,
     closed: AtomicBool,
+    /// Set when shutdown stopped waiting for the final flush and counted what
+    /// was left as dropped: the worker, which may still finish later, then
+    /// leaves the counters alone so nothing is counted twice.
+    abandoned: AtomicBool,
     queue_full: RateLimited,
 }
 
@@ -101,6 +105,7 @@ impl ExportQueue {
             pending: AtomicUsize::new(0),
             capacity: settings.max_queue,
             closed: AtomicBool::new(false),
+            abandoned: AtomicBool::new(false),
             queue_full: RateLimited::new(WARN_INTERVAL),
         });
         let (sender, receiver) = mpsc::channel();
@@ -216,10 +221,12 @@ impl SpanProcessor for ExportQueue {
                 ))
             }
             Err(abandoned) => {
-                stats()
-                    .spans_dropped
+                self.shared.abandoned.store(true, Ordering::SeqCst);
+                let s = stats();
+                s.spans_dropped
                     .with_label_values(&["shutdown"])
                     .inc_by(abandoned as u64);
+                s.queue_length.sub(abandoned as i64);
                 tracing::warn!(
                     dropped = abandoned,
                     "OpenTelemetry trace flush gave up after {}s, {} spans dropped: the \
@@ -245,8 +252,17 @@ struct Worker<E> {
 }
 
 impl<E: SpanExporter> Worker<E> {
+    /// `n` spans are no longer pending (exported, failed or dropped).
+    fn settle(&self, n: usize) {
+        self.shared.pending.fetch_sub(n, Ordering::SeqCst);
+        if !self.shared.abandoned.load(Ordering::SeqCst) {
+            stats().queue_length.sub(n as i64);
+        }
+    }
+
     fn run(mut self, receiver: mpsc::Receiver<Msg>) {
-        let mut batch: Vec<SpanData> = Vec::with_capacity(self.settings.max_batch);
+        // Not preallocated: the batch grows only as spans arrive.
+        let mut batch: Vec<SpanData> = Vec::new();
         let mut due: Option<Instant> = None;
         loop {
             let wait = due.map_or(Duration::from_secs(3600), |d| {
@@ -270,6 +286,18 @@ impl<E: SpanExporter> Worker<E> {
                     if last {
                         let _ = self.exporter.shutdown();
                         let _ = reply.send(report);
+                        // A span whose `on_end` passed the `closed` check just
+                        // before shutdown set it lands behind this flush:
+                        // counted as dropped, not lost with the channel
+                        // (review of #693).
+                        for msg in receiver.try_iter() {
+                            if let Msg::Span(_) = msg {
+                                self.settle(1);
+                                if !self.shared.abandoned.load(Ordering::SeqCst) {
+                                    stats().spans_dropped.with_label_values(&["shutdown"]).inc();
+                                }
+                            }
+                        }
                         return;
                     }
                     let _ = reply.send(report);
@@ -295,8 +323,11 @@ impl<E: SpanExporter> Worker<E> {
             let chunk = std::mem::replace(&mut rest, tail);
             let n = chunk.len();
             let result = futures::executor::block_on(self.exporter.export(chunk));
-            self.shared.pending.fetch_sub(n, Ordering::SeqCst);
-            s.queue_length.sub(n as i64);
+            self.settle(n);
+            if self.shared.abandoned.load(Ordering::SeqCst) {
+                // Shutdown already counted these as dropped.
+                continue;
+            }
             match result {
                 Ok(()) => {
                     s.spans_exported.inc_by(n as u64);
@@ -321,5 +352,81 @@ impl<E: SpanExporter> Worker<E> {
             }
         }
         report
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry::trace::{SpanContext, SpanId, SpanKind, Status};
+    use std::time::SystemTime;
+
+    fn span() -> SpanData {
+        SpanData {
+            span_context: SpanContext::empty_context(),
+            parent_span_id: SpanId::INVALID,
+            parent_span_is_remote: false,
+            span_kind: SpanKind::Internal,
+            name: "batch".into(),
+            start_time: SystemTime::now(),
+            end_time: SystemTime::now(),
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            events: Default::default(),
+            links: Default::default(),
+            status: Status::Unset,
+            instrumentation_scope: Default::default(),
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Accepts;
+
+    impl SpanExporter for Accepts {
+        async fn export(&self, _batch: Vec<SpanData>) -> OTelSdkResult {
+            Ok(())
+        }
+    }
+
+    /// Review of #693: a span that reaches the channel after the final flush
+    /// (its `on_end` passed the `closed` check just before shutdown set it) is
+    /// counted as a shutdown drop and leaves the queue length at 0, rather
+    /// than vanishing with the channel.
+    #[test]
+    fn a_span_behind_the_final_flush_is_counted_not_lost() {
+        let shared = Arc::new(Shared {
+            pending: AtomicUsize::new(1),
+            capacity: 16,
+            closed: AtomicBool::new(true),
+            abandoned: AtomicBool::new(false),
+            queue_full: RateLimited::new(WARN_INTERVAL),
+        });
+        let worker = Worker {
+            exporter: Accepts,
+            shared: Arc::clone(&shared),
+            settings: QueueSettings {
+                max_queue: 16,
+                max_batch: 4,
+                schedule_delay: Duration::from_secs(5),
+            },
+            failures: RateLimited::new(WARN_INTERVAL),
+        };
+        let (sender, receiver) = mpsc::channel();
+        let (reply, answer) = mpsc::sync_channel(1);
+        sender.send(Msg::Flush { reply, last: true }).unwrap();
+        sender.send(Msg::Span(span())).unwrap();
+        let dropped = || stats().spans_dropped.with_label_values(&["shutdown"]).get();
+        let before = dropped();
+        worker.run(receiver);
+        assert_eq!(answer.recv().unwrap(), FlushReport::default());
+        assert_eq!(
+            shared.pending.load(Ordering::SeqCst),
+            0,
+            "the span is still counted as pending"
+        );
+        assert!(
+            dropped() > before,
+            "the span was lost without being counted"
+        );
     }
 }

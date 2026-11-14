@@ -117,7 +117,10 @@ with an endpoint set.
 - **What never leaves, and is never logged.** Record content, credentials,
   keys, MAC values, object and manifest URIs, URLs with a path or query string
   (a presigned URL carries its signature there), and the values of the
-  `OTEL_EXPORTER_OTLP_*HEADERS` variables.
+  `OTEL_EXPORTER_OTLP_*HEADERS` variables. The one URL that is printed is the
+  collector endpoint, as host and path (never user-info or query string), in
+  the startup line and `validate --print-effective`: a collector token
+  **MUST** go in a header, not in the endpoint's path or query.
   - Before an error message becomes a span status or a log line, every URL in
     it is cut to `scheme://host`, every run of 32 or more hex digits (a MAC, a
     key, a digest) becomes `<hex>`, and every AWS access key id becomes
@@ -146,9 +149,10 @@ with an endpoint set.
     the queue is full. One thread sends. A collector that is down or slow
     costs spans and data points, which are counted on `/metrics` and warned
     about at most once a minute.
-  - On a stop, the process flushes for at most 5 s after its own shutdown
-    flush, or not at all once another stop signal arrives, then exits
-    whatever the collector is doing.
+  - On a stop, the process flushes for 5 s after its own shutdown flush (6 s
+    at the outside: a 1 s backstop over the queue's own bound), or not at all
+    once another stop signal arrives, then exits whatever the collector is
+    doing.
 
 ### Authentication mechanisms
 
@@ -623,7 +627,7 @@ the ignore list and the build re-audited.
 | Credentials via env vars / mounted secrets / external secret managers | **SHOULD** |
 | TLS for Kafka and S3-compatible endpoints | **SHOULD** |
 | TLS for an off-host OTLP collector (export is off unless configured) | **SHOULD** |
-| Record content, credentials, keys, MACs, URLs with a path or query, or OTLP header values in exported telemetry or log lines | **MUST NOT** |
+| Record content, credentials, keys, MACs, URLs with a path or query (the collector endpoint aside, printed as host and path), or OTLP header values in exported telemetry or log lines | **MUST NOT** |
 | Error messages in span statuses redacted (URLs to host, hex runs, key ids) | **MUST** |
 | Hostname-verified TLS for remote PostgreSQL | **MUST** |
 | PostgreSQL URL supplied through an env/file reference | **MUST** |
