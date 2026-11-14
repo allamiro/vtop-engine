@@ -1068,10 +1068,14 @@ mode_mismatch. The deployment profile is
   nobody can remove them before the date: storage cost, said at startup.
 - **`vtopctl tier copy` refuses the block;** locking cold-tier copies is a
   separate decision.
-- **Proven against MinIO only** (RELEASE.2025-09-07, the lab's build). AWS S3
-  behaviour is taken from its documentation (the integrity header a locked
-  write needs, the permissions a HEAD needs to return the lock headers), not
-  measured.
+- **Proven against the S3 compatibility matrix's servers** (#722): the lab's
+  MinIO (RELEASE.2025-09-07), RustFS 1.0.5 and SeaweedFS 4.53 keep the lock;
+  Garage v2.5.0 implements no Object Lock and is refused at startup. Which
+  server did what is the generated
+  [S3 compatibility](reference/s3-compatibility.md) table. AWS S3 behaviour
+  is still taken from its documentation (the integrity header a locked write
+  needs, the permissions a HEAD needs to return the lock headers) until the
+  opt-in AWS workflow has run.
 
 ---
 
