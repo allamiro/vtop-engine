@@ -485,7 +485,11 @@ What follows from that, in the engine:
 - **"Unchanged" is one identity test**, `continuity::proves` (#647), the
   test every identity decision shares: the same inode, the first page
   (#578) and the page below the committed end (#620's tail fingerprint),
-  plus the exact length, mtime and ctime. The covering commit, the delete decision
+  plus the exact length, the mtime the batch READ (the marker's, not the
+  file's at commit time - review of #689: a same-length rewrite between
+  the pages during the upload, or during the downtime before recovery
+  commits, became the baseline and was deleted unread) and the ctime. The
+  covering commit, the delete decision
   and the final check before the unlink all make it. Before #619 was
   finished, the delete had a test of its own, which passed a marker that
   named no first page on the inode and length alone, so a same-inode,
@@ -521,7 +525,17 @@ What follows from that, in the engine:
   or a file whose mtime moved, leaves the delete unarmed, and the file is
   kept with a warning. The ledger has no ctime, so the candidate takes the
   file's ctime at the restart: a rewrite while the engine was down that
-  also set the mtime back is the one change a restart cannot see.
+  also set the mtime back is the one change a restart cannot see. The same
+  holds between a batch's read and its commit, for the same reason: the
+  marker records the mtime the batch read, not the ctime.
+- **Hard links.** Deleting one name of a file moves the ctime of the
+  others (#378 makes each its own source), so another name's delete then
+  finds the ctime moved and keeps its file, saying so. Nothing is lost; the
+  remaining name is removed by hand.
+- With `delete_without_open_check` and no lease, a delete whose unlink fails
+  after the move aside puts the file back, which moves its ctime; the next
+  attempt then keeps the file and says so, rather than trusting a ctime it
+  cannot vouch for.
 
 Limits, stated plainly:
 

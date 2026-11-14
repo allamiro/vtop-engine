@@ -453,9 +453,9 @@ pub struct FileSourceConfig {
     pub enabled: bool,
     pub paths: Vec<String>,
     /// If true, a source file is deleted once a committed batch covers it to
-    /// its end, it has then stayed unwritten - same inode, first page,
-    /// length and mtime - for `delete_quiet_seconds`, AND no process has it
-    /// open (#619).
+    /// its end, it has then stayed unwritten - same inode, first page, page
+    /// below the archived end, length, the mtime the batch read and the
+    /// ctime - for `delete_quiet_seconds`, AND no process has it open (#619).
     ///
     /// Safe for files nothing writes to any more: whole-file drops, and
     /// rotated logs once the writer has reopened its new file. A deleted file

@@ -221,9 +221,11 @@ impl Kept {
                 Level::WARN,
                 format!(
                     "not deleting {path}: its {archived} bytes look archived, but its mtime or \
-                     ctime changed since the commit (a touch, a chmod, or a rewrite between the \
-                     first page and the last, which cannot be told apart); it is KEPT and not \
-                     tried again - remove it by hand once you know it holds nothing new"
+                     ctime changed since they were read (a touch, a chmod, a rewrite between the \
+                     first page and the last - which cannot be told apart - or another name of \
+                     the same file being deleted); it is KEPT, and deleted only if a later commit \
+                     covers it unchanged - otherwise remove it by hand once you know it holds \
+                     nothing new"
                 ),
             ),
             Kept::Gone => (
@@ -289,7 +291,14 @@ impl DeleteCandidate {
         };
         let inode = inode_of(&md);
         if self.inode.is_none() || self.content.is_none() {
-            return Compared::Kept(Kept::Unprovable);
+            // A file still growing is simply not covered yet, which needs no
+            // warning on every commit - a platform without inode numbers
+            // would otherwise say "unprovable" for each one.
+            return Compared::Kept(if md.len() > self.end_byte {
+                Kept::Grew { len: md.len() }
+            } else {
+                Kept::Unprovable
+            });
         }
         if inode != self.inode {
             return Compared::Kept(Kept::OtherFile { inode });
@@ -467,6 +476,14 @@ impl DeleteJob {
         let candidate = &self.candidate;
         match std::fs::symlink_metadata(path) {
             Ok(md) if md.file_type().is_symlink() => return DeleteAttempt::Kept(Kept::Symlink),
+            // A FIFO or device swapped in at the path: never opened, since an
+            // open of a FIFO blocks a pool thread for as long as no writer
+            // comes.
+            Ok(md) if !md.is_file() => {
+                return DeleteAttempt::Kept(Kept::OtherFile {
+                    inode: inode_of(&md),
+                })
+            }
             Ok(_) => {}
             // GONE is not a failure to retry (review of #631): a candidate
             // kept for a vanished file outlives it, and would be held up
@@ -560,9 +577,10 @@ impl DeleteJob {
             }
         };
         // Put the file back and, if it is leased, say what its ctime is now:
-        // the rename and the put-back moved it, and nothing else could have -
-        // an opener waits on the lease (even one that has broken it) until it
-        // is released.
+        // the rename and the put-back moved it. Under the lease nothing can
+        // have changed the content meanwhile - an opener waits on it, even
+        // one that has broken it, until it is released; a chmod or utimes
+        // could move the ctime too, but neither changes a byte.
         let restore = |lease: &Option<write_lease::WriteLease<'_>>| {
             put_back(&aside, path);
             lease
@@ -582,10 +600,15 @@ impl DeleteJob {
         let moved = std::fs::symlink_metadata(&aside)
             .ok()
             .and_then(|md| dev_ino(&md));
-        if moved.is_none() || moved != file.metadata().ok().and_then(|md| dev_ino(&md)) {
+        let Some(moved) = moved else {
+            // Something removed or renamed the hidden name in the grace;
+            // there is nothing here to put back.
+            return DeleteAttempt::Kept(Kept::Gone);
+        };
+        if Some(moved) != file.metadata().ok().and_then(|md| dev_ino(&md)) {
             put_back(&aside, path);
             return DeleteAttempt::Kept(Kept::OtherFile {
-                inode: moved.map(|(_, ino)| ino),
+                inode: Some(moved.1),
             });
         }
         if lease.as_ref().is_some_and(|lease| !lease.intact()) {
@@ -2704,8 +2727,12 @@ fn put_back(aside: &Path, path: &Path) {
                     path = %path.display(),
                     aside = %aside.display(),
                     %error,
-                    "delete-after-commit: the file is back under its name, but the name it \
-                     was moved aside to could not be removed; both now name it"
+                    "delete-after-commit: {} is back under its name, but the hidden name it \
+                     was moved aside to, {}, could not be removed, so both name it; the hidden \
+                     name is read as a source of its own (a duplicate). Remove it by hand to \
+                     avoid that",
+                    path.display(),
+                    aside.display()
                 );
             }
         }
@@ -2990,9 +3017,11 @@ impl SourceAdapter for FileSource {
                             "found {name}, {} bytes left under a delete's hidden name by an \
                              interrupted delete (a crash between the move aside and the unlink) \
                              or by a put-back that found a new file at the path; it may hold \
-                             lines nothing archived, so it is archived as a source of its own \
-                             (the bytes already archived are archived again) and then deleted \
-                             like any other file. Nothing to do",
+                             lines nothing archived, so it is read as a source of its own (bytes \
+                             already archived under the old name are archived again) and then \
+                             deleted like any other file. Nothing to do - but keep \
+                             delete_after_commit on until it is gone, since only then is it \
+                             looked for",
                             md.len()
                         );
                     }
@@ -3186,6 +3215,7 @@ impl SourceAdapter for FileSource {
             end_byte,
             inode: marker_inode,
             file_size: marker_file_size,
+            mtime: marker_mtime,
             content_fingerprint: marker_content,
             tail_fingerprint: marker_tail,
             ..
@@ -3385,7 +3415,25 @@ impl SourceAdapter for FileSource {
                         let md = file.metadata().ok();
                         candidate.mtime = md.as_ref().and_then(|md| md.modified().ok());
                         candidate.ctime = md.as_ref().and_then(ctime_of);
-                        candidate.compare(&file, true)
+                        match candidate.compare(&file, true) {
+                            // THE BASELINE IS THE READ, not this commit (review
+                            // of #689): a same-length rewrite between the two
+                            // pages that lands while the batch uploads and
+                            // verifies - or while the engine is down, for a
+                            // batch recovery commits - would otherwise become
+                            // "unchanged" and be deleted unread. The marker's
+                            // mtime came from the descriptor the batch read;
+                            // an empty one (unknown) proves nothing either.
+                            Compared::Unchanged
+                                if marker_mtime.is_empty()
+                                    || md.as_ref().is_none_or(|md| {
+                                        Self::identity_of(md).mtime != *marker_mtime
+                                    }) =>
+                            {
+                                Compared::Kept(Kept::MetadataMoved)
+                            }
+                            verdict => verdict,
+                        }
                     }
                     // A file that can no longer be opened is not the one
                     // read either.
@@ -3393,6 +3441,14 @@ impl SourceAdapter for FileSource {
                 })
             };
             match verdict {
+                // A stale batch that never reached the end of its file: no
+                // delete was ever due for it.
+                None if *marker_file_size > archived => tracing::debug!(
+                    path,
+                    archived_bytes = archived,
+                    "not deleting {path} for this commit: its batch was read before the file was \
+                     rotated or truncated, and did not reach its end"
+                ),
                 None => self.notify(
                     "stale_commit",
                     tracing::Level::INFO,
@@ -6204,12 +6260,19 @@ mod tests {
     /// cursor dropped, nothing reads that path again, so nothing else would
     /// ever close the descriptor: it pinned the deleted file's space, and a
     /// slot of the limit, for the life of the process.
+    ///
+    /// The append and the cut move the mtime, and since review of #689 a
+    /// commit keeps a file whose mtime is not the one its batch read. So the
+    /// cut sets the mtime back to what the first read saw: the one change a
+    /// commit cannot see (the marker records no ctime), and the way to reach
+    /// a delete with the descriptor still held, which is what is under test.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_delete_closes_a_descriptor_the_adapter_still_held_for_that_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.log").to_string_lossy().into_owned();
         std::fs::write(&path, "a 1\n").unwrap(); // 4 bytes
+        let first_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
             .with_delete_quiet_period(Duration::ZERO);
         let first = read_all_one(&mut fs, &path).await;
@@ -6227,12 +6290,10 @@ mod tests {
             "a later window, [4, 8), outstanding"
         );
         // Cut back to the first window's end before the second commits.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_len(4)
-            .unwrap();
+        let cut = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        cut.set_len(4).unwrap();
+        cut.set_modified(first_mtime).unwrap();
+        drop(cut);
 
         fs.commit_progress(&first[0].progress_end).await.unwrap();
         assert!(
@@ -7904,6 +7965,49 @@ mod tests {
                 fs.notices
             );
         }
+    }
+
+    /// The same rewrite between the two pages, landing after the READ and
+    /// before the COMMIT - the whole upload and verify, or the whole downtime
+    /// for a batch recovery commits after a crash (review of #689). The
+    /// covering commit took the file as it found it for the baseline, so the
+    /// rewrite became "unchanged" and was deleted unread. The marker's mtime,
+    /// taken through the descriptor the batch read, is the baseline now.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rewrite_between_the_read_and_the_commit_is_never_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let (original, rewrite) = (long_file("old"), long_file("NEW"));
+        std::fs::write(&path, &original).unwrap();
+        let quiet = Duration::from_millis(50);
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(quiet);
+        let read = fs
+            .read_batch_candidates(&src(&path), 10_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        // A later second, so a coarse mtime still moves.
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(rewrite.as_bytes())
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        for _ in 0..3 {
+            pass_after(&mut fs, &path, quiet).await;
+        }
+        assert!(
+            std::fs::read_to_string(&path).ok().as_deref() == Some(rewrite.as_str()),
+            "rewritten between the read and the commit, and deleted with the rewrite unread"
+        );
+        assert!(
+            notice(&fs, &format!("not deleting {path}: its 12000 bytes look archived, but its mtime or ctime changed")),
+            "{:?}",
+            fs.notices
+        );
     }
 
     /// A configured path that is a symbolic link. A rename moves the link,

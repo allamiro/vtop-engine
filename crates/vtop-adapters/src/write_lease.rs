@@ -61,7 +61,9 @@ pub(crate) enum Sole<'a> {
 /// Filesystems on which a write lease sees every opener of a file: local
 /// ones, by `statfs` `f_type` (`linux/magic.h`). An overlay counts: it is
 /// the container's own root, and its lower and upper layers are local
-/// directories.
+/// directories. Its lease sees writers that go through the overlay mount,
+/// not a host process writing the upper layer's file directly - which
+/// nothing that writes a container's logs does.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const LOCAL_FILESYSTEMS: &[(u32, &str)] = &[
     (0xEF53, "ext2/ext3/ext4"),
