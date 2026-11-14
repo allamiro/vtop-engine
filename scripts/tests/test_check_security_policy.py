@@ -55,6 +55,10 @@ If that page offers no form, open an issue titled `Security contact request`.
 
 Only the latest minor release receives security fixes.
 
+| Version | Security fixes |
+|---|---|
+| 0.9.x | yes |
+
 ## Coordinated disclosure
 
 Keep the report private until a fix is released or 90 days after the report.
@@ -66,6 +70,9 @@ FILES = {
     "CONTRIBUTING.md": "## Security\n\nSee [SECURITY.md](SECURITY.md).\n",
     "docs/security-policy.md": "<!-- vtop:include SECURITY.md -->\n",
     "docs/SECURITY_MODEL.md": "# Security model\n",
+    "Cargo.toml": '[workspace]\nmembers = []\n\n[workspace.package]\nversion = "0.9.1"\nedition = "2021"\n',
+    ".github/ISSUE_TEMPLATE/config.yml": "blank_issues_enabled: false\n",
+    ".github/ISSUE_TEMPLATE/security_contact.yml": 'name: Security contact request\ntitle: "Security contact request"\nbody: []\n',
 }
 
 
@@ -131,7 +138,8 @@ class CheckTests(unittest.TestCase):
         self.assertOneProblem(self.problems({"SECURITY.md": text}), "high")
 
     def test_no_supported_versions_section_fails(self):
-        text = self.without("## Supported versions\n\nOnly the latest minor release receives security fixes.\n")
+        start = POLICY.index("## Supported versions")
+        text = POLICY[:start] + POLICY[POLICY.index("## Coordinated disclosure"):]
         self.assertOneProblem(self.problems({"SECURITY.md": text}), "Supported versions")
 
     def test_no_disclosure_rule_fails(self):
@@ -149,6 +157,27 @@ class CheckTests(unittest.TestCase):
     def test_external_links_and_anchors_are_not_treated_as_paths(self):
         text = POLICY + "\nSee [model](docs/SECURITY_MODEL.md#14-x) and [top](#reporting-a-vulnerability).\n"
         self.assertEqual(self.problems({"SECURITY.md": text}), [])
+
+    def test_a_fallback_no_issue_form_can_open_fails(self):
+        # Blank issues are off, so the fallback needs its own form (review of #760).
+        problems = self.problems({".github/ISSUE_TEMPLATE/security_contact.yml": None})
+        self.assertOneProblem(problems, "Security contact request", "blank_issues_enabled")
+
+    def test_a_fallback_through_blank_issues_needs_no_form(self):
+        problems = self.problems({
+            ".github/ISSUE_TEMPLATE/config.yml": "blank_issues_enabled: true\n",
+            ".github/ISSUE_TEMPLATE/security_contact.yml": None,
+        })
+        self.assertEqual(problems, [])
+
+    def test_a_supported_version_behind_the_workspace_version_fails(self):
+        # After a minor bump, a policy still naming the old minor is stale (review of #760).
+        cargo = FILES["Cargo.toml"].replace('"0.9.1"', '"0.10.0"')
+        self.assertOneProblem(self.problems({"Cargo.toml": cargo}), "0.10.x", "Supported versions")
+
+    def test_a_patch_release_keeps_the_supported_minor(self):
+        cargo = FILES["Cargo.toml"].replace('"0.9.1"', '"0.9.7"')
+        self.assertEqual(self.problems({"Cargo.toml": cargo}), [])
 
     def test_a_readme_without_the_link_fails(self):
         self.assertOneProblem(self.problems({"README.md": "No link here.\n"}), "README.md")

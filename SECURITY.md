@@ -15,6 +15,8 @@ maintainers and you can read the report and the conversation that follows.
 
 **If that page offers no form to fill in** (private reporting has been switched
 off for the repository), open a public issue titled `Security contact request`
+with the
+[security contact request form](https://github.com/allamiro/vtop-engine/issues/new?template=security_contact.yml),
 and write nothing about the problem in it: no component, no symptom, no
 version. The maintainer replies there with a private channel, and the issue is
 closed once you are in touch.

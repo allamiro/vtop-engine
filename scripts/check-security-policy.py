@@ -12,9 +12,13 @@ this check reads it and fails when:
   - no line gives an acknowledgement time in days;
   - the fix-target table lacks a critical, high, medium or low row, or a row
     has an empty target;
-  - the "Supported versions" section is missing or empty;
+  - the "Supported versions" section is missing or empty, or has no
+    "| X.Y.x | yes |" row for the workspace version in Cargo.toml, so a minor
+    release cannot leave the policy naming the previous one;
   - the "Coordinated disclosure" section is missing or gives no day count;
   - a relative link in SECURITY.md points at a path that does not exist;
+  - blank issues are off (.github/ISSUE_TEMPLATE/config.yml) and no issue form
+    is titled "Security contact request", so the fallback cannot be used;
   - README.md or CONTRIBUTING.md does not link to SECURITY.md, or
     docs/security-policy.md does not include it.
 
@@ -70,6 +74,14 @@ def _policy_problems(root: pathlib.Path, text: str) -> list[str]:
     supported = _section(text, "Supported versions")
     if not supported:
         problems.append('SECURITY.md has no "## Supported versions" section, or it is empty')
+    else:
+        current = _workspace_minor(root)
+        row = _table_row(supported, f"{current}.x") if current else None
+        if current and not (row and len(row) > 1 and row[1].lower().startswith("yes")):
+            problems.append(
+                f'SECURITY.md\'s "Supported versions" section has no "| {current}.x | yes |" row, '
+                f"but Cargo.toml's workspace version is {current}: update it with the release"
+            )
     disclosure = _section(text, "Coordinated disclosure")
     if disclosure is None:
         problems.append('SECURITY.md has no "## Coordinated disclosure" section')
@@ -84,11 +96,41 @@ def _policy_problems(root: pathlib.Path, text: str) -> list[str]:
     return problems
 
 
+def _workspace_minor(root: pathlib.Path) -> str | None:
+    """MAJOR.MINOR of [workspace.package] version in Cargo.toml, if there is one."""
+    cargo = root / "Cargo.toml"
+    if not cargo.is_file():
+        return None
+    m = re.search(r'^\[workspace\.package\][^\[]*?^version\s*=\s*"(\d+)\.(\d+)\.',
+                  cargo.read_text(encoding="utf-8"), re.M | re.S)
+    return f"{m.group(1)}.{m.group(2)}" if m else None
+
+
+def _fallback_problems(root: pathlib.Path) -> list[str]:
+    """The fallback is an issue titled FALLBACK_TITLE. With blank issues off,
+    only an issue form can open one, so a form must carry that title."""
+    templates = root / ".github" / "ISSUE_TEMPLATE"
+    config = templates / "config.yml"
+    text = config.read_text(encoding="utf-8") if config.is_file() else ""
+    if not re.search(r"^blank_issues_enabled:\s*false\b", text, re.M):
+        return []
+    for form in sorted(templates.glob("*.y*ml")):
+        if form.name.startswith("config."):
+            continue
+        if re.search(r'^title:\s*["\']?' + re.escape(FALLBACK_TITLE), form.read_text(encoding="utf-8"), re.M):
+            return []
+    return [
+        f'blank_issues_enabled is false in {config.relative_to(root)}, and no issue form is titled '
+        f'"{FALLBACK_TITLE}", so the fallback SECURITY.md describes cannot be opened'
+    ]
+
+
 def check(root: pathlib.Path) -> list[str]:
     policy = root / "SECURITY.md"
     if not policy.is_file():
         return ["SECURITY.md does not exist at the repository root, where GitHub looks for it"]
     problems = _policy_problems(root, policy.read_text(encoding="utf-8"))
+    problems += _fallback_problems(root)
     for name in ("README.md", "CONTRIBUTING.md"):
         p = root / name
         text = p.read_text(encoding="utf-8") if p.is_file() else ""
