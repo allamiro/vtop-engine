@@ -337,6 +337,7 @@ impl<'a> Pipeline<'a> {
             manifest_sha256: None,
             manifest_version_id: None,
             object_size_bytes: None,
+            verification_class: None,
             record_count: Some(batch.records.len() as i64),
             error_message: None,
             // Ownership (#93): this engine claims the batch at birth, leased so
@@ -1173,13 +1174,34 @@ impl<'a> Pipeline<'a> {
         // (VERIFIED -> SOURCE_COMMITTED below). The on-disk manifest was written
         // and uploaded *before* this step (its hash must be stable), so we do
         // not re-stamp it here — querying the store is the source of truth.
-        if backend_limited {
-            tracing::warn!(batch_id, "verification_passed (backend_limited: size-only)");
+        // The class goes into the ledger with the transition (#664): a
+        // recovery after a restart counts the commit by it, not by what its
+        // own re-check of the store finds then. The backends' own messages
+        // name the check that ran (a store checksum, a read-back, size only).
+        let class = if backend_limited {
+            vtop_state::VerificationClass::SizeOnly
         } else {
-            tracing::info!(batch_id, "verification_passed");
+            vtop_state::VerificationClass::Strong
+        };
+        if backend_limited {
+            tracing::warn!(
+                batch_id,
+                verification_class = class.as_str(),
+                object_check = %obj_v.message,
+                manifest_check = %man_v.message,
+                "verification_passed (backend_limited: size-only)"
+            );
+        } else {
+            tracing::info!(
+                batch_id,
+                verification_class = class.as_str(),
+                object_check = %obj_v.message,
+                manifest_check = %man_v.message,
+                "verification_passed"
+            );
         }
         let t_write = Instant::now();
-        self.store.mark_verified(&batch_id).await?;
+        self.store.mark_verified(&batch_id, class).await?;
         state_write += t_write.elapsed();
         // Counted only AFTER the store has persisted ManifestUploaded ->
         // Verified. Incrementing first would let a failed state write leave
@@ -2272,14 +2294,17 @@ impl Engine {
                         ])
                         .inc();
                 }
-                // A size-only acceptance at recovery's re-check is counted at
-                // the commit, as `commit_recovered` counts it (#651).
+                // A size-only verification is counted at the commit, as
+                // `commit_recovered` counts it (#651): by the class `rec`,
+                // read again just above, was verified with (#664), and by
+                // recovery's re-check only for a row with none.
                 if let Some(recheck) = row.recheck {
                     verification_mode::count_size_only_commit(recheck, &rec);
                 }
                 tracing::info!(
                     batch_id = %rec.batch_id,
                     held_back = row.held_back,
+                    verification_class = verification_mode::class_name(&rec),
                     "source_committed (an earlier pass left it VERIFIED)"
                 );
                 true
@@ -2868,6 +2893,7 @@ impl Engine {
                     // anything less trusts a stale claim about a system this
                     // process has never observed.
                     let recheck = self.storage_still_verified(&rec).await;
+                    verification_mode::count_recheck(&rec, recheck);
                     if recheck == Recheck::UnsupportedVersion {
                         // Written by a newer release (#671): not stale, only
                         // unreadable here. It is neither committed nor marked
@@ -2895,6 +2921,7 @@ impl Engine {
                         tracing::warn!(
                             batch_id = %rec.batch_id,
                             object_uri = rec.object_uri.as_deref().unwrap_or(""),
+                            verification_class = verification_mode::class_name(&rec),
                             "recovery: VERIFIED batch failed storage re-check; replaying instead of committing"
                         );
                         // The replay decision must be DURABLE before the
@@ -2957,6 +2984,7 @@ impl Engine {
                         summary.replay_required += 1;
                         continue;
                     }
+                    verification_mode::note_stored_class(&rec, recheck);
                     verified.push((rec, recheck));
                 }
                 RecoveryAction::None => {}
@@ -3361,10 +3389,18 @@ impl Engine {
                     }
                     // Counted at the commit, like verified_total above, not
                     // at the re-check: a held-back row passes the re-check on
-                    // every restart without committing (#629 review).
+                    // every restart without committing (#629 review). By the
+                    // class the row was verified with, as the claim read it
+                    // from the ledger (#664); by the re-check only for a row
+                    // with none.
                     verification_mode::count_size_only_commit(recheck, rec);
                     summary.committed += 1;
-                    tracing::info!(batch_id = %rec.batch_id, "recovered: source_committed");
+                    tracing::info!(
+                        batch_id = %rec.batch_id,
+                        verification_class = verification_mode::class_name(rec),
+                        recheck = recheck.as_str(),
+                        "recovered: source_committed"
+                    );
                 }
                 Err(e) => {
                     tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery commit failed");
@@ -4149,8 +4185,10 @@ struct Unsettled {
     /// it; a pipeline row's verification is counted already.
     count_verified: bool,
     /// What recovery's storage re-check of the row concluded (#651), for a
-    /// row recovery left: a size-only acceptance is counted when the row
-    /// commits, as `commit_recovered` counts it, never at the hold.
+    /// row recovery left. A size-only verification is counted when the row
+    /// commits, as `commit_recovered` counts it, never at the hold - by the
+    /// class the ledger holds for the row, and by this only for a row with
+    /// none (#664).
     recheck: Option<Recheck>,
 }
 
@@ -5832,9 +5870,13 @@ mod tests {
             self.refuse(LedgerWrite::To(BatchState::Failed))?;
             self.inner.mark_failed(batch_id, message).await
         }
-        async fn mark_verified(&self, batch_id: &str) -> Result<(), VtopError> {
+        async fn mark_verified(
+            &self,
+            batch_id: &str,
+            class: vtop_state::VerificationClass,
+        ) -> Result<(), VtopError> {
             self.refuse(LedgerWrite::To(BatchState::Verified))?;
-            self.inner.mark_verified(batch_id).await
+            self.inner.mark_verified(batch_id, class).await
         }
         async fn mark_source_committed(&self, batch_id: &str) -> Result<(), VtopError> {
             self.refuse(LedgerWrite::To(BatchState::SourceCommitted))?;

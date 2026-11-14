@@ -1488,6 +1488,7 @@ mod tests {
             manifest_sha256: None,
             manifest_version_id: None,
             object_size_bytes: Some(10),
+            verification_class: None,
             record_count: Some(1),
             error_message: None,
             owner: None,

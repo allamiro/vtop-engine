@@ -217,13 +217,17 @@ async fn recovery_uses_manifest_algorithm_after_stream_config_change() {
         "{summary:?}"
     );
     assert_archived_algorithms(&restart, &backend, &["blake3"]).await;
-    assert!(restart
-        .store
-        .list_batches()
-        .await
-        .unwrap()
+    let rows = restart.store.list_batches().await.unwrap();
+    assert!(rows
         .iter()
         .all(|row| row.state == BatchState::SourceCommitted));
+    // #664: the class the first engine verified with, kept through the
+    // restart and the recovered commit.
+    assert!(
+        rows.iter()
+            .all(|row| row.verification_class == Some(vtop_state::VerificationClass::Strong)),
+        "{rows:?}"
+    );
 }
 
 #[tokio::test]
@@ -247,6 +251,18 @@ async fn stream_none_with_opt_out_commits_and_counts_size_only() {
                 && line.ends_with(" 1")
         ),
         "size-only stream must increment its counter: {scrape}"
+    );
+    // #664: and the ledger records that the batch was verified size-only, so
+    // a recovery would count it the same way.
+    let rows = engine.store.list_batches().await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.state, row.verification_class))
+            .collect::<Vec<_>>(),
+        vec![(
+            BatchState::SourceCommitted,
+            Some(vtop_state::VerificationClass::SizeOnly)
+        )],
     );
 }
 
