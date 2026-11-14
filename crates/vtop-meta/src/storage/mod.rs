@@ -90,7 +90,9 @@ pub(crate) fn codec_corrupt(path: &Path, error: &CodecError) -> MetaStoreError {
 /// that predates the variant, a checksum-valid record carrying it was
 /// written by a newer release, so it is reported as a newer format, never
 /// as corruption (#554, #743). Every `UnknownTag` site in this crate is in
-/// this list or in [`CLOSED_FOREVER_WHATS`]; a test scans the sources.
+/// this list or in `CLOSED_FOREVER_WHATS`; a test scans the sources.
+/// An enum or presence byte that can grow must fail with `UnknownTag`, not
+/// `InvalidValue`, or this review cannot see it.
 pub(crate) const NEWER_FORMAT_WHATS: &[&str] = &[
     "command kind",
     "log entry kind",
@@ -116,25 +118,34 @@ pub(crate) const NEWER_FORMAT_WHATS: &[&str] = &[
     "transition grant kind",
     "response kind",
     "error kind",
+    // Shapes that grew in place before: a range record's lease presence
+    // (#223 added 2, a lease with a deadline), and a membership's joint
+    // marker (#215 appended it). Both reach a voter in a snapshot or a log
+    // entry from a newer leader.
+    "lease presence",
+    "joint marker",
 ];
 
-/// The `UnknownTag` `what`s that no release will extend, so an unknown value
-/// is damage, not a newer writer. Each is a transport reply decoded only
-/// from a peer or an admin endpoint of the same VTPM version (a new shape is
-/// a new op or a VTPM version bump, which the frame header already reports
-/// as newer, #554), never from disk.
+/// The `UnknownTag` `what`s this review does not classify as newer, each
+/// with its reason. All five are decoded only on a client side (the leader
+/// reading AppendEntries replies, `vtopctl` reading admin replies), where
+/// nothing consults `is_newer_format` today: a new caller of the classifier
+/// on those paths must revisit this list.
 #[cfg(test)]
 pub(crate) const CLOSED_FOREVER_WHATS: &[&str] = &[
-    // AppendEntries reply kinds: a new kind is a new VTPM version (review
-    // of #554 kept it out of the newer set).
+    // AppendEntries reply kinds, read by the leader: the review of #554
+    // kept them out of the newer set on purpose
+    // (`only_a_newer_peers_frames_are_called_newer`).
     "append response kind",
-    // Presence bytes of an admin range view: absent or present (and, for a
-    // placement proposal, refused). A new shape is a new admin op.
+    // Presence bytes of `AdminReadSegmentPlacementResponse`, read by
+    // `vtopctl`: an Option's absent or present (and, for a placement
+    // proposal, refused).
     "rebalance intent presence",
     "segment presence",
     "proposal presence",
-    // The redirect hint of an admin error: none, unknown leader or a leader
-    // id. A new hint is a new admin op.
+    // The redirect hint on an admin error, read by `vtopctl`. It grew in
+    // place once (#292); a client that cannot read a newer hint reports the
+    // error text it has.
     "admin error redirect",
 ];
 
@@ -538,10 +549,14 @@ mod closed_enum_review_tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// Every literal `what` passed to `CodecError::UnknownTag { .. }` in this
-    /// crate's sources.
-    fn unknown_tag_whats() -> BTreeSet<String> {
-        let mut found = BTreeSet::new();
+    /// What the production sources (each file up to its first `#[cfg(test)]`
+    /// module) say about `UnknownTag`: every literal `what` they name, and
+    /// the ones a decoder actually returns (`Err(...UnknownTag { .. })`).
+    /// A site whose `what` is not a literal fails here: the scan could not
+    /// classify it, so it must not pass silently.
+    fn unknown_tag_whats() -> (BTreeSet<String>, BTreeSet<String>) {
+        let mut named = BTreeSet::new();
+        let mut raised = BTreeSet::new();
         let mut pending = vec![std::path::PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src"
@@ -556,30 +571,48 @@ mod closed_enum_review_tests {
                 if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                     continue;
                 }
-                let source = std::fs::read_to_string(&path).unwrap();
+                let full = std::fs::read_to_string(&path).unwrap();
+                let source = match full.find("#[cfg(test)]\nmod ") {
+                    Some(at) => &full[..at],
+                    None => &full[..],
+                };
                 for (at, opening) in source.match_indices("UnknownTag {") {
-                    // The struct literal up to its closing brace; a site that
-                    // passes a variable `what` has no literal in it.
+                    // The struct literal up to its closing brace.
                     let body = &source[at + opening.len()..];
                     let window = &body[..body.find('}').unwrap_or(body.len())];
                     let Some(start) = window.find("what: \"") else {
+                        // A pattern (`{ what, .. }`) or the variant's own
+                        // definition names no value; anything else must.
+                        assert!(
+                            window.contains("..") || window.contains("what: &'static str"),
+                            "{}: an UnknownTag whose what is not a literal: {window:?}. \
+                             Use a literal, so this review can classify it",
+                            path.display()
+                        );
                         continue;
                     };
                     let rest = &window[start + "what: \"".len()..];
                     let end = rest.find('"').expect("an unterminated what literal");
-                    found.insert(rest[..end].to_owned());
+                    let what = rest[..end].to_owned();
+                    let before = source[..at].trim_end();
+                    if before.ends_with("Err(CodecError::")
+                        || before.ends_with("Err(crate::wire::CodecError::")
+                    {
+                        raised.insert(what.clone());
+                    }
+                    named.insert(what);
                 }
             }
         }
-        found
+        (named, raised)
     }
 
     #[test]
     fn unknown_tag_sites_are_classified() {
-        let whats = unknown_tag_whats();
+        let (whats, raised) = unknown_tag_whats();
         assert!(
-            whats.contains("command kind") && whats.contains("node state"),
-            "the source scan found nothing it should: {whats:?}"
+            raised.contains("command kind") && raised.contains("node state"),
+            "the source scan found nothing it should: {raised:?}"
         );
         let unclassified: Vec<_> = whats
             .iter()
@@ -614,8 +647,11 @@ mod closed_enum_review_tests {
         let stale: Vec<_> = NEWER_FORMAT_WHATS
             .iter()
             .chain(CLOSED_FOREVER_WHATS)
-            .filter(|what| !whats.contains(**what))
+            .filter(|what| !raised.contains(**what))
             .collect();
-        assert!(stale.is_empty(), "listed but raised nowhere: {stale:?}");
+        assert!(
+            stale.is_empty(),
+            "listed but no decoder returns it: {stale:?}"
+        );
     }
 }

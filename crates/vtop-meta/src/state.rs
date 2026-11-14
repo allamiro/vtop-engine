@@ -1018,10 +1018,10 @@ impl MetaValue {
                             _ => None,
                         },
                     }),
-                    _ => {
-                        return Err(CodecError::InvalidValue {
+                    other => {
+                        return Err(CodecError::UnknownTag {
                             what: "lease presence",
-                            reason: "lease presence byte must be 0, 1, or 2",
+                            tag: u32::from(other),
                         })
                     }
                 };
@@ -11650,6 +11650,40 @@ mod closed_enum_newer_tests {
         assert_eq!(bytes.len(), 4, "response kind then error kind");
         bytes[2..4].copy_from_slice(&u16::from(NEWER_TAG).to_be_bytes());
         assert_newer(MetadataResponse::decode(&bytes).unwrap_err(), "error kind");
+    }
+
+    /// Lease presence has grown once already (#223 added 2, a lease with a
+    /// deadline); a third shape from a later release is newer, not damage.
+    #[test]
+    fn an_unknown_lease_presence_in_a_range_record_is_newer() {
+        let range = |expires_at_ms| {
+            MetaValue::Range(RangeRecord {
+                generation: 1,
+                key_prefix: 0,
+                key_prefix_bits: 0,
+                fencing_epoch: 2,
+                lineage_generation: 0,
+                parents: Vec::new(),
+                sealed_at: None,
+                lease: Some(LeaseRecord {
+                    holder_node_uuid: Uuid::from_u128(3),
+                    fencing_epoch: 2,
+                    granted_apply_index: 4,
+                    expires_at_ms,
+                }),
+            })
+            .encode()
+            .unwrap()
+        };
+        // The two encodings differ first at the presence byte (1, then 2).
+        let (plain, deadline) = (range(None), range(Some(5)));
+        let at = plain
+            .iter()
+            .zip(&deadline)
+            .position(|(a, b)| a != b)
+            .unwrap();
+        let bytes = with_newer_tag(deadline, at, 2);
+        assert_newer(MetaValue::decode(&bytes).unwrap_err(), "lease presence");
     }
 
     /// The control: damage, not an unknown tag, still reads as corruption.
