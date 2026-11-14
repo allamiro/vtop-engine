@@ -42,7 +42,7 @@ use vtop_core::manifest::{
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::ChecksumAlgorithm;
 use vtop_state::BatchRecord;
-use vtop_upload::{ObjectChecksum, UploadBackend};
+use vtop_upload::{ObjectChecksum, ObjectLockMode, UploadBackend};
 
 /// What a check found. The `result` label of `vtop_scrub_objects_total`: a
 /// small closed set, never a batch id or a URI.
@@ -452,6 +452,50 @@ async fn scrub_one(
     }
 }
 
+/// What `--check-retention` found for one committed batch (#684): its
+/// object's and its manifest's S3 Object Lock retention, the worse of the
+/// two. Counted in `vtop_scrub_retention_total`, its own family, so the
+/// `result` set of `vtop_scrub_objects_total` does not change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionResult {
+    /// Under the configured mode, until a date still in the future.
+    Locked,
+    /// Under the configured mode, until a date that has passed: normal for an
+    /// object older than the retention, and not a finding.
+    Elapsed,
+    /// No retention at all. A finding: the object was written without it, or
+    /// a principal allowed to bypass governance removed it.
+    Missing,
+    /// Another mode than the configured one. A finding.
+    ModeMismatch,
+}
+
+impl RetentionResult {
+    pub const ALL: [RetentionResult; 4] = [
+        RetentionResult::Locked,
+        RetentionResult::Elapsed,
+        RetentionResult::Missing,
+        RetentionResult::ModeMismatch,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RetentionResult::Locked => "locked",
+            RetentionResult::Elapsed => "elapsed",
+            RetentionResult::Missing => "missing",
+            RetentionResult::ModeMismatch => "mode_mismatch",
+        }
+    }
+
+    pub fn is_finding(self) -> bool {
+        matches!(
+            self,
+            RetentionResult::Missing | RetentionResult::ModeMismatch
+        )
+    }
+}
+
 // ---- What to check ----------------------------------------------------------
 
 /// Where a committed row was read from.
@@ -521,6 +565,9 @@ pub struct ScrubOptions {
     pub sample: Option<usize>,
     /// The sample's seed; random when not given, and reported either way.
     pub seed: Option<u64>,
+    /// `--check-retention` (#684): also read each committed batch's S3 Object
+    /// Lock retention and expect this mode.
+    pub check_retention: Option<ObjectLockMode>,
 }
 
 pub const DEFAULT_CONCURRENCY: usize = 4;
@@ -535,6 +582,7 @@ impl Default for ScrubOptions {
             cursor_file: None,
             sample: None,
             seed: None,
+            check_retention: None,
         }
     }
 }
@@ -795,6 +843,9 @@ pub struct ScrubFinding {
     pub object_uri: Option<String>,
     pub manifest_uri: Option<String>,
     pub manifest_version_id: Option<String>,
+    /// Set for a retention finding (#684); `result` is then the content
+    /// check's, which passed.
+    pub retention: Option<RetentionResult>,
     pub detail: String,
 }
 
@@ -836,6 +887,9 @@ pub struct ScrubReport {
     /// archive was signed with should appear here and nothing should be a
     /// finding. Empty when no key is configured.
     pub manifest_keys: BTreeMap<String, u64>,
+    /// `--check-retention` results by [`RetentionResult`] (#684), every one
+    /// at zero when nothing had it; empty without the flag.
+    pub retention: BTreeMap<&'static str, u64>,
     pub findings: Vec<ScrubFinding>,
     pub cursor: Option<CursorProgress>,
     pub sample_seed: Option<u64>,
@@ -1007,6 +1061,7 @@ pub async fn scrub_held(
                     object_uri: row.record.object_uri.clone(),
                     manifest_uri: row.record.manifest_uri.clone(),
                     manifest_version_id: row.record.manifest_version_id.clone(),
+                    retention: None,
                     detail: check.detail,
                 });
             }
@@ -1063,6 +1118,7 @@ pub async fn scrub_held(
         checked: checked_ids.len(),
         results,
         manifest_keys,
+        retention: BTreeMap::new(),
         findings,
         cursor: progress,
         sample_seed,
@@ -1399,6 +1455,7 @@ mod tests {
             checked: 0,
             results: counts,
             manifest_keys: BTreeMap::new(),
+            retention: BTreeMap::new(),
             findings: (0..findings)
                 .map(|i| ScrubFinding {
                     batch_id: format!("b{i}"),
@@ -1407,6 +1464,7 @@ mod tests {
                     object_uri: None,
                     manifest_uri: None,
                     manifest_version_id: None,
+                    retention: None,
                     detail: String::new(),
                 })
                 .collect(),

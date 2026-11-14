@@ -2287,6 +2287,12 @@ impl Engine {
         })
     }
 
+    /// The S3 Object Lock profile's startup check (#684).
+    pub async fn preflight_object_lock(&self) -> Result<(), VtopError> {
+        // SKELETON (#684): the check lands with the implementation.
+        Ok(())
+    }
+
     /// Batching thresholds (records / bytes / age) from config.
     fn batch_limits(&self) -> BatchLimits {
         BatchLimits {

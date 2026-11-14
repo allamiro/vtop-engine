@@ -14,8 +14,8 @@
 //! (backend-limited).
 
 use crate::base::{
-    parse_s3_uri, read_bounded, ObjectChecksum, ObjectHead, StoredManifest, StoredObject,
-    UploadBackend, UploadedPart, VerificationResult,
+    parse_s3_uri, read_bounded, CreatedUpload, ObjectChecksum, ObjectHead, StoredManifest,
+    StoredObject, UploadBackend, UploadedPart, VerificationResult,
 };
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -96,6 +96,10 @@ pub struct S3NativeConfig {
     /// A body-carrying attempt is allowed `request_timeout_seconds` plus its
     /// size at this rate. Must be non-zero.
     pub request_min_bytes_per_second: u64,
+    /// The S3 Object Lock retention every object, manifest and multipart
+    /// upload is created with (#684), from `upload.object_lock`. `None` sends
+    /// no lock header, exactly as before the profile existed.
+    pub object_lock: Option<crate::base::ObjectLockPolicy>,
 }
 
 /// How long a connection attempt may take. A store that is up accepts in
@@ -205,6 +209,8 @@ pub struct S3NativeBackend {
     /// request's deadlines, per request, in [`Self::body_timeouts`].
     request_timeout_seconds: u64,
     request_min_bytes_per_second: u64,
+    /// See [`S3NativeConfig::object_lock`] (#684).
+    object_lock: Option<crate::base::ObjectLockPolicy>,
 }
 
 /// Enforce the transport policy BEFORE any client is built (#75).
@@ -721,6 +727,7 @@ impl S3NativeBackend {
                 .saturating_mul(OPERATION_ATTEMPTS),
             request_timeout_seconds: cfg.request_timeout_seconds,
             request_min_bytes_per_second: cfg.request_min_bytes_per_second,
+            object_lock: cfg.object_lock,
         })
     }
 
@@ -993,7 +1000,10 @@ impl UploadBackend for S3NativeBackend {
         let version_id = self
             .put(local_path, object_uri, "application/octet-stream", checksum)
             .await?;
-        Ok(StoredObject { version_id })
+        Ok(StoredObject {
+            version_id,
+            retention: None,
+        })
     }
 
     async fn put_manifest(
@@ -1005,7 +1015,10 @@ impl UploadBackend for S3NativeBackend {
         let version_id = self
             .put(local_path, manifest_uri, "application/json", checksum)
             .await?;
-        Ok(StoredManifest { version_id })
+        Ok(StoredManifest {
+            version_id,
+            retention: None,
+        })
     }
 
     async fn get_manifest_pinned(
@@ -1320,7 +1333,7 @@ impl UploadBackend for S3NativeBackend {
         object_uri: &str,
         content_type: &str,
         checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<String, VtopError> {
+    ) -> Result<CreatedUpload, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
         let mut req = self
             .client
@@ -1337,10 +1350,14 @@ impl UploadBackend for S3NativeBackend {
             .send()
             .await
             .map_err(|e| sdk_failure("create_multipart_upload", object_uri, e))?;
-        out.upload_id().map(str::to_owned).ok_or_else(|| {
+        let upload_id = out.upload_id().map(str::to_owned).ok_or_else(|| {
             VtopError::Upload(format!(
                 "create_multipart_upload {object_uri}: service returned no upload id"
             ))
+        })?;
+        Ok(CreatedUpload {
+            upload_id,
+            retention: None,
         })
     }
 
@@ -1411,7 +1428,11 @@ impl UploadBackend for S3NativeBackend {
             .filter(|id| *id != "null")
             .map(str::to_owned);
         tracing::info!(uri = object_uri, "object uploaded via s3_native multipart");
-        Ok(StoredObject { version_id })
+        // The retention was fixed at create; the multipart module carries it.
+        Ok(StoredObject {
+            version_id,
+            retention: None,
+        })
     }
 
     async fn abort_multipart_upload(
@@ -1476,6 +1497,10 @@ pub fn config_from_upload(upload: &vtop_core::config::UploadConfig) -> S3NativeC
         max_egress_bytes_per_second: upload.max_egress_bytes_per_second,
         request_timeout_seconds: upload.request_timeout_seconds,
         request_min_bytes_per_second: upload.request_min_bytes_per_second,
+        object_lock: upload
+            .object_lock
+            .as_ref()
+            .map(crate::base::ObjectLockPolicy::from_config),
     }
 }
 
@@ -2943,6 +2968,7 @@ mod tests {
             max_egress_bytes_per_second: None,
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
+            object_lock: None,
         };
         let err = match S3NativeBackend::new(&cfg).await {
             Err(err) => err,
@@ -3252,6 +3278,7 @@ mod egress_ceiling {
             body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
+            object_lock: None,
         };
         let payload = Bytes::from_static(b"bytes the process ceiling must see");
         let untouched = |b: ByteStream| {
@@ -3376,6 +3403,7 @@ mod egress_ceiling {
             max_egress_bytes_per_second: cap,
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
+            object_lock: None,
         };
         let unset = S3NativeBackend::new(&build(None)).await.unwrap();
         assert!(
@@ -3444,6 +3472,7 @@ mod egress_ceiling {
             body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
+            object_lock: None,
         };
         let payload = Bytes::from_static(b"the pipeline an unset cap must not touch");
 
@@ -3547,6 +3576,7 @@ mod egress_ceiling {
             body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
+            object_lock: None,
         }
     }
 
@@ -3786,6 +3816,7 @@ mod body_deadline {
             max_egress_bytes_per_second: None,
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 0,
+            object_lock: None,
         })
         .await
         {

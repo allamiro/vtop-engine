@@ -845,6 +845,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cursor_file: cursor_file.clone(),
                 sample: sample.map(to_usize),
                 seed: *seed,
+                check_retention: None,
             };
             // The run's locks, from before anything it will replace is read
             // until it has published or rolled back (review of #652): an

@@ -67,6 +67,24 @@ pub const MULTIPART_SESSION_OUTCOMES: [&str; 5] = [
     "swept",
 ];
 
+/// The values of `result` on `vtop_object_lock_checks_total` (#684): what a
+/// written object's or manifest's retention check found (`ok`, `missing`,
+/// `mode_mismatch`, `too_short`, `legal_hold_missing`, `error` for a check
+/// that could not be made), and `bucket_not_locked` for a batch refused
+/// because its bucket does not have Object Lock enabled.
+pub const OBJECT_LOCK_CHECK_RESULTS: [&str; 7] = [
+    "ok",
+    "missing",
+    "mode_mismatch",
+    "too_short",
+    "legal_hold_missing",
+    "error",
+    "bucket_not_locked",
+];
+
+/// The values of `mode` on `vtop_object_lock_mode` (#684).
+pub const OBJECT_LOCK_MODES: [&str; 3] = ["off", "governance", "compliance"];
+
 /// The values of `outcome` on `vtop_file_delete_decisions_total` (#619):
 /// `deleted`, or why `delete_after_commit` kept a fully archived file.
 pub const FILE_DELETE_OUTCOMES: [&str; 16] = [
@@ -124,6 +142,18 @@ pub struct Metrics {
     /// alerted on before any traffic. Exported only by `vtopctl run` with
     /// `VTOP_METRICS_ADDR` set, the one process that builds a registry.
     pub verification_mode: IntGaugeVec,
+
+    /// The S3 Object Lock profile this engine started with (#684): 1 for
+    /// `mode="governance"` or `mode="compliance"` when `upload.object_lock`
+    /// is set, 1 for `mode="off"` otherwise; the other values read 0. Set
+    /// once at startup, like `verification_mode`.
+    pub object_lock_mode: IntGaugeVec,
+    /// Object Lock checks by `result` (#684), the bounded set
+    /// [`OBJECT_LOCK_CHECK_RESULTS`]: one per object and per manifest a
+    /// batch wrote or reused under the profile, plus `bucket_not_locked`
+    /// for a batch refused at its bucket's preflight. Anything but `ok` is a
+    /// batch that failed and will be replayed.
+    pub object_lock_checks_total: IntCounterVec,
 
     /// Batches sent back to be re-read from source. Safe by design, but a
     /// sustained rate means work is being repeated.
@@ -329,6 +359,19 @@ impl Metrics {
             &["tenant", "mode"],
         )?;
         registry.register(Box::new(verification_mode.clone()))?;
+        let object_lock_mode = IntGaugeVec::new(
+            Opts::new(
+                "object_lock_mode",
+                "1 for the S3 Object Lock mode this engine writes under (governance, compliance), or for off when upload.object_lock is unset",
+            ),
+            &["tenant", "mode"],
+        )?;
+        registry.register(Box::new(object_lock_mode.clone()))?;
+        let object_lock_checks_total = cv(
+            "object_lock_checks_total",
+            "S3 Object Lock checks of written or reused objects and manifests, by result (ok, missing, mode_mismatch, too_short, legal_hold_missing, error) and bucket_not_locked for a batch refused at its bucket's preflight; anything but ok failed the batch, which is replayed",
+            vec!["tenant", "result"],
+        )?;
         let replay_required_total = cv(
             "replay_required_total",
             "Batches marked REPLAY_REQUIRED and re-read from source",
@@ -493,6 +536,8 @@ impl Metrics {
             verification_failures_total,
             verification_backend_limited_total,
             verification_mode,
+            object_lock_mode,
+            object_lock_checks_total,
             replay_required_total,
             failed_total,
             recovery_unsupported_manifest_total,

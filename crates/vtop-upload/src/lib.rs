@@ -18,12 +18,13 @@ pub mod s3cmd_backend;
 
 pub use vtop_core::effective_config::{verification_method, VerificationMethod};
 
-pub use base::{is_throttle_code, is_throttle_status, looks_throttled, THROTTLE_ERROR_CODES};
 pub use base::{
-    ObjectChecksum, ObjectHead, StoredManifest, StoredObject, UploadBackend, UploadedPart,
-    VerificationResult,
+    format_unix_secs, judge_retention, CreatedUpload, ObjectChecksum, ObjectHead, ObjectLockMode,
+    ObjectLockPolicy, RequestedRetention, RetentionCheck, RetentionExpectation, StoredManifest,
+    StoredObject, StoredRetention, UploadBackend, UploadedPart, VerificationResult,
 };
-pub use mock::{HeadFault, MockBackend, PartFault};
+pub use base::{is_throttle_code, is_throttle_status, looks_throttled, THROTTLE_ERROR_CODES};
+pub use mock::{HeadFault, LockFault, MockBackend, PartFault};
 pub use multipart::{
     abort_session, cleanup_abandoned, upload_resumable, upload_resumable_with_report,
     MultipartFence, MultipartReport, MultipartUploadConfig, PartBackoff,
@@ -134,6 +135,14 @@ fn refuse_an_egress_cap_the_backend_cannot_honour(cfg: &UploadConfig) -> Result<
     )))
 }
 
+/// Refuse `upload.object_lock` on a backend that cannot write an object
+/// under a retention lock or read one back (#684), naming the key and the
+/// backend, before anything is built.
+fn refuse_object_lock_the_backend_cannot_honour(_cfg: &UploadConfig) -> Result<(), VtopError> {
+    // SKELETON (#684): the refusal lands with the implementation.
+    Ok(())
+}
+
 #[cfg(test)]
 mod egress_cap_construction {
     use super::*;
@@ -213,5 +222,98 @@ mod egress_cap_construction {
                 "[{name}] no cap, no refusal — the default path is untouched"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod object_lock_construction {
+    use super::*;
+
+    async fn every_backend_name() -> Vec<String> {
+        let cfg: UploadConfig = serde_json::from_str(r#"{"bucket":"b","backend":"no_such"}"#)
+            .expect("a bare upload config parses");
+        let msg = match build_backend(&cfg).await {
+            Ok(_) => panic!("an unknown backend must be refused"),
+            Err(err) => err.to_string(),
+        };
+        msg.split("(expected ")
+            .nth(1)
+            .and_then(|tail| tail.split(')').next())
+            .unwrap_or_else(|| panic!("the refusal lists the backends: {msg}"))
+            .split('|')
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn locked(backend: &str) -> UploadConfig {
+        let mut cfg: UploadConfig = serde_json::from_str(
+            r#"{"bucket":"b","require_object_versioning":true,
+                "object_lock":{"mode":"governance","retain_days":30}}"#,
+        )
+        .expect("parses");
+        cfg.backend = backend.to_owned();
+        cfg
+    }
+
+    /// #684: every backend but s3_native refuses the profile at
+    /// construction, naming the key and itself. None may accept it and write
+    /// unlocked objects the operator believes are locked. The table is read
+    /// from `build_backend`'s own list, so a new backend joins it.
+    #[tokio::test]
+    async fn a_backend_that_cannot_lock_an_object_refuses_the_profile_naming_the_key() {
+        let names = every_backend_name().await;
+        assert!(
+            names.len() >= 8 && names.iter().any(|n| n == "s3_native"),
+            "the table must cover the real backend list: {names:?}"
+        );
+        for name in names {
+            let cfg = locked(&name);
+            let verdict = refuse_object_lock_the_backend_cannot_honour(&cfg);
+            if name == "s3_native" {
+                assert!(verdict.is_ok(), "s3_native writes the lock: {verdict:?}");
+                continue;
+            }
+            let msg = verdict
+                .expect_err(&format!("[{name}] cannot lock an object and must refuse"))
+                .to_string();
+            assert!(
+                msg.contains("upload.object_lock")
+                    && msg.contains(&name)
+                    && msg.contains("s3_native"),
+                "[{name}] the refusal names the key, the backend and the one that can: {msg}"
+            );
+            // Through the real door, first: a command backend with no binary
+            // configured would otherwise fail for THAT and hide this.
+            let msg = match build_backend(&cfg).await {
+                Ok(_) => panic!("[{name}] build_backend accepted a lock it cannot write"),
+                Err(err) => err.to_string(),
+            };
+            assert!(msg.contains("upload.object_lock"), "[{name}] {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unset_profile_changes_nothing_for_any_backend() {
+        for name in every_backend_name().await {
+            let mut cfg: UploadConfig = serde_json::from_str(r#"{"bucket":"b"}"#).expect("parses");
+            cfg.backend = name.clone();
+            assert!(
+                refuse_object_lock_the_backend_cannot_honour(&cfg).is_ok(),
+                "[{name}] no profile, no refusal"
+            );
+        }
+    }
+
+    /// The block's own rules hold on this door too (`vtopctl tier` builds a
+    /// backend from a bare UploadConfig and never validates a VtopConfig).
+    #[tokio::test]
+    async fn build_backend_checks_the_block_itself() {
+        let mut cfg = locked("s3_native");
+        cfg.require_object_versioning = false;
+        let msg = match build_backend(&cfg).await {
+            Ok(_) => panic!("a lock without versioning must be refused here too"),
+            Err(err) => err.to_string(),
+        };
+        assert!(msg.contains("upload.require_object_versioning"), "{msg}");
     }
 }

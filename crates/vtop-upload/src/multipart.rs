@@ -226,6 +226,13 @@ pub struct MultipartSession {
     pub updated_at_unix_secs: u64,
     /// Set once complete succeeds so a retry can short-circuit.
     pub completed_version_id: Option<String>,
+    /// The Object Lock retention CreateMultipartUpload asked for (#684). S3
+    /// fixes it there, so after a resume this, not the time of the resume,
+    /// is the date the completed object carries. Optional and defaulted, so
+    /// `SESSION_SCHEMA` stays 1: a session written before the field reads as
+    /// one created without a lock, and an older binary ignores the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<crate::base::RequestedRetention>,
 }
 
 const SESSION_SCHEMA: u32 = 1;
@@ -711,13 +718,14 @@ impl SessionCall<'_> {
             .create_multipart_upload(self.object_uri, "application/octet-stream", self.checksum)
             .await;
         report.count(&created);
+        let created = created?;
         let now = now_unix_secs();
         let session = MultipartSession {
             schema_version: SESSION_SCHEMA,
             backend_id: self.backend.backend_name().to_owned(),
             object_uri: self.object_uri.to_owned(),
             local_path: self.local_path.to_path_buf(),
-            upload_id: created?,
+            upload_id: created.upload_id,
             part_size_bytes: self.cfg.part_size_bytes,
             fence: self.fence.clone(),
             phase: MultipartSessionPhase::InProgress,
@@ -725,6 +733,7 @@ impl SessionCall<'_> {
             created_at_unix_secs: now,
             updated_at_unix_secs: now,
             completed_version_id: None,
+            retention: None,
         };
         save_session(self.path, &session)?;
         Ok(session)
@@ -798,6 +807,7 @@ async fn finish_idempotent(
         // current key has moved — evidence must cite the verified generation.
         return Ok(StoredObject {
             version_id: session.completed_version_id.clone(),
+            retention: None,
         });
     }
     Ok(stored)
@@ -827,7 +837,10 @@ async fn recover_completed(
     // head_object does not currently surface version id; leave None and let
     // callers that require versioning re-complete or treat as unversioned.
     // Mock/S3 complete paths return version ids on the happy path.
-    Ok(StoredObject { version_id: None })
+    Ok(StoredObject {
+        version_id: None,
+        retention: None,
+    })
 }
 
 async fn revalidate_persisted_parts(
@@ -1676,6 +1689,7 @@ mod tests {
                 created_at_unix_secs: now,
                 updated_at_unix_secs: now,
                 completed_version_id: first.version_id.clone(),
+                retention: None,
             },
         )
         .unwrap();

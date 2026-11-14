@@ -192,6 +192,7 @@ async fn backend(endpoint: &str) -> S3NativeBackend {
         max_egress_bytes_per_second: None,
         request_timeout_seconds: 300,
         request_min_bytes_per_second: 4 * 1024,
+        object_lock: None,
     })
     .await
     .unwrap()
