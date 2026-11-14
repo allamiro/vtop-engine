@@ -219,7 +219,7 @@ Each source is optional. A source block that is present but has
 | `create_bucket` | `false` | `s3_native` only: create the bucket if it does not exist. Needs the CreateBucket permission. |
 | `require_strong_verification` | `true` | Commit only when verification is derived from stored content or a store-computed digest. `false` accepts same-size corruption; the engine warns at startup and in `validate`. |
 | `require_object_versioning` | `false` | Hardened profile: the bucket must have versioning enabled and every manifest upload must return a version, which recovery then reads. |
-| `object_lock` | - | `s3_native` only: the S3 Object Lock profile. Write every object and manifest under a retention lock, refuse a bucket without Object Lock, and fail a batch whose stored object or manifest does not carry the retention asked for. Needs `require_object_versioning: true`; refuses `create_bucket: true`. See [below](#uploadobject_lock). |
+| `object_lock` | - | `s3_native` only (any other backend is refused at load): the S3 Object Lock profile. Write every object and manifest under a retention lock, refuse a bucket without Object Lock, and fail a batch whose stored object or manifest does not carry the retention asked for. Needs `require_object_versioning: true`; refuses `create_bucket: true`. See [below](#uploadobject_lock). |
 | `local_path` | - | `localfs` only, and required there: objects are written under `<local_path>/<bucket>/<key>`. |
 | `command_binary` | - | `awscli`, `s3cmd`, `minio`: absolute path of the client. Required for those backends; PATH is never searched. |
 | `profile` | - | Command backends: named profile or alias (`minio` defaults to `local`). |

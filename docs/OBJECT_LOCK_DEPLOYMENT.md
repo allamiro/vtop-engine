@@ -21,18 +21,27 @@ may bypass a governance retention are yours to set up.
   object's lock is fixed when its upload is created, so after a resume it is
   retained from the creation, not the completion. The resumed session records
   that date.
-- **The bucket is checked first.** For a literal `upload.bucket`, the engine
-  refuses to start when `GetObjectLockConfiguration` says Object Lock is not
-  enabled. For a templated bucket (`telemetry-{format}`), each bucket is
-  checked at its first upload and the batch fails if it is not locked. Every
-  bucket is checked once per process.
+- **The bucket is checked first.** For a literal `upload.bucket` (as
+  sanitized for use: lower case, `.` and `_` become `-`), the engine refuses
+  to start when `GetObjectLockConfiguration` says Object Lock is not enabled.
+  A check the store cannot answer at startup (a 503, a timeout) is logged as
+  a WARN and made again before the first upload to the bucket. For a
+  templated bucket (`telemetry-{format}`), each bucket is checked at its
+  first upload and the batch fails if it is not locked. Every bucket is
+  checked once per process, and a batch is never written to a bucket that
+  has not passed.
 - **The stored retention is verified.** After the object and the manifest
   pass their content checks, the engine reads their retention with a
-  `HeadObject` of the exact versions it wrote. It compares what it finds with
-  what it asked for: the same mode, a date no earlier, and the legal hold. A
-  longer date passes. The comparison is against the date the engine sent,
-  never its own clock at check time, so clock skew between the engine and the
-  store cannot fail a batch.
+  `HeadObject` of the exact versions it wrote. Two cases fall back to the
+  object's current version, which is also the version whose content was just
+  verified: a reused object, and a multipart object completed by an earlier
+  call whose version id the store did not report again. The engine compares
+  what it finds with what it asked for: the same mode, a date no earlier, and
+  the legal hold. A longer date passes. The comparison is against the date
+  the engine sent (and never a date already past), not against its own clock
+  plus `retain_days`, so clock skew between the engine and the store cannot
+  fail a batch. A resumed multipart session whose retention has already ended
+  is not continued: a new upload is started under a lock from now.
 - **A reused object is checked more loosely.** A replay of the same bytes
   reuses the object an earlier attempt stored (#626). Its lock was set when
   it was first archived, so it only has to be under the configured mode with
@@ -60,7 +69,7 @@ plus:
 | `s3:GetObjectVersion` | To read the exact version written. |
 | `s3:GetBucketObjectLockConfiguration` | The bucket check. |
 | `s3:GetBucketVersioning` | `upload.require_object_versioning`, which the profile requires. |
-| `s3:PutObjectLegalHold`, `s3:GetObjectLegalHold` | Only with `legal_hold: true`. |
+| `s3:PutObjectLegalHold`, `s3:GetObjectLegalHold` | Only with `legal_hold: true`. Without it the engine sends no legal-hold header at all, because S3 checks `s3:PutObjectLegalHold` whenever the header is present. |
 
 Do **not** give the runtime identity `s3:BypassGovernanceRetention`. A
 principal holding it can shorten or remove a governance retention, so keep it
@@ -119,8 +128,8 @@ upload:
 
 Every key is listed in the
 [config reference](configure/reference.md#uploadobject_lock). Only `s3_native`
-supports the profile. Every other backend refuses the block at startup,
-naming the key and itself. Unknown keys inside the block are refused, so a
+supports the profile. Every other backend's config is refused at load (and
+by `vtopctl validate`), naming the key and the backend. Unknown keys inside the block are refused, so a
 misspelt `retain_day` is caught. The 3650-day cap is the engine's guard
 against a typo, not a limit of S3. A `compliance` retention cannot be taken
 back, so an extra digit would otherwise lock every object for a century.
@@ -145,10 +154,12 @@ Each refusal says what happened, what the engine did, and what to do:
 |---|---|---|
 | Startup, literal bucket without Object Lock | `bucket X does not have Object Lock enabled; the engine did not start. Object Lock can only be enabled when a bucket is created: create a new bucket with it and point upload.bucket at it` | As it says. |
 | First batch for a templated bucket without Object Lock (`object_lock_bucket_refused`, `result="bucket_not_locked"`) | the same, with `the batch was not uploaded and will be replayed` | As it says. Nothing was written to the bucket. |
-| Bucket check could not be made | `the Object Lock configuration of bucket X could not be read (...); ...` | Grant `s3:GetBucketObjectLockConfiguration`. |
+| Bucket check could not be made | WARN at startup: `the Object Lock configuration of bucket X could not be read (...); the engine started anyway, and the bucket is checked again before the first upload to it`; at a batch, the same with `the batch was not uploaded and will be replayed` (`result="error"`) | Grant `s3:GetBucketObjectLockConfiguration`, or check the store's health. |
 | Startup, a backend that does not apply the lock | `upload.object_lock is set, but the X upload backend does not apply it ...` | Use `s3_native`. |
-| Written object or manifest without the lock (`object_lock_check_failed`, `result` = `missing`, `mode_mismatch`, `too_short` or `legal_hold_missing`) | `object X (version V) is not under the requested retention (expected governance until at least D, found ...); the batch was marked failed and will be replayed; check the bucket's Object Lock configuration and the credentials' s3:PutObjectRetention permission` | Fix the store or the credentials. The replay writes the batch again. |
+| Written object or manifest without the lock (`object_lock_check_failed`, `result` = `missing`, `mode_mismatch`, `too_short` or `legal_hold_missing`) | `object X (version V) is not under the requested retention (expected governance until at least D, found ...); the batch was marked failed and will be replayed; check the bucket's Object Lock configuration and the credentials' s3:PutObjectRetention permission, and s3:GetObjectRetention, without which the store answers a HEAD with no lock at all` | Fix the store or the credentials. The replay writes the batch again. |
+| A write that asked for no lock (a multipart upload completed by a run without the profile) | `... was written by the s3_native backend without asking for the retention upload.object_lock sets (...); ... the replay checks the stored object itself` | Nothing, unless it repeats. |
 | Reused object without the lock | `object X, reused from an earlier attempt, is not under the requested retention (...); ... a replay of the same bytes reuses this object again, so extend its retention with PutObjectRetention, or delete that version if nothing protects it and the replay will write a locked one` | As it says. Until then this range fails on every replay. |
+| Reused object without the legal hold (`legal_hold` turned on later) | `... has no legal hold (...); ... place a legal hold on it with PutObjectLegalHold` | As it says. |
 | Retention could not be read (`result="error"`) | `the retention of object X could not be read (...); ...; check the store's health and the credentials' s3:GetObjectRetention permission` | As it says. |
 
 Messages and logs never carry a signed URL or credentials. A store error that

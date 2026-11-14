@@ -1093,6 +1093,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 )
                 .engine(&engine_name)
                 .param("cursor_file", cursor.display())
+                .param("check_retention", check_retention)
                 .after("cursor_moved", cursor_moved)
                 .after("passed", scrubbed.is_ok());
                 if let Some(limit) = limit {

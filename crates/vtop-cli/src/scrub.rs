@@ -1369,15 +1369,27 @@ impl ScrubReport {
         }
         // Only with --check-retention (#684), in its own family so the
         // result set of vtop_scrub_objects_total does not change.
-        if !self.retention.is_empty() {
+        // A run without the flag writes the carried totals unchanged, so
+        // they survive it (review of #708).
+        let retention: BTreeMap<String, u64> = if self.retention.is_empty() {
+            carried.retention.clone()
+        } else {
+            self.retention
+                .iter()
+                .map(|(result, n)| {
+                    let total = carried.retention.get(*result).copied().unwrap_or(0) + n;
+                    ((*result).to_owned(), total)
+                })
+                .collect()
+        };
+        if !retention.is_empty() {
             out.push_str(
                 "# HELP vtop_scrub_retention_total Committed batches whose S3 Object Lock \
                  retention the scrub read (--check-retention), by result: locked, elapsed (the \
                  retention has ended; not a finding), missing and mode_mismatch (findings)\n\
                  # TYPE vtop_scrub_retention_total counter\n",
             );
-            for (result, n) in &self.retention {
-                let total = carried.retention.get(*result).copied().unwrap_or(0) + n;
+            for (result, total) in &retention {
                 out.push_str(&format!(
                     "vtop_scrub_retention_total{{result=\"{result}\"}} {total}\n"
                 ));

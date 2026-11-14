@@ -1356,10 +1356,16 @@ impl<'a> Pipeline<'a> {
                     legal_hold: lock.legal_hold,
                 })
             } else {
-                written
-                    .as_ref()
-                    .and_then(|w| w.retention)
-                    .map(|r| r.expectation())
+                // Never earlier than now (review of #708): a fresh write asks
+                // for now plus at least a day, so this cannot fail on skew,
+                // and a multipart session resumed past its own date (fixed at
+                // its create) cannot pass with a lock that has ended.
+                written.as_ref().and_then(|w| w.retention).map(|r| {
+                    let mut expected = r.expectation();
+                    expected.retain_until_at_least_unix_secs =
+                        expected.retain_until_at_least_unix_secs.max(now_secs);
+                    expected
+                })
             };
             let object_version = written.as_ref().and_then(|w| w.version_id.clone());
             let checks = [

@@ -1120,6 +1120,27 @@ impl UploadConfig {
         let Some(lock) = &self.object_lock else {
             return Ok(());
         };
+        // Only s3_native sends the lock headers on every write and reads the
+        // retention of the exact version back. Refused at config load, so
+        // `vtopctl validate` says so too (review of #708). An unknown name is
+        // left to `build_backend`, which lists the registered ones.
+        let why = match self.backend.as_str() {
+            "s3cmd" | "awscli" | "minio" => Some(
+                "it shells out to an external CLI, which sends the request itself; VTOP cannot \
+                 add the lock headers to it or read the retention of the version it wrote",
+            ),
+            "localfs" => Some("it writes to a local directory, which has no retention lock"),
+            "mock" | "mock_fail" | "mock_limited" => Some("it keeps objects in memory"),
+            _ => None,
+        };
+        if let Some(why) = why {
+            return Err(VtopError::Config(format!(
+                "upload.object_lock is set, but the {} backend cannot write an object under an \
+                 S3 Object Lock: {why}. Nothing was built. Only s3_native supports the profile; \
+                 use s3_native or remove upload.object_lock",
+                self.backend
+            )));
+        }
         if lock.retain_days == 0 || lock.retain_days > MAX_OBJECT_LOCK_RETAIN_DAYS {
             return Err(VtopError::Config(format!(
                 "upload.object_lock.retain_days = {} is outside 1..={MAX_OBJECT_LOCK_RETAIN_DAYS}: \

@@ -158,7 +158,16 @@ pub(crate) async fn preflight(
             }
         )));
     }
-    let bucket = config.upload.bucket.as_str();
+    // The name batches are written to: a literal bucket is sanitized before
+    // use (review of #708), so that, not the raw spelling, is what is checked
+    // and cached.
+    let resolved;
+    let bucket = if bucket_is_templated(&config.upload.bucket) {
+        config.upload.bucket.as_str()
+    } else {
+        resolved = vtop_core::partitioning::sanitize_bucket(&config.upload.bucket);
+        resolved.as_str()
+    };
     let checked = if bucket_is_templated(bucket) {
         "(each bucket the template names is checked at its first upload)"
     } else {
@@ -173,12 +182,22 @@ pub(crate) async fn preflight(
                     "the engine did not start",
                 )))
             }
+            // A check the store could not answer proves nothing either way,
+            // and is no reason to stay down (review of #708): the bucket is
+            // left unchecked, and the pipeline checks it before the first
+            // upload to it, failing that batch if it is not locked.
             Err(e) => {
-                return Err(VtopError::Config(bucket_unreadable(
+                tracing::warn!(
                     bucket,
-                    "the engine did not start",
-                    &e,
-                )))
+                    "{}",
+                    bucket_unreadable(
+                        bucket,
+                        "the engine started anyway, and the bucket is checked again before the \
+                         first upload to it",
+                        &e,
+                    )
+                );
+                "(not yet checked: the store did not answer)"
             }
         }
     };
@@ -246,8 +265,11 @@ pub(crate) async fn check(
         count(tenant, "error");
         let message = format!(
             "{what} {uri}{version} was written by the {} backend without asking for the \
-             retention upload.object_lock sets; the batch was marked failed and will be \
-             replayed; use the s3_native backend",
+             retention upload.object_lock sets (a multipart upload completed by a run without \
+             the profile, or a backend that does not apply it); the batch was marked failed and \
+             will be replayed, and the replay checks the stored object itself; nothing to do \
+             unless it repeats, then check that the engine runs s3_native with \
+             upload.object_lock",
             backend.backend_name()
         );
         tracing::error!(
@@ -292,7 +314,14 @@ pub(crate) async fn check(
         return Ok(());
     }
     let describe = found.describe(&expected);
-    let message = if reused {
+    let message = if reused && matches!(found, RetentionCheck::LegalHoldMissing) {
+        format!(
+            "{what} {uri}, reused from an earlier attempt, has no legal hold ({describe}); the \
+             batch was marked failed and will be replayed; a replay of the same bytes reuses this \
+             object again, so place a legal hold on it with PutObjectLegalHold \
+             (s3:PutObjectLegalHold), and the replay will pass"
+        )
+    } else if reused {
         format!(
             "{what} {uri}, reused from an earlier attempt, is not under the requested \
              retention ({describe}); the batch was marked failed and will be replayed; a \
@@ -309,7 +338,8 @@ pub(crate) async fn check(
         format!(
             "{what} {uri}{version} is not under the requested retention ({describe}); the \
              batch was marked failed and will be replayed; check the bucket's Object Lock \
-             configuration and the credentials' s3:PutObjectRetention permission{hold}"
+             configuration and the credentials' s3:PutObjectRetention permission{hold}, and \
+             s3:GetObjectRetention, without which the store answers a HEAD with no lock at all"
         )
     };
     let unsupported = matches!(found, RetentionCheck::Unsupported);

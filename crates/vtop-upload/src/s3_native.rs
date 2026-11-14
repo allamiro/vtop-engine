@@ -714,12 +714,20 @@ impl S3NativeBackend {
         // default tcp_tls install is a strict no-op, so the shipping client is
         // `Builder::from(&shared).force_path_style(..)` carrying the #488 scheme
         // gate and nothing else — the seam itself contributes no difference.
-        let s3_conf = install_transport_then_the_last_gate(
-            aws_sdk_s3::config::Builder::from(&shared).force_path_style(cfg.force_path_style),
-            &transport,
-            cfg.verify_tls,
-        )?
-        .build();
+        let mut builder =
+            aws_sdk_s3::config::Builder::from(&shared).force_path_style(cfg.force_path_style);
+        // A write under Object Lock needs an integrity header (#684), and the
+        // BLAKE3 path relies on the SDK computing a CRC32 for it. With
+        // AWS_REQUEST_CHECKSUM_CALCULATION=when_required the SDK names the
+        // algorithm and sends no value, and S3 refuses every locked write
+        // (review of #708), so the profile pins the calculation on.
+        if cfg.object_lock.is_some() {
+            builder = builder.request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported,
+            );
+        }
+        let s3_conf =
+            install_transport_then_the_last_gate(builder, &transport, cfg.verify_tls)?.build();
 
         Ok(Self {
             client: Client::from_conf(s3_conf),
@@ -849,8 +857,12 @@ impl S3NativeBackend {
                 .object_lock_mode(lock_mode(asked))
                 .object_lock_retain_until_date(aws_smithy_types::DateTime::from_secs(
                     asked.retain_until_unix_secs,
-                ))
-                .object_lock_legal_hold_status(legal_hold(asked));
+                ));
+            // Only when a hold is asked for: S3 checks s3:PutObjectLegalHold
+            // whenever the header is present, OFF included (review of #708).
+            if asked.legal_hold {
+                req = req.object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On);
+            }
             req = lock_integrity(req, checksum);
         }
 
@@ -1439,8 +1451,12 @@ impl UploadBackend for S3NativeBackend {
                 .object_lock_mode(lock_mode(asked))
                 .object_lock_retain_until_date(aws_smithy_types::DateTime::from_secs(
                     asked.retain_until_unix_secs,
-                ))
-                .object_lock_legal_hold_status(legal_hold(asked));
+                ));
+            // Only when a hold is asked for: S3 checks s3:PutObjectLegalHold
+            // whenever the header is present, OFF included (review of #708).
+            if asked.legal_hold {
+                req = req.object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On);
+            }
         }
         let out = req
             .send()
@@ -1553,14 +1569,6 @@ fn lock_mode(asked: RequestedRetention) -> aws_sdk_s3::types::ObjectLockMode {
     match asked.mode {
         crate::base::ObjectLockMode::Governance => aws_sdk_s3::types::ObjectLockMode::Governance,
         crate::base::ObjectLockMode::Compliance => aws_sdk_s3::types::ObjectLockMode::Compliance,
-    }
-}
-
-fn legal_hold(asked: RequestedRetention) -> ObjectLockLegalHoldStatus {
-    if asked.legal_hold {
-        ObjectLockLegalHoldStatus::On
-    } else {
-        ObjectLockLegalHoldStatus::Off
     }
 }
 

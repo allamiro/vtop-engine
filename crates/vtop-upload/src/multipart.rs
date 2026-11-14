@@ -591,6 +591,21 @@ impl SessionCall<'_> {
                         .abort_multipart_upload(&existing.object_uri, &existing.upload_id)
                         .await;
                     report.count(&aborted);
+                    if let Err(e) = aborted {
+                        if !matches!(e, VtopError::UploadSessionGone(_)) {
+                            let cause = redact_urls(&e.to_string());
+                            tracing::warn!(
+                                event = "multipart_abort_failed",
+                                key = %existing.object_uri,
+                                error = %cause,
+                                "could not abort the multipart upload for {} that cannot carry \
+                                 the lock ({cause}); its parts stay at the store until a bucket \
+                                 lifecycle rule (AbortIncompleteMultipartUpload) removes them; \
+                                 add one if the bucket has none",
+                                existing.object_uri
+                            );
+                        }
+                    }
                     delete_session(path)?;
                     self.create(report).await?
                 } else if existing.fence.content_digest_hex.is_empty() {
@@ -776,6 +791,13 @@ fn lock_mismatch(session: &MultipartSession, backend: &dyn UploadBackend) -> Opt
         Some(r) if r.mode != policy.mode || r.legal_hold != policy.legal_hold => Some(format!(
             "under mode {} with legal_hold={}, not mode {} with legal_hold={}",
             r.mode, r.legal_hold, policy.mode, policy.legal_hold
+        )),
+        // A session lives as long as replays keep resuming it: one whose
+        // lock has already ended would complete an object nobody has to keep
+        // (review of #708).
+        Some(r) if r.retain_until_unix_secs <= now_unix_secs() as i64 => Some(format!(
+            "under a retention that ended at {}",
+            crate::base::format_unix_secs(r.retain_until_unix_secs)
         )),
         Some(_) => None,
     }
