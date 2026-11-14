@@ -1136,11 +1136,27 @@ fn kafka_source(name: &str) -> DiscoveredSource {
     }
 }
 
+/// Route the adapter's warnings into the test's captured output (#675). The
+/// stall check, its re-assign fallback and the rebuild report only through
+/// `tracing`, and without a subscriber a live failure showed none of them, so
+/// which path it took could not be read from the CI log.
+fn capture_adapter_warnings() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new("vtop_adapters=warn"))
+            .try_init();
+    });
+}
+
 /// One pass at the engine's default 250ms window; records read per source.
 /// A failed pass reads nothing, as in the engine, which retries next cycle: a
 /// broker whose group coordinator is still being created fails the first
 /// pass that asks it for a committed offset.
 async fn read_pass(adapter: &mut KafkaSource, sources: &[DiscoveredSource]) -> Vec<usize> {
+    capture_adapter_warnings();
     let report = match adapter
         .read_all_batch_candidates(
             sources,
@@ -1563,29 +1579,42 @@ async fn recovering_one_partition_does_not_move_another_that_started_at_the_end(
 /// broker has not applied a topic created moments before. The adapter cached
 /// that answer for five minutes, so the topic was in no assignment and none of
 /// its records were read; the stall check, which watches assigned partitions,
-/// never saw it. That is the CI failure of the stall-isolation test above:
-/// its quiet topic, created last, read 0 of 3 for the whole 30s while the
-/// victim recovered. Here the first pass asks before the topic exists, which
-/// gets that answer every time.
+/// never saw it. That gives the signature of the CI failure of the
+/// stall-isolation test above: its quiet topic, created last, read 0 of 3 for
+/// the whole 30s while the victim recovered. Here the first pass asks before
+/// the topic exists, which gets that answer every time.
 #[tokio::test]
 #[ignore = "requires a running Kafka broker"]
 async fn a_topic_the_broker_did_not_list_at_the_first_pass_is_read_once_it_does() {
-    let (busy, _busy_cleanup) = fresh_topic("late_busy", 0).await;
     let late = fresh_topic_name("late");
     let group = unique_group("late-topic");
     let mut adapter =
         KafkaSource::new(kafka_cfg(&bootstrap(), &group), TelemetryFormat::Cef).unwrap();
-    let sources = vec![kafka_source(&busy), kafka_source(&late)];
+    let sources = vec![kafka_source(&late)];
 
-    let first = read_pass(&mut adapter, &sources).await;
-    assert_eq!(first[1], 0, "precondition: the topic does not exist yet");
+    // The pass asks the broker for the topic's partitions, gets none, and
+    // reads nothing: with nothing to assign it returns before any poll, so
+    // the group coordinator cannot fail it.
+    let first = adapter
+        .read_all_batch_candidates(
+            &sources,
+            1000,
+            1 << 20,
+            std::time::Duration::from_millis(250),
+        )
+        .await
+        .expect("precondition: a pass over a topic the broker does not list succeeds");
+    assert!(
+        first.outcomes[0].result.as_ref().is_ok_and(Vec::is_empty),
+        "precondition: nothing is read from a topic that does not exist yet"
+    );
     let _late_cleanup = create_topic(&late).await;
     produce(&late, 3);
 
     let started = std::time::Instant::now();
     let mut late_read = 0;
-    while late_read < 3 && started.elapsed() < std::time::Duration::from_secs(20) {
-        late_read += read_pass(&mut adapter, &sources).await[1];
+    while late_read < 3 && started.elapsed() < std::time::Duration::from_secs(30) {
+        late_read += read_pass(&mut adapter, &sources).await[0];
     }
     assert_eq!(
         late_read,

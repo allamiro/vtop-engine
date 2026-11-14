@@ -878,7 +878,8 @@ pub struct KafkaSource {
     liveness: PartitionLiveness,
     /// Re-assigns the stall check has made in this process, for the log.
     stall_reassigns: u64,
-    /// Partition ids per topic, cached with a TTL.
+    /// Partition ids per topic, cached with a TTL. A list with no partitions
+    /// is never cached (#675, `cached_partition_ids`).
     ///
     /// assign() needs the partition list, but fetching metadata on EVERY read
     /// costs a broker round trip per topic per cycle. With a few topics that is
@@ -1394,7 +1395,9 @@ impl KafkaSource {
     /// still at `Offset::Stored` again - for `latest`, at the NEW end of the
     /// log, skipping whatever arrived since its first assign. Should the
     /// consumer refuse the incremental calls, the whole assignment is renewed
-    /// on the next pass instead, as before.
+    /// on the next pass instead, once every partition waiting at the end of
+    /// the log is pinned where it started (`pin_latest_starts`, #675); when
+    /// that cannot be established the assignment is kept for the next check.
     fn reassign_stalled(&mut self, stalled: &[(String, i32)]) {
         let positions: Vec<((String, i32), Offset)> = stalled
             .iter()
@@ -1411,22 +1414,25 @@ impl KafkaSource {
                 (key.clone(), at)
             })
             .collect();
+        let mut plain = TopicPartitionList::new();
+        let mut at = TopicPartitionList::new();
+        let mut result = Ok(());
+        for ((topic, partition), offset) in &positions {
+            plain.add_partition(topic, *partition);
+            if let Err(e) = at.add_partition_offset(topic, *partition, *offset) {
+                result = Err(e);
+                break;
+            }
+        }
         let Some(consumer) = self.consumer.as_ref() else {
             return;
         };
-        let mut plain = TopicPartitionList::new();
-        let mut at = TopicPartitionList::new();
-        for ((topic, partition), offset) in &positions {
-            plain.add_partition(topic, *partition);
-            if at.add_partition_offset(topic, *partition, *offset).is_err() {
-                self.assigned.clear();
-                return;
-            }
-        }
-        let result = consumer
-            .incremental_unassign(&plain)
-            .and_then(|()| consumer.incremental_assign(&at))
-            .and_then(|()| consumer.resume(&plain));
+        let result = result.and_then(|()| {
+            consumer
+                .incremental_unassign(&plain)
+                .and_then(|()| consumer.incremental_assign(&at))
+                .and_then(|()| consumer.resume(&plain))
+        });
         match result {
             Ok(()) => {
                 for (key, offset) in positions {
@@ -1437,7 +1443,12 @@ impl KafkaSource {
                     };
                 }
             }
-            Err(e) => {
+            // A whole re-assign resolves every partition still at
+            // `Offset::Stored` again, so those that started at the end of the
+            // log are pinned first (#675). Without a pin it would skip what
+            // arrived since their first assign, and nothing would recover it:
+            // their new start is the new end.
+            Err(e) if self.pin_latest_starts() => {
                 tracing::warn!(
                     error = %e,
                     "kafka could not re-assign the stalled partitions alone; renewing the whole \
@@ -1445,6 +1456,12 @@ impl KafkaSource {
                 );
                 self.assigned.clear();
             }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "kafka could not re-assign the stalled partitions alone, and where a partition \
+                 assigned at the end of the log started could not be established, so the \
+                 assignment is kept; the next check rebuilds the consumer (#623, #675)"
+            ),
         }
     }
 
@@ -1459,6 +1476,32 @@ impl KafkaSource {
     /// waits for a later check and the consumer is kept: a failed lookup is
     /// not permission to discard the assignment. Returns whether it rebuilt.
     fn rebuild_consumer_after_stall(&mut self) -> bool {
+        if !self.pin_latest_starts() {
+            tracing::warn!(
+                "kafka consumer rebuild deferred: where a partition assigned at the end of the \
+                 log started could not be established, and a new consumer would skip what \
+                 arrived since; asked again at the next check (#623)"
+            );
+            return false;
+        }
+        self.consumer = None;
+        self.assigned.clear();
+        self.delivered.clear();
+        self.paused.clear();
+        true
+    }
+
+    /// Before anything assigns every partition again (a rebuilt consumer, or
+    /// a whole re-assign): pin each assigned partition still waiting on
+    /// `Offset::Stored` under `latest`, with nothing delivered or held in its
+    /// cursor, where it started. Assigned at `Offset::Stored` again, it would
+    /// resolve at the NEW end of the log and skip what arrived since its first
+    /// assign (review of #644; #675). Returns false, pinning nothing, when a
+    /// start cannot be established.
+    fn pin_latest_starts(&mut self) -> bool {
+        if !resets_to_latest(&self.cfg.auto_offset_reset) {
+            return true;
+        }
         let waiting: Vec<(String, i32)> = self
             .assigned
             .iter()
@@ -1470,24 +1513,15 @@ impl KafkaSource {
             })
             .cloned()
             .collect();
-        if !waiting.is_empty() && resets_to_latest(&self.cfg.auto_offset_reset) {
-            let Some(pins) = self.latest_starts(&waiting) else {
-                tracing::warn!(
-                    partitions = waiting.len(),
-                    "kafka consumer rebuild deferred: where a partition assigned at the end of \
-                     the log started could not be established, and a new consumer would skip \
-                     what arrived since; asked again at the next check (#623)"
-                );
-                return false;
-            };
-            for (key, start) in pins {
-                self.cursors.entry(key).or_default().committed_offset = Some(start);
-            }
+        if waiting.is_empty() {
+            return true;
         }
-        self.consumer = None;
-        self.assigned.clear();
-        self.delivered.clear();
-        self.paused.clear();
+        let Some(pins) = self.latest_starts(&waiting) else {
+            return false;
+        };
+        for (key, start) in pins {
+            self.cursors.entry(key).or_default().committed_offset = Some(start);
+        }
         true
     }
 
@@ -1718,9 +1752,9 @@ impl KafkaSource {
 /// the whole TTL, five minutes: none of its records were read, and the stall
 /// check never saw it, since it watches assigned partitions only. Under
 /// `latest`, the assign that finally came resolved at the end of the log and
-/// skipped everything written in between. The live-broker failure in #675
-/// has exactly this signature, on a topic created just before the adapter's
-/// first pass. Asking again on the next pass costs one metadata round trip
+/// skipped everything written in between. A topic created just before the
+/// adapter's first pass gives exactly the signature of the live-broker
+/// failure in #675. Asking again on the next pass costs one metadata round trip
 /// per partitionless topic; a topic the broker lists is cached as before.
 fn cached_partition_ids(
     cache: &mut HashMap<String, (Vec<i32>, Instant)>,
@@ -2648,6 +2682,58 @@ mod tests {
         assert!(
             src.cursors
                 .get(&waiting)
+                .and_then(|c| c.committed_offset)
+                .is_none(),
+            "nothing is pinned from a lookup that failed"
+        );
+    }
+
+    /// #675, review: when the consumer refuses the incremental re-assign of a
+    /// stalled partition, the fallback renews the whole assignment. Another
+    /// partition still waiting at the end of the log (`latest`, nothing
+    /// delivered) must be pinned where it started first; at `Offset::Stored`
+    /// it would resolve at the new end and skip what arrived since, the same
+    /// signature as the #675 CI failure (victim 10 of 10, quiet 0 of 3).
+    /// A consumer with no assignment refuses the incremental unassign.
+    #[test]
+    fn a_whole_reassign_after_a_refused_incremental_one_pins_a_latest_partition() {
+        let quiet = tp("q", 0);
+        let victim = tp("v", 0);
+        let mut src = latest_source_assigned_to(&[quiet.clone(), victim.clone()]);
+        src.consumer().expect("consumer");
+        src.cursors
+            .entry(victim.clone())
+            .or_default()
+            .committed_offset = Some(0);
+        src.liveness.note_baseline(&quiet, 0);
+        src.reassign_stalled(std::slice::from_ref(&victim));
+        assert!(src.assigned.is_empty(), "the whole assignment is renewed");
+        assert_eq!(
+            src.cursors.get(&quiet).and_then(|c| c.committed_offset),
+            Some(0),
+            "the waiting partition is pinned where it started"
+        );
+    }
+
+    /// #675, review: when that start cannot be established either (here no
+    /// broker answers), the assignment is kept rather than renewed unpinned;
+    /// the next check escalates to a rebuild, which asks again.
+    #[test]
+    fn a_refused_incremental_reassign_keeps_the_assignment_while_a_start_is_unknown() {
+        let quiet = tp("q", 0);
+        let victim = tp("v", 0);
+        let assigned = vec![quiet.clone(), victim.clone()];
+        let mut src = latest_source_assigned_to(&assigned);
+        src.consumer().expect("consumer");
+        src.cursors
+            .entry(victim.clone())
+            .or_default()
+            .committed_offset = Some(0);
+        src.reassign_stalled(std::slice::from_ref(&victim));
+        assert_eq!(src.assigned, assigned, "the assignment is kept");
+        assert!(
+            src.cursors
+                .get(&quiet)
                 .and_then(|c| c.committed_offset)
                 .is_none(),
             "nothing is pinned from a lookup that failed"
