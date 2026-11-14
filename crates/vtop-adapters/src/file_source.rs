@@ -1256,25 +1256,54 @@ impl FileSource {
                 self.cursors.remove(path);
                 self.held.remove(path);
                 if let Some((aside, names)) = opened_at_unlink.as_ref().filter(|(_, n)| *n > 0) {
-                    // The opener came through another hard link (#378), or
-                    // the file has one: the file keeps that name, so what
-                    // the opener writes stays reachable and is archived
-                    // under it. Nothing is lost.
+                    // The file keeps another name (a hard link, #378), so
+                    // what the opener writes is not gone. Whether it is
+                    // ARCHIVED depends on whether this engine reads that
+                    // name as a source of its own (review of #753): a
+                    // cursor of another path on this inode, still naming
+                    // it, says so; a link outside the patterns does not.
                     count_delete_decision("deleted");
-                    self.notify(
-                        "opened_at_unlink",
-                        tracing::Level::WARN,
-                        path,
-                        inode,
-                        archived,
-                        format!(
-                            "deleted the name {path} after a process opened the file between the \
-                             final check and the unlink (it was under its hidden name {}); the \
-                             file still has {names} other name(s), so what that process writes \
-                             stays in it and is archived under that name (#378); nothing to do",
-                            aside.display()
+                    let read_as = self
+                        .cursors
+                        .iter()
+                        .filter(|(other, c)| {
+                            other.as_str() != path
+                                && inode.is_some()
+                                && c.seen.as_ref().and_then(|seen| seen.inode) == inode
+                                && std::fs::metadata(other.as_str())
+                                    .ok()
+                                    .and_then(|md| inode_of(&md))
+                                    == inode
+                        })
+                        .map(|(other, _)| other.clone())
+                        .min();
+                    let (level, message) = match read_as {
+                        Some(other) => (
+                            tracing::Level::WARN,
+                            format!(
+                                "deleted the name {path} after a process opened the file between \
+                                 the final check and the unlink (it was under its hidden name \
+                                 {}); the file is still named {other}, a source this engine reads, \
+                                 so what that process writes is archived from there (#378); \
+                                 nothing to do",
+                                aside.display()
+                            ),
                         ),
-                    );
+                        None => (
+                            tracing::Level::ERROR,
+                            format!(
+                                "deleted the name {path} after a process opened the file between \
+                                 the final check and the unlink (it was under its hidden name \
+                                 {}); the file still has {names} other name(s), none of them a \
+                                 source this engine reads, so what that process writes stays in \
+                                 the file but is NOT archived. Add a pattern for the file's other \
+                                 name, or find the writer that opens it and have it stay off it \
+                                 until the quiet period has passed",
+                                aside.display()
+                            ),
+                        ),
+                    };
+                    self.notify("opened_at_unlink", level, path, inode, archived, message);
                 } else if let Some((aside, _)) = opened_at_unlink {
                     // The limit the grace bounds (#619): an open of the path
                     // that resolved it before the rename and reached the

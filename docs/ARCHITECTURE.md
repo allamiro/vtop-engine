@@ -635,12 +635,14 @@ Limits, stated plainly:
   process opened it between the final check and the unlink ... what that
   process writes to it is not archived") and counts `opened_at_unlink`;
   one that breaks it after that check, before the lease is dropped, is not
-  seen. A process that reaches the file through another hard link loses
-  nothing: the file keeps that name, and the link is its own source
-  (#378). If that open breaks the lease at the unlink, the engine says so
-  as a warning ("the file still has N other name(s), so what that process
-  writes stays in it and is archived under that name"), still counted
-  `opened_at_unlink`.
+  seen. A process that reaches the file through another hard link writes
+  into a file that keeps that name, so its lines are not gone; they are
+  archived only if that name is a source this engine reads (#378). If such
+  an open breaks the lease at the unlink, the engine says which: a warning
+  naming the other source ("the file is still named Q, a source this
+  engine reads ... nothing to do"), or, when no source this engine reads
+  names the file, an error that the lines are NOT archived and that the
+  other name needs a pattern. Either is counted `opened_at_unlink`.
 
   **The 50 ms grace is a bound, not a proof.** An open of the path that
   began before the rename and spends more than 50 ms in the kernel before
