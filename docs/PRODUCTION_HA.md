@@ -92,9 +92,11 @@ As of **August 2026** (repo at v0.3.0):
 
 **Not started — the critical path to a fleet**
 - Phase 4: deterministic / content-addressed object keys + idempotent retry.
-  Batch ids still embed `Utc::now()` + `Uuid::new_v4()`; replay still writes a
-  duplicate object. This is also the implementation's one known conformance
-  gap against protocol §15.1 (deterministic naming is a MUST).
+  **Objects done (#626):** the object key is derived from the source, the
+  range and the content digest, and an existing object is reused only after
+  it verifies strongly. Remaining: batch boundaries are not reproduced after a
+  power loss, a seal-time partition moves a replay in a later hour, and
+  manifests stay per attempt ([ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3).
 - Phase 5: Kafka consumer-group fleet mode. The consumer still uses per-read
   `assign()`; no `VTOP_KAFKA_GROUP_MODE` toggle; no multi-writer recovery
   (`FOR UPDATE SKIP LOCKED` / leases, #93).
@@ -159,8 +161,8 @@ section calls out the consequence.
 ### 2.5 Current vs. target behavior (read this before trusting any HA claim)
 | Property | Current code | Target for production HA |
 |---|---|---|
-| Object key | `vtop-<UTCstamp>-<source>-<range>-<uuid8>` — **non-deterministic** (`Utc::now()` + `Uuid::new_v4()`) | **Deterministic or content-addressed** so retries are idempotent **[PROPOSED]** |
-| Replay outcome | Re-processing writes a **new object** (new key) → **duplicate object, no overwrite, no loss** | Retry resolves to the **same** object/version; duplicates impossible **[PROPOSED]** |
+| Object key | `vtop-<source>-<range>-<digest>` — **deterministic for the same bytes** (#626); falls back to the per-attempt `vtop-<UTCstamp>-<source>-<range>-<uuid8>` without a checksum, on a command backend, or when the derived key holds bytes that do not verify | **Deterministic or content-addressed** so retries are idempotent |
+| Replay outcome | Same bytes → **the stored object is reused** after strong verification; other boundaries, a later seal-time hour, or other bytes → **second object, no overwrite, no loss** | Retry resolves to the **same** object/version; duplicates impossible **[PROPOSED]** |
 | File/syslog cursor | Lives **only in the state store** (rebuilt from `SOURCE_COMMITTED` rows) | Same, but **migrate/drain on backend switch** (§6.4) |
 | Kafka offset | Committed to the **broker** after VERIFIED (resumes broker-side) | Same; consumer-group mode for multi-instance **[PROPOSED]** |
 | Concurrency | Single process, **single-instance lock enforced at startup** (#66) | N replicas via Kafka consumer groups **[PROPOSED]** |
@@ -202,7 +204,7 @@ VTOP has a clean **two-plane** design; understanding it keeps the HA design smal
 - The run loop is **single-process**, and the engine takes an exclusive
   instance lock at startup (§19).
 - The **bottleneck is S3 upload**, not the state store.
-- **Object keys are non-deterministic** (§2.5) — central to §7.
+- **Object keys are deterministic only for the same bytes** (§2.5, #626) — central to §7.
 
 ---
 
@@ -649,17 +651,25 @@ row; the end is right in both. See
 This section supersedes any earlier "rewrites the same object" wording.
 
 ### 7.1 Current reality
-Object keys are **non-deterministic** (`Utc::now()` + `Uuid::new_v4()` inside
-the `batch_id`), so a replayed batch writes a **new** object. Result: **no data
-loss, but duplicate objects** can accumulate on crash/replay. The **state
-ledger + manifests** are the dedup authority today — not key collision.
+Since #626 the object key is **content-addressed within its range**:
+`vtop-<source>-<range>-<digest>`, under the partition prefix. A replay that
+produces the same bytes finds the object an earlier attempt stored, reuses it
+only after a strong verification against the batch's digest, and never writes
+over an object that does not verify (it falls back to the per-attempt key, the
+old scheme, and logs why). The `batch_id` stays per attempt and names the
+ledger row and the manifest. A replay still writes a second object when its
+batch boundaries, its seal-time partition hour, or its bytes differ, or when no
+digest or no reliable absent-key answer is available
+([ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3). The **state ledger +
+manifests** remain the dedup authority for those.
 
 Protocol §15.1 requires the naming scheme to be **deterministic so that replay
 produces the same object key**, and protocol §14 says re-uploads of identical
 content SHOULD be idempotent. The reference implementation follows the §15.1
 partition layout (`tenant=…/source=…/format=…/year=…/…/{batch_id}…`) but the
 random `batch_id` component breaks the determinism MUST — this is the
-conformance gap that roadmap Phase 4 closes.
+conformance gap that roadmap Phase 4 closes. #626 closes it for objects and
+narrows it for manifests, which stay per attempt.
 
 ### 7.2 Object Lock / WORM safe-retry rules
 With S3 Object Lock, protected object versions **cannot be overwritten or deleted**.
@@ -1152,7 +1162,7 @@ Invariant preserved: source progress is NEVER advanced for unverified data.
 | Failure | Behavior | Why it's safe |
 |---|---|---|
 | Engine crash mid-batch | `recover()`: pre-VERIFIED → replay from last committed source position; VERIFIED-but-not-committed → retry commit | Progress never advanced for unverified data |
-| Replay after crash | **Today:** new object key → duplicate object (no loss). **After deterministic keys:** same key, existing verified = success | At-least-once now; idempotent later |
+| Replay after crash | **Today (#626):** same bytes → same key, existing verified object = success; other boundaries or partition hour → second object (no loss) | At-least-once; idempotent for a replay of the same bytes |
 | State store unavailable | Cannot transition → stops committing (fails safe) | No commit-before-verify possible |
 | Kafka rebalance (fleet) | Revoked partitions: finish/abandon in-flight, no commit; reassigned replica resumes from committed offset | Offsets commit only post-verify |
 | File-owner replica dies (Tier 3) | Lease expires; another replica resumes from stored byte cursor | Cursor in shared durable store |
@@ -1437,10 +1447,11 @@ Short procedures now; expand into a full ops runbook before go-live.
   an engine on a different host pointed at the same Postgres; that
   configuration is unsupported and warned about at startup. Do not scale
   replicas.
-- **Non-deterministic object keys** — replay can create **duplicate objects** (no
-  loss). This is also the implementation's one known gap against the protocol
-  draft's deterministic-naming MUST (protocol §15.1). Fixed by
-  deterministic/content-addressed keys (Phase 4).
+- **Object keys are deterministic only for the same bytes** (#626) — a replay
+  with the same batch boundaries reuses the stored object; one whose
+  boundaries, seal-time hour or bytes differ still writes a second object (no
+  loss), and manifests stay per attempt. This narrows the gap against protocol
+  §15.1 without closing it (ARCHITECTURE.md §13 item 3).
 - **Engine loop is single-process** — no horizontal scale until Kafka
   consumer-group fleet mode lands (Phase 5).
 - **File/syslog HA is not solved without leases** — single-owner only.
@@ -1498,7 +1509,7 @@ bounded retry on SQLSTATE `40001`; battery green on Postgres. DDL is an explicit
 deployment identity; the live battery proves the runtime role cannot run DDL,
 `DELETE`, or `TRUNCATE`. See [`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md).
 
-### Phase 4 — Deterministic keys + idempotent retry ⬜ NOT STARTED — next up
+### Phase 4 — Deterministic keys + idempotent retry 🟡 PARTIAL (#626)
 - **Objective:** replaying a batch must resolve to the same object, so retry is
   idempotent at the archive layer and Object Lock is safe (§7). This also
   closes the implementation's one known conformance gap against the protocol
@@ -1516,6 +1527,14 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 - **Exit criteria:** replay produces zero duplicate objects; retries never
   overwrite or delete a protected version.
 - **Rollback:** `VTOP_OBJECT_KEY_MODE=legacy` (duplicates return; no loss).
+- **Status (#626):** objects are named by source, range and content digest
+  (`build_object_name`); an object already at the key is reused only after a
+  strong verification, and anything else there is never overwritten (the
+  batch falls back to its per-attempt key). There is no key-mode toggle: the
+  attempt key is the fallback, not a mode. Not done: reproducing batch
+  boundaries after a power loss, a partition hour stable under
+  `time_source = seal`, per-range manifests, and the Object Lock compose test.
+  See [ARCHITECTURE.md](ARCHITECTURE.md) §13 item 3.
 
 ### Phase 5 — Kafka consumer-group fleet mode ⬜ NOT STARTED
 - **Objective:** N replicas split partitions safely (§8).
@@ -1612,7 +1631,7 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 | 1 | `StateStore` trait | ✅ done | P0 | 0 | no behavior change; `sqlite://` works | revert refactor |
 | 2 | Shared invariant tests | ✅ done | P0 | 1 | one invariant impl; battery green | keep SQLite path |
 | 3 | Postgres backend | ✅ done | P1 | 2 | `postgres://` works; DB enforces invariant | switch to `sqlite://` (drain first) |
-| 4 | Deterministic keys | ⬜ next | P1 | 3 | no duplicate objects; Object Lock safe | `VTOP_OBJECT_KEY_MODE=legacy` |
+| 4 | Deterministic keys | 🟡 partial (#626) | P1 | 3 | no duplicate objects; Object Lock safe | `VTOP_OBJECT_KEY_MODE=legacy` |
 | 5 | Kafka fleet mode | ⬜ | P1 | 4 | safe rebalance; no double-commit; no double-recovery | `assign` mode, 1 replica |
 | 6 | Observability & alerting | ◐ partial | P1 | 0 | alerts fire; traces exported; SLOs documented | disable metrics endpoint |
 | 7 | Engine k8s deployment | ⬜ | P1 | 4,5,6 | rolling upgrade w/o loss; bounded autoscale | Helm rollback |

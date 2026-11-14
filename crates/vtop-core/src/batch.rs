@@ -248,10 +248,15 @@ fn now_or_epoch() -> chrono::DateTime<Utc> {
     Utc::now()
 }
 
-/// Build a deterministic, filesystem-safe batch id of the form
+/// Build a filesystem-safe batch id of the form
 /// `vtop-<UTCstamp>-<source>-<range>-<short-uuid>`. `range` is the marker's
 /// range token: pass the batch's whole range ([`ProgressMarker::spanning`]),
 /// not its last read's end marker, or the id names only that read (#622).
+///
+/// The id names one ATTEMPT at a range, not the range: the stamp and the
+/// random suffix make every attempt's ledger row and manifest distinct. The
+/// object a batch's bytes are stored under is named by [`build_object_name`]
+/// instead, so a replay of the same bytes finds it (#626).
 pub fn build_batch_id(source_name: &str, range: &ProgressMarker) -> String {
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
     let safe_source = sanitize_token(source_name);
@@ -259,6 +264,37 @@ pub fn build_batch_id(source_name: &str, range: &ProgressMarker) -> String {
     let suffix = Uuid::new_v4().simple().to_string();
     let short = &suffix[..8];
     format!("vtop-{stamp}-{safe_source}-{range}-{short}")
+}
+
+/// How many hex digits of the content digest an object name carries: 128
+/// bits. The name only has to find the candidate; nothing is reused on the
+/// strength of the name alone, the stored bytes are verified against the
+/// batch's full digest first.
+pub const OBJECT_NAME_DIGEST_HEX: usize = 32;
+
+/// The name of the object that holds a batch's bytes (#626):
+/// `vtop-<source>-<range>-<digest>`, where `digest` is the first
+/// [`OBJECT_NAME_DIGEST_HEX`] hex digits of the object's checksum.
+///
+/// Derived from what the object IS, not from the attempt that wrote it: a
+/// replay that reads the same range of the same source and compresses it to
+/// the same bytes (gzip and zstd output is a function of the input and the
+/// level) gets the same name, and a replay that produces other bytes - a
+/// different batch boundary, a replaced file, another compression setting -
+/// gets another name. So a replay can find an object an earlier attempt left,
+/// and can never land on an object that holds other bytes unless the stored
+/// object was damaged, which the engine checks before it reuses anything.
+/// `range` is the batch's whole range, as for [`build_batch_id`].
+pub fn build_object_name(source_name: &str, range: &ProgressMarker, digest_hex: &str) -> String {
+    let safe_source = sanitize_token(source_name);
+    let range = range.range_token();
+    let digest: String = digest_hex
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(OBJECT_NAME_DIGEST_HEX)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    format!("vtop-{safe_source}-{range}-{digest}")
 }
 
 /// Replace characters that are unsafe in object keys / file names.
@@ -283,6 +319,36 @@ mod tests {
             end_offset: end,
             consumer_group: "vtop-engine".into(),
         }
+    }
+
+    #[test]
+    fn an_object_name_is_the_same_for_the_same_bytes_of_the_same_range() {
+        let range = kafka_marker(100, 249);
+        let digest = "AB".repeat(32);
+        let a = build_object_name("app.events", &range, &digest);
+        let b = build_object_name("app.events", &range, &digest);
+        assert_eq!(a, b, "no clock and no randomness in the name");
+        assert_eq!(a, format!("vtop-app_events-p0-100-249-{}", "ab".repeat(16)));
+        assert_ne!(
+            a,
+            build_object_name("app.events", &range, &"cd".repeat(32)),
+            "other bytes, another name"
+        );
+        assert_ne!(
+            a,
+            build_object_name("app.events", &kafka_marker(100, 250), &digest),
+            "another range, another name"
+        );
+        assert_ne!(
+            a,
+            build_object_name("other", &range, &digest),
+            "another source, another name"
+        );
+        // Two attempts at the same range are still two batch ids.
+        assert_ne!(
+            build_batch_id("app.events", &range),
+            build_batch_id("app.events", &range)
+        );
     }
 
     #[test]

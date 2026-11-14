@@ -173,6 +173,12 @@ impl UploadBackend for LocalFsBackend {
     fn supports_checksum_verification(&self) -> bool {
         true
     }
+
+    fn reports_absent_objects(&self) -> bool {
+        // read_error: NotFound only for an absent file (#626 relies on it).
+        true
+    }
+
     fn supports_multipart(&self) -> bool {
         false
     }

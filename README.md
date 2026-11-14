@@ -760,7 +760,7 @@ tests/integration_file_to_minio.rs
 > [!NOTE]
 > The manifest is written at `MANIFEST_UPLOADED`, before storage-side verification.
 >
-> The trailing `batch_id` token is a random suffix: replaying a batch currently writes a **new** object key rather than reproducing the same one — the open gap against the deterministic-naming rule of [docs/VTOP_PROTOCOL_DRAFT.md §15.1](docs/VTOP_PROTOCOL_DRAFT.md#151-object-key).
+> The object is named by its source, range and content digest (`vtop-<source>-<range>-<digest>`), so a replay that produces the same bytes resolves to the object already stored, and is never written over an object that does not verify (#626). The manifest is named by the per-attempt `batch_id`, whose trailing token is a random suffix. A replay with different batch boundaries, a later seal-time hour, or no checksum still writes a second object: see [docs/ARCHITECTURE.md §13](docs/ARCHITECTURE.md) and the deterministic-naming rule of [docs/VTOP_PROTOCOL_DRAFT.md §15.1](docs/VTOP_PROTOCOL_DRAFT.md#151-object-key).
 >
 > The authoritative post-verification state lives in the state store and can be queried with `vtopctl status` or `vtopctl list-batches --json`.
 
@@ -876,7 +876,7 @@ VTOP is currently a prototype. The following limits are known and intentional.
 
 | Area | Current behavior | Planned direction |
 |---|---|---|
-| Deterministic object naming | not yet — `batch_id` embeds a timestamp + random suffix, so replay writes a **new** key (duplicate object, no data loss), against the MUST of [protocol §15.1](docs/VTOP_PROTOCOL_DRAFT.md#151-object-key)/§16 | deterministic / content-addressed keys ([PRODUCTION_HA.md Phase 4](docs/PRODUCTION_HA.md)) |
+| Deterministic object naming | partly — objects are keyed by source, range and content digest, so a replay of the same bytes reuses the stored object (#626); a replay with other boundaries, a later seal-time hour or no checksum still writes a second object, and manifests stay per attempt ([protocol §15.1](docs/VTOP_PROTOCOL_DRAFT.md#151-object-key)/§16) | reproducible batch boundaries, per-range manifests ([PRODUCTION_HA.md Phase 4](docs/PRODUCTION_HA.md)) |
 | Verification classes | strong (default) / backend-limited / disabled (size-only), per [protocol §17](docs/VTOP_PROTOCOL_DRAFT.md#17-verification-semantics); non-strong commit requires explicit opt-out | — |
 | Large objects | native S3 + mock support resumable multipart with persisted sessions (`vtopctl tier copy --multipart-state-dir`); compatibility backends still single-shot `put_object` | wire remaining backends / streaming rehydrate |
 | Large records / whole files | `max_bytes` is a hard per-source/per-batch ceiling; an oversized record is rejected without advancing source progress | raise the explicit budget only when the deployment has matching memory headroom |

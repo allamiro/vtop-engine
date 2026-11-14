@@ -494,7 +494,14 @@ impl<'a> Pipeline<'a> {
         // Bucket may be templated (e.g. "telemetry-{format}") for one bucket
         // per data format.
         let bucket = partitioning::resolve_bucket(&self.config.upload.bucket, &ctx);
-        let object_uri = partitioning::object_uri(
+        // Two candidate object keys (#626). The DERIVED key is named by the
+        // source, the range and the digest of the bytes, so a replay that
+        // produces the same bytes finds the object an earlier attempt left;
+        // it needs a digest. The ATTEMPT key is named by this attempt's
+        // batch id, unique by construction: the fallback when there is no
+        // digest, when the backend cannot tell an absent key from a refused
+        // request, or when the derived key holds bytes that do not verify.
+        let attempt_object_uri = partitioning::object_uri(
             &bucket,
             &self.config.upload.prefix,
             &resolved_prefix,
@@ -502,6 +509,19 @@ impl<'a> Pipeline<'a> {
             format.clone(),
             compressed.compression,
         );
+        let derived_object_uri = object_checksum
+            .as_deref()
+            .filter(|_| self.backend.reports_absent_objects())
+            .map(|digest| {
+                partitioning::object_uri(
+                    &bucket,
+                    &self.config.upload.prefix,
+                    &resolved_prefix,
+                    &vtop_core::batch::build_object_name(&source.source_name, &window, digest),
+                    format.clone(),
+                    compressed.compression,
+                )
+            });
         let manifest_uri = partitioning::manifest_uri(
             &bucket,
             &self.config.upload.prefix,
@@ -585,6 +605,52 @@ impl<'a> Pipeline<'a> {
             .as_deref()
             .map(|h| ObjectChecksum::new(algo.as_str(), h));
 
+        // Which key the bytes go under, and whether they are already there
+        // (#626). An object already at the derived key is reused only when it
+        // verifies STRONGLY against this batch's digest: then it holds these
+        // bytes and putting them again would only add a version. Anything
+        // else at the key is never overwritten - it may be a damaged object
+        // a scrub has yet to report - and the batch goes under its attempt
+        // key instead. The reused object is verified again below like any
+        // other, so VERIFIED still rests on a read of the stored bytes.
+        let labels = [
+            tenant.as_str(),
+            source.source_type.as_str(),
+            format.extension(),
+        ];
+        let (object_uri, reused) = match derived_object_uri {
+            None => (attempt_object_uri, false),
+            Some(derived) => match probe_object_key(
+                self.backend.as_ref(),
+                &derived,
+                compressed.size_bytes,
+                object_ck,
+                labels,
+                &self.attempts,
+                &self.throttles,
+            )
+            .await
+            {
+                Ok(KeyProbe::Free) => (derived, false),
+                Ok(KeyProbe::Holds) => (derived, true),
+                Ok(KeyProbe::Unusable(why)) => {
+                    tracing::warn!(
+                        batch_id,
+                        derived = %derived,
+                        uri = %attempt_object_uri,
+                        reason = %why,
+                        "object_key_fallback: the derived key is not usable, so the batch \
+                         is written under its attempt key"
+                    );
+                    (attempt_object_uri, false)
+                }
+                Err(e) => fail!(format!("object key probe failed: {e}")),
+            },
+        };
+        if reused {
+            tracing::info!(batch_id, uri = %object_uri, "object_reused");
+        }
+
         // ONE PUT, OR RESUMABLE MULTIPART above the threshold (#482). The
         // retransmission unit for a single put is the whole batch — a lost
         // object near the end of a 100 MB batch costs the whole 100 MB
@@ -593,19 +659,25 @@ impl<'a> Pipeline<'a> {
         // built ONE way for both this path and `vtopctl tier`, so part
         // sizes and fencing cannot drift.
         //
-        // The fence is derived from the batch id and the content digest,
+        // The fence is derived from the object key and the content digest,
         // NOT a lease this path does not have. What it protects: a session
         // resumed for THIS object identity carries THIS content — the
         // resume refuses if the local bytes or their digest changed, so a
         // re-derived batch (a new digest) never adopts a stale session. It
         // does NOT fence against a concurrent writer to the same object
-        // key; the telemetry path has one writer per batch id by
-        // construction (the run's own key prefix), which is the property
-        // that stands in for the lease `tier` holds.
+        // key. An attempt key has one writer by construction; a derived key
+        // is named by its content digest, so two writers of it write the
+        // same bytes (#626), which is the property that stands in for the
+        // lease `tier` holds. A replay of the same bytes after a crash
+        // resumes the session the crashed attempt left under the derived
+        // key, where an attempt key always started a new one.
         let mp_cfg = MultipartUploadConfig::from_upload(&self.config.upload, work_dir.clone());
         let t = Instant::now();
-        let multipart_used = mp_cfg.should_multipart(self.backend.as_ref(), compressed.size_bytes);
-        let upload_result = if multipart_used {
+        let multipart_used =
+            !reused && mp_cfg.should_multipart(self.backend.as_ref(), compressed.size_bytes);
+        let upload_result = if reused {
+            None
+        } else if multipart_used {
             let fence = MultipartFence {
                 // No segment lineage on the telemetry path; the identity is
                 // the batch and its bytes.
@@ -615,33 +687,36 @@ impl<'a> Pipeline<'a> {
                 content_digest_algorithm: algo.as_str().to_owned(),
                 byte_length: compressed.size_bytes,
             };
-            multipart::upload_resumable(
-                self.backend.as_ref(),
-                &mp_cfg,
-                &compressed.path,
-                &object_uri,
-                object_ck,
-                fence,
-            )
-            .await
-            .map(|_| ())
-        } else {
-            self.backend
-                .put_object(&compressed.path, &object_uri, object_ck)
+            Some(
+                multipart::upload_resumable(
+                    self.backend.as_ref(),
+                    &mp_cfg,
+                    &compressed.path,
+                    &object_uri,
+                    object_ck,
+                    fence,
+                )
                 .await
-                .map(|_| ())
+                .map(|_| ()),
+            )
+        } else {
+            Some(
+                self.backend
+                    .put_object(&compressed.path, &object_uri, object_ck)
+                    .await
+                    .map(|_| ()),
+            )
         };
-        if let Err(e) = note_store_request(
-            upload_result,
-            "object_upload",
-            [
-                tenant.as_str(),
-                source.source_type.as_str(),
-                format.extension(),
-            ],
-            &self.attempts,
-            &self.throttles,
-        ) {
+        // A reused object made no request here, so none is counted.
+        if let Some(Err(e)) = upload_result.map(|result| {
+            note_store_request(
+                result,
+                "object_upload",
+                labels,
+                &self.attempts,
+                &self.throttles,
+            )
+        }) {
             // NO ORPHANED SESSION (#482): a failed multipart leaves a
             // *.multipart.json and a live upload id, and mark_failed
             // re-derives the batch — a re-derivation with the same bytes
@@ -1211,6 +1286,69 @@ fn note_store_request<T>(
         note_upload_throttle(error, stage, labels, throttles);
     }
     result
+}
+
+/// What a batch's derived object key holds (#626).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyProbe {
+    /// The store says nothing is there: put the batch under it.
+    Free,
+    /// An object is there and verified strongly against the batch's size and
+    /// digest: these bytes are already stored, reuse it.
+    Holds,
+    /// Something is there that does not verify, verified only by size, or
+    /// the store's answer was not a clear "absent": never write over it.
+    Unusable(String),
+}
+
+/// Look at a derived object key before writing to it (#626). A throttle is
+/// returned as an error, since the store is asking for less traffic and the
+/// batch is retried like any other stage's; every other failure only makes
+/// the key unusable, so the batch falls back to its attempt key rather than
+/// fail on a probe a backend may refuse (a HEAD without list permission is a
+/// 403 on S3).
+async fn probe_object_key(
+    backend: &dyn UploadBackend,
+    uri: &str,
+    size: u64,
+    checksum: Option<ObjectChecksum<'_>>,
+    labels: [&str; 3],
+    attempts: &AtomicU64,
+    throttles: &AtomicU64,
+) -> Result<KeyProbe, VtopError> {
+    match note_store_request(
+        backend.head_object(uri).await,
+        "object_probe",
+        labels,
+        attempts,
+        throttles,
+    ) {
+        Ok(_) => {}
+        Err(VtopError::NotFound(_)) => return Ok(KeyProbe::Free),
+        Err(e) if e.is_upload_throttle() => return Err(e),
+        Err(e) => return Ok(KeyProbe::Unusable(format!("the probe failed: {e}"))),
+    }
+    match note_store_request(
+        backend.verify_object(uri, size, checksum).await,
+        "object_probe_verify",
+        labels,
+        attempts,
+        throttles,
+    ) {
+        Ok(v) if v.passed && !v.backend_limited => Ok(KeyProbe::Holds),
+        Ok(v) if v.passed => Ok(KeyProbe::Unusable(format!(
+            "an object is there and only its size could be confirmed: {}",
+            v.message
+        ))),
+        Ok(v) => Ok(KeyProbe::Unusable(format!(
+            "an object is there and does not verify against this batch: {}",
+            v.message
+        ))),
+        Err(e) if e.is_upload_throttle() => Err(e),
+        Err(e) => Ok(KeyProbe::Unusable(format!(
+            "an object is there and could not be verified: {e}"
+        ))),
+    }
 }
 
 fn note_upload_throttle(error: &VtopError, stage: &str, labels: [&str; 3], throttles: &AtomicU64) {
@@ -6966,8 +7104,9 @@ mod tests {
             row.batch_id
         );
         assert!(
-            row.object_uri.as_deref().unwrap().contains(&row.batch_id),
-            "and so does the object key"
+            row.object_uri.as_deref().unwrap().contains(&token),
+            "and so does the object key: {:?}",
+            row.object_uri
         );
 
         // The ledger and the adapter keep the last read's marker, exactly as
@@ -8530,5 +8669,56 @@ mod tests {
             BatchState::SourceCommitted,
             "the hold on offset 1 is released once offset 0 is archived"
         );
+    }
+
+    /// #626: what may be done with a derived key. Only an absent key is
+    /// written to, and only an object that verifies STRONGLY against the
+    /// batch's digest is reused; damaged bytes and a size-only pass leave the
+    /// key alone.
+    #[tokio::test]
+    async fn a_derived_key_is_reused_only_for_strongly_verified_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("object");
+        std::fs::write(&path, b"the batch's bytes\n").unwrap();
+        let digest = vtop_core::checksum::sha256_bytes(b"the batch's bytes\n");
+        let size = std::fs::metadata(&path).unwrap().len();
+        let ck = || Some(ObjectChecksum::new("sha256", &digest));
+        let (attempts, throttles) = (AtomicU64::new(0), AtomicU64::new(0));
+        let uri = "s3://bucket/x/vtop-src-b0-18-abc.raw";
+        let probe = |backend: Arc<vtop_upload::MockBackend>| {
+            let (attempts, throttles) = (&attempts, &throttles);
+            let ck = ck();
+            async move {
+                probe_object_key(
+                    backend.as_ref(),
+                    uri,
+                    size,
+                    ck,
+                    ["default", "file", "raw"],
+                    attempts,
+                    throttles,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let strong = Arc::new(vtop_upload::MockBackend::new());
+        assert_eq!(probe(strong.clone()).await, KeyProbe::Free);
+        strong.put_object(&path, uri, ck()).await.unwrap();
+        assert_eq!(probe(strong.clone()).await, KeyProbe::Holds);
+        strong.corrupt(uri);
+        assert!(
+            matches!(probe(strong.clone()).await, KeyProbe::Unusable(why) if why.contains("does not verify")),
+            "damaged bytes are neither reused nor written over"
+        );
+
+        let limited = Arc::new(vtop_upload::MockBackend::limited());
+        limited.put_object(&path, uri, ck()).await.unwrap();
+        assert!(
+            matches!(probe(limited).await, KeyProbe::Unusable(why) if why.contains("only its size")),
+            "a size-only pass does not prove the bytes are this batch's"
+        );
+        assert_eq!(throttles.load(Ordering::Relaxed), 0);
     }
 }

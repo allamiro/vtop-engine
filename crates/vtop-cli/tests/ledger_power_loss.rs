@@ -262,6 +262,9 @@ fn engine_config(
         "mock",
     );
     cfg.batching.max_batch_age_seconds = 3_600;
+    // No time fields: a run that crosses an hour boundary must not see two
+    // partitions, and so two keys, for one range (#626).
+    cfg.partitioning.template = "tenant={tenant}/source={source}/format={format}/".into();
     cfg
 }
 
@@ -490,4 +493,135 @@ async fn a_power_loss_archives_again_only_the_batches_still_in_flight() {
     assert_eq!(*kill.twice.last().unwrap(), 0);
     assert_eq!(*critical.twice.last().unwrap(), 0);
     assert_eq!(*normal.twice.last().unwrap(), FILES * ROUNDS);
+}
+
+/// #626, the object half: a range the restart reads again with the bytes A
+/// already uploaded resolves to A's object, whatever survived of the ledger.
+///
+/// One round, so every range B reads is a range A read: B resumes at the
+/// committed end of each file, or at 0 when no commit survived, and reads to
+/// the end of the file, which is where A's one batch ended. Batch boundaries
+/// that do not repeat (several rounds, re-read as one) are the documented
+/// limit of the scheme and are not what this test measures.
+#[tokio::test]
+async fn a_power_loss_replay_of_an_uploaded_range_writes_no_second_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    let db = dir.join("state.db");
+    let inputs: Vec<PathBuf> = (0..FILES)
+        .map(|f| dir.join(format!("app-{f}.log")))
+        .collect();
+    for input in &inputs {
+        std::fs::write(input, "").unwrap();
+    }
+    let backend = Arc::new(MockBackend::new());
+
+    let mut a = Engine::new(
+        engine_config(dir, "work-a", &db, &inputs),
+        StreamsConfig { streams: vec![] },
+    )
+    .await
+    .unwrap();
+    a.backend = backend.clone() as Arc<dyn UploadBackend>;
+    let log = Arc::new(tokio::sync::Mutex::new(Log::default()));
+    let inner = vtop_state::connect_state_store(&format!("sqlite://{}", db.display()))
+        .await
+        .unwrap();
+    a.store = Box::new(Recorder {
+        inner,
+        wal: wal_of(&db),
+        log: log.clone(),
+    });
+    let wal_at_start = std::fs::metadata(wal_of(&db)).map(|m| m.len()).unwrap_or(0);
+
+    for (f, input) in inputs.iter().enumerate() {
+        let mut out = std::fs::OpenOptions::new()
+            .append(true)
+            .open(input)
+            .unwrap();
+        for line in 0..LINES_PER_ROUND {
+            writeln!(out, "file {f} line {line}").unwrap();
+        }
+    }
+    let outcomes = a.process_once(SourceType::File).await.unwrap();
+    assert_eq!(outcomes.len(), FILES, "one batch per file");
+    assert!(outcomes.iter().all(|o| o.committed));
+    // A's object per range.
+    let mut a_object: HashMap<Range, String> = HashMap::new();
+    for row in a.store.list_batches().await.unwrap() {
+        a_object.insert(range_of(&row), row.object_uri.clone().unwrap());
+    }
+    assert_eq!(a_object.len(), FILES);
+
+    let db_bytes = std::fs::read(&db).unwrap();
+    let wal_bytes = std::fs::read(wal_of(&db)).unwrap();
+    let log = std::mem::take(&mut *log.lock().await);
+    let crashed = Crashed {
+        dir,
+        db_bytes,
+        wal_bytes,
+        inputs: &inputs,
+        backend: backend.clone(),
+        written_by_a: log.ranges.keys().cloned().collect(),
+    };
+
+    // Every survivor: each crash point as a process crash, as a power loss
+    // with only the critical writes synced, and as one with nothing synced.
+    let mut lengths: Vec<u64> = vec![wal_at_start];
+    let mut last_critical = wal_at_start;
+    for k in 0..log.wal_after.len() {
+        if log.critical[k] {
+            last_critical = log.wal_after[k];
+        }
+        lengths.push(log.wal_after[k]);
+        lengths.push(last_critical);
+    }
+    lengths.sort_unstable();
+    lengths.dedup();
+    let mut replayed = 0;
+    for wal_len in lengths {
+        let tag = wal_len;
+        let db = dir.join(format!("survivor-{tag}.db"));
+        std::fs::write(&db, &crashed.db_bytes).unwrap();
+        std::fs::write(wal_of(&db), &crashed.wal_bytes[..wal_len as usize]).unwrap();
+        let mut b = Engine::new(
+            engine_config(dir, &format!("work-{tag}"), &db, &inputs),
+            StreamsConfig { streams: vec![] },
+        )
+        .await
+        .unwrap();
+        b.backend = backend.clone() as Arc<dyn UploadBackend>;
+        for _ in 0..4 {
+            b.recover().await.unwrap();
+            let outcomes = b.process_once(SourceType::File).await.unwrap();
+            assert!(outcomes.iter().all(|o| o.committed), "{tag}: {outcomes:?}");
+            if outcomes.is_empty() && b.store.list_incomplete_batches().await.unwrap().is_empty() {
+                break;
+            }
+        }
+        for row in b.store.list_batches().await.unwrap() {
+            if crashed.written_by_a.contains(&row.batch_id)
+                || row.state != BatchState::SourceCommitted
+            {
+                continue;
+            }
+            let range = range_of(&row);
+            let Some(archived) = a_object.get(&range) else {
+                panic!("{tag}: B read {range:?}, a range A never read");
+            };
+            replayed += 1;
+            assert_eq!(
+                row.object_uri.as_ref(),
+                Some(archived),
+                "{tag}: B's replay of {range:?} resolves to A's object"
+            );
+        }
+    }
+    assert!(replayed > 0, "some survivor replayed an uploaded range");
+    for uri in a_object.values() {
+        assert!(
+            backend.get_object_pinned(uri, "v2", 1 << 20).await.is_err(),
+            "no restart put {uri} a second time"
+        );
+    }
 }

@@ -539,6 +539,12 @@ impl UploadBackend for MockBackend {
     fn supports_checksum_verification(&self) -> bool {
         !self.backend_limited
     }
+
+    fn reports_absent_objects(&self) -> bool {
+        // head_object answers a missing key, and only that, with NotFound.
+        true
+    }
+
     fn supports_multipart(&self) -> bool {
         true
     }
