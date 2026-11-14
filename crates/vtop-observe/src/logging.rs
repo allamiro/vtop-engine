@@ -53,6 +53,44 @@ pub fn init(level: &str, json: bool) {
     }
 }
 
+/// [`init`] with one more layer beside the log output: the engine's trace
+/// exporter (#683). Returns whether this call installed the subscriber; when
+/// it did not (one was already in place), `extra` was dropped unused and the
+/// caller should release whatever it holds.
+///
+/// The log filter here is the log layer's own, not the subscriber's, so the
+/// extra layer sees what it asks for whatever `RUST_LOG` says, and the log
+/// output is filtered exactly as [`init`] filters it.
+pub fn init_with_layer<L>(level: &str, json: bool, extra: L) -> bool
+where
+    L: tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+{
+    use std::io::IsTerminal;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::{EnvFilter, Layer};
+
+    let json = json || json_requested();
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level.to_lowercase()));
+    let logs = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    let logs = if json {
+        logs.json()
+            .with_current_span(false)
+            .with_filter(filter)
+            .boxed()
+    } else {
+        logs.with_ansi(std::io::stderr().is_terminal())
+            .with_filter(filter)
+            .boxed()
+    };
+    tracing_subscriber::registry()
+        .with(extra)
+        .with(logs)
+        .try_init()
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

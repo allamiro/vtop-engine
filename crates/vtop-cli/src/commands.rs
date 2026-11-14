@@ -258,7 +258,15 @@ impl From<SourceKind> for SourceType {
 /// JSON is selected by `--json` OR `VTOP_LOG_FORMAT=json`. The encoding rules
 /// and the reasoning behind them live in [`vtop_observe::logging`], shared with
 /// the cluster nodes so engine and node lines land in Loki with one shape.
+///
+/// With the `otel` feature, the OTLP trace exporter is installed beside the
+/// logs when `OTEL_EXPORTER_OTLP_ENDPOINT` (or the traces-only variable) is
+/// set, and not otherwise; see [`crate::otel`]. [`dispatch`] flushes it before
+/// the process exits.
 pub fn init_tracing(level: &str, json: bool) {
+    #[cfg(feature = "otel")]
+    crate::otel::init_tracing(level, json);
+    #[cfg(not(feature = "otel"))]
     vtop_observe::logging::init(level, json);
 }
 
@@ -374,7 +382,7 @@ pub async fn dispatch(cli: Cli) -> i32 {
     if let Command::Tier { command } = cli.command {
         return crate::tier_tools::run(command, cli.json).await;
     }
-    match run_command(&cli).await {
+    let code = match run_command(&cli).await {
         Ok(()) => 0,
         Err(e) => {
             // Errors are reported on stderr without leaking secrets.
@@ -382,7 +390,12 @@ pub async fn dispatch(cli: Cli) -> i32 {
             eprintln!("error: {e}");
             1
         }
-    }
+    };
+    // The last spans of a stop (the shutdown flush's batches) are still
+    // queued; send them before exiting, within a bounded wait (#683).
+    #[cfg(feature = "otel")]
+    crate::otel::shutdown().await;
+    code
 }
 
 async fn run_command(cli: &Cli) -> Result<(), VtopError> {

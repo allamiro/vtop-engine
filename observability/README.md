@@ -44,7 +44,7 @@ This mattered enough to check rather than assume:
 
 | Component | Metrics | Logs | Traces |
 |---|---|---|---|
-| **VTOP engine** | ✅ **native Prometheus** (`/metrics`, opt-in via `VTOP_METRICS_ADDR`) | ✅ structured events | ⏳ wired, not emitted yet |
+| **VTOP engine** | ✅ **native Prometheus** (`/metrics`, opt-in via `VTOP_METRICS_ADDR`) | ✅ structured events | ✅ **OTLP spans** per batch, recovery row and scrub check (opt-in via `OTEL_EXPORTER_OTLP_ENDPOINT`, [below](#traces)) |
 | MinIO | ✅ native Prometheus | ✅ | — |
 | Kafka | ⚠️ JMX only → `kafka-exporter` sidecar translates it | ✅ | — |
 | rsyslog | ⚠️ `impstats` only | ✅ | — |
@@ -298,6 +298,109 @@ produces.
 - **Telemetry can never break the data path.** A bad `VTOP_METRICS_ADDR`, a port
   clash, or a registry failure logs an error and the engine keeps archiving.
 
+## Traces
+
+The metrics say how long the `upload_object` stage takes at p99; a trace says
+where one particular batch spent its time, and which step it failed in. The
+engine exports traces over OTLP (#683). **Off by default**: with no endpoint
+set there is no exporter, no export thread, and the spans are never created
+(they sit at DEBUG, below the default log level). Setting an endpoint turns
+it on, for `vtopctl run` and the one-shot commands alike.
+
+### What is exported
+
+| Span | Parent | One per | Attributes |
+|---|---|---|---|
+| `batch` | — (a trace of its own) | batch | `batch_id`, `source_type`, `source_name`, `tenant`, `format`, `records`, `bytes` (uncompressed), `compressed_bytes`, `checksum_algorithm`, `verification_method` (`store_checksum`, `read_back`, `size_only`), `verification_result` (`strong`, `size_only`), `result`, and `failed_stage` when it failed |
+| `seal`, `compress`, `checksum`, `upload_object`, `upload_manifest`, `verify`, `commit` | `batch` | step the batch reached | `upload_object` adds `multipart` |
+| `recovery` | — | recovery scan (engine start) | `rows`, `committed`, `replay_required`, `superseded`, `still_pending` |
+| `recovery_row` | `recovery` | row recovery claimed | `batch_id`, `source_type`, `source_name`, `tenant`, `state`, `action`, `recheck`, `decision` |
+| `recovery_commit` | `recovery` | VERIFIED row whose re-check passed | the row's identity, `recheck`, `decision` (`committed`, `held_back`, `not_committed`) |
+| `scrub_check` | — | batch `vtopctl scrub` checks | `batch_id`, `source_type`, `source_name`, `tenant`, `origin`, `bytes`, `result` |
+
+`result` on a batch is `committed`, `failed` (a step failed; the batch's range
+is handed back to the source), `commit_failed` (verified, but the source
+commit failed and is retried later), or `incomplete` (a ledger write or a store
+request errored before the batch reached an outcome, or a second stop signal
+abandoned the shutdown flush; the range is handed back as for `failed`). A
+failure sets the span status to error on the batch and on the step it
+happened in.
+
+A `recovery_row`'s `decision` is `replay_required`, `superseded` (its source
+already committed past it), `recheck_passed` (a VERIFIED row whose stored
+object still checks out; its `recovery_commit` span follows),
+`held_unsupported_version` or `retired_unsupported_version` (a manifest from a
+newer release), `none`, or, with an error status, `held_ledger_write_failed`
+and `superseded_write_failed` (the decision could not be recorded; the next
+recovery decides again).
+
+What is **never** exported: record content, credentials, keys, object and
+manifest URIs, error messages (a store error can quote a signed URL), and log
+events. Spans of libraries (the S3 client's, say) are not exported either.
+Search by `batch_id` in Loki for the detail a span leaves out; the log lines
+carry the same field names. Exporting is new network egress, and
+[SECURITY_MODEL.md](../docs/SECURITY_MODEL.md#otlp-trace-export-683) covers
+it.
+
+A span covers its step and the ledger write that records the step's state. In
+`upload_object`, the bucket provisioning and the versioning preflight are
+included: they are that upload's store round trips.
+
+### Configuration
+
+The standard OpenTelemetry variables:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (export off) | Collector base URL, `http://` or `https://`; `/v1/traces` is appended. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | unset | Full traces URL, used as given; wins over the base URL. |
+| `OTEL_SERVICE_NAME` | `vtop-engine` | `service.name` of every span. `service.version` is the engine's version. |
+| `OTEL_EXPORTER_OTLP_HEADERS` / `..._TRACES_HEADERS` | none | `key=value,...` request headers, e.g. a collector's auth token. A secret: supply it like the storage keys. |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` / `..._TRACES_TIMEOUT` | `10000` | Per-export timeout, milliseconds. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` / `..._TRACES_PROTOCOL` | `http/protobuf` | Only `http/protobuf` is supported; any other value leaves export off with a warning. |
+| `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BSP_EXPORT_TIMEOUT` | 5000 ms, 2048, 512, 30000 ms | Batching. A full queue drops spans; it never slows a batch. |
+| `OTEL_RESOURCE_ATTRIBUTES` | none | Extra resource attributes. |
+| `OTEL_SDK_DISABLED` | `false` | `true` turns export off even with an endpoint set. |
+
+Not supported: the gRPC transport, `OTEL_EXPORTER_OTLP_COMPRESSION` (setting it
+makes setup fail and the engine run without export), and HTTP proxies. TLS uses
+the system's root certificates; `SSL_CERT_FILE` or `SSL_CERT_DIR` name others.
+
+At start-up the engine logs `OTLP trace export enabled` with the endpoint's host
+and port (never its path or query), or why export was refused. A collector that
+is down or slow costs spans, never a batch: export runs on its own thread with a
+bounded queue. On a stop, after its own shutdown flush, the engine waits at
+most **5 s** for the last spans to reach the collector, then exits.
+
+The `otel` Cargo feature carries the exporter and is in the default build. A
+build that must not contain the egress code at all is
+`cargo build --no-default-features --features kafka`.
+
+### Tempo in this lab
+
+The stack is wired end to end: the observability overlay points the engine at
+Alloy (`OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318`, on the storage network
+both share), Alloy's OTLP receiver forwards to Tempo, and Grafana has Tempo as
+a datasource. Bring the lab up as above, let a few batches run, then in
+Grafana open **Explore → Tempo** and query with TraceQL:
+
+```text
+{ resource.service.name = "vtop-engine" && name = "batch" }
+{ name = "batch" && span.result != "committed" }
+{ name = "upload_object" && duration > 1s }
+{ span.batch_id = "<a batch_id from a log line>" }
+```
+
+Outside the lab, point the engine at any OTLP/HTTP collector (an OpenTelemetry
+Collector, Alloy, or Tempo's own receiver on 4318):
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector.example:4318 vtopctl run --config config.yaml
+```
+
+To run the lab without exporting, set `OTEL_SDK_DISABLED=true` in `.env`; the
+overlay passes it to the engine.
+
 ## Editing dashboards
 
 Dashboards are **seeded through the Grafana API**, not file-provisioned, so they
@@ -348,6 +451,8 @@ panel.
 ## Scope: this is a lab, not production
 
 - single-node Mimir/Loki/Tempo on filesystem storage, no retention tuning;
+- the engine exports traces to Alloy over plain HTTP on the lab network; an
+  off-host collector should be reached over `https://`;
 - lab credentials, anonymous Grafana viewing;
 - `MINIO_PROMETHEUS_AUTH_TYPE=public` disables auth on MinIO's metrics endpoint —
   **never do that outside a lab**;

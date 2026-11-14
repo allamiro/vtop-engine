@@ -425,6 +425,15 @@ pub enum RowOrigin {
     Digest,
 }
 
+impl RowOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RowOrigin::Ledger => "ledger",
+            RowOrigin::Digest => "digest",
+        }
+    }
+}
+
 /// One committed row to check.
 #[derive(Debug, Clone)]
 pub struct ScrubRow {
@@ -912,7 +921,20 @@ pub async fn scrub_held(
                     .and_then(|size| u64::try_from(size).ok())
                     .unwrap_or(0);
                 pacer.admit(bytes).await;
-                (row, scrub_one(backend, mac_key, &row.record).await)
+                // Opened after the pacer, so the span times the check and not
+                // the wait for its turn (#683).
+                let span = crate::spans::scrub_check(&row.record, row.origin.as_str());
+                let check = scrub_one(backend, mac_key, &row.record).await;
+                span.record("result", check.result.as_str());
+                span.record(
+                    "otel.status_code",
+                    if check.result.is_finding() {
+                        "error"
+                    } else {
+                        "ok"
+                    },
+                );
+                (row, check)
             })
             // In order, so the cursor only ever passes a contiguous run of
             // checked batches.

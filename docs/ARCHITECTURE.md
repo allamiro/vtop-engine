@@ -906,7 +906,7 @@ reality.
 | Upload backends incl. `localfs`, hardened command backends (§8) | ✅ shipped | Verification strength declared per backend (protocol §17). |
 | `StateStore`: SQLite + PostgreSQL, shared battery, DB constraints (§12) | ✅ shipped | Retry-on-`40001`; `vtopctl migrate` privilege split; retention (#128). |
 | Manifest self-hash + keyed BLAKE3 MAC, version pinning (§9) | ✅ shipped | Public-key signatures and key rotation are future work. |
-| Metrics endpoint + readiness, dashboards-as-code (§14) | ✅ shipped | OTLP trace export and alerting rules are future work. |
+| Metrics endpoint + readiness, dashboards-as-code (§14) | ✅ shipped | OTLP trace export shipped too (opt-in, #683); alerting rules are future work. |
 | Deterministic object naming (§11, §13) | ⬜ planned | Protocol §15.1 MUST; the open conformance gap — [PRODUCTION_HA.md](PRODUCTION_HA.md) Phase 4. |
 | Multi-instance fleet (consumer groups + multi-writer recovery) | ⬜ planned | Phase 5; single-instance lock (#66) until then. |
 | Engine Kubernetes chart | ⬜ planned | Phase 7 — `helm/vtop` deploys the cluster plane, not the engine. |

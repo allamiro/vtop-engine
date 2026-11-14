@@ -72,6 +72,18 @@ pub(crate) enum Recheck {
     SizeOnly,
 }
 
+impl Recheck {
+    /// The span attribute value (#683).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Recheck::Failed => "failed",
+            Recheck::UnsupportedVersion => "unsupported_version",
+            Recheck::Strong => "strong",
+            Recheck::SizeOnly => "size_only",
+        }
+    }
+}
+
 /// Recovery's storage re-check got a size-only result for a VERIFIED row.
 /// Under the strong default the row fails the re-check; under the opt-out it
 /// passes as [`Recheck::SizeOnly`]. Either way the decision is logged with
