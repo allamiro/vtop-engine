@@ -261,6 +261,18 @@ pub struct Metrics {
     /// beside it.
     pub kafka_partition_events_total: IntCounterVec,
 
+    /// Audit records written (#694), by `action` (the closed set
+    /// [`AUDIT_ACTIONS`]) and `outcome` (`attempt`, `success`, `failure`,
+    /// `refused`). Never the actor, the target or a path: those are in the
+    /// record. A rising `refused` is the one to look at.
+    pub audit_events_total: IntCounterVec,
+    /// Audit records a sink could not take (#694), by `sink`: `log`, `file`
+    /// (`VTOP_AUDIT_LOG`) or `ledger` (the state store's `audit_events`
+    /// table). A destructive ledger command is refused when its attempt
+    /// record cannot be written, so any increase is a command that did not
+    /// run, or ran with its record in fewer places than configured.
+    pub audit_write_failures_total: IntCounterVec,
+
     /// Multipart parts by `result` (#668), the bounded set
     /// [`MULTIPART_PART_RESULTS`]. Per upload a part counts `uploaded` or
     /// `reused` once, `failed` once if its last attempt failed, and `retried`
@@ -276,6 +288,29 @@ pub struct Metrics {
     /// keeping sessions saves. Unlabelled, like the egress account.
     pub multipart_bytes_reused_total: IntCounter,
 }
+
+/// The values of `action` on `vtop_audit_events_total` (#694); the same set
+/// as `vtop_observe::audit::Action`.
+pub const AUDIT_ACTIONS: [&str; 12] = [
+    "ledger.replay",
+    "ledger.prune",
+    "ledger.migrate",
+    "scrub.cursor",
+    "cluster.init",
+    "cluster.membership",
+    "cluster.enable_features",
+    "cluster.create_topic",
+    "cluster.propose",
+    "node.repair",
+    "node.reconfigure_range",
+    "promotion.attest",
+];
+
+/// The values of `outcome` on `vtop_audit_events_total`.
+pub const AUDIT_OUTCOMES: [&str; 4] = ["attempt", "success", "failure", "refused"];
+
+/// The values of `sink` on `vtop_audit_write_failures_total`.
+pub const AUDIT_SINKS: [&str; 3] = ["log", "file", "ledger"];
 
 fn labels3() -> Vec<&'static str> {
     vec!["tenant", "source_type", "format"]
@@ -412,6 +447,16 @@ impl Metrics {
             "Kafka partition-list changes seen while reading and what the source did (see logs for topic/partition): no_partitions, lookup_failed, grew, new_partition_from_beginning, start_deferred, pinned_before_renewal, recreated_or_truncated",
             vec!["event"],
         )?;
+        let audit_events_total = cv(
+            "audit_events_total",
+            "Audit records written, by action (the closed set in docs/operate/auditing.md) and outcome (attempt, success, failure, refused)",
+            vec!["action", "outcome"],
+        )?;
+        let audit_write_failures_total = cv(
+            "audit_write_failures_total",
+            "Audit records that could not be written to a sink (log, file, ledger); a destructive ledger command is refused when its attempt record cannot be written",
+            vec!["sink"],
+        )?;
         let multipart_parts_total = cv(
             "multipart_parts_total",
             "Multipart parts by result (#668): uploaded (sent in this upload call; after a restart, to each upload), reused (kept from an earlier call and not sent again), retried (one per extra attempt at a part), failed (the part's last attempt in the call failed); the object path is in the log line",
@@ -515,6 +560,8 @@ impl Metrics {
             file_delete_decisions_total,
             object_key_decisions_total,
             kafka_partition_events_total,
+            audit_events_total,
+            audit_write_failures_total,
             multipart_parts_total,
             multipart_sessions_total,
             multipart_bytes_reused_total,

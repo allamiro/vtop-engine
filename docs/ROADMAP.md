@@ -867,6 +867,46 @@ A bug-fix release: only issues labelled `bug`, and the PRs that fix them. Featur
 
 ## v0.10.0 and beyond
 
+**The audit trail (#694).** Every operator command that changes engine or cluster
+state writes one versioned, attributable record (`audit_version: 1`): who
+(the local uid and host, or the admin endpoint's certificate identity), what,
+on what, with which parameters (an allowlist, redacted), and how it ended,
+failures and refusals included. Records go to the `vtop::audit` log target,
+which `RUST_LOG` cannot silence, to the JSONL file `VTOP_AUDIT_LOG` names,
+and, for `replay`, `prune-ledger` and `migrate`, to a new append-only,
+hash-chained `audit_events` table, keyed with the manifest MAC key when one
+is configured. Those three commands write an `attempt` record first and are
+refused when it cannot be written. The admin endpoint records every refusal
+and each operator command with the caller's identity, and every metadata
+replica records the entry it applied with its log index. `vtopctl audit
+list` reads the table or a file; `vtopctl audit verify` checks the chain.
+New metrics: `vtop_audit_events_total{action,outcome}` and
+`vtop_audit_write_failures_total{sink}`. See
+[operate/auditing.md](operate/auditing.md). Upgrade notes and limitations:
+
+- **PostgreSQL: run `vtopctl migrate` and grant the new table before
+  starting engines of this release.** They refuse a schema without
+  `audit_events`, naming it. The runtime and maintenance roles need `SELECT,
+  INSERT` on it and `USAGE` on `audit_events_seq_seq`
+  ([POSTGRES_DEPLOYMENT.md](POSTGRES_DEPLOYMENT.md)). An older release on a
+  migrated database ignores the table. SQLite creates it on open.
+- **With a manifest MAC key configured, `prune-ledger`, `replay` and
+  `migrate` need it** (they key their audit rows with it), so a migration
+  job or a prune cron needs the engine's key environment; they stop naming
+  the variable when it is missing. `vtopctl audit list` does not.
+- **A destructive ledger command now fails when its audit record cannot be
+  written** (a full disk, a missing grant, an unwritable `VTOP_AUDIT_LOG`).
+  That is the intended cost of "fail rather than run unrecorded"; there is
+  no break-glass switch.
+- **The actor is in the edge record only.** Each replica's applied record
+  carries the request id and log index; the requester's identity is in the
+  admin endpoint's record of the same request id. Making the actor durable
+  in the replicated log is a separate format change.
+- **A mixed fleet's trail is only as complete as its least-upgraded node**:
+  older engines and nodes write no audit records.
+- **`vtopctl meta`, `node` and `tier` now log** to stderr at WARN (audit
+  records always), where they logged nothing before.
+
 The theme is **the gateway at the speed its durability allows**: wire the
 broker's group commit into the gateway path and close the compatibility
 gaps the Kafka comparison found (#596), measure failover and crash

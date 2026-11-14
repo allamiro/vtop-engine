@@ -5,6 +5,7 @@
 //! pieces (`vtop-meta` Raft node, `vtop-broker` replication/serving); every
 //! correctness mechanism lives in those crates, none here.
 
+mod audit;
 mod client;
 mod colocated;
 mod config;
@@ -248,6 +249,15 @@ fn shutdown_signal() -> tokio::sync::watch::Receiver<bool> {
 }
 
 async fn run(cli: Cli) -> Result<i32, String> {
+    // The audit file (#694), for the server roles: a set but unwritable
+    // `VTOP_AUDIT_LOG` stops the node here, naming the path, rather than
+    // after it has served a command it could not record there.
+    if matches!(
+        cli.command,
+        Command::Meta { .. } | Command::Data { .. } | Command::Node { .. }
+    ) {
+        vtop_observe::audit::init_file_sink_from_env().map_err(|e| e.to_string())?;
+    }
     match cli.command {
         // The handler is installed only for the SERVER roles. A client
         // command (`produce`, `verify`, `replica-status`) keeps the default

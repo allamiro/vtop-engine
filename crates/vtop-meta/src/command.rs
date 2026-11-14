@@ -4070,6 +4070,80 @@ mod tests {
         );
     }
 
+    /// #694: every command is on one side of the audit list (the match in
+    /// `audit::command_audit` has no wildcard, so a new variant does not
+    /// compile until it is placed), and the sides are the ones the plan
+    /// chose: operator commands audited; node-initiated and client-rate
+    /// commands not.
+    #[test]
+    fn every_command_is_on_one_side_of_the_audit_list() {
+        use crate::audit::{command_audit, command_name, AuditAction};
+        let commands = every_command();
+        let mut names: Vec<_> = commands.iter().map(command_name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 39, "every_command() must hold every variant");
+        let audited: std::collections::BTreeSet<_> = commands
+            .iter()
+            .filter(|c| command_audit(c).is_some())
+            .map(command_name)
+            .collect();
+        let expected: std::collections::BTreeSet<_> = [
+            "RegisterNode",
+            "SetNodeState",
+            "CreateTopic",
+            "GrantRangeLease",
+            "ReleaseRangeLease",
+            "RegisterSealedSegment",
+            "MarkSegmentVerified",
+            "PutKeyRecord",
+            "SetNodePlacementAttrs",
+            "CommitSegmentPlacement",
+            "CommitReplacementProof",
+            "PlanReplicaRetirement",
+            "ConfirmReplicaRetired",
+            "ProposeRebalance",
+            "CancelRebalance",
+            "CommitTierEvidence",
+            "SetTopicRetentionPolicy",
+            "PlanRetention",
+            "ConfirmRetentionExpired",
+            "CancelRetention",
+            "SetFeatureLevel",
+            "SetRangeReplicaSet",
+            "AttestUnprovenPromotion",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(audited, expected);
+        for command in &commands {
+            let Some(audit) = command_audit(command) else {
+                continue;
+            };
+            let expected_action = match command {
+                MetadataCommand::SetFeatureLevel { .. } => AuditAction::ClusterEnableFeatures,
+                MetadataCommand::CreateTopic { .. } => AuditAction::ClusterCreateTopic,
+                MetadataCommand::AttestUnprovenPromotion { .. } => AuditAction::PromotionAttest,
+                _ => AuditAction::ClusterPropose,
+            };
+            assert_eq!(audit.action, expected_action, "{}", audit.command);
+            // Identifiers and small values only: never a URI, a digest or
+            // key material.
+            for (name, value) in &audit.params {
+                assert!(
+                    !value.contains("://") && value.len() < 512,
+                    "{} param {name} = {value:?}",
+                    audit.command
+                );
+                assert!(
+                    !value.chars().all(|c| c.is_ascii_hexdigit()) || value.len() < 32,
+                    "{} param {name} looks like a digest: {value}",
+                    audit.command
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_command_and_response_round_trips_byte_exactly() {
         for command in every_command() {

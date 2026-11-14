@@ -18,6 +18,9 @@
 //!   running". This is what replaces log-grep readiness in the chaos harness.
 //! * [`logging`] — one definition of `VTOP_LOG_FORMAT=json`, so node logs and
 //!   engine logs land in Loki with the same shape.
+//! * [`audit`] — the audit trail (#694): one versioned record of every
+//!   command that changes state, on the `vtop::audit` target and an optional
+//!   append-only file.
 //! * [`otel`] — OpenTelemetry export (traces and metrics over OTLP/HTTP, log
 //!   correlation), compiled in and idle until an OTLP endpoint is set (#683).
 //!
@@ -26,6 +29,7 @@
 //! [`server::MetricsSource`]. Keeping the catalogue out of the shared crate is
 //! what stops it from growing a dependency on every crate in the workspace.
 
+pub mod audit;
 pub mod logging;
 pub mod otel;
 pub mod readiness;

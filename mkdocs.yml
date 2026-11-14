@@ -183,6 +183,7 @@ nav:
       - Metrics and alerts: operate/monitoring.md
       - Node endpoints and metrics: NODE_OBSERVABILITY.md
       - Logs and auditing: operate/logs-and-auditing.md
+      - Auditing: operate/auditing.md
       - Scrub and coverage audit: operate/scrub-and-audit.md
       - Rotate the manifest MAC key: operate/manifest-key-rotation.md
       - Upgrades: operate/upgrades.md

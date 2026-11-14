@@ -207,4 +207,56 @@ DROP TRIGGER IF EXISTS trg_commit_after_verify ON batches;
 CREATE TRIGGER trg_commit_after_verify BEFORE INSERT OR UPDATE ON batches
     FOR EACH ROW EXECUTE FUNCTION vtop_enforce_commit_after_verify();
 
+-- The audit trail (#694): one row per audit record of a ledger command
+-- (prune-ledger, replay, migrate), append only and hash-chained (see
+-- crates/vtop-state/src/audit.rs). A new table, so no marker bump: an older
+-- release never reads it, and engines of this release refuse a schema
+-- without it at startup (PgStateStore::check_schema names it). The runtime
+-- role needs SELECT, INSERT on it and USAGE on its sequence, nothing else:
+--
+--   GRANT SELECT, INSERT ON TABLE audit_events TO <runtime role>;
+--   GRANT USAGE ON SEQUENCE audit_events_seq_seq TO <runtime role>;
+CREATE TABLE IF NOT EXISTS audit_events (
+    seq BIGSERIAL PRIMARY KEY,
+    audit_id TEXT NOT NULL UNIQUE,
+    time TEXT NOT NULL,
+    action TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    actor TEXT,
+    target TEXT,
+    audit_version INTEGER NOT NULL,
+    record TEXT NOT NULL,
+    prev_hash TEXT,
+    hash TEXT NOT NULL,
+    chain TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(time);
+
+-- Append only as a database property, not only a grant: UPDATE, DELETE and
+-- TRUNCATE are refused for every role but the table's owner (the migration
+-- identity), so a maintenance role granted DELETE for prune-ledger still
+-- cannot remove an audit row.
+CREATE OR REPLACE FUNCTION vtop_audit_events_append_only() RETURNS trigger AS $fn$
+BEGIN
+    IF current_user <> (SELECT pg_catalog.pg_get_userbyid(c.relowner)
+                          FROM pg_catalog.pg_class c WHERE c.oid = TG_RELID) THEN
+        RAISE EXCEPTION 'audit_events is append-only: % by % refused', TG_OP, current_user
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    IF TG_LEVEL = 'STATEMENT' THEN
+        RETURN NULL;
+    ELSIF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_audit_events_append_only ON audit_events;
+CREATE TRIGGER trg_audit_events_append_only BEFORE UPDATE OR DELETE ON audit_events
+    FOR EACH ROW EXECUTE FUNCTION vtop_audit_events_append_only();
+DROP TRIGGER IF EXISTS trg_audit_events_no_truncate ON audit_events;
+CREATE TRIGGER trg_audit_events_no_truncate BEFORE TRUNCATE ON audit_events
+    FOR EACH STATEMENT EXECUTE FUNCTION vtop_audit_events_append_only();
+
 COMMIT;

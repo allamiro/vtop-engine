@@ -1038,20 +1038,28 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
         MetaCommand::Init { common, members } => {
             let config = load_admin_config(&common.config)?;
             let client = connect(&config)?;
-            let response = client
-                .init(members)
-                .await
-                .map_err(|error| error.to_string())?;
+            let listed = join_ids(&members);
+            let response = audited_membership(
+                vtop_observe::audit::Action::ClusterInit,
+                vec![("members", listed)],
+                || client.init(members),
+            )
+            .await?;
             note_redirects(&client);
             print_membership_change(&response.membership, "initialized", json)
         }
         MetaCommand::AddLearner { common, node_id } => {
             let config = load_admin_config(&common.config)?;
             let client = connect(&config)?;
-            let response = client
-                .add_learner(node_id)
-                .await
-                .map_err(|error| error.to_string())?;
+            let response = audited_membership(
+                vtop_observe::audit::Action::ClusterMembership,
+                vec![
+                    ("operation", "add_learner".to_owned()),
+                    ("node_id", node_id.to_string()),
+                ],
+                || client.add_learner(node_id),
+            )
+            .await?;
             note_redirects(&client);
             print_membership_change(&response.membership, "learner added", json)
         }
@@ -1062,10 +1070,20 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
         } => {
             let config = load_admin_config(&common.config)?;
             let client = connect(&config)?;
-            let response = client
-                .change_membership(voters, retain_removed_as_learners)
-                .await
-                .map_err(|error| error.to_string())?;
+            let listed = join_ids(&voters);
+            let response = audited_membership(
+                vtop_observe::audit::Action::ClusterMembership,
+                vec![
+                    ("operation", "change_membership".to_owned()),
+                    ("voters", listed),
+                    (
+                        "retain_removed_as_learners",
+                        retain_removed_as_learners.to_string(),
+                    ),
+                ],
+                || client.change_membership(voters, retain_removed_as_learners),
+            )
+            .await?;
             note_redirects(&client);
             print_membership_change(&response.membership, "membership changed", json)
         }
@@ -1444,16 +1462,6 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                     vtop_meta::SUPPORTED_FEATURE_LEVEL
                 ));
             }
-            // Judged here as well as in the state machine (#634): the state
-            // machine's refusal is bounded to a few hundred bytes, and this
-            // one names every node the raise waits for.
-            if level > vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL {
-                let config = load_admin_config(&common.config)?;
-                let client = connect(&config)?;
-                let read = client.read_cluster_versions(true).await;
-                note_redirects(&client);
-                judge_feature_raise(level, read)?;
-            }
             let command = MetadataCommand::SetFeatureLevel {
                 env: CommandEnvelope {
                     request_id: request_id.unwrap_or_else(Uuid::new_v4),
@@ -1461,7 +1469,38 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 },
                 feature_level: level,
             };
-            propose_and_print(&common.config, command, json).await
+            // Judged here as well as in the state machine (#634): the state
+            // machine's refusal is bounded to a few hundred bytes, and this
+            // one names every node the raise waits for. The level it raises
+            // from goes into the audit record when this read was made
+            // (#694); below the levels that need it, nothing is read, as
+            // before (review of #705).
+            let mut before = Vec::new();
+            if level > vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL {
+                let config = load_admin_config(&common.config)?;
+                let client = connect(&config)?;
+                let read = client.read_cluster_versions(true).await;
+                note_redirects(&client);
+                if let Ok(read) = &read {
+                    before.push((
+                        "level",
+                        serde_json::Value::from(read.versions.feature_level),
+                    ));
+                }
+                if let Err(refusal) = judge_feature_raise(level, read) {
+                    if let Some(event) =
+                        crate::audit::client_record(&command, vtop_observe::audit::Outcome::Refused)
+                    {
+                        let mut event = event.reason(format!("refused before sending: {refusal}"));
+                        for (name, value) in &before {
+                            event = event.before(name, value.clone());
+                        }
+                        crate::audit::record_best_effort(&event);
+                    }
+                    return Err(refusal);
+                }
+            }
+            propose_and_print_noting(&common.config, command, json, before).await
         }
         MetaCommand::NodeVersions { common, level } => {
             let config = load_admin_config(&common.config)?;
@@ -2180,13 +2219,54 @@ pub(crate) async fn propose_and_print(
     command: MetadataCommand,
     json: bool,
 ) -> Result<(), String> {
-    let config = load_admin_config(config_path)?;
-    let client = connect(&config)?;
-    let response = client
-        .propose(command)
-        .await
-        .map_err(|error| error.to_string())?;
-    note_redirects(&client);
+    propose_and_print_noting(config_path, command, json, Vec::new()).await
+}
+
+/// [`propose_and_print`], with what the command changes from (`before`) in
+/// its audit record.
+///
+/// An audited command (#694) leaves the client's record: this operator, on
+/// this host, asked for it, and what came back - committed at an index,
+/// rejected by the state machine, refused by the endpoint, or not sent. The
+/// metadata nodes write the edge and applied records of the same request id.
+pub(crate) async fn propose_and_print_noting(
+    config_path: &Path,
+    command: MetadataCommand,
+    json: bool,
+    before: Vec<(&'static str, serde_json::Value)>,
+) -> Result<(), String> {
+    let record = crate::audit::client_record(&command, vtop_observe::audit::Outcome::Success);
+    let sent = async {
+        let config =
+            load_admin_config(config_path).map_err(|e| (false, format!("not sent: {e}")))?;
+        let client = connect(&config).map_err(|e| (false, format!("not sent: {e}")))?;
+        let response = client.propose(command).await;
+        note_redirects(&client);
+        response.map_err(|error| (is_refusal(&error), error.to_string()))
+    }
+    .await;
+    if let Some(mut event) = record {
+        for (name, value) in before {
+            event = event.before(name, value);
+        }
+        let event = match &sent {
+            Ok(response) => match &response.response {
+                MetadataResponse::Rejected(error) => event
+                    .with_outcome(vtop_observe::audit::Outcome::Failure)
+                    .log_index(response.log_id.index)
+                    .reason(format!("rejected by the state machine: {error}")),
+                _ => event.log_index(response.log_id.index),
+            },
+            Err((true, reason)) => event
+                .with_outcome(vtop_observe::audit::Outcome::Refused)
+                .reason(reason),
+            Err((false, reason)) => event
+                .with_outcome(vtop_observe::audit::Outcome::Failure)
+                .reason(reason),
+        };
+        crate::audit::record_best_effort(&event);
+    }
+    let response = sent.map_err(|(_, message)| message)?;
     if json {
         println!(
             "{}",
@@ -2204,6 +2284,48 @@ pub(crate) async fn propose_and_print(
         return Err("metadata command was rejected".to_owned());
     }
     Ok(())
+}
+
+/// Whether the endpoint refused the request by its authorization policy:
+/// the refusal crosses the wire as an admin error whose text the server's
+/// `TransportError::Unauthorized` wrote.
+fn is_refusal(error: &vtop_meta::TransportError) -> bool {
+    match error {
+        vtop_meta::TransportError::Unauthorized(_) => true,
+        vtop_meta::TransportError::Protocol(message) => message.starts_with("unauthorized: "),
+        _ => false,
+    }
+}
+
+/// Run a bootstrap or membership request and write the client's audit
+/// record of it (#694).
+async fn audited_membership<F, Fut>(
+    action: vtop_observe::audit::Action,
+    params: Vec<(&'static str, String)>,
+    run: F,
+) -> Result<vtop_meta::transport::AdminMembershipResponse, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<
+        Output = Result<vtop_meta::transport::AdminMembershipResponse, vtop_meta::TransportError>,
+    >,
+{
+    let result = run().await;
+    let outcome = match &result {
+        Ok(_) => vtop_observe::audit::Outcome::Success,
+        Err(error) if is_refusal(error) => vtop_observe::audit::Outcome::Refused,
+        Err(_) => vtop_observe::audit::Outcome::Failure,
+    };
+    let mut event = crate::audit::membership_record(action, &params, outcome);
+    if let Err(error) = &result {
+        event = event.reason(error);
+    }
+    crate::audit::record_best_effort(&event);
+    result.map_err(|error| error.to_string())
+}
+
+fn join_ids(ids: &[u64]) -> String {
+    ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
 }
 
 fn status_json(status: &AdminStatusResponse) -> serde_json::Value {
