@@ -132,11 +132,11 @@ transfer engine, **without weakening the core guarantee**:
   spool position) advances only after the object **and** manifest are uploaded
   and verified.
 - **Replay safety** — a crash at any stage is recoverable with **no data loss**.
-- **Delivery semantics (accurate):** today the system is **at-least-once with
-  possible duplicate objects** (§2.5, §7). *Idempotent at the archive layer*
-  requires **deterministic / content-addressed object keys [PROPOSED]** —
-  which protocol §15.1 already mandates (deterministic naming is a **MUST**);
-  this is the one known conformance gap in the reference implementation.
+- **Delivery semantics (accurate):** today the system is **at-least-once**. A
+  replay of the same bytes reuses the stored object (content-addressed keys,
+  #626); a replay with other batch boundaries, a later seal-time hour, no
+  checksum or a command backend can still leave a duplicate object (§2.5, §7).
+  Protocol §15.1's deterministic naming MUST is narrowed by #626, not closed.
 
 ### 2.3 Non-goals
 - Not a stream-processing/analytics engine (only framing/format detection).
@@ -906,9 +906,9 @@ Define `end_offset` as the **last record's offset**; the committed offset is
 **Crash edge case (must be documented as safe):**
 ```text
 If the engine marks VERIFIED but crashes before the Kafka offset commit, the
-batch is replayed after rebalance. This is safe ONLY once object keys are
-deterministic (§7.3): the existing verified object+manifest is treated as
-success. Until then, replay produces a duplicate object (no loss).
+batch is replayed after rebalance. Since #626 a replay of the same range with
+the same bytes finds the existing verified object and reuses it (§7.3); a
+replay whose batch boundaries differ still writes a second object (no loss).
 ```
 
 ### 8.2 Single-node vs fleet consumer mode (design decision)
@@ -1766,9 +1766,9 @@ proven by a scenario that drives real processes, not only by unit coverage.
   today from a `--features postgres` source build** (release artifacts don't
   yet enable the feature).
 - **Two current-behavior caveats the design must still fix for fleet HA:**
-  (a) object keys are **non-deterministic** → replay makes **duplicates**; fix with
-  **deterministic keys** (Phase 4) for idempotency + Object Lock safety —
-  also the one conformance gap against protocol §15.1.
+  (a) object keys are **deterministic only for the same bytes** (#626) → a replay
+  with other boundaries still makes **duplicates**; reproducible boundaries
+  (the rest of Phase 4) close it, and protocol §15.1 stays narrowed until then.
   (b) the engine is **single-instance by design** until Kafka consumer-group
   fleet mode and multi-writer recovery land (Phase 5).
 - **VERIFIED is defined precisely (§4); strong content-derived verification is

@@ -165,14 +165,14 @@ fn file_range(input: &Path) -> String {
     format!("b0-{}", std::fs::metadata(input).unwrap().len())
 }
 
-/// The process-wide count of `decision` for file batches of the default
-/// tenant (#626). Tests run in parallel and only ever add, so a test asserts
-/// that its own decision moved the count, never an exact total.
-fn decisions(decision: &str) -> u64 {
+/// The count of `decision` for file batches of `tenant` (#626). A test that
+/// asserts on it uses a tenant of its own, so the parallel tests of this
+/// binary never add to the series it reads and it can assert exact deltas.
+fn decisions(tenant: &str, decision: &str) -> u64 {
     vtop_core::telemetry::init()
         .unwrap()
         .object_key_decisions_total
-        .with_label_values(&["default", "file", "raw", decision])
+        .with_label_values(&[tenant, "file", "raw", decision])
         .get()
 }
 
@@ -204,14 +204,14 @@ async fn a_replay_of_an_uploaded_range_writes_no_second_object() {
     let input = dir.path().join("app.log");
     write_lines(&input, "app", 4);
     let backend = Arc::new(MockBackend::new().with_throttled_manifest_puts(1));
-    let mut engine = engine(
-        config(dir.path(), "state.db", std::slice::from_ref(&input)),
-        &backend,
-    )
-    .await;
+    let tenant = "counted-626";
+    let mut cfg = config(dir.path(), "state.db", std::slice::from_ref(&input));
+    cfg.engine.tenant = tenant.into();
+    let mut engine = engine(cfg, &backend).await;
     let (logs, _guard) = Logs::capture();
     let range = file_range(&input);
-    let (derived_before, reused_before) = (decisions("derived"), decisions("reused"));
+    let count = |decision| decisions(tenant, decision);
+    let (derived_before, reused_before) = (count("derived"), count("reused"));
 
     let first = engine.process_once(SourceType::File).await.unwrap();
     assert_eq!(first.len(), 1, "{first:?}");
@@ -263,11 +263,16 @@ async fn a_replay_of_an_uploaded_range_writes_no_second_object() {
             "nothing to do",
         ],
     );
-    assert!(
-        decisions("derived") > derived_before,
-        "the first attempt is counted"
+    assert_eq!(
+        count("derived"),
+        derived_before + 1,
+        "the first attempt is counted once"
     );
-    assert!(decisions("reused") > reused_before, "the reuse is counted");
+    assert_eq!(
+        count("reused"),
+        reused_before + 1,
+        "the reuse is counted once"
+    );
 
     // The committed row scrubs clean against the reused object.
     let rows = scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
@@ -760,7 +765,7 @@ async fn a_refused_probe_falls_back_to_the_attempt_key_and_says_why() {
         &fallback,
         &text(&fallback, "key"),
         &file_range(&input),
-        &["could not be checked", "403", "permissions"],
+        &["could not be checked", "403", "grant list permission"],
     );
 }
 

@@ -163,10 +163,13 @@ pub struct Pipeline<'a> {
 /// the store refuses. The first is logged at once; later ones at most once a
 /// minute per kind, with how many were suppressed in between. Each decision
 /// is still counted in `vtop_object_key_decisions_total`.
+type NoticeKey = (&'static str, String);
+
 #[derive(Debug)]
 pub struct KeyNotices {
     every: Duration,
-    last: std::sync::Mutex<HashMap<&'static str, (Instant, u64)>>,
+    /// (kind, source) -> (when one was last logged, suppressed since).
+    last: std::sync::Mutex<HashMap<NoticeKey, (Instant, u64)>>,
 }
 
 impl Default for KeyNotices {
@@ -184,13 +187,18 @@ impl KeyNotices {
     }
 
     /// `Some(suppressed since the last one logged)` when a notice of `kind`
-    /// should be logged now, `None` when it is suppressed.
-    fn admit(&self, kind: &'static str) -> Option<u64> {
+    /// about `source` should be logged now, `None` when it is suppressed. Per
+    /// source, so one stream's notices never hide another's; sources are
+    /// bounded by configuration and discovery.
+    fn admit(&self, kind: &'static str, source: &str) -> Option<u64> {
+        self.admit_at(kind, source, Instant::now())
+    }
+
+    fn admit_at(&self, kind: &'static str, source: &str, now: Instant) -> Option<u64> {
         let mut last = self.last.lock().unwrap();
-        let now = Instant::now();
-        match last.get_mut(kind) {
+        match last.get_mut(&(kind, source.to_owned())) {
             None => {
-                last.insert(kind, (now, 0));
+                last.insert((kind, source.to_owned()), (now, 0));
                 Some(0)
             }
             Some((at, suppressed)) if now.duration_since(*at) >= self.every => {
@@ -691,6 +699,10 @@ impl<'a> Pipeline<'a> {
         let range = window.range_token();
         let source_name = source.source_name.as_str();
         let decided = |decision: &str| {
+            debug_assert!(
+                telemetry::OBJECT_KEY_DECISIONS.contains(&decision),
+                "{decision} is not a pinned decision value"
+            );
             if let Some(mx) = telemetry::metrics() {
                 mx.object_key_decisions_total
                     .with_label_values(&[labels[0], labels[1], labels[2], decision])
@@ -700,7 +712,7 @@ impl<'a> Pipeline<'a> {
         let (object_uri, reused) = match derived_object_uri {
             Err(why) => {
                 decided("per_attempt");
-                if let Some(suppressed) = self.key_notices.admit("per_attempt") {
+                if let Some(suppressed) = self.key_notices.admit("per_attempt", source_name) {
                     tracing::info!(
                         event = "object_key_per_attempt",
                         batch_id,
@@ -769,19 +781,32 @@ impl<'a> Pipeline<'a> {
                             "nothing is lost; use a backend and checksum that verify stored \
                              content so a replay can reuse it",
                         ),
+                        KeyProbe::Unreadable(_) => (
+                            "fallback_unreadable",
+                            "exists but could not be read to verify it",
+                            "nothing is lost; run `vtopctl scrub` to see whether a committed \
+                             batch names it, and check the store's health",
+                        ),
+                        KeyProbe::Unchecked(why) if why.contains("403") => (
+                            "fallback_unchecked",
+                            "could not be checked: the store refused the request",
+                            "nothing is lost; grant list permission on the bucket: without it \
+                             S3 answers a missing key with 403, not 404, and no replay can reuse \
+                             an object",
+                        ),
                         _ => (
                             "fallback_unchecked",
-                            "could not be checked",
-                            "nothing is lost; check the store's permissions: without list \
-                             permission S3 answers a missing key with 403, not 404",
+                            "could not be checked: the store did not answer the request",
+                            "nothing is lost; check the store's health if this persists",
                         ),
                     };
                     decided(decision);
-                    // A refused probe repeats for every batch until the
-                    // permission is fixed; a damaged or size-only object is
-                    // about one key and is always reported.
+                    // A failed check of the key repeats for every batch while
+                    // the store or its permissions stay as they are; an
+                    // object that does not verify, verifies by size only or
+                    // cannot be read is about one key and is always reported.
                     let suppressed = if decision == "fallback_unchecked" {
-                        self.key_notices.admit(decision)
+                        self.key_notices.admit(decision, source_name)
                     } else {
                         Some(0)
                     };
@@ -939,7 +964,9 @@ impl<'a> Pipeline<'a> {
             .await?;
         state_write += t_write.elapsed();
         mark_state!(BatchState::ObjectUploaded);
-        tracing::info!(batch_id, uri = %object_uri, "object_uploaded");
+        if !reused {
+            tracing::info!(batch_id, uri = %object_uri, "object_uploaded");
+        }
 
         // ---- Build + upload manifest ------------------------------------
         let manifest = ManifestBuilder {
@@ -1480,15 +1507,21 @@ enum KeyProbe {
     Differs(String),
     /// An object is there and the backend could confirm only its size.
     SizeOnly(String),
-    /// The store's answer was not a clear "absent" or a verification.
-    Unknown(String),
+    /// An object is there and its verification failed with an error.
+    Unreadable(String),
+    /// The store refused or failed the check of the key (a 403 without list
+    /// permission, a 5xx, a timeout): it did not say the key is absent.
+    Unchecked(String),
 }
 
 impl KeyProbe {
     fn reason(&self) -> &str {
         match self {
             KeyProbe::Free | KeyProbe::Holds => "",
-            KeyProbe::Differs(why) | KeyProbe::SizeOnly(why) | KeyProbe::Unknown(why) => why,
+            KeyProbe::Differs(why)
+            | KeyProbe::SizeOnly(why)
+            | KeyProbe::Unreadable(why)
+            | KeyProbe::Unchecked(why) => why,
         }
     }
 }
@@ -1518,7 +1551,7 @@ async fn probe_object_key(
         Ok(_) => {}
         Err(VtopError::NotFound(_)) => return Ok(KeyProbe::Free),
         Err(e) if e.is_upload_throttle() => return Err(e),
-        Err(e) => return Ok(KeyProbe::Unknown(format!("the probe failed: {e}"))),
+        Err(e) => return Ok(KeyProbe::Unchecked(format!("the probe failed: {e}"))),
     }
     match note_store_request(
         backend.verify_object(uri, size, checksum).await,
@@ -1531,7 +1564,7 @@ async fn probe_object_key(
         Ok(v) if v.passed => Ok(KeyProbe::SizeOnly(v.message)),
         Ok(v) => Ok(KeyProbe::Differs(v.message)),
         Err(e) if e.is_upload_throttle() => Err(e),
-        Err(e) => Ok(KeyProbe::Unknown(format!(
+        Err(e) => Ok(KeyProbe::Unreadable(format!(
             "an object is there and could not be verified: {e}"
         ))),
     }
@@ -8862,6 +8895,65 @@ mod tests {
         );
     }
 
+    /// A store whose objects exist but cannot be read back to verify.
+    struct UnreadableObjects(Arc<vtop_upload::MockBackend>);
+
+    #[async_trait::async_trait]
+    impl UploadBackend for UnreadableObjects {
+        async fn put_object(
+            &self,
+            local_path: &std::path::Path,
+            object_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredObject, VtopError> {
+            self.0.put_object(local_path, object_uri, checksum).await
+        }
+        async fn put_manifest(
+            &self,
+            local_path: &std::path::Path,
+            manifest_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredManifest, VtopError> {
+            self.0
+                .put_manifest(local_path, manifest_uri, checksum)
+                .await
+        }
+        async fn head_object(&self, uri: &str) -> Result<vtop_upload::ObjectHead, VtopError> {
+            self.0.head_object(uri).await
+        }
+        async fn get_object(&self, uri: &str) -> Result<Vec<u8>, VtopError> {
+            self.0.get_object(uri).await
+        }
+        async fn get_object_bounded(&self, uri: &str, max: usize) -> Result<Vec<u8>, VtopError> {
+            self.0.get_object_bounded(uri, max).await
+        }
+        async fn verify_object(
+            &self,
+            uri: &str,
+            _size: u64,
+            _expected: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::VerificationResult, VtopError> {
+            Err(VtopError::Upload(format!(
+                "get_object {uri}: connection reset"
+            )))
+        }
+        async fn delete_object(&self, uri: &str) -> Result<(), VtopError> {
+            self.0.delete_object(uri).await
+        }
+        fn backend_name(&self) -> &'static str {
+            "unreadable"
+        }
+        fn supports_checksum_verification(&self) -> bool {
+            true
+        }
+        fn supports_multipart(&self) -> bool {
+            false
+        }
+        fn reports_absent_objects(&self) -> bool {
+            true
+        }
+    }
+
     /// #626: what may be done with a derived key. Only an absent key is
     /// written to, and only an object that verifies STRONGLY against the
     /// batch's digest is reused; damaged bytes and a size-only pass leave the
@@ -8912,13 +9004,33 @@ mod tests {
         );
         assert_eq!(throttles.load(Ordering::Relaxed), 0);
 
+        // An object is there but reading it to verify fails: not reused, not
+        // written over, and told apart from a refused check.
+        let unreadable = UnreadableObjects(Arc::new(vtop_upload::MockBackend::new()));
+        unreadable.0.put_object(&path, uri, ck()).await.unwrap();
+        let got = probe_object_key(
+            &unreadable,
+            uri,
+            size,
+            ck(),
+            ["default", "file", "raw"],
+            &attempts,
+            &throttles,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&got, KeyProbe::Unreadable(why) if why.contains("could not be verified")),
+            "{got:?}"
+        );
+
         // A HEAD the store refused says nothing about the key: it is not
         // free, so nothing is written to it.
         let refused = Arc::new(
             vtop_upload::MockBackend::new().with_head_fault(vtop_upload::HeadFault::Refused),
         );
         assert!(
-            matches!(probe(refused).await, KeyProbe::Unknown(why) if why.contains("403")),
+            matches!(probe(refused).await, KeyProbe::Unchecked(why) if why.contains("403")),
             "a refused probe falls back to the attempt key"
         );
 
@@ -8945,21 +9057,31 @@ mod tests {
     /// most once per interval, saying how many were suppressed in between.
     #[test]
     fn key_notices_admit_the_first_then_one_per_interval_with_the_suppressed_count() {
-        let notices = KeyNotices::every(Duration::from_millis(50));
-        assert_eq!(notices.admit("per_attempt"), Some(0), "the first is logged");
-        assert_eq!(notices.admit("per_attempt"), None);
-        assert_eq!(notices.admit("per_attempt"), None);
+        let notices = KeyNotices::every(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
         assert_eq!(
-            notices.admit("fallback_unchecked"),
+            notices.admit_at("per_attempt", "a", at(0)),
+            Some(0),
+            "the first is logged"
+        );
+        assert_eq!(notices.admit_at("per_attempt", "a", at(1)), None);
+        assert_eq!(notices.admit_at("per_attempt", "a", at(59)), None);
+        assert_eq!(
+            notices.admit_at("per_attempt", "b", at(2)),
+            Some(0),
+            "another source is not hidden by the first"
+        );
+        assert_eq!(
+            notices.admit_at("fallback_unchecked", "a", at(3)),
             Some(0),
             "each kind has its own interval"
         );
-        std::thread::sleep(Duration::from_millis(60));
         assert_eq!(
-            notices.admit("per_attempt"),
+            notices.admit_at("per_attempt", "a", at(60)),
             Some(2),
             "the next one reports the two suppressed"
         );
-        assert_eq!(notices.admit("per_attempt"), None);
+        assert_eq!(notices.admit_at("per_attempt", "a", at(61)), None);
     }
 }

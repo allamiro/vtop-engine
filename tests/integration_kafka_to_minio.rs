@@ -1942,6 +1942,9 @@ async fn an_engine_sharing_the_ledger_reuses_the_object_another_left_for_a_kafka
             let mut cfg =
                 vtop_cli::testkit::file_config(work.to_str().unwrap(), &db, vec![], "mock");
             cfg.engine.name = name;
+            // No time fields: B seals after A, and a run that crossed an hour
+            // between them would see two partitions and so two keys.
+            cfg.partitioning.template = "tenant={tenant}/source={source}/format={format}/".into();
             cfg.sources.file = None;
             let mut kafka = kafka_cfg(&bootstrap(), &group);
             kafka.topic_include_regex = format!("^{topic}$");
