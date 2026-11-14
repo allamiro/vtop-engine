@@ -634,9 +634,11 @@ struct ReceiptCheck {
 /// are not pinned in the ledger, and a GET returns no version id here, so
 /// there is no version to pin it to. `Ok(None)`: the receipt went between
 /// the two reads, which the next run counts as missing. `Err`: why the
-/// retention could not be read, for an `unreadable` receipt finding.
+/// retention could not be read (what happened only; the caller says what
+/// the scrub did about it).
 async fn receipt_retention_of(
     backend: &dyn UploadBackend,
+    batch_id: &str,
     receipt_uri: &str,
     mode: ObjectLockMode,
 ) -> Result<Option<RetentionResult>, String> {
@@ -644,6 +646,8 @@ async fn receipt_retention_of(
         RetentionRead::Judged(result) => Ok(Some(result)),
         RetentionRead::Failed { absent: true, .. } => {
             tracing::info!(
+                event = "scrub_receipt_retention_gone",
+                batch_id,
                 receipt_uri,
                 "verification receipt {receipt_uri} was deleted between its read and its \
                  retention read; the scrub judged no retention for it, and the next run \
@@ -651,15 +655,9 @@ async fn receipt_retention_of(
             );
             Ok(None)
         }
-        RetentionRead::Failed { error: e, .. } => Err(format!(
-            "the retention of verification receipt {receipt_uri} could not be read: {e}; the \
-             receipt is reported unreadable and the batch's own result is left alone (nothing \
-             was proven about the receipt's lock; the scrub needs s3:GetObjectRetention)"
-        )),
+        RetentionRead::Failed { error, .. } => Err(error.to_string()),
         RetentionRead::Unsupported => Err(format!(
-            "the retention of verification receipt {receipt_uri} cannot be read by the {} \
-             backend; the receipt is reported unreadable and the batch's own result is left \
-             alone",
+            "the {} backend cannot read retention",
             backend.backend_name()
         )),
     }
@@ -671,10 +669,14 @@ fn receipt_retention_detail(receipt_uri: &str, found: RetentionResult, mode: &st
     let (what, remedy) = match found {
         RetentionResult::Missing => (
             "carries no retention",
-            "a receipt with no lock can be deleted or overwritten: re-apply the retention with \
-             PutObjectRetention on the receipt's current version if it should be kept (it is \
-             evidence from the engine, not a commit precondition), and check who could bypass \
-             it, or whether an engine older than v0.10.0 wrote it",
+            "a receipt with no lock can be deleted or overwritten. It was written before \
+             upload.object_lock was set, or the engine's read-back after the write found it \
+             unlocked (it logged verification_receipt_failed), or a principal allowed to \
+             bypass governance removed the lock; if every batch's retention reads missing too, \
+             the scrub lacks s3:GetObjectRetention, which reads as no lock; re-apply the \
+             retention with PutObjectRetention on the receipt's current version if it should \
+             be kept (it is evidence from the engine, not a commit precondition), and check \
+             who could bypass it",
         ),
         _ => (
             "is under another retention mode than the configured one",
@@ -800,13 +802,24 @@ async fn receipt_check(
     let (mut result, mut detail, read_at) = receipt_of(backend, keyring, rec).await;
     let mut judged = None;
     if let (Some(mode), Some(ruri)) = (retention, read_at.as_deref()) {
-        match receipt_retention_of(backend, ruri, mode).await {
+        match receipt_retention_of(backend, &rec.batch_id, ruri, mode).await {
             Ok(found) => judged = found,
             Err(why) if result == ReceiptResult::Ok => {
                 result = ReceiptResult::Unreadable;
-                detail = why;
+                detail = format!(
+                    "the retention of verification receipt {ruri} could not be read ({why}); \
+                     the receipt is reported unreadable and the batch's own result is left \
+                     alone: nothing was proven about the receipt's lock"
+                );
             }
-            Err(why) => detail = format!("{detail}; {why}"),
+            // Already a finding (review of #749): it keeps its result.
+            Err(why) => {
+                detail = format!(
+                    "{detail}; its retention could not be read either ({why}); the receipt \
+                     stays reported {}",
+                    result.as_str()
+                )
+            }
         }
     }
     ReceiptCheck {
@@ -2524,6 +2537,7 @@ mod tests {
         let backend = vtop_upload::MockBackend::new();
         let found = receipt_retention_of(
             &backend,
+            "b",
             "s3://telemetry-raw/x/b.receipt.json",
             ObjectLockMode::Governance,
         )

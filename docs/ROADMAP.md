@@ -1004,13 +1004,15 @@ known limitations:
   When receipts are checked, `vtopctl scrub --check-retention` reads each
   existing receipt's retention again, at its current key (#710), counted
   apart from the batch's in `vtop_scrub_receipt_retention_total{result}`: no
-  retention and another mode are findings, an ended retention and a missing
-  receipt are not.
+  retention and another mode are findings, an ended retention is not, and a
+  missing receipt is not a retention finding.
 - **A scheduled `scrub --check-retention` can now fail on receipts.** On an
-  archive that has receipts, a receipt written before the profile was set,
-  or by an engine older than v0.10.0, carries no lock and is a finding: the
-  run exits non-zero and `vtop_scrub_last_finding_timestamp_seconds` moves,
-  as for an unlocked object. Each read is one more request per receipt.
+  archive that has receipts, a receipt written before `upload.object_lock`
+  was set, one the engine's read-back found unlocked (it logged
+  `verification_receipt_failed`), or one whose lock was removed carries no
+  lock and is a finding: the run exits non-zero and
+  `vtop_scrub_last_finding_timestamp_seconds` moves, as for an unlocked
+  object. Each read is one more request per receipt.
 - **Going back.** Set `verification_receipts: false`. Receipts already written
   stay readable; drop `--require-receipts` from scheduled scrubs.
 

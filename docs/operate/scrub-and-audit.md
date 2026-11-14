@@ -126,7 +126,7 @@ without one; a finding prints as `FAIL receipt retention missing <batch>`:
 |---|---|---|
 | `locked` | Under the configured mode until a date still ahead. | No |
 | `elapsed` | Under the configured mode until a date that has passed. | No |
-| `missing` | No retention: written before the profile was set, or removed by a principal allowed to bypass governance. The receipt can be deleted or overwritten. | Yes |
+| `missing` | No retention: written before the profile was set, found unlocked by the engine's read-back after the write (it logged `verification_receipt_failed`), or removed by a principal allowed to bypass governance. The receipt can be deleted or overwritten. A scrub without `s3:GetObjectRetention` reads every lock as missing. | Yes |
 | `mode_mismatch` | Under another mode than the configured one. | Yes |
 
 A receipt finding is about the evidence, not the data: the batch's object and

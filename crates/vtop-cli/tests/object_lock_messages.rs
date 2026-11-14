@@ -208,7 +208,14 @@ async fn the_object_lock_events_carry_what_an_operator_needs() {
         assert_eq!(text(&event[0], "batch_id"), out[0].batch_id);
         assert_eq!(text(&event[0], "receipt_uri"), ruri);
         assert_eq!(text(&event[0], "receipt_retention"), "missing");
-        assert!(logs.raw().contains("\"level\":\"WARN\""), "{}", logs.raw());
+        let line = logs
+            .raw()
+            .lines()
+            .find(|l| l.contains("scrub_receipt_retention_finding"))
+            .map(str::to_owned)
+            .unwrap();
+        let line: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(line["level"], "WARN", "{line}");
         assert_eq!(
             text(&event[0], "message"),
             "scrub receipt retention finding"
