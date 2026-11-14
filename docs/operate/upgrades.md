@@ -26,9 +26,9 @@ in the roadmap; the steps that need an operator are:
   any v0.8.0 engine that was running during the migration: until its
   connections are replaced, its whole-row reads fail. SQLite migrates on
   connect.
-- **`delete_after_commit` keeps files it cannot prove are closed**, which
-  includes the shipped Helm chart's unprivileged pod. Watch disk use and
-  `vtop_file_delete_decisions_total{outcome}`.
+- **`delete_after_commit` keeps files it cannot prove are closed**: on
+  macOS, NFS or FUSE, another user's file, and in any container without
+  `CAP_LEASE`. Watch disk use and `vtop_file_delete_decisions_total{outcome}`.
 - **Kerberos (SASL GSSAPI) for the Kafka source is no longer in the default
   build.** If you use `sasl_mechanism: GSSAPI`, build with
   `--features kafka-gssapi`.

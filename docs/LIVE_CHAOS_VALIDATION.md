@@ -172,10 +172,9 @@ production cluster daemon.
   data plane follows metadata leases from the live Raft group: scenarios 09,
   14 and 23 kill a range leader and assert that another node takes the range
   under a lease (09 also asserts that the restarted old leader is refused as
-  fenced). Membership changes
-  (scenarios 01 to 03) and data replica-set changes (scenario 12) are driven
-  by the operator; the harness does not claim that a data node reacts to a
-  membership change on its own.
+  fenced). Membership changes (scenarios 01 to 03) and data replica-set
+  changes (scenario 12) are driven by the operator; the harness does not
+  claim that a data node reacts to a membership change on its own.
 - Scenario 03 validates metadata voter replacement, and only that. The
   #180/#181 replacement-proof lifecycle for a sealed DATA replica is
   exercised end to end by scenario 12 — operator-driven, through
