@@ -517,6 +517,14 @@ What follows from that, in the engine:
   losses above, by the operator's choice. Where the lease can be had, it is
   always taken, and a file some process holds is kept whatever that key
   says.
+- **macOS.** The engine's open-file check is a Linux write lease, and it
+  has no check on macOS (`write_lease::take` answers that it cannot tell;
+  `libproc` and `lsof` see a snapshot, as a `/proc/*/fd` scan does). So a
+  fully archived file is kept there unless `delete_without_open_check` is
+  set. The file source's lib tests run on macOS in CI (the
+  `file source (macOS)` job) with the opt-in, because that is the only way
+  a delete happens there. Tests that need a lease run on Linux only, and a
+  test pins the default refusal on macOS and the other Unix platforms.
 - **"Unchanged" is one identity test**, `continuity::proves` (#647), the
   test every identity decision shares: the same inode, the first page
   (#578) and the page below the committed end (#620's tail fingerprint),
