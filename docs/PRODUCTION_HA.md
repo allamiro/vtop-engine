@@ -653,6 +653,14 @@ below it. For those, take the start from the ledger row with the manifest's
 row; the end is right in both. See
 [`VTOP_PROTOCOL_DRAFT.md`](VTOP_PROTOCOL_DRAFT.md) §11.2.
 
+**Each pass is audited (#694).** `prune-ledger` writes an `attempt` record
+to the state store's `audit_events` table (and the log and `VTOP_AUDIT_LOG`)
+before it deletes anything, and is refused when it cannot; its outcome
+record names the rows deleted and the digest. Pruning never deletes an audit
+row. On PostgreSQL the maintenance identity needs `SELECT, INSERT` on
+`audit_events` and `USAGE` on its sequence. See
+[operate/auditing.md](operate/auditing.md).
+
 ---
 
 ## 7. Object storage, idempotency & Object Lock / WORM

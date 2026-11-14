@@ -56,6 +56,7 @@ are in the [security model §3](../SECURITY_MODEL.md#3-credential-handling).
 | `VTOP_METRICS_TLS_CLIENT_CA` | With the pair above, require scrapers to present a certificate under this CA. |
 | `RUST_LOG` | Log filter. Wins over `--log-level` and `engine.log_level`. |
 | `VTOP_LOG_FORMAT` | `json` for JSON log lines (as does `--json`). |
+| `VTOP_AUDIT_LOG` | Append audit records (#694) to this JSONL file, as well as the log stream. A set but unwritable path stops the command or node at startup, naming it. See [Auditing](../operate/auditing.md). |
 | `VTOP_CONFIG` | Container image only: the config path the entrypoint passes to `vtopctl`. Default `/app/examples/config.yaml`. |
 
 The variable named by `engine.state_store.env` (conventionally

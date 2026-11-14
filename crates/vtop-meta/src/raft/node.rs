@@ -67,7 +67,7 @@ pub async fn start_meta_node(
         .map_err(|error| format!("open meta store: {error}"))?;
     let log_store = MetaRaftLogStore::new(store.clone());
     let read_store = store.clone();
-    let state_machine = MetaRaftStateMachine::new(store);
+    let state_machine = MetaRaftStateMachine::new(store).with_node_id(node_id);
     let network = TlsRaftNetworkFactory::new(node_id, directory, material);
     let config = Arc::new(
         Config {

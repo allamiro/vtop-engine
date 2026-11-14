@@ -515,7 +515,7 @@ async fn spawn_node_on(
     let env = sim.env(seed ^ id);
     let store = MetaRaftStore::open_tiny(&env, &root, CLUSTER).map_err(|e| e.to_string())?;
     let log_store = MetaRaftLogStore::new(store.clone());
-    let state_machine = MetaRaftStateMachine::new(store.clone());
+    let state_machine = MetaRaftStateMachine::new(store.clone()).with_node_id(id);
     let network = NetworkFactory {
         router: router.clone(),
         source: id,
@@ -565,6 +565,93 @@ async fn three_node_bootstrap_converges_to_byte_identical_snapshots() {
         );
     }
     cluster.assert_converged_snapshots();
+}
+
+/// #694: every replica writes one applied audit record per audited
+/// command, with the same request id and log index, from the state-machine
+/// wrapper; a node-initiated command writes none; and a restarted replica
+/// replaying its log at open writes nothing again.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn every_replica_writes_one_applied_audit_record_per_audited_command() {
+    use vtop_meta::audit::{AuditAction, AuditActor, AuditOutcome, AuditStage, Recording};
+    let audit = Recording::installed();
+    let seed = SEED ^ 0x694;
+    let mut cluster = Cluster::boot(seed).await;
+    // Request ids of this test only: the recording auditor is process-wide.
+    let envelope = || CommandEnvelope {
+        request_id: Uuid::new_v4(),
+        issued_at_ms: 1_750_000_000_000,
+    };
+    let audited = envelope();
+    cluster
+        .write(register_cmd(audited, Uuid::from_u128(0x694)))
+        .await;
+    let records = audit.for_request(audited.request_id);
+    assert_eq!(
+        records.len(),
+        3,
+        "one applied record per replica: {records:?}"
+    );
+    let mut replicas: Vec<_> = records
+        .iter()
+        .map(|r| match r.actor {
+            AuditActor::Replica(Some(id)) => id,
+            ref other => panic!("an applied record names its replica, not {other:?}"),
+        })
+        .collect();
+    replicas.sort_unstable();
+    assert_eq!(replicas, vec![1, 2, 3]);
+    let index = records[0]
+        .log_index
+        .expect("an applied record has its index");
+    for record in &records {
+        assert_eq!(record.stage, AuditStage::Applied);
+        assert_eq!(record.action, AuditAction::ClusterPropose);
+        assert_eq!(record.outcome, AuditOutcome::Success);
+        assert_eq!(
+            record.log_index,
+            Some(index),
+            "the same index on every replica"
+        );
+        assert!(record
+            .params
+            .contains(&("command", "RegisterNode".to_owned())));
+    }
+
+    // Rejected by the state machine (a generation that does not match): a
+    // failure on every replica, with the reason.
+    let rejected = envelope();
+    cluster
+        .write(MetadataCommand::RegisterNode {
+            env: rejected,
+            node_uuid: Uuid::from_u128(0x694),
+            addr: "10.0.0.94:9200".to_owned(),
+            expected_generation: Some(999),
+        })
+        .await;
+    let records = audit.for_request(rejected.request_id);
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert!(records.iter().all(|r| r.outcome == AuditOutcome::Failure
+        && r.reason.as_deref().unwrap_or_default().contains("rejected")));
+
+    // A replica restarted from its disk replays its log at open and writes
+    // no record for what it had applied before.
+    let follower = [1u64, 2, 3]
+        .into_iter()
+        .find(|id| *id != cluster.leader_id())
+        .unwrap();
+    let (sim, root) = cluster.take_and_shutdown(follower).await;
+    cluster.restart_node(follower, sim, root).await;
+    let after = envelope();
+    cluster
+        .write(register_cmd(after, Uuid::from_u128(0x695)))
+        .await;
+    assert_eq!(
+        audit.for_request(audited.request_id).len(),
+        3,
+        "a restart must not write the applied records again"
+    );
+    assert_eq!(audit.for_request(after.request_id).len(), 3);
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

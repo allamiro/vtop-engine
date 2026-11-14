@@ -3,6 +3,7 @@
 use crate::engine::Engine;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
+use tracing::Instrument as _;
 use vtop_core::config::{StreamsConfig, VtopConfig};
 use vtop_core::errors::VtopError;
 use vtop_core::state_machine::BatchState;
@@ -228,6 +229,12 @@ pub enum Command {
         #[command(subcommand)]
         command: crate::tier_tools::TierCommand,
     },
+    /// Read the audit trail (#694): who changed engine or cluster state,
+    /// when, from where, and what changed. See docs/operate/auditing.md.
+    Audit {
+        #[command(subcommand)]
+        command: crate::audit::AuditCommand,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -420,6 +427,22 @@ pub async fn dispatch(cli: Cli) -> i32 {
     if let Command::Segment { command } = &cli.command {
         return crate::segment_tools::run(command, cli.json);
     }
+    if let Command::Audit { command } = cli.command {
+        return crate::audit::run(command, cli.json).await;
+    }
+    // The cluster and node clients write audit records of the commands they
+    // send (#694): their log stream (WARN and above unless --log-level says
+    // otherwise; audit records always) and the audit file.
+    if matches!(
+        cli.command,
+        Command::Meta { .. } | Command::Node { .. } | Command::Tier { .. }
+    ) {
+        vtop_observe::logging::init(cli.log_level.as_deref().unwrap_or("warn"), cli.json);
+        if let Err(error) = crate::audit::init_sink() {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    }
     // Meta admin tools talk to the VTPM admin endpoint; they bypass the
     // archive engine entirely.
     if let Command::Meta { command } = cli.command {
@@ -464,6 +487,9 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             // long-running `run` action: one-shot commands would expose a port
             // for a few milliseconds and never be scraped. Failure to start is
             // logged, never fatal - telemetry must not block archiving.
+            // A set but unwritable audit file stops the engine here, naming
+            // the path (#694).
+            crate::audit::init_sink()?;
             crate::metrics_server::maybe_start().await;
             let mut engine = Engine::new_exclusive(cfg, streams).await?;
             engine.run().await
@@ -544,27 +570,74 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
                 Some(&cfg.engine.name),
             )?;
+            crate::audit::init_sink()?;
+            let engine_name = cfg.engine.name.clone();
+            let audit = crate::audit::LedgerAudit {
+                command: "replay",
+                keyring: crate::audit::ledger_keyring(&cfg, "replay")?,
+            };
             let mut engine = Engine::new_exclusive(cfg, streams).await?;
-            if let Some(id) = batch_id {
-                match engine.store.get_batch(id).await? {
-                    Some(rec) => println!(
-                        "batch {} is in state {} — recovery will {}",
-                        id,
-                        rec.state,
-                        describe_recovery(rec.state)
-                    ),
-                    None => return Err(VtopError::NotFound(format!("batch {id}"))),
+            let span = tracing::info_span!("replay");
+            async {
+                if let Some(id) = batch_id {
+                    match engine.store.get_batch(id).await? {
+                        Some(rec) => println!(
+                            "batch {} is in state {} — recovery will {}",
+                            id,
+                            rec.state,
+                            describe_recovery(rec.state)
+                        ),
+                        None => return Err(VtopError::NotFound(format!("batch {id}"))),
+                    }
                 }
+                // Recorded before recovery moves a single row, and recovery is
+                // refused when the record cannot be written (#694).
+                // The ledger, whatever --batch-id names: recovery covers every
+                // incomplete batch, and --batch-id only prints that one's
+                // state (review of #705).
+                let target = vtop_observe::audit::Target::new("ledger", None);
+                let mut attempt = crate::audit::ledger_attempt(
+                    vtop_observe::audit::Action::LedgerReplay,
+                    target,
+                    &engine_name,
+                );
+                if let Some(id) = batch_id {
+                    attempt = attempt.param("batch_id", id);
+                }
+                audit.attempt(Some(engine.store.as_ref()), &attempt).await?;
+                let summary = match engine.recover().await {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        let failed = attempt
+                            .terminal(vtop_observe::audit::Outcome::Failure)
+                            .reason(&error);
+                        if let Err(unrecorded) =
+                            audit.finish(Some(engine.store.as_ref()), &failed).await
+                        {
+                            eprintln!("error: {unrecorded}");
+                        }
+                        return Err(error);
+                    }
+                };
+                let done = attempt
+                    .terminal(vtop_observe::audit::Outcome::Success)
+                    .after("committed", summary.committed)
+                    .after("replay_required", summary.replay_required)
+                    .after("superseded", summary.superseded)
+                    .after("still_pending", summary.still_pending);
+                println!(
+                    "recovery complete: committed={} replay_required={} superseded={} \
+                     still_pending={}; audit record {}",
+                    summary.committed,
+                    summary.replay_required,
+                    summary.superseded,
+                    summary.still_pending,
+                    done.audit_id
+                );
+                audit.finish(Some(engine.store.as_ref()), &done).await
             }
-            let summary = engine.recover().await?;
-            println!(
-                "recovery complete: committed={} replay_required={} superseded={} still_pending={}",
-                summary.committed,
-                summary.replay_required,
-                summary.superseded,
-                summary.still_pending
-            );
-            Ok(())
+            .instrument(span)
+            .await
         }
         Command::Status { config } => {
             let (cfg, streams) = load(config)?;
@@ -728,22 +801,69 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
                 Some(&cfg.engine.name),
             )?;
+            crate::audit::init_sink()?;
             let state_store = cfg.engine.state_store.resolve()?;
             let backend = if state_store.is_postgres() {
                 "postgresql"
             } else {
                 "sqlite"
             };
-            vtop_state::migrate_state_store(state_store.expose_secret()).await?;
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({"status": "ok", "backend": backend})
-                );
-            } else {
-                println!("state-store migration complete ({backend})");
+            let audit = crate::audit::LedgerAudit {
+                command: "migrate",
+                keyring: crate::audit::ledger_keyring(&cfg, "migrate")?,
+            };
+            let span = tracing::info_span!("migrate");
+            async {
+                // The attempt goes to the log stream and the audit file
+                // only: the table it would also go to is what this command
+                // creates. The rows follow once it exists (#694).
+                let attempt = crate::audit::ledger_attempt(
+                    vtop_observe::audit::Action::LedgerMigrate,
+                    vtop_observe::audit::Target::new("ledger", None),
+                    &cfg.engine.name,
+                )
+                .param("backend", backend);
+                audit.attempt(None, &attempt).await?;
+                if let Err(error) =
+                    vtop_state::migrate_state_store(state_store.expose_secret()).await
+                {
+                    let failed = attempt
+                        .terminal(vtop_observe::audit::Outcome::Failure)
+                        .reason(&error);
+                    if let Err(unrecorded) = audit.finish(None, &failed).await {
+                        eprintln!("error: {unrecorded}");
+                    }
+                    return Err(error);
+                }
+                let done = attempt.terminal(vtop_observe::audit::Outcome::Success);
+                // Both rows, now that the table exists: with the migration
+                // identity, which may write it.
+                let store = crate::engine::connect_configured_store(&cfg.engine, &state_store)
+                    .await
+                    .map_err(|e| {
+                        VtopError::Other(format!(
+                            "the migration completed, but its audit rows could not be written \
+                             (the state store did not open: {e}); the log stream (target \
+                             vtop::audit) holds them"
+                        ))
+                    })?;
+                audit.append_to_ledger(store.as_ref(), &attempt).await?;
+                audit.finish(Some(store.as_ref()), &done).await?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"status": "ok", "backend": backend, "audit_id": done.audit_id})
+                    );
+                } else {
+                    println!(
+                        "state-store migration complete ({backend}); audit record {}",
+                        done.audit_id
+                    );
+                }
+                Ok(())
             }
-            Ok(())
+            .instrument(span)
+            .await
         }
         Command::AuditCoverage {
             config,
@@ -817,117 +937,165 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
                 Some(&cfg.engine.name),
             )?;
-            let digest_dir = digest_dir
-                .clone()
-                .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
-            let retention_days = cfg.engine.ledger_retention_days;
-            // Read-only construction, as for audit-coverage: a scrub may run
-            // beside a live engine.
-            let engine = Engine::new(cfg, streams).await?;
-            let ledger = engine.store.list_batches().await?;
-            let (digested, digest_files) = crate::coverage::read_digests(&digest_dir)?;
-            let digest_warning =
-                crate::scrub::missing_digests_warning(retention_days, &digest_dir, digest_files);
-            if let Some(warning) = &digest_warning {
-                tracing::warn!("{warning}");
-            }
-            let sources = crate::scrub::RowSources {
-                ledger_rows: ledger.len(),
-                digest_rows: digested.len(),
-                digest_files,
-            };
-            let to_usize = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
-            let opts = crate::scrub::ScrubOptions {
-                concurrency: *concurrency as usize,
-                max_objects_per_sec: *max_objects_per_sec,
-                max_bytes_per_sec: *max_bytes_per_sec,
-                limit: limit.map(to_usize),
-                cursor_file: cursor_file.clone(),
-                sample: sample.map(to_usize),
-                seed: *seed,
-            };
-            // The run's locks, from before anything it will replace is read
-            // until it has published or rolled back (review of #652): an
-            // overlapping run that published in between would otherwise be
-            // overwritten from this run's older snapshot. Held to the end of
-            // this arm.
-            let lock = crate::scrub::lock_run(cursor_file.as_deref(), metrics_file.as_deref())?;
-            // Read BEFORE the scrub, and only an absent file is a first run:
-            // the totals and last-success time carry forward from it, so a
-            // file that exists and cannot be read would otherwise be replaced
-            // with counters reset and a success time of "never" (review).
-            let previous = match metrics_file {
-                Some(path) => match std::fs::read_to_string(path) {
-                    Ok(text) => Some(text),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(e) => {
-                        return Err(VtopError::Other(format!(
-                            "metrics file {} cannot be read ({e}); the scrub's totals carry \
-                             forward from it",
-                            path.display()
-                        )))
-                    }
-                },
-                None => None,
-            };
-            // Taken before the run moves the cursor: with --metrics-file, a run
-            // counts only once its metrics are published (review of #652).
-            let snapshot = match (cursor_file, metrics_file) {
-                (Some(cursor), Some(_)) => Some(crate::scrub::CursorSnapshot::take(cursor)?),
-                _ => None,
-            };
-            let mut report = engine
-                .scrub_held(crate::scrub::committed_rows(ledger, digested), &opts, &lock)
-                .await?;
-            report.sources = sources;
-            report.warnings.extend(digest_warning);
-            // The report first, so the findings reach stdout whatever happens
-            // to the metrics file.
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                for line in report.lines() {
-                    println!("{line}");
-                }
-            }
-            if let Some(path) = metrics_file {
-                let written = crate::coverage::write_textfile(
-                    path,
-                    &report.prometheus_text(previous.as_deref(), chrono::Utc::now().timestamp()),
+            crate::audit::init_sink()?;
+            let engine_name = cfg.engine.name.clone();
+            // Whether this run moved the cursor: what its audit record says.
+            let mut cursor_moved = false;
+            let scrubbed: Result<(), VtopError> = async {
+                let digest_dir = digest_dir
+                    .clone()
+                    .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
+                let retention_days = cfg.engine.ledger_retention_days;
+                // Read-only construction, as for audit-coverage: a scrub may run
+                // beside a live engine.
+                let engine = Engine::new(cfg, streams).await?;
+                let ledger = engine.store.list_batches().await?;
+                let (digested, digest_files) = crate::coverage::read_digests(&digest_dir)?;
+                let digest_warning = crate::scrub::missing_digests_warning(
+                    retention_days,
+                    &digest_dir,
+                    digest_files,
                 );
-                if let Err(error) = written {
-                    // Unpublished, the run's findings are in no metric the
-                    // alerts read. Put the cursor back, so the next run checks
-                    // this slice again and publishes what it finds.
-                    let undone = match &snapshot {
-                        Some(snapshot) => match snapshot.restore(&lock) {
-                            Ok(()) => "; the cursor was put back, so the next run checks \
+                if let Some(warning) = &digest_warning {
+                    tracing::warn!("{warning}");
+                }
+                let sources = crate::scrub::RowSources {
+                    ledger_rows: ledger.len(),
+                    digest_rows: digested.len(),
+                    digest_files,
+                };
+                let to_usize = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+                let opts = crate::scrub::ScrubOptions {
+                    concurrency: *concurrency as usize,
+                    max_objects_per_sec: *max_objects_per_sec,
+                    max_bytes_per_sec: *max_bytes_per_sec,
+                    limit: limit.map(to_usize),
+                    cursor_file: cursor_file.clone(),
+                    sample: sample.map(to_usize),
+                    seed: *seed,
+                };
+                // The run's locks, from before anything it will replace is read
+                // until it has published or rolled back (review of #652): an
+                // overlapping run that published in between would otherwise be
+                // overwritten from this run's older snapshot. Held to the end of
+                // this arm.
+                let lock = crate::scrub::lock_run(cursor_file.as_deref(), metrics_file.as_deref())?;
+                // Read BEFORE the scrub, and only an absent file is a first run:
+                // the totals and last-success time carry forward from it, so a
+                // file that exists and cannot be read would otherwise be replaced
+                // with counters reset and a success time of "never" (review).
+                let previous = match metrics_file {
+                    Some(path) => match std::fs::read_to_string(path) {
+                        Ok(text) => Some(text),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            return Err(VtopError::Other(format!(
+                                "metrics file {} cannot be read ({e}); the scrub's totals carry \
+                             forward from it",
+                                path.display()
+                            )))
+                        }
+                    },
+                    None => None,
+                };
+                // Taken before the run moves the cursor: with --metrics-file, a run
+                // counts only once its metrics are published (review of #652).
+                let snapshot = match (cursor_file, metrics_file) {
+                    (Some(cursor), Some(_)) => Some(crate::scrub::CursorSnapshot::take(cursor)?),
+                    _ => None,
+                };
+                let mut report = engine
+                    .scrub_held(crate::scrub::committed_rows(ledger, digested), &opts, &lock)
+                    .await?;
+                report.sources = sources;
+                report.warnings.extend(digest_warning);
+                // The report first, so the findings reach stdout whatever happens
+                // to the metrics file.
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    for line in report.lines() {
+                        println!("{line}");
+                    }
+                }
+                if let Some(path) = metrics_file {
+                    let written = crate::coverage::write_textfile(
+                        path,
+                        &report
+                            .prometheus_text(previous.as_deref(), chrono::Utc::now().timestamp()),
+                    );
+                    if let Err(error) = written {
+                        // Unpublished, the run's findings are in no metric the
+                        // alerts read. Put the cursor back, so the next run checks
+                        // this slice again and publishes what it finds.
+                        let undone = match &snapshot {
+                            Some(snapshot) => match snapshot.restore(&lock) {
+                                Ok(()) => "; the cursor was put back, so the next run checks \
                                        this slice again"
-                                .to_string(),
-                            Err(e) => format!("; the cursor could NOT be put back ({e})"),
-                        },
-                        None => String::new(),
-                    };
-                    return Err(VtopError::Other(format!(
-                        "scrub metrics file {} could not be written ({error}){undone}",
-                        path.display()
-                    )));
+                                    .to_string(),
+                                Err(e) => format!("; the cursor could NOT be put back ({e})"),
+                            },
+                            None => String::new(),
+                        };
+                        return Err(VtopError::Other(format!(
+                            "scrub metrics file {} could not be written ({error}){undone}",
+                            path.display()
+                        )));
+                    }
+                }
+                // Published (the report, and the metrics file when asked for):
+                // only now may the cursor pass this run's findings.
+                if let Some(pending) = report.pending_cursor.take() {
+                    pending.commit(&lock)?;
+                    cursor_moved = true;
+                }
+                drop(lock);
+                if report.passed {
+                    Ok(())
+                } else {
+                    Err(VtopError::Other(format!(
+                        "scrub FAILED: {} finding(s) (see the report above)",
+                        report.findings.len()
+                    )))
                 }
             }
-            // Published (the report, and the metrics file when asked for):
-            // only now may the cursor pass this run's findings.
-            if let Some(pending) = report.pending_cursor.take() {
-                pending.commit(&lock)?;
+            .await;
+            // A run that writes a cursor changes what the next run checks:
+            // its record says whether the cursor moved (#694). Not refused
+            // when the audit file fails: the scrub reads, it does not delete.
+            if let Some(cursor) = cursor_file {
+                // Success: the run completed, whether or not it found
+                // anything (a run with nothing left to check keeps the
+                // cursor where it is). Failure: it stopped on an error
+                // before it could move the cursor.
+                let outcome = if cursor_moved || scrubbed.is_ok() {
+                    vtop_observe::audit::Outcome::Success
+                } else {
+                    vtop_observe::audit::Outcome::Failure
+                };
+                let mut event = vtop_observe::audit::AuditEvent::new(
+                    vtop_observe::audit::Action::ScrubCursor,
+                    vtop_observe::audit::Stage::Local,
+                    vtop_observe::audit::Actor::local(),
+                    vtop_observe::audit::Target::new("cursor", Some(cursor.display().to_string())),
+                    outcome,
+                )
+                .engine(&engine_name)
+                .param("cursor_file", cursor.display())
+                .after("cursor_moved", cursor_moved)
+                .after("passed", scrubbed.is_ok());
+                if let Some(limit) = limit {
+                    event = event.param("limit", limit);
+                }
+                if let Some(path) = metrics_file {
+                    event = event.param("metrics_file", path.display());
+                }
+                if let Err(error) = &scrubbed {
+                    event = event.reason(error);
+                }
+                crate::audit::record_best_effort(&event);
             }
-            drop(lock);
-            if report.passed {
-                Ok(())
-            } else {
-                Err(VtopError::Other(format!(
-                    "scrub FAILED: {} finding(s) (see the report above)",
-                    report.findings.len()
-                )))
-            }
+            scrubbed
         }
         Command::PruneLedger {
             config,
@@ -942,7 +1110,12 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
                 Some(&cfg.engine.name),
             )?;
+            crate::audit::init_sink()?;
             let state_store = cfg.engine.state_store.resolve()?;
+            let audit = crate::audit::LedgerAudit {
+                command: "prune-ledger",
+                keyring: crate::audit::ledger_keyring(&cfg, "prune-ledger")?,
+            };
             // The configured bound, as the engine uses (review of #568).
             let store = crate::engine::connect_configured_store(&cfg.engine, &state_store).await?;
             let cutoff = (chrono::Utc::now() - chrono::Duration::days(i64::from(*older_than_days)))
@@ -950,30 +1123,75 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             let digest_dir = digest_dir
                 .clone()
                 .unwrap_or_else(|| crate::coverage::default_digest_dir(&cfg.engine));
-            let (deleted, digest) =
-                crate::coverage::prune_with_digest(store.as_ref(), &cutoff, *limit, &digest_dir)
-                    .await?;
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({"status": "ok", "deleted": deleted, "digest": digest})
-                );
-            } else {
-                match digest {
-                    Some(path) => println!(
-                        "pruned {deleted} committed ledger row(s); digest {}",
-                        path.display()
-                    ),
-                    None => println!("pruned 0 committed ledger row(s)"),
+            let span = tracing::info_span!("prune_ledger");
+            async {
+                // Recorded before a row is deleted; the prune is refused when
+                // the record cannot be written (#694).
+                let attempt = crate::audit::ledger_attempt(
+                    vtop_observe::audit::Action::LedgerPrune,
+                    vtop_observe::audit::Target::new("ledger", None),
+                    &cfg.engine.name,
+                )
+                .param("older_than_days", older_than_days)
+                .param("limit", limit)
+                .param("digest_dir", digest_dir.display());
+                audit.attempt(Some(store.as_ref()), &attempt).await?;
+                let (deleted, digest) = match crate::coverage::prune_with_digest(
+                    store.as_ref(),
+                    &cutoff,
+                    *limit,
+                    &digest_dir,
+                )
+                .await
+                {
+                    Ok(pruned) => pruned,
+                    Err(error) => {
+                        let failed = attempt
+                            .terminal(vtop_observe::audit::Outcome::Failure)
+                            .reason(&error);
+                        if let Err(unrecorded) = audit.finish(Some(store.as_ref()), &failed).await
+                        {
+                            eprintln!("error: {unrecorded}");
+                        }
+                        return Err(error);
+                    }
+                };
+                let mut done = attempt
+                    .terminal(vtop_observe::audit::Outcome::Success)
+                    .after("deleted", deleted);
+                if let Some(path) = &digest {
+                    done = done.after("digest", path.display().to_string());
                 }
+                audit.finish(Some(store.as_ref()), &done).await?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"status": "ok", "deleted": deleted, "digest": digest, "audit_id": done.audit_id})
+                    );
+                } else {
+                    match digest {
+                        Some(path) => println!(
+                            "pruned {deleted} committed ledger row(s); digest {}; audit record {}",
+                            path.display(),
+                            done.audit_id
+                        ),
+                        None => println!(
+                            "pruned 0 committed ledger row(s); audit record {}",
+                            done.audit_id
+                        ),
+                    }
+                }
+                Ok(())
             }
-            Ok(())
+            .instrument(span)
+            .await
         }
         Command::Receipt { .. } => unreachable!("dispatched before run_command"),
         Command::Segment { .. } => unreachable!("dispatched before run_command"),
         Command::Meta { .. } => unreachable!("dispatched before run_command"),
         Command::Node { .. } => unreachable!("dispatched before run_command"),
         Command::Tier { .. } => unreachable!("dispatched before run_command"),
+        Command::Audit { .. } => unreachable!("dispatched before run_command"),
     }
 }
 

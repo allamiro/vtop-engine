@@ -138,6 +138,9 @@ impl NodeObservability {
         // so the series read 0 rather than being absent.
         vtop_observe::otel::register_registry(&registry)
             .map_err(|error| format!("register OpenTelemetry counters: {error}"))?;
+        // The audit trail's counters (#694), at 0 from the first scrape.
+        vtop_observe::audit::register_counters(&registry)
+            .map_err(|error| format!("register audit counters: {error}"))?;
         Ok(Self {
             registry,
             gate: ReadinessGate::starting("node is still starting"),
