@@ -825,45 +825,7 @@ impl LocalBroker {
     /// a config that does not is refused here by name.
     pub fn with_group_commit(mut self, config: GroupCommitConfig) -> BrokerResult<Self> {
         if self.replicas.is_some() {
-            let limits = crate::replication::REPLICA_LIMITS;
-            let frame = u64::from(limits.max_frame_bytes);
-            let header = vtop_protocol::HEADER_LEN as u64;
-            let per_request = vtop_protocol::replica_append_frame_size(&self.range, &[])
-                .map_err(|problem| BrokerError::InvalidConfig(problem.to_string()))?
-                as u64
-                - header;
-            // How many requests one group can hold: the record threshold seals
-            // at max_records (one record per request at the least), the queue
-            // at max_pending_requests. ONE request never batches — the driver
-            // sends it as a single append, already judged per request — so
-            // only a config that can seal a multi-request group is judged
-            // here (review).
-            let requests = (config.max_records.min(config.max_pending_requests)) as u64;
-            if requests > 1 {
-                // The record bytes a group can reach: whichever bound is met
-                // first (review) — the byte and record thresholds together, or
-                // `requests` admissible requests each carrying the most one
-                // frame allows. A threshold set high to disable itself does
-                // not count against a config the other threshold keeps safe.
-                let single_payload_max = frame.saturating_sub(header + per_request);
-                let by_thresholds = config
-                    .max_bytes
-                    .saturating_add((config.max_records as u64).saturating_mul(16));
-                let by_requests = requests.saturating_mul(single_payload_max);
-                let worst = header
-                    .saturating_add(4)
-                    .saturating_add(requests.saturating_mul(per_request))
-                    .saturating_add(by_thresholds.min(by_requests));
-                if worst > frame {
-                    return Err(BrokerError::InvalidConfig(format!(
-                        "group commit could seal a group of up to {worst} bytes on the wire \
-                         (max_bytes {} + {} records + {requests} requests), more than the \
-                         replica plane frames per append ({frame}); lower max_bytes or \
-                         max_records so a sealed group always fits one replica frame",
-                        config.max_bytes, config.max_records
-                    )));
-                }
-            }
+            refuse_unframeable_group_commit(&self.range, &config)?;
         }
         self.group_commit = Some(Arc::new(
             GroupCommitCoordinator::new(config).map_err(BrokerError::InvalidConfig)?,
@@ -2028,11 +1990,24 @@ impl LocalBroker {
             return Vec::new();
         }
         let durability = batch[0].request.durability;
+        // One barrier, so one durability (#752, D8). The coordinator seals a
+        // group before a member that asks for another, so this cannot
+        // happen; were it to, each run of one durability is flushed on its
+        // own, in order, and no member is acknowledged at a weaker barrier
+        // than it asked for.
+        if let Some(split) = batch
+            .iter()
+            .position(|item| item.request.durability != durability)
+        {
+            let mut frames = self.flush_produce_group(&batch[..split]);
+            frames.extend(self.flush_produce_group(&batch[split..]));
+            return frames;
+        }
         // Lock order: metadata lease view, then broker state. Hold both only
         // through the local durable append so a concurrent grant/release cannot
         // revoke between the fencing check and fsync. Quorum fan-out runs after
         // these locks are released.
-        let prepared = {
+        let prepared = 'prepared: {
             let meta = self.meta_fencing_epoch.lock();
             let mut state = self
                 .state
@@ -2155,7 +2130,16 @@ impl LocalBroker {
                         cursor += count;
                         wire_by_member.push(Ok(member_outcomes));
                     }
-                    (tip_before, leader_committed, wire_by_member)
+                    Ok((tip_before, leader_committed, wire_by_member))
+                }
+                // A refusal one member can cause, in a group of more than
+                // one (#752, D6): the log validates the whole group before it
+                // writes a byte and refuses it whole, so nothing of it is on
+                // disk, and each member is re-run alone below, after these
+                // locks are released, so only the member that caused it
+                // fails. A storage error still fails the whole group.
+                Err(problem) if batch.len() > 1 && member_can_cause(&problem) => {
+                    break 'prepared Err(problem);
                 }
                 Err(problem) => {
                     let code = match &problem {
@@ -2182,7 +2166,10 @@ impl LocalBroker {
             }
         };
 
-        let (tip_before, leader_committed, wire_by_member) = prepared;
+        let (tip_before, leader_committed, wire_by_member) = match prepared {
+            Ok(prepared) => prepared,
+            Err(problem) => return self.flush_each_alone(batch, &problem),
+        };
         if durability == WireDurability::LocalFsync {
             return batch
                 .iter()
@@ -2356,6 +2343,34 @@ impl LocalBroker {
             .collect()
     }
 
+    /// Re-run a group the log refused whole, one member at a time and in
+    /// order, so the refusal reaches only the members that cause it (#752,
+    /// D6). Each member then pays its own barrier, which is what it would
+    /// have paid without group commit; nothing of the refused group was
+    /// written, so nothing is appended twice.
+    fn flush_each_alone(
+        &self,
+        batch: &[QueuedProduce],
+        problem: &vtop_log::LogError,
+    ) -> Vec<WireFrame> {
+        if let Some(coordinator) = &self.group_commit {
+            coordinator.metrics().record_split();
+        }
+        vtop_meta::transport::warn_rate_limited(
+            "group-commit-split",
+            &format!(
+                "group commit: a group of {} requests was refused as a whole ({problem}); it \
+                 was re-run request by request, so only the requests that caused it fail. \
+                 Nothing is needed unless a client keeps sending the request that is refused",
+                batch.len()
+            ),
+        );
+        batch
+            .iter()
+            .flat_map(|item| self.flush_produce_group(std::slice::from_ref(item)))
+            .collect()
+    }
+
     fn check_range(
         &self,
         meta: &MetaLeaseState,
@@ -2384,6 +2399,78 @@ impl LocalBroker {
         }
         Ok(())
     }
+}
+
+/// Whether a replicated range could frame every group `config` can seal
+/// (#453, review): a group of individually admissible requests is
+/// replicated as one batch frame, and a config that could seal a group the
+/// plane cannot frame would lose quorum after the leader append. Public so a
+/// node can refuse such a config at startup, before it holds a lease it
+/// would then fail to build a leader for (#752).
+pub fn refuse_unframeable_group_commit(
+    range: &RangeIdentity,
+    config: &GroupCommitConfig,
+) -> BrokerResult<()> {
+    let limits = crate::replication::REPLICA_LIMITS;
+    let frame = u64::from(limits.max_frame_bytes);
+    let header = vtop_protocol::HEADER_LEN as u64;
+    let per_request = vtop_protocol::replica_append_frame_size(range, &[])
+        .map_err(|problem| BrokerError::InvalidConfig(problem.to_string()))?
+        as u64
+        - header;
+    // How many requests one group can hold: the record threshold seals
+    // at max_records (one record per request at the least), the queue
+    // at max_pending_requests. ONE request never batches — the driver
+    // sends it as a single append, already judged per request — so
+    // only a config that can seal a multi-request group is judged
+    // here (review).
+    let requests = (config.max_records.min(config.max_pending_requests)) as u64;
+    if requests > 1 {
+        // The record bytes a group can reach: whichever bound is met
+        // first (review) — the byte and record thresholds together, or
+        // `requests` admissible requests each carrying the most one
+        // frame allows. A threshold set high to disable itself does
+        // not count against a config the other threshold keeps safe.
+        let single_payload_max = frame.saturating_sub(header + per_request);
+        let by_thresholds = config
+            .max_bytes
+            .saturating_add((config.max_records as u64).saturating_mul(16));
+        let by_requests = requests.saturating_mul(single_payload_max);
+        let worst = header
+            .saturating_add(4)
+            .saturating_add(requests.saturating_mul(per_request))
+            .saturating_add(by_thresholds.min(by_requests));
+        if worst > frame {
+            return Err(BrokerError::InvalidConfig(format!(
+                "group commit could seal a group of up to {worst} bytes on the wire \
+                     (max_bytes {} + {} records + {requests} requests), more than the \
+                     replica plane frames per append ({frame}); lower max_bytes or \
+                     max_records so a sealed group always fits one replica frame",
+                config.max_bytes, config.max_records
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether the log refused a group for something one of its members can
+/// cause — a sequence or fencing refusal for one producer, or a size limit
+/// a smaller group would meet — rather than for the storage under it. These
+/// are all judged before a byte of the group is written.
+fn member_can_cause(problem: &vtop_log::LogError) -> bool {
+    matches!(
+        problem,
+        vtop_log::LogError::FirstSequence { .. }
+            | vtop_log::LogError::SequenceGap { .. }
+            | vtop_log::LogError::SequenceConflict { .. }
+            | vtop_log::LogError::SequenceBelowWindow { .. }
+            | vtop_log::LogError::ProducerFenced { .. }
+            | vtop_log::LogError::RecordTooLarge { .. }
+            | vtop_log::LogError::GroupTooLarge { .. }
+            | vtop_log::LogError::SegmentByteLimit { .. }
+            | vtop_log::LogError::SegmentRecordLimit { .. }
+            | vtop_log::LogError::UnsupportedRecordField(_)
+    )
 }
 
 fn map_metadata_error(error: &MetadataError) -> (ErrorCode, String) {

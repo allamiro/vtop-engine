@@ -177,7 +177,11 @@ fn a_crash_at_any_operation_of_a_group_loses_no_acknowledged_member() {
     let broker = broker_on(&env);
     let first = sim.op_count();
     let acked = run_group(&broker);
-    assert_eq!(acked.len(), MEMBERS as usize, "the clean run acknowledges every member");
+    assert_eq!(
+        acked.len(),
+        MEMBERS as usize,
+        "the clean run acknowledges every member"
+    );
     assert_eq!(broker.group_commit().unwrap().metrics().commits_total(), 1);
     let last = sim.op_count();
     let writes: Vec<_> = sim
@@ -204,7 +208,12 @@ fn a_crash_at_any_operation_of_a_group_loses_no_acknowledged_member() {
         swept += 1;
     }
     for write in &writes {
-        for byte_cut in [0, 1, write.len as usize / 2, (write.len as usize).saturating_sub(1)] {
+        for byte_cut in [
+            0,
+            1,
+            write.len as usize / 2,
+            (write.len as usize).saturating_sub(1),
+        ] {
             let context = format!(
                 "crash during write op {} at byte {byte_cut} of {}, seed {SEED:#x}",
                 write.index, write.len

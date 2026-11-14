@@ -154,8 +154,13 @@ group. The coordinator seals on the first of `max_delay`, `max_records`,
 deferred to the next group (no silent drops); and exposes per-commit metrics
 for records/bytes/requests, sync duration, queue wait, and flush reason. Each
 request is acknowledged only after its records are included in a successful
-group barrier. Weighted fair scheduling and soak deltas remain follow-ups
-(see issues #185, #92, #98).
+group barrier. A group's leader flushes one group and hands the lead to the
+next waiting request, so every member is answered as soon as its own group's
+barrier is done; a group never mixes durabilities; and a group the log
+refuses whole for something one member caused (a sequence, fencing or size
+refusal, all judged before a byte is written) is re-run request by request,
+so only that member fails (#752). Weighted fair scheduling and soak deltas
+remain follow-ups (see issues #185, #92, #98).
 
 This remains a library slice by default. It does not provide an operator
 daemon/config surface, replicated metadata ownership of replica sets, consumer

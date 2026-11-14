@@ -5,11 +5,30 @@
 //! met, and runs one local durability / quorum cycle for every member. Each
 //! request is acknowledged only after that shared barrier succeeds for the
 //! offsets that include its records.
+//!
+//! A leader flushes ONE group (#752). Its own request is always in it (a
+//! leader is the front of the queue when it takes the lead), so once the
+//! group is published the leader's answer is ready, and it hands the lead to
+//! the next waiter instead of flushing the groups queued behind it. Leading
+//! on until the queue emptied answered the first leader last: under steady
+//! load the queue never empties, and an append that succeeded could reach the
+//! client's produce timeout unanswered.
+//!
+//! With `max_delay` zero (natural batching) a leader seals whatever is queued
+//! the moment it leads: a lone request pays nothing, and the requests that
+//! arrive while one group's barrier runs form the next group, so a group is
+//! exactly as large as the barrier is long.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(vtop_loom))]
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+// The coordinator's own synchronisation, swapped for loom's under the model
+// test (#752); see `loom_model` below. Everything else stays std.
+#[cfg(vtop_loom)]
+use loom::sync::{Arc, Condvar, Mutex};
 use vtop_protocol::{ErrorCode, Message, ProduceRequest, WireFrame};
 
 /// Thresholds that seal a commit group. The first matched trigger wins.
@@ -60,6 +79,12 @@ pub enum FlushReason {
     MaxBytes,
     MaxPending,
     SingleRequest,
+    /// No window (`max_delay` zero): the leader sealed the requests already
+    /// queued when it took the lead.
+    Queued,
+    /// The next queued request asked for a different durability, so the
+    /// group sealed before it rather than acknowledge it at another (#752).
+    Durability,
 }
 
 /// One sealed commit group's observed sizes and timings.
@@ -82,7 +107,12 @@ pub struct GroupCommitMetrics {
     bytes_total: AtomicU64,
     sync_nanos_total: AtomicU64,
     queue_wait_nanos_total: AtomicU64,
-    last: Mutex<GroupCommitSample>,
+    /// Requests refused because the queue was full.
+    overloaded_total: AtomicU64,
+    /// Groups refused whole by the log and re-run request by request (#752).
+    split_groups_total: AtomicU64,
+    // std's, not the model's: the metrics are not part of the protocol.
+    last: std::sync::Mutex<GroupCommitSample>,
 }
 
 impl GroupCommitMetrics {
@@ -131,6 +161,22 @@ impl GroupCommitMetrics {
         self.queue_wait_nanos_total.load(Ordering::Relaxed)
     }
 
+    /// Requests answered `Overloaded` because the queue was full.
+    pub fn overloaded_total(&self) -> u64 {
+        self.overloaded_total.load(Ordering::Relaxed)
+    }
+
+    /// Groups the log refused as a whole for a reason one member can cause,
+    /// re-run request by request so only that member failed (#752).
+    pub fn split_groups_total(&self) -> u64 {
+        self.split_groups_total.load(Ordering::Relaxed)
+    }
+
+    /// Count a group re-run request by request.
+    pub fn record_split(&self) {
+        self.split_groups_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn last_sample(&self) -> GroupCommitSample {
         self.last
             .lock()
@@ -172,7 +218,17 @@ impl QueuedProduce {
 #[derive(Debug)]
 enum SlotState {
     Waiting,
+    /// The previous leader handed this waiter the lead (#752).
+    Lead,
     Ready(Box<WireFrame>),
+}
+
+/// What woke a waiting request.
+enum Wake {
+    /// Its group was flushed: this is its answer.
+    Answer(Box<WireFrame>),
+    /// It is the front of the queue and must flush the next group.
+    Lead,
 }
 
 struct WaitSlot {
@@ -197,20 +253,30 @@ impl WaitSlot {
         self.cv.notify_one();
     }
 
-    fn recv(&self) -> WireFrame {
+    /// Wake this waiter to lead. Only a waiter still waiting can be handed
+    /// the lead; one already answered is never at the front of the queue.
+    fn hand_lead(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(
+            matches!(*state, SlotState::Waiting),
+            "the lead is handed only to a queued, unanswered request"
+        );
+        *state = SlotState::Lead;
+        self.cv.notify_one();
+    }
+
+    fn recv(&self) -> Wake {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
-            match &*state {
-                SlotState::Ready(_) => {
-                    if let SlotState::Ready(frame) =
-                        std::mem::replace(&mut *state, SlotState::Waiting)
-                    {
-                        return *frame;
-                    }
-                }
+            match std::mem::replace(&mut *state, SlotState::Waiting) {
+                SlotState::Ready(frame) => return Wake::Answer(frame),
+                SlotState::Lead => return Wake::Lead,
                 SlotState::Waiting => {
                     state = self
                         .cv
@@ -277,13 +343,18 @@ impl GroupCommitCoordinator {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if state.pending.len() >= self.config.max_pending_requests {
-                return overloaded_frame(
-                    item.request_id,
-                    item.stream_id,
-                    "group commit queue is full",
-                );
+                let queued = state.pending.len();
+                drop(state);
+                return self.refuse_full(item, queued);
             }
-            let lead = !state.flushing && state.pending.is_empty();
+            // A leader exists, or a lead is being handed over, exactly while
+            // `flushing` is set; with no leader the queue is empty, because
+            // a leader that leaves work queued hands the lead on.
+            let lead = !state.flushing;
+            debug_assert!(
+                !lead || state.pending.is_empty(),
+                "a queue with no leader must be empty"
+            );
             if lead {
                 state.flushing = true;
             }
@@ -296,26 +367,50 @@ impl GroupCommitCoordinator {
         };
 
         if become_leader {
-            self.run_leader(&mut flush);
+            self.lead_one_group(&mut flush);
         }
-        slot.recv()
+        loop {
+            match slot.recv() {
+                Wake::Answer(frame) => return *frame,
+                Wake::Lead => self.lead_one_group(&mut flush),
+            }
+        }
     }
 
-    fn run_leader<F>(&self, flush: &mut F)
+    /// Answer a request the full queue cannot take: `Overloaded`
+    /// (retryable), nothing appended, and said so — rate-limited, with the
+    /// count it suppressed — and counted.
+    fn refuse_full(&self, item: QueuedProduce, queued: usize) -> WireFrame {
+        self.metrics
+            .overloaded_total
+            .fetch_add(1, Ordering::Relaxed);
+        vtop_meta::transport::warn_rate_limited(
+            "group-commit-queue-full",
+            &format!(
+                "produce refused: {queued} requests are queued for the group commit and the \
+                 limit is {}. This request was answered Overloaded (retryable) and nothing was \
+                 appended. The range is receiving more than one barrier can drain; raise \
+                 `group_commit.max_pending_requests` only if the disk and followers keep up, \
+                 or add producers' back-off",
+                self.config.max_pending_requests
+            ),
+        );
+        overloaded_frame(
+            item.request_id,
+            item.stream_id,
+            "group commit queue is full",
+        )
+    }
+
+    /// Flush the group at the front of the queue, which holds this thread's
+    /// own request, publish every member's answer, then hand the lead to
+    /// the next waiter or, with nothing queued, give it up (#752).
+    fn lead_one_group<F>(&self, flush: &mut F)
     where
         F: FnMut(&[QueuedProduce]) -> Vec<WireFrame>,
     {
-        loop {
-            let (members, slots, reason, max_queue_wait) = self.collect_group();
-            if members.is_empty() {
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.flushing = false;
-                self.cv.notify_all();
-                return;
-            }
+        let (members, slots, reason, max_queue_wait) = self.collect_group();
+        if !members.is_empty() {
             let started = Instant::now();
             let frames = flush(&members);
             let sync_duration = started.elapsed();
@@ -337,19 +432,19 @@ impl GroupCommitCoordinator {
             for (slot, frame) in slots.into_iter().zip(frames) {
                 slot.publish(frame);
             }
-
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state.pending.is_empty() {
-                state.flushing = false;
-                self.cv.notify_all();
-                return;
-            }
-            // More waiters arrived during the barrier; keep leading so they
-            // cannot deadlock waiting for a new enqueue to pick up leadership.
         }
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match state.pending.front() {
+            // `flushing` stays set: the lead passes, it is not given up, so
+            // no arriving request can become a second leader meanwhile.
+            Some(next) => next.slot.hand_lead(),
+            None => state.flushing = false,
+        }
+        self.cv.notify_all();
     }
 
     fn collect_group(
@@ -376,6 +471,14 @@ impl GroupCommitCoordinator {
             if bytes >= self.config.max_bytes {
                 break FlushReason::MaxBytes;
             }
+            // Natural batching: no window, so no wait — seal what is queued.
+            if self.config.max_delay.is_zero() && !state.pending.is_empty() {
+                break if state.pending.len() == 1 {
+                    FlushReason::SingleRequest
+                } else {
+                    FlushReason::Queued
+                };
+            }
             if !state.pending.is_empty() && Instant::now() >= deadline {
                 break if state.pending.len() == 1 {
                     FlushReason::SingleRequest
@@ -383,40 +486,16 @@ impl GroupCommitCoordinator {
                     FlushReason::MaxDelay
                 };
             }
-            if state.pending.is_empty() {
-                let wait = deadline.saturating_duration_since(Instant::now());
-                if wait.is_zero() {
-                    break FlushReason::MaxDelay;
-                }
-                let (guard, wait_result) = self
-                    .cv
-                    .wait_timeout(state, wait)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state = guard;
-                if wait_result.timed_out() && !state.pending.is_empty() {
-                    break if state.pending.len() == 1 {
-                        FlushReason::SingleRequest
-                    } else {
-                        FlushReason::MaxDelay
-                    };
-                }
-                continue;
-            }
-            // Have at least one request: wait for joiners until delay/threshold.
             let wait = deadline.saturating_duration_since(Instant::now());
             if wait.is_zero() {
-                break if state.pending.len() == 1 {
-                    FlushReason::SingleRequest
-                } else {
-                    FlushReason::MaxDelay
-                };
+                break FlushReason::MaxDelay;
             }
             let (guard, wait_result) = self
                 .cv
                 .wait_timeout(state, wait)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state = guard;
-            if wait_result.timed_out() {
+            if wait_result.timed_out() && !state.pending.is_empty() {
                 break if state.pending.len() == 1 {
                     FlushReason::SingleRequest
                 } else {
@@ -425,12 +504,22 @@ impl GroupCommitCoordinator {
             }
         };
 
-        let mut members = Vec::new();
+        let mut members: Vec<QueuedProduce> = Vec::new();
         let mut slots = Vec::new();
         let mut taken_records = 0usize;
         let mut taken_bytes = 0u64;
         let mut max_queue_wait = Duration::ZERO;
+        let mut split_by_durability = false;
         while let Some(front) = state.pending.front() {
+            // A group is homogeneous (#752, D8): the barrier it runs is the
+            // one its members asked for, so a member asking for another
+            // seals the group before it and leads the next one.
+            if let Some(first) = members.first() {
+                if front.item.request.durability != first.request.durability {
+                    split_by_durability = true;
+                    break;
+                }
+            }
             let next_records = taken_records + front.item.record_count;
             let next_bytes = taken_bytes + front.item.payload_bytes;
             if !members.is_empty()
@@ -451,8 +540,18 @@ impl GroupCommitCoordinator {
                 break;
             }
         }
-        let reason = if matches!(reason, FlushReason::SingleRequest) && members.len() > 1 {
+        debug_assert!(
+            members
+                .iter()
+                .all(|item| item.request.durability == members[0].request.durability),
+            "a sealed group is homogeneous in durability"
+        );
+        let reason = if split_by_durability {
+            FlushReason::Durability
+        } else if matches!(reason, FlushReason::SingleRequest) && members.len() > 1 {
             FlushReason::MaxDelay
+        } else if members.len() == 1 && matches!(reason, FlushReason::Queued) {
+            FlushReason::SingleRequest
         } else {
             reason
         };
@@ -605,9 +704,9 @@ mod tests {
         let coord_second = Arc::clone(&coord);
         let second = thread::spawn(move || {
             let item = QueuedProduce::new(2, 1, sample_request(1));
-            coord_second.enqueue_and_wait(item, |_batch| {
-                unreachable!("second waiter is not the flush leader");
-            })
+            // The first leader hands this waiter the lead once its own
+            // group is answered (#752), so it flushes its own group.
+            coord_second.enqueue_and_wait(item, answer)
         });
         thread::sleep(Duration::from_millis(20));
         let rejected = coord.enqueue_and_wait(QueuedProduce::new(3, 1, sample_request(2)), |_| {
@@ -660,7 +759,10 @@ mod tests {
             (0..5u64)
                 .map(|index| {
                     let started = Instant::now();
-                    coord.enqueue_and_wait(QueuedProduce::new(index, 1, sample_request(index)), answer);
+                    coord.enqueue_and_wait(
+                        QueuedProduce::new(index, 1, sample_request(index)),
+                        answer,
+                    );
                     started.elapsed()
                 })
                 .min()
@@ -772,7 +874,8 @@ mod tests {
         let coord = Arc::new(GroupCommitCoordinator::new(zero_delay()).unwrap());
         let hold = Arc::new(Mutex::new(()));
         let held = hold.lock().unwrap();
-        let groups: Arc<Mutex<Vec<Vec<(u64, Durability)>>>> = Arc::default();
+        type Groups = Vec<Vec<(u64, Durability)>>;
+        let groups: Arc<Mutex<Groups>> = Arc::default();
         let flush = {
             let hold = Arc::clone(&hold);
             let groups = Arc::clone(&groups);
@@ -816,11 +919,116 @@ mod tests {
         let groups = groups.lock().unwrap();
         for group in groups.iter() {
             assert!(
-                group.iter().all(|(_, durability)| *durability == group[0].1),
+                group
+                    .iter()
+                    .all(|(_, durability)| *durability == group[0].1),
                 "a group mixed durabilities: {group:?} (all groups: {groups:?})"
             );
         }
         let order: Vec<u64> = groups.iter().flatten().map(|(id, _)| *id).collect();
         assert_eq!(order, [1, 2, 3, 4], "queue order is kept across the split");
+    }
+}
+
+/// Every interleaving of a small model of the coordinator (#752): lost
+/// wake-ups and a lead handed to nobody would show as a deadlock, which loom
+/// reports; an answer delivered to the wrong waiter or twice would fail the
+/// assertions. Natural batching (no window), so no timed wait is involved.
+///
+/// Run with
+/// `RUSTFLAGS="--cfg vtop_loom" cargo test -p vtop-broker --lib --release loom_model`.
+#[cfg(all(test, vtop_loom))]
+mod loom_model {
+    use super::*;
+    use uuid::Uuid;
+    use vtop_protocol::{Durability, ProduceRecord, ProduceResponse, RangeIdentity};
+
+    fn item(request_id: u64) -> QueuedProduce {
+        QueuedProduce::new(
+            request_id,
+            1,
+            ProduceRequest {
+                range: RangeIdentity {
+                    topic: "t".to_owned(),
+                    topic_epoch: 1,
+                    range_id: Uuid::from_u128(1),
+                    range_generation: 0,
+                },
+                fencing_epoch: 1,
+                producer_id: Uuid::from_u128(u128::from(request_id)),
+                producer_epoch: 1,
+                first_sequence: 0,
+                durability: Durability::Quorum,
+                records: vec![ProduceRecord {
+                    timestamp_millis: 1,
+                    key: Vec::new(),
+                    value: Vec::new(),
+                }],
+            },
+        )
+    }
+
+    /// Answers each member with its own request id as the offset, so a
+    /// misdelivered answer is visible.
+    fn echo(batch: &[QueuedProduce]) -> Vec<WireFrame> {
+        batch
+            .iter()
+            .map(|item| WireFrame {
+                request_id: item.request_id,
+                stream_id: item.stream_id,
+                message: Message::ProduceResponse(ProduceResponse {
+                    outcomes: Vec::new(),
+                    committed_next_offset: item.request_id,
+                }),
+            })
+            .collect()
+    }
+
+    fn answered_with_its_own(frame: WireFrame, request_id: u64) {
+        assert_eq!(frame.request_id, request_id);
+        match frame.message {
+            Message::ProduceResponse(response) => {
+                assert_eq!(response.committed_next_offset, request_id)
+            }
+            other => panic!("request {request_id} was not answered: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn three_producers_are_each_answered_once_and_the_lead_is_never_lost() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let coord = Arc::new(
+                GroupCommitCoordinator::new(GroupCommitConfig {
+                    max_delay: Duration::ZERO,
+                    ..GroupCommitConfig::default()
+                })
+                .unwrap(),
+            );
+            let others: Vec<_> = [2u64, 3]
+                .into_iter()
+                .map(|request_id| {
+                    let coord = Arc::clone(&coord);
+                    loom::thread::spawn(move || {
+                        answered_with_its_own(
+                            coord.enqueue_and_wait(item(request_id), echo),
+                            request_id,
+                        )
+                    })
+                })
+                .collect();
+            answered_with_its_own(coord.enqueue_and_wait(item(1), echo), 1);
+            for other in others {
+                other.join().unwrap();
+            }
+            let state = coord.state.lock().unwrap();
+            assert!(state.pending.is_empty(), "every request was taken");
+            assert!(
+                !state.flushing,
+                "the lead was given up once the queue emptied"
+            );
+            assert_eq!(coord.metrics().requests_total(), 3);
+        });
     }
 }

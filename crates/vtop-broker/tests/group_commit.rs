@@ -561,7 +561,11 @@ fn one_members_sequence_conflict_does_not_fail_the_others() {
         "the two requests must have shared a group for this test to mean anything"
     );
     let response = expect_ok(answers[0].clone());
-    assert_eq!(response.outcomes.len(), 1, "the good member is acknowledged");
+    assert_eq!(
+        response.outcomes.len(),
+        1,
+        "the good member is acknowledged"
+    );
     match &answers[1].message {
         Message::Error(ErrorResponse { code, .. }) => {
             assert_eq!(*code, ErrorCode::SequenceConflict, "{:?}", answers[1])
@@ -620,17 +624,27 @@ fn a_lease_lost_between_fsync_and_commit_fences_every_member() {
             .map(|index| produce_frame(range.clone(), Uuid::from_u128(0xB0 + index), 0, 1))
             .collect(),
     );
-    assert_eq!(leader.group_commit().unwrap().metrics().last_sample().requests, 3);
+    assert_eq!(
+        leader
+            .group_commit()
+            .unwrap()
+            .metrics()
+            .last_sample()
+            .requests,
+        3
+    );
     for answer in &answers {
         match &answer.message {
             Message::Error(ErrorResponse { code, .. }) => assert_eq!(*code, ErrorCode::Fenced),
             other => panic!("a member was acknowledged past a lost lease: {other:?}"),
         }
     }
-    assert_eq!(cluster_committed.get(), 0, "nothing is published as committed");
+    assert_eq!(
+        cluster_committed.get(),
+        0,
+        "nothing is published as committed"
+    );
 }
-
-use vtop_log::env::{Storage as _, StorageFile as _};
 
 /// Storage whose data barrier can be held: `sync_data` blocks while the
 /// gate is armed, and says when it has started.
@@ -669,7 +683,10 @@ impl SyncGate {
                 .wait_timeout(entered, Duration::from_secs(10))
                 .unwrap();
             entered = guard;
-            assert!(!timeout.timed_out() || *entered, "the group never reached its fsync");
+            assert!(
+                !timeout.timed_out() || *entered,
+                "the group never reached its fsync"
+            );
         }
     }
 
@@ -741,7 +758,10 @@ impl vtop_log::env::Storage for HoldingStorage {
     fn exists(&self, path: &std::path::Path) -> std::io::Result<bool> {
         self.inner.exists(path)
     }
-    fn read_dir(&self, path: &std::path::Path) -> std::io::Result<Vec<vtop_log::env::DirEntryInfo>> {
+    fn read_dir(
+        &self,
+        path: &std::path::Path,
+    ) -> std::io::Result<Vec<vtop_log::env::DirEntryInfo>> {
         self.inner.read_dir(path)
     }
     fn sync_dir(&self, path: &std::path::Path) -> std::io::Result<()> {
