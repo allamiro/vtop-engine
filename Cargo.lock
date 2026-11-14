@@ -3958,6 +3958,7 @@ dependencies = [
  "chrono",
  "futures",
  "glob",
+ "libc",
  "rdkafka",
  "regex",
  "rustix",

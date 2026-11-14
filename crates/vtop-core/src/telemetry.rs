@@ -52,6 +52,27 @@ pub const OBJECT_KEY_DECISIONS: [&str; 8] = [
     "per_attempt",
 ];
 
+/// The values of `outcome` on `vtop_file_delete_decisions_total` (#619):
+/// `deleted`, or why `delete_after_commit` kept a fully archived file.
+pub const FILE_DELETE_OUTCOMES: [&str; 16] = [
+    "deleted",
+    "appended",
+    "shorter",
+    "other_file",
+    "rewritten",
+    "unprovable",
+    "metadata_changed",
+    "gone",
+    "symlink",
+    "open",
+    "no_open_check",
+    "rename_refused",
+    "failed",
+    "stale_commit",
+    "leftover_archived",
+    "opened_at_unlink",
+];
+
 /// The engine's metric set. Cheap to clone (all fields are `Arc` internally).
 pub struct Metrics {
     pub registry: Registry,
@@ -189,6 +210,18 @@ pub struct Metrics {
     /// `bytes_out_total`.
     pub upload_egress_bytes_total: IntCounterVec,
 
+    /// Every decision `sources.file.delete_after_commit` takes about a fully
+    /// archived file (#619), by `outcome`: `deleted`, or why it was kept -
+    /// `appended`, `shorter`, `other_file`, `rewritten`, `unprovable`,
+    /// `metadata_changed`, `gone`, `symlink`, `open`, `no_open_check`,
+    /// `rename_refused`, `failed`, `stale_commit` - plus `leftover_archived`
+    /// for a file found under a delete's hidden name, and
+    /// `opened_at_unlink` for a delete a late open slipped past. A fixed set,
+    /// never the path: the path is in the log line beside each count. A
+    /// rising `no_open_check` or `rename_refused` means files that will not
+    /// be deleted until the operator acts.
+    pub file_delete_decisions_total: IntCounterVec,
+
     /// Changes to a Kafka topic's partition list seen while reading, and what
     /// the source did about them (#675), by `event`: `no_partitions` (a topic
     /// listed without partitions), `lookup_failed`, `grew`,
@@ -311,6 +344,11 @@ impl Metrics {
             "Request-body bytes admitted through the upload egress shaper, retries included; present only when upload.max_egress_bytes_per_second is set. Application-layer accounting, not a host network counter",
             vec![],
         )?;
+        let file_delete_decisions_total = cv(
+            "file_delete_decisions_total",
+            "delete_after_commit decisions about fully archived files, by outcome (deleted, or why kept); the path is in the log line",
+            vec!["outcome"],
+        )?;
         let retention_lost_records_total = cv(
             "retention_lost_records_total",
             "Records source-side retention removed before the engine read them; any increase is data loss upstream of the archive (see logs for topic/partition)",
@@ -404,6 +442,7 @@ impl Metrics {
             source_replay_refused_total,
             upload_throttled_total,
             upload_egress_bytes_total,
+            file_delete_decisions_total,
             object_key_decisions_total,
             kafka_partition_events_total,
         })

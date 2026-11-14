@@ -63,6 +63,7 @@ pub fn file_config(
                 paths,
                 delete_after_commit: false,
                 delete_quiet_seconds: vtop_core::config::DEFAULT_DELETE_QUIET_SECONDS,
+                delete_without_open_check: false,
                 whole_file: false,
             }),
             syslog_spool: None,

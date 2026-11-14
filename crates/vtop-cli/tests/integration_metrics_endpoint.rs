@@ -91,6 +91,11 @@ fn populated() -> String {
             .with_label_values(&[e])
             .inc_by(0);
     }
+    for o in telemetry::FILE_DELETE_OUTCOMES {
+        m.file_delete_decisions_total
+            .with_label_values(&[o])
+            .inc_by(0);
+    }
     m.inflight_batches.set(2);
     m.encode().expect("encode must succeed")
 }
@@ -173,10 +178,11 @@ fn every_exported_label_is_from_a_bounded_set() {
     // "le" is Prometheus's own histogram bucket label. It is bounded by the
     // bucket list defined in telemetry.rs, not free-form, so it is legitimate.
     // "decision" takes the values of telemetry::OBJECT_KEY_DECISIONS (#626),
+    // "outcome" those of FILE_DELETE_OUTCOMES (#619), never the path,
     // "event" the seven of KAFKA_PARTITION_EVENTS (#675), and
     // `verification_class` (strong, size_only, unknown) and `result` (strong,
     // size_only, failed, unsupported_version) are closed sets (#664).
-    const BOUNDED: [&str; 10] = [
+    const BOUNDED: [&str; 11] = [
         "tenant",
         "source_type",
         "format",
@@ -184,6 +190,7 @@ fn every_exported_label_is_from_a_bounded_set() {
         "stage",
         "le",
         "decision",
+        "outcome",
         "event",
         "verification_class",
         "result",
@@ -408,6 +415,19 @@ fn object_key_decisions_are_exported_by_bounded_decision() {
     assert!(text.contains("vtop_object_key_decisions_total"), "{text}");
     for d in vtop_core::telemetry::OBJECT_KEY_DECISIONS {
         let label = format!(r#"decision="{d}""#);
+        assert!(text.contains(&label), "missing {label}");
+    }
+}
+
+/// #619: every `delete_after_commit` decision is exported by `outcome`, a
+/// fixed set, so a rising `no_open_check` or `rename_refused` - files kept
+/// until the operator acts - can be alerted on without parsing logs.
+#[test]
+fn file_delete_decisions_are_exported_by_bounded_outcome() {
+    let text = populated();
+    assert!(text.contains("vtop_file_delete_decisions_total"), "{text}");
+    for o in vtop_core::telemetry::FILE_DELETE_OUTCOMES {
+        let label = format!(r#"outcome="{o}""#);
         assert!(text.contains(&label), "missing {label}");
     }
 }
