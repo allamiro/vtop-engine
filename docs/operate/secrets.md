@@ -91,11 +91,13 @@ vtopctl validate --config /etc/vtop/config.yaml
 
 `validate` checks every file the config names, plus the audit file when
 `VTOP_AUDIT_LOG` is set in its environment, and reports every refused file in
-one run, with a non-zero exit. It reads no file and contacts nothing. A SQLite
-ledger named through `env:` or `file:` is not known until the secret is read,
-so it is checked when the engine opens it, not here. Run `validate` with the
-same environment and on the same host (or in the same pod) as the engine:
-the modes it checks are the ones that host shows.
+one run, with a non-zero exit. It reads no file's contents and contacts
+nothing. A SQLite ledger named through `env:` or `file:` is not known until
+the secret is read, so it is checked when the engine opens it, not here. Run
+`validate` as the engine's user, with the same environment, on the same host
+(or in the same pod): the modes it checks are the ones that host shows, and a
+closed directory counts only for the user who owns it, so the same config
+checked as root or as another account can report a file the engine accepts.
 
 ## The override
 
@@ -175,9 +177,27 @@ manifest:
 
 - Do not use `subPath`. A `subPath` mount is a single file outside the
   kubelet's layout, so a `0440` file there is refused, and it is never
-  updated when the Secret changes.
+  updated when the Secret changes. For the same reason keep each
+  `items[].path` a plain file name, without a directory part.
 - The Secret volume's default mode is `0644`. Left unset, every key is
   readable by every user in the container and is refused.
+
+**The ledger and the audit file on a writable volume.** With `fsGroup` set,
+the kubelet gives every file on a writable volume (a PersistentVolumeClaim,
+an `emptyDir`) group read and write, and with the default
+`fsGroupChangePolicy: Always` it does so at every mount. A ledger the engine
+created `0600` is then `0660` at the next start, and a group-writable ledger
+is refused with no override. Set `fsGroupChangePolicy: OnRootMismatch` (the
+Helm chart's default for its own pods), which leaves the files alone once the
+volume's root has the right owner and mode; if a ledger was already widened,
+`chmod 0600` it and its `-wal` and `-shm` once.
+
+```yaml
+spec:
+  securityContext:
+    fsGroup: 10001
+    fsGroupChangePolicy: OnRootMismatch
+```
 
 ### External Secrets Operator
 

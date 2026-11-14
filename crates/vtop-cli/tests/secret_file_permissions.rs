@@ -9,7 +9,9 @@ use std::process::{Command, Output, Stdio};
 
 const KEY_HEX: &str = "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d";
 
-/// A directory other users can enter (0755), under the test's private one.
+/// A directory other users can enter (0755). The test's own temporary
+/// directory is 0755 too under the usual umask 022, so a test that needs a
+/// closed directory makes one explicitly.
 fn open_dir(root: &Path) -> PathBuf {
     let dir = root.join("open");
     std::fs::create_dir_all(&dir).unwrap();
@@ -407,5 +409,89 @@ fn audit_list_announces_an_override_like_any_other_command() {
         recorded.contains("\"action\":\"security.override\"")
             && recorded.contains(&db.display().to_string()),
         "no record in VTOP_AUDIT_LOG: {recorded}"
+    );
+}
+
+/// Review: every command that reads the keys or the ledger opens the audit
+/// file first, so a file accepted under the override is recorded there, not
+/// only on the log stream. `process-once` is the engine's own start-up path.
+#[test]
+fn process_once_records_an_override_in_the_audit_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = open_dir(dir.path()).join("q4");
+    write_mode(&key, KEY_HEX, 0o644);
+    let audit = dir.path().join("audit.jsonl");
+    let config = write_config(dir.path(), &key, &dir.path().join("state.db"), true);
+    let out = vtopctl(&["process-once", "--source", "file"], &config, Some(&audit));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let recorded = std::fs::read_to_string(&audit).unwrap_or_default();
+    let overrides: Vec<_> = recorded
+        .lines()
+        .filter(|l| l.contains("\"action\":\"security.override\""))
+        .collect();
+    assert_eq!(overrides.len(), 1, "{recorded}");
+    assert!(
+        overrides[0].contains(&key.display().to_string()),
+        "{recorded}"
+    );
+}
+
+/// Review: in `vtopctl run`, an override on the audit file itself is counted
+/// on `/metrics`: the registry exists before the audit file is opened.
+#[test]
+fn run_counts_an_override_on_the_audit_file() {
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("q4");
+    write_mode(&key, KEY_HEX, 0o400);
+    let audit = open_dir(dir.path()).join("audit.jsonl");
+    write_mode(&audit, "", 0o644);
+    let config = write_config(dir.path(), &key, &dir.path().join("state.db"), true);
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vtopctl"))
+        .args(["run", "--config"])
+        .arg(&config)
+        .env("VTOP_METRICS_ADDR", &addr)
+        .env("VTOP_AUDIT_LOG", &audit)
+        .env_remove("RUST_LOG")
+        .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn vtopctl run");
+    let name = "vtop_secret_file_permission_overrides_total";
+    let mut last = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
+            let _ = stream.write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n");
+            let mut body = String::new();
+            let _ = stream.read_to_string(&mut body);
+            if body.lines().any(|l| l == format!("{name} 1")) {
+                last = body;
+                break;
+            }
+            last = body;
+        }
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        last.lines().any(|l| l == format!("{name} 1")),
+        "{name} is not 1:\n{}",
+        last.lines()
+            .filter(|l| l.starts_with(name) || l.starts_with("HTTP"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }

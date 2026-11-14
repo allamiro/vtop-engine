@@ -147,7 +147,10 @@ can reach. When you run it in Kubernetes yourself, mount its manifest keys
 and its `engine.state_store` secret the same way: a Secret volume with
 `defaultMode: 0400`, a pod `fsGroup` the engine's user belongs to, no
 `subPath`, and the file paths in `config.yaml`. The resulting `0440` files
-are accepted as a Kubernetes Secret mount. The rule, the override and the
+are accepted as a Kubernetes Secret mount. Keep its ledger and audit file on
+a volume with `fsGroupChangePolicy: OnRootMismatch`: under the default
+policy the kubelet makes every file on a writable volume group-writable at
+each mount, which the engine refuses. The rule, the override and the
 recipes for each manager are on
 [Secret files and their permissions](../operate/secrets.md).
 

@@ -200,13 +200,14 @@ access to them. Secrets from a manager reach the pods the same way:
 - **External Secrets Operator** syncs into an ordinary Secret: name it in
   `tls.metaSecretName` / `tls.dataSecretName`, or mount it with
   `extraVolumes`.
-- **Any other secret file** (a Secret, or a Secrets Store CSI volume with
-  `readOnly: true`) goes in through `extraVolumes` and `extraVolumeMounts`.
-  Mount the whole volume at a directory, never with `subPath`, and set
-  `defaultMode: 0400`. The kubelet adds the group read bit because the pod
-  sets `fsGroup`, so the file is `0440` on disk, owned by root and group
-  10001. A Secret's own default mode is `0644`, readable by every user in
-  the container.
+- **Any other secret file** goes in through `extraVolumes` and
+  `extraVolumeMounts`. Mount the whole volume at a directory, never with
+  `subPath`. For a Secret, set `defaultMode: 0400`: the kubelet adds the
+  group read bit because the pod sets `fsGroup`, so the file is `0440` on
+  disk, owned by root and group 10001. A Secret's own default mode is
+  `0644`, readable by every user in the container. A Secrets Store CSI
+  volume (`readOnly: true`) has no `defaultMode`; its file mode comes from
+  the provider, so set it there.
 
 [`ci/external-secret-values.yaml`](ci/external-secret-values.yaml) mounts a
 Secret this way and is rendered by the chart's CI lint:

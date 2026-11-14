@@ -256,6 +256,10 @@ pub struct Refusal {
     pub mode: u32,
     pub writable: bool,
     pub exposure: Exposure,
+    /// Whether the process has an engine config, and so a setting to point
+    /// at: `vtopctl meta`, `node` and `tier` read none, and their message
+    /// does not offer one.
+    pub override_available: bool,
 }
 
 impl fmt::Display for Refusal {
@@ -292,10 +296,14 @@ impl fmt::Display for Refusal {
                  0440 when the pod sets `fsGroup`, which is accepted)",
             )?;
         }
-        write!(
-            f,
-            ". To accept the exposure knowingly, set `{OVERRIDE_SETTING}: true`"
-        )
+        if self.override_available {
+            write!(
+                f,
+                ". To accept the exposure knowingly, set `{OVERRIDE_SETTING}: true`"
+            )
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -382,12 +390,14 @@ pub fn inspect(file: &SecretFile, policy: &SecretPolicy) -> Result<Option<Overri
                 mode,
                 writable: false,
                 exposure,
+                override_available: policy.engine.is_some(),
             }),
             Verdict::RefusedWritable(exposure) => Err(Refusal {
                 file: file.clone(),
                 mode,
                 writable: true,
                 exposure,
+                override_available: policy.engine.is_some(),
             }),
         }
     }
@@ -689,6 +699,7 @@ mod tests {
             mode: 0o644,
             writable: false,
             exposure: exposure(true, true),
+            override_available: true,
         }
         .to_string();
         for needle in [
@@ -707,6 +718,7 @@ mod tests {
             mode: 0o666,
             writable: true,
             exposure: exposure(true, true),
+            override_available: true,
         }
         .to_string();
         for needle in [
@@ -724,6 +736,7 @@ mod tests {
             mode: 0o644,
             writable: false,
             exposure: exposure(true, true),
+            override_available: true,
         }
         .to_string();
         assert!(database.contains("chmod 0600 /d/s.db"), "{database}");
@@ -742,6 +755,23 @@ mod tests {
         ] {
             assert!(accepted.contains(needle), "{needle}: {accepted}");
         }
+    }
+
+    /// Review: a command with no engine config (`vtopctl meta`, `node`,
+    /// `tier`) has no setting to offer, so its refusal does not offer one.
+    #[test]
+    fn a_refusal_without_an_engine_config_offers_no_setting() {
+        let file = SecretFile::new(AuditLog, "the audit file (VTOP_AUDIT_LOG)", "/var/log/a");
+        let strict = Refusal {
+            file,
+            mode: 0o644,
+            writable: false,
+            exposure: exposure(false, true),
+            override_available: false,
+        }
+        .to_string();
+        assert!(strict.contains("chmod 0600 /var/log/a"), "{strict}");
+        assert!(!strict.contains(OVERRIDE_SETTING), "{strict}");
     }
 
     #[test]
