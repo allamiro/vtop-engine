@@ -15,10 +15,15 @@
 #   2. The OLD vtopctl, on the same ledger and config: `status`,
 #      `audit-coverage` (reads the digest) and `process-once` over newly
 #      appended lines must all succeed.
+#      Before the old release runs, this build leaves an INCOMPLETE row too
+#      (an upload to a store path that cannot exist fails it into
+#      REPLAY_REQUIRED, with `sealed_at`), so the old release's recovery
+#      claims, replays and commits a row this build wrote.
 #   3. This build runs `process-once` and `audit-coverage` again over what the
-#      old one wrote. With sqlite3 on the PATH, the old row's `sealed_at` is
-#      checked to be NULL, this build's rows to carry one, and `user_version`
-#      to be what the old release reads.
+#      old one wrote. The old row's `sealed_at` is checked to be NULL (sqlite3
+#      must be on the PATH; LEDGER_COMPAT_NO_SQLITE3=1 skips this check
+#      explicitly), this build's rows to carry one, and `user_version` to be
+#      what the old release reads.
 #
 # With LEDGER_COMPAT_POSTGRES set to a PostgreSQL URL (a throwaway database
 # on localhost), the same runs against PostgreSQL: the OLD release migrates
@@ -50,11 +55,20 @@ run() {
     || fail "$label failed (exit $?); see $WORKDIR/logs/$label.log"
 }
 
-# Only keys every replayed release knows.
+if ! command -v sqlite3 > /dev/null && [[ -z "${LEDGER_COMPAT_NO_SQLITE3:-}" ]]; then
+  fail "sqlite3 is not on the PATH; install it, or set LEDGER_COMPAT_NO_SQLITE3=1 to skip the column checks"
+fi
+
+# Only keys every replayed release knows. $3, when set, names the file the
+# store path runs through: every upload fails (ENOTDIR).
 write_config() {
-  local dir="$1" store="$2"
+  local dir="$1" store="$2" name="${3:-config.yaml}" local_path="$1/store"
   mkdir -p "$dir"
-  cat > "$dir/config.yaml" <<YAML
+  if [[ "$name" != config.yaml ]]; then
+    : > "$dir/notadir"
+    local_path="$dir/notadir/store"
+  fi
+  cat > "$dir/$name" <<YAML
 engine:
   name: ledger-compat
   state_store: $store
@@ -69,7 +83,7 @@ sources:
 upload:
   backend: localfs
   bucket: telemetry-data
-  local_path: $dir/store
+  local_path: $local_path
 partitioning: {}
 YAML
 }
@@ -90,10 +104,16 @@ exercise() {
   grep -q '"sealed_at"' "$dir"/digests/* \
     || fail "$p: the digest rows carry no sealed_at, so the old reader is not tested on it"
 
+  # An incomplete row of this build's, for the old release's recovery.
+  append "$dir" "$p third"
+  "$NEW_BIN" process-once --source file --config "$dir/broken.yaml" \
+    > "$WORKDIR/logs/$p-new-broken.log" 2>&1 || true
+  grep -q 'state=failed' "$WORKDIR/logs/$p-new-broken.log" \
+    || fail "$p: this build left no failed row; see $WORKDIR/logs/$p-new-broken.log"
+
   log "$p: $OLD_LABEL reads the ledger and the digest this build wrote"
   run "$p-old-status" "$OLD_BIN" status --config "$cfg"
   run "$p-old-audit" "$OLD_BIN" audit-coverage --config "$cfg" --digest-dir "$dir/digests"
-  append "$dir" "$p third"
   run "$p-old-process" "$OLD_BIN" process-once --source file --config "$cfg"
   grep -q 'committed=true' "$WORKDIR/logs/$p-old-process.log" \
     || fail "$p: $OLD_LABEL did not commit on the ledger this build opened; see $WORKDIR/logs/$p-old-process.log"
@@ -109,6 +129,7 @@ exercise() {
 log "SQLite: this build archives and prunes, then $OLD_LABEL works on the same ledger"
 sqlite_dir="$WORKDIR/sqlite"
 write_config "$sqlite_dir" "\"sqlite://$sqlite_dir/state.db\""
+write_config "$sqlite_dir" "\"sqlite://$sqlite_dir/state.db\"" broken.yaml
 exercise "$sqlite_dir" sqlite
 if command -v sqlite3 > /dev/null; then
   db="$sqlite_dir/state.db"
@@ -122,7 +143,7 @@ if command -v sqlite3 > /dev/null; then
   [[ "$new_rows" -ge 1 ]] || fail "no row of this build's carries sealed_at"
   log "SQLite: user_version $version, $OLD_LABEL's row NULL, $new_rows rows of this build's with sealed_at"
 else
-  log "SQLite: sqlite3 not on the PATH; the column values were not inspected"
+  log "SQLite: LEDGER_COMPAT_NO_SQLITE3 is set; the column values were not inspected"
 fi
 
 if [[ -n "${LEDGER_COMPAT_POSTGRES:-}" ]]; then
@@ -130,6 +151,7 @@ if [[ -n "${LEDGER_COMPAT_POSTGRES:-}" ]]; then
   export VTOP_STATE_STORE="$LEDGER_COMPAT_POSTGRES"
   pg_dir="$WORKDIR/postgres"
   write_config "$pg_dir" "{env: VTOP_STATE_STORE}"
+  write_config "$pg_dir" "{env: VTOP_STATE_STORE}" broken.yaml
   run pg-old-migrate "$OLD_BIN" migrate --config "$pg_dir/config.yaml"
   run pg-new-migrate "$NEW_BIN" migrate --config "$pg_dir/config.yaml"
   exercise "$pg_dir" postgres

@@ -86,6 +86,7 @@ async fn a_v0_9_0_ledger_opens_and_its_failed_ranges_are_replayed_once() {
         "mock",
     );
     cfg.engine.name = "fixture-090".into();
+    cfg.engine.tenant = "ledger-v090-626".into();
     let backend = Arc::new(MockBackend::new());
     let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
         .await
@@ -98,6 +99,14 @@ async fn a_v0_9_0_ledger_opens_and_its_failed_ranges_are_replayed_once() {
         rows.iter().all(|r| r.sealed_at.is_none()),
         "v0.9.0 recorded no seal instant: {rows:?}"
     );
+    let exact = || {
+        vtop_core::telemetry::init()
+            .unwrap()
+            .replay_rebuilds_total
+            .with_label_values(&["ledger-v090-626", "file", "raw", "exact"])
+            .get()
+    };
+    let exact_before = exact();
     let summary = engine.recover().await.unwrap();
     assert_eq!(summary.replay_required, 2, "{summary:?}");
     let out = engine.process_once(SourceType::File).await.unwrap();
@@ -124,6 +133,12 @@ async fn a_v0_9_0_ledger_opens_and_its_failed_ranges_are_replayed_once() {
     }
     assert_eq!(next, len, "the archive stops short: {committed:?}");
 
+    assert_eq!(
+        exact(),
+        exact_before,
+        "v0.9.0's rows recorded no seal instant: their replay is not claimed as rebuilt in \
+         its first hour"
+    );
     let mut conn = sqlite(&db).await;
     let version: i64 = sqlx::query_scalar("PRAGMA user_version")
         .fetch_one(&mut conn)

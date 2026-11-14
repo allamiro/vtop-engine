@@ -921,8 +921,9 @@ time partition is taken from (section 11).
   item 3). Nothing else reads it.
 - NULL is unknown: every row written before #626. A stored value that is not
   an RFC 3339 instant reads as unknown too, on every read path and in a prune
-  digest, and is logged as a WARN naming the row (`batch_id`, `column`,
-  `stored_len`; never the value); it never fails the row. Such a row's replay
+  digest; it never fails the row. A store read logs it as a WARN naming the
+  row (`batch_id`, `column`, `stored_len`; never the value), at most once a
+  minute with a `suppressed` count; a digest read drops it without a log. Such a row's replay
   is sealed when it is read again, as before.
 - SQLite adds the column when it opens the file and leaves `PRAGMA
   user_version` at 1: a nullable column older releases never name is nothing
@@ -1153,11 +1154,11 @@ On startup, the `replay` module inspects `vtop-state` and maps each incomplete b
 
    | `event` | Level | `result` | Condition and action |
    |---|---|---|---|
-   | `replay_rebuilt` | info | `exact` | the window covers exactly the recorded range and was sealed at the recorded instant, so it names the same derived key, and the key decision used it; its bytes match the object the earlier attempt uploaded, where the ledger recorded one |
+   | `replay_rebuilt` | info | `exact` | the window covers exactly the recorded range and was sealed at the recorded instant, so it names the same derived key, and the key decision used it (with `recorded_digest`, or `unknown` when the earlier attempt recorded no upload); its bytes match the object the earlier attempt uploaded, where the ledger recorded one |
    | `replay_key_fallback` | info | `fallback` | the window covers exactly the recorded range with the same bytes, but the key decision fell back to the attempt key (an `object_key_fallback` or `object_key_per_attempt` event for the same batch says why), so a second object is written; the counter for the reason is `vtop_object_key_decisions_total` |
    | `replay_bytes_differ` | warn | `bytes_differ` | the window covers exactly the recorded range, but its digest differs from the object the earlier attempt uploaded (the row's `object_sha256`); the batch is written under its own key and the earlier object is left untouched; nothing to do if compression, format or checksum settings changed since, otherwise run `vtopctl scrub` |
 
-   The earlier digest is the one the ledger recorded with `OBJECT_UPLOADED`. A failed attempt that put its object and then lost that write (a crash, or a ledger fault) records none, so a rebuild of it is judged on its range alone and counted `exact`.
+   Each is reported once the batch is VERIFIED, so an attempt that fails again (a store outage) is not counted. A window whose row recorded no seal instant (a row from before v0.10.0) is not reported unless its digest differs: it was sealed when it was read again. The earlier digest is the one the ledger recorded with `OBJECT_UPLOADED`. A failed attempt that put its object and then lost that write (a crash, or a ledger fault) records none, so a rebuild of it is judged on its range alone and counted `exact`, its event saying `recorded_digest: unknown`.
 
    **What stays per attempt, and why.** The `batch_id` keeps its stamp and random suffix: it names the ledger row and the manifest (`{batch_id}.manifest.json`). A ledger row is one attempt: a FAILED or `REPLAY_REQUIRED` row and the row of the replay that succeeded are both kept, and a unique id per attempt keeps their transitions and claims apart (`batch_id` is the primary key of both stores). A manifest is per attempt for the same reason: it carries the `batch_id`, its own `created_at` and the self-hash and version id its row pinned (#135), so one attempt's manifest written over another's would break the pinned row's binding. Several manifests can therefore name one object, and they are always attempts at one unit's range with the same bytes, so a reader can dedupe them by the object URI. Batches of different units never share an object.
 

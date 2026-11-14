@@ -34,6 +34,12 @@ use crate::engine::{end_position, proven_other, start_position, unit_key};
 /// rewind was refused, or that is never read again).
 const MAX_RECORDED_PER_UNIT: usize = 1024;
 
+/// How many recorded windows the engine keeps in all. A unit that is never
+/// read again (a deleted topic, a path dropped from the config, a file
+/// rotated away with no descriptor left) keeps its windows until this
+/// evicts the oldest-recorded one.
+const MAX_RECORDED: usize = 16 * 1024;
+
 /// A window an earlier attempt sealed and handed back to its source.
 #[derive(Debug, Clone)]
 pub(crate) struct RecordedWindow {
@@ -76,6 +82,16 @@ impl RecordedWindow {
                 self.start.content_fingerprint(),
                 start.content_fingerprint(),
             )
+            // The bytes ending at the window's end (#620): a file rewritten
+            // or replaced at the same inode, shorter than a page, agrees with
+            // the recorded window on everything above.
+            && !proven_other(self.end.tail_fingerprint(), end.tail_fingerprint())
+    }
+
+    /// Whether `other` is the same window: the same unit and range, and
+    /// content not proven other.
+    fn same_window(&self, other: &RecordedWindow) -> bool {
+        self.is(&other.start, &other.end)
     }
 }
 
@@ -96,30 +112,91 @@ pub(crate) fn recorded_digest(stored: Option<&str>) -> Option<String> {
 /// The windows handed back to their sources and not yet read again.
 #[derive(Debug, Default)]
 pub(crate) struct RecordedWindows {
-    by_unit: HashMap<String, Vec<RecordedWindow>>,
+    /// Per unit, each window with the order it was recorded in.
+    by_unit: HashMap<String, Vec<(u64, RecordedWindow)>>,
+    next: u64,
+    total: usize,
 }
 
 impl RecordedWindows {
     /// Record a window that is being handed back. A window already recorded
-    /// at the same start is replaced, keeping the earlier attempt's digest
-    /// when this one has none: it is the object that may be in the store.
+    /// at the same start is replaced. Only when it is the SAME window (the
+    /// same end, content not proven other) does the new record keep what the
+    /// earlier one knew and it does not: the digest of the object the
+    /// earlier attempt uploaded, and its seal instant. A window with another
+    /// end is another window, and inherits nothing.
     pub(crate) fn remember(&mut self, mut window: RecordedWindow) {
         let unit = self.by_unit.entry(unit_key(&window.start)).or_default();
         let start = start_position(&window.start);
-        if let Some(i) = unit.iter().position(|w| start_position(&w.start) == start) {
-            let earlier = unit.remove(i);
-            if window.digest.is_none() {
-                window.digest = earlier.digest;
-            }
-            if window.sealed_at.is_none() {
-                window.sealed_at = earlier.sealed_at;
+        if let Some(i) = unit
+            .iter()
+            .position(|(_, w)| start_position(&w.start) == start)
+        {
+            let (_, earlier) = unit.remove(i);
+            self.total -= 1;
+            if earlier.same_window(&window) {
+                if window.digest.is_none() {
+                    window.digest = earlier.digest;
+                }
+                if window.sealed_at.is_none() {
+                    window.sealed_at = earlier.sealed_at;
+                }
             }
         }
-        unit.push(window);
-        unit.sort_by_key(|w| start_position(&w.start));
+        let seq = self.next;
+        self.next += 1;
+        unit.push((seq, window));
+        self.total += 1;
         if unit.len() > MAX_RECORDED_PER_UNIT {
-            // The lowest start is the one a read has most likely passed.
-            unit.remove(0);
+            // The oldest-recorded, never the window just recorded.
+            if let Some(i) = unit
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (seq, _))| *seq)
+                .map(|(i, _)| i)
+            {
+                unit.remove(i);
+                self.total -= 1;
+            }
+        }
+        while self.total > MAX_RECORDED {
+            self.evict_oldest();
+        }
+    }
+
+    /// Drop the oldest-recorded window of any unit.
+    fn evict_oldest(&mut self) {
+        let Some((key, seq)) = self
+            .by_unit
+            .iter()
+            .flat_map(|(key, unit)| unit.iter().map(move |(seq, _)| (key, *seq)))
+            .min_by_key(|(_, seq)| *seq)
+            .map(|(key, seq)| (key.clone(), seq))
+        else {
+            return;
+        };
+        if let Some(unit) = self.by_unit.get_mut(&key) {
+            unit.retain(|(s, _)| *s != seq);
+            self.total -= 1;
+            if unit.is_empty() {
+                self.by_unit.remove(&key);
+            }
+        }
+    }
+
+    /// Forget the window recorded at `start`: its rewind was refused, so no
+    /// re-read will rebuild it.
+    pub(crate) fn forget(&mut self, start: &ProgressMarker) {
+        let key = unit_key(start);
+        let Some(unit) = self.by_unit.get_mut(&key) else {
+            return;
+        };
+        let position = start_position(start);
+        let before = unit.len();
+        unit.retain(|(_, w)| start_position(&w.start) != position);
+        self.total -= before - unit.len();
+        if unit.is_empty() {
+            self.by_unit.remove(&key);
         }
     }
 
@@ -136,7 +213,8 @@ impl RecordedWindows {
         let unit = self.by_unit.get_mut(&key)?;
         let position = start_position(start);
         let mut found = None;
-        unit.retain(|w| {
+        let before = unit.len();
+        unit.retain(|(_, w)| {
             if start_position(&w.start) > position {
                 return true;
             }
@@ -145,6 +223,7 @@ impl RecordedWindows {
             }
             false
         });
+        self.total -= before - unit.len();
         if unit.is_empty() {
             self.by_unit.remove(&key);
         }
@@ -153,7 +232,11 @@ impl RecordedWindows {
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.by_unit.values().map(Vec::len).sum()
+        debug_assert_eq!(
+            self.total,
+            self.by_unit.values().map(Vec::len).sum::<usize>()
+        );
+        self.total
     }
 }
 
@@ -179,10 +262,24 @@ pub(crate) fn note_rebuilt(
 ) {
     let earlier = window.batch_id.as_deref().unwrap_or("unrecorded");
     let differs = window.digest.as_deref().zip(digest).filter(|(a, b)| a != b);
-    let result = match (differs, key_is_derived) {
-        (Some(_), _) => "bytes_differ",
-        (None, false) => "fallback",
-        (None, true) => "exact",
+    // A window with no recorded instant (a row from before #626, or one a
+    // v0.9.0 engine wrote to a shared ledger) was sealed when it was read
+    // again, so nothing can be claimed about its hour or its key: only a
+    // digest that differs is reported.
+    let result = match (differs, window.sealed_at, key_is_derived) {
+        (Some(_), _, _) => "bytes_differ",
+        (None, None, _) => {
+            tracing::debug!(
+                batch_id,
+                earlier_batch_id = earlier,
+                range,
+                "replay of a window that recorded no seal instant; filed under the hour it was \
+                 read again"
+            );
+            return;
+        }
+        (None, Some(_), false) => "fallback",
+        (None, Some(_), true) => "exact",
     };
     debug_assert!(
         telemetry::REPLAY_REBUILD_RESULTS.contains(&result),
@@ -197,6 +294,7 @@ pub(crate) fn note_rebuilt(
         .sealed_at
         .map(|t| t.to_rfc3339())
         .unwrap_or_else(|| "unknown".to_owned());
+    let recorded_digest = window.digest.as_deref().unwrap_or("unknown");
     match differs {
         None if !key_is_derived => tracing::info!(
             event = "replay_key_fallback",
@@ -208,26 +306,36 @@ pub(crate) fn note_rebuilt(
             records,
             sealed_at = %sealed_at,
             "range {range} of {source} failed earlier (batch {earlier}) and was rebuilt exactly as \
-             first cut ({records} records), filed under the hour it was first sealed in \
+             first cut ({records} records) and sealed at the instant first recorded \
              ({sealed_at}), but its derived key could not be used, so it was written under {key}, \
              a second object (nothing is lost); the object_key_fallback or \
              object_key_per_attempt event for this batch says why and what to do"
         ),
-        None => tracing::info!(
-            event = "replay_rebuilt",
-            batch_id,
-            earlier_batch_id = earlier,
-            source,
-            range,
-            key,
-            records,
-            sealed_at = %sealed_at,
-            "range {range} of {source} failed earlier (batch {earlier}) and was read again: it \
-             was rebuilt exactly as first cut ({records} records), not to the end of the source, \
-             and filed under the hour it was first sealed in ({sealed_at}), so it names the same \
-             key ({key}) as the earlier attempt; newer data follows in the next batch; nothing \
-             to do"
-        ),
+        None => {
+            // What can be said of the object depends on whether the ledger
+            // recorded the earlier attempt's digest.
+            let object = if window.digest.is_some() {
+                "the object the earlier attempt uploaded, with the same bytes"
+            } else {
+                "the key the earlier attempt would have used for the same bytes (it recorded no \
+                 upload)"
+            };
+            tracing::info!(
+                event = "replay_rebuilt",
+                batch_id,
+                earlier_batch_id = earlier,
+                source,
+                range,
+                key,
+                records,
+                sealed_at = %sealed_at,
+                recorded_digest,
+                "range {range} of {source} failed earlier (batch {earlier}) and was read again: it \
+                 was rebuilt exactly as first cut ({records} records) and sealed at the instant \
+                 first recorded ({sealed_at}), so under `partitioning.time_source: seal` it is \
+                 filed under the same hour and names {object}: {key}; nothing to do"
+            )
+        }
         Some((recorded, rebuilt)) => tracing::warn!(
             event = "replay_bytes_differ",
             batch_id,
@@ -308,6 +416,70 @@ mod tests {
         windows.remember(window(0, 10));
         let found = windows.take(&file(0, 0, 7), &file(0, 10, 7)).unwrap();
         assert_eq!(found.digest.as_deref(), Some("aa"));
+    }
+
+    /// Review of #755: a window recorded at the same start with ANOTHER end
+    /// is another window, and inherits neither the digest nor the instant of
+    /// the one it replaces. Inheriting the digest made a grown replay report
+    /// `bytes_differ` against an object of a shorter range.
+    #[test]
+    fn a_window_with_another_end_inherits_nothing() {
+        let mut windows = RecordedWindows::default();
+        let mut first = window(0, 10);
+        first.digest = Some("aa".into());
+        windows.remember(first);
+        let mut grown = window(0, 15);
+        grown.sealed_at = None;
+        windows.remember(grown);
+        let found = windows.take(&file(0, 0, 7), &file(0, 15, 7)).unwrap();
+        assert_eq!(found.digest, None);
+        assert_eq!(found.sealed_at, None);
+    }
+
+    /// Review of #755: two windows over one range whose bytes before the end
+    /// differ (a small file rewritten at the same inode) are not the same.
+    #[test]
+    fn a_window_whose_end_bytes_differ_is_not_the_recorded_one() {
+        let tail = |bytes: &[u8]| ProgressMarker::File {
+            path: "/var/log/a.log".into(),
+            inode: Some(7),
+            start_byte: 0,
+            end_byte: 10,
+            file_size: 10,
+            mtime: String::new(),
+            content_fingerprint: None,
+            tail_fingerprint: vtop_core::types::ContentFingerprint::of(bytes),
+        };
+        let mut windows = RecordedWindows::default();
+        let mut w = window(0, 10);
+        w.end = tail(b"0123456789");
+        windows.remember(w);
+        assert!(windows.take(&file(0, 0, 7), &tail(b"abcdefghij")).is_none());
+    }
+
+    /// Review of #755: forgetting a window whose rewind was refused, and the
+    /// bound on every unit together.
+    #[test]
+    fn a_refused_window_is_forgotten_and_the_total_is_bounded() {
+        let mut windows = RecordedWindows::default();
+        windows.remember(window(0, 10));
+        windows.forget(&file(0, 0, 7));
+        assert_eq!(windows.len(), 0);
+        for i in 0..(MAX_RECORDED as u64 + 3) {
+            let mut w = window(0, 10);
+            w.start = ProgressMarker::File {
+                path: format!("/var/log/{i}.log"),
+                inode: Some(i),
+                start_byte: 0,
+                end_byte: 0,
+                file_size: 0,
+                mtime: String::new(),
+                content_fingerprint: None,
+                tail_fingerprint: None,
+            };
+            windows.remember(w);
+        }
+        assert_eq!(windows.len(), MAX_RECORDED);
     }
 
     /// The records of one unit are bounded.
