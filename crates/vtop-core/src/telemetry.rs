@@ -40,6 +40,39 @@ pub const STAGES: [&str; 7] = [
     "state_write",
 ];
 
+/// The values of `decision` on `vtop_object_key_decisions_total` (#626).
+pub const OBJECT_KEY_DECISIONS: [&str; 8] = [
+    "derived",
+    "reused",
+    "fallback_differs",
+    "fallback_size_only",
+    "fallback_unreadable",
+    "fallback_unchecked",
+    "probe_throttled",
+    "per_attempt",
+];
+
+/// The values of `outcome` on `vtop_file_delete_decisions_total` (#619):
+/// `deleted`, or why `delete_after_commit` kept a fully archived file.
+pub const FILE_DELETE_OUTCOMES: [&str; 16] = [
+    "deleted",
+    "appended",
+    "shorter",
+    "other_file",
+    "rewritten",
+    "unprovable",
+    "metadata_changed",
+    "gone",
+    "symlink",
+    "open",
+    "no_open_check",
+    "rename_refused",
+    "failed",
+    "stale_commit",
+    "leftover_archived",
+    "opened_at_unlink",
+];
+
 /// The engine's metric set. Cheap to clone (all fields are `Arc` internally).
 pub struct Metrics {
     pub registry: Registry,
@@ -157,6 +190,10 @@ pub struct Metrics {
     /// retrying at the same width is the overload it is complaining about.
     /// `stage` says which upload (`object_upload`, `manifest_upload`).
     pub upload_throttled_total: IntCounterVec,
+    /// How each batch's object key was decided (#626). `decision` is the
+    /// bounded set [`OBJECT_KEY_DECISIONS`]: a rising `fallback_*` or
+    /// `per_attempt` rate means replays are writing second objects.
+    pub object_key_decisions_total: IntCounterVec,
 
     /// Request-body bytes admitted through the egress shaper (#481) — VTOP's
     /// own account of what it handed the wire under
@@ -289,6 +326,11 @@ impl Metrics {
             "Source reads that failed and were skipped for this cycle (see logs for the path)",
             vec!["tenant", "source_type"],
         )?;
+        let object_key_decisions_total = cv(
+            "object_key_decisions_total",
+            "How each batch's object key was decided (#626): derived (uploaded under its content-derived key), reused (the verified object was already stored, no upload), fallback_differs / fallback_size_only / fallback_unreadable (an object is at the derived key and does not verify, verifies by size only, or could not be read) and fallback_unchecked (the store refused or failed the check of the key): the batch was written under its per-attempt key instead of overwriting anything, probe_throttled (the batch failed and was handed back), per_attempt (no checksum, or a backend that cannot report an absent key)",
+            vec!["tenant", "source_type", "format", "decision"],
+        )?;
         let upload_throttled_total = cv(
             "upload_throttled_total",
             "Uploads the object store answered with a throttle (HTTP 429/503 or an S3 SlowDown/Throttling code) after the backend's own retries; a sustained rate means the store wants less concurrency, not more retries",
@@ -401,6 +443,7 @@ impl Metrics {
             upload_throttled_total,
             upload_egress_bytes_total,
             file_delete_decisions_total,
+            object_key_decisions_total,
             kafka_partition_events_total,
         })
     }

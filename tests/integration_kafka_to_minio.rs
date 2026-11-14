@@ -2300,3 +2300,109 @@ async fn a_held_back_kafka_range_is_settled_without_a_restart_and_never_moves_th
         watch.0
     );
 }
+
+/// #626: two engines sharing one ledger and one store, reading one Kafka
+/// partition as one group. Engine A uploads a range's object and fails
+/// before VERIFIED (its manifest put is throttled), so the range is not
+/// committed. Engine B reads the same range and finds A's object: a Kafka
+/// topic-partition is one unit wherever it is read, so the derived key does
+/// not name the engine, and B reuses the object instead of writing a second
+/// one or overwriting it.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn an_engine_sharing_the_ledger_reuses_the_object_another_left_for_a_kafka_range() {
+    use std::sync::Arc;
+    use vtop_core::state_machine::BatchState;
+    use vtop_upload::{MockBackend, UploadBackend};
+
+    let (topic, _cleanup) = fresh_topic("shared_ledger", 5).await;
+    let group = unique_group("shared-ledger");
+    let dir = tempfile::tempdir().unwrap();
+    let db = format!("sqlite://{}", dir.path().join("shared.db").display());
+    let backend = Arc::new(MockBackend::new().with_throttled_manifest_puts(1));
+    let named = |name: &str, work: &str| {
+        let backend = backend.clone();
+        let (db, topic, group) = (db.clone(), topic.clone(), group.clone());
+        let work = dir.path().join(work);
+        let name = name.to_owned();
+        async move {
+            let mut cfg =
+                vtop_cli::testkit::file_config(work.to_str().unwrap(), &db, vec![], "mock");
+            cfg.engine.name = name;
+            // No time fields: B seals after A, and a run that crossed an hour
+            // between them would see two partitions and so two keys.
+            cfg.partitioning.template = "tenant={tenant}/source={source}/format={format}/".into();
+            cfg.sources.file = None;
+            let mut kafka = kafka_cfg(&bootstrap(), &group);
+            kafka.topic_include_regex = format!("^{topic}$");
+            cfg.sources.kafka = Some(kafka);
+            cfg.batching.source_poll_wait_ms = 2_000;
+            let mut engine =
+                vtop_cli::Engine::new(cfg, vtop_core::config::StreamsConfig { streams: vec![] })
+                    .await
+                    .expect("engine starts");
+            engine.backend = backend as Arc<dyn UploadBackend>;
+            engine
+        }
+    };
+
+    // Engine A: read until a batch is attempted; its manifest put fails.
+    let mut a = named("kafka-a", "work-a").await;
+    let mut failed = None;
+    for _ in 0..15 {
+        let out = through_warm_up!(
+            "engine A's pass",
+            a.process_once(vtop_core::types::SourceType::Kafka).await
+        );
+        if let Some(o) = out.into_iter().next() {
+            failed = Some(o);
+            break;
+        }
+    }
+    let failed = failed.expect("engine A attempted a batch");
+    assert!(
+        !failed.committed,
+        "A's manifest put was throttled: {failed:?}"
+    );
+    let a_row = a.store.get_batch(&failed.batch_id).await.unwrap().unwrap();
+    let a_object = a_row.object_uri.clone().expect("A uploaded the object");
+    let a_range = (a_row.progress_start.clone(), a_row.progress_end.clone());
+    drop(a);
+
+    // Engine B, same ledger and store, another name: reads the same range.
+    let mut b = named("kafka-b", "work-b").await;
+    read_until_a_new_commit(&mut b).await;
+    let b_row = b
+        .store
+        .list_batches()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.state == BatchState::SourceCommitted)
+        .expect("B committed a batch");
+    let start = |m: &ProgressMarker| match m {
+        ProgressMarker::Kafka { start_offset, .. } => *start_offset,
+        other => panic!("{other:?}"),
+    };
+    let end = |m: &ProgressMarker| match m {
+        ProgressMarker::Kafka { end_offset, .. } => *end_offset,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        (start(&b_row.progress_start), end(&b_row.progress_end)),
+        (start(&a_range.0), end(&a_range.1)),
+        "both engines read the whole topic in one batch"
+    );
+    assert_eq!(
+        b_row.object_uri.as_deref(),
+        Some(a_object.as_str()),
+        "B reused the object A left for the same range"
+    );
+    assert!(
+        backend
+            .get_object_pinned(&a_object, "v2", 1 << 20)
+            .await
+            .is_err(),
+        "nothing was put twice under {a_object}"
+    );
+}

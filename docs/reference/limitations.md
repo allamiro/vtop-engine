@@ -8,7 +8,7 @@ engine's HA status is in [PRODUCTION_HA.md](../PRODUCTION_HA.md).
 
 | Area | Current behavior | Planned direction |
 |---|---|---|
-| Deterministic object naming | not yet — `batch_id` embeds a timestamp + random suffix, so replay writes a **new** key (duplicate object, no data loss), against the MUST of [protocol §15.1](../VTOP_PROTOCOL_DRAFT.md#151-object-key)/§16 | deterministic / content-addressed keys ([PRODUCTION_HA.md Phase 4](../PRODUCTION_HA.md)) |
+| Deterministic object naming | partly — objects are keyed by source, range and content digest, so a replay of the same bytes reuses the stored object (#626); a replay with other boundaries, a later seal-time hour, no checksum or a command backend still writes a second object, and manifests stay per attempt ([protocol §15.1](../VTOP_PROTOCOL_DRAFT.md#151-object-key)/§16) | reproducible batch boundaries, per-range manifests ([PRODUCTION_HA.md Phase 4](../PRODUCTION_HA.md)) |
 | Verification classes | strong (default) / backend-limited / disabled (size-only), per [protocol §17](../VTOP_PROTOCOL_DRAFT.md#17-verification-semantics); non-strong commit requires explicit opt-out | — |
 | Large objects | native S3 + mock support resumable multipart with persisted sessions (`vtopctl tier copy --multipart-state-dir`); compatibility backends still single-shot `put_object` | wire remaining backends / streaming rehydrate |
 | Large records / whole files | `max_bytes` is a hard per-source/per-batch ceiling; an oversized record is rejected without advancing source progress | raise the explicit budget only when the deployment has matching memory headroom |

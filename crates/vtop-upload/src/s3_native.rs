@@ -950,6 +950,27 @@ where
     }
 }
 
+/// A failed HEAD, with an absent key told apart from every other failure
+/// (#626). A HEAD response has no body, so the status is the only evidence:
+/// 404 means the key holds nothing. Anything else - 403 included, which S3
+/// answers for a missing key when the caller may not list the bucket - stays
+/// an error, because the engine must not treat a key it cannot see as free.
+fn head_failure<E>(object_uri: &str, error: SdkError<E, HttpResponse>) -> VtopError
+where
+    E: std::error::Error + ProvideErrorMetadata + Send + Sync + 'static,
+{
+    let status = match &error {
+        SdkError::ServiceError(context) => Some(context.raw().status().as_u16()),
+        SdkError::ResponseError(context) => Some(context.raw().status().as_u16()),
+        _ => None,
+    };
+    if status == Some(404) {
+        VtopError::NotFound(object_uri.to_string())
+    } else {
+        sdk_failure("head_object", object_uri, error)
+    }
+}
+
 #[async_trait]
 impl UploadBackend for S3NativeBackend {
     async fn put_object(
@@ -1117,7 +1138,7 @@ impl UploadBackend for S3NativeBackend {
             .checksum_mode(ChecksumMode::Enabled)
             .send()
             .await
-            .map_err(|e| sdk_failure("head_object", object_uri, e))?;
+            .map_err(|e| head_failure(object_uri, e))?;
 
         // Only expose the checksum S3 itself computed over the stored body.
         // x-amz-meta-vtop-checksum is written by the uploader and therefore
@@ -1269,6 +1290,12 @@ impl UploadBackend for S3NativeBackend {
     fn supports_checksum_verification(&self) -> bool {
         true
     }
+
+    fn reports_absent_objects(&self) -> bool {
+        // head_failure: NotFound only for a 404 (#626).
+        true
+    }
+
     fn supports_multipart(&self) -> bool {
         true
     }

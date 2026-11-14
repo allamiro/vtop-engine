@@ -666,6 +666,12 @@ const DELETE_GRACE: Duration = Duration::from_millis(50);
 /// Count one `delete_after_commit` decision (#619) in
 /// `vtop_file_delete_decisions_total{outcome}`, when metrics are on.
 fn count_delete_decision(outcome: &'static str) {
+    // A label outside the documented set is a bug: every test that reaches
+    // a decision checks it.
+    debug_assert!(
+        vtop_core::telemetry::FILE_DELETE_OUTCOMES.contains(&outcome),
+        "{outcome} is not in telemetry::FILE_DELETE_OUTCOMES"
+    );
     if let Some(metrics) = vtop_core::telemetry::metrics() {
         metrics
             .file_delete_decisions_total
@@ -3790,6 +3796,40 @@ mod tests {
             .file_delete_decisions_total
             .with_label_values(&[outcome])
             .get()
+    }
+
+    /// Every outcome a delete decision is counted under is one the metric
+    /// documents (#619): the kept reasons, and those `settle_delete`,
+    /// `commit_progress`, discovery and the unlink count by name.
+    #[test]
+    fn every_delete_outcome_is_a_documented_label() {
+        let kept = [
+            Kept::Grew { len: 1 },
+            Kept::Shrank { len: 0 },
+            Kept::OtherFile { inode: None },
+            Kept::Rewritten,
+            Kept::Unprovable,
+            Kept::MetadataMoved,
+            Kept::Gone,
+            Kept::Symlink,
+        ];
+        let named = [
+            "deleted",
+            "open",
+            "no_open_check",
+            "rename_refused",
+            "failed",
+            "stale_commit",
+            "leftover_archived",
+            "opened_at_unlink",
+            "metadata_changed",
+        ];
+        for outcome in kept.iter().map(Kept::outcome).chain(named) {
+            assert!(
+                vtop_core::telemetry::FILE_DELETE_OUTCOMES.contains(&outcome),
+                "{outcome} is counted but not in telemetry::FILE_DELETE_OUTCOMES"
+            );
+        }
     }
 
     /// Whether a delete decision said `needle` to the operator (#619).

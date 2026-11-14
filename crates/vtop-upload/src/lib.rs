@@ -23,7 +23,7 @@ pub use base::{
     ObjectChecksum, ObjectHead, StoredManifest, StoredObject, UploadBackend, UploadedPart,
     VerificationResult,
 };
-pub use mock::MockBackend;
+pub use mock::{HeadFault, MockBackend};
 pub use multipart::{
     abort_session, cleanup_abandoned, upload_resumable, MultipartFence, MultipartUploadConfig,
 };
