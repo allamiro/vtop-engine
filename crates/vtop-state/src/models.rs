@@ -99,8 +99,12 @@ impl VerificationClass {
 
 /// Tells the operator that a migration added the verification class column
 /// to a table that already held rows (#664): what happened, what it means for
-/// those rows, and that nothing needs doing.
+/// those rows, and that nothing needs doing. Says nothing for an empty table:
+/// no row is left without a class.
 pub(crate) fn log_class_column_added(backend: &str, existing_rows: i64) {
+    if existing_rows == 0 {
+        return;
+    }
     tracing::info!(
         backend,
         existing_rows,
@@ -109,6 +113,20 @@ pub(crate) fn log_class_column_added(backend: &str, existing_rows: i64) {
          NULL (verification class unknown). A VERIFIED row among them is counted, when recovery \
          commits it, by recovery's re-check of the stored object, as before this release. \
          Nothing to do"
+    );
+}
+
+/// [`log_class_column_added`] when the rows could not be counted: the column
+/// is there either way, so this is not a failure of the migration.
+pub(crate) fn log_class_column_added_uncounted(backend: &str, error: &str) {
+    tracing::warn!(
+        backend,
+        column = "verification_class",
+        error,
+        "state store: added the verification_class column, but could not count the existing \
+         rows it left NULL (verification class unknown). The migration is complete; those rows' \
+         recovered commits are counted by recovery's re-check, as before this release. Nothing \
+         to do"
     );
 }
 

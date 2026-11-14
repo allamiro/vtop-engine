@@ -122,7 +122,8 @@ pub(crate) fn note_stored_class(rec: &BatchRecord, recheck: Recheck) {
             recheck = found,
             "verification class unknown for batch {}: it was verified by a release before the \
              ledger recorded classes (or one newer than this). Recovery re-checked the stored \
-             object ({found}) and counts its commit by that, as before. Nothing to do",
+             object ({found}) and counts its commit by that when it commits, as before. Nothing \
+             to do",
             rec.batch_id
         ),
         Some(VerificationClass::Strong) if recheck == Recheck::SizeOnly => tracing::warn!(
@@ -132,8 +133,8 @@ pub(crate) fn note_stored_class(rec: &BatchRecord, recheck: Recheck) {
             "batch {} was verified strong, but recovery's re-check could confirm only its size \
              (upload.require_strong_verification: false lets it commit). Its commit is counted \
              as strong, the class that admitted it. The store can no longer show its content \
-             matches: check the backend's checksum support, and run `vtopctl scrub` to re-check \
-             committed batches",
+             matches: restore checksum support (checksums enabled, a backend that can hash the \
+             stored bytes), then run `vtopctl scrub` to re-check committed batches",
             rec.batch_id
         ),
         Some(VerificationClass::SizeOnly) if recheck == Recheck::Strong => tracing::info!(

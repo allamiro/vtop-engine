@@ -14,6 +14,9 @@
 //! Build with `--features postgres,test-support`.
 
 use tracing::instrument::WithSubscriber;
+
+/// The migration SQL as `vtopctl migrate` applies it, to run it raw.
+const MIGRATION_SQL: &str = include_str!("../migrations/postgres/0001_state_store.sql");
 use vtop_state::pg_store::PgStateStore;
 
 /// Log lines captured as JSON, to assert the messages an operator reads.
@@ -258,10 +261,14 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
 BEGIN
     RETURN NEW;
 END;
-$fn$ LANGUAGE plpgsql;",
+$fn$ LANGUAGE plpgsql; \
+             ALTER TABLE batches DROP COLUMN verification_class;",
         )
         .await
         .unwrap();
+    // The newer release also dropped a column this one names (review): the
+    // refusal must still be the newer-schema one. Sending the operator to
+    // `vtopctl migrate`, which then refuses, sends them the wrong way first.
     for (what, refused) in [
         (
             "startup",
@@ -292,6 +299,18 @@ $fn$ LANGUAGE plpgsql;",
             );
         }
     }
+    // The migration's own guard (review): the SQL refuses a newer marker in
+    // its transaction, under an advisory lock, so a run that slips past the
+    // pre-check - an older migrate racing a newer one, or the SQL applied by
+    // an external migration system - still cannot overwrite the newer body.
+    let err = admin
+        .execute_raw(MIGRATION_SQL)
+        .await
+        .expect_err("the migration SQL must refuse a newer marker by itself");
+    assert!(
+        err.to_string().contains("vtop-state-schema 4") && err.to_string().contains("newer"),
+        "the migration SQL's own refusal must name the marker: {err}"
+    );
     admin
         .execute_raw(
             "DO $chk$ BEGIN \

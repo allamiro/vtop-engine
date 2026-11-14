@@ -55,8 +55,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
     }
 }
 
-/// A SQLite ledger from before #664, holding `rows` rows in `state`, at a
-/// path whose name is unique to the caller so its log line can be found.
+/// A SQLite ledger from before #664 at `path`, holding `rows` VERIFIED rows.
 async fn pre_664_file(path: &std::path::Path, rows: usize) {
     use sqlx::ConnectOptions;
     let mut conn = sqlx::sqlite::SqliteConnectOptions::new()

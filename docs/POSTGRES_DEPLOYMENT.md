@@ -181,7 +181,12 @@ migration job per database; engine replicas should start only after it succeeds.
   (both 3 today). A higher marker means a newer release migrated the
   database for a change this one could misread, so startup refuses it, and
   so does this release's `vtopctl migrate`, which would otherwise install its
-  older trigger body over the newer one. The refusal names the marker it
+  older trigger body over the newer one. The migration SQL carries the same
+  guard itself, in its own transaction under an advisory lock that every
+  migration from #664 on takes, so it holds for SQL applied by an external
+  migration system and for two migrations run at once. Startup checks the
+  marker before the columns, so a newer schema that dropped or renamed a
+  column is refused as newer, not sent to `vtopctl migrate`. The refusal names the marker it
   found and the versions this release reads: `schema marker 4 (-- vtop-state-schema 4 ...)
   is newer than this release supports (minimum 3, newest 3): a newer release
   has migrated this database. Nothing was started or changed. ...`. Releases

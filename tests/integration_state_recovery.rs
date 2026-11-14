@@ -3275,6 +3275,19 @@ impl vtop_adapters::base::SourceAdapter for FlakyCommit {
             .read_batch_candidates(source, records, bytes, wait)
             .await
     }
+    // Forwarded too: the file source overrides it, and the tests must read
+    // through the production path, not the trait's default.
+    async fn read_all_batch_candidates(
+        &mut self,
+        sources: &[vtop_adapters::base::DiscoveredSource],
+        records: usize,
+        bytes: usize,
+        wait: std::time::Duration,
+    ) -> Result<vtop_adapters::base::AdapterReadReport, vtop_core::errors::VtopError> {
+        self.inner
+            .read_all_batch_candidates(sources, records, bytes, wait)
+            .await
+    }
     async fn commit_progress(
         &mut self,
         marker: &ProgressMarker,

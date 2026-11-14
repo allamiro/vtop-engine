@@ -1,5 +1,30 @@
 BEGIN;
 
+-- Refuse a schema a newer release migrated (#664): its marker (see the
+-- trigger function below) is above the one this migration installs, and
+-- CREATE OR REPLACE would put this release's older body over it. In this
+-- transaction, under an advisory lock every migration from #664 on takes,
+-- so two of them cannot interleave the check and the replace. `vtopctl
+-- migrate` checks first for a clearer message; this guard also covers the
+-- SQL applied by an external migration system. Keep 3 equal to the marker
+-- below and SCHEMA_VERSION in pg_store.rs.
+SELECT pg_advisory_xact_lock(hashtext('vtop-state-schema'));
+DO $newer$
+DECLARE
+    marker integer;
+BEGIN
+    SELECT substring(p.prosrc FROM '^\s*-- vtop-state-schema ([0-9]+)')::integer
+      INTO marker
+      FROM pg_catalog.pg_proc p
+     WHERE p.proname = 'vtop_enforce_commit_after_verify'
+       AND p.pronamespace = current_schema()::regnamespace;
+    IF marker > 3 THEN
+        RAISE EXCEPTION 'state-store schema marker % (-- vtop-state-schema %) is newer than this migration (3): a newer release has migrated this database; nothing was changed. Run the release that migrated it, or a later one', marker, marker
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+END
+$newer$;
+
 CREATE TABLE IF NOT EXISTS batches (
     batch_id TEXT PRIMARY KEY,
     tenant TEXT NOT NULL,

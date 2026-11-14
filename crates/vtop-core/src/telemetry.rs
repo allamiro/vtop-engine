@@ -238,7 +238,7 @@ impl Metrics {
         )?;
         let recovery_rechecks_total = cv(
             "recovery_rechecks_total",
-            "VERIFIED batches recovery re-checked against storage, by the class they were verified with (strong, size_only; unknown for a row from before #664) and the re-check's result (strong, size_only, failed, unsupported_version). verification_class=strong with result=size_only: the store can no longer confirm content verified strongly; check the backend's checksum support and run vtopctl scrub",
+            "VERIFIED batches recovery re-checked against storage, by the class they were verified with (strong, size_only; unknown for a row from before #664 or with a newer release's class) and the re-check's result (strong, size_only, failed, unsupported_version). verification_class=strong with result=size_only: the store can no longer confirm content verified strongly; restore checksum support on the backend, then run vtopctl scrub",
             vec!["tenant", "source_type", "format", "verification_class", "result"],
         )?;
         let failed_total = cv(

@@ -820,7 +820,48 @@ impl StateStore for SqliteStateStore {
 /// Create the schema, or bring an older one up to date: idempotent, and run
 /// on every open. See [`SqliteStateStore::connect`] for why it runs on one
 /// connection.
+///
+/// One `BEGIN IMMEDIATE` transaction from the version check to the version
+/// write (review of #664): it takes the write lock before reading the
+/// version, so a newer release raising the version at the same moment is
+/// either seen and refused, or waits; this release never writes its version
+/// over a newer one.
 async fn migrate(conn: &mut sqlx::SqliteConnection) -> Result<(), VtopError> {
+    sqlx::raw_sql("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx)?;
+    let added = match migrate_in_transaction(&mut *conn).await {
+        Ok(added) => added,
+        Err(e) => {
+            // The refusal or failure is the error reported; a failed
+            // rollback adds nothing to it, and the connection is closed.
+            let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
+            return Err(e);
+        }
+    };
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut *conn)
+        .await
+        .map_err(map_sqlx)?;
+    if added {
+        // Counted after the commit, and best effort: the column is there
+        // either way, and a failed count must not fail the open.
+        match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM batches")
+            .fetch_one(&mut *conn)
+            .await
+        {
+            Ok(rows) => crate::models::log_class_column_added("SQLite", rows),
+            Err(e) => crate::models::log_class_column_added_uncounted("SQLite", &e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// [`migrate`]'s statements, in its transaction. `true` when this run added
+/// the verification class column to a table that already existed.
+async fn migrate_in_transaction(conn: &mut sqlx::SqliteConnection) -> Result<bool, VtopError> {
+    let mut added = false;
     // A file a newer release has opened is left alone (#664): see
     // SQLITE_SCHEMA_VERSION.
     let version: i64 = sqlx::query_scalar("PRAGMA user_version")
@@ -871,13 +912,7 @@ async fn migrate(conn: &mut sqlx::SqliteConnection) -> Result<(), VtopError> {
             Err(_) => {}
             // Added to a table that already existed: a new table is created
             // with the column, and this ALTER finds it there.
-            Ok(_) if stmt.contains("verification_class") => {
-                let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM batches")
-                    .fetch_one(&mut *conn)
-                    .await
-                    .map_err(map_sqlx)?;
-                crate::models::log_class_column_added("SQLite", rows);
-            }
+            Ok(_) if stmt.contains("verification_class") => added = true,
             Ok(_) => {}
         }
     }
@@ -901,7 +936,7 @@ async fn migrate(conn: &mut sqlx::SqliteConnection) -> Result<(), VtopError> {
             .await
             .map_err(map_sqlx)?;
     }
-    Ok(())
+    Ok(added)
 }
 
 fn is_in_memory(conn_str: &str) -> bool {
@@ -1345,6 +1380,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    /// Review of #664: the version check and the version write are one
+    /// transaction with the migration. A newer release that raises the
+    /// version while this one opens the file must be refused, not have its
+    /// version written back down: this release read 0, then ran its DDL,
+    /// then wrote 1 over the newer release's 2.
+    #[tokio::test]
+    async fn sqlite_does_not_write_a_newer_releases_version_back_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.db");
+        let url = format!("sqlite://{}", path.display());
+        // A pre-#664 file: version 0, no class column.
+        {
+            let mut conn = sqlx::ConnectOptions::connect(&parse_sqlite_opts(&url).unwrap())
+                .await
+                .unwrap();
+            sqlx::raw_sql(
+                "CREATE TABLE batches (batch_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, \
+                 source_type TEXT NOT NULL, source_name TEXT NOT NULL, format TEXT NOT NULL, \
+                 state TEXT NOT NULL, progress_start_json TEXT NOT NULL, \
+                 progress_end_json TEXT NOT NULL, created_at TEXT NOT NULL, \
+                 updated_at TEXT NOT NULL)",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        // The newer release holds the write lock and raises the version.
+        let mut newer = sqlx::ConnectOptions::connect(&parse_sqlite_opts(&url).unwrap())
+            .await
+            .unwrap();
+        sqlx::raw_sql("BEGIN IMMEDIATE; PRAGMA user_version = 2;")
+            .execute(&mut newer)
+            .await
+            .unwrap();
+        let opening = tokio::spawn({
+            let url = url.clone();
+            async move { SqliteStateStore::connect(&url).await.map(|_| ()) }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        sqlx::raw_sql("COMMIT").execute(&mut newer).await.unwrap();
+        let opened = opening.await.unwrap();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut newer)
+            .await
+            .unwrap();
+        assert_eq!(
+            version, 2,
+            "the newer release's version was written back down"
+        );
+        let refused = opened.expect_err("this release opened a file a newer release had raised");
+        assert!(
+            refused.to_string().contains("schema version 2"),
+            "{refused}"
+        );
     }
 
     /// Review of #664: a store that is open while another connection adds a

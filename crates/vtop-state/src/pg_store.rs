@@ -356,11 +356,19 @@ impl PgStateStore {
             .await
             .map_err(map_sqlx)?;
         if adds_class_column {
-            let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM batches")
+            // Best effort (review of #664): the migration has committed, and
+            // a failed count must not report it as failed. An exact count, as
+            // the message promises a number; migrate is a one-off step.
+            match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM batches")
                 .fetch_one(&pool)
                 .await
-                .map_err(map_sqlx)?;
-            crate::models::log_class_column_added("PostgreSQL", rows);
+            {
+                Ok(rows) => crate::models::log_class_column_added("PostgreSQL", rows),
+                Err(e) => crate::models::log_class_column_added_uncounted(
+                    "PostgreSQL",
+                    &redact_postgres_urls(&e.to_string()),
+                ),
+            }
         }
         Self {
             pool,
@@ -387,20 +395,9 @@ impl PgStateStore {
     }
 
     async fn check_schema(&self) -> Result<(), VtopError> {
-        // Listing every runtime column makes an old/partial schema fail during
-        // startup instead of halfway through a batch. This is a SELECT only.
-        // The list every whole-row read names (`batch_columns!`).
-        sqlx::query(concat!(
-            "SELECT ",
-            batch_columns!(),
-            " FROM batches WHERE FALSE"
-        ))
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_schema_check)?;
-
-        // The trigger must be enabled and call a function whose body carries a
-        // current schema marker, not merely exist by name: a schema restored
+        // First, the schema marker. The trigger must be enabled and call a
+        // function whose body carries a current schema marker, not merely
+        // exist by name (a missing table is reported as needing migrate): a schema restored
         // from an older archive, never re-migrated, or re-migrated by an older
         // release keeps the name with an older body, and a restore that
         // disabled the trigger may never have enabled it again.
@@ -422,6 +419,21 @@ impl PgStateStore {
         if !schema_marker_is_current(body.as_deref()) {
             return Err(schema_migration_required());
         }
+
+        // Listing every runtime column makes an old/partial schema fail during
+        // startup instead of halfway through a batch. This is a SELECT only.
+        // The list every whole-row read names (`batch_columns!`). After the
+        // marker (review of #664): a newer release may drop or rename one of
+        // these, and its schema must be refused as newer, not sent to a
+        // `vtopctl migrate` that then refuses it.
+        sqlx::query(concat!(
+            "SELECT ",
+            batch_columns!(),
+            " FROM batches WHERE FALSE"
+        ))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_schema_check)?;
 
         // The state CHECK must admit every state this build writes (#567),
         // under a current marker or not: see STATE_ADDED_SINCE_FIRST_SCHEMA.

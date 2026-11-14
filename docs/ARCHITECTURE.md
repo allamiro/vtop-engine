@@ -724,7 +724,10 @@ A table change, unlike the two notes above: one new column on both backends,
   0). A file whose version is higher was opened by a newer release, and this
   release refuses it - `SQLite state-store schema version N (the ledger
   file's PRAGMA user_version) is newer than this release supports (newest
-  1) ...` - and leaves it as it was. The PostgreSQL schema has the same rule
+  1) ...` - and leaves it as it was. The check, the migration and the
+  version write are one `BEGIN IMMEDIATE` transaction, so a newer release
+  raising the version at the same moment is seen, never written back down.
+  The PostgreSQL schema has the same rule
   for its marker. Releases before #664 do not read the version.
 - The serialized record (a prune digest row) carries `verification_class`
   only when it is known, so a legacy row serializes as before; a value the
