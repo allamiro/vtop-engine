@@ -14,6 +14,8 @@
 //! `VTOP_TEST_S3_BUCKET` may select an existing bucket (defaults to
 //! `telemetry-raw`, created if missing). Each test aborts or deletes what it
 //! creates.
+//!
+//! CI runs it in the `minio-integration` job, against the lab's MinIO.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -190,6 +192,7 @@ async fn backend(endpoint: &str) -> S3NativeBackend {
         max_egress_bytes_per_second: None,
         request_timeout_seconds: 300,
         request_min_bytes_per_second: 4 * 1024,
+        object_lock: None,
     })
     .await
     .unwrap()

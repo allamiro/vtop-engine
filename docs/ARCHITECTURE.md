@@ -913,6 +913,19 @@ All backends implement `UploadBackend` (`upload`, `verify_object`, `ensure_bucke
 | `mock` | In-memory | Configurable | Yes (test double for resume/fencing) | Yes | Tests/benchmarks. |
 | `mock_fail` / `mock_limited` | In-memory fault injection | Forced failure / size-only | Yes | Yes | Fault-injection tests. |
 
+Only `s3_native` supports the S3 Object Lock profile (`upload.object_lock`,
+#684): every other backend refuses it at construction, naming the key and
+itself. With it, `put` and `create_multipart_upload` send the lock headers on
+every write (objects, manifests, multipart creates, so no write path can miss
+them), and the trait's `bucket_object_lock_enabled` and `verify_retention`
+(a HEAD of the version a write returned, or of the current version for a
+reused object) give the engine its preflight
+and its check. The engine compares the stored retention with the date the
+backend reports it ASKED for, never with its own clock, and the check runs
+only in the pipeline before VERIFIED: recovery and the scrub verify content
+long after the write, when an ended retention is normal. See
+[OBJECT_LOCK_DEPLOYMENT.md](OBJECT_LOCK_DEPLOYMENT.md).
+
 ### Resumable multipart (#191)
 
 Large sealed segments (and other objects above `upload.multipart_threshold_bytes`)

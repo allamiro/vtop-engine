@@ -57,8 +57,10 @@ Operated in [Scrub and coverage audit](../operate/scrub-and-audit.md).
 
 ## Not provided by VTOP
 
-Encryption at rest (use the store's), object lock retention (bucket policy),
-access control between tenants (storage IAM), and public-key manifest
+Encryption at rest (use the store's), creating a bucket with Object Lock and
+its default retention (the engine writes each object under a lock with
+`upload.object_lock`, and checks it, but the bucket is yours; see
+[Object Lock](../OBJECT_LOCK_DEPLOYMENT.md)), access control between tenants (storage IAM), and public-key manifest
 signatures (not implemented: a MAC key is a shared secret). See the
 [security model §14](../SECURITY_MODEL.md#14-security-properties-provided-vs-not-provided).
 

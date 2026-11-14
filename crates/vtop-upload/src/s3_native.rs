@@ -14,8 +14,9 @@
 //! (backend-limited).
 
 use crate::base::{
-    parse_s3_uri, read_bounded, ObjectChecksum, ObjectHead, StoredManifest, StoredObject,
-    UploadBackend, UploadedPart, VerificationResult,
+    judge_retention, parse_s3_uri, read_bounded, CreatedUpload, ObjectChecksum, ObjectHead,
+    ObjectLockPolicy, RequestedRetention, RetentionCheck, RetentionExpectation, StoredManifest,
+    StoredObject, StoredRetention, UploadBackend, UploadedPart, VerificationResult,
 };
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -23,6 +24,7 @@ use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, ChecksumMode, CompletedMultipartUpload, CompletedPart,
+    ObjectLockEnabled, ObjectLockLegalHoldStatus,
 };
 use aws_sdk_s3::Client;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
@@ -96,6 +98,10 @@ pub struct S3NativeConfig {
     /// A body-carrying attempt is allowed `request_timeout_seconds` plus its
     /// size at this rate. Must be non-zero.
     pub request_min_bytes_per_second: u64,
+    /// The S3 Object Lock retention every object, manifest and multipart
+    /// upload is created with (#684), from `upload.object_lock`. `None` sends
+    /// no lock header, exactly as before the profile existed.
+    pub object_lock: Option<crate::base::ObjectLockPolicy>,
 }
 
 /// How long a connection attempt may take. A store that is up accepts in
@@ -205,6 +211,8 @@ pub struct S3NativeBackend {
     /// request's deadlines, per request, in [`Self::body_timeouts`].
     request_timeout_seconds: u64,
     request_min_bytes_per_second: u64,
+    /// See [`S3NativeConfig::object_lock`] (#684).
+    object_lock: Option<crate::base::ObjectLockPolicy>,
 }
 
 /// Enforce the transport policy BEFORE any client is built (#75).
@@ -706,12 +714,20 @@ impl S3NativeBackend {
         // default tcp_tls install is a strict no-op, so the shipping client is
         // `Builder::from(&shared).force_path_style(..)` carrying the #488 scheme
         // gate and nothing else — the seam itself contributes no difference.
-        let s3_conf = install_transport_then_the_last_gate(
-            aws_sdk_s3::config::Builder::from(&shared).force_path_style(cfg.force_path_style),
-            &transport,
-            cfg.verify_tls,
-        )?
-        .build();
+        let mut builder =
+            aws_sdk_s3::config::Builder::from(&shared).force_path_style(cfg.force_path_style);
+        // A write under Object Lock needs an integrity header (#684), and the
+        // BLAKE3 path relies on the SDK computing a CRC32 for it. With
+        // AWS_REQUEST_CHECKSUM_CALCULATION=when_required the SDK names the
+        // algorithm and sends no value, and S3 refuses every locked write
+        // (review of #708), so the profile pins the calculation on.
+        if cfg.object_lock.is_some() {
+            builder = builder.request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported,
+            );
+        }
+        let s3_conf =
+            install_transport_then_the_last_gate(builder, &transport, cfg.verify_tls)?.build();
 
         Ok(Self {
             client: Client::from_conf(s3_conf),
@@ -721,6 +737,7 @@ impl S3NativeBackend {
                 .saturating_mul(OPERATION_ATTEMPTS),
             request_timeout_seconds: cfg.request_timeout_seconds,
             request_min_bytes_per_second: cfg.request_min_bytes_per_second,
+            object_lock: cfg.object_lock,
         })
     }
 
@@ -784,13 +801,20 @@ impl S3NativeBackend {
         }
     }
 
+    /// The lock this write asks for, fixed at the moment of the request
+    /// (#684), or `None` without the profile.
+    fn lock_for_this_write(&self) -> Option<RequestedRetention> {
+        self.object_lock
+            .map(|policy| policy.request_at(std::time::SystemTime::now()))
+    }
+
     async fn put(
         &self,
         local_path: &Path,
         uri: &str,
         content_type: &str,
         checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<Option<String>, VtopError> {
+    ) -> Result<(Option<String>, Option<RequestedRetention>), VtopError> {
         let (bucket, key) = parse_s3_uri(uri)?;
         let body = ByteStream::from_path(local_path)
             .await
@@ -823,6 +847,25 @@ impl S3NativeBackend {
             }
         }
 
+        // The S3 Object Lock profile (#684): every write, object or
+        // manifest, carries the lock. S3 requires an integrity header on a
+        // write under retention (Content-MD5 or x-amz-sdk-checksum-algorithm);
+        // see `lock_integrity` for how each checksum path provides it.
+        let retention = self.lock_for_this_write();
+        if let Some(asked) = retention {
+            req = req
+                .object_lock_mode(lock_mode(asked))
+                .object_lock_retain_until_date(aws_smithy_types::DateTime::from_secs(
+                    asked.retain_until_unix_secs,
+                ));
+            // Only when a hold is asked for: S3 checks s3:PutObjectLegalHold
+            // whenever the header is present, OFF included (review of #708).
+            if asked.legal_hold {
+                req = req.object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On);
+            }
+            req = lock_integrity(req, checksum);
+        }
+
         let out = req
             .customize()
             .config_override(self.body_timeouts("put_object", uri, body_bytes))
@@ -833,10 +876,12 @@ impl S3NativeBackend {
         // A suspended-versioning bucket reports the literal version "null",
         // which later writes overwrite — it is not an immutable pin. Surface
         // it as unversioned so it is never persisted as one (#135).
-        Ok(out
-            .version_id()
-            .filter(|id| *id != "null")
-            .map(str::to_owned))
+        Ok((
+            out.version_id()
+                .filter(|id| *id != "null")
+                .map(str::to_owned),
+            retention,
+        ))
     }
 
     /// Recompute a digest from the bytes returned by S3 without buffering the
@@ -990,10 +1035,13 @@ impl UploadBackend for S3NativeBackend {
         object_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<StoredObject, VtopError> {
-        let version_id = self
+        let (version_id, retention) = self
             .put(local_path, object_uri, "application/octet-stream", checksum)
             .await?;
-        Ok(StoredObject { version_id })
+        Ok(StoredObject {
+            version_id,
+            retention,
+        })
     }
 
     async fn put_manifest(
@@ -1002,10 +1050,13 @@ impl UploadBackend for S3NativeBackend {
         manifest_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<StoredManifest, VtopError> {
-        let version_id = self
+        let (version_id, retention) = self
             .put(local_path, manifest_uri, "application/json", checksum)
             .await?;
-        Ok(StoredManifest { version_id })
+        Ok(StoredManifest {
+            version_id,
+            retention,
+        })
     }
 
     async fn get_manifest_pinned(
@@ -1079,6 +1130,64 @@ impl UploadBackend for S3NativeBackend {
                  the hardened manifest profile requires it"
             ))),
         }
+    }
+
+    fn object_lock(&self) -> Option<ObjectLockPolicy> {
+        self.object_lock
+    }
+
+    async fn bucket_object_lock_enabled(&self, bucket: &str) -> Result<bool, VtopError> {
+        match self
+            .client
+            .get_object_lock_configuration()
+            .bucket(bucket)
+            .send()
+            .await
+        {
+            Ok(out) => Ok(out
+                .object_lock_configuration()
+                .and_then(|c| c.object_lock_enabled())
+                .is_some_and(|e| *e == ObjectLockEnabled::Enabled)),
+            // S3's answer for a bucket that has no Object Lock configuration
+            // at all: a definite "not enabled", not a failed check.
+            Err(SdkError::ServiceError(context))
+                if context.err().code() == Some("ObjectLockConfigurationNotFoundError") =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(sdk_failure("get_object_lock_configuration", bucket, e)),
+        }
+    }
+
+    async fn verify_retention(
+        &self,
+        object_uri: &str,
+        version_id: Option<&str>,
+        expected: &RetentionExpectation,
+    ) -> Result<RetentionCheck, VtopError> {
+        let (bucket, key) = parse_s3_uri(object_uri)?;
+        // The EXACT version a write returned (#684): another write to the key
+        // after it would otherwise answer for it. S3 returns the lock headers
+        // only to a caller holding s3:GetObjectRetention (and the legal hold
+        // only with s3:GetObjectLegalHold), so a missing permission reads as
+        // a missing lock and fails the batch, loudly, rather than passing it.
+        let out = self
+            .client
+            .head_object()
+            .bucket(&bucket)
+            .key(&key)
+            .set_version_id(version_id.map(str::to_owned))
+            .send()
+            .await
+            .map_err(|e| head_failure(object_uri, e))?;
+        let stored = StoredRetention {
+            mode: out.object_lock_mode().map(|m| m.as_str().to_owned()),
+            retain_until_unix_secs: out.object_lock_retain_until_date().map(|d| d.secs()),
+            legal_hold: out
+                .object_lock_legal_hold_status()
+                .map(|s| *s == ObjectLockLegalHoldStatus::On),
+        };
+        Ok(judge_retention(&stored, expected))
     }
 
     async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
@@ -1320,7 +1429,7 @@ impl UploadBackend for S3NativeBackend {
         object_uri: &str,
         content_type: &str,
         checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<String, VtopError> {
+    ) -> Result<CreatedUpload, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
         let mut req = self
             .client
@@ -1333,14 +1442,34 @@ impl UploadBackend for S3NativeBackend {
             // be sent as x-amz-checksum-sha256.
             req = req.metadata(CHECKSUM_META_KEY, c.hex);
         }
+        // S3 fixes a multipart object's lock HERE, not at complete (#684):
+        // the date asked for now is the date the completed object carries,
+        // however long a resume takes, and the session records it.
+        let retention = self.lock_for_this_write();
+        if let Some(asked) = retention {
+            req = req
+                .object_lock_mode(lock_mode(asked))
+                .object_lock_retain_until_date(aws_smithy_types::DateTime::from_secs(
+                    asked.retain_until_unix_secs,
+                ));
+            // Only when a hold is asked for: S3 checks s3:PutObjectLegalHold
+            // whenever the header is present, OFF included (review of #708).
+            if asked.legal_hold {
+                req = req.object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On);
+            }
+        }
         let out = req
             .send()
             .await
             .map_err(|e| sdk_failure("create_multipart_upload", object_uri, e))?;
-        out.upload_id().map(str::to_owned).ok_or_else(|| {
+        let upload_id = out.upload_id().map(str::to_owned).ok_or_else(|| {
             VtopError::Upload(format!(
                 "create_multipart_upload {object_uri}: service returned no upload id"
             ))
+        })?;
+        Ok(CreatedUpload {
+            upload_id,
+            retention,
         })
     }
 
@@ -1411,7 +1540,11 @@ impl UploadBackend for S3NativeBackend {
             .filter(|id| *id != "null")
             .map(str::to_owned);
         tracing::info!(uri = object_uri, "object uploaded via s3_native multipart");
-        Ok(StoredObject { version_id })
+        // The retention was fixed at create; the multipart module carries it.
+        Ok(StoredObject {
+            version_id,
+            retention: None,
+        })
     }
 
     async fn abort_multipart_upload(
@@ -1429,6 +1562,31 @@ impl UploadBackend for S3NativeBackend {
             .await
             .map_err(|e| sdk_failure("abort_multipart_upload", object_uri, e))?;
         Ok(())
+    }
+}
+
+fn lock_mode(asked: RequestedRetention) -> aws_sdk_s3::types::ObjectLockMode {
+    match asked.mode {
+        crate::base::ObjectLockMode::Governance => aws_sdk_s3::types::ObjectLockMode::Governance,
+        crate::base::ObjectLockMode::Compliance => aws_sdk_s3::types::ObjectLockMode::Compliance,
+    }
+}
+
+/// The integrity header a write under retention needs (#684): S3 requires
+/// `Content-MD5` or `x-amz-sdk-checksum-algorithm` on it. The engine's own
+/// SHA-256 rides in `x-amz-checksum-sha256`, which S3 checks against the
+/// body; naming the algorithm adds the header S3 asks for without the SDK
+/// computing anything (a checksum value it was given is sent as is). The
+/// BLAKE3 and no-checksum paths send no checksum of their own, so the SDK is
+/// asked for its CRC32, computed over the body as it is sent.
+fn lock_integrity(
+    req: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+    checksum: Option<ObjectChecksum<'_>>,
+) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
+    if checksum.is_some_and(|c| c.is_sha256() && hex_to_b64_sha256(c.hex).is_some()) {
+        req.checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
+    } else {
+        req.checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
     }
 }
 
@@ -1476,6 +1634,10 @@ pub fn config_from_upload(upload: &vtop_core::config::UploadConfig) -> S3NativeC
         max_egress_bytes_per_second: upload.max_egress_bytes_per_second,
         request_timeout_seconds: upload.request_timeout_seconds,
         request_min_bytes_per_second: upload.request_min_bytes_per_second,
+        object_lock: upload
+            .object_lock
+            .as_ref()
+            .map(crate::base::ObjectLockPolicy::from_config),
     }
 }
 
@@ -2943,6 +3105,7 @@ mod tests {
             max_egress_bytes_per_second: None,
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
+            object_lock: None,
         };
         let err = match S3NativeBackend::new(&cfg).await {
             Err(err) => err,
@@ -3252,6 +3415,7 @@ mod egress_ceiling {
             body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
+            object_lock: None,
         };
         let payload = Bytes::from_static(b"bytes the process ceiling must see");
         let untouched = |b: ByteStream| {
@@ -3376,6 +3540,7 @@ mod egress_ceiling {
             max_egress_bytes_per_second: cap,
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
+            object_lock: None,
         };
         let unset = S3NativeBackend::new(&build(None)).await.unwrap();
         assert!(
@@ -3444,6 +3609,7 @@ mod egress_ceiling {
             body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
+            object_lock: None,
         };
         let payload = Bytes::from_static(b"the pipeline an unset cap must not touch");
 
@@ -3547,6 +3713,7 @@ mod egress_ceiling {
             body_deadline: std::time::Duration::from_secs(300).saturating_mul(OPERATION_ATTEMPTS),
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 4 * 1024,
+            object_lock: None,
         }
     }
 
@@ -3786,6 +3953,7 @@ mod body_deadline {
             max_egress_bytes_per_second: None,
             request_timeout_seconds: 300,
             request_min_bytes_per_second: 0,
+            object_lock: None,
         })
         .await
         {

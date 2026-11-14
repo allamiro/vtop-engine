@@ -39,6 +39,15 @@ archive is complete, then the procedures you will need less often.
 
     [:octicons-arrow-right-24: Key rotation](manifest-key-rotation.md)
 
+-   **S3 Object Lock**
+
+    ---
+
+    Write every object under a retention lock, and have the engine refuse a
+    bucket or a batch that does not carry it.
+
+    [:octicons-arrow-right-24: Object Lock profile](../OBJECT_LOCK_DEPLOYMENT.md)
+
 -   **Upgrades**
 
     ---

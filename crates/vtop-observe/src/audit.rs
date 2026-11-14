@@ -143,7 +143,9 @@ impl Action {
             // The backend kind only: the connection string carries the
             // database password.
             Action::LedgerMigrate => &["backend"],
-            Action::ScrubCursor => &["cursor_file", "limit", "metrics_file"],
+            // `check_retention` (#684): whether the run read Object Lock
+            // retention, a boolean.
+            Action::ScrubCursor => &["cursor_file", "limit", "metrics_file", "check_retention"],
             Action::ClusterInit => &["members"],
             Action::ClusterMembership => &[
                 "operation",

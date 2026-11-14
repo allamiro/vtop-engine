@@ -61,6 +61,7 @@ pinned version.
 | `--sample` | - | Check this many batches chosen at random. Not with `--limit` or `--cursor-file`. |
 | `--seed` | random | The sample's seed; printed either way. Needs `--sample`. |
 | `--metrics-file` | - | Write the results as a Prometheus text file. Totals carry forward from the file it replaces. |
+| `--check-retention` | off | Also read each batch's S3 Object Lock retention and expect the mode `upload.object_lock` sets. Refused when the config has no `upload.object_lock`. See below. |
 
 Each batch gets one result:
 
@@ -80,6 +81,21 @@ key: q3-2026=4 q4-2026=2`, and `vtop_scrub_manifest_keys_total{key_id}` in
 the metrics file). After a key rotation, that line is how you confirm every
 key the archive was signed with still verifies; see
 [Rotate the manifest MAC key](manifest-key-rotation.md).
+
+With `--check-retention` (#684), each batch whose content passed also gets a
+retention result, from its object at its key and its manifest at the pinned
+version (the worse of the two), counted in `vtop_scrub_retention_total{result}`
+and printed as a `retention:` line:
+
+| Retention | Meaning | Finding |
+|---|---|---|
+| `locked` | Under the configured mode until a date still ahead. | No |
+| `elapsed` | Under the configured mode until a date that has passed: normal for an object older than `retain_days`. | No |
+| `missing` | No retention: written without it, or removed by a principal allowed to bypass governance. It can be deleted or overwritten. | Yes |
+| `mode_mismatch` | Under another mode than the configured one. | Yes |
+
+A retention that cannot be read makes the batch `unreadable`. The scrub needs
+`s3:GetObjectRetention`; see [S3 Object Lock](../OBJECT_LOCK_DEPLOYMENT.md).
 
 ## Schedule them
 

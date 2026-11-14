@@ -50,6 +50,7 @@ jobs:
       scripts: ${{ steps.filter.outputs.scripts }}
       shell: ${{ steps.filter.outputs.shell }}
       kafka: ${{ steps.filter.outputs.kafka }}
+      minio: ${{ steps.filter.outputs.minio }}
       postgres: ${{ steps.filter.outputs.postgres }}
       fuzz: ${{ steps.filter.outputs.fuzz }}
       chaos: ${{ steps.filter.outputs.chaos }}
@@ -114,6 +115,32 @@ jobs:
               # Executed by the job's seeding step, and its output is what the
               # test asserts on.
               - 'docker/seed-events.sh'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - '.github/workflows/ci.yml'
+
+            # `cargo test -p vtop-upload --test live_s3_*` and
+            # `--test transport_conformance` against the lab's MinIO, and
+            # `cargo test -p vtop-cli --test live_s3_object_lock_engine` (#684),
+            # the engine end to end. vtop-cli depends on every workspace crate
+            # except vtop-node (as the kafka filter says), plus the MinIO build
+            # (docker/minio/**) and the compose file that runs it and creates
+            # the buckets.
+            minio:
+              - 'crates/vtop-adapters/**'
+              - 'crates/vtop-broker/**'
+              - 'crates/vtop-cli/**'
+              - 'crates/vtop-core/**'
+              - 'crates/vtop-log/**'
+              - 'crates/vtop-meta/**'
+              - 'crates/vtop-observe/**'
+              - 'crates/vtop-protocol/**'
+              - 'crates/vtop-state/**'
+              - 'crates/vtop-upload/**'
+              - 'docker/minio/**'
+              - 'docker-compose.yml'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -1198,6 +1225,97 @@ jobs:
         env:
           VTOP_TEST_KAFKA: localhost:9092
         run: cargo test -p vtop-cli --test integration_kafka_to_minio -- --ignored
+
+  # The live S3 tests against a real store (#668). They are `#[ignore]` and
+  # need `VTOP_TEST_S3_ENDPOINT`, so until this job they ran only by hand:
+  # the multipart resume test (#668) proved the store keeps the parts that
+  # completed only on someone's laptop. They run here against the lab's
+  # MinIO, the same release the compose lab and the e2e smoke use.
+  #
+  # MinIO is BUILT from source (docker/minio/Dockerfile), not pulled: no
+  # registry serves its images any more (`docker manifest inspect` finds
+  # neither the pinned release tag nor `latest` on Docker Hub or quay.io).
+  # The Dockerfile pins the release by commit and its base images by digest.
+  # Compose runs the server on 127.0.0.1:9000 and `minio-init` creates the
+  # buckets the tests name, exactly as the lab does, including
+  # `telemetry-locked`, created with Object Lock for the #684 tests.
+  minio-integration:
+    name: minio integration (live S3 tests)
+    needs: changes
+    if: needs.changes.outputs.minio == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-minio-it-${{ hashFiles('**/Cargo.lock') }}
+
+      # The engine test builds vtop-cli, which compiles librdkafka.
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+
+      # Built before it is started, so a failed build reads as a build
+      # failure rather than as a store that never became healthy.
+      - name: Build the lab's MinIO image
+        run: docker compose build minio
+
+      - name: Start MinIO and create the lab buckets
+        run: |
+          set -euo pipefail
+          docker compose up -d minio
+          # `run` waits for minio's healthcheck (depends_on: service_healthy)
+          # and exits non-zero if a bucket cannot be created.
+          docker compose run --rm minio-init
+
+      # One test thread: the tests share the store, and the multipart ones
+      # count the requests a forwarder in front of it sees.
+      - name: Run the live S3 tests
+        env:
+          VTOP_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+        run: |
+          cargo test -p vtop-upload --locked \
+            --test live_s3_verification \
+            --test transport_conformance \
+            --test live_s3_multipart_resume \
+            --test live_s3_object_lock \
+            -- --ignored --test-threads=1
+
+      # The S3 Object Lock profile end to end (#684): the engine refuses a
+      # bucket without Object Lock at startup, and archives a batch whose
+      # object and manifest the store then reports locked.
+      - name: Run the live engine Object Lock test
+        env:
+          VTOP_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+        run: |
+          cargo test -p vtop-cli --locked --test live_s3_object_lock_engine \
+            -- --ignored --test-threads=1
+
+      # minio-init ran as a one-off `compose run` container, removed when it
+      # exited; its output is in the "Start MinIO" step above.
+      - name: MinIO logs on failure
+        if: failure()
+        run: docker compose logs --tail=200 minio || true
+
   # cargo-deny covers what cargo-audit does not: license compliance, dependency
   # bans, and source provenance. Advisory decisions are mirrored from
   # .cargo/audit.toml (the single source of truth) so the two cannot disagree.

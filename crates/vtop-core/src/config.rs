@@ -780,9 +780,21 @@ pub struct UploadConfig {
     /// exact stored version, so overwriting or deleting the current manifest
     /// key cannot roll a batch back to an older validly-authenticated
     /// manifest. Defaults to false because it needs a versioned bucket
-    /// (`mc version enable` / S3 bucket versioning, ideally with Object Lock).
+    /// (`mc version enable` / S3 bucket versioning). The S3 Object Lock
+    /// profile ([`object_lock`](Self::object_lock)) requires it.
     #[serde(default)]
     pub require_object_versioning: bool,
+    /// The S3 Object Lock profile (#684): write every object and manifest
+    /// under this retention, refuse a bucket without Object Lock enabled, and
+    /// fail a batch whose stored object does not carry the retention the
+    /// engine asked for. Unset by default, and unset is exactly the pipeline
+    /// without it: no lock header is sent and no bucket or object is checked.
+    /// `s3_native` only; it requires `require_object_versioning` and refuses
+    /// `create_bucket`. An engine older than v0.10.0 ignores this key and
+    /// writes UNLOCKED objects, so keep a bucket default retention as the
+    /// floor and drain older engines first (docs/OBJECT_LOCK_DEPLOYMENT.md).
+    #[serde(default)]
+    pub object_lock: Option<ObjectLockConfig>,
     /// Byte size of each multipart part (except possibly the last). Used by
     /// resumable uploads for large sealed segments (#191). Default 8 MiB.
     /// Real S3 requires at least 5 MiB for non-final parts; mock/local tests
@@ -856,6 +868,70 @@ pub struct UploadConfig {
 /// would expire long before its body finished. A cap that low is a mistake,
 /// refused here rather than discovered as a stalled engine.
 pub const MIN_EGRESS_BYTES_PER_SECOND: u64 = 1024;
+
+/// An S3 Object Lock retention mode (#684).
+///
+/// `governance`: the retention can be shortened or removed by a principal
+/// holding `s3:BypassGovernanceRetention`. `compliance`: it cannot be
+/// shortened or removed by anyone, the account root included, until the
+/// date passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectLockMode {
+    Governance,
+    Compliance,
+}
+
+impl ObjectLockMode {
+    /// The config spelling, and the `mode` label of `vtop_object_lock_mode`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Governance => "governance",
+            Self::Compliance => "compliance",
+        }
+    }
+
+    /// The spelling S3 uses on the wire (`x-amz-object-lock-mode`).
+    pub fn as_s3(self) -> &'static str {
+        match self {
+            Self::Governance => "GOVERNANCE",
+            Self::Compliance => "COMPLIANCE",
+        }
+    }
+}
+
+impl fmt::Display for ObjectLockMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The most days `upload.object_lock.retain_days` accepts (#684): ten years.
+///
+/// Not a limit of S3, which documents no maximum for a per-object
+/// retain-until date (the Object Lock guide mentions 100 years only for a
+/// bucket policy that bounds retention). It is a guard on a value that, in
+/// `compliance` mode, nobody can take back: a typo of an extra digit would
+/// otherwise lock every object for a century.
+pub const MAX_OBJECT_LOCK_RETAIN_DAYS: u32 = 3650;
+
+/// `upload.object_lock` (#684). Unknown keys are refused: a misspelled key in
+/// a retention policy must not fall back to a default silently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectLockConfig {
+    /// `governance` or `compliance`.
+    pub mode: ObjectLockMode,
+    /// Days each object and manifest is retained, counted from its write
+    /// (from CreateMultipartUpload for a multipart object). 1 to
+    /// [`MAX_OBJECT_LOCK_RETAIN_DAYS`].
+    pub retain_days: u32,
+    /// Also place a legal hold on every object and manifest. A legal hold has
+    /// no end date: it stays until a principal holding
+    /// `s3:PutObjectLegalHold` removes it. Default false.
+    #[serde(default)]
+    pub legal_hold: bool,
+}
 
 /// Redundancy / forward-error-correction policy for an egress path (#480).
 ///
@@ -1033,6 +1109,67 @@ impl UploadConfig {
         } else {
             EgressTuning::default()
         }
+    }
+
+    /// The S3 Object Lock profile's own rules (#684), on `UploadConfig` and
+    /// called from `build_backend` as well as [`VtopConfig::validate`], for the
+    /// reason `validate_transports` is: not every consumer builds a
+    /// VtopConfig. Each refusal names the keys involved. Which BACKEND can
+    /// honour the block is decided in `vtop-upload`, which knows the backends.
+    pub fn validate_object_lock(&self) -> Result<(), VtopError> {
+        let Some(lock) = &self.object_lock else {
+            return Ok(());
+        };
+        // Only s3_native sends the lock headers on every write and reads the
+        // retention of the exact version back. Refused at config load, so
+        // `vtopctl validate` says so too (review of #708). An unknown name is
+        // left to `build_backend`, which lists the registered ones.
+        let why = match self.backend.as_str() {
+            "s3cmd" | "awscli" | "minio" => Some(
+                "it shells out to an external CLI, which sends the request itself; VTOP cannot \
+                 add the lock headers to it or read the retention of the version it wrote",
+            ),
+            "localfs" => Some("it writes to a local directory, which has no retention lock"),
+            "mock" | "mock_fail" | "mock_limited" => Some("it keeps objects in memory"),
+            _ => None,
+        };
+        if let Some(why) = why {
+            return Err(VtopError::Config(format!(
+                "upload.object_lock is set, but the {} backend cannot write an object under an \
+                 S3 Object Lock: {why}. Nothing was built. Only s3_native supports the profile; \
+                 use s3_native or remove upload.object_lock",
+                self.backend
+            )));
+        }
+        if lock.retain_days == 0 || lock.retain_days > MAX_OBJECT_LOCK_RETAIN_DAYS {
+            return Err(VtopError::Config(format!(
+                "upload.object_lock.retain_days = {} is outside 1..={MAX_OBJECT_LOCK_RETAIN_DAYS}: \
+                 zero would lock nothing, and more than {MAX_OBJECT_LOCK_RETAIN_DAYS} days (ten \
+                 years) is refused as a likely typo because a compliance retention cannot be \
+                 shortened by anyone. Set a value in that range",
+                lock.retain_days
+            )));
+        }
+        if !self.require_object_versioning {
+            return Err(VtopError::Config(
+                "upload.object_lock is set but upload.require_object_versioning is false: \
+                 Object Lock works only on a versioned bucket, and the engine checks the \
+                 retention of the exact version it wrote. Set \
+                 upload.require_object_versioning: true"
+                    .into(),
+            ));
+        }
+        if self.create_bucket {
+            return Err(VtopError::Config(
+                "upload.object_lock is set together with upload.create_bucket: true: Object \
+                 Lock can only be enabled when a bucket is created, and the engine never \
+                 creates a locked bucket (CreateBucket stays out of its permissions). Create \
+                 the bucket with Object Lock enabled yourself and set upload.create_bucket: \
+                 false"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Bounds that belong to the MECHANISM, not to any one backend (#480).
@@ -1450,6 +1587,7 @@ impl VtopConfig {
         // copy ran on the legacy multipart defaults. The checks now live on
         // UploadConfig itself and every consumer runs them.
         self.upload.validate_transports()?;
+        self.upload.validate_object_lock()?;
         if self.upload.multipart_part_size_bytes == 0 {
             return Err(VtopError::Config(
                 "upload.multipart_part_size_bytes must be > 0".into(),
@@ -3363,6 +3501,108 @@ upload:
             .expect_err("a zero ceiling admits nothing and must be refused")
             .to_string();
         assert!(msg.contains("max_concurrency_ceiling"), "{msg}");
+    }
+
+    /// #684: the Object Lock profile's config, through the real door
+    /// (`from_yaml_str` then `validate`). Written against YAML only, so the
+    /// same test compiles on a tree without the profile, where the block is
+    /// an unknown key that is silently ignored and every refusal below is
+    /// missing.
+    fn object_lock_config(upload_extra: &str) -> Result<VtopConfig, String> {
+        let yaml = format!(
+            r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {{}}
+compression: {{}}
+sources: {{}}
+upload:
+  bucket: telemetry-locked
+{upload_extra}"#
+        );
+        let cfg = VtopConfig::from_yaml_str(&yaml).map_err(|e| e.to_string())?;
+        cfg.validate().map_err(|e| e.to_string())?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn an_object_lock_block_is_checked_and_refused_naming_its_keys() {
+        let versioned = "  require_object_versioning: true\n";
+        // Accepted at both ends of the range, in either mode.
+        for (mode, days) in [("governance", 1), ("compliance", 3650)] {
+            object_lock_config(&format!(
+                "{versioned}  object_lock:\n    mode: {mode}\n    retain_days: {days}\n"
+            ))
+            .unwrap_or_else(|e| panic!("{mode} for {days} days is valid: {e}"));
+        }
+        // A mode that is not one is refused at the parse, naming both.
+        let msg = object_lock_config(&format!(
+            "{versioned}  object_lock:\n    mode: strict\n    retain_days: 30\n"
+        ))
+        .expect_err("an unknown mode must be refused");
+        assert!(
+            msg.contains("strict") && msg.contains("governance") && msg.contains("compliance"),
+            "the refusal names the bad mode and the valid ones: {msg}"
+        );
+        // retain_days outside 1..=3650.
+        for days in [0, 3651] {
+            let msg = object_lock_config(&format!(
+                "{versioned}  object_lock:\n    mode: governance\n    retain_days: {days}\n"
+            ))
+            .expect_err("a retention outside the range must be refused");
+            assert!(
+                msg.contains(&format!("upload.object_lock.retain_days = {days}"))
+                    && msg.contains("1..=3650"),
+                "the refusal names the key, the value and the range: {msg}"
+            );
+        }
+        // Without versioning: names both keys and what to set.
+        let msg = object_lock_config("  object_lock:\n    mode: governance\n    retain_days: 30\n")
+            .expect_err("Object Lock without versioning must be refused");
+        assert!(
+            msg.contains("upload.object_lock")
+                && msg.contains("upload.require_object_versioning: true"),
+            "{msg}"
+        );
+        // With create_bucket: names both keys and what to do.
+        let msg = object_lock_config(&format!(
+            "{versioned}  create_bucket: true\n  object_lock:\n    mode: governance\n    retain_days: 30\n"
+        ))
+        .expect_err("Object Lock with create_bucket must be refused");
+        assert!(
+            msg.contains("upload.object_lock")
+                && msg.contains("upload.create_bucket")
+                && msg.contains("Create the bucket with Object Lock enabled"),
+            "{msg}"
+        );
+        // A misspelled key inside the block is refused, not ignored.
+        let msg = object_lock_config(&format!(
+            "{versioned}  object_lock:\n    mode: governance\n    retain_day: 30\n"
+        ))
+        .expect_err("a misspelled key in a retention policy must be refused");
+        assert!(msg.contains("retain_day"), "{msg}");
+        // Another backend is refused at config load, as `vtopctl validate`
+        // runs it, not only when the engine builds the backend (review of
+        // #708).
+        let msg = object_lock_config(&format!(
+            "{versioned}  backend: localfs\n  local_path: /tmp/x\n  object_lock:\n    mode: governance\n    retain_days: 30\n"
+        ))
+        .expect_err("a backend that cannot lock must be refused at load");
+        assert!(
+            msg.contains("upload.object_lock")
+                && msg.contains("localfs")
+                && msg.contains("s3_native"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn without_an_object_lock_block_nothing_changes() {
+        // The default: no block, and none of the rules above applies, even
+        // with create_bucket set and versioning off.
+        object_lock_config("  create_bucket: true\n").expect("valid as before");
     }
 
     #[test]

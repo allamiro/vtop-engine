@@ -706,6 +706,25 @@ Object Lock ENABLED:
      3. use CONTENT-ADDRESSED keys so duplicates are inherently harmless. [PROPOSED]
 ```
 
+**Status (#626, #684).** Rules 1 and 3 are implemented. Since #626 an
+object's key is derived from its source, range and content digest: a retry of
+the same bytes finds the object an earlier attempt stored, reuses it after a
+strong verification and writes nothing; anything else at the key is never
+written over, and the batch falls back to its per-attempt key. Manifests stay
+per attempt, so a retry never needs to overwrite one. Rule 2's version id is
+recorded for manifests (the hardened profile); objects' versions are read for
+the retention check but not persisted.
+
+With `upload.object_lock` (#684, `s3_native`), the engine itself writes
+every object and manifest under the configured retention and fails a batch
+whose stored versions do not carry it. A reused object is checked with the
+weaker bound (still under the configured mode); if its lock has ended, or it
+was stored unlocked, the batch fails on every replay until the operator
+extends its retention or deletes that unprotected version. Objects from failed
+attempts are locked as well and cannot be removed before their retention ends
+(under `compliance`, by anyone). See
+[OBJECT_LOCK_DEPLOYMENT.md](OBJECT_LOCK_DEPLOYMENT.md).
+
 ### 7.3 Recommendation
 Adopt **(1) deterministic keys + "existing verified object = success"** (optionally
 with **(2)** version_id recording). Only after this change is replay **idempotent at
@@ -1804,7 +1823,7 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 
 | Risk | Impact | Mitigation | Phase | Status |
 |---|---|---|---|---|
-| Object Lock prevents overwrite-based retry | Retries fail / stuck batches | Deterministic keys + "existing verified = success" / version_id (§7.2) | 4 | open |
+| Object Lock prevents overwrite-based retry | Retries fail / stuck batches | Deterministic keys + "existing verified = success" (#626); the engine writes and verifies the lock itself with `upload.object_lock` (#684) (§7.2) | 4 | mitigated (a reused object whose lock ended fails until the operator acts) |
 | Kafka rebalance during in-flight batch | Duplicate work / spurious revocation | Revocation handler; tune poll/session timeouts; cooperative rebalancing (§8.3) | 5 | open |
 | Two engines over one store double-recover | Duplicate ingestion / double-commit | **Same host only:** the startup instance lock (#66) refuses it. **Cross-host over shared Postgres it cannot detect** — unsupported and warned at startup (§19). The ledger now fences a stalled engine (claim generation, #557) so a handover cannot be overwritten, but sources are still not divided between engines; open until Phase 5 | 5 | partially mitigated (same-host lock; ledger fence for handover) |
 | State database unavailable | Engine cannot commit | Fails safe (stops committing); HA store; alerts | 3,6 | mitigated |

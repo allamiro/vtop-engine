@@ -550,6 +550,26 @@ fn derived_tier_copy_request_id(args: &TierCopyArgs, expected_root: &[u8; 32]) -
     Uuid::from_bytes(bytes)
 }
 
+/// `vtopctl tier copy` refuses `upload.object_lock` (#684).
+///
+/// The copy goes through the same S3 backend as the engine, which would put
+/// the lock on every cold-tier object, but the tier path never reads a
+/// retention back, so the copy would be recorded as evidence of a lock
+/// nobody checked. Refused, naming the key, until locking a tier copy is
+/// designed; rehydrate and cleanup-abandoned write nothing and accept it.
+pub fn refuse_object_lock_for_tier(upload: &vtop_core::config::UploadConfig) -> Result<(), String> {
+    if upload.object_lock.is_none() {
+        return Ok(());
+    }
+    Err(
+        "upload.object_lock is set in the --upload-config file, but vtopctl tier copy does \
+         not check the retention of what it writes; nothing was copied. Remove \
+         upload.object_lock from the tier's --upload-config file (keep a bucket default \
+         retention on the cold-tier bucket if its copies must be locked)"
+            .into(),
+    )
+}
+
 /// Dispatch `vtopctl tier` and return a process exit code.
 pub async fn run(command: TierCommand, json: bool) -> i32 {
     match run_inner(command, json).await {
@@ -569,6 +589,7 @@ async fn run_inner(command: TierCommand, json: bool) -> Result<(), String> {
                 .map_err(|error| format!("read {}: {error}", args.upload_config.display()))?;
             let upload_config: vtop_core::config::UploadConfig = serde_yaml::from_str(&upload_text)
                 .map_err(|error| format!("parse {}: {error}", args.upload_config.display()))?;
+            refuse_object_lock_for_tier(&upload_config)?;
             request.multipart = multipart_config_from_args(args.as_ref(), &upload_config)?;
             let backend = vtop_upload::build_backend(&upload_config)
                 .await
@@ -742,7 +763,7 @@ mod tests {
             checksum: Option<ObjectChecksum<'_>>,
         ) -> Result<vtop_upload::StoredObject, VtopError> {
             self.0.put_object(local_path, object_uri, checksum).await?;
-            Ok(vtop_upload::StoredObject { version_id: None })
+            Ok(vtop_upload::StoredObject::default())
         }
         async fn put_manifest(
             &self,
@@ -753,7 +774,7 @@ mod tests {
             self.0
                 .put_manifest(local_path, manifest_uri, checksum)
                 .await?;
-            Ok(StoredManifest { version_id: None })
+            Ok(StoredManifest::default())
         }
         async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
             self.0.head_object(object_uri).await
@@ -1066,6 +1087,26 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), data);
     }
 
+    /// #684: `vtopctl tier copy` would apply `upload.object_lock` to the
+    /// cold-tier copy through the same S3 backend and never check it, so it
+    /// refuses the block, naming the key, until locking a tier copy is
+    /// designed.
+    #[test]
+    fn tier_copy_refuses_an_object_lock_block_naming_the_key() {
+        let mut upload: vtop_core::config::UploadConfig = serde_yaml::from_str(
+            "bucket: cold\nbackend: s3_native\nrequire_object_versioning: true\n\
+             object_lock:\n  mode: governance\n  retain_days: 30\n",
+        )
+        .unwrap();
+        let msg = refuse_object_lock_for_tier(&upload)
+            .expect_err("a tier copy must not write locks it never checks");
+        for part in ["upload.object_lock", "vtopctl tier copy", "--upload-config"] {
+            assert!(msg.contains(part), "{msg:?} should say {part:?}");
+        }
+        upload.object_lock = None;
+        refuse_object_lock_for_tier(&upload).expect("no block, no refusal");
+    }
+
     /// One config construction, two callers (#482): the engine builds its
     /// MultipartUploadConfig with MultipartUploadConfig::from_upload, and
     /// so does the tier path — before its CLI overrides — so with no
@@ -1101,6 +1142,7 @@ mod tests {
             transports: Default::default(),
             max_egress_bytes_per_second: None,
             max_concurrency_ceiling: None,
+            object_lock: None,
         };
         let state_dir = PathBuf::from("/work");
         // The engine path: from_upload, no overrides.
