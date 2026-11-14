@@ -478,6 +478,23 @@ impl MetaStorage {
         self.audited.save(index)
     }
 
+    /// The highest index a snapshot install brought this replica past: its
+    /// audit replay never reads the log at or below it (#706).
+    pub fn audited_floor(&self) -> u64 {
+        self.audited.floor()
+    }
+
+    /// Persist the install floor (never above the applied frontier).
+    pub fn save_audited_floor(&mut self, floor: u64) -> MetaStoreResult<()> {
+        if floor > self.last_applied_index {
+            return Err(MetaStoreError::InvalidConfig(format!(
+                "the audit install floor cannot pass the applied frontier: {floor} > {}",
+                self.last_applied_index
+            )));
+        }
+        self.audited.save_floor(floor)
+    }
+
     /// Pin the audit frontier at the applied frontier when no file exists:
     /// a store first opened by a release with #706 starts its audit trail
     /// here, and replays nothing written before (#706). Its earlier records

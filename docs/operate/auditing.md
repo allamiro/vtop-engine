@@ -126,6 +126,10 @@ neither a failing sink nor its recovery stalls the metadata tier. A write to
 the audit file that fails part-way is cut off again, or the next record
 starts on a new line, so a re-delivered record is never glued to a fragment.
 
+`meta.audited` also keeps the highest index a snapshot install brought the
+node past; a replay never reads the log at or below it, because the log there
+may be a branch the snapshot replaced.
+
 If `meta.audited` is damaged, the node refuses to start and names the file.
 Removing it re-pins the frontier at the applied index on the next start:
 the records it still owed are not re-delivered by that node, and the other

@@ -774,3 +774,111 @@ async fn a_newer_snapshot_gap_replaces_a_refused_older_one() {
     assert_eq!(gaps, vec![("1".to_owned(), "20".to_owned())]);
     assert_eq!(audited_frontier(&store), Some(20));
 }
+
+/// Codex review of #767: a snapshot install over a stale branch, with the
+/// sink refusing its gap, then new entries applied and a LOCAL snapshot built
+/// on top - whose index and term the log agrees with, while the stale branch
+/// below the installed snapshot still sits in the log. A restart must still
+/// name the installed range as a gap and read nothing of the stale branch.
+#[tokio::test]
+async fn a_stale_branch_stays_unread_after_a_later_local_snapshot() {
+    use openraft::storage::RaftSnapshotBuilder;
+    let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/leader"));
+    sim.create_dir_all(Path::new("/n"));
+    let env = sim.env(0x70d);
+    let membership_entry = |term| MetaLogEntry {
+        term,
+        index: 1,
+        payload: MetaLogPayload::Membership(MetaMembership {
+            voters: vec![MetaNodeId(1), MetaNodeId(2)],
+            learners: vec![],
+            joint_outgoing: None,
+        }),
+    };
+    let mut leader = MetaStorage::open_in(&env, "/leader", cluster()).unwrap();
+    let mut entries: Vec<MetaLogEntry> = workload(10)
+        .into_iter()
+        .map(|mut entry| {
+            entry.term = 2;
+            entry
+        })
+        .collect();
+    entries[0] = membership_entry(2);
+    leader.append(&entries).unwrap();
+    leader.apply_through(10).unwrap();
+    let snapshot = leader.write_snapshot().unwrap();
+    let bytes = env.storage.read(&snapshot.path).unwrap();
+
+    // A stale term-1 branch ending exactly at the snapshot's index.
+    append(&env, &workload(10));
+    let refusing = Sink::refusing();
+    let (store, mut machine) = open(&env, &refusing);
+    let meta = SnapshotMeta {
+        last_log_id: Some(LogId::new(CommittedLeaderId::new(2, 0), 9)),
+        last_membership: StoredMembership::new(
+            Some(LogId::new(CommittedLeaderId::new(2, 0), 0)),
+            openraft::Membership::new(
+                vec![std::collections::BTreeSet::from([1u64, 2u64])],
+                None::<BTreeSet<u64>>,
+            ),
+        ),
+        snapshot_id: snapshot.snapshot_id.clone(),
+    };
+    machine
+        .install_snapshot(&meta, Box::new(Cursor::new(bytes)))
+        .await
+        .unwrap();
+    drop((store, machine));
+
+    // New committed entries 11..=13 after the install, applied while the
+    // sink still refuses, then a snapshot built here at 13.
+    let newer: Vec<MetaLogEntry> = (11..=13).map(|index| entry(2, index, true)).collect();
+    {
+        let mut storage = MetaStorage::open_in(&env, "/n", cluster()).unwrap();
+        storage.append(&newer).unwrap();
+    }
+    let (store, mut machine) = open(&env, &refusing);
+    machine
+        .apply(newer.iter().map(raft_entry).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    machine
+        .get_snapshot_builder()
+        .await
+        .build_snapshot()
+        .await
+        .unwrap();
+    store.with_storage(|s| {
+        assert_eq!(s.snapshots().newest().unwrap().last_index, 13);
+        assert_eq!(
+            s.log().first_index(),
+            Some(1),
+            "the stale branch is still there"
+        );
+    });
+    drop((store, machine));
+    sim.crash();
+    sim.reboot();
+
+    let sink = Arc::new(Sink::default());
+    let (store, _machine) = open(&env, &sink);
+    assert!(store.deliver_pending(ReplayReason::Restart));
+    let gaps = sink.gaps();
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    let params: BTreeMap<_, _> = gaps[0].params.iter().cloned().collect();
+    assert_eq!(
+        (
+            params["from_index"].as_str(),
+            params["through_index"].as_str()
+        ),
+        ("1", "10")
+    );
+    assert_eq!(params["reason"], "snapshot_install");
+    assert_eq!(
+        sink.indexes(),
+        vec![11, 12, 13],
+        "nothing of the stale branch"
+    );
+    assert_eq!(audited_frontier(&store), Some(13));
+}

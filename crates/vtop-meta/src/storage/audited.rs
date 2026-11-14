@@ -1,14 +1,21 @@
 //! Durable audit frontier (#706): the highest log index through which every
 //! applied audit record this replica owes has been accepted by its sink.
 //!
-//! Layout (50 bytes exactly):
+//! Layout (58 bytes exactly):
 //!
 //! ```text
 //! magic "VTOPMAU1"        8
 //! version u16             2
 //! index u64               8
+//! floor u64               8
 //! BLAKE3-32 over prior   32
 //! ```
+//!
+//! `floor` is the highest index a snapshot install brought this replica
+//! past: entries at or below it were never applied here one by one, and the
+//! log below it may be a stale branch. A replay never reads at or below it
+//! (Codex review of #767: a later local snapshot can make that branch look
+//! like the committed log again, so the boundary is kept durably).
 //!
 //! # Why a second frontier
 //!
@@ -36,7 +43,7 @@ pub(crate) const AUDITED_FILE_NAME: &str = "meta.audited";
 
 const AUDITED_MAGIC: &[u8; 8] = b"VTOPMAU1";
 const AUDITED_VERSION: u16 = 1;
-const AUDITED_BYTES: usize = 8 + 2 + 8 + 32;
+const AUDITED_BYTES: usize = 8 + 2 + 8 + 8 + 32;
 const CHECKSUM_LEN: usize = 32;
 
 /// Owner of the on-disk audit frontier file.
@@ -44,6 +51,7 @@ pub struct AuditedFrontierFile {
     env: Env,
     path: PathBuf,
     index: Option<u64>,
+    floor: u64,
     poisoned: bool,
 }
 
@@ -54,19 +62,21 @@ impl AuditedFrontierFile {
             .storage
             .exists(&path)
             .map_err(|source| io_error(&path, source))?;
-        let index = if exists {
+        let (index, floor) = if exists {
             let bytes = env
                 .storage
                 .read(&path)
                 .map_err(|source| io_error(&path, source))?;
-            Some(decode(&path, &bytes)?)
+            let (index, floor) = decode(&path, &bytes)?;
+            (Some(index), floor)
         } else {
-            None
+            (None, 0)
         };
         Ok(Self {
             env: env.clone(),
             path,
             index,
+            floor,
             poisoned: false,
         })
     }
@@ -77,21 +87,38 @@ impl AuditedFrontierFile {
         self.index
     }
 
+    /// The highest index a snapshot install brought this replica past.
+    pub fn floor(&self) -> u64 {
+        self.floor
+    }
+
     /// Persist `index` if it is above the stored one; at or below it this is
     /// a no-op (see the module docs).
     pub fn save(&mut self, index: u64) -> MetaStoreResult<()> {
-        if self.poisoned {
-            return Err(MetaStoreError::Poisoned("audit frontier"));
-        }
         if self.index.is_some_and(|stored| index <= stored) {
             return Ok(());
         }
-        let bytes = encode(index);
-        if let Err(error) = write_atomic(&self.env, &self.path, &bytes) {
+        self.write(index, self.floor)
+    }
+
+    /// Persist the install floor if it is above the stored one.
+    pub fn save_floor(&mut self, floor: u64) -> MetaStoreResult<()> {
+        if floor <= self.floor {
+            return Ok(());
+        }
+        self.write(self.index.unwrap_or(0), floor)
+    }
+
+    fn write(&mut self, index: u64, floor: u64) -> MetaStoreResult<()> {
+        if self.poisoned {
+            return Err(MetaStoreError::Poisoned("audit frontier"));
+        }
+        if let Err(error) = write_atomic(&self.env, &self.path, &encode(index, floor)) {
             self.poisoned = true;
             return Err(error);
         }
         self.index = Some(index);
+        self.floor = floor;
         Ok(())
     }
 
@@ -105,26 +132,22 @@ impl AuditedFrontierFile {
         if self.poisoned {
             return Err(MetaStoreError::Poisoned("audit frontier"));
         }
-        if let Err(error) = write_atomic(&self.env, &self.path, &encode(index)) {
-            self.poisoned = true;
-            return Err(error);
-        }
-        self.index = Some(index);
-        Ok(())
+        self.write(index, self.floor)
     }
 }
 
-fn encode(index: u64) -> Vec<u8> {
+fn encode(index: u64, floor: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(AUDITED_BYTES);
     out.extend_from_slice(AUDITED_MAGIC);
     put_u16(&mut out, AUDITED_VERSION);
     put_u64(&mut out, index);
+    put_u64(&mut out, floor);
     let checksum = blake3::hash(&out);
     out.extend_from_slice(checksum.as_bytes());
     out
 }
 
-fn decode(path: &Path, bytes: &[u8]) -> MetaStoreResult<u64> {
+fn decode(path: &Path, bytes: &[u8]) -> MetaStoreResult<(u64, u64)> {
     if bytes.len() != AUDITED_BYTES {
         return Err(corrupt(
             path,
@@ -154,8 +177,9 @@ fn decode(path: &Path, bytes: &[u8]) -> MetaStoreResult<u64> {
         });
     }
     let index = reader.u64("audited index").map_err(decode_error)?;
+    let floor = reader.u64("audit install floor").map_err(decode_error)?;
     reader.finish().map_err(decode_error)?;
-    Ok(index)
+    Ok((index, floor))
 }
 
 #[cfg(test)]
@@ -178,11 +202,12 @@ mod tests {
         golden.extend_from_slice(b"VTOPMAU1");
         golden.extend_from_slice(&[0x00, 0x01]);
         golden.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x03, 0x2c]);
+        golden.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0x02, 0x58]);
         let checksum = blake3::hash(&golden);
         golden.extend_from_slice(checksum.as_bytes());
-        assert_eq!(golden.len(), 50);
-        assert_eq!(encode(812), golden);
-        assert_eq!(decode(Path::new("/x"), &golden).unwrap(), 812);
+        assert_eq!(golden.len(), 58);
+        assert_eq!(encode(812, 600), golden);
+        assert_eq!(decode(Path::new("/x"), &golden).unwrap(), (812, 600));
     }
 
     #[test]
@@ -205,17 +230,22 @@ mod tests {
             AuditedFrontierFile::open_in(&env, path).unwrap().get(),
             Some(9)
         );
+        file.save_floor(20).unwrap();
+        file.save_floor(5).unwrap();
+        file.save(30).unwrap();
+        let reopened = AuditedFrontierFile::open_in(&env, path).unwrap();
+        assert_eq!((reopened.get(), reopened.floor()), (Some(30), 20));
     }
 
     #[test]
     fn a_damaged_frontier_is_refused_as_corrupt() {
         let (_sim, env) = sim_env();
         let path = Path::new("/meta/meta.audited");
-        let good = encode(7);
+        let good = encode(7, 0);
         let mut bad_magic = good.clone();
         bad_magic[0] = b'X';
-        let checksum = blake3::hash(&bad_magic[..18]);
-        bad_magic[18..].copy_from_slice(checksum.as_bytes());
+        let checksum = blake3::hash(&bad_magic[..26]);
+        bad_magic[26..].copy_from_slice(checksum.as_bytes());
         let mut flipped = good.clone();
         flipped[12] ^= 1;
         let mut trailing = good.clone();
@@ -224,7 +254,7 @@ mod tests {
             ("bad magic", bad_magic),
             ("checksum", flipped),
             ("trailing byte", trailing),
-            ("truncated", good[..49].to_vec()),
+            ("truncated", good[..57].to_vec()),
         ] {
             write_atomic(&env, path, &bytes).unwrap();
             assert!(
@@ -239,6 +269,7 @@ mod tests {
         newer.extend_from_slice(b"VTOPMAU1");
         newer.extend_from_slice(&[0x00, 0x02]);
         newer.extend_from_slice(&7u64.to_be_bytes());
+        newer.extend_from_slice(&0u64.to_be_bytes());
         let checksum = blake3::hash(&newer);
         newer.extend_from_slice(checksum.as_bytes());
         write_atomic(&env, path, &newer).unwrap();

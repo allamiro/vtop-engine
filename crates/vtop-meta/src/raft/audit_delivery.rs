@@ -371,6 +371,19 @@ impl MetaRaftStore {
         // A newer snapshot's gap starts at the same frontier and covers an
         // older one still owed (review of #767: it was sent twice).
         delivery.pending_gap = None;
+        // The boundary of what this replica never applied one by one, kept
+        // durably before anything else (Codex review of #767): a refused gap
+        // lives in memory only, and a later local snapshot can make a stale
+        // branch below it look like the committed log.
+        if let Err(error) = self.lock().storage.save_audited_floor(snapshot_index) {
+            crate::transport::warn_rate_limited(
+                "audit-floor-save",
+                &format!(
+                    "could not save the audit install floor at {snapshot_index} ({error}); a \
+                     restart may re-derive the range from the log's newest snapshot instead"
+                ),
+            );
+        }
         let from = delivery.delivered + 1;
         let gap = AuditRecord::gap(
             delivery.node_id,
@@ -619,6 +632,12 @@ fn readable_from(
     };
     let mut readable = from.max(first_in_log);
     let mut reason = GapReason::LogPurged;
+    // Never at or below what a snapshot install brought this replica past.
+    let floor = storage.audited_floor();
+    if readable <= floor {
+        readable = floor + 1;
+        reason = GapReason::SnapshotInstall;
+    }
     if let Some(snapshot) = &newest {
         if readable <= snapshot.last_index {
             let agrees = storage
