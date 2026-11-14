@@ -286,10 +286,17 @@ pub async fn run_tier_copy(
     if request.require_versioning {
         let (bucket, _key) = parse_s3_uri(&request.object_uri)
             .map_err(|error| refuse("versioning preflight", error))?;
-        let did = "nothing was copied";
-        let refusal = match backend.bucket_versioning(&bucket).await {
-            Ok(answer) => crate::bucket_versioning::refusal(answer, &bucket, did),
-            Err(error) => Some(crate::bucket_versioning::unreadable(&bucket, did, &error)),
+        use crate::bucket_versioning::{self as versioning, Refuser};
+        let refusal = if !backend.supports_object_versions() {
+            Some(versioning::backend_without_versions(
+                backend.backend_name(),
+                Refuser::TIER_COPY,
+            ))
+        } else {
+            match backend.bucket_versioning(&bucket).await {
+                Ok(answer) => versioning::refusal(answer, &bucket, Refuser::TIER_COPY),
+                Err(error) => Some(versioning::unreadable(&bucket, Refuser::TIER_COPY, &error)),
+            }
         };
         if let Some(message) = refusal {
             return Err(refuse("versioning preflight", message));
@@ -815,6 +822,10 @@ mod tests {
         fn backend_name(&self) -> &'static str {
             "mock-unversioned"
         }
+        // Versioned-looking: it says it addresses versions, then returns none.
+        fn supports_object_versions(&self) -> bool {
+            true
+        }
         fn supports_checksum_verification(&self) -> bool {
             true
         }
@@ -1023,6 +1034,130 @@ mod tests {
             .await
             .expect_err("non-s3 uri cannot satisfy the versioning preflight");
         assert!(error.contains("versioning preflight"), "{error}");
+    }
+
+    /// Review of #770: tier copy's versioning refusals name ITS switch
+    /// (`--require-versioning`), not the engine's config key, and its
+    /// credentials, not the engine's; and a backend without object versions
+    /// is told so, not sent to grant s3:GetBucketVersioning.
+    #[tokio::test]
+    async fn tier_copy_versioning_refusals_name_its_own_switch() {
+        let directory = tempfile::tempdir().unwrap();
+        let sealed = seal_bundle(directory.path());
+        let root = sealed_root(&sealed);
+        let cases: [(MockBackend, &[&str]); 3] = [
+            (
+                MockBackend::new().with_bucket_versioning(vtop_upload::BucketFeature::NotEnabled),
+                &[
+                    "bucket tier does not have versioning enabled",
+                    "Enable versioning on the bucket",
+                    "pass --require-versioning false",
+                ],
+            ),
+            (
+                MockBackend::new().with_bucket_versioning(vtop_upload::BucketFeature::NotSupported),
+                &[
+                    "the store does not implement S3 bucket versioning",
+                    "pass --require-versioning false",
+                ],
+            ),
+            (
+                MockBackend::new().with_versioning_errors(1),
+                &[
+                    "could not be read",
+                    "Grant the credentials vtopctl uses s3:GetBucketVersioning",
+                ],
+            ),
+        ];
+        for (backend, parts) in cases {
+            let error = run_tier_copy(&backend, &request(&sealed, root))
+                .await
+                .expect_err("the versioning preflight refuses");
+            for part in parts
+                .iter()
+                .chain(&["refusing at versioning preflight", "nothing was copied"])
+            {
+                assert!(error.contains(part), "{error:?} should say {part:?}");
+            }
+            assert!(
+                !error.contains("upload.require_object_versioning"),
+                "tier copy does not read that key: {error}"
+            );
+        }
+        let error = run_tier_copy(
+            &WithoutVersions(MockBackend::new()),
+            &request(&sealed, root),
+        )
+        .await
+        .expect_err("a backend without versions refuses");
+        for part in [
+            "--require-versioning is set",
+            "cannot address object versions",
+            "nothing was copied",
+            "pass --require-versioning false",
+        ] {
+            assert!(error.contains(part), "{error:?} should say {part:?}");
+        }
+    }
+
+    /// A backend that cannot address object versions at all.
+    struct WithoutVersions(MockBackend);
+
+    #[async_trait]
+    impl UploadBackend for WithoutVersions {
+        async fn put_object(
+            &self,
+            local_path: &Path,
+            object_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<vtop_upload::StoredObject, VtopError> {
+            self.0.put_object(local_path, object_uri, checksum).await
+        }
+        async fn put_manifest(
+            &self,
+            local_path: &Path,
+            manifest_uri: &str,
+            checksum: Option<ObjectChecksum<'_>>,
+        ) -> Result<StoredManifest, VtopError> {
+            self.0
+                .put_manifest(local_path, manifest_uri, checksum)
+                .await
+        }
+        async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
+            self.0.head_object(object_uri).await
+        }
+        async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
+            self.0.get_object(object_uri).await
+        }
+        async fn get_object_bounded(
+            &self,
+            object_uri: &str,
+            max_bytes: usize,
+        ) -> Result<Vec<u8>, VtopError> {
+            self.0.get_object_bounded(object_uri, max_bytes).await
+        }
+        async fn verify_object(
+            &self,
+            object_uri: &str,
+            expected_size: u64,
+            expected: Option<ObjectChecksum<'_>>,
+        ) -> Result<VerificationResult, VtopError> {
+            self.0
+                .verify_object(object_uri, expected_size, expected)
+                .await
+        }
+        async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError> {
+            self.0.delete_object(object_uri).await
+        }
+        fn backend_name(&self) -> &'static str {
+            "without-versions"
+        }
+        fn supports_checksum_verification(&self) -> bool {
+            true
+        }
+        fn supports_multipart(&self) -> bool {
+            false
+        }
     }
 
     #[tokio::test]

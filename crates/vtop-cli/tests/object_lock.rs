@@ -212,6 +212,73 @@ async fn a_templated_bucket_on_a_store_without_object_lock_fails_its_first_batch
     );
 }
 
+/// Review of #770: a store without Object Lock usually has no versioning
+/// either (Garage's GetBucketVersioning is a stub answering "not enabled").
+/// The batch is refused for the Object Lock it lacks, which no bucket setting
+/// can add, not for the versioning, whose advice the operator cannot follow.
+/// Startup runs the two checks in the same order.
+#[tokio::test]
+async fn a_store_without_object_lock_or_versioning_is_refused_for_the_lock_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 2);
+    let tenant = "lock-and-versioning-missing";
+    let lock = governance();
+    let backend = Arc::new(
+        locked_mock(&lock)
+            .with_object_lock_not_implemented()
+            .with_bucket_versioning(vtop_upload::BucketFeature::NotEnabled),
+    );
+    let mut templated = engine(
+        config(dir.path(), tenant, "telemetry-{format}", &input),
+        Some(lock.clone()),
+        &backend,
+    )
+    .await;
+    let unsupported_before = checks(tenant, "store_unsupported");
+    templated.preflight_buckets().await.unwrap();
+    let out = templated.process_once(SourceType::File).await.unwrap();
+    assert!(!out[0].committed, "{out:?}");
+    let message = row(&templated, &out[0].batch_id)
+        .await
+        .error_message
+        .unwrap_or_default();
+    assert_says(&message, &["the store does not implement S3 Object Lock"]);
+    assert!(!message.contains("versioning"), "{message}");
+    assert_eq!(checks(tenant, "store_unsupported"), unsupported_before + 1);
+
+    // A literal bucket: the same order at startup.
+    let backend = Arc::new(
+        locked_mock(&lock)
+            .with_object_lock_not_implemented()
+            .with_bucket_versioning(vtop_upload::BucketFeature::NotEnabled),
+    );
+    let literal = engine(
+        config(
+            dir.path(),
+            "lock-and-versioning-literal",
+            "telemetry-raw",
+            &input,
+        ),
+        Some(lock),
+        &backend,
+    )
+    .await;
+    let err = literal.preflight_buckets().await.unwrap_err().to_string();
+    assert_says(
+        &err,
+        &[
+            "the store does not implement S3 Object Lock",
+            "the engine did not start",
+        ],
+    );
+    assert_eq!(
+        backend.versioning_calls(),
+        0,
+        "refused before versioning: {err}"
+    );
+}
+
 #[tokio::test]
 async fn without_the_profile_no_bucket_or_object_is_checked() {
     let dir = tempfile::tempdir().unwrap();

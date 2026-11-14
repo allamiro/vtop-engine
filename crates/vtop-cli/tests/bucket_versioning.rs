@@ -72,6 +72,9 @@ async fn a_literal_bucket_without_versioning_refuses_startup_naming_it_and_the_f
             // What to do.
             "Enable versioning on the bucket",
             "or set upload.require_object_versioning: false",
+            // Review of #770: some stores answer "not enabled" and cannot
+            // enable it (Garage's GetBucketVersioning is a stub).
+            "if the store cannot enable it, use a store that keeps object versions",
         ],
     );
     assert_eq!(backend.versioning_calls(), 1);
@@ -210,4 +213,22 @@ async fn without_the_profile_no_bucket_versioning_is_checked() {
     let out = engine.process_once(SourceType::File).await.unwrap();
     assert!(out.iter().all(|o| o.committed), "{out:?}");
     assert_eq!(backend.versioning_calls(), 0);
+}
+
+/// Review of #770: with `upload.create_bucket` the bucket may not exist yet
+/// at startup (the pipeline creates it), so the startup check would only
+/// report a missing bucket as an unreadable one. It is left to the first
+/// upload, after the bucket is created.
+#[tokio::test]
+async fn with_create_bucket_the_check_waits_for_the_first_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = versioned_engine(dir.path(), "ver-create", "telemetry-raw", &backend).await;
+    engine.config.upload.create_bucket = true;
+
+    engine.preflight_bucket_versioning().await.unwrap();
+    assert_eq!(backend.versioning_calls(), 0);
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert!(out.iter().all(|o| o.committed), "{out:?}");
+    assert_eq!(backend.versioning_calls(), 1);
 }

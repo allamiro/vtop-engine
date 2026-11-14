@@ -950,18 +950,12 @@ impl S3NativeBackend {
     }
 }
 
-/// The engine's error for a failed SDK call, telling a throttle apart (#102).
-///
-/// The SDK has already retried a throttle with its own backoff by the time
-/// one reaches here, so what arrives is "still overloaded after retries" —
-/// exactly the signal a concurrency controller wants and a same-rate retry
-/// would only worsen. Classified on the wire facts the SDK keeps: the HTTP
-/// status (429, or 503 as S3 spells `SlowDown`) and the error code.
 /// A store's definite "I do not implement this operation" (#722): HTTP 501,
-/// or the `NotImplemented` / `XNotImplemented` error code under any status
-/// (some stores send it with a 400). Told apart from a check that could not
-/// be made (a 403, a 503, a timeout), which proves nothing either way: the
-/// SDK does not retry a 501, so this is the store's first and only answer.
+/// or S3's `NotImplemented` error code under whatever status it came with.
+/// Told apart from a check that could not be made (a 403, a 503, a timeout),
+/// which proves nothing either way: the SDK does not retry a 501, so this is
+/// the store's first and only answer. Other codes a store may use for the
+/// same answer are added when a live run shows one, each with a wire test.
 fn not_implemented<E>(error: &SdkError<E, HttpResponse>) -> bool
 where
     E: ProvideErrorMetadata,
@@ -973,9 +967,16 @@ where
         SdkError::ResponseError(context) => (Some(context.raw().status().as_u16()), None),
         _ => (None, None),
     };
-    status == Some(501) || matches!(code, Some("NotImplemented" | "XNotImplemented"))
+    status == Some(501) || code == Some("NotImplemented")
 }
 
+/// The engine's error for a failed SDK call, telling a throttle apart (#102).
+///
+/// The SDK has already retried a throttle with its own backoff by the time
+/// one reaches here, so what arrives is "still overloaded after retries" —
+/// exactly the signal a concurrency controller wants and a same-rate retry
+/// would only worsen. Classified on the wire facts the SDK keeps: the HTTP
+/// status (429, or 503 as S3 spells `SlowDown`) and the error code.
 fn sdk_failure<E>(operation: &str, target: &str, error: SdkError<E, HttpResponse>) -> VtopError
 where
     E: std::error::Error + ProvideErrorMetadata + Send + Sync + 'static,

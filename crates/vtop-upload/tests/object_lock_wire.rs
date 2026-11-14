@@ -580,9 +580,9 @@ async fn a_store_without_object_lock_is_told_from_one_that_could_not_answer() {
         ),
         (
             "400 Bad Request",
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>XNotImplemented</Code>\
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NotImplemented</Code>\
              <Message>not implemented</Message></Error>",
-            "the XNotImplemented code some stores send",
+            "the NotImplemented code under another status",
         ),
     ] {
         store.answer_lock_config(status, body);
