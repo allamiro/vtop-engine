@@ -63,10 +63,32 @@ entries=$(mktemp)
 issues=$(mktemp)
 trap 'rm -f "$entries" "$issues"' EXIT
 
+# Contributor tooling is not part of what a release ships, so the notes leave
+# it out: a pull request whose files are all under .claude/ or .agents/, or
+# whose title (component prefix included) is about that tooling. Matched
+# case-insensitively on whole words.
+tooling_words='(^|[^a-z])(skills?|claude|codex|anthropic|llm|generative ai|ai)([^a-z]|$)'
+
+is_tooling() {
+    local json=$1 title
+    title=$(printf '%s' "$json" | jq -r '.title')
+    # Every changed file is tooling. An empty file list is not "all tooling".
+    if printf '%s' "$json" | jq -e '
+        (.files | length) > 0 and
+        all(.files[].path; startswith(".claude/") or startswith(".agents/"))
+    ' >/dev/null; then
+        return 0
+    fi
+    printf '%s' "$title" | grep -Eiq "$tooling_words"
+}
+
 for number in $pulls; do
     json=$(gh pr view "$number" --repo "$repo" \
-        --json title,closingIssuesReferences 2>/dev/null || true)
+        --json title,closingIssuesReferences,files 2>/dev/null || true)
     [ -n "$json" ] || continue
+    if is_tooling "$json"; then
+        continue
+    fi
 
     title=$(printf '%s' "$json" | jq -r '.title')
     # "broker,node: subject" -> "broker,node". A subject with no prefix groups
