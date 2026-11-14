@@ -3514,6 +3514,10 @@ impl Engine {
         } else if let Some(spools) = any.downcast_mut::<SyslogSpoolSource>() {
             refused.extend(spools.take_refused_cuts());
         }
+        #[cfg(feature = "kafka")]
+        if let Some(kafka) = adapter.as_any_mut().downcast_mut::<KafkaSource>() {
+            refused.extend(kafka.take_refused_cuts());
+        }
         let mut gone: Vec<(String, u64, u64, String)> = refused
             .into_iter()
             .map(|cut| (cut.path, cut.start, cut.end, cut.reason.to_owned()))
