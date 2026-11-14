@@ -310,6 +310,18 @@ async fn without_the_profile_no_bucket_or_object_is_checked() {
     for result in vtop_core::telemetry::OBJECT_LOCK_CHECK_RESULTS {
         assert_eq!(checks(tenant, result), 0, "{result}");
     }
+    // The startup check sets the mode gauge: off (review of #708).
+    let gauge = |mode: &str| {
+        vtop_core::telemetry::init()
+            .unwrap()
+            .object_lock_mode
+            .with_label_values(&[tenant, mode])
+            .get()
+    };
+    assert_eq!(
+        (gauge("off"), gauge("governance"), gauge("compliance")),
+        (1, 0, 0)
+    );
 }
 
 // ---- What the store kept ----------------------------------------------------
@@ -433,6 +445,18 @@ async fn a_lock_the_store_did_not_keep_fails_the_batch_by_its_own_result() {
                  s3:PutObjectRetention permission",
             ],
         );
+        if result == "missing" {
+            // A missing s3:GetObjectRetention reads as a missing lock: S3
+            // returns the headers only to a caller holding it (review of
+            // #708).
+            assert_says(
+                &row(&engine, &out[0].batch_id)
+                    .await
+                    .error_message
+                    .unwrap_or_default(),
+                &["s3:GetObjectRetention"],
+            );
+        }
         assert_eq!(
             checks(&tenant, result),
             1,
@@ -875,4 +899,161 @@ async fn scrub_check_retention_counts_an_ended_lock_without_failing() {
         Some(3),
         "{report:#?}"
     );
+}
+
+// ---- Review of #708 ---------------------------------------------------------
+
+/// The startup check names the bucket the engine will write to: a literal
+/// `upload.bucket` is sanitized (lower case, `.` and `_` to `-`) before use,
+/// and checking the raw spelling would ask about a bucket nobody writes to.
+#[tokio::test]
+async fn startup_checks_the_bucket_name_the_batches_are_written_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 2);
+    let lock = governance();
+    let backend = Arc::new(locked_mock(&lock));
+    let mut engine = engine(
+        config(dir.path(), "lock-sanitized", "Telemetry_Locked", &input),
+        Some(lock),
+        &backend,
+    )
+    .await;
+    engine.preflight_object_lock().await.unwrap();
+    assert_eq!(
+        backend.object_lock_config_buckets(),
+        vec!["telemetry-locked"]
+    );
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert!(out.iter().all(|o| o.committed), "{out:?}");
+    assert_eq!(
+        backend.object_lock_config_calls(),
+        1,
+        "the first batch found the bucket already checked"
+    );
+}
+
+/// A bucket check the store could not answer at startup is not a reason to
+/// stay down: the engine starts, says so, and checks again before the first
+/// upload to that bucket. Only a definite "not enabled" refuses startup.
+#[tokio::test]
+async fn a_failed_bucket_check_at_startup_is_retried_at_the_first_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 2);
+    let lock = governance();
+    let backend = Arc::new(locked_mock(&lock).with_lock_config_errors(1));
+    let mut engine = engine(
+        config(dir.path(), "lock-blip", "telemetry-raw", &input),
+        Some(lock),
+        &backend,
+    )
+    .await;
+    let (logs, _guard) = Logs::capture();
+    engine
+        .preflight_object_lock()
+        .await
+        .expect("a store blip does not keep the engine down");
+    assert!(
+        logs.raw().contains("could not be read")
+            && logs.raw().contains("checked again before the first upload"),
+        "{}",
+        logs.raw()
+    );
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert!(out.iter().all(|o| o.committed), "{out:?}");
+    assert_eq!(backend.object_lock_config_calls(), 2);
+}
+
+/// A backend that does not apply the configured lock refuses startup.
+#[tokio::test]
+async fn startup_refuses_a_backend_that_does_not_apply_the_configured_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 2);
+    let backend = Arc::new(MockBackend::new());
+    let engine = engine(
+        config(dir.path(), "lock-mismatch", "telemetry-raw", &input),
+        Some(governance()),
+        &backend,
+    )
+    .await;
+    let err = engine
+        .preflight_object_lock()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_says(
+        &err,
+        &[
+            "does not apply it",
+            "unlocked objects",
+            "the engine did not start",
+            "s3_native",
+        ],
+    );
+}
+
+/// A write that asked for no lock while the profile is set fails its batch,
+/// and the message says what the replay will do.
+#[tokio::test]
+async fn a_write_that_asked_for_no_lock_fails_the_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 2);
+    let tenant = "lock-none-asked";
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = engine(
+        config(dir.path(), tenant, "telemetry-raw", &input),
+        Some(governance()),
+        &backend,
+    )
+    .await;
+    let out = engine.process_once(SourceType::File).await.unwrap();
+    assert!(!out[0].committed);
+    assert_says(
+        &row(&engine, &out[0].batch_id)
+            .await
+            .error_message
+            .unwrap_or_default(),
+        &[
+            "without asking for the retention upload.object_lock sets",
+            "the batch was marked failed and will be replayed",
+            "the replay checks the stored object itself",
+        ],
+    );
+    assert_eq!(checks(tenant, "error"), 1);
+}
+
+/// A reused object without the legal hold the config now asks for needs a
+/// legal hold, not a longer retention: the message says which.
+#[tokio::test]
+async fn a_reused_object_without_the_legal_hold_says_to_place_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 2);
+    let lock = governance();
+    let backend = Arc::new(locked_mock(&lock).with_throttled_manifest_puts(1));
+    let mut engine = engine(
+        config(dir.path(), "lock-reuse-hold", "telemetry-raw", &input),
+        Some(lock),
+        &backend,
+    )
+    .await;
+    let first = engine.process_once(SourceType::File).await.unwrap();
+    assert!(!first[0].committed);
+    engine.config.upload.object_lock = Some(lock_with_hold());
+    let second = engine.process_once(SourceType::File).await.unwrap();
+    assert!(!second[0].committed);
+    assert_says(
+        &row(&engine, &second[0].batch_id)
+            .await
+            .error_message
+            .unwrap_or_default(),
+        &["reused from an earlier attempt", "PutObjectLegalHold"],
+    );
+}
+
+fn lock_with_hold() -> ObjectLockConfig {
+    lock(ObjectLockMode::Governance, true)
 }

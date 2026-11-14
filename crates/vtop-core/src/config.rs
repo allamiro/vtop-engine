@@ -3562,6 +3562,19 @@ upload:
         ))
         .expect_err("a misspelled key in a retention policy must be refused");
         assert!(msg.contains("retain_day"), "{msg}");
+        // Another backend is refused at config load, as `vtopctl validate`
+        // runs it, not only when the engine builds the backend (review of
+        // #708).
+        let msg = object_lock_config(&format!(
+            "{versioned}  backend: localfs\n  local_path: /tmp/x\n  object_lock:\n    mode: governance\n    retain_days: 30\n"
+        ))
+        .expect_err("a backend that cannot lock must be refused at load");
+        assert!(
+            msg.contains("upload.object_lock")
+                && msg.contains("localfs")
+                && msg.contains("s3_native"),
+            "{msg}"
+        );
     }
 
     #[test]

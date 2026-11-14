@@ -147,6 +147,10 @@ pub struct MockBackend {
     /// `bucket_object_lock_enabled` calls, so a test can pin that a config
     /// without the profile makes none.
     lock_config_calls: AtomicUsize,
+    /// The buckets those calls named, in order.
+    lock_config_buckets: Mutex<Vec<String>>,
+    /// How many upcoming bucket checks fail as a store blip would.
+    lock_config_errors: AtomicUsize,
     /// The retention the store keeps per `(key, version)` (#684).
     retention: Mutex<HashMap<(String, String), StoredRetention>>,
 }
@@ -272,6 +276,17 @@ impl MockBackend {
         self.lock_config_calls.load(Ordering::SeqCst)
     }
 
+    /// The buckets those checks named, in order.
+    pub fn object_lock_config_buckets(&self) -> Vec<String> {
+        self.lock_config_buckets.lock().unwrap().clone()
+    }
+
+    /// The next `times` bucket checks fail with a 503, as a store blip.
+    pub fn with_lock_config_errors(self, times: usize) -> Self {
+        self.lock_config_errors.store(times, Ordering::SeqCst);
+        self
+    }
+
     /// The retention the store keeps for one version of `uri`, `None` for
     /// the current version.
     pub fn stored_retention(&self, uri: &str, version_id: Option<&str>) -> StoredRetention {
@@ -389,6 +404,8 @@ impl MockBackend {
             retention_error: None,
             bucket_object_lock: true,
             lock_config_calls: AtomicUsize::new(0),
+            lock_config_buckets: Mutex::new(Vec::new()),
+            lock_config_errors: AtomicUsize::new(0),
             retention: Mutex::new(HashMap::new()),
             multipart_fail_after_parts: Arc::new(AtomicUsize::new(usize::MAX)),
             multipart_parts_uploaded: Arc::new(AtomicUsize::new(0)),
@@ -907,8 +924,28 @@ impl UploadBackend for MockBackend {
         self.object_lock
     }
 
-    async fn bucket_object_lock_enabled(&self, _bucket: &str) -> Result<bool, VtopError> {
+    async fn bucket_object_lock_enabled(&self, bucket: &str) -> Result<bool, VtopError> {
         self.lock_config_calls.fetch_add(1, Ordering::SeqCst);
+        self.lock_config_buckets
+            .lock()
+            .unwrap()
+            .push(bucket.to_owned());
+        let mut left = self.lock_config_errors.load(Ordering::SeqCst);
+        while left > 0 {
+            match self.lock_config_errors.compare_exchange_weak(
+                left,
+                left - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Err(VtopError::Upload(format!(
+                        "mock get_object_lock_configuration {bucket}: ServiceUnavailable (http 503)"
+                    )))
+                }
+                Err(observed) => left = observed,
+            }
+        }
         Ok(self.bucket_object_lock)
     }
 

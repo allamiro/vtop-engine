@@ -302,3 +302,49 @@ async fn a_session_created_without_a_lock_is_not_resumed_by_a_locked_upload() {
         "the completed object carries the lock"
     );
 }
+
+/// Review of #708: a session's lock was fixed at its creation, and a session
+/// lives as long as replays keep resuming it. One whose retention has
+/// already ended would complete an object nobody has to keep, and that
+/// object's date is exactly the one asked for, so it would pass. It is not
+/// adopted: a new upload carries a lock from now.
+#[tokio::test]
+async fn a_session_whose_lock_has_already_ended_is_not_resumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = data();
+    let path = write(dir.path(), &data);
+    let (digest, fence) = fence(&data);
+    let backend = MockBackend::new().with_object_lock(policy());
+    let uri = "s3://b/ended-session/object.raw";
+
+    let ended = ObjectLockPolicy::with_retention_for_tests(
+        ObjectLockMode::Governance,
+        Duration::from_secs(DAY),
+        false,
+    )
+    .request_at(SystemTime::now() - Duration::from_secs(2 * DAY));
+    assert!(ended.retain_until_unix_secs < unix_now());
+    let mut session = earlier_session(uri, &path, &fence, &data, Duration::from_secs(2 * DAY));
+    session.retention = Some(ended);
+    save_session(&dir.path().join(session_file_name(uri, &fence)), &session).unwrap();
+    backend.seed_multipart_locked(uri, "mpu-earlier", vec![(1, data[..PART].to_vec())], ended);
+
+    let mut report = MultipartReport::default();
+    let stored = upload_resumable_with_report(
+        &backend,
+        &config(dir.path()),
+        &path,
+        uri,
+        Some(ObjectChecksum::new("sha256", &digest)),
+        fence,
+        &mut report,
+    )
+    .await
+    .expect("the upload completes on a new upload");
+    assert!(!report.resumed, "{report:?}");
+    let asked = stored.retention.unwrap();
+    assert!(
+        asked.retain_until_unix_secs > unix_now() + (29 * DAY) as i64,
+        "the object is locked from now: {asked:?}"
+    );
+}

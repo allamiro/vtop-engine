@@ -1764,4 +1764,28 @@ mod tests {
         drop(held);
         lock_run(Some(&cursor), Some(&metrics)).expect("free again once the first run ends");
     }
+
+    /// Review of #708: a run without `--check-retention` keeps the retention
+    /// totals an earlier run wrote, or an hourly run without the flag would
+    /// reset the daily run's counter every hour.
+    #[test]
+    fn a_run_without_check_retention_carries_the_retention_totals_forward() {
+        let mut with = report(&[(ScrubResult::Ok, 2)], 0, true);
+        with.retention = RetentionResult::ALL
+            .iter()
+            .map(|r| (r.as_str(), u64::from(*r == RetentionResult::Locked) * 2))
+            .collect();
+        let first = with.prometheus_text(None, 100);
+        assert!(
+            first.contains("vtop_scrub_retention_total{result=\"locked\"} 2\n"),
+            "{first}"
+        );
+        let without = report(&[(ScrubResult::Ok, 1)], 0, true);
+        assert!(without.retention.is_empty());
+        let second = without.prometheus_text(Some(&first), 200);
+        assert!(
+            second.contains("vtop_scrub_retention_total{result=\"locked\"} 2\n"),
+            "the totals survive a run that did not read retention: {second}"
+        );
+    }
 }

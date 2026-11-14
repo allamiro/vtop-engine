@@ -540,3 +540,83 @@ async fn the_bucket_preflight_tells_not_enabled_from_could_not_check() {
         .expect_err("a refused check proves nothing either way");
     assert!(err.to_string().contains("403"), "{err}");
 }
+
+/// Review of #708: the legal-hold header is sent only when a hold is asked
+/// for. S3 checks `s3:PutObjectLegalHold` whenever the header is on the
+/// request, OFF included, so sending OFF would refuse every write of an
+/// identity granted only what the profile documents for `legal_hold: false`.
+#[tokio::test]
+async fn no_legal_hold_header_is_sent_without_a_hold() {
+    let store = Store::default();
+    let endpoint = store.start().await;
+    let policy = ObjectLockPolicy::with_retention_for_tests(
+        ObjectLockMode::Governance,
+        Duration::from_secs(DAY),
+        false,
+    );
+    let locked = backend(endpoint, Some(policy)).await;
+    let body = file(b"hello");
+    let sha = vtop_core::checksum::sha256_bytes(b"hello");
+    let ck = ObjectChecksum::new("sha256", &sha);
+    locked
+        .put_object(body.path(), "s3://telemetry-locked/nh/obj.raw", Some(ck))
+        .await
+        .unwrap();
+    locked
+        .put_manifest(body.path(), "s3://telemetry-locked/nh/m.json", Some(ck))
+        .await
+        .unwrap();
+    locked
+        .create_multipart_upload(
+            "s3://telemetry-locked/nh/big.raw",
+            "application/octet-stream",
+            Some(ck),
+        )
+        .await
+        .unwrap();
+    let seen = store.seen();
+    assert_eq!(seen.len(), 3);
+    for request in seen {
+        assert_eq!(request.header("x-amz-object-lock-mode"), Some("GOVERNANCE"));
+        assert_eq!(
+            request.header("x-amz-object-lock-legal-hold"),
+            None,
+            "no hold asked for, no hold header: {request:?}"
+        );
+    }
+}
+
+/// Review of #708: `AWS_REQUEST_CHECKSUM_CALCULATION=when_required`, common
+/// for third-party stores, stops the SDK computing a checksum it is not
+/// required to send. A locked BLAKE3 write would then name an algorithm and
+/// carry no value, and S3 refuses it. With the profile the backend pins the
+/// calculation on, so the CRC32 is computed and sent.
+#[tokio::test]
+async fn a_locked_blake3_write_carries_a_checksum_value_even_when_calculation_is_when_required() {
+    std::env::set_var("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required");
+    let store = Store::default();
+    let endpoint = store.start().await;
+    let policy = ObjectLockPolicy::with_retention_for_tests(
+        ObjectLockMode::Governance,
+        Duration::from_secs(DAY),
+        false,
+    );
+    let locked = backend(endpoint, Some(policy)).await;
+    std::env::remove_var("AWS_REQUEST_CHECKSUM_CALCULATION");
+    let body = file(b"hello");
+    let b3 = vtop_core::checksum::blake3_bytes(b"hello");
+    locked
+        .put_object(
+            body.path(),
+            "s3://telemetry-locked/wr/b3.raw",
+            Some(ObjectChecksum::new("blake3", &b3)),
+        )
+        .await
+        .unwrap();
+    let request = store.seen().pop().unwrap();
+    assert!(
+        request.header("x-amz-checksum-crc32").is_some()
+            || request.header("x-amz-trailer").is_some(),
+        "a locked write carries a checksum value, not only an algorithm name: {request:#?}"
+    );
+}
