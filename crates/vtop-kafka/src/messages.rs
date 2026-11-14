@@ -15,6 +15,33 @@
 
 use crate::wire::{Decoder, Encoder, WireError};
 
+/// What a refusal of an unserved api key says the gateway does serve.
+pub const SERVED_APIS: &str = "Produce, Fetch, ListOffsets, Metadata, ApiVersions, \
+     InitProducerId, and the group protocol: FindCoordinator, JoinGroup, SyncGroup, Heartbeat, \
+     LeaveGroup, OffsetCommit, OffsetFetch";
+
+/// Api keys a stock client or admin tool sends that this gateway does not
+/// serve, by name (#596). Used in log lines and refusal reasons only: a
+/// client's key is never a metric label. These are the topic and config
+/// administration requests (`kafka-topics --create`, `kafka-configs
+/// --describe`), which a VTOP topic answers on the metadata plane instead.
+pub const UNSERVED_API_NAMES: [(i16, &str); 6] = [
+    (19, "CreateTopics"),
+    (20, "DeleteTopics"),
+    (32, "DescribeConfigs"),
+    (33, "AlterConfigs"),
+    (37, "CreatePartitions"),
+    (44, "IncrementalAlterConfigs"),
+];
+
+/// The name of an unserved api key this gateway knows by name, if any.
+pub fn unserved_api_name(key: i16) -> Option<&'static str> {
+    UNSERVED_API_NAMES
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, name)| *name)
+}
+
 /// The phase-1 API surface. Everything outside it is refused by name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKey {
@@ -356,12 +383,14 @@ impl RequestHeader {
                     client_id: None,
                 },
                 code: ErrorCode::UnsupportedVersion,
-                reason: format!(
-                    "api key {api_key} is not served by this gateway (Produce, Fetch, \
-                     ListOffsets, Metadata, ApiVersions, InitProducerId, and the group protocol: \
-                     FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup, OffsetCommit, \
-                     OffsetFetch)"
-                ),
+                reason: match unserved_api_name(api_key) {
+                    Some(name) => format!(
+                        "{name} (api key {api_key}) is not served by this gateway ({SERVED_APIS})"
+                    ),
+                    None => {
+                        format!("api key {api_key} is not served by this gateway ({SERVED_APIS})")
+                    }
+                },
             });
         };
 
@@ -472,6 +501,7 @@ mod tests {
                 assert_eq!(header.correlation_id, 7);
                 assert_eq!(code, ErrorCode::UnsupportedVersion);
                 assert!(reason.contains("19"), "{reason}");
+                assert!(reason.starts_with("CreateTopics (api key 19)"), "{reason}");
             }
             other => panic!("expected Refuse, got {other:?}"),
         }
