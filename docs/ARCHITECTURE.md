@@ -430,8 +430,14 @@ What follows from that, in the engine:
   - a writer that opens the file after the lease is granted breaks it. The
     final check sees that, the file is put back under its name, and only
     then is the lease released, so the opener gets a file that still has
-    its name;
-  - after the rename, an open of the path finds a new file, never this one.
+    its name (unless a new file has taken the name since the rename; see
+    the limits);
+  - an open of the path that starts after the rename finds a new file. One
+    that started before it may have resolved the path to this file and not
+    yet reached the lease, so the lease is held for a grace of 50 ms after
+    the rename before the final check (review of #689). With writers that
+    open, append and close in a tight loop and no grace, a harness that
+    copies the delete's steps lost lines; with 20 or 50 ms it lost none.
 
   Leases are per inode in the kernel, so the check also sees a writer in
   another container sharing the volume, which a scan of `/proc/*/fd` cannot.
@@ -449,9 +455,16 @@ What follows from that, in the engine:
   call, behind a safe wrapper (`write_lease::take`, `WriteLease::intact`,
   and the release on drop), with a `SAFETY` note on the one block.
 - **Where there is no such proof, the delete is refused.** The lease needs
-  Linux, a local filesystem (NFS and most FUSE, 9p and virtiofs mounts
-  answer `EINVAL`), the engine running as the file's owner or with
-  `CAP_LEASE` (otherwise `EACCES`), and `fs.leases-enable` on. Without it
+  Linux, a local filesystem, the engine running as the file's owner or with
+  `CAP_LEASE` in its effective set (otherwise `EACCES`), and
+  `fs.leases-enable` on. "Local" is checked by `statfs` type against a list
+  (ext2/3/4, xfs, btrfs, tmpfs, overlay, f2fs, zfs, bcachefs) before a lease
+  is asked for: a lease counts only the openers its own kernel sees, so on
+  NFS, CIFS, CephFS, GlusterFS, virtiofs, 9p or sshfs it could not see a
+  writer on another machine or on the host of a shared folder, and kernels
+  from before leases became opt-in per filesystem grant one on FUSE anyway.
+  A lease error that may pass (anything but `EACCES`, `EPERM`, `EINVAL`,
+  `ENOSYS`, `EOPNOTSUPP`) is a failed delete, tried again. Without the proof
   the fully archived file is kept, and a warning names the reason and the
   remedies; the candidate is dropped, so the refusal is said once per
   covering commit rather than retried every pass. On a platform other than
@@ -511,13 +524,30 @@ Limits, stated plainly:
   Linux-only like the lease, it needs privileges to see other users'
   descriptors, and it cannot see writers in other containers' PID
   namespaces, which is exactly where a sidecar deployment puts them.
-- **With the lease, one window is left**: a process that opens the file by
-  its hidden name (`.vtop-delete.<nanos>.<n>`) between the final check and
-  the unlink. Its open waits on the lease, and gets the unlinked file once
-  the lease is released. Nothing has reason to open that name, and the
-  engine logs an error if it happens. A process that reaches the file
-  through another hard link is not in this window: the file keeps that
-  name, and the link is its own source (#378).
+- **With the lease, these windows are left**:
+  - an open of the path that resolved it to the file before the rename and
+    then stalled in the kernel for longer than the 50 ms grace before
+    reaching the lease;
+  - a process that opens the file by its hidden name
+    (`.vtop-delete.<nanos>.<n>`) between the final check and the unlink,
+    which nothing has reason to do.
+
+  Either open gets the unlinked file once the lease is released; if it
+  broke the lease before then, the engine logs an error. A process that
+  reaches the file through another hard link is not in this window: the
+  file keeps that name, and the link is its own source (#378).
+- **A put-back can fail while an opener waits.** An opener that breaks the
+  lease is meant to get the file back under its name. If, since the rename,
+  a writer has created a new file at the path (`O_CREAT`), the hard link
+  back fails: the file stays under its hidden name, the waiting opener
+  writes into it, and those lines are not archived unless a configured
+  pattern matches the hidden name. An error names both paths. It takes two
+  writers on a file that has been quiet for `delete_quiet_seconds`, one of
+  them opening it within the grace; archiving the hidden file as a source
+  of its own would close it, and is not done here.
+- While the lease is held - the grace and the checks around it - an open of
+  the file waits (up to `fs.lease-break-time`, 45 s by default, if the
+  engine were frozen), and an `O_NONBLOCK` open fails with `EWOULDBLOCK`.
 - A crash between the rename and the unlink leaves the file under its
   hidden name; it is never deleted unchecked. The crash releases the lease,
   and an opener that was waiting on it then gets that file: anything it

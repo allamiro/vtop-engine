@@ -18,12 +18,22 @@
 //! Leases are per inode in the kernel, so this sees a writer in another
 //! container sharing the volume, which a scan of `/proc/*/fd` cannot.
 //!
-//! WHERE IT CANNOT. Elsewhere there is no such check: other platforms, file
-//! systems without leases (NFS, most FUSE and 9p/virtiofs mounts, where the
-//! kernel answers `EINVAL`), a file whose owner is not the engine's user when
-//! the engine lacks `CAP_LEASE` (`EACCES`), or `fs.leases-enable = 0`. Those
-//! answer [`Sole::Unknown`], and the caller refuses the delete unless the
-//! operator chose the quiet period alone (`delete_without_open_check`).
+//! ONLY ON A LOCAL FILESYSTEM. A lease counts the openers THIS kernel sees.
+//! On a network or FUSE filesystem (NFS, CIFS, CephFS, GlusterFS, virtiofs,
+//! 9p, sshfs) a writer on another machine, or on the host behind a VM's
+//! shared folder, is invisible to it - and kernels before leases became
+//! opt-in per filesystem grant one there anyway (review of #689). So the
+//! filesystem type is checked first, against a list of local ones
+//! ([`LOCAL_FILESYSTEMS`]), and anything else answers [`Sole::Unknown`]
+//! without asking for a lease.
+//!
+//! WHERE IT CANNOT. Elsewhere there is no such check: other platforms, a
+//! filesystem not on that list, a file whose owner is not the engine's user
+//! when the engine lacks an effective `CAP_LEASE` (`EACCES`), or
+//! `fs.leases-enable = 0` (`EINVAL`). Those answer [`Sole::Unknown`], and the
+//! caller refuses the delete unless the operator chose the quiet period alone
+//! (`delete_without_open_check`). Any other error answers [`Sole::Failed`]:
+//! not a verdict, so the delete is tried again later.
 //!
 //! UNSAFE. The only `unsafe` in this crate is here: `fcntl` with integer
 //! arguments on a descriptor the borrowed `File` keeps open for the call. No
@@ -43,6 +53,31 @@ pub(crate) enum Sole<'a> {
     Open,
     /// There is no way to tell here; the reason, for the log.
     Unknown(String),
+    /// The check itself failed for a reason that may pass (`ENOMEM`,
+    /// `ENOLCK`, a failed `fstatfs`): no verdict either way.
+    Failed(std::io::Error),
+}
+
+/// Filesystems on which a write lease sees every opener of a file: local
+/// ones, by `statfs` `f_type` (`linux/magic.h`). An overlay counts: it is
+/// the container's own root, and its lower and upper layers are local
+/// directories.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const LOCAL_FILESYSTEMS: &[(u32, &str)] = &[
+    (0xEF53, "ext2/ext3/ext4"),
+    (0x5846_5342, "xfs"),
+    (0x9123_683E, "btrfs"),
+    (0x0102_1994, "tmpfs"),
+    (0x794C_7630, "overlay"),
+    (0xF2F5_2010, "f2fs"),
+    (0x2FC1_2FC1, "zfs"),
+    (0xCA45_1A4E, "bcachefs"),
+];
+
+/// Whether a filesystem of type `magic` is one a lease can be trusted on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn is_local(magic: u32) -> bool {
+    LOCAL_FILESYSTEMS.iter().any(|(m, _)| *m == magic)
 }
 
 /// A Linux write lease on a file, released when dropped.
@@ -75,6 +110,19 @@ mod imp {
     }
 
     pub(super) fn take(file: &File) -> Sole<'_> {
+        let magic = match rustix::fs::fstatfs(file) {
+            // `f_type` is a signed long on 64-bit targets and a u32 on some
+            // others; the magic numbers are 32-bit either way.
+            Ok(fs) => fs.f_type as u64 as u32,
+            Err(error) => return Sole::Failed(error.into()),
+        };
+        if !super::is_local(magic) {
+            return Sole::Unknown(format!(
+                "the file is on a filesystem of type {magic:#x}, not a local one (ext2/3/4, \
+                 xfs, btrfs, tmpfs, overlay, f2fs, zfs, bcachefs): a lease there cannot see \
+                 a writer on another machine or on the host of a shared folder"
+            ));
+        }
         // A lease break signals the holder, and the default signal, SIGIO,
         // terminates the process. SIGURG's default action is to ignore it,
         // and nothing in the engine handles it, so a break can never stop the
@@ -90,12 +138,23 @@ mod imp {
             {
                 return Sole::Open
             }
-            Err(error) => {
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EACCES)
+                        | Some(libc::EPERM)
+                        | Some(libc::EINVAL)
+                        | Some(libc::ENOSYS)
+                        | Some(libc::EOPNOTSUPP)
+                ) =>
+            {
                 return Sole::Unknown(format!(
                     "a write lease, the engine's check that no process holds the file open, \
-                     was refused: {error}"
+                     was refused ({error}): it needs the engine to own the file or to have \
+                     CAP_LEASE in its effective set, and fs.leases-enable on"
                 ))
             }
+            Err(error) => return Sole::Failed(error),
         }
         // And no signal at all: with no owner, a break sends none. The lease
         // state, which is what the delete reads, is unaffected.
@@ -163,11 +222,24 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Review of #689: a lease is trusted only on a local filesystem.
+    #[test]
+    fn only_local_filesystems_are_trusted() {
+        for magic in [0xEF53, 0x5846_5342, 0x0102_1994, 0x794C_7630] {
+            assert!(is_local(magic), "{magic:#x}");
+        }
+        // nfs, cifs, fuse (sshfs, virtiofs on older kernels), 9p, ceph.
+        for magic in [0x6969, 0xFF53_4D42, 0x6573_5546, 0x0102_1997, 0x00C3_6400] {
+            assert!(!is_local(magic), "{magic:#x}");
+        }
+    }
+
     fn leased(file: &File) -> Option<WriteLease<'_>> {
         match take(file) {
             Sole::Proven(lease) => Some(lease),
             Sole::Open => None,
             Sole::Unknown(why) => panic!("no lease check on the test's filesystem: {why}"),
+            Sole::Failed(error) => panic!("the lease check failed: {error}"),
         }
     }
 

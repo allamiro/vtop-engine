@@ -467,11 +467,14 @@ pub struct FileSourceConfig {
     /// writer that holds the file open - or opens it while it is being
     /// deleted - keeps it, however long it has been silent.
     ///
-    /// The lease needs Linux, a local filesystem (not NFS, and not most FUSE,
-    /// 9p or virtiofs mounts), and the engine running as the files' owner or
-    /// with `CAP_LEASE`. Without it there is no check, and a fully archived
-    /// file is KEPT, with a warning naming the reason, unless
-    /// `delete_without_open_check` is set.
+    /// The lease needs Linux, a local filesystem (ext2/3/4, xfs, btrfs,
+    /// tmpfs, overlay, f2fs, zfs or bcachefs: on NFS, CIFS, FUSE, 9p,
+    /// virtiofs or CephFS it could not see a writer on another machine, so it
+    /// is not asked for), and the engine running as the files' owner or with
+    /// `CAP_LEASE` in its effective set. Without it there is no check, and a
+    /// fully archived file is KEPT, with a warning naming the reason, unless
+    /// `delete_without_open_check` is set. On a platform without inode
+    /// numbers no file is ever deleted.
     #[serde(default)]
     pub delete_after_commit: bool,
     /// How long, in seconds, a fully archived file must stay unwritten before

@@ -1561,11 +1561,20 @@ impl Engine {
         }
         if let Some(f) = &config.sources.file {
             if f.enabled {
-                if f.delete_after_commit
+                if f.delete_after_commit && !cfg!(unix) {
+                    // Said at startup, not first when a file is due (#619).
+                    // Without inode numbers no file can be proven to be the
+                    // one a batch read, so none is ever deleted, whatever
+                    // delete_without_open_check says (review of #689).
+                    tracing::warn!(
+                        "sources.file.delete_after_commit is set, but this platform has no \
+                         inode numbers to prove a file is the one archived, so no file is ever \
+                         deleted"
+                    );
+                } else if f.delete_after_commit
                     && !f.delete_without_open_check
                     && !cfg!(target_os = "linux")
                 {
-                    // Said at startup, not first when a file is due (#619).
                     tracing::warn!(
                         "sources.file.delete_after_commit is set, but this platform has no check \
                          that no process holds a file open (the engine uses Linux write leases), \

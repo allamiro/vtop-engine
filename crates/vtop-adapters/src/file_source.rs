@@ -261,23 +261,38 @@ impl DeleteJob {
     ///    still holding it - silent however long - keeps it. Where no lease
     ///    can be had at all, the delete is refused, unless the operator has
     ///    chosen the quiet period alone.
-    /// 3. The file is renamed to a hidden name beside it. A writer that opens
-    ///    the path from now on creates a new file there, which is read as one.
-    /// 4. The renamed file is checked again, through the same descriptor: it
+    /// 3. The file is renamed to a hidden name beside it. A writer whose open
+    ///    of the path starts from now on creates a new file there, which is
+    ///    read as one.
+    /// 4. The lease is held for [`DELETE_GRACE`] more. An open resolves the
+    ///    path to the file BEFORE it reaches the lease, so an open that
+    ///    started before the rename can still be on its way to this file;
+    ///    checked at once, it found the lease intact, the file was unlinked
+    ///    and the lease released, and the open then landed on the unlinked
+    ///    file (review of #689, reproduced with writers that open, append and
+    ///    close in a loop). The grace lets such an open reach the lease and
+    ///    break it.
+    /// 5. The renamed file is checked again, through the same descriptor: it
     ///    must be the inode that was leased, unchanged, and the lease must
     ///    still stand - an open of the file after step 2, by anyone, breaks
     ///    it, and the opener waits until the lease is released. Any of these
-    ///    failing puts the file back under its name and keeps it; the waiting
-    ///    opener then gets a file that still has its name.
-    /// 5. Only then is it unlinked, and the lease released.
+    ///    failing puts the file back under its name and keeps it, and only
+    ///    then releases the lease, so the waiting opener gets a file that
+    ///    still has its name - unless a new file has taken the name since
+    ///    step 3, when the put-back fails, the file stays under the hidden
+    ///    name, and an error names both (see [`put_back`]).
+    /// 6. Only then is it unlinked, and the lease released.
     ///
     /// A check followed by an unlink with none of this lost a line appended
     /// in between; the quiet period alone lost the lines of a writer that
     /// held the file open through it.
     ///
-    /// What is left, with the lease: a process that opens the file by its
-    /// HIDDEN name between step 4 and the unlink, which nothing has reason to
-    /// do; it is logged as an error. A crash after step 3 leaves the file
+    /// What is left, with the lease: an open that started before the rename
+    /// and stalls in the kernel for longer than the grace before reaching
+    /// the lease, and a process that opens the file by its HIDDEN name
+    /// between step 5 and the unlink, which nothing has reason to do. Either,
+    /// if it breaks the lease before the release, is logged as an error. A
+    /// crash after step 3 leaves the file
     /// under the hidden name in the same directory (`.vtop-delete.<nanos>.<n>`),
     /// never deleted. It is fully archived unless an opener waiting on the
     /// lease wrote to it after the crash released it. If a configured pattern
@@ -326,10 +341,16 @@ impl DeleteJob {
         let lease = match self.open_check(file) {
             write_lease::Sole::Proven(lease) => Some(lease),
             write_lease::Sole::Open => {
-                return DeleteAttempt::Open("a process has it open; a writer may still be there")
+                return DeleteAttempt::Open(
+                    "it is open elsewhere - in another process, or through another descriptor \
+                     of this engine - so a writer may still be there",
+                )
             }
             write_lease::Sole::Unknown(_) if self.without_open_check => None,
             write_lease::Sole::Unknown(why) => return DeleteAttempt::Refused(why),
+            write_lease::Sole::Failed(error) => {
+                return DeleteAttempt::Failed(format!("the open-file check failed: {error}"))
+            }
         };
         #[cfg(test)]
         if let Some(hook) = &self.after_lease {
@@ -351,6 +372,11 @@ impl DeleteJob {
                 return DeleteAttempt::Failed(format!("the file could not be moved aside: {error}"))
             }
         };
+        // An open that resolved the path before the rename reaches the lease
+        // within this, and breaks it (step 4 above). Without a lease there is
+        // nothing to break, but a write such an open makes lands in time to
+        // be seen by the check below.
+        std::thread::sleep(DELETE_GRACE);
         // The final checks before the unlink, through the descriptor that
         // holds the lease: opening the renamed file again would break it.
         // The name moved must be the file leased - a rotation can put another
@@ -383,9 +409,10 @@ impl DeleteJob {
                             tracing::error!(
                                 path = %path.display(),
                                 aside = %aside.display(),
-                                "delete-after-commit: a process opened the file by its hidden \
-                                 name in the instant before it was unlinked; anything it writes \
-                                 to it is not archived"
+                                "delete-after-commit: a process opened the file in the instant \
+                                 before it was unlinked (by its hidden name, or an open of the \
+                                 path that stalled for longer than the grace); anything it \
+                                 writes to it is not archived"
                             );
                         }
                         DeleteAttempt::Deleted
@@ -414,6 +441,14 @@ impl DeleteJob {
         }
     }
 }
+
+/// How long a delete holds its lease on the file it has moved aside before
+/// the final check (#619, review of #689): long enough for an open that
+/// resolved the path just before the rename to reach the lease. Writers'
+/// opens of the path are never held up by it - after the rename they find a
+/// new file. With writers opening, appending and closing in a tight loop, 20
+/// and 50 ms both lost nothing where no grace lost lines.
+const DELETE_GRACE: Duration = Duration::from_millis(50);
 
 /// Whether two descriptors are on the same file (device and inode).
 fn same_file(a: &std::fs::File, b: &std::fs::File) -> bool {
@@ -2603,6 +2638,9 @@ impl SourceAdapter for FileSource {
         _max_wait: Duration,
     ) -> Result<Vec<ReadResult>, VtopError> {
         let path = source.source_name.clone();
+        // Expired rotated descriptors are closed first: one still open on the
+        // file would make the delete's lease fail (#619).
+        self.expire_rotated();
         // A fully archived file that has stayed unwritten for the quiet period
         // goes now (#619); nothing in it is left to read.
         if self.delete_if_quiet(&path).await {
@@ -2612,7 +2650,6 @@ impl SourceAdapter for FileSource {
         // skipped without an open (see `run_job`). The marker still reports
         // the cursor where it stands, so a skipped file is indistinguishable
         // from one that was read and had nothing to give — which is what it is.
-        self.expire_rotated();
         let job = self.read_job(&path);
         let start = job.start;
         let (outcome, drained) = Self::run_job(job, max_records, max_bytes, self.whole_file).await;
@@ -2657,6 +2694,9 @@ impl SourceAdapter for FileSource {
         // serialize them all ahead of every read, the pre-pass #412 removed.
         // Only the decision of which are due, and the cursor updates after,
         // run here.
+        // Expired rotated descriptors are closed first: one still open on a
+        // file would make its delete's lease fail.
+        self.expire_rotated();
         let due: Vec<(usize, DeleteJob)> = sources
             .iter()
             .enumerate()
@@ -2676,7 +2716,6 @@ impl SourceAdapter for FileSource {
                 deleted.insert(i);
             }
         }
-        self.expire_rotated();
         let jobs: Vec<(usize, ReadJob)> = sources
             .iter()
             .enumerate()
@@ -6993,7 +7032,10 @@ mod tests {
     /// whose write lands after the delete's final check of the file moved
     /// aside but before the unlink. The check saw the file unchanged, so the
     /// unlink took the write with it. The seam writes exactly there, through
-    /// the writer's own descriptor.
+    /// the writer's own descriptor, if the delete gets that far - on the
+    /// delete before #619 was finished it did. Now the writer's open
+    /// descriptor stops it at the lease (or, off Linux, the delete is refused),
+    /// and the writer writes after the delete instead.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_write_between_the_final_check_and_the_unlink_is_not_lost() {
@@ -7061,20 +7103,40 @@ mod tests {
             let Some(wait_for_go) = wait_for_go.lock().unwrap().take() else {
                 return;
             };
-            let (started, wait_for_start) = mpsc::channel::<()>();
+            use std::os::unix::fs::MetadataExt;
+            let inode = std::fs::metadata(&seam_path).unwrap().ino();
+            let (opened, has_opened) = mpsc::channel::<()>();
             let path = seam_path.clone();
             *seam_opener.lock().unwrap() = Some(std::thread::spawn(move || {
-                started.send(()).unwrap();
                 let mut w = std::fs::OpenOptions::new()
                     .append(true)
                     .open(&path)
                     .unwrap();
+                let _ = opened.send(());
                 wait_for_go.recv().unwrap();
                 w.write_all(b"late\n").unwrap();
             }));
-            wait_for_start.recv().unwrap();
-            // Long enough for the open to reach the file.
-            std::thread::sleep(Duration::from_millis(300));
+            // Wait until the open has reached the file: it either returned
+            // (nothing held it up) or is waiting on the lease, which
+            // /proc/locks then shows breaking for this inode. No sleep to
+            // guess at, so a slow machine cannot turn this into the
+            // in-flight case the grace covers.
+            let breaking = format!(":{inode} ");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if has_opened.try_recv().is_ok() {
+                    return;
+                }
+                let locks = std::fs::read_to_string("/proc/locks").unwrap_or_default();
+                if locks
+                    .lines()
+                    .any(|l| l.contains("LEASE") && l.contains("BREAKING") && l.contains(&breaking))
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            panic!("the opener never reached the file");
         }));
         let read = fs
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
