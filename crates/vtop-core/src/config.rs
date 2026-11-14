@@ -513,7 +513,11 @@ pub fn sqlite_ledger_file(conn: &str) -> Option<std::path::PathBuf> {
         }
         None => path,
     };
-    let path = percent_decode(path);
+    let mut path = percent_decode(path);
+    // SQLite reads the decoded name as a C string: `%00` ends it (review).
+    if let Some(nul) = path.iter().position(|&b| b == 0) {
+        path.truncate(nul);
+    }
     if path.is_empty() || path == b":memory:" {
         return None;
     }
@@ -3582,6 +3586,11 @@ upload:
             ("sqlite:file:/data/state.db?mode=rwc&mode=memory", None),
             (
                 "sqlite:file:/data/state.db?mode=Memory",
+                some("/data/state.db"),
+            ),
+            // `%00` ends the name, as it does for SQLite (review).
+            (
+                "sqlite:file:/data/state.db%00ignored",
                 some("/data/state.db"),
             ),
             ("sqlite::memory:", None),
