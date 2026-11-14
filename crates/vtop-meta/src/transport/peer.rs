@@ -710,9 +710,6 @@ mod tests {
         server_task.abort();
     }
 
-    /// A plaintext Raft group forms and exchanges votes with no PKI at all
-    /// (#294 slice 2). This is the shape the compose lab wants and the reason
-    /// option (2) was chosen over refusing plaintext on this plane entirely.
     /// #706: a member answers what it runs - who it is, its release and the
     /// highest feature level this build implements.
     #[tokio::test]
@@ -853,6 +850,9 @@ mod tests {
         server_task.abort();
     }
 
+    /// A plaintext Raft group forms and exchanges votes with no PKI at all
+    /// (#294 slice 2). This is the shape the compose lab wants and the reason
+    /// option (2) was chosen over refusing plaintext on this plane entirely.
     #[tokio::test]
     async fn loopback_plaintext_vote_round_trip() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

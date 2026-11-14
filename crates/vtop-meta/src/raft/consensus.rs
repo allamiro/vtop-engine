@@ -96,7 +96,7 @@ pub enum ConsensusError {
         if *.skew_ms >= 0 { "ahead of" } else { "behind" }
     )]
     ClockSkew { skew_ms: i64, bound_ms: u64 },
-    /// A raise to a level only the metadata tier reads was refused because
+    /// A raise to a level every metadata member must implement was refused because
     /// a metadata member did not show it supports the level (#706). Nothing
     /// was proposed. The message names each member and what it answered.
     #[error("{}", crate::versions::describe_member_blockers(*.level, *.enabled, .blockers))]
@@ -105,6 +105,10 @@ pub enum ConsensusError {
         enabled: u32,
         blockers: Vec<crate::versions::MemberBlocker>,
     },
+    /// Refused before anything was proposed, for a reason the message
+    /// states with what to do.
+    #[error("{0}")]
+    Refused(String),
 }
 
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
@@ -265,9 +269,9 @@ impl OpenraftConsensus {
             return Ok(());
         }
         let Some(store) = self.store.as_ref() else {
-            return Err(ConsensusError::Message(format!(
+            return Err(ConsensusError::Refused(format!(
                 "this node was built without applied state, so it cannot tell which feature \
-                 level is in force; the raise to {level} is refused"
+                 level is in force; the raise to {level} is refused and nothing was proposed"
             )));
         };
         let enabled = store.with_storage(|storage| storage.state().feature_level());
@@ -283,6 +287,10 @@ impl OpenraftConsensus {
             });
         }
         let local = MetaNodeId(metrics.id);
+        // Judged against one term and one membership: re-read once the
+        // members have answered (review of #758).
+        let judged_term = metrics.current_term;
+        let judged_membership = *metrics.membership_config.log_id();
         let membership = metrics.membership_config.membership();
         let members: std::collections::BTreeSet<NodeId> = membership
             .voter_ids()
@@ -336,12 +344,29 @@ impl OpenraftConsensus {
                 // was asking would drop out of the judgement: refuse the
                 // raise rather than judge without it.
                 Err(error) => {
-                    return Err(ConsensusError::Message(format!(
+                    return Err(ConsensusError::Refused(format!(
                         "asking the metadata members what they run failed ({error}); the \
                          raise to {level} is refused and nothing was proposed"
                     )))
                 }
             }
+        }
+        // The answers hold only for the term and the membership they were
+        // asked under (review of #758). A leader that lost office and won it
+        // back, or a member added while they were asked, would otherwise
+        // carry a judgement about a different group into `client_write`.
+        let now = self.raft.metrics().borrow().clone();
+        if now.state != ServerState::Leader || now.current_term != judged_term {
+            return Err(ConsensusError::NotLeader {
+                leader: now.current_leader.map(MetaNodeId),
+            });
+        }
+        if *now.membership_config.log_id() != judged_membership {
+            return Err(ConsensusError::Refused(format!(
+                "feature level {level} not raised: the metadata membership changed while its \
+                 members were asked what they run. Nothing was proposed; the level stays \
+                 {enabled}. Raise again"
+            )));
         }
         let blockers = member_blockers(level, &answers);
         if blockers.is_empty() {
@@ -1248,7 +1273,7 @@ fn to_transport_error(error: ConsensusError) -> TransportError {
         },
         // Refused before anything was proposed: the edge record says
         // "refused", not "outcome unknown".
-        refused @ ConsensusError::MembersNotReady { .. } => {
+        refused @ (ConsensusError::MembersNotReady { .. } | ConsensusError::Refused(_)) => {
             TransportError::Refused(refused.to_string())
         }
         other => TransportError::Protocol(other.to_string()),

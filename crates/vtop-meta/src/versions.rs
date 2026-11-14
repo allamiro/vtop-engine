@@ -140,13 +140,30 @@ pub fn describe_blockers(level: u32, blockers: &[FeatureBlocker]) -> String {
 /// The first feature level a leader raises only on the metadata members'
 /// own word (#706).
 ///
-/// Levels up to 8 were raised on the operator's: nothing asked the voters,
-/// and a voter on v0.9.0 (which implements 8) cannot answer the question, so
-/// asking it would refuse a raise that release supports. From 9 on every
-/// member must answer, because level 9 is the first whose commands are
-/// routine operator traffic: a voter that cannot decode them appends nothing
-/// more, and the level it rejected leaves its view diverged for good.
-pub const FIRST_MEMBER_CHECKED_FEATURE_LEVEL: u32 = 9;
+/// Levels up to 7 were raised on the operator's: nothing asked the voters,
+/// and the releases that implement 7 (v0.8.0, v0.9.0) cannot answer the
+/// question, so asking them would refuse a raise they support. Level 8 ships
+/// in the same release as the question, so no release that implements 8 is
+/// unable to answer it, and from 8 on every member must: a voter that cannot
+/// apply a level rejects it deterministically, its view of the level
+/// diverges for good, and the first command of that level is one it cannot
+/// decode (review of #758: v0.9.0 implements 7, not 8).
+pub const FIRST_MEMBER_CHECKED_FEATURE_LEVEL: u32 = 8;
+
+/// Bound on the reason an unreachable member is named with, so the members
+/// after it survive the admin error bound.
+const MAX_UNREACHABLE_REASON_BYTES: usize = 48;
+
+fn clip_reason(reason: &str) -> &str {
+    if reason.len() <= MAX_UNREACHABLE_REASON_BYTES {
+        return reason;
+    }
+    let mut end = MAX_UNREACHABLE_REASON_BYTES;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    &reason[..end]
+}
 
 /// What one metadata member answered when the leader asked what it runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,11 +205,20 @@ impl std::fmt::Display for MemberBlocker {
                 "{} (node {node_id} answered at its address)",
                 self.member
             ),
-            MemberVersion::NoAnswer => {
-                write!(formatter, "{} (no answer: v0.9.0 or older)", self.member)
-            }
+            // Any close after the request, so not only an old release: a
+            // member that refused the request closes the same way.
+            MemberVersion::NoAnswer => write!(
+                formatter,
+                "{} (closed without answering: v0.9.0 or older, or it refused)",
+                self.member
+            ),
             MemberVersion::Unreachable(reason) => {
-                write!(formatter, "{} (unreachable: {reason})", self.member)
+                write!(
+                    formatter,
+                    "{} (unreachable: {})",
+                    self.member,
+                    clip_reason(reason)
+                )
             }
         }
     }
@@ -237,7 +263,11 @@ pub fn member_blockers(
     // find from a version listing.
     blockers.sort_by_key(|blocker| {
         (
-            matches!(blocker.answer, MemberVersion::Reported { .. }),
+            match blocker.answer {
+                MemberVersion::NoAnswer => 0,
+                MemberVersion::Unreachable(_) => 1,
+                MemberVersion::Reported { .. } => 2,
+            },
             blocker.member,
         )
     });
@@ -343,63 +373,71 @@ mod tests {
         }
     }
 
-    /// #706: from level 9 every metadata member must answer as itself with
+    /// #706: from level 8 every metadata member must answer as itself with
     /// that level or higher. An old member's silence, an unreachable member
-    /// and another node answering at a member's address all hold it back.
+    /// and another node answering at a member's address all hold it back;
+    /// the silent first, then the unreachable, then those that answered low.
     #[test]
-    fn a_raise_from_level_9_waits_for_every_metadata_member() {
+    fn a_raise_from_level_8_waits_for_every_metadata_member() {
         use crate::keys::MetaNodeId;
         let answers = vec![
-            (MetaNodeId(1), reported(1, 9)),
-            (MetaNodeId(2), reported(2, 10)),
+            (MetaNodeId(1), reported(1, 8)),
+            (MetaNodeId(2), reported(2, 9)),
             (MetaNodeId(3), MemberVersion::NoAnswer),
-            (MetaNodeId(4), reported(4, 8)),
+            (MetaNodeId(4), reported(4, 7)),
             (
                 MetaNodeId(5),
                 MemberVersion::Unreachable("connection refused".into()),
             ),
-            (MetaNodeId(6), reported(7, 9)),
+            (MetaNodeId(6), reported(7, 8)),
         ];
-        let blockers = member_blockers(9, &answers);
+        let blockers = member_blockers(8, &answers);
         assert_eq!(
             blockers.iter().map(|b| b.member.0).collect::<Vec<_>>(),
             vec![3, 5, 4, 6],
-            "the silent and the unreachable first, then those that answered"
+            "the silent, then the unreachable, then those that answered"
         );
-        let why = describe_member_blockers(9, 8, &blockers);
+        let why = describe_member_blockers(8, 7, &blockers);
         assert!(why.contains("not raised"), "{why}");
         assert!(
-            why.contains("Nothing was proposed; the level stays 8"),
+            why.contains("Nothing was proposed; the level stays 7"),
             "{why}"
         );
         assert!(why.contains("Upgrade them, then raise again"), "{why}");
-        assert!(why.contains("3 (no answer: v0.9.0 or older"), "{why}");
-        assert!(why.contains("4 (release 0.10.0, supports 8)"), "{why}");
+        assert!(
+            why.contains("3 (closed without answering: v0.9.0 or older, or it refused)"),
+            "{why}"
+        );
+        assert!(why.contains("4 (release 0.10.0, supports 7)"), "{why}");
         assert!(why.contains("5 (unreachable: connection refused)"), "{why}");
         assert!(why.contains("6 (node 7 answered at its address)"), "{why}");
-
         assert!(
-            member_blockers(9, &answers[..2]).is_empty(),
-            "members that answered 9 and 10 let a raise to 9 through"
+            member_blockers(8, &answers[..2]).is_empty(),
+            "members that answered 8 and 9 let a raise to 8 through"
         );
-        assert_eq!(member_blockers(10, &answers[..2]).len(), 1);
+        assert_eq!(member_blockers(9, &answers[..2]).len(), 1);
     }
 
-    /// Levels up to 8 were raised on the operator's word, and a v0.9.0
-    /// voter supports 8 but cannot answer: asking would refuse a raise it
-    /// can apply.
+    /// Levels up to 7 were raised on the operator's word, and v0.8.0 and
+    /// v0.9.0 implement 7 but cannot answer: asking would refuse a raise
+    /// they can apply. v0.9.0 implements 7, not 8 (review of #758), so the
+    /// check starts at 8.
     #[test]
-    fn levels_below_9_are_not_judged_on_the_metadata_members() {
+    fn levels_below_8_are_not_judged_on_the_metadata_members() {
         let answers = vec![(crate::keys::MetaNodeId(3), MemberVersion::NoAnswer)];
         for level in 1..FIRST_MEMBER_CHECKED_FEATURE_LEVEL {
             assert!(member_blockers(level, &answers).is_empty(), "level {level}");
         }
-        assert_eq!(FIRST_MEMBER_CHECKED_FEATURE_LEVEL, 9);
-        assert_eq!(member_blockers(9, &answers).len(), 1);
+        assert_eq!(
+            FIRST_MEMBER_CHECKED_FEATURE_LEVEL,
+            crate::command::PROMOTE_UNPROVEN_FEATURE_LEVEL
+        );
+        assert_eq!(member_blockers(8, &answers).len(), 1);
     }
 
     /// The admin error is cut at `MAX_ERROR_DETAIL_BYTES`: what happened,
-    /// what was done and what to do survive however many members it names.
+    /// what was done and what to do survive however many members it names,
+    /// and a long unreachable reason is clipped so the members after it fit.
     #[test]
     fn the_member_refusal_keeps_its_remedy_inside_the_error_bound() {
         let blockers: Vec<MemberBlocker> = (1..=9)
@@ -408,30 +446,34 @@ mod tests {
                 answer: MemberVersion::Unreachable("x".repeat(80)),
             })
             .collect();
-        let why = describe_member_blockers(9, 8, &blockers);
+        let why = describe_member_blockers(8, 7, &blockers);
         let cut = &why[..crate::command::MAX_ERROR_DETAIL_BYTES.min(why.len())];
         assert!(cut.contains("Upgrade them, then raise again"), "{cut}");
-        assert!(cut.contains("level stays 8"), "{cut}");
+        assert!(cut.contains("level stays 7"), "{cut}");
         assert!(why.contains("9 metadata members"), "{why}");
-        assert!(describe_member_blockers(9, 8, &blockers[..1]).contains("1 metadata member "));
+        assert!(!why.contains(&"x".repeat(49)), "reasons are clipped: {why}");
+        assert!(describe_member_blockers(8, 7, &blockers[..1]).contains("1 metadata member "));
 
-        // The rolling-upgrade shape: two members on this release, one older
-        // one that cannot answer. All three names fit, the silent one first.
+        // The rolling-upgrade shape: an unreachable member with a long TLS
+        // reason and an old one that closes the connection. The old one is
+        // named first, so it survives the bound.
         let rolling = member_blockers(
-            9,
+            8,
             &[
-                (crate::keys::MetaNodeId(1), reported(1, 8)),
-                (crate::keys::MetaNodeId(2), reported(2, 8)),
+                (
+                    crate::keys::MetaNodeId(2),
+                    MemberVersion::Unreachable(format!(
+                        "tls: peer connect: invalid peer certificate: {}",
+                        "expired ".repeat(20)
+                    )),
+                ),
                 (crate::keys::MetaNodeId(3), MemberVersion::NoAnswer),
             ],
         );
-        let why = describe_member_blockers(9, 4, &rolling);
-        assert!(
-            why.len() <= crate::command::MAX_ERROR_DETAIL_BYTES,
-            "{} bytes: {why}",
-            why.len()
-        );
-        assert!(why.contains("again: 3 (no answer"), "{why}");
+        let why = describe_member_blockers(8, 4, &rolling);
+        let cut = &why[..crate::command::MAX_ERROR_DETAIL_BYTES.min(why.len())];
+        assert!(cut.contains("again: 3 (closed without answering"), "{cut}");
+        assert!(cut.contains("2 (unreachable: tls"), "{cut}");
     }
 
     /// Nothing can vouch for a data node before reports exist, so the level

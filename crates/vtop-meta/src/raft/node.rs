@@ -69,7 +69,7 @@ pub async fn start_meta_node(
     let read_store = store.clone();
     let state_machine = MetaRaftStateMachine::new(store).with_node_id(node_id);
     let network = TlsRaftNetworkFactory::new(node_id, directory, material);
-    // Asked before a raise to a level only the metadata tier reads (#706).
+    // Asked before a raise to a level every member must implement (#706).
     let member_probe = network.member_probe();
     let config = Arc::new(
         Config {

@@ -44,11 +44,13 @@ raise above 7 (in a later release) is refused while any counted node has not
 reported that level, and the refusal names each one. `node-versions --level N`
 answers whether level `N` could be raised now, and exits non-zero if not.
 
-From level 9 the metadata voters are checked too (#706): the leader asks every
+From level 8 the metadata voters are checked too (#706): the leader asks every
 voter and learner what it runs before it proposes the raise, and refuses,
 proposing nothing, unless each answers that it supports the level. A voter
-still on v0.9.0 or older cannot answer, so the refusal names it ("no answer");
-upgrade it and raise again.
+still on v0.9.0 or older cannot answer, so the refusal names it ("closed
+without answering"); upgrade it and raise again. The leader must run this
+release for the check to happen: raise once `vtopctl meta status` shows an
+upgraded node leads.
 
 ### 3. Then use the new settings
 

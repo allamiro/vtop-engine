@@ -10,6 +10,10 @@
 # proposes nothing above the cluster's feature level, so at every mixed step
 # the tier must keep committing and every voter must converge.
 #
+# While one voter is still on the previous release, a raise to feature level 8
+# - the first level the leader judges on the voters' own answers (#706) - is
+# refused and names it.
+#
 # After the last voter is replaced, the operator raises the feature level; the
 # new record must be readable by every node, including one restarted on it.
 #
@@ -93,6 +97,39 @@ meta_admin 1 init --members 1,2,3 > /dev/null
 commit_write "previous release" 01
 await_converged "previous release"
 
+# A raise past a voter on the previous release is refused, naming it (#706).
+# Only a leader on this build asks the voters what they run, so while the
+# old voter leads it is restarted - still on the previous release - until a
+# node on this build does. The previous release has no answer to the
+# question and closes the connection, which is what the refusal must name.
+raise_refused_past_old_voter() { # <old voter id>
+  local old="$1" leader="" attempt out
+  for attempt in 1 2 3 4 5; do
+    leader="$(wait_meta_leader 1 2 3)"
+    [[ "$leader" != "$old" ]] && break
+    log "the old voter $old leads (attempt $attempt); restarting it on the previous release"
+    stop_node_now "${PID[$old]}"
+    leader="$(wait_meta_leader 1 2 3)"
+    VTOP_NODE="$OLD_VTOP_NODE"
+    case "$old" in
+      1) PID[1]=$(start_meta_node 1 2 3) ;;
+      2) PID[2]=$(start_meta_node 2 1 3) ;;
+      3) PID[3]=$(start_meta_node 3 1 2) ;;
+    esac
+    VTOP_NODE="$NEW_VTOP_NODE"
+    await_converged "old voter $old restarted"
+  done
+  [[ "$leader" != "$old" ]] || fail "the old voter $old kept the leadership through 5 restarts"
+  if out="$("$VTOPCTL" --json meta enable-features --level 8 \
+      --config "$(emit_admin_config "$leader")" 2>&1)"; then
+    fail "a raise to 8 was accepted while voter $old runs the previous release: $out"
+  fi
+  [[ "$out" == *"feature level 8 not raised"* && "$out" == *"$old (closed without answering"* \
+    && "$out" == *"Nothing was proposed"* ]] \
+    || fail "the refused raise did not name the old voter $old: $out"
+  log "a raise to 8 was refused while voter $old runs the previous release"
+}
+
 # --- replace each voter with this build ---------------------------------------
 VTOP_NODE="$NEW_VTOP_NODE"
 suffix=2
@@ -108,6 +145,9 @@ for id in 1 2 3; do
   commit_write "node $id upgraded" "$(printf '%02x' "$suffix")"
   suffix=$((suffix + 1))
   await_converged "node $id upgraded"
+  if [[ "$id" == 2 ]]; then
+    raise_refused_past_old_voter 3
+  fi
 done
 
 # --- every voter is upgraded: raise the feature level -------------------------

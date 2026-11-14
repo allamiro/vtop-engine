@@ -65,7 +65,7 @@ pub const KIND_INSTALL_REQ: u16 = 5;
 pub const KIND_INSTALL_RESP: u16 = 6;
 /// A metadata member's release and the highest feature level it implements
 /// (#706): what a leader asks every member before it raises the level to one
-/// only the metadata tier reads. A release before this one has no arm for
+/// the members must all implement (8 and up). A release before this one has no arm for
 /// the kind and closes the connection without an answer, which is itself
 /// the answer: it predates the question, so it supports no level that asks
 /// it.
