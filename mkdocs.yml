@@ -153,6 +153,7 @@ nav:
       - How it works: concepts/how-it-works.md
       - Architecture: concepts/architecture.md
       - Security: concepts/security.md
+      - Security policy: security-policy.md
   - Getting started:
       - getting-started/index.md
       - Quick start (Docker lab): getting-started/quickstart.md
