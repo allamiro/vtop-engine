@@ -152,6 +152,15 @@ jobs:
             benchmark_charts:
               - 'benchmarks/kafka_compare/**'
               - 'docs/benchmarks/**'
+              # The README's evidence charts: their generator and test, the
+              # measurements they are drawn from, the output, and the README
+              # whose prose quotes the same figures.
+              - 'benchmarks/readme_charts.py'
+              - 'benchmarks/tests/test_readme_charts.py'
+              - 'benchmarks/measurements/483-tcp-baseline/**'
+              - 'benchmarks/measurements/663-policed-uplink/**'
+              - 'docs/assets/readme/**'
+              - 'README.md'
               - '.github/workflows/ci.yml'
             scripts:
               - 'scripts/**'
@@ -1756,7 +1765,7 @@ jobs:
       # need it skip there; here they run.
       - name: Report and drift-check tests, with matplotlib
         working-directory: benchmarks
-        run: python -m pytest tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py
+        run: python -m pytest tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_readme_charts.py
       - name: Regenerate every chart and report and fail on drift
         run: |
           python3 benchmarks/kafka_compare/regenerate.py
@@ -1768,6 +1777,15 @@ jobs:
             echo "::error::Committed benchmark charts or reports differ from what the committed CSVs produce. Run 'python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/kafka_compare/regenerate.py' and commit the result."
             echo "$drift"
             git diff --stat -- docs/benchmarks/
+            exit 1
+          fi
+      - name: Redraw the README's charts and fail on drift
+        run: |
+          python3 benchmarks/readme_charts.py
+          drift="$(git status --porcelain -- docs/assets/readme/)"
+          if [ -n "$drift" ]; then
+            echo "::error::The README's charts differ from what the committed measurements produce. Run 'python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt && python3 benchmarks/readme_charts.py' and commit the result."
+            echo "$drift"
             exit 1
           fi
 
