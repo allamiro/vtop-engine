@@ -271,6 +271,10 @@ The limits that matter most when evaluating it:
 - **Not built yet:** public-key manifest signatures and a million-file
   benchmark.
 
+Data-safety bugs were still being found as late as November 2026; each one is
+in the [data-safety register](docs/reference/data-safety-register.md). Keep the
+source data until a scrub of the archive passes.
+
 The full table, with what is done and what is planned, is in
 [limitations.md](docs/reference/limitations.md). Per-release limits are in
 [ROADMAP.md](docs/ROADMAP.md), and the engine's HA status is in

@@ -129,9 +129,20 @@ same retention, and the engine reads its retention back the way it reads the
 manifest's. A receipt the store did not lock is a failed receipt, not a
 failed batch, and is not counted in `vtop_object_lock_checks_total`, whose
 failures are failed batches. Because recovery never writes over an existing receipt, no
-second locked version appears beside the first. `vtopctl scrub
---check-retention` does not read receipts' retention yet
-([#710](https://github.com/allamiro/vtop-engine/issues/710)).
+second locked version appears beside the first.
+
+After that, `vtopctl scrub --check-retention` reads each receipt's retention
+again whenever the scrub also checks receipts (#710): the receipt at its
+current key, since receipts are not pinned in the ledger. It is counted apart
+from the batch's own retention, in
+`vtop_scrub_receipt_retention_total{result}` and a `receipt retention:` line,
+so a receipt whose lock was removed (by a principal allowed to bypass
+governance) or that an engine wrote before the profile was set is reported,
+and never mistaken for an unlocked object. A receipt with no retention, or
+under another mode, is a finding; one whose retention has ended is not; a
+missing receipt is not a retention finding (it is `missing` in
+`vtop_scrub_receipts_total`). See
+[Scrub and coverage audit](scrub-and-audit.md#scrub).
 
 ## Check them
 
