@@ -1,0 +1,103 @@
+# Documentation site: build it on every pull request that touches it, and
+# publish it to GitHub Pages from main.
+#
+#   pull_request        mkdocs build --strict (broken links, broken anchors,
+#                       pages missing from the nav all fail), plus the check
+#                       that every config.yaml key has a reference row.
+#   push to main        the same build, then deploy to GitHub Pages.
+#   workflow_dispatch   rebuild and redeploy main by hand.
+#
+# Publishing needs Pages enabled with "Build and deployment: GitHub Actions"
+# (Settings -> Pages). Until it is, the deploy job fails at configure-pages
+# and the build job still runs.
+name: Docs
+
+on:
+  pull_request:
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "README.md"
+      - "CONTRIBUTING.md"
+      - "scripts/docs_hooks.py"
+      - "scripts/check-config-reference.py"
+      - "crates/vtop-core/src/config.rs"
+      - ".github/workflows/docs.yml"
+  push:
+    branches: [main]
+    # The same list as pull_request.
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "README.md"
+      - "CONTRIBUTING.md"
+      - "scripts/docs_hooks.py"
+      - "scripts/check-config-reference.py"
+      - "crates/vtop-core/src/config.rs"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+# Least privilege by default; only the deploy job is granted Pages and OIDC.
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: build (mkdocs --strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: docs/requirements.txt
+
+      - name: Install pinned, hash-checked dependencies
+        run: python -m pip install --require-hashes -r docs/requirements.txt
+
+      - name: Every config.yaml key has a reference row
+        run: python scripts/check-config-reference.py
+
+      - name: mkdocs build --strict
+        env:
+          # Material prints an end-of-life banner on every build; it is not a
+          # build warning and only adds noise to the log.
+          NO_MKDOCS_2_WARNING: "1"
+        run: mkdocs build --strict --site-dir site
+
+      - name: Upload the site for Pages
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  deploy:
+    name: deploy (GitHub Pages)
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    # One deployment at a time, and never cancel one half-way.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check Pages is enabled for GitHub Actions
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -33,9 +33,29 @@ From the release after v0.8.0, the Linux and macOS binaries need no extra
 libraries. The v0.8.0 binaries and earlier still link OpenSSL 3 and Cyrus
 SASL dynamically:
 
-- **macOS:** `brew install openssl@3 cyrus-sasl`.
-- **Debian/Ubuntu:** `sudo apt-get install -y libssl3 libsasl2-2`.
-- **RHEL family and Fedora:** `sudo dnf install -y openssl-libs cyrus-sasl-lib`.
+=== "Debian / Ubuntu"
+
+    ```bash
+    sudo apt-get install -y libssl3 libsasl2-2
+    ```
+
+=== "RHEL family"
+
+    ```bash
+    sudo dnf install -y openssl-libs cyrus-sasl-lib
+    ```
+
+=== "Fedora"
+
+    ```bash
+    sudo dnf install -y openssl-libs cyrus-sasl-lib
+    ```
+
+=== "macOS"
+
+    ```bash
+    brew install openssl@3 cyrus-sasl
+    ```
 
 The container image always carries what it needs.
 
