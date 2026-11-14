@@ -964,11 +964,13 @@ B. Known limitations:
   does.** Old writers are covered by the committed fixtures in
   `crates/vtop-core/tests/fixtures/manifests/` (v0.7.0 and v0.8.0 output, and
   the first `0.4` manifests and receipts release B wrote). Old readers are
-  covered by the `manifest-compat` CI job (`scripts/manifest-compat.sh`): HEAD
-  writes a signed `0.4` archive with receipts, the published v0.8.0 and later
-  `vtopctl` (checked against each release's `SHA256SUMS`) must pass
-  `verify-manifest` on it and accept the config in `validate`, and v0.7.0
-  must report the self-hash failure.
+  covered by the `manifest` cells of the compatibility matrix
+  (`.github/workflows/compat.yml`, running `scripts/manifest-compat.sh`, #743):
+  HEAD writes a signed `0.4` archive with receipts, the published v0.8.0 and
+  later `vtopctl` (checked against each release's `SHA256SUMS` and Sigstore
+  bundle) must pass `verify-manifest` on it and accept the config in
+  `validate`, and v0.7.0 must report the self-hash failure. Pull requests run
+  the newest release and v0.7.0; the nightly run covers every release.
 
 **Verification receipts (#671 release B).** With
 `manifest.verification_receipts: true` the engine writes

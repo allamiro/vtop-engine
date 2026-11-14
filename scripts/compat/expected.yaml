@@ -1,0 +1,41 @@
+# The compatibility matrix (#743, docs/reference/compatibility.md).
+#
+# A cell is one format, one released tag and one direction:
+#   upgrade  the released binary writes, this build reads;
+#   forward  this build writes, the released binary reads.
+# Releases are the repository's final tags, the newest patch of each minor,
+# from each cell's `since` (scripts/compat/select_cells.py). The released
+# binaries are the published assets, checked by scripts/compat/fetch-release.sh
+# (SHA256SUMS, the Sigstore bundle, the archive's contents), never rebuilds.
+#
+# Every cell is expected to `pass` unless an exception below says otherwise.
+# A cell that refuses or fails with no row here fails the build, so adding a
+# one-way step means editing this reviewed file. Each exception gives:
+#   cell, direction, and `tags: [...]` or `older_than: vX.Y.Z`;
+#   expect: refuse (with `message`, what the older binary prints) or
+#           hash-failure (a manifest reader before the 0.4 scheme);
+#   why: the reason, in a sentence.
+
+cells:
+  # This build writes a signed 0.4 archive with verification receipts; the
+  # released vtopctl runs verify-manifest on it, and `validate` on its config
+  # where it has that command (scripts/manifest-compat.sh). v0.7.0 is the last
+  # release before the 0.4 reader.
+  manifest:
+    since: v0.7.0
+    directions: [forward]
+
+# Tags whose published assets cannot be checked by fetch-release.sh. No
+# released-binary cell runs them; the run's summary lists them as built from
+# source. Every final tag from v0.1.0 to v0.9.0 verified on all four targets
+# when this file was written, so the list is empty.
+built_from_source: []
+
+exceptions:
+  - cell: manifest
+    direction: forward
+    older_than: v0.8.0
+    expect: hash-failure
+    why: >-
+      Releases before v0.8.0 re-encode a 0.4 manifest without the fields they
+      do not know, so its self-hash fails: the documented cutoff.
