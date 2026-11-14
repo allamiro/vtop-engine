@@ -379,9 +379,9 @@ pub trait StateStore: Send + Sync {
     async fn append_audit(
         &self,
         row: &crate::audit::AuditInsert,
-        key: Option<&vtop_core::manifest::ManifestMacKey>,
+        keyring: &vtop_core::manifest::ManifestKeyring,
     ) -> Result<crate::audit::AuditRow, VtopError> {
-        let _ = (row, key);
+        let _ = (row, keyring);
         Err(crate::audit::unsupported())
     }
 

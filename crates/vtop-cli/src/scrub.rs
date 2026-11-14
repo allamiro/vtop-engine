@@ -36,7 +36,9 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 use tracing::Instrument;
 use vtop_core::errors::VtopError;
-use vtop_core::manifest::{ManifestMacKey, ParsedManifest, MAX_MANIFEST_BYTES};
+use vtop_core::manifest::{
+    KeyOutcome, KeyResult, ManifestKeyring, ParsedManifest, MAX_MANIFEST_BYTES,
+};
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::ChecksumAlgorithm;
 use vtop_state::BatchRecord;
@@ -69,7 +71,10 @@ pub enum ScrubResult {
     Mismatched,
     /// The manifest does not parse, fails its self-hash or MAC, or does not
     /// bind to the ledger row (a different batch's manifest, or a forgery
-    /// whose digest is not the one the ledger recorded).
+    /// whose digest is not the one the ledger recorded). Also a manifest
+    /// signed with a key this process does not hold or that is retired
+    /// (#685): unauthenticated, not corrupt; the detail names the key id and
+    /// [`BatchCheck::key`] says which case it is.
     Unauthenticated,
     /// The store could not be read for a reason other than absence (a
     /// timeout, a throttle, a permission error). Nothing was proven either
@@ -118,6 +123,10 @@ pub struct BatchCheck {
     pub result: ScrubResult,
     /// What was found, naming the URI it concerns.
     pub detail: String,
+    /// The manifest MAC check (#685): the key used, by its bounded label,
+    /// and what it found. `None` when no key is configured or the check did
+    /// not get that far.
+    pub key: Option<KeyOutcome>,
 }
 
 impl BatchCheck {
@@ -125,6 +134,7 @@ impl BatchCheck {
         Self {
             result,
             detail: detail.into(),
+            key: None,
         }
     }
 }
@@ -186,10 +196,10 @@ fn read_failure(what: &str, uri: &str, error: &VtopError) -> BatchCheck {
 /// checksum the storage service computed over it.
 pub async fn check_stored_batch(
     backend: &dyn UploadBackend,
-    mac_key: Option<&ManifestMacKey>,
+    keyring: &ManifestKeyring,
     rec: &BatchRecord,
 ) -> BatchCheck {
-    check_with_manifest(backend, mac_key, rec).await.0
+    check_with_manifest(backend, keyring, rec).await.0
 }
 
 /// Whether a manifest claiming a version this build cannot authenticate is
@@ -231,7 +241,7 @@ fn newer_manifest_is_the_fleets(rec: &BatchRecord, bytes: &[u8]) -> Result<(), S
 /// they were read, so the scrub can compare the current key against them.
 async fn check_with_manifest(
     backend: &dyn UploadBackend,
-    mac_key: Option<&ManifestMacKey>,
+    keyring: &ManifestKeyring,
     rec: &BatchRecord,
 ) -> (BatchCheck, Option<Vec<u8>>) {
     let Some(uri) = rec.object_uri.as_deref() else {
@@ -268,13 +278,13 @@ async fn check_with_manifest(
             return (read_failure(&what, muri, &e), None);
         }
     };
-    let check = check_manifest_and_object(backend, mac_key, rec, uri, muri, &bytes).await;
+    let check = check_manifest_and_object(backend, keyring, rec, uri, muri, &bytes).await;
     (check, Some(bytes))
 }
 
 async fn check_manifest_and_object(
     backend: &dyn UploadBackend,
-    mac_key: Option<&ManifestMacKey>,
+    keyring: &ManifestKeyring,
     rec: &BatchRecord,
     uri: &str,
     muri: &str,
@@ -297,9 +307,29 @@ async fn check_manifest_and_object(
         }
         Err(e) => return unauthenticated(format!("manifest {muri} does not parse: {e}")),
     };
-    if let Err(e) = manifest.verify_authentication(mac_key) {
-        return unauthenticated(format!("manifest {muri} does not authenticate: {e}"));
-    }
+    // With the key the manifest names, never a search (#685), counted by
+    // that key's configured id.
+    let authentication = manifest.authenticate(keyring);
+    authentication.count();
+    let key = authentication.key.clone();
+    let mut check = match authentication.into_result() {
+        Err(e) => unauthenticated(format!("manifest {muri} does not authenticate: {e}")),
+        Ok(()) => check_authenticated(backend, rec, uri, muri, &manifest).await,
+    };
+    check.key = key;
+    check
+}
+
+/// The rest of [`check_manifest_and_object`], for a manifest that
+/// authenticated.
+async fn check_authenticated(
+    backend: &dyn UploadBackend,
+    rec: &BatchRecord,
+    uri: &str,
+    muri: &str,
+    manifest: &ParsedManifest,
+) -> BatchCheck {
+    let unauthenticated = |why: String| BatchCheck::new(ScrubResult::Unauthenticated, why);
     // Bind the manifest to the durable ledger before trusting it: a validly
     // authenticated manifest of ANOTHER batch, or one whose digest is not the
     // one the ledger recorded, is not this batch's manifest.
@@ -393,10 +423,10 @@ async fn check_manifest_and_object(
 /// there is damage even though the pinned version the ledger trusts survives.
 async fn scrub_one(
     backend: &dyn UploadBackend,
-    mac_key: Option<&ManifestMacKey>,
+    keyring: &ManifestKeyring,
     rec: &BatchRecord,
 ) -> BatchCheck {
-    let (check, pinned) = check_with_manifest(backend, mac_key, rec).await;
+    let (check, pinned) = check_with_manifest(backend, keyring, rec).await;
     if check.result.is_finding() || rec.manifest_version_id.is_none() {
         return check;
     }
@@ -405,14 +435,20 @@ async fn scrub_one(
     };
     match backend.get_object_bounded(muri, MAX_MANIFEST_BYTES).await {
         Ok(current) if current == pinned => check,
-        Ok(_) => BatchCheck::new(
-            ScrubResult::Mismatched,
-            format!(
-                "manifest {muri}: the current key no longer holds version {} the ledger pinned",
-                rec.manifest_version_id.as_deref().unwrap_or_default()
-            ),
-        ),
-        Err(e) => read_failure("the current key of manifest", muri, &e),
+        Ok(_) => BatchCheck {
+            key: check.key,
+            ..BatchCheck::new(
+                ScrubResult::Mismatched,
+                format!(
+                    "manifest {muri}: the current key no longer holds version {} the ledger pinned",
+                    rec.manifest_version_id.as_deref().unwrap_or_default()
+                ),
+            )
+        },
+        Err(e) => BatchCheck {
+            key: check.key,
+            ..read_failure("the current key of manifest", muri, &e)
+        },
     }
 }
 
@@ -794,6 +830,12 @@ pub struct ScrubReport {
     pub checked: usize,
     /// Every result, at zero when nothing had it.
     pub results: BTreeMap<&'static str, u64>,
+    /// Manifests whose MAC authenticated, by the key that verified them
+    /// (#685): each configured key id (or `none` for a key with no id), at
+    /// zero when it verified nothing. After a rotation, every key the
+    /// archive was signed with should appear here and nothing should be a
+    /// finding. Empty when no key is configured.
+    pub manifest_keys: BTreeMap<String, u64>,
     pub findings: Vec<ScrubFinding>,
     pub cursor: Option<CursorProgress>,
     pub sample_seed: Option<u64>,
@@ -848,12 +890,12 @@ fn sample_rows(rows: Vec<ScrubRow>, n: usize, seed: u64) -> Vec<ScrubRow> {
 /// the report and metrics are out ([`PendingCursor`]).
 pub async fn scrub(
     backend: &dyn UploadBackend,
-    mac_key: Option<&ManifestMacKey>,
+    keyring: &ManifestKeyring,
     rows: Vec<ScrubRow>,
     opts: &ScrubOptions,
 ) -> Result<ScrubReport, VtopError> {
     let lock = lock_run(opts.cursor_file.as_deref(), None)?;
-    let mut report = scrub_held(backend, mac_key, rows, opts, &lock).await?;
+    let mut report = scrub_held(backend, keyring, rows, opts, &lock).await?;
     if let Some(pending) = report.pending_cursor.take() {
         pending.commit(&lock)?;
     }
@@ -865,7 +907,7 @@ pub async fn scrub(
 /// `pending_cursor`, for the caller to commit after publishing.
 pub async fn scrub_held(
     backend: &dyn UploadBackend,
-    mac_key: Option<&ManifestMacKey>,
+    keyring: &ManifestKeyring,
     rows: Vec<ScrubRow>,
     opts: &ScrubOptions,
     _held: &RunLock,
@@ -909,6 +951,8 @@ pub async fn scrub_held(
     let pacer = Pacer::new(opts.max_objects_per_sec, opts.max_bytes_per_sec);
     let mut results: BTreeMap<&'static str, u64> =
         ScrubResult::ALL.iter().map(|r| (r.as_str(), 0)).collect();
+    let mut manifest_keys: BTreeMap<String, u64> =
+        keyring.key_labels().into_iter().map(|k| (k, 0)).collect();
     let mut findings = Vec::new();
     let mut checked_ids = Vec::with_capacity(selected.len());
     let selected_count = selected.len();
@@ -926,7 +970,7 @@ pub async fn scrub_held(
                 // Opened after the pacer, so the span times the check and not
                 // the wait for its turn (#683).
                 let span = crate::spans::scrub_check(&row.record, row.origin.as_str());
-                let check = scrub_one(backend, mac_key, &row.record)
+                let check = scrub_one(backend, keyring, &row.record)
                     .instrument(span.clone())
                     .await;
                 span.record("result", check.result.as_str());
@@ -945,6 +989,9 @@ pub async fn scrub_held(
             .buffered(concurrency);
         while let Some((row, check)) = checks.next().await {
             *results.entry(check.result.as_str()).or_default() += 1;
+            if let Some(key) = check.key.as_ref().filter(|k| k.result == KeyResult::Ok) {
+                *manifest_keys.entry(key.key_id.clone()).or_default() += 1;
+            }
             checked_ids.push(row.record.batch_id.clone());
             if check.result.is_finding() {
                 tracing::warn!(
@@ -1015,6 +1062,7 @@ pub async fn scrub_held(
         selected: selected_count,
         checked: checked_ids.len(),
         results,
+        manifest_keys,
         findings,
         cursor: progress,
         sample_seed,
@@ -1076,6 +1124,16 @@ impl ScrubReport {
                 .collect::<Vec<_>>()
                 .join(" ")
         ));
+        if !self.manifest_keys.is_empty() {
+            out.push(format!(
+                "manifests authenticated by key: {}",
+                self.manifest_keys
+                    .iter()
+                    .map(|(key, n)| format!("{key}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
         for finding in &self.findings {
             let origin = match finding.origin {
                 RowOrigin::Ledger => "ledger",
@@ -1131,6 +1189,22 @@ impl ScrubReport {
             out.push_str(&format!(
                 "vtop_scrub_objects_total{{result=\"{result}\"}} {total}\n"
             ));
+        }
+        // By configured key only (#685): the labels are this run's keyring,
+        // never an id read from storage, and a key no longer configured
+        // drops out (its counter resets if it comes back).
+        if !self.manifest_keys.is_empty() {
+            out.push_str(
+                "# HELP vtop_scrub_manifest_keys_total Manifests the archive scrub authenticated, \
+                 by the configured key id that verified them (none: a key with no id)\n# TYPE \
+                 vtop_scrub_manifest_keys_total counter\n",
+            );
+            for (key, n) in &self.manifest_keys {
+                let total = carried.key_counts.get(key).copied().unwrap_or(0) + n;
+                out.push_str(&format!(
+                    "vtop_scrub_manifest_keys_total{{key_id=\"{key}\"}} {total}\n"
+                ));
+            }
         }
         let gauge = |out: &mut String, name: &str, help: &str, value: String| {
             out.push_str(&format!(
@@ -1195,6 +1269,7 @@ impl ScrubReport {
 #[derive(Default)]
 struct Carried {
     counts: BTreeMap<String, u64>,
+    key_counts: BTreeMap<String, u64>,
     last_success: i64,
     last_pass_complete: i64,
     last_finding: i64,
@@ -1210,6 +1285,13 @@ impl Carried {
                 if let Some((result, value)) = rest.split_once("\"} ") {
                     if let Ok(value) = value.trim().parse::<u64>() {
                         carried.counts.insert(result.to_owned(), value);
+                    }
+                }
+            } else if let Some(rest) = line.strip_prefix("vtop_scrub_manifest_keys_total{key_id=\"")
+            {
+                if let Some((key, value)) = rest.split_once("\"} ") {
+                    if let Ok(value) = value.trim().parse::<u64>() {
+                        carried.key_counts.insert(key.to_owned(), value);
                     }
                 }
             } else if let Some(value) =
@@ -1316,6 +1398,7 @@ mod tests {
             selected: 0,
             checked: 0,
             results: counts,
+            manifest_keys: BTreeMap::new(),
             findings: (0..findings)
                 .map(|i| ScrubFinding {
                     batch_id: format!("b{i}"),

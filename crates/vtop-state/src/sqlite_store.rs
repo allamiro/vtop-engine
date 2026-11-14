@@ -851,7 +851,7 @@ impl StateStore for SqliteStateStore {
     async fn append_audit(
         &self,
         row: &AuditInsert,
-        key: Option<&vtop_core::manifest::ManifestMacKey>,
+        keyring: &vtop_core::manifest::ManifestKeyring,
     ) -> Result<AuditRow, VtopError> {
         // Through the synchronous=FULL connection: the row is on disk before
         // the action it records runs. BEGIN IMMEDIATE takes the write lock
@@ -862,7 +862,7 @@ impl StateStore for SqliteStateStore {
             .execute(&mut *conn)
             .await
             .map_err(map_sqlx)?;
-        let appended = append_audit_in(&mut conn, row, key).await;
+        let appended = append_audit_in(&mut conn, row, keyring).await;
         match appended {
             Ok(stored) => {
                 sqlx::raw_sql("COMMIT")
@@ -896,14 +896,14 @@ impl StateStore for SqliteStateStore {
 async fn append_audit_in(
     conn: &mut sqlx::SqliteConnection,
     row: &AuditInsert,
-    key: Option<&vtop_core::manifest::ManifestMacKey>,
+    keyring: &vtop_core::manifest::ManifestKeyring,
 ) -> Result<AuditRow, VtopError> {
     let previous: Option<String> =
         sqlx::query_scalar("SELECT hash FROM audit_events ORDER BY seq DESC LIMIT 1")
             .fetch_optional(&mut *conn)
             .await
             .map_err(map_sqlx)?;
-    let (hash, chain) = crate::audit::link_for(previous.as_deref(), &row.record, key);
+    let (hash, chain) = crate::audit::link_for(previous.as_deref(), &row.record, keyring);
     let seq: i64 = sqlx::query_scalar(
         "INSERT INTO audit_events (audit_id, time, action, outcome, actor, target, \
          audit_version, record, prev_hash, hash, chain) \
@@ -919,7 +919,7 @@ async fn append_audit_in(
     .bind(&row.record)
     .bind(&previous)
     .bind(&hash)
-    .bind(chain)
+    .bind(&chain)
     .fetch_one(&mut *conn)
     .await
     .map_err(map_sqlx)?;
@@ -935,7 +935,7 @@ async fn append_audit_in(
         record: row.record.clone(),
         prev_hash: previous,
         hash,
-        chain: chain.to_owned(),
+        chain,
     })
 }
 
@@ -1699,17 +1699,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version, SQLITE_SCHEMA_VERSION, "a new table needs no bump");
-        let key = vtop_core::manifest::ManifestMacKey::from_hex(&"ab".repeat(32)).unwrap();
+        let key = vtop_core::manifest::ManifestKeyring::single(
+            vtop_core::manifest::ManifestMacKey::from_hex(&"ab".repeat(32)).unwrap(),
+        );
         for i in 0..3 {
             let record = format!(
                 r#"{{"audit_version":1,"audit_id":"k{i}","time":"t","action":"ledger.replay","outcome":"attempt","actor":{{"kind":"os","uid":1,"source":"os"}},"target":{{"kind":"ledger"}}}}"#
             );
             let row = crate::audit::AuditInsert::from_record(&record).unwrap();
-            let stored = store.append_audit(&row, Some(&key)).await.unwrap();
+            let stored = store.append_audit(&row, &key).await.unwrap();
             assert_eq!(stored.chain, "blake3-keyed");
         }
         let rows = store.list_audit(0, 10).await.unwrap();
-        assert!(crate::audit::verify_chain(&rows, Some(&key)).passed());
+        assert!(crate::audit::verify_chain(&rows, &key).passed());
         for (sql, what) in [
             (
                 "UPDATE audit_events SET outcome = 'success' WHERE seq = 1",
@@ -1733,7 +1735,7 @@ mod tests {
         .await
         .unwrap();
         let rows = store.list_audit(0, 10).await.unwrap();
-        let report = crate::audit::verify_chain(&rows, Some(&key));
+        let report = crate::audit::verify_chain(&rows, &key);
         assert!(!report.passed());
         assert!(
             report.problems[0].contains("row 2"),

@@ -574,7 +574,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             let engine_name = cfg.engine.name.clone();
             let audit = crate::audit::LedgerAudit {
                 command: "replay",
-                key: cfg.resolve_manifest_mac_key()?,
+                keyring: cfg.resolve_manifest_keyring()?,
             };
             let mut engine = Engine::new_exclusive(cfg, streams).await?;
             let span = tracing::info_span!("replay");
@@ -712,7 +712,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 engine.store.as_ref(),
                 engine.backend.as_ref(),
                 manifest,
-                engine.manifest_mac_key(),
+                engine.manifest_keyring(),
             )
             .await?;
             if cli.json {
@@ -810,7 +810,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             };
             let audit = crate::audit::LedgerAudit {
                 command: "migrate",
-                key: cfg.resolve_manifest_mac_key()?,
+                keyring: cfg.resolve_manifest_keyring()?,
             };
             let span = tracing::info_span!("migrate");
             async {
@@ -1110,7 +1110,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             let state_store = cfg.engine.state_store.resolve()?;
             let audit = crate::audit::LedgerAudit {
                 command: "prune-ledger",
-                key: cfg.resolve_manifest_mac_key()?,
+                keyring: cfg.resolve_manifest_keyring()?,
             };
             // The configured bound, as the engine uses (review of #568).
             let store = crate::engine::connect_configured_store(&cfg.engine, &state_store).await?;
@@ -1215,7 +1215,7 @@ pub async fn verify_manifest_deep(
     store: &dyn vtop_state::StateStore,
     backend: &dyn vtop_upload::UploadBackend,
     manifest_uri: &str,
-    manifest_mac_key: Option<&vtop_core::manifest::ManifestMacKey>,
+    keyring: &vtop_core::manifest::ManifestKeyring,
 ) -> Result<VerifyReport, VtopError> {
     use vtop_core::checksum::digest_bytes;
     use vtop_core::types::ChecksumAlgorithm;
@@ -1264,13 +1264,40 @@ pub async fn verify_manifest_deep(
     // A configured key upgrades the verdict from corruption detection to
     // authentication and deliberately rejects pre-key manifests. Without a
     // key, retain legacy behavior but do not claim an unverified MAC is valid.
-    let authentication_ok = parsed.verify_authentication(manifest_mac_key).is_ok();
+    //
+    // With a keyring (#685) the key is the one the manifest names, and the
+    // line says which, or why none could be used. The reason is the
+    // keyring's own text: it names key ids, never key material.
+    let authentication = parsed.authenticate(keyring);
+    authentication.count();
+    // The bounded label of the key that verified it: a configured id, or
+    // `none` for the manifest_mac_key_env key. Never the manifest's own id.
+    let verified_with = authentication
+        .key
+        .as_ref()
+        .filter(|k| k.result == vtop_core::manifest::KeyResult::Ok)
+        .map(|k| k.key_id.clone());
+    let authentication_ok = authentication.is_ok();
     failed |= !authentication_ok;
-    let authentication_status = match (manifest_mac_key, parsed.fields().manifest.mac.as_deref()) {
-        (Some(_), _) if authentication_ok => "OK (keyed BLAKE3)".to_string(),
-        (Some(_), _) => "FAILED (MAC missing or invalid)".to_string(),
-        (None, Some(_)) => "PRESENT (not checked: no key configured)".to_string(),
-        (None, None) => "NOT CONFIGURED (self-hash only)".to_string(),
+    // The manifest_mac_key_env key keeps its wording from before key ids.
+    let single_key = keyring.is_configured() && keyring.active_id().is_none();
+    let names_an_id = parsed.fields().manifest.mac_key_id.is_some();
+    let authentication_status = match (
+        keyring.is_configured(),
+        parsed.fields().manifest.mac.as_deref(),
+        authentication.result,
+    ) {
+        (true, _, Ok(())) => match verified_with.as_deref() {
+            Some(label) if !single_key && names_an_id => {
+                format!("OK (keyed BLAKE3, key id {label})")
+            }
+            Some(label) if !single_key => format!("OK (keyed BLAKE3, legacy key {label})"),
+            _ => "OK (keyed BLAKE3)".to_string(),
+        },
+        (true, _, Err(VtopError::Manifest(why))) if !single_key => format!("FAILED ({why})"),
+        (true, _, Err(_)) => "FAILED (MAC missing or invalid)".to_string(),
+        (false, Some(_), _) => "PRESENT (not checked: no key configured)".to_string(),
+        (false, None, _) => "NOT CONFIGURED (self-hash only)".to_string(),
     };
     lines.push(format!("authentication  : {authentication_status}"));
 
@@ -1367,7 +1394,8 @@ pub async fn verify_manifest_deep(
         "object_uri": parsed.fields().object.uri,
         "self_hash_ok": self_hash_ok,
         "manifest_authentication": authentication_status,
-        "manifest_authentication_required": manifest_mac_key.is_some(),
+        "manifest_authentication_required": keyring.is_configured(),
+        "manifest_verified_with_key": verified_with,
         "object_size_ok": size_ok,
         "object_content": checksum_status,
         "ledger": ledger_status,

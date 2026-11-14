@@ -106,6 +106,11 @@ fn populated() -> String {
             .with_label_values(&[sink])
             .inc_by(0);
     }
+    for r in vtop_core::manifest::KeyResult::ALL {
+        m.manifest_authentications_total
+            .with_label_values(&["q4-2026", r.as_str()])
+            .inc_by(0);
+    }
     m.inflight_batches.set(2);
     m.encode().expect("encode must succeed")
 }
@@ -224,7 +229,10 @@ fn every_exported_label_is_from_a_bounded_set() {
     // "action" is the closed set of audit actions and "sink" one of log,
     // file, ledger (#694); `outcome` there is attempt, success, failure or
     // refused.
-    const BOUNDED: [&str; 16] = [
+    // "key_id" is a key id the operator configured in `manifest.mac`, or
+    // `none` or `other`, never an id read from a manifest (#685): bounded by
+    // the config, and pinned by `a_hostile_manifest_key_id_never_becomes_a_label`.
+    const BOUNDED: [&str; 17] = [
         "tenant",
         "source_type",
         "format",
@@ -241,6 +249,7 @@ fn every_exported_label_is_from_a_bounded_set() {
         "version",
         "action",
         "sink",
+        "key_id",
     ];
     let text = populated();
     let mut seen = std::collections::BTreeSet::new();
@@ -556,4 +565,69 @@ fn kafka_partition_events_are_exported_by_bounded_event() {
         let label = format!(r#"event="{e}""#);
         assert!(text.contains(&label), "missing {label}");
     }
+}
+
+/// #685: manifest MAC checks are counted by key and result, and the key is
+/// the CONFIGURED id that was used, `none`, or `other`. A manifest naming a
+/// hostile id (from storage, so unbounded) is counted as `other`; its id
+/// never becomes a label.
+#[test]
+fn a_hostile_manifest_key_id_never_becomes_a_label() {
+    use serde_json::{json, Value};
+    use vtop_core::manifest::{
+        KeySourceKind, KeyringKey, ManifestKeyring, ManifestMacKey, ParsedManifest,
+    };
+    let m = telemetry::init().expect("registry must initialize");
+    let fixture: &[u8] =
+        include_bytes!("../../vtop-core/tests/fixtures/manifests/keyring-0.4-q4.json");
+    let hostile = "attacker-chosen-id-0123456789";
+    let mut doc: Value = serde_json::from_slice(fixture).unwrap();
+    doc["manifest"]["mac_key_id"] = json!(hostile);
+    let mut canonical = doc.clone();
+    canonical["manifest"]["sha256"] = json!("");
+    canonical["manifest"]["mac"] = json!("");
+    doc["manifest"]["sha256"] = json!(vtop_core::checksum::sha256_bytes(
+        &serde_json::to_vec(&canonical).unwrap()
+    ));
+    let keyring = ManifestKeyring::new(
+        "q4-endpoint",
+        vec![KeyringKey {
+            id: "q4-endpoint".into(),
+            key: ManifestMacKey::from_hex(&"22".repeat(32)).unwrap(),
+            source: KeySourceKind::File,
+            legacy: false,
+        }],
+        vec![],
+    )
+    .unwrap();
+    let before = m
+        .manifest_authentications_total
+        .with_label_values(&["other", "unknown_key"])
+        .get();
+    let auth = ParsedManifest::from_slice(&serde_json::to_vec(&doc).unwrap())
+        .unwrap()
+        .authenticate(&keyring);
+    assert!(auth.result.is_err());
+    auth.count();
+    assert_eq!(
+        m.manifest_authentications_total
+            .with_label_values(&["other", "unknown_key"])
+            .get(),
+        before + 1
+    );
+    let text = m.encode().expect("encode must succeed");
+    assert!(
+        text.contains("# TYPE vtop_manifest_authentications_total counter"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            r#"vtop_manifest_authentications_total{key_id="other",result="unknown_key"}"#
+        ),
+        "{text}"
+    );
+    assert!(
+        !text.contains(hostile),
+        "a manifest's id became a label: {text}"
+    );
 }

@@ -4,7 +4,9 @@
 //! environment variables or mounted secrets and are never serialized.
 
 use crate::errors::VtopError;
-use crate::manifest::{ManifestMacKey, ManifestWriteVersion};
+use crate::manifest::{
+    KeySourceKind, KeyringKey, ManifestKeyring, ManifestMacKey, ManifestWriteVersion,
+};
 use crate::types::{ChecksumAlgorithm, CompressionType, SourceType, TelemetryFormat};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
@@ -29,6 +31,8 @@ pub struct VtopConfig {
     pub checksum: ChecksumConfig,
     /// Name of the environment variable holding a 32-byte hex manifest MAC
     /// key. The secret itself is never part of this serializable config.
+    /// Shorthand for a keyring of one key that writes no key id (#685);
+    /// refused together with `manifest.mac`.
     #[serde(default)]
     pub manifest_mac_key_env: Option<String>,
     /// How manifests are written (#671 release B). Absent means every
@@ -53,6 +57,140 @@ pub struct ManifestConfig {
     /// an earlier reader reports a `0.4` manifest as tampered.
     #[serde(default)]
     pub write_version: ManifestWriteVersion,
+    /// The manifest MAC keyring (#685): several keys by id, one of them
+    /// signing. Needs `write_version: "0.4"`, the only version that can
+    /// record a key id. Absent means `manifest_mac_key_env` (one key, no id)
+    /// or no key at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<ManifestMacConfig>,
+}
+
+/// `manifest.mac` (#685). Unknown keys are refused, unlike the rest of the
+/// engine config: a misspelt `retired` would otherwise leave a withdrawn key
+/// authenticating, with no error. The cost is that a later release's new key
+/// in this section is refused by this one, which the release note must say.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestMacConfig {
+    /// The id of the key that signs new manifests. Every other key verifies
+    /// only.
+    pub active: String,
+    /// Every key that verifies, the active one included.
+    pub keys: Vec<ManifestKeyConfig>,
+    /// Tombstoned ids: manifests naming one fail authentication, reported as
+    /// a retired key. For a key that was withdrawn or compromised; a key
+    /// rotated out in the normal way stays in `keys`, verify-only. No key
+    /// material is configured for a tombstone.
+    #[serde(default)]
+    pub retired: Vec<String>,
+}
+
+/// One entry of `manifest.mac.keys`: an id and where the 64-hex-character
+/// key is read from, `env` or `file` (exactly one).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestKeyConfig {
+    /// 1 to 64 characters from `[A-Za-z0-9._-]`; `none` and `other` are
+    /// reserved metric labels.
+    pub id: String,
+    /// Name of the environment variable holding the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// Path of a file holding the key, such as a mounted secret. Its
+    /// permissions are not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// This key verifies manifests that name no key id: every manifest
+    /// written before key ids, and any written with `manifest_mac_key_env`.
+    /// At most one key.
+    #[serde(default)]
+    pub legacy: bool,
+}
+
+impl ManifestMacConfig {
+    /// The keyring with placeholder key material: its shape without reading
+    /// a variable or a file. The cross-entry rules (unique ids, one legacy
+    /// key, an active key that exists) live in one place, the keyring, and
+    /// are checked through this at load; `validate --print-effective`
+    /// describes the keyring through it.
+    fn unresolved_keyring(&self) -> Result<ManifestKeyring, VtopError> {
+        let placeholder = ManifestMacKey::from_hex(&"00".repeat(32))?;
+        let keys = self
+            .keys
+            .iter()
+            .map(|k| {
+                Ok(KeyringKey {
+                    id: k.id.clone(),
+                    key: placeholder.clone(),
+                    source: k.source()?.0,
+                    legacy: k.legacy,
+                })
+            })
+            .collect::<Result<Vec<_>, VtopError>>()?;
+        ManifestKeyring::new(&self.active, keys, self.retired.clone())
+    }
+
+    /// The keyring by id and source kind (`env` or `file`), as
+    /// `validate --print-effective` prints it: never a value, and not the
+    /// variable's name or the file's path either.
+    pub fn describe(&self) -> String {
+        match self.unresolved_keyring() {
+            Ok(keyring) => keyring.describe_config(),
+            Err(e) => format!("invalid ({e})"),
+        }
+    }
+}
+
+/// The longest key file read: a key is 64 hex characters, so anything near
+/// this is not a key, and a path such as `/dev/zero` must not hang startup.
+const MAX_KEY_FILE_BYTES: u64 = 4096;
+
+impl ManifestKeyConfig {
+    fn source(&self) -> Result<(KeySourceKind, &str), VtopError> {
+        let id = &self.id;
+        match (self.env.as_deref(), self.file.as_deref()) {
+            (Some(env), None) if !env.trim().is_empty() => Ok((KeySourceKind::Env, env.trim())),
+            (None, Some(file)) if !file.trim().is_empty() => Ok((KeySourceKind::File, file.trim())),
+            (Some(_), Some(_)) => Err(VtopError::Config(format!(
+                "manifest.mac.keys: key {id:?} sets both env and file; set exactly one"
+            ))),
+            (None, None) => Err(VtopError::Config(format!(
+                "manifest.mac.keys: key {id:?} needs env (a variable name) or file (a path)"
+            ))),
+            _ => Err(VtopError::Config(format!(
+                "manifest.mac.keys: key {id:?} names an empty env or file"
+            ))),
+        }
+    }
+
+    /// Read and decode the key. Errors name the id and the variable or file,
+    /// never the value.
+    fn resolve(&self) -> Result<ManifestMacKey, VtopError> {
+        use std::io::Read;
+        let id = &self.id;
+        let value = match self.source()? {
+            (KeySourceKind::Env, name) => std::env::var(name).map_err(|_| {
+                VtopError::Config(format!(
+                    "manifest key {id:?}: environment variable {name} is missing or not valid \
+                     Unicode"
+                ))
+            })?,
+            (KeySourceKind::File, path) => {
+                let mut text = String::new();
+                std::fs::File::open(path)
+                    .and_then(|f| f.take(MAX_KEY_FILE_BYTES).read_to_string(&mut text))
+                    .map_err(|e| {
+                        VtopError::Config(format!("manifest key {id:?}: reading {path}: {e}"))
+                    })?;
+                text
+            }
+        };
+        ManifestMacKey::from_hex(value.trim()).map_err(|_| {
+            VtopError::Config(format!(
+                "manifest key {id:?}: the value must be exactly 32 bytes (64 hex characters)"
+            ))
+        })
+    }
 }
 
 /// Object integrity checksum configuration.
@@ -1250,6 +1388,7 @@ impl VtopConfig {
         }
 
         self.engine.state_store.validate()?;
+        self.validate_manifest_mac()?;
         if self
             .manifest_mac_key_env
             .as_deref()
@@ -1489,12 +1628,81 @@ impl VtopConfig {
         Ok(())
     }
 
-    /// Resolve the optional manifest authentication key from its named
-    /// environment variable. A configured-but-missing key is a hard startup
-    /// error, never a silent downgrade to unsigned manifests.
-    pub fn resolve_manifest_mac_key(&self) -> Result<Option<ManifestMacKey>, VtopError> {
+    /// The `manifest.mac` rules that need no key material (#685), checked
+    /// at load. [`VtopConfig::resolve_manifest_keyring`] checks them again,
+    /// so a config built in code cannot skip them.
+    fn validate_manifest_mac(&self) -> Result<(), VtopError> {
+        let Some(mac) = &self.manifest.mac else {
+            return Ok(());
+        };
+        if self.manifest_mac_key_env.is_some() {
+            return Err(VtopError::Config(
+                "manifest.mac and manifest_mac_key_env are both set; use one. To keep the \
+                 manifest_mac_key_env key, list it in manifest.mac.keys with legacy: true"
+                    .into(),
+            ));
+        }
+        if self.manifest.write_version != ManifestWriteVersion::V0_4 {
+            return Err(VtopError::Config(format!(
+                "manifest.mac needs manifest.write_version: \"0.4\" (it is \"{}\"): a key id \
+                 can only be recorded in a version 0.4 manifest; a 0.3 reader drops unknown \
+                 fields and would report the manifest as tampered",
+                self.manifest.write_version
+            )));
+        }
+        for key in &mac.keys {
+            crate::manifest::keyring::validate_key_id(&key.id)
+                .map_err(|why| VtopError::Config(format!("manifest.mac.keys: {why}")))?;
+            key.source()?;
+        }
+        for id in &mac.retired {
+            crate::manifest::keyring::validate_key_id(id)
+                .map_err(|why| VtopError::Config(format!("manifest.mac.retired: {why}")))?;
+        }
+        mac.unresolved_keyring().map(drop)
+    }
+
+    /// The startup line naming the manifest keys by id and source kind
+    /// (#685), from the config alone: no variable or file is read, and no
+    /// value or variable name is printed.
+    pub fn manifest_key_summary(&self) -> String {
+        let shape = match (&self.manifest.mac, &self.manifest_mac_key_env) {
+            (Some(mac), _) => mac.unresolved_keyring(),
+            (None, Some(_)) => {
+                ManifestMacKey::from_hex(&"00".repeat(32)).map(ManifestKeyring::single)
+            }
+            (None, None) => Ok(ManifestKeyring::default()),
+        };
+        match shape {
+            Ok(keyring) => keyring.summary(),
+            Err(e) => format!("manifest MAC: invalid configuration ({e})"),
+        }
+    }
+
+    /// Resolve the manifest keys (#685): `manifest.mac`, the
+    /// `manifest_mac_key_env` shorthand (one key, writing no id), or none. A
+    /// configured key that is missing or malformed is a hard startup error,
+    /// never a silent downgrade to unsigned manifests; the error names the
+    /// variable or file, never its value.
+    pub fn resolve_manifest_keyring(&self) -> Result<ManifestKeyring, VtopError> {
+        self.validate_manifest_mac()?;
+        if let Some(mac) = &self.manifest.mac {
+            let keys = mac
+                .keys
+                .iter()
+                .map(|k| {
+                    Ok(KeyringKey {
+                        id: k.id.clone(),
+                        key: k.resolve()?,
+                        source: k.source()?.0,
+                        legacy: k.legacy,
+                    })
+                })
+                .collect::<Result<Vec<_>, VtopError>>()?;
+            return ManifestKeyring::new(&mac.active, keys, mac.retired.clone());
+        }
         let Some(name) = self.manifest_mac_key_env.as_deref() else {
-            return Ok(None);
+            return Ok(ManifestKeyring::default());
         };
         let name = name.trim();
         if name.is_empty() {
@@ -1507,7 +1715,7 @@ impl VtopConfig {
                 "manifest MAC key environment variable {name} is missing or not valid Unicode"
             ))
         })?;
-        ManifestMacKey::from_hex(value.trim()).map(Some)
+        ManifestMacKey::from_hex(value.trim()).map(ManifestKeyring::single)
     }
 }
 
@@ -1927,7 +2135,7 @@ upload:
         assert_eq!(cfg.engine.work_retention_seconds, 86_400);
         assert_eq!(cfg.engine.work_max_bytes, 10 * 1024 * 1024 * 1024);
         assert!(cfg.upload.require_strong_verification);
-        assert!(cfg.resolve_manifest_mac_key().unwrap().is_none());
+        assert!(!cfg.resolve_manifest_keyring().unwrap().is_configured());
 
         let mut bad_retention = cfg.clone();
         bad_retention.engine.work_retention_seconds = 0;
@@ -2539,6 +2747,192 @@ upload:
             .contains("command_timeout_seconds"));
     }
 
+    /// A config with a `manifest:` section `section` (YAML at two spaces).
+    fn with_manifest(section: &str) -> String {
+        format!("{}manifest:\n{section}", tuning_base())
+    }
+
+    const KEYRING: &str = r#"  write_version: "0.4"
+  mac:
+    active: q4-2026
+    keys:
+      - {id: q3-2026, env: VTOP_TEST_MAC_Q3, legacy: true}
+      - {id: q4-2026, file: /run/secrets/q4}
+    retired: [q1-2026]
+"#;
+
+    /// #685: a keyring loads with `write_version: "0.4"`, and its shape
+    /// (which key signs, which only verify, which is legacy, the tombstones)
+    /// is what the config says.
+    #[test]
+    fn a_keyring_loads_with_write_version_04() {
+        let cfg = VtopConfig::from_yaml_str(&with_manifest(KEYRING)).unwrap();
+        cfg.validate().unwrap();
+        let mac = cfg.manifest.mac.as_ref().unwrap();
+        assert_eq!(mac.active, "q4-2026");
+        assert_eq!(mac.retired, ["q1-2026"]);
+        assert!(mac.keys[0].legacy && !mac.keys[1].legacy);
+        assert_eq!(
+            cfg.manifest_key_summary(),
+            "manifest MAC keyring: active key q4-2026 (file); verify-only: q3-2026 (env, \
+             legacy); retired: q1-2026"
+        );
+    }
+
+    /// #685: a keyring needs `write_version: "0.4"`, because a key id can
+    /// only be recorded in a 0.4 manifest. Refused at load, naming both keys
+    /// and the reason, whether 0.3 is set or the default.
+    #[test]
+    fn a_keyring_with_write_version_03_is_refused_naming_the_reason() {
+        for version in ["  write_version: \"0.3\"\n", ""] {
+            let section = KEYRING.replace("  write_version: \"0.4\"\n", version);
+            let cfg = VtopConfig::from_yaml_str(&with_manifest(&section)).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            for needle in [
+                "manifest.mac needs manifest.write_version: \"0.4\"",
+                "(it is \"0.3\")",
+                "a key id can only be recorded in a version 0.4 manifest",
+                "would report the manifest as tampered",
+            ] {
+                assert!(err.contains(needle), "{needle}: {err}");
+            }
+            // The engine resolves through the same check.
+            assert!(cfg.resolve_manifest_keyring().is_err());
+        }
+    }
+
+    /// #685: every inconsistent keyring is refused at load with a message
+    /// naming what is wrong.
+    #[test]
+    fn inconsistent_keyrings_are_refused_at_load() {
+        let mac = |body: &str| format!("  write_version: \"0.4\"\n  mac:\n{body}");
+        let cases = [
+            (
+                "    active: q5\n    keys: [{id: q4, env: K4}]\n",
+                "active key id \"q5\" is not one of manifest.mac.keys",
+            ),
+            (
+                "    active: q4\n    keys: [{id: q4, env: K4}, {id: q4, env: K5}]\n",
+                "appears more than once",
+            ),
+            (
+                "    active: q4\n    keys: [{id: q3, env: K3, legacy: true}, {id: q4, env: K4, legacy: true}]\n",
+                "at most one key may be marked legacy",
+            ),
+            (
+                "    active: q4\n    keys: [{id: q4, env: K4}]\n    retired: [q4]\n",
+                "a retired id may not also be a key",
+            ),
+            (
+                "    active: q1\n    keys: [{id: q4, env: K4}]\n    retired: [q1]\n",
+                "is retired; a retired key cannot sign",
+            ),
+            (
+                "    active: \"q 4\"\n    keys: [{id: \"q 4\", env: K4}]\n",
+                "may only contain letters, digits",
+            ),
+            (
+                "    active: q4\n    keys: [{id: q4, env: K4}]\n    retired: [\"\"]\n",
+                "must be 1 to 64 characters",
+            ),
+            (
+                "    active: other\n    keys: [{id: other, env: K4}]\n",
+                "is reserved",
+            ),
+            (
+                "    active: q4\n    keys: [{id: q4, env: K4, file: /k}]\n",
+                "sets both env and file",
+            ),
+            ("    active: q4\n    keys: [{id: q4}]\n", "needs env"),
+            ("    active: q4\n    keys: [{id: q4, env: \" \"}]\n", "names an empty env"),
+        ];
+        for (body, needle) in cases {
+            let cfg = VtopConfig::from_yaml_str(&with_manifest(&mac(body))).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{body}: {err}");
+        }
+        // A misspelt key in the section is refused, not ignored: `retire`
+        // would otherwise leave a withdrawn key authenticating.
+        let err = VtopConfig::from_yaml_str(&with_manifest(&mac(
+            "    active: q4\n    keys: [{id: q4, env: K4}]\n    retire: [q1]\n",
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field `retire`"), "{err}");
+        // Both forms of key at once are refused, naming both.
+        let both = format!("manifest_mac_key_env: K0\n{}", with_manifest(KEYRING));
+        let err = VtopConfig::from_yaml_str(&both)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("manifest.mac and manifest_mac_key_env are both set"),
+            "{err}"
+        );
+    }
+
+    /// #685: keys come from an environment variable or a file. A missing or
+    /// malformed key fails resolution naming the key id and the variable or
+    /// file, never the value; the resolved keyring signs with the active key.
+    #[test]
+    fn keyring_keys_resolve_from_env_and_file_without_leaking_values() {
+        use std::io::Write;
+        let env = format!("VTOP_TEST_KEYRING_{}", uuid::Uuid::new_v4().simple());
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let q4_hex = "4d".repeat(32);
+        writeln!(file, "{q4_hex}").unwrap();
+        let section = KEYRING
+            .replace("VTOP_TEST_MAC_Q3", &env)
+            .replace("/run/secrets/q4", &file.path().to_string_lossy());
+        let cfg = VtopConfig::from_yaml_str(&with_manifest(&section)).unwrap();
+        cfg.validate().unwrap();
+
+        let err = cfg.resolve_manifest_keyring().unwrap_err().to_string();
+        assert!(err.contains("\"q3-2026\""), "{err}");
+        assert!(err.contains(&env) && err.contains("missing"), "{err}");
+
+        let malformed = "zz-not-a-key-but-a-secret-anyway";
+        std::env::set_var(&env, malformed);
+        let err = cfg.resolve_manifest_keyring().unwrap_err().to_string();
+        std::env::remove_var(&env);
+        assert!(err.contains("64 hex characters"), "{err}");
+        assert!(!err.contains(malformed), "the value leaked: {err}");
+
+        let q3_hex = "3c".repeat(32);
+        std::env::set_var(&env, &q3_hex);
+        let keyring = cfg.resolve_manifest_keyring().unwrap();
+        std::env::remove_var(&env);
+        assert_eq!(keyring.active_id(), Some("q4-2026"));
+        assert_eq!(keyring.verify_only_ids(), ["q3-2026"]);
+        assert_eq!(keyring.retired_ids(), ["q1-2026"]);
+        let shown = format!("{keyring:?} {}", keyring.summary());
+        assert!(
+            !shown.contains(&q3_hex) && !shown.contains(&q4_hex),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains(&env),
+            "the variable's name is config, not shown: {shown}"
+        );
+
+        drop(file);
+        let err = {
+            std::env::set_var(&env, &q3_hex);
+            let err = cfg.resolve_manifest_keyring().unwrap_err().to_string();
+            std::env::remove_var(&env);
+            err
+        };
+        assert!(
+            err.contains("\"q4-2026\"") && err.contains("reading"),
+            "{err}"
+        );
+
+        // The config itself serializes names and paths, never values.
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(yaml.contains(&env) && !yaml.contains(&q3_hex), "{yaml}");
+    }
+
     #[test]
     fn configured_manifest_key_must_exist_without_silent_downgrade() {
         let name = format!("VTOP_TEST_MISSING_MAC_{}", uuid::Uuid::new_v4());
@@ -2562,7 +2956,7 @@ upload:
         );
         let cfg: VtopConfig = serde_yaml::from_str(&yaml).unwrap();
         cfg.validate().unwrap();
-        let err = cfg.resolve_manifest_mac_key().unwrap_err().to_string();
+        let err = cfg.resolve_manifest_keyring().unwrap_err().to_string();
         assert!(err.contains(&name));
         assert!(err.contains("missing"));
     }

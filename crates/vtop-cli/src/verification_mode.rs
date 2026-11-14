@@ -52,6 +52,26 @@ pub(crate) fn announce(config: &VtopConfig, streams: &StreamsConfig) {
         "{}",
         manifest_version_notice(config)
     );
+    // The manifest keys by id (#685): which signs, which only verify, which
+    // are retired. Ids and source kinds only, never a value. Until the audit
+    // stream (#694) exists, this line is the record of an active-key change.
+    tracing::info!(
+        active_key_id = config
+            .manifest
+            .mac
+            .as_ref()
+            .map(|mac| mac.active.as_str())
+            .unwrap_or(""),
+        "{}",
+        config.manifest_key_summary()
+    );
+    if let Some(mx) = telemetry::metrics() {
+        for (key_id, result) in primed_key_series(config) {
+            mx.manifest_authentications_total
+                .with_label_values(&[key_id.as_str(), result])
+                .inc_by(0);
+        }
+    }
     if let Some(mx) = telemetry::metrics() {
         let size_only = !config.upload.require_strong_verification;
         let tenant = config.engine.tenant.as_str();
@@ -88,6 +108,69 @@ pub(crate) fn manifest_version_notice(config: &VtopConfig) -> String {
              or later (older readers report these manifests as tampered). Set \"0.3\" to go back; \
              0.4 manifests already written stay readable"
             .to_owned(),
+    }
+}
+
+/// The `vtop_manifest_authentications_total` series created at zero at
+/// startup (review of #703): a series born at 1 shows no `increase()`, so
+/// without them an alert misses the first unknown-key check. Each key's
+/// `ok` and `failed`, each tombstone's `retired_key`, and `unknown_key` for
+/// `other` (and for `none` with a keyring: a manifest with no id and no
+/// legacy key). Configured ids only, so the set is bounded by the config.
+pub(crate) fn primed_key_series(config: &VtopConfig) -> Vec<(String, &'static str)> {
+    use vtop_core::manifest::{KEY_LABEL_NONE, KEY_LABEL_OTHER};
+    let mut series = Vec::new();
+    if let Some(mac) = &config.manifest.mac {
+        for key in &mac.keys {
+            series.push((key.id.clone(), "ok"));
+            series.push((key.id.clone(), "failed"));
+        }
+        for id in &mac.retired {
+            series.push((id.clone(), "retired_key"));
+        }
+        series.push((KEY_LABEL_NONE.to_owned(), "unknown_key"));
+    } else if config.manifest_mac_key_env.is_some() {
+        series.push((KEY_LABEL_NONE.to_owned(), "ok"));
+        series.push((KEY_LABEL_NONE.to_owned(), "failed"));
+    } else {
+        return series;
+    }
+    series.push((KEY_LABEL_OTHER.to_owned(), "unknown_key"));
+    series
+}
+
+/// Recovery's message for a VERIFIED row whose manifest names a key it
+/// cannot use (#685): what happened, that the range is replayed, and the
+/// remedy for that case. `None` for an ordinary MAC failure, which keeps the
+/// generic re-check message.
+pub(crate) fn key_recheck_notice(
+    key: &vtop_core::manifest::KeyOutcome,
+) -> Option<(tracing::Level, &'static str)> {
+    use vtop_core::manifest::{KeyResult, KEY_LABEL_NONE};
+    match key.result {
+        KeyResult::UnknownKey if key.key_id == KEY_LABEL_NONE => Some((
+            tracing::Level::ERROR,
+            "recovery: a VERIFIED batch's manifest names no key id and no key in \
+             manifest.mac.keys is marked legacy: true, so it is unauthenticated (not corrupt); \
+             the range is replayed instead of committed (duplicates, never a gap). Mark the key \
+             that signed manifests before key ids (the old manifest_mac_key_env key) \
+             legacy: true on every engine before the next restart",
+        )),
+        KeyResult::UnknownKey => Some((
+            tracing::Level::ERROR,
+            "recovery: a VERIFIED batch's manifest is signed with a key this engine does not \
+             hold, so it is unauthenticated (not corrupt); the range is replayed instead of \
+             committed (duplicates, never a gap). Add the key to manifest.mac.keys as a \
+             verify-only entry on every engine before the next restart",
+        )),
+        KeyResult::RetiredKey => Some((
+            tracing::Level::WARN,
+            "recovery: a VERIFIED batch's manifest is signed with a retired key \
+             (manifest.mac.retired), so it is unauthenticated; the range is replayed instead of \
+             committed and archived again under the active key. Expected only if that key was \
+             withdrawn",
+        )),
+        KeyResult::Ok | KeyResult::Failed => None,
     }
 }
 
@@ -262,6 +345,85 @@ mod tests {
              batching: {{}}\ncompression: {{}}\nsources: {{}}\nupload: {{bucket: b}}\n{manifest}"
         ))
         .unwrap()
+    }
+
+    fn keyring_config() -> VtopConfig {
+        config(
+            "manifest:\n  write_version: \"0.4\"\n  mac:\n    active: q4\n    keys:\n      \
+             - {id: q3, env: K3, legacy: true}\n      - {id: q4, file: /k4}\n    retired: [q1]\n",
+        )
+    }
+
+    /// #685, review of #703: recovery's message for a key it cannot use says
+    /// what to do for THAT case. A manifest naming no id where no key is
+    /// legacy needs a key marked legacy, not a new verify-only entry.
+    #[test]
+    fn the_recovery_notice_for_a_key_names_the_right_remedy() {
+        use vtop_core::manifest::{KeyOutcome, KeyResult};
+        let notice = |key_id: &str, result| {
+            key_recheck_notice(&KeyOutcome {
+                key_id: key_id.into(),
+                result,
+            })
+        };
+        let (level, text) = notice("other", KeyResult::UnknownKey).unwrap();
+        assert_eq!(level, tracing::Level::ERROR);
+        for needle in [
+            "does not hold",
+            "unauthenticated (not corrupt)",
+            "replayed instead of committed",
+            "as a verify-only entry",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        let (level, text) = notice("none", KeyResult::UnknownKey).unwrap();
+        assert_eq!(level, tracing::Level::ERROR);
+        assert!(text.contains("names no key id"), "{text}");
+        assert!(text.contains("legacy: true"), "{text}");
+        assert!(!text.contains("verify-only entry"), "{text}");
+        let (level, text) = notice("q1", KeyResult::RetiredKey).unwrap();
+        assert_eq!(level, tracing::Level::WARN);
+        assert!(
+            text.contains("retired key") && text.contains("withdrawn"),
+            "{text}"
+        );
+        assert!(notice("q4", KeyResult::Ok).is_none());
+        assert!(notice("q4", KeyResult::Failed).is_none());
+    }
+
+    /// Review of #703: the per-key series exist at zero from startup, so an
+    /// alert on `increase()` sees the FIRST unknown-key check (a series born
+    /// at 1 shows no increase). Configured ids, `none` and `other` only.
+    #[test]
+    fn the_key_series_an_alert_reads_are_primed_at_startup() {
+        let mut primed = primed_key_series(&keyring_config());
+        primed.sort();
+        assert_eq!(
+            primed,
+            [
+                ("none".to_string(), "unknown_key"),
+                ("other".to_string(), "unknown_key"),
+                ("q1".to_string(), "retired_key"),
+                ("q3".to_string(), "failed"),
+                ("q3".to_string(), "ok"),
+                ("q4".to_string(), "failed"),
+                ("q4".to_string(), "ok"),
+            ]
+        );
+        let mut shorthand = primed_key_series(&config("manifest_mac_key_env: K0\n"));
+        shorthand.sort();
+        assert_eq!(
+            shorthand,
+            [
+                ("none".to_string(), "failed"),
+                ("none".to_string(), "ok"),
+                ("other".to_string(), "unknown_key"),
+            ]
+        );
+        assert!(
+            primed_key_series(&config("")).is_empty(),
+            "no key, no series"
+        );
     }
 
     /// #671 release B: the startup line names the version new manifests get

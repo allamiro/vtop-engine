@@ -1002,7 +1002,7 @@ impl StateStore for PgStateStore {
     async fn append_audit(
         &self,
         row: &AuditInsert,
-        key: Option<&vtop_core::manifest::ManifestMacKey>,
+        keyring: &vtop_core::manifest::ManifestKeyring,
     ) -> Result<AuditRow, VtopError> {
         // One transaction, under an advisory lock every writer takes, from
         // reading the last link to inserting the next: two writers cannot
@@ -1019,7 +1019,7 @@ impl StateStore for PgStateStore {
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(map_sqlx)?;
-        let (hash, chain) = crate::audit::link_for(previous.as_deref(), &row.record, key);
+        let (hash, chain) = crate::audit::link_for(previous.as_deref(), &row.record, keyring);
         let version = i32::try_from(row.audit_version).map_err(|_| {
             VtopError::State(format!(
                 "audit_version {} is out of range",
@@ -1041,7 +1041,7 @@ impl StateStore for PgStateStore {
         .bind(&row.record)
         .bind(&previous)
         .bind(&hash)
-        .bind(chain)
+        .bind(&chain)
         .fetch_one(&mut *tx)
         .await
         .map_err(map_sqlx)?;
@@ -1058,7 +1058,7 @@ impl StateStore for PgStateStore {
             record: row.record.clone(),
             prev_hash: previous,
             hash,
-            chain: chain.to_owned(),
+            chain,
         })
     }
 

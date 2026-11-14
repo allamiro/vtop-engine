@@ -258,12 +258,12 @@ impl StateStore for DeadlineStore {
     async fn append_audit(
         &self,
         row: &crate::audit::AuditInsert,
-        key: Option<&vtop_core::manifest::ManifestMacKey>,
+        keyring: &vtop_core::manifest::ManifestKeyring,
     ) -> Result<crate::audit::AuditRow, VtopError> {
         self.within(
             "append_audit",
             self.point,
-            self.inner.append_audit(row, key),
+            self.inner.append_audit(row, keyring),
         )
         .await
     }

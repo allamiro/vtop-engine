@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use vtop_core::errors::VtopError;
-use vtop_core::manifest::ManifestMacKey;
+use vtop_core::manifest::ManifestKeyring;
 use vtop_observe::audit::{
     self as audit, Action, Actor, AuditEvent, Outcome, ReadRecord, Sink, Stage, Target, LOG_ENV,
 };
@@ -40,12 +40,12 @@ pub fn bind_counters(metrics: &vtop_core::telemetry::Metrics) {
 
 /// The records of one ledger command: the log stream and the audit file
 /// through `vtop_observe::audit`, and the state store's `audit_events` table
-/// when a store is given. The chain is keyed with `key` (the manifest MAC
-/// key) when one is configured.
+/// when a store is given. The chain is keyed with the keyring's signing key
+/// (#685) when one is configured.
 pub struct LedgerAudit {
     /// The command as the operator typed it, for messages.
     pub command: &'static str,
-    pub key: Option<ManifestMacKey>,
+    pub keyring: ManifestKeyring,
 }
 
 impl LedgerAudit {
@@ -103,7 +103,7 @@ impl LedgerAudit {
     ) -> Result<(), VtopError> {
         let row = AuditInsert::from_record(&event.to_json()).map_err(VtopError::Other)?;
         store
-            .append_audit(&row, self.key.as_ref())
+            .append_audit(&row, &self.keyring)
             .await
             .map(|_| ())
             .map_err(|e| {
@@ -133,7 +133,7 @@ impl LedgerAudit {
             Some(store) => {
                 let row = AuditInsert::from_record(&json).map_err(|e| e.to_string())?;
                 store
-                    .append_audit(&row, self.key.as_ref())
+                    .append_audit(&row, &self.keyring)
                     .await
                     .map(|_| ())
                     .map_err(|e| {
@@ -381,7 +381,7 @@ async fn run_inner(command: AuditCommand, json: bool) -> Result<i32, VtopError> 
         AuditCommand::Verify { config } => {
             let (store, key) = open_store(&config).await?;
             let rows = all_rows(store.as_ref()).await?;
-            let report = vtop_state::verify_chain(&rows, key.as_ref());
+            let report = vtop_state::verify_chain(&rows, &key);
             if json {
                 println!(
                     "{}",
@@ -422,12 +422,10 @@ async fn run_inner(command: AuditCommand, json: bool) -> Result<i32, VtopError> 
     }
 }
 
-async fn open_store(
-    config: &Path,
-) -> Result<(Box<dyn StateStore>, Option<ManifestMacKey>), VtopError> {
+async fn open_store(config: &Path) -> Result<(Box<dyn StateStore>, ManifestKeyring), VtopError> {
     let cfg = vtop_core::config::VtopConfig::from_path(config)?;
     cfg.validate()?;
-    let key = cfg.resolve_manifest_mac_key()?;
+    let key = cfg.resolve_manifest_keyring()?;
     let state_store = cfg.engine.state_store.resolve()?;
     let store = crate::engine::connect_configured_store(&cfg.engine, &state_store).await?;
     Ok((store, key))

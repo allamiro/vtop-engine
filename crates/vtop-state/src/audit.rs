@@ -25,7 +25,7 @@
 //! count, for an operator to keep elsewhere and compare.
 
 use vtop_core::manifest::{
-    audit_chain_link, ManifestMacKey, AUDIT_CHAIN_KEYED, AUDIT_CHAIN_UNKEYED,
+    audit_chain_link, audit_chain_recompute, ManifestKeyring, AUDIT_CHAIN_UNKEYED,
 };
 
 /// A row to append. The indexed columns are copies of the record's fields.
@@ -96,13 +96,14 @@ pub struct AuditRow {
     pub chain: String,
 }
 
-/// The link and chain name for a row appended after `previous`.
+/// The link and chain name for a row appended after `previous`: keyed with
+/// the keyring's signing key when there is one.
 pub fn link_for(
     previous: Option<&str>,
     record: &str,
-    key: Option<&ManifestMacKey>,
-) -> (String, &'static str) {
-    audit_chain_link(previous, record, key)
+    keyring: &ManifestKeyring,
+) -> (String, String) {
+    audit_chain_link(previous, record, keyring)
 }
 
 /// What [`verify_chain`] found.
@@ -128,11 +129,11 @@ impl ChainReport {
 ///
 /// A row breaks the chain when its `prev_hash` is not the previous row's
 /// link (a row deleted or reordered), or its link does not match its record
-/// (a row edited). A keyed row cannot be checked without `key`, and is
-/// reported as such; an unkeyed row after a keyed one is reported too: a
-/// writer without the key could otherwise rewrite the rest of the table as
-/// an unkeyed chain.
-pub fn verify_chain(rows: &[AuditRow], key: Option<&ManifestMacKey>) -> ChainReport {
+/// (a row edited). A keyed row is checked with the keyring key its chain
+/// names (#685), and reported when that key is not configured here; an
+/// unkeyed row after a keyed one is reported too: a writer without the key
+/// could otherwise rewrite the rest of the table as an unkeyed chain.
+pub fn verify_chain(rows: &[AuditRow], keyring: &ManifestKeyring) -> ChainReport {
     let mut report = ChainReport::default();
     let mut previous: Option<&str> = None;
     let mut seen_keyed = false;
@@ -147,44 +148,26 @@ pub fn verify_chain(rows: &[AuditRow], key: Option<&ManifestMacKey>) -> ChainRep
                 previous.unwrap_or("none (this is the first row)")
             ));
         }
-        match row.chain.as_str() {
-            AUDIT_CHAIN_KEYED => {
-                seen_keyed = true;
-                report.keyed_rows += 1;
-                match key {
-                    Some(key) => {
-                        let (expected, _) =
-                            link_for(row.prev_hash.as_deref(), &row.record, Some(key));
-                        if expected != row.hash {
-                            report.problems.push(format!(
-                                "{at}: its keyed link does not match its record: the row was \
-                                 edited, or the configured key is not the one it was written with"
-                            ));
-                        }
-                    }
-                    None => report.problems.push(format!(
-                        "{at}: keyed with the manifest MAC key, which is not configured here; \
-                         set manifest_mac_key_env in the config to verify it"
-                    )),
-                }
-            }
-            AUDIT_CHAIN_UNKEYED => {
-                if seen_keyed {
-                    report.problems.push(format!(
-                        "{at}: an unkeyed link after a keyed one: the chain was rewritten \
-                         without the key, or the key was removed from the configuration"
-                    ));
-                }
-                let (expected, _) = link_for(row.prev_hash.as_deref(), &row.record, None);
-                if expected != row.hash {
-                    report.problems.push(format!(
-                        "{at}: its link does not match its record: the row was edited"
-                    ));
-                }
-            }
-            other => report.problems.push(format!(
-                "{at}: chain {other:?} is not one this build reads (a newer release wrote it)"
+        let keyed = row.chain != AUDIT_CHAIN_UNKEYED;
+        if keyed {
+            seen_keyed = true;
+            report.keyed_rows += 1;
+        } else if seen_keyed {
+            report.problems.push(format!(
+                "{at}: an unkeyed link after a keyed one: the chain was rewritten without the \
+                 key, or the key was removed from the configuration"
+            ));
+        }
+        match audit_chain_recompute(row.prev_hash.as_deref(), &row.record, &row.chain, keyring) {
+            Ok(expected) if expected == row.hash => {}
+            Ok(_) if keyed => report.problems.push(format!(
+                "{at}: its keyed link does not match its record: the row was edited, or the \
+                 configured key is not the one it was written with"
             )),
+            Ok(_) => report.problems.push(format!(
+                "{at}: its link does not match its record: the row was edited"
+            )),
+            Err(why) => report.problems.push(format!("{at}: {why}")),
         }
         previous = Some(&row.hash);
         report.last_hash = Some(row.hash.clone());
@@ -202,7 +185,7 @@ pub(crate) fn unsupported() -> vtop_core::errors::VtopError {
 mod tests {
     use super::*;
 
-    fn chain(n: usize, key: Option<&ManifestMacKey>) -> Vec<AuditRow> {
+    fn chain(n: usize, key: &ManifestKeyring) -> Vec<AuditRow> {
         let mut rows: Vec<AuditRow> = Vec::new();
         for i in 0..n {
             let record = format!(r#"{{"audit_version":1,"audit_id":"a{i}"}}"#);
@@ -220,41 +203,49 @@ mod tests {
                 record,
                 prev_hash: prev,
                 hash,
-                chain: name.into(),
+                chain: name,
             });
         }
         rows
     }
 
-    fn key() -> ManifestMacKey {
-        ManifestMacKey::from_hex(&"ab".repeat(32)).unwrap()
+    fn mac(byte: &str) -> vtop_core::manifest::ManifestMacKey {
+        vtop_core::manifest::ManifestMacKey::from_hex(&byte.repeat(32)).unwrap()
+    }
+
+    fn key() -> ManifestKeyring {
+        ManifestKeyring::single(mac("ab"))
+    }
+
+    fn none() -> ManifestKeyring {
+        ManifestKeyring::default()
     }
 
     #[test]
     fn an_intact_chain_verifies_and_names_its_last_link() {
-        let rows = chain(5, None);
-        let report = verify_chain(&rows, None);
+        let rows = chain(5, &none());
+        let report = verify_chain(&rows, &none());
         assert!(report.passed(), "{:?}", report.problems);
         assert_eq!(report.rows, 5);
         assert_eq!(report.last_hash.as_deref(), Some(rows[4].hash.as_str()));
-        let keyed = chain(3, Some(&key()));
-        assert!(verify_chain(&keyed, Some(&key())).passed());
+        let keyed = chain(3, &key());
+        assert!(verify_chain(&keyed, &key()).passed());
     }
 
     #[test]
     fn an_edited_row_breaks_the_chain() {
-        let mut rows = chain(4, None);
+        let mut rows = chain(4, &none());
         rows[2].record = rows[2].record.replace("a2", "a9");
-        let report = verify_chain(&rows, None);
+        let report = verify_chain(&rows, &none());
         assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
         assert!(report.problems[0].contains("row 3") && report.problems[0].contains("edited"));
     }
 
     #[test]
     fn a_deleted_row_breaks_the_chain() {
-        let mut rows = chain(4, None);
+        let mut rows = chain(4, &none());
         rows.remove(1);
-        let report = verify_chain(&rows, None);
+        let report = verify_chain(&rows, &none());
         assert!(
             report
                 .problems
@@ -267,22 +258,22 @@ mod tests {
 
     #[test]
     fn reordered_rows_break_the_chain() {
-        let mut rows = chain(4, None);
+        let mut rows = chain(4, &none());
         rows.swap(1, 2);
-        assert!(!verify_chain(&rows, None).passed());
+        assert!(!verify_chain(&rows, &none()).passed());
     }
 
     #[test]
     fn a_keyed_chain_cannot_be_recomputed_without_the_key() {
-        let mut rows = chain(3, Some(&key()));
+        let mut rows = chain(3, &key());
         // A writer without the key edits a row and recomputes its link as
         // best it can: unkeyed, or with a guessed key.
         rows[1].record = rows[1].record.replace("a1", "a7");
-        let other = ManifestMacKey::from_hex(&"cd".repeat(32)).unwrap();
-        let (forged, _) = link_for(rows[1].prev_hash.as_deref(), &rows[1].record, Some(&other));
+        let other = ManifestKeyring::single(mac("cd"));
+        let (forged, _) = link_for(rows[1].prev_hash.as_deref(), &rows[1].record, &other);
         rows[1].hash = forged;
         rows[2].prev_hash = Some(rows[1].hash.clone());
-        let report = verify_chain(&rows, Some(&key()));
+        let report = verify_chain(&rows, &key());
         assert!(
             report
                 .problems
@@ -292,22 +283,22 @@ mod tests {
             report.problems
         );
         // Rewritten as an unkeyed chain from there on: caught too.
-        let mut downgraded = chain(3, Some(&key()));
+        let mut downgraded = chain(3, &key());
         let (hash, name) = link_for(
             downgraded[1].prev_hash.as_deref(),
             &downgraded[1].record,
-            None,
+            &none(),
         );
         downgraded[1].hash = hash;
-        downgraded[1].chain = name.into();
+        downgraded[1].chain = name;
         downgraded[2].prev_hash = Some(downgraded[1].hash.clone());
         let (hash, _) = link_for(
             downgraded[2].prev_hash.as_deref(),
             &downgraded[2].record,
-            Some(&key()),
+            &key(),
         );
         downgraded[2].hash = hash;
-        let report = verify_chain(&downgraded, Some(&key()));
+        let report = verify_chain(&downgraded, &key());
         assert!(
             report
                 .problems
@@ -317,9 +308,57 @@ mod tests {
             report.problems
         );
         // And without the key at all, a keyed row is not passed as checked.
-        let report = verify_chain(&chain(2, Some(&key())), None);
+        let report = verify_chain(&chain(2, &key()), &none());
         assert_eq!(report.problems.len(), 2);
         assert!(report.problems[0].contains("manifest_mac_key_env"));
+    }
+
+    /// #685: a chain written under one keyring key verifies after rotation,
+    /// as long as the old key is still configured (verify-only); retired, its
+    /// rows are named as unverifiable rather than passed.
+    #[test]
+    fn a_rotated_key_still_verifies_the_rows_it_wrote() {
+        let ring = |active: &str, keys: &[(&str, &str)], retired: &[&str]| {
+            ManifestKeyring::new(
+                active,
+                keys.iter()
+                    .map(|(id, byte)| vtop_core::manifest::KeyringKey {
+                        id: (*id).to_owned(),
+                        key: mac(byte),
+                        source: vtop_core::manifest::KeySourceKind::Env,
+                        legacy: false,
+                    })
+                    .collect(),
+                retired.iter().map(|r| (*r).to_owned()).collect(),
+            )
+            .unwrap()
+        };
+        let q3 = ring("q3", &[("q3", "aa")], &[]);
+        let mut rows = chain(2, &q3);
+        assert_eq!(rows[0].chain, "blake3-keyed:q3");
+        let rotated = ring("q4", &[("q4", "bb"), ("q3", "aa")], &[]);
+        let prev = rows.last().map(|r| r.hash.clone());
+        let record = r#"{"audit_version":1,"audit_id":"a2"}"#.to_owned();
+        let (hash, name) = link_for(prev.as_deref(), &record, &rotated);
+        rows.push(AuditRow {
+            seq: 3,
+            audit_id: "a2".into(),
+            record,
+            prev_hash: prev,
+            hash,
+            chain: name,
+            ..rows[0].clone()
+        });
+        assert_eq!(rows[2].chain, "blake3-keyed:q4");
+        assert!(verify_chain(&rows, &rotated).passed());
+        let retired = ring("q4", &[("q4", "bb")], &["q3"]);
+        let report = verify_chain(&rows, &retired);
+        assert_eq!(report.problems.len(), 2, "{:?}", report.problems);
+        assert!(
+            report.problems[0].contains("\"q3\""),
+            "{:?}",
+            report.problems
+        );
     }
 
     #[test]

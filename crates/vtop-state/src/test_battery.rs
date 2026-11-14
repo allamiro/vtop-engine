@@ -312,7 +312,7 @@ pub async fn run_audit_battery(store: &dyn StateStore) {
             r#"{{"audit_version":1,"audit_id":"{audit_id}","time":"2026-11-14T00:00:0{i}.000Z","action":"ledger.prune","stage":"local","outcome":"{outcome}","actor":{{"kind":"os","uid":1000,"name":"ops","source":"os"}},"target":{{"kind":"ledger"}}}}"#
         );
         let row = crate::audit::AuditInsert::from_record(&record).unwrap();
-        let stored = store.append_audit(&row, None).await.unwrap();
+        let stored = store.append_audit(&row, &Default::default()).await.unwrap();
         assert_eq!(stored.audit_id, audit_id);
         assert_eq!(stored.actor.as_deref(), Some("ops"));
         assert_eq!(stored.chain, "blake3");
@@ -339,13 +339,13 @@ pub async fn run_audit_battery(store: &dyn StateStore) {
         after = last.seq;
         all.extend(page);
     }
-    let report = crate::audit::verify_chain(&all, None);
+    let report = crate::audit::verify_chain(&all, &Default::default());
     assert!(report.passed(), "{:?}", report.problems);
     assert_eq!(report.last_hash.as_deref(), Some(appended[2].hash.as_str()));
     // An audit_id is unique: a record is stored once.
     let again = crate::audit::AuditInsert::from_record(&appended[0].record).unwrap();
     store
-        .append_audit(&again, None)
+        .append_audit(&again, &Default::default())
         .await
         .expect_err("an audit_id is stored once");
 }
@@ -356,7 +356,7 @@ async fn prune_never_touches_the_audit_table(store: &dyn StateStore) {
     let record = r#"{"audit_version":1,"audit_id":"prune-keeps-me","time":"2000-01-01T00:00:00.000Z","action":"ledger.prune","stage":"local","outcome":"success","actor":{"kind":"os","uid":0,"source":"os"},"target":{"kind":"ledger"}}"#;
     let row = crate::audit::AuditInsert::from_record(record).unwrap();
     // A reused database may hold it from an earlier run.
-    let _ = store.append_audit(&row, None).await;
+    let _ = store.append_audit(&row, &Default::default()).await;
     let count = |rows: Vec<crate::audit::AuditRow>| rows.len();
     let before = count(store.list_audit(0, 100_000).await.unwrap());
     store
