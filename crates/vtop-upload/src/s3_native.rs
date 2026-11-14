@@ -945,6 +945,17 @@ where
         || code.as_deref().is_some_and(crate::base::is_throttle_code);
     if throttled {
         VtopError::UploadThrottled(detail)
+    } else if matches!(
+        code.as_deref(),
+        Some("NoSuchUpload" | "InvalidPart" | "InvalidPartOrder")
+    ) {
+        // The multipart upload this request names cannot be continued
+        // (#668): it is gone (aborted by a lifecycle rule or a sweep, or
+        // completed by an earlier attempt), or the store refuses to complete
+        // it because a part it holds is not the one named, which leaves the
+        // upload in place. Sending the same request again fails the same way
+        // on every replay, so the caller must start a new upload.
+        VtopError::UploadSessionGone(detail)
     } else {
         VtopError::Upload(detail)
     }
@@ -3152,6 +3163,51 @@ mod throttle_classification {
         }
         let error = sdk_failure("upload_part", "s3://b/k", response_error(502));
         assert!(!error.is_upload_throttle(), "{error}");
+    }
+
+    /// S3 answers `NoSuchUpload` for an upload id it no longer holds (#668):
+    /// aborted by a lifecycle rule or a sweep, or already completed. That is
+    /// not a failure a retry of the same request can fix, so it is told apart
+    /// from every other error and the caller starts a new upload.
+    #[test]
+    fn no_such_upload_is_a_gone_session_and_nothing_else_is() {
+        let error = sdk_failure(
+            "upload_part",
+            "s3://b/k#2",
+            service_error(404, Some("NoSuchUpload")),
+        );
+        assert!(
+            matches!(error, VtopError::UploadSessionGone(_)),
+            "NoSuchUpload must classify as a gone session: {error:?}"
+        );
+        assert!(error.to_string().contains("NoSuchUpload"), "{error}");
+        assert!(error.to_string().contains("s3://b/k#2"), "{error}");
+        // A complete S3 refuses because a part it holds is not the one named
+        // leaves the upload in place, and completing again fails the same
+        // way (review): it too needs a new upload, not a retry.
+        for code in ["InvalidPart", "InvalidPartOrder"] {
+            let error = sdk_failure(
+                "complete_multipart_upload",
+                "s3://b/k",
+                service_error(400, Some(code)),
+            );
+            assert!(
+                matches!(error, VtopError::UploadSessionGone(_)),
+                "{code} must start a new upload: {error:?}"
+            );
+        }
+        for (status, code) in [
+            (404, Some("NoSuchKey")),
+            (404, None),
+            (400, Some("EntityTooSmall")),
+            (500, Some("InternalError")),
+        ] {
+            let error = sdk_failure("upload_part", "s3://b/k", service_error(status, code));
+            assert!(
+                matches!(error, VtopError::Upload(_)),
+                "{status} {code:?} is not a gone session: {error:?}"
+            );
+        }
     }
 }
 

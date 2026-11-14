@@ -106,6 +106,12 @@ fn populated() -> String {
             .with_label_values(&[sink])
             .inc_by(0);
     }
+    for r in telemetry::MULTIPART_PART_RESULTS {
+        m.multipart_parts_total.with_label_values(&[r]).inc_by(0);
+    }
+    for o in telemetry::MULTIPART_SESSION_OUTCOMES {
+        m.multipart_sessions_total.with_label_values(&[o]).inc_by(0);
+    }
     for r in vtop_core::manifest::KeyResult::ALL {
         m.manifest_authentications_total
             .with_label_values(&["q4-2026", r.as_str()])
@@ -565,6 +571,42 @@ fn kafka_partition_events_are_exported_by_bounded_event() {
         let label = format!(r#"event="{e}""#);
         assert!(text.contains(&label), "missing {label}");
     }
+}
+
+/// #668: multipart parts and sessions are exported by `result` and `outcome`,
+/// fixed sets, and never by object path, upload id or batch id, so an alert
+/// can see sessions kept after failures piling up without parsing logs.
+#[test]
+fn multipart_parts_and_sessions_are_exported_by_bounded_labels() {
+    let text = populated();
+    for name in [
+        "vtop_multipart_parts_total",
+        "vtop_multipart_sessions_total",
+        "vtop_multipart_bytes_reused_total",
+    ] {
+        assert!(text.contains(name), "{name} is not exported: {text}");
+    }
+    for r in vtop_core::telemetry::MULTIPART_PART_RESULTS {
+        let label = format!(r#"vtop_multipart_parts_total{{result="{r}"}}"#);
+        assert!(text.contains(&label), "missing {label}");
+    }
+    for o in vtop_core::telemetry::MULTIPART_SESSION_OUTCOMES {
+        let label = format!(r#"vtop_multipart_sessions_total{{outcome="{o}"}}"#);
+        assert!(text.contains(&label), "missing {label}");
+    }
+    for line in text.lines().filter(|l| l.starts_with("vtop_multipart_")) {
+        for forbidden in ["upload_id", "key=", "uri", "batch_id", "path"] {
+            assert!(
+                !line.contains(forbidden),
+                "{forbidden} is unbounded and belongs in the log line: {line}"
+            );
+        }
+    }
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("vtop_multipart_bytes_reused_total ")),
+        "the bytes counter is a plain, unlabelled counter, present from the start: {text}"
+    );
 }
 
 /// #685: manifest MAC checks are counted by key and result, and the key is

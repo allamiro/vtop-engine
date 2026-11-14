@@ -24,6 +24,25 @@ what each release does **not** yet do.
   No manifest format or ledger migration is introduced. Downgrade remains
   unsupported.
 
+- **[#668](https://github.com/allamiro/vtop-engine/issues/668)** — a failed
+  multipart part no longer discards the parts that completed. The failed part
+  alone is retried, up to the new `upload.multipart_part_attempts` (default 3),
+  with backoff; a batch that still fails keeps its multipart session, and the
+  replay of the same bytes resumes it and sends only the missing parts. A
+  running engine sweeps abandoned sessions periodically, not only at startup.
+  New metrics: `vtop_multipart_parts_total{result}`,
+  `vtop_multipart_sessions_total{outcome}`, `vtop_multipart_bytes_reused_total`.
+  `vtopctl tier copy` shares the code, so it gets the per-part retries too.
+- **Upgrade note (#668):** an older engine ignores
+  `upload.multipart_part_attempts` and keeps its behaviour (the SDK's retries
+  only). Session files keep schema 1. An older engine that finds a session
+  the new one kept refuses it (it still compares the local file's name), fails
+  that attempt and aborts the session, and its replay uploads the object
+  afresh: one wasted attempt, no data at risk. Incomplete uploads
+  kept for a replay are billed storage until resumed or swept: add the
+  `AbortIncompleteMultipartUpload` lifecycle rule in PRODUCTION_HA §7.6.
+  Downgrade remains unsupported.
+
 ## v0.1.0 — a range that fails over
 
 Metadata leases, a lease agent on the data node, verified promotion, and the

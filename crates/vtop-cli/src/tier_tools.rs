@@ -1012,6 +1012,8 @@ mod tests {
             max_parallelism: 2,
             abandon_after_secs: 60,
             state_dir: state.path().to_path_buf(),
+            part_attempts: 3,
+            part_backoff: Default::default(),
         });
         let command = run_tier_copy(&backend, &req)
             .await
@@ -1095,6 +1097,7 @@ mod tests {
             multipart_threshold_bytes: 8 * 1024 * 1024,
             multipart_max_parallelism: 4,
             multipart_abandon_after_secs: 86_400,
+            multipart_part_attempts: 3,
             transports: Default::default(),
             max_egress_bytes_per_second: None,
             max_concurrency_ceiling: None,
