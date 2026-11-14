@@ -798,7 +798,14 @@ impl<'a> Pipeline<'a> {
             let checked = self.versioned_buckets.lock().unwrap().contains(&bucket);
             if !checked {
                 if let Err(e) = note_store_request(
-                    self.backend.verify_bucket_versioning(&bucket).await,
+                    match self.backend.bucket_versioning(&bucket).await {
+                        Ok(vtop_upload::BucketFeature::Enabled) => Ok(()),
+                        Ok(other) => Err(VtopError::Upload(format!(
+                            "bucket {bucket} does not have versioning enabled (status: \
+                             {other:?}); the hardened manifest profile requires it"
+                        ))),
+                        Err(e) => Err(e),
+                    },
                     "bucket_versioning",
                     [
                         tenant.as_str(),
@@ -825,7 +832,12 @@ impl<'a> Pipeline<'a> {
             && !self.locked_buckets.lock().unwrap().contains(&bucket)
         {
             let checked = note_store_request(
-                self.backend.bucket_object_lock_enabled(&bucket).await,
+                match self.backend.bucket_object_lock(&bucket).await {
+                    Ok(vtop_upload::BucketFeature::NotSupported) => {
+                        Err(VtopError::Upload("not implemented".into()))
+                    }
+                    other => other,
+                },
                 "bucket_object_lock",
                 [
                     tenant.as_str(),
@@ -836,8 +848,8 @@ impl<'a> Pipeline<'a> {
                 &self.throttles,
             );
             let refusal = match checked {
-                Ok(true) => None,
-                Ok(false) => {
+                Ok(vtop_upload::BucketFeature::Enabled) => None,
+                Ok(_) => {
                     crate::object_lock::count(&tenant, "bucket_not_locked");
                     Some(crate::object_lock::bucket_refusal(
                         &bucket,
@@ -2476,6 +2488,12 @@ impl Engine {
     pub async fn preflight_object_lock(&self) -> Result<(), VtopError> {
         crate::object_lock::preflight(&self.config, self.backend.as_ref(), &self.locked_buckets)
             .await
+    }
+
+    /// The hardened profile's startup check of a literal bucket's versioning
+    /// (#722).
+    pub async fn preflight_bucket_versioning(&self) -> Result<(), VtopError> {
+        Ok(())
     }
 
     /// Batching thresholds (records / bytes / age) from config.

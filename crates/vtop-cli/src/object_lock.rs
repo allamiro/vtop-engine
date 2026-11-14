@@ -9,7 +9,9 @@ use vtop_core::config::{ObjectLockMode, VtopConfig};
 use vtop_core::errors::VtopError;
 use vtop_core::telemetry;
 use vtop_upload::multipart::redact_urls;
-use vtop_upload::{ObjectLockPolicy, RetentionCheck, RetentionExpectation, UploadBackend};
+use vtop_upload::{
+    BucketFeature, ObjectLockPolicy, RetentionCheck, RetentionExpectation, UploadBackend,
+};
 
 /// One startup line: its level and its text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,12 +173,16 @@ pub(crate) async fn preflight(
     let checked = if bucket_is_templated(bucket) {
         "(each bucket the template names is checked at its first upload)"
     } else {
-        match backend.bucket_object_lock_enabled(bucket).await {
-            Ok(true) => {
+        let answer = match backend.bucket_object_lock(bucket).await {
+            Ok(BucketFeature::NotSupported) => Err(VtopError::Upload("not implemented".into())),
+            other => other,
+        };
+        match answer {
+            Ok(BucketFeature::Enabled) => {
                 locked_buckets.lock().unwrap().insert(bucket.to_owned());
                 "(checked)"
             }
-            Ok(false) => {
+            Ok(_) => {
                 return Err(VtopError::Config(bucket_refusal(
                     bucket,
                     "the engine did not start",

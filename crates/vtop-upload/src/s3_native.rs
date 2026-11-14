@@ -14,9 +14,9 @@
 //! (backend-limited).
 
 use crate::base::{
-    judge_retention, parse_s3_uri, read_bounded, CreatedUpload, ObjectChecksum, ObjectHead,
-    ObjectLockPolicy, RequestedRetention, RetentionCheck, RetentionExpectation, StoredManifest,
-    StoredObject, StoredRetention, UploadBackend, UploadedPart, VerificationResult,
+    judge_retention, parse_s3_uri, read_bounded, BucketFeature, CreatedUpload, ObjectChecksum,
+    ObjectHead, ObjectLockPolicy, RequestedRetention, RetentionCheck, RetentionExpectation,
+    StoredManifest, StoredObject, StoredRetention, UploadBackend, UploadedPart, VerificationResult,
 };
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -1116,7 +1116,7 @@ impl UploadBackend for S3NativeBackend {
         true
     }
 
-    async fn verify_bucket_versioning(&self, bucket: &str) -> Result<(), VtopError> {
+    async fn bucket_versioning(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
         let out = self
             .client
             .get_bucket_versioning()
@@ -1124,20 +1124,19 @@ impl UploadBackend for S3NativeBackend {
             .send()
             .await
             .map_err(|e| sdk_failure("get_bucket_versioning", bucket, e))?;
-        match out.status() {
-            Some(BucketVersioningStatus::Enabled) => Ok(()),
-            other => Err(VtopError::Upload(format!(
-                "bucket {bucket} does not have versioning enabled (status: {other:?}); \
-                 the hardened manifest profile requires it"
-            ))),
-        }
+        // Suspended, or no status at all (a bucket versioning was never
+        // turned on for): either way overwritten versions are not kept.
+        Ok(match out.status() {
+            Some(BucketVersioningStatus::Enabled) => BucketFeature::Enabled,
+            _ => BucketFeature::NotEnabled,
+        })
     }
 
     fn object_lock(&self) -> Option<ObjectLockPolicy> {
         self.object_lock
     }
 
-    async fn bucket_object_lock_enabled(&self, bucket: &str) -> Result<bool, VtopError> {
+    async fn bucket_object_lock(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
         match self
             .client
             .get_object_lock_configuration()
@@ -1145,16 +1144,23 @@ impl UploadBackend for S3NativeBackend {
             .send()
             .await
         {
-            Ok(out) => Ok(out
-                .object_lock_configuration()
-                .and_then(|c| c.object_lock_enabled())
-                .is_some_and(|e| *e == ObjectLockEnabled::Enabled)),
+            Ok(out) => Ok(
+                if out
+                    .object_lock_configuration()
+                    .and_then(|c| c.object_lock_enabled())
+                    .is_some_and(|e| *e == ObjectLockEnabled::Enabled)
+                {
+                    BucketFeature::Enabled
+                } else {
+                    BucketFeature::NotEnabled
+                },
+            ),
             // S3's answer for a bucket that has no Object Lock configuration
             // at all: a definite "not enabled", not a failed check.
             Err(SdkError::ServiceError(context))
                 if context.err().code() == Some("ObjectLockConfigurationNotFoundError") =>
             {
-                Ok(false)
+                Ok(BucketFeature::NotEnabled)
             }
             Err(e) => Err(sdk_failure("get_object_lock_configuration", bucket, e)),
         }
