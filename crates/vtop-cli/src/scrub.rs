@@ -985,19 +985,21 @@ impl Cursor {
             }
             Err(e) => return Err(e.into()),
         };
+        Self::parse(&text, &path.display().to_string())
+    }
+
+    fn parse(text: &str, name: &str) -> Result<Self, VtopError> {
         // An unreadable cursor is an error, not a fresh start: restarting
         // silently would re-read from the beginning on every run, and on a
         // large archive never reach the end (delete the file to restart).
-        let cursor: Self = serde_json::from_str(&text).map_err(|e| {
+        let cursor: Self = serde_json::from_str(text).map_err(|e| {
             VtopError::Other(format!(
-                "scrub cursor {} is not a cursor ({e}); delete it to start a new pass",
-                path.display()
+                "scrub cursor {name} is not a cursor ({e}); delete it to start a new pass"
             ))
         })?;
         if cursor.vtop_scrub_cursor != CURSOR_VERSION {
             return Err(VtopError::Other(format!(
-                "scrub cursor {} is version {}; this build reads {CURSOR_VERSION}",
-                path.display(),
+                "scrub cursor {name} is version {}; this build reads {CURSOR_VERSION}",
                 cursor.vtop_scrub_cursor
             )));
         }
@@ -1021,6 +1023,14 @@ impl Cursor {
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
+}
+
+/// Parse a cursor file's text as a run reads it; `name` is what the errors
+/// call it. Returns the batch the pass resumes after (`None` at a pass's
+/// start). Public for the `session_files` fuzz target (#729), which drives
+/// the parser a run uses on hostile text.
+pub fn parse_cursor(text: &str, name: &str) -> Result<Option<String>, VtopError> {
+    Cursor::parse(text, name).map(|cursor| cursor.after)
 }
 
 /// The locks a run holds from before it reads anything it will replace until
@@ -2095,6 +2105,33 @@ mod tests {
         std::fs::write(&path, "{ half a cur").unwrap();
         let error = Cursor::load(&path).unwrap_err().to_string();
         assert!(error.contains("delete it"), "{error}");
+    }
+
+    /// #729: the cursor parser the `session_files` fuzz target drives reads
+    /// a stored cursor's resume point and refuses another version by name.
+    #[test]
+    fn parse_cursor_reads_the_resume_point_and_refuses_another_version() {
+        let mut cursor = Cursor {
+            vtop_scrub_cursor: CURSOR_VERSION,
+            after: Some("batch-7".to_owned()),
+            ..Cursor::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scrub.cursor");
+        cursor.store(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            parse_cursor(&text, "c").unwrap().as_deref(),
+            Some("batch-7")
+        );
+        let newer = text.replace("\"vtop_scrub_cursor\": 1", "\"vtop_scrub_cursor\": 2");
+        assert_ne!(
+            newer, text,
+            "the version field is where the test expects it"
+        );
+        let error = parse_cursor(&newer, "c").unwrap_err().to_string();
+        assert!(error.contains("version 2"), "{error}");
+        assert!(parse_cursor("{ half", "c").is_err());
     }
 
     #[test]

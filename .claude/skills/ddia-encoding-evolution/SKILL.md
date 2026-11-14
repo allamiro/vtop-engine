@@ -44,6 +44,6 @@ Book lens: chapter 4 — formats for encoding data, schema evolution, and datafl
 - [ ] Which version marker changes, and what do old readers do with the new data?
 - [ ] Is there an old-release fixture in `upgrade-compat.sh` coverage (add the profile if the format is new)?
 - [ ] Mixed-version behaviour stated for each of: old leader/new follower, new leader/old follower, old reader of new data?
-- [ ] Fuzz target extended (`fuzz/fuzz_targets/`: `manifest_parse`, `detect_*`; add one for new parsers)?
+- [ ] Fuzz target extended (`fuzz/fuzz_targets/`, one per decoder of untrusted bytes, listed in `fuzz/README.md`; add one for a new parser) and its seeds rewritten if the format changed?
 - [ ] Docs updated: `docs/VTOP_PROTOCOL_DRAFT.md` for protocol, `docs/ROADMAP.md` known limitations for compatibility notes?
 - [ ] CHANGELOG / release notes mention it (`scripts/release-notes.sh`, `docs/RELEASE_VERIFICATION.md`)?

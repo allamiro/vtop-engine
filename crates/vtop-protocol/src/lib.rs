@@ -2422,9 +2422,9 @@ mod tests {
         assert_eq!(decode_frame(&first, limits()).unwrap(), produce());
     }
 
-    #[test]
-    fn every_message_family_round_trips() {
-        let messages = vec![
+    /// One message of every family; also the fuzz seeds (#729).
+    fn every_message_family() -> Vec<Message> {
+        vec![
             Message::ClientHello(ClientHello {
                 cluster_id: Uuid::from_u128(1),
                 principal_id: Uuid::from_u128(9),
@@ -2689,7 +2689,12 @@ mod tests {
                 sealed_end: 4096,
                 records_sealed: 640,
             }),
-        ];
+        ]
+    }
+
+    #[test]
+    fn every_message_family_round_trips() {
+        let messages = every_message_family();
         for (request_id, message) in messages.into_iter().enumerate() {
             let frame = WireFrame {
                 request_id: request_id as u64,
@@ -3143,6 +3148,64 @@ mod tests {
             ),
             "a non-advancing history is malformed, and must report the same \
              way whichever message carried it"
+        );
+    }
+    /// `fuzz/corpus/protocol_frame`, where the fuzz target's committed seeds
+    /// live (#729).
+    fn fuzz_seed_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/protocol_frame")
+    }
+
+    /// The seeds: one valid frame per message family, under the default
+    /// limits the fuzz target decodes with.
+    fn fuzz_seeds() -> Vec<(String, Vec<u8>)> {
+        every_message_family()
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| {
+                let kind = message.kind();
+                let frame = WireFrame {
+                    request_id: index as u64,
+                    stream_id: 1,
+                    message,
+                };
+                let encoded = encode_frame(&frame, ProtocolLimits::default()).unwrap();
+                (format!("kind-{kind:03}"), encoded)
+            })
+            .collect()
+    }
+
+    /// Rewrites the committed seeds. Run on purpose after a format change:
+    /// `cargo test -p vtop-protocol -- --ignored write_fuzz_seeds`.
+    #[test]
+    #[ignore = "writes fuzz/corpus/protocol_frame; run on purpose"]
+    fn write_fuzz_seeds() {
+        let dir = fuzz_seed_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes) in fuzz_seeds() {
+            std::fs::write(dir.join(format!("{name}.seed")), bytes).unwrap();
+        }
+    }
+
+    /// #729: every committed seed is a frame this build decodes, so the
+    /// fuzzer starts from inputs that reach each message decoder, and a
+    /// format change that strands the seeds fails here, not silently in
+    /// a shallower nightly. Every family has one.
+    #[test]
+    fn the_committed_fuzz_seeds_decode() {
+        let mut kinds = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(fuzz_seed_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            let frame = decode_frame(&bytes, ProtocolLimits::default())
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            kinds.insert(frame.message.kind());
+        }
+        let expected: std::collections::BTreeSet<u16> =
+            every_message_family().iter().map(Message::kind).collect();
+        assert_eq!(
+            kinds, expected,
+            "a message family has no seed; run write_fuzz_seeds"
         );
     }
 }

@@ -53,6 +53,7 @@ jobs:
       minio: ${{ steps.filter.outputs.minio }}
       postgres: ${{ steps.filter.outputs.postgres }}
       fuzz: ${{ steps.filter.outputs.fuzz }}
+      mutants_gate: ${{ steps.filter.outputs.mutants_gate }}
       chaos: ${{ steps.filter.outputs.chaos }}
       upgrade: ${{ steps.filter.outputs.upgrade }}
       manifest_compat: ${{ steps.filter.outputs.manifest_compat }}
@@ -160,15 +161,36 @@ jobs:
               - 'rust-toolchain*'
               - '.github/workflows/ci.yml'
 
-            # The fuzz targets (detect_batch, detect_record, manifest_parse)
-            # exercise vtop-core only, and need a pinned nightly toolchain.
+            # The fuzz crate's closure (`cargo tree --manifest-path
+            # fuzz/Cargo.toml -e normal`): every decoder of untrusted bytes
+            # it fuzzes (#729) lives in one of these, and vtop-cli (built
+            # without its kafka feature) pulls in the rest. Only vtop-node is
+            # outside it. It needs a pinned nightly toolchain.
             fuzz:
               - 'fuzz/**'
+              - 'crates/vtop-adapters/**'
+              - 'crates/vtop-broker/**'
+              - 'crates/vtop-cli/**'
               - 'crates/vtop-core/**'
+              - 'crates/vtop-kafka/**'
+              - 'crates/vtop-log/**'
+              - 'crates/vtop-meta/**'
+              - 'crates/vtop-observe/**'
+              - 'crates/vtop-protocol/**'
+              - 'crates/vtop-state/**'
+              - 'crates/vtop-upload/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
               - 'rust-toolchain*'
+              - '.github/workflows/ci.yml'
+
+            # The gate script and its test: the gated mutation job runs the
+            # test first, so a change to either must run it even when no
+            # Rust changed.
+            mutants_gate:
+              - 'scripts/mutants-gate.py'
+              - 'scripts/tests/test_mutants_gate.py'
               - '.github/workflows/ci.yml'
 
             dashboards:
@@ -1877,17 +1899,17 @@ jobs:
         if: failure()
         run: docker compose logs --tail=100 vtop-engine 2>/dev/null || echo "stack already torn down; see the smoke output above"
 
-  # Fuzzing (issue #25): detect.rs and manifest deserialization both parse
-  # UNTRUSTED bytes, so they must never panic. This is a bounded SMOKE run - a
-  # short campaign from the committed seed corpus that fails the build if any
-  # target crashes. It is not a substitute for long out-of-band fuzzing, but it
-  # catches regressions on every PR. cargo-fuzz needs nightly + libFuzzer.
+  # Fuzzing (issues #25, #729): every decoder of untrusted bytes must never
+  # panic. This is a bounded SMOKE run - a short campaign per target from the
+  # committed seed corpus that fails the build if any target crashes. The
+  # long campaigns, with a corpus that persists between nights, are
+  # .github/workflows/fuzz-nightly.yml. cargo-fuzz needs nightly + libFuzzer.
   fuzz:
-    name: fuzz smoke (detect + manifest)
+    name: fuzz smoke (every target)
     needs: changes
     if: needs.changes.outputs.fuzz == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -1895,6 +1917,7 @@ jobs:
           # Pinned: the floating "nightly" channel broke on 2026-07-24 with an
           # ICE compiling tokio under ASAN (rustc 89c61a754). Pin the last
           # known-good nightly; bump deliberately when a newer one is verified.
+          # fuzz-nightly.yml pins the same one.
           toolchain: nightly-2026-07-22
           # ASAN (which libFuzzer builds with) is incompatible with a statically
           # linked libc, so the fuzz build must target the GNU (dynamic-libc)
@@ -1911,18 +1934,125 @@ jobs:
             ~/.cargo/git
             fuzz/target
           key: ${{ runner.os }}-fuzz-${{ hashFiles('**/Cargo.lock', 'fuzz/Cargo.toml') }}
-      - name: Smoke-fuzz each target (fails on any crash)
+      # The fuzz crate is its own workspace with no committed lockfile.
+      # Starting it from the workspace's lockfile builds the same, audited
+      # versions the engine ships, rather than whatever resolves today.
+      - name: Seed the fuzz lockfile from the workspace
+        run: cp Cargo.lock fuzz/Cargo.lock
+      # The list comes from the crate, not from this file, so a target added
+      # to fuzz/Cargo.toml is fuzzed here and nightly without a workflow edit.
+      - name: List the targets
+        id: targets
         run: |
-          for t in detect_record detect_batch manifest_parse; do
+          targets=$(cargo +nightly-2026-07-22 fuzz list | tr '\n' ' ')
+          echo "targets: $targets"
+          test -n "$targets"
+          echo "list=$targets" >> "$GITHUB_OUTPUT"
+      - name: Build every target
+        run: cargo +nightly-2026-07-22 fuzz build --target x86_64-unknown-linux-gnu
+      # Each committed seed is decoded once (-runs=0 runs the corpus and
+      # stops), so a seed that panics names itself before the campaign.
+      - name: Replay every committed seed
+        env:
+          TARGETS: ${{ steps.targets.outputs.list }}
+        run: |
+          for t in $TARGETS; do
+            echo "::group::seeds $t"
+            cargo +nightly-2026-07-22 fuzz run "$t" --target x86_64-unknown-linux-gnu -- -runs=0
+            echo "::endgroup::"
+          done
+      - name: Smoke-fuzz each target (fails on any crash)
+        env:
+          TARGETS: ${{ steps.targets.outputs.list }}
+        run: |
+          for t in $TARGETS; do
             echo "::group::fuzz $t"
             cargo +nightly-2026-07-22 fuzz run "$t" --target x86_64-unknown-linux-gnu -- \
               -max_total_time=60 -print_final_stats=1
             echo "::endgroup::"
           done
+      - name: Upload crash inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-smoke-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
 
-  # Mutation testing (issue #25): measure whether the suite actually catches
-  # injected faults. REPORT ONLY - never gates the build (continue-on-error) -
-  # and scoped to the highest-value modules so a run finishes in CI time.
+  # Mutation testing on the commit path (#729): GATED. A mutant of the
+  # state machine (`transition`, `can_transition`, `is_committable`) or of
+  # replay that the tests do not catch is a way to reach SOURCE_COMMITTED
+  # before VERIFIED that nothing would notice, so the build fails when the
+  # score drops below MUTANTS_MIN_SCORE. scripts/mutants-gate.py computes
+  # caught / (caught + missed + timeout) from mutants.out/outcomes.json
+  # (unviable mutants do not compile and are left out, as cargo-mutants
+  # leaves them out), names every survivor, and refuses a run that is not
+  # evidence (failed baseline, no viable mutant, a file with none).
+  mutants-gate:
+    name: mutation testing (commit path)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.mutants_gate == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # The maintainer sets this. 0.90 leaves room for a mutant that times
+      # out on a loaded runner, which would otherwise flake the gate; 1.00 is
+      # a no-slack gate for these two files.
+      MUTANTS_MIN_SCORE: "0.90"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      # The gate is only as good as its arithmetic: prove it on crafted
+      # outcomes (pass, fail, unviable excluded, timeouts counted, empty and
+      # failed-baseline runs refused) before trusting it with a real one.
+      - name: Test the gate script
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+        with:
+          tool: cargo-mutants
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+      # cargo-mutants exits non-zero when a mutant survives; the gate script,
+      # not that exit code, decides, so the run's result is kept for it.
+      - name: Run cargo-mutants on the commit path
+        run: |
+          cargo mutants --package vtop-core \
+            --file 'crates/vtop-core/src/state_machine.rs' \
+            --file 'crates/vtop-core/src/replay.rs' \
+            --timeout 120 --no-shuffle | tee /tmp/mutants.txt || true
+      - name: Gate on the mutation score
+        run: |
+          python3 scripts/mutants-gate.py \
+            --outcomes mutants.out/outcomes.json \
+            --min-score "$MUTANTS_MIN_SCORE" \
+            --expect-file crates/vtop-core/src/state_machine.rs \
+            --expect-file crates/vtop-core/src/replay.rs \
+            --title 'Mutation testing (commit path, gated)' \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - name: Upload the outcomes
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants-commit-path
+          path: |
+            mutants.out/outcomes.json
+            mutants.out/missed.txt
+            mutants.out/timeout.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Mutation testing (issue #25): REPORT ONLY - never gates the build
+  # (continue-on-error) - for the classifier and the batcher, which are not
+  # on the commit path. The commit-path files moved to the gated job above.
   mutants:
     name: mutation testing (report only)
     needs: changes
@@ -1947,7 +2077,6 @@ jobs:
         run: |
           cargo mutants --package vtop-core \
             --file 'crates/vtop-core/src/detect.rs' \
-            --file 'crates/vtop-core/src/state_machine.rs' \
             --file 'crates/vtop-core/src/batch.rs' \
             --timeout 120 --no-shuffle | tee /tmp/mutants.txt || true
       - name: Publish summary

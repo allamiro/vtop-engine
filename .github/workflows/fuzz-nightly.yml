@@ -1,0 +1,381 @@
+name: fuzz nightly
+
+# Long fuzzing campaigns over every decoder of untrusted bytes, with a corpus
+# that persists from one night to the next, and a report-only mutation run
+# over the verify, recovery and file-continuity code (#729).
+#
+# The PR job in ci.yml runs each target for 60 seconds from the committed
+# seeds. That catches a regression on the way in; it does not find the bug
+# that needs an hour of coverage-guided search, or the one that needs a
+# corpus grown over many nights. This workflow does both.
+#
+# HOW THE CORPUS PERSISTS. Each target's corpus is an Actions cache keyed
+# `fuzz-corpus-<target>-<run id>` and restored by the prefix
+# `fuzz-corpus-<target>-`, so every night restores the newest one and saves
+# a new one. A cache entry is immutable, which is why the key changes every
+# night; restoring one also refreshes its seven-day eviction clock. The
+# committed `fuzz/corpus/<target>/*.seed` files are copied in on every run,
+# so a cold or evicted cache starts from the seeds, never from nothing. The
+# corpus is minimized (libFuzzer -merge, what `cargo fuzz cmin` runs) before
+# it is saved, so it holds only inputs that add coverage.
+#
+# WHAT A CRASH DOES. The input is minimized (-minimize_crash, what `cargo
+# fuzz tmin` runs) and uploaded as an artifact, and an issue titled
+# `fuzz: <target> crashed` is opened, or commented on if one is already open,
+# with the run and the artifact. The fixing PR commits the input as a
+# regression test in the crate that owns the decoder (fuzz/README.md).
+#
+# HOW THIS FILE IS TESTED BEFORE IT RUNS ON main. A scheduled workflow runs
+# only from the default branch, so a pull request that changes this file or
+# fuzz/ runs it too, with a 30 second budget per target: the matrix, the
+# corpus restore and save, the minimization and the artifact path all run on
+# the PR head. The issue step runs there as a dry run: it performs the
+# duplicate search and prints what it would create or comment, and creates
+# nothing. The real crash path (an issue opened on a real finding) can only
+# run on main.
+on:
+  schedule:
+    # 02:37 UTC: off the hour, because scheduled runs queue heavily at :00.
+    - cron: "37 2 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Fuzzing time per target, in seconds"
+        default: "3600"
+        required: true
+      dry_run:
+        description: "Exercise the crash-issue step without opening or commenting on an issue"
+        type: boolean
+        default: false
+      mutation:
+        description: "Also run the report-only mutation job"
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - ".github/workflows/fuzz-nightly.yml"
+      - "fuzz/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  # A PR push supersedes its earlier run; a nightly run is never cancelled
+  # by another (a dispatch during the night queues behind it).
+  group: fuzz-nightly-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned with ci.yml's fuzz job: the floating nightly broke on 2026-07-24
+  # with an ICE compiling tokio under ASAN. Bump both together.
+  FUZZ_TOOLCHAIN: nightly-2026-07-22
+  FUZZ_TRIPLE: x86_64-unknown-linux-gnu
+
+jobs:
+  # Build every target once and hand the binaries to the matrix: the fuzz
+  # crate's closure is most of the workspace, and building it once per
+  # target would spend the night compiling.
+  build:
+    name: build the fuzz targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      targets: ${{ steps.targets.outputs.json }}
+      seconds: ${{ steps.budget.outputs.seconds }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Choose the time budget
+        id: budget
+        env:
+          EVENT: ${{ github.event_name }}
+          REQUESTED: ${{ inputs.seconds }}
+        run: |
+          case "$EVENT" in
+            pull_request) seconds=30 ;;
+            workflow_dispatch) seconds="$REQUESTED" ;;
+            *) seconds=3600 ;;
+          esac
+          case "$seconds" in
+            ''|*[!0-9]*) echo "::error::seconds must be a whole number, got '$seconds'"; exit 1 ;;
+          esac
+          echo "seconds=$seconds" >> "$GITHUB_OUTPUT"
+          echo "fuzzing $seconds s per target ($EVENT)"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly-2026-07-22
+          targets: x86_64-unknown-linux-gnu
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+        with:
+          tool: cargo-fuzz
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('**/Cargo.lock', 'fuzz/Cargo.toml') }}
+      # Same versions the engine ships (see ci.yml's fuzz job).
+      - name: Seed the fuzz lockfile from the workspace
+        run: cp Cargo.lock fuzz/Cargo.lock
+      # The matrix is whatever the crate declares, so a target added to
+      # fuzz/Cargo.toml (#706's meta_decode, for one) runs here with no edit.
+      - name: List the targets
+        id: targets
+        run: |
+          cargo "+$FUZZ_TOOLCHAIN" fuzz list > /tmp/targets.txt
+          cat /tmp/targets.txt
+          test -s /tmp/targets.txt
+          json=$(jq -R -s -c 'split("\n") | map(select(length > 0))' /tmp/targets.txt)
+          echo "json=$json" >> "$GITHUB_OUTPUT"
+      - name: Build every target
+        run: cargo "+$FUZZ_TOOLCHAIN" fuzz build --target "$FUZZ_TRIPLE"
+      - name: Collect the binaries
+        run: |
+          mkdir -p /tmp/fuzz-bin
+          while read -r t; do
+            cp "fuzz/target/$FUZZ_TRIPLE/release/$t" /tmp/fuzz-bin/
+          done < /tmp/targets.txt
+          ls -la /tmp/fuzz-bin
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-binaries
+          path: /tmp/fuzz-bin/
+          retention-days: 1
+
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    needs: build
+    runs-on: ubuntu-latest
+    # The budget plus the minimization and the cache save, with room to spare.
+    timeout-minutes: 100
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.build.outputs.targets) }}
+    env:
+      TARGET: ${{ matrix.target }}
+      SECONDS_PER_TARGET: ${{ needs.build.outputs.seconds }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fuzz-binaries
+          path: /tmp/fuzz-bin
+      - name: Restore the corpus
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: work/corpus
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+      - name: Add the committed seeds
+        env:
+          MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          mkdir -p work/corpus work/artifacts
+          before=$(find work/corpus -type f | wc -l)
+          if [ -d "fuzz/corpus/$TARGET" ]; then
+            cp fuzz/corpus/"$TARGET"/* work/corpus/ 2>/dev/null || true
+          fi
+          echo "restored $before input(s) (restored from: ${MATCHED:-nothing, a cold start}); $(find work/corpus -type f | wc -l) with the seeds"
+      - name: Fuzz
+        id: run
+        run: |
+          chmod +x "/tmp/fuzz-bin/$TARGET"
+          set +e
+          "/tmp/fuzz-bin/$TARGET" work/corpus \
+            -max_total_time="$SECONDS_PER_TARGET" \
+            -print_final_stats=1 \
+            -artifact_prefix=work/artifacts/ 2>&1 | tee work/fuzz.log
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "libFuzzer exited $status"
+          if [ "$status" -ne 0 ]; then
+            echo "crashed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "crashed=false" >> "$GITHUB_OUTPUT"
+          fi
+      # Merge into a fresh directory keeps only the inputs that add coverage
+      # (`cargo fuzz cmin` is this call). A crash input is not in the corpus:
+      # libFuzzer writes it under work/artifacts, not work/corpus.
+      - name: Minimize the corpus
+        if: always() && steps.run.outcome == 'success'
+        run: |
+          mkdir -p work/minimized
+          "/tmp/fuzz-bin/$TARGET" -merge=1 work/minimized work/corpus 2>&1 | tail -5
+          before=$(find work/corpus -type f | wc -l)
+          after=$(find work/minimized -type f | wc -l)
+          rm -rf work/corpus && mv work/minimized work/corpus
+          size=$(du -sh work/corpus | cut -f1)
+          echo "corpus: $before input(s) before minimizing, $after after, $size" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Save the corpus
+        if: always() && steps.run.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: work/corpus
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+      - name: Minimize the crash input
+        if: steps.run.outputs.crashed == 'true'
+        run: |
+          for input in work/artifacts/*; do
+            [ -f "$input" ] || continue
+            "/tmp/fuzz-bin/$TARGET" -minimize_crash=1 -runs=100000 \
+              -exact_artifact_path="$input.min" "$input" 2>&1 | tail -3 || true
+          done
+          ls -la work/artifacts
+      - name: Upload the crash input
+        if: steps.run.outputs.crashed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            work/artifacts/
+            work/fuzz.log
+          retention-days: 90
+      # Runs on a crash; on a pull request or a dispatch with dry_run it also
+      # runs WITHOUT one, as a dry run, so the duplicate search and the text
+      # of the issue are exercised before the workflow reaches main.
+      - name: Open or update the crash issue
+        if: >-
+          steps.run.outputs.crashed == 'true'
+          || github.event_name == 'pull_request'
+          || inputs.dry_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ARTIFACT: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
+          CRASHED: ${{ steps.run.outputs.crashed }}
+          DRY_RUN: ${{ github.event_name == 'pull_request' || inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          title="fuzz: $TARGET crashed"
+          body=$(cat <<EOF
+          The nightly fuzz run found an input that crashes \`$TARGET\`.
+
+          - Run: $RUN_URL
+          - Artifact: \`$ARTIFACT\` (the input libFuzzer saved, a \`.min\` minimized copy, and the log)
+
+          Reproduce: download the artifact, then from the repository root
+          \`cargo +nightly-2026-07-22 fuzz run $TARGET <input>\`.
+
+          The fix commits the input as a regression test in the crate that owns
+          the decoder (fuzz/README.md).
+          EOF
+          )
+          # Exact title match among OPEN issues: the search is fuzzy, the
+          # comparison is not.
+          existing=$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" \
+            --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "dry run (crashed: ${CRASHED:-false}); nothing is created or commented"
+            if [ -n "$existing" ]; then
+              echo "would comment on #$existing"
+            else
+              echo "would create an issue titled '$title' with labels security,testing"
+            fi
+            printf '%s\n' "$body"
+            exit 0
+          fi
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "Found again. $body"
+            echo "commented on #$existing"
+          else
+            gh issue create --repo "$REPO" --title "$title" --label security --label testing --body "$body"
+          fi
+      - name: Fail the job on a crash
+        if: steps.run.outputs.crashed == 'true'
+        run: |
+          echo "::error::$TARGET crashed; the input is in the artifact fuzz-crash-$TARGET-${{ github.run_id }}"
+          exit 1
+
+  # Report only. The verify, recovery and file-continuity code has no
+  # measured mutation score yet, so a gate on it now would be a number
+  # picked from nothing. This records the score every night; the gate in
+  # ci.yml is extended once two weeks of scores exist (#729).
+  mutants:
+    name: mutation (report only) ${{ matrix.package }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    if: github.event_name != 'workflow_dispatch' || inputs.mutation
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Verification of an upload and the multipart resume checks.
+          - package: vtop-upload
+            files: crates/vtop-upload/src/base.rs crates/vtop-upload/src/multipart.rs
+          # File continuity: identity, rotation and resume across restarts.
+          - package: vtop-adapters
+            files: crates/vtop-adapters/src/continuity.rs crates/vtop-adapters/src/rotated.rs crates/vtop-adapters/src/file_source.rs
+          # Recovery: the ledger's claims, fences and the store's recovery reads.
+          - package: vtop-state
+            files: crates/vtop-state/src/store.rs crates/vtop-state/src/fence.rs crates/vtop-state/src/sqlite_store.rs
+    env:
+      PACKAGE: ${{ matrix.package }}
+      FILES: ${{ matrix.files }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+        with:
+          tool: cargo-mutants
+      - name: Install librdkafka build dependencies
+        if: github.event_name != 'pull_request'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+      - name: Build the --file arguments
+        id: args
+        run: |
+          args=""
+          for f in $FILES; do
+            test -f "$f" || { echo "::error::$f does not exist; update the mutation scope"; exit 1; }
+            args="$args --file $f"
+          done
+          echo "args=$args" >> "$GITHUB_OUTPUT"
+      # On a pull request this lists the mutants instead of testing them: it
+      # proves the scope matches code without spending two hours on it.
+      - name: List the mutants (pull request)
+        if: github.event_name == 'pull_request'
+        env:
+          ARGS: ${{ steps.args.outputs.args }}
+        run: |
+          # shellcheck disable=SC2086
+          cargo mutants --package "$PACKAGE" $ARGS --list > /tmp/mutants.txt
+          count=$(wc -l < /tmp/mutants.txt)
+          echo "$count mutant(s) in scope for $PACKAGE" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$count" -gt 0
+      - name: Run cargo-mutants
+        if: github.event_name != 'pull_request'
+        env:
+          ARGS: ${{ steps.args.outputs.args }}
+        run: |
+          # shellcheck disable=SC2086
+          cargo mutants --package "$PACKAGE" $ARGS \
+            --timeout 300 --no-shuffle | tail -40 || true
+      - name: Report the score
+        if: github.event_name != 'pull_request'
+        run: |
+          python3 scripts/mutants-gate.py --report-only \
+            --outcomes mutants.out/outcomes.json \
+            --title "Mutation testing (report only): $PACKAGE" \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && github.event_name != 'pull_request'
+        with:
+          name: mutants-${{ matrix.package }}-${{ github.run_id }}
+          path: |
+            mutants.out/outcomes.json
+            mutants.out/missed.txt
+            mutants.out/timeout.txt
+          if-no-files-found: ignore
+          retention-days: 30
