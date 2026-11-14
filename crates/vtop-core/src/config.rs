@@ -2046,6 +2046,16 @@ upload:
         // An empty section is every default.
         let cfg = VtopConfig::from_yaml_str(&format!("{base}manifest: {{}}\n")).unwrap();
         assert_eq!(cfg.manifest.write_version, ManifestWriteVersion::V0_3);
+        // The mechanism that lets a v0.8.0 engine start on this section: an
+        // unknown top-level key is ignored, and so is a later release's key
+        // inside the section (#685 plans `manifest.mac_key_id`). Ignoring
+        // leaves 0.3, the safe direction.
+        let cfg = VtopConfig::from_yaml_str(&format!(
+            "{base}future_section:\n  anything: 1\nmanifest:\n  write_version: \"0.4\"\n  mac_key_id: k1\n"
+        ))
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.manifest.write_version, ManifestWriteVersion::V0_4);
         for value in [
             r#""0.5""#,
             r#""0.2""#,

@@ -276,6 +276,69 @@ fn a_plan_is_never_part_of_a_03_manifest() {
     manifest.verify_self_hash().unwrap();
 }
 
+/// Review of #698: a legacy reader must treat `verification_plan` as v0.8.0
+/// did, as an unknown key, whatever its value. Decoding it first made a 0.3
+/// manifest carrying a malformed or duplicated one (which no legacy hash
+/// covers) fail to parse here while v0.8.0 verified it: scrub reported it
+/// and recovery replayed the batch.
+#[test]
+fn a_malformed_plan_in_a_03_manifest_is_ignored_as_v080_ignores_it() {
+    let key = fixture_key();
+    for (fixture, signed) in [(V080_UNSIGNED, false), (V080_SIGNED, true)] {
+        let text = String::from_utf8(fixture.to_vec()).unwrap();
+        for plan in [
+            r#""garbage""#,
+            "5",
+            "null",
+            r#"{"method": "x"}"#,
+            r#"{"method": 1, "require_strong": "yes"}"#,
+            r#"[1, 2]"#,
+        ] {
+            let edited = text.replacen(
+                r#""created_at""#,
+                &format!(r#""verification_plan": {plan}, "created_at""#),
+                1,
+            );
+            assert_ne!(edited, text);
+            let parsed = ParsedManifest::from_slice(edited.as_bytes())
+                .unwrap_or_else(|e| panic!("{plan}: {e}"));
+            parsed
+                .verify_authentication(signed.then_some(&key))
+                .unwrap_or_else(|e| panic!("{plan}: {e}"));
+            assert_eq!(parsed.fields().verification_plan, None, "{plan}");
+        }
+        // A duplicated key too: v0.8.0's struct decode skipped both.
+        let doubled = text.replacen(
+            r#""created_at""#,
+            r#""verification_plan": 1, "verification_plan": {"method": "read_back", "require_strong": true}, "created_at""#,
+            1,
+        );
+        let parsed = ParsedManifest::from_slice(doubled.as_bytes()).unwrap();
+        parsed
+            .verify_authentication(signed.then_some(&key))
+            .unwrap();
+        assert_eq!(parsed.fields().verification_plan, None);
+    }
+}
+
+/// In 0.4 the field is defined, so a malformed plan is a malformed document,
+/// not a newer one.
+#[test]
+fn a_malformed_plan_in_a_04_manifest_is_malformed() {
+    for plan in [json!("garbage"), json!({"method": "x"}), json!(5)] {
+        let mut doc: Value = serde_json::from_slice(v04(None).bytes()).unwrap();
+        doc["verification_plan"] = plan.clone();
+        doc["manifest"]["sha256"] = json!("");
+        let auth = serde_json::to_vec(&doc).unwrap();
+        doc["manifest"]["sha256"] = json!(sha256_bytes(&auth));
+        let err = ParsedManifest::from_slice(&serde_json::to_vec(&doc).unwrap()).unwrap_err();
+        assert!(
+            !matches!(err, VtopError::UnsupportedManifestVersion { .. }),
+            "{plan}: {err}"
+        );
+    }
+}
+
 /// A later writer's method, or a field added to the plan, still reads and
 /// verifies: `method` is a string, not a closed set.
 #[test]

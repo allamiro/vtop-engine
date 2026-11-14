@@ -287,7 +287,7 @@ A conformant manifest:
 | `manifest.mac` | string | MAY | 32-byte keyed BLAKE3 authenticator (lowercase hex), computed over the same canonical bytes. |
 | `state` | enum | SHOULD | Lifecycle state at manifest-write time (`manifest_uploaded`). |
 | `verification_status` | enum | SHOULD | Status at manifest-write time, so always `not_verified`. **Deprecated** in favour of `verification_plan` plus the ledger; still written in `0.4` because v0.8.0 readers require it. |
-| `verification_plan` | object | `0.4`: MUST; earlier: MUST NOT | How the object will be verified, as configured when the manifest was written (`0.4`, #671). `method` and `require_strong` below. |
+| `verification_plan` | object | `0.4` writer: MUST; earlier: MUST NOT | How the object will be verified, as configured when the manifest was written (`0.4`, #671). `method` and `require_strong` below. A `0.4` reader does not require it (a `0.4` document without it still verifies), and refuses a malformed one as a malformed document. |
 | `verification_plan.method` | string | MUST | `store_checksum`, `read_back` or `size_only`: the method for the configured backend and the object's `checksum_algorithm`, the same value `vtopctl validate --print-effective` and the startup log print. A reader accepts any string. |
 | `verification_plan.require_strong` | boolean | MUST | `upload.require_strong_verification` when the manifest was written. |
 | `partition` / retention metadata | object | SHOULD | Time/retention partitioning context. |
@@ -351,7 +351,8 @@ document with `"version": "0.4"` and one more object:
   canonical form, and the stored bytes verify on every reader of `0.4`.
 - **A `0.1`-`0.3` manifest never carries `verification_plan`.** The legacy
   scheme drops fields its release does not know, so there the plan would be
-  unauthenticated. A reader ignores one found in such a document.
+  unauthenticated. A reader ignores one found in such a document, whatever
+  its value, as an unknown key, exactly as a v0.8.0 reader does.
 - **`0.3` output is unchanged** byte for byte while the setting is off.
 
 **Version grammar.** A version is dotted digits, `MAJOR.MINOR` or

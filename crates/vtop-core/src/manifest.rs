@@ -261,8 +261,10 @@ pub struct VtopManifest {
     pub verification_status: VerificationStatus,
     /// Version 0.4 only (#671 release B). Never part of a 0.1-0.3 manifest:
     /// a legacy reader drops it before hashing, so in one it would be
-    /// unauthenticated, and [`ParsedManifest`] discards it there.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// unauthenticated. Never decoded with the struct: a legacy document
+    /// treats the key as unknown, whatever its value, exactly as v0.8.0 did
+    /// (review of #698), and [`ParsedManifest`] fills it for 0.4 only.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub verification_plan: Option<VerificationPlan>,
     pub created_at: String,
 }
@@ -343,10 +345,10 @@ impl ParsedManifest {
             HashScheme::Legacy => {
                 // Decoded straight from the bytes, as every earlier reader
                 // did, and hashed by re-encoding the struct: unchanged. A
-                // `verification_plan` in a legacy document is dropped, as
-                // v0.8.0 dropped it: no hash covers it there.
-                let mut decoded: VtopManifest = serde_json::from_slice(bytes)?;
-                decoded.verification_plan = None;
+                // `verification_plan` in a legacy document is skipped as an
+                // unknown key (the field is never deserialized), as v0.8.0
+                // skipped it: no hash covers it there.
+                let decoded: VtopManifest = serde_json::from_slice(bytes)?;
                 let auth_bytes = decoded.legacy_auth_bytes()?;
                 Ok(Self {
                     decoded,
@@ -355,7 +357,12 @@ impl ParsedManifest {
             }
             HashScheme::Canonical => {
                 let StrictJson(value) = serde_json::from_slice(bytes)?;
-                let decoded = VtopManifest::deserialize(&value)?;
+                let mut decoded = VtopManifest::deserialize(&value)?;
+                // Defined in 0.4, so a malformed plan is a malformed document.
+                decoded.verification_plan = value
+                    .get("verification_plan")
+                    .map(VerificationPlan::deserialize)
+                    .transpose()?;
                 let auth_bytes = canonical_auth_bytes(value)?;
                 Ok(Self {
                     decoded,
