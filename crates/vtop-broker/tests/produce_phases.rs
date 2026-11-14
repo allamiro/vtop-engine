@@ -243,7 +243,10 @@ fn a_commit_group_is_timed_once_not_once_per_member() {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                expect_ack(broker.handle(Role::Producer, produce(0xB0 + index, WireDurability::Quorum)));
+                expect_ack(broker.handle(
+                    Role::Producer,
+                    produce(0xB0 + index, WireDurability::Quorum),
+                ));
             })
         })
         .collect();

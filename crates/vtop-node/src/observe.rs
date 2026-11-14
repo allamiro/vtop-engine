@@ -239,6 +239,30 @@ impl CounterFamily {
     ///
     /// Label values are positional against the names given at construction.
     fn family<'a>(&self, samples: impl IntoIterator<Item = (Vec<&'a str>, u64)>) -> MetricFamily {
+        self.family_f64(
+            samples
+                .into_iter()
+                .map(|(values, total)| (values, total as f64)),
+        )
+    }
+
+    /// The same from nanosecond totals, exported in seconds: a `_seconds`
+    /// name carries seconds, whatever the source counts in.
+    fn family_seconds_from_nanos<'a>(
+        &self,
+        samples: impl IntoIterator<Item = (Vec<&'a str>, u64)>,
+    ) -> MetricFamily {
+        self.family_f64(
+            samples
+                .into_iter()
+                .map(|(values, nanos)| (values, nanos as f64 / 1e9)),
+        )
+    }
+
+    fn family_f64<'a>(
+        &self,
+        samples: impl IntoIterator<Item = (Vec<&'a str>, f64)>,
+    ) -> MetricFamily {
         let mut family = MetricFamily::default();
         family.set_name(self.desc.fq_name.clone());
         family.set_help(self.desc.help.clone());
@@ -252,7 +276,7 @@ impl CounterFamily {
                     // there below 2^53, which for a byte counter is nine
                     // petabytes — far past the point where a process restart
                     // has reset it anyway.
-                    counter.set_value(total as f64);
+                    counter.set_value(total);
                     let mut metric = prometheus::proto::Metric::default();
                     metric.set_label(
                         self.label_names
@@ -768,6 +792,7 @@ pub struct BrokerCollector {
 
     group_commit_last_batch_records: IntGauge,
     group_commit_last_batch_bytes: IntGauge,
+    group_commit_enabled: IntGauge,
     memory_used_bytes: IntGaugeVec,
     memory_queue_depth: IntGauge,
 
@@ -777,6 +802,7 @@ pub struct BrokerCollector {
     group_commit_bytes: CounterFamily,
     group_commit_sync_nanos: CounterFamily,
     group_commit_queue_wait_nanos: CounterFamily,
+    produce_phase_seconds: CounterFamily,
     memory_rejections: CounterFamily,
     backpressure_nanos: CounterFamily,
     backpressure_events: CounterFamily,
@@ -870,13 +896,29 @@ impl BrokerCollector {
             )?,
             group_commit_sync_nanos: CounterFamily::new(
                 "broker_group_commit_sync_nanoseconds_total",
-                "Nanoseconds spent in group fsync; divide by commits for mean sync cost",
+                "Nanoseconds spent flushing commit groups: the local fsync, the replication \
+                 round and the commit together, not the fsync alone; \
+                 vtop_broker_produce_phase_seconds_total splits them",
                 &[],
             )?,
             group_commit_queue_wait_nanos: CounterFamily::new(
                 "broker_group_commit_queue_wait_nanoseconds_total",
-                "Nanoseconds requests waited to join a group, summed over groups",
+                "Nanoseconds the longest-waiting request of each group waited to join it, \
+                 summed over groups (one wait per group, not per request)",
                 &[],
+            )?,
+            produce_phase_seconds: CounterFamily::new(
+                "broker_produce_phase_seconds_total",
+                "Seconds produce flushes spent in each phase: local_fsync (the leader's \
+                 append and fsync), replicate (until a quorum acked), commit (the \
+                 high-water mark advance and its propagation). One flush per request, \
+                 or per group with group commit on",
+                &["phase"],
+            )?,
+            group_commit_enabled: gauge(
+                "broker_group_commit_enabled",
+                "1 when concurrent produce requests on this range share one fsync and one \
+                 replication round (group commit), 0 when each request has its own",
             )?,
             group_commit_last_batch_records: gauge(
                 "broker_group_commit_last_batch_records",
@@ -927,6 +969,7 @@ impl BrokerCollector {
             &self.follower_connected,
             &self.group_commit_last_batch_records,
             &self.group_commit_last_batch_bytes,
+            &self.group_commit_enabled,
             &self.memory_used_bytes,
             &self.memory_queue_depth,
         ];
@@ -1016,6 +1059,8 @@ impl BrokerCollector {
             }
         }
 
+        self.group_commit_enabled
+            .set(i64::from(self.broker.group_commit().is_some()));
         if let Some(coordinator) = self.broker.group_commit() {
             let last = coordinator.metrics().last_sample();
             self.group_commit_last_batch_records
@@ -1045,6 +1090,14 @@ impl BrokerCollector {
     /// Counter families read straight from the broker's monotonic atomics.
     fn counter_families(&self) -> Vec<MetricFamily> {
         let mut families = Vec::new();
+        let phases = self.broker.produce_phases();
+        families.push(
+            self.produce_phase_seconds.family_seconds_from_nanos(
+                vtop_broker::produce_phases::ProducePhase::ALL
+                    .into_iter()
+                    .map(|phase| (vec![phase.as_str()], phases.nanos(phase))),
+            ),
+        );
         if let Some(coordinator) = self.broker.group_commit() {
             let metrics = coordinator.metrics();
             for (family, total) in [
@@ -1089,6 +1142,7 @@ impl BrokerCollector {
             &self.group_commit_bytes.desc,
             &self.group_commit_sync_nanos.desc,
             &self.group_commit_queue_wait_nanos.desc,
+            &self.produce_phase_seconds.desc,
             &self.memory_rejections.desc,
             &self.backpressure_nanos.desc,
             &self.backpressure_events.desc,
@@ -3108,7 +3162,8 @@ mod tests {
                 BrokerCollector::new(Arc::clone(&broker), None, Vec::new()).unwrap(),
             ))
             .unwrap();
-        let phase = |name: &str| format!("vtop_broker_produce_phase_seconds_total{{phase=\"{name}\"}}");
+        let phase =
+            |name: &str| format!("vtop_broker_produce_phase_seconds_total{{phase=\"{name}\"}}");
 
         let before = scrape(&registry);
         for name in ["local_fsync", "replicate", "commit"] {
