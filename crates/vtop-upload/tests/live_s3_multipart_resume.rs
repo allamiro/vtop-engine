@@ -14,6 +14,8 @@
 //! `VTOP_TEST_S3_BUCKET` may select an existing bucket (defaults to
 //! `telemetry-raw`, created if missing). Each test aborts or deletes what it
 //! creates.
+//!
+//! CI runs it in the `minio-integration` job, against the lab's MinIO.
 
 use std::collections::HashMap;
 use std::io::Write;
