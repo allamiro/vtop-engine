@@ -2204,6 +2204,13 @@ jobs:
     if: needs.changes.outputs.postgres == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Every run, from every branch, shares the one managed instance and the
+    # fixed `vtop_test_*` databases and roles, and the workflow's concurrency
+    # group is per ref. One at a time across the repository; a run waits
+    # rather than cancel another's half-done restore.
+    concurrency:
+      group: postgres-managed-smoke
+      cancel-in-progress: false
     env:
       VTOP_TEST_POSTGRES: ${{ secrets.VTOP_MANAGED_POSTGRES_URL }}
       VTOP_TEST_POSTGRES_RUNTIME: ${{ secrets.VTOP_MANAGED_POSTGRES_RUNTIME_URL }}

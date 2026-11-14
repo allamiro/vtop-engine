@@ -232,8 +232,21 @@ impl Pg {
                      CREATE ROLE {user} LOGIN PASSWORD '{password}'; \
                    END IF; \
                  END $role$; \
-                 ALTER ROLE {user} LOGIN PASSWORD '{password}' NOSUPERUSER"
+                 ALTER ROLE {user} LOGIN PASSWORD '{password}'"
             )],
+        );
+        // Asserted, not set: naming SUPERUSER or NOSUPERUSER in ALTER ROLE
+        // needs a superuser, which a managed service's admin is not.
+        let rolsuper = self.psql(
+            &self.admin,
+            &[&format!(
+                "SELECT rolsuper FROM pg_roles WHERE rolname = '{user}'"
+            )],
+        );
+        assert_eq!(
+            rolsuper, "f",
+            "role {user} is a superuser, so it would prove nothing about the owner's \
+             and the runtime role's own privileges; drop it or use another server"
         );
     }
 
@@ -497,6 +510,11 @@ async fn a_ledger_restores_into_a_migrated_schema_only_past_the_commit_rule() {
     let dir = tempfile::tempdir().unwrap();
     let config = write_config(dir.path());
 
+    // Each case below restores into a database of its own: the stores a
+    // case opens keep pooled sessions after it, and dropping a database
+    // with another role's sessions open takes pg_signal_backend, which a
+    // managed service's admin may not hold. The next run drops and
+    // creates each again, after this one's sessions have closed.
     // The ledger that was backed up: migrated by `vtopctl migrate`, so its
     // audit trail holds that command's records, then written by an engine.
     let source = pg.fresh_database("vtop_test_restore_source");
@@ -508,7 +526,7 @@ async fn a_ledger_restores_into_a_migrated_schema_only_past_the_commit_rule() {
 
     // 1. A data-only restore into a migrated schema is refused by the
     //    trigger: the rows past `batching` would bypass the commit rule.
-    let (owner, runtime) = pg.migrated_target(&config, "vtop_test_restore_target");
+    let (owner, _) = pg.migrated_target(&config, "vtop_test_restore_refused");
     let out = pg.restore(&owner, &["--data-only"], &archive);
     let stderr = text(&out.stderr);
     assert!(
@@ -525,8 +543,7 @@ async fn a_ledger_restores_into_a_migrated_schema_only_past_the_commit_rule() {
 
     // 2. `--disable-triggers` is for the tables' owner: the runtime role is
     //    refused, and nothing lands.
-    let (owner, runtime_target) = pg.migrated_target(&config, "vtop_test_restore_target");
-    assert_eq!(runtime, runtime_target);
+    let (owner, runtime) = pg.migrated_target(&config, "vtop_test_restore_runtime");
     let out = pg.restore(&runtime, &["--data-only", "--disable-triggers"], &archive);
     let stderr = text(&out.stderr);
     assert!(
@@ -546,7 +563,7 @@ async fn a_ledger_restores_into_a_migrated_schema_only_past_the_commit_rule() {
     //    wrote into the new database: they hold `seq` 1 and 2, which the
     //    restored trail also holds, and its COPY would fail on the primary
     //    key (#694; the step the deployment doc gives).
-    let (owner, runtime) = pg.migrated_target(&config, "vtop_test_restore_target");
+    let (owner, runtime) = pg.migrated_target(&config, "vtop_test_restore_owner");
     clear_the_migrations_audit_rows(&pg, &owner);
     let out = pg.restore(&owner, &["--data-only", "--disable-triggers"], &archive);
     assert!(
@@ -564,7 +581,7 @@ async fn a_ledger_restores_into_a_migrated_schema_only_past_the_commit_rule() {
     // 4. Without superuser and without --disable-triggers: the owner
     //    disables the commit rule's trigger by name, restores, and no engine
     //    starts until `vtopctl migrate` has re-enabled it.
-    let (owner, runtime) = pg.migrated_target(&config, "vtop_test_restore_target");
+    let (owner, runtime) = pg.migrated_target(&config, "vtop_test_restore_by_name");
     clear_the_migrations_audit_rows(&pg, &owner);
     pg.psql(
         &owner,
