@@ -14,12 +14,34 @@ C/C++ toolchain, CMake, make and Perl, plus Rust from
 [rustup](https://rustup.rs). The minimum Rust version is `rust-version` in
 [`Cargo.toml`](../../Cargo.toml).
 
-| Platform | Install |
-|---|---|
-| Debian / Ubuntu | `sudo apt-get install -y build-essential cmake perl pkg-config libcurl4-openssl-dev zlib1g-dev` |
-| RHEL, AlmaLinux, Rocky Linux 8, 9 and 10 | `sudo dnf install -y gcc gcc-c++ make cmake perl-core libcurl-devel zlib-devel` |
-| Fedora | `sudo dnf install -y gcc gcc-c++ make cmake perl-core libcurl-devel zlib-devel` |
-| macOS 11 or later, Apple silicon or Intel | `xcode-select --install`, then `brew install cmake` |
+=== "Debian / Ubuntu"
+
+    ```bash
+    sudo apt-get install -y build-essential cmake perl pkg-config libcurl4-openssl-dev zlib1g-dev
+    ```
+
+=== "RHEL family"
+
+    RHEL, AlmaLinux and Rocky Linux 8, 9 and 10:
+
+    ```bash
+    sudo dnf install -y gcc gcc-c++ make cmake perl-core libcurl-devel zlib-devel
+    ```
+
+=== "Fedora"
+
+    ```bash
+    sudo dnf install -y gcc gcc-c++ make cmake perl-core libcurl-devel zlib-devel
+    ```
+
+=== "macOS"
+
+    macOS 11 or later, Apple silicon or Intel:
+
+    ```bash
+    xcode-select --install
+    brew install cmake
+    ```
 
 The `dnf` line was checked on AlmaLinux 8.10, 9.8 and 10.2, Rocky Linux 8.10
 and 9.8, and Fedora 45. A full build was run on AlmaLinux 8 (OpenSSL 1.1.1
@@ -96,7 +118,7 @@ request; the workflow is [`.github/workflows/ci.yml`](../../.github/workflows/ci
 | `Library not loaded: .../libsasl2.3.dylib` or `libssl.3.dylib` (macOS) | A v0.8.0 or earlier binary. Run `brew install openssl@3 cyrus-sasl`, or build from source. |
 | `error while loading shared libraries: libsasl2.so.3` or `libssl.so.3` (Linux) | A v0.8.0 or earlier binary. Install the run-time packages listed in [binaries.md](binaries.md#run-time-libraries). |
 | `Can't locate FindBin.pm` or `IPC/Cmd.pm` during the build | The OpenSSL build needs those Perl modules. Install `perl-core` (RHEL family, Fedora) or `perl` (Debian/Ubuntu). |
-| `failed to run custom build command for rdkafka-sys` mentioning `cmake` | Install CMake (see the table). |
+| `failed to run custom build command for rdkafka-sys` mentioning `cmake` | Install CMake (see [Native prerequisites](#native-prerequisites)). |
 | `fatal error: curl/curl.h: No such file or directory` (Linux) | Install `libcurl4-openssl-dev` or `libcurl-devel` (header only; see above). |
 | Undefined `_ENGINE_*` symbols, or the link line names `openssl@4` | `OPENSSL_NO_VENDOR` is set and found OpenSSL 4. Unset it, or point `OPENSSL_DIR` at an OpenSSL 3. |
 | `No provider for SASL mechanism GSSAPI` when the engine starts | The binary was built without Kerberos. Rebuild with `--features kafka-gssapi`. |
