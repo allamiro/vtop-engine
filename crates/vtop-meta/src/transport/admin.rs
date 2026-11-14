@@ -636,7 +636,11 @@ async fn dispatch_admin(
                 )
             });
             let result = handler.propose(request.command).await;
-            if let Some(mut record) = audited {
+            // A follower's redirect is not an outcome: the client asks the
+            // leader next, which writes the record that counts (review of
+            // #705).
+            let redirected = matches!(result, Err(TransportError::NotLeader { .. }));
+            if let Some(mut record) = audited.filter(|_| !redirected) {
                 match &result {
                     Ok(response) => {
                         record.log_index = Some(response.log_id.index);
@@ -648,9 +652,14 @@ async fn dispatch_admin(
                             ));
                         }
                     }
+                    // A transport error, a timeout above all, leaves the
+                    // outcome unknown: the entry may still commit.
                     Err(error) => {
                         record.outcome = crate::audit::AuditOutcome::Failure;
-                        record.reason = Some(format!("not committed: {error}"));
+                        record.reason = Some(format!(
+                            "outcome unknown (it may still commit; the applied records say): \
+                             {error}"
+                        ));
                     }
                 }
                 crate::audit::emit(&record);
@@ -764,11 +773,16 @@ async fn audited_membership(
         return Err(TransportError::Unauthorized(refusal.message()));
     }
     let result = run.await;
-    if let Err(error) = &result {
-        record.outcome = crate::audit::AuditOutcome::Failure;
-        record.reason = Some(error.to_string());
+    match &result {
+        // The leader the client is sent to writes the record (review of #705).
+        Err(TransportError::NotLeader { .. }) => {}
+        Err(error) => {
+            record.outcome = crate::audit::AuditOutcome::Failure;
+            record.reason = Some(error.to_string());
+            crate::audit::emit(&record);
+        }
+        Ok(_) => crate::audit::emit(&record),
     }
-    crate::audit::emit(&record);
     let response = result?;
     Ok(VtpmFrame {
         kind: KIND_ADMIN_MEMBERSHIP_RESP,
@@ -3578,6 +3592,53 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("nothing was changed"));
+        task.abort();
+    }
+
+    /// Review of #705: a follower that redirects a proposal to the leader
+    /// writes no edge record (the leader writes the one that counts); a
+    /// failure that leaves the outcome unknown says so.
+    #[tokio::test]
+    async fn a_redirect_writes_no_edge_record() {
+        let audit = crate::audit::Recording::installed();
+        let (client, _handler, task) = live_endpoint_with(
+            AdminAuthorizer::permissive(),
+            "ops-alice",
+            Arc::new(NotLeaderHandler {
+                leader: None,
+                asked: AtomicUsize::new(0),
+            }),
+        )
+        .await;
+        let request_id = Uuid::new_v4();
+        client.propose(create_topic(request_id)).await.unwrap_err();
+        assert!(
+            audit.for_request(request_id).is_empty(),
+            "{:?}",
+            audit.for_request(request_id)
+        );
+        task.abort();
+
+        let (client, _handler, task) = live_endpoint_with(
+            AdminAuthorizer::permissive(),
+            "ops-alice",
+            Arc::new(CountingHandler::default()),
+        )
+        .await;
+        let request_id = Uuid::new_v4();
+        client.propose(create_topic(request_id)).await.unwrap_err();
+        let records = audit.for_request(request_id);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, crate::audit::AuditOutcome::Failure);
+        assert!(
+            records[0]
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outcome unknown"),
+            "{:?}",
+            records[0].reason
+        );
         task.abort();
     }
 

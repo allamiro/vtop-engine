@@ -1469,27 +1469,24 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 },
                 feature_level: level,
             };
-            // The level it raises from, for the audit record (#694): read
-            // whatever the level asked for, best effort below the levels
-            // that need the read (an older tier may not answer it).
-            let config = load_admin_config(&common.config)?;
-            let client = connect(&config)?;
-            let read = client.read_cluster_versions(true).await;
-            note_redirects(&client);
-            let before = read
-                .as_ref()
-                .ok()
-                .map(|read| {
-                    vec![(
-                        "level",
-                        serde_json::Value::from(read.versions.feature_level),
-                    )]
-                })
-                .unwrap_or_default();
             // Judged here as well as in the state machine (#634): the state
             // machine's refusal is bounded to a few hundred bytes, and this
-            // one names every node the raise waits for.
+            // one names every node the raise waits for. The level it raises
+            // from goes into the audit record when this read was made
+            // (#694); below the levels that need it, nothing is read, as
+            // before (review of #705).
+            let mut before = Vec::new();
             if level > vtop_meta::NODE_VERSION_REPORTS_FEATURE_LEVEL {
+                let config = load_admin_config(&common.config)?;
+                let client = connect(&config)?;
+                let read = client.read_cluster_versions(true).await;
+                note_redirects(&client);
+                if let Ok(read) = &read {
+                    before.push((
+                        "level",
+                        serde_json::Value::from(read.versions.feature_level),
+                    ));
+                }
                 if let Err(refusal) = judge_feature_raise(level, read) {
                     if let Some(event) =
                         crate::audit::client_record(&command, vtop_observe::audit::Outcome::Refused)

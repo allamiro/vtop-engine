@@ -7,14 +7,14 @@ trends. The audit trail is a separate record (#694), built the same way by
 
 ## What is recorded
 
-Every command that changes state writes one record per outcome. The
-destructive ledger commands write an `attempt` record **before** they act,
-and are refused when it cannot be written.
+Every operator command in the table below writes one record per outcome.
+The destructive ledger commands write an `attempt` record **before** they
+act, and are refused when it cannot be written.
 
 | Action | Written by | When |
 |---|---|---|
 | `ledger.prune` | `vtopctl prune-ledger` | `attempt` before a row is deleted; then `success` (rows deleted, digest file) or `failure`. |
-| `ledger.replay` | `vtopctl replay` | `attempt` before recovery moves a row; then `success` (how many rows were committed, sent back to be re-read, superseded or left pending) or `failure`. |
+| `ledger.replay` | `vtopctl replay` | `attempt` before recovery moves a row; then `success` (how many rows were committed, sent back to be re-read, superseded or left pending) or `failure`. The target is the ledger: recovery covers every incomplete batch, and `params.batch_id` is only the batch `--batch-id` asked about. The work-directory and abandoned-multipart cleanup the engine runs when it opens happens before the attempt and is not covered. |
 | `ledger.migrate` | `vtopctl migrate` | `attempt` to the log and the audit file (the table does not exist yet); after the migration, the attempt and the outcome rows in the new table. |
 | `scrub.cursor` | `vtopctl scrub --cursor-file` | After the run: whether the cursor moved, and whether the scrub passed. A scrub without a cursor changes nothing and writes no record. |
 | `cluster.init`, `cluster.membership` | `vtopctl meta init`, `add-learner`, `change-membership`; the admin endpoint; every metadata replica | The client's record, the endpoint's record with the caller's certificate identity, and each replica's record of the membership entry it applied. |
@@ -24,6 +24,12 @@ and are refused when it cannot be written.
 | `promotion.attest` | `vtopctl node promote-unproven` (#636); the admin endpoint; every replica | Including a refusal before anything was sent (no `--i-accept-data-loss`). |
 | `node.repair` | `vtopctl node repair` (`params.side: client`); the leader serving the transfer (`params.side: serving`) | The client's outcome; the leader's grant or refusal of the listing that starts a transfer, its refusal of any chunk, and the outcome of a `seal_tail`. |
 | `node.reconfigure_range` | `vtopctl node reconfigure-range` | The thresholds written, or the failure. |
+
+Not audited: the archive path itself (`vtopctl run` and `process-once`
+archive and commit batches; that is the batch lifecycle, in the ledger and
+the logs), and the object-store work of `vtopctl tier copy`, `rehydrate` and
+`cleanup-abandoned` (the tier evidence they commit to the metadata plane is
+audited, as `cluster.propose` `CommitTierEvidence`).
 
 On the cluster plane, every **refusal** is recorded, whatever the command:
 a node certificate asking for another node's lease, a non-operator asking
@@ -66,10 +72,10 @@ ever added to version 1, and a reader ignores what it does not know.
 | `stage` | `local` (a command that acted itself), `client` (a command that asked a cluster), `edge` (the admin endpoint, or a leader serving a transfer) or `applied` (a metadata replica applying the committed entry). |
 | `params` | An allowlist per action, never a dump of the command: a connection string, a key, a key variable's value or a URL is never on it. Every value and reason is redacted again (URLs cut to their host, long hex runs, access key ids, `password=` and `token=` values) and bounded to 1 KiB. |
 | `before`, `after` | What changed, where it is cheap to say. |
-| `correlation.request_id` | Joins the client, edge and applied records of one cluster command (its envelope's request id), and the attempt and outcome of a ledger command. |
+| `correlation.request_id` | Joins the client, edge and applied records of one cluster command (its envelope's request id), and the attempt and outcome of a ledger command. Bootstrap and membership requests carry none on the wire: join their records by time and, for the applied ones, `log_index`. |
 | `correlation.attempt_id` | On an outcome, the `audit_id` of its attempt. |
 | `correlation.trace_id`, `span_id` | The OpenTelemetry trace the command ran in, when export is on (#683): the same ids its JSON log lines carry. |
-| `correlation.log_index` | The metadata log index a cluster command committed at. Applied records are written at least once; dedupe on it. |
+| `correlation.log_index` | The metadata log index a cluster command committed at. Dedupe applied records on it. Each replica writes its applied record once, after the entry is applied: a replica that crashes between applying an entry and writing the record, or that catches up by installing a snapshot, writes none for those entries. A follower that redirects a request to the leader writes no edge record; the leader does. |
 | `engine` | The engine's `engine.name`, `meta-<id>` for a metadata node, or a data node's UUID. |
 
 ### What the actor proves
@@ -92,8 +98,8 @@ log is a format change of its own, not part of this release.
 
 | Sink | When | Notes |
 |---|---|---|
-| The log stream, target `vtop::audit` | Always | Written whatever `RUST_LOG` or `--log-level` say, never sampled or rate-limited. INFO for `attempt` and `success`, WARN for `failure` and `refused`. The message is `audit: <action> <outcome>` (closed sets, so a pipeline may index it); `summary` says who did it and on what, and `audit_id`, `action`, `outcome` and `actor` sit beside the full record in `record`. |
-| An append-only JSONL file | `VTOP_AUDIT_LOG=/path` | One record per line, synced before the command goes on. Created with mode `0600`. A set but unwritable path stops the command (or the node) at startup, naming the path. Rotate it with `logrotate` and `copytruncate`. |
+| The log stream, target `vtop::audit` | Always | Written whatever `RUST_LOG` or `--log-level` say, never sampled or rate-limited. INFO for `attempt` and `success`, WARN for `failure` and `refused`. The message is `audit: <action> <outcome>` (closed sets, so a pipeline may index it); `summary` says who did it and on what, and `audit_id`, `action`, `outcome` and `actor` sit beside the full record in `record`. A sink's own error line on this target carries `audit_sink_error=true` and no `record`. |
+| An append-only JSONL file | `VTOP_AUDIT_LOG=/path` | One record per line, synced before the command goes on. Created with mode `0600` (an existing file keeps its mode). A set but unwritable path stops the command (or the node) at startup, naming the path. Rotate it by moving the file away while nothing writes to it (between `vtopctl` runs; for a node, at a restart); `logrotate`'s `copytruncate` can lose a record appended between the copy and the truncate. |
 | The state store's `audit_events` table | The ledger commands | Append only, hash-chained (below). `prune-ledger` never touches it; there is no retention for it yet. |
 
 `vtopctl meta`, `node` and `tier` now install a log subscriber: WARN and
@@ -135,7 +141,7 @@ know) is printed as stored with a warning on stderr, never dropped.
 In Loki, with JSON logs:
 
 ```logql
-{service=~"vtop.*"} | json | target="vtop::audit" | line_format "{{.fields_record}}"
+{service=~"vtop.*"} | json | target="vtop::audit" | fields_record != "" | line_format "{{.fields_record}}"
 ```
 
 A cluster command is read from each metadata node's audit file (or log
@@ -160,8 +166,18 @@ vtopctl audit verify --config /etc/vtop/config.yaml
 ```
 
 It exits non-zero and names each row where an edited, deleted, inserted or
-reordered row breaks the chain, a keyed row whose key is not configured
-here, and an unkeyed row after a keyed one. A chain cannot show rows removed
+reordered row breaks the chain, and an unkeyed row after a keyed one; with a
+signing key configured, a table that holds rows but no keyed row at all (a
+table rewritten without the key) fails too. A keyed row whose key this
+configuration does not hold (a retired key, or none configured) is counted
+under `NOT CHECKED`: its links to the rows around it are still checked, and
+it does not fail the verdict, so retiring a key does not fail every later
+verify.
+
+`prune-ledger`, `replay` and `migrate` key their rows, so with a key
+configured they need it in their environment, as the engine does, and stop
+naming the variable when it is missing. `vtopctl audit list` does not need
+the key. A chain cannot show rows removed
 from its **end**: keep the printed count and last link somewhere the
 database's writers cannot reach, and compare.
 

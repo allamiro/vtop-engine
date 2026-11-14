@@ -848,7 +848,7 @@ A bug-fix release: only issues labelled `bug`, and the PRs that fix them. Featur
 
 ## v0.10.0 and beyond
 
-**The audit trail (#694).** Every command that changes engine or cluster
+**The audit trail (#694).** Every operator command that changes engine or cluster
 state writes one versioned, attributable record (`audit_version: 1`): who
 (the local uid and host, or the admin endpoint's certificate identity), what,
 on what, with which parameters (an allowlist, redacted), and how it ended,
@@ -871,6 +871,10 @@ New metrics: `vtop_audit_events_total{action,outcome}` and
   INSERT` on it and `USAGE` on `audit_events_seq_seq`
   ([POSTGRES_DEPLOYMENT.md](POSTGRES_DEPLOYMENT.md)). An older release on a
   migrated database ignores the table. SQLite creates it on open.
+- **With a manifest MAC key configured, `prune-ledger`, `replay` and
+  `migrate` need it** (they key their audit rows with it), so a migration
+  job or a prune cron needs the engine's key environment; they stop naming
+  the variable when it is missing. `vtopctl audit list` does not.
 - **A destructive ledger command now fails when its audit record cannot be
   written** (a full disk, a missing grant, an unwritable `VTOP_AUDIT_LOG`).
   That is the intended cost of "fail rather than run unrecorded"; there is

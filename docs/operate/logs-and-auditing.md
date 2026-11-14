@@ -40,7 +40,7 @@ The lab's optional stack ships logs with Grafana Alloy into Loki; see
 
 ## The audit trail
 
-Every command that changes engine or cluster state writes an attributable
+Every operator command that changes engine or cluster state writes an attributable
 audit record (#694): who did it, when, from where, what changed and how it
 ended, on the `vtop::audit` log target (which `RUST_LOG` cannot silence), in
 the file `VTOP_AUDIT_LOG` names, and, for the ledger commands, in the state

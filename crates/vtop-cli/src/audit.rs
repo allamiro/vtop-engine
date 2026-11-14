@@ -140,6 +140,7 @@ impl LedgerAudit {
                         audit::count_failure(Sink::Ledger);
                         tracing::error!(
                             target: "vtop::audit",
+                            audit_sink_error = true,
                             audit_id = %event.audit_id,
                             action = event.action.as_str(),
                             error = %e,
@@ -365,7 +366,7 @@ async fn run_inner(command: AuditCommand, json: bool) -> Result<i32, VtopError> 
         AuditCommand::List(args) => {
             let lines = match (&args.config, &args.file) {
                 (Some(config), _) => {
-                    let (store, _) = open_store(config).await?;
+                    let (store, _) = open_store(config, false).await?;
                     all_rows(store.as_ref())
                         .await?
                         .into_iter()
@@ -379,7 +380,7 @@ async fn run_inner(command: AuditCommand, json: bool) -> Result<i32, VtopError> 
             Ok(0)
         }
         AuditCommand::Verify { config } => {
-            let (store, key) = open_store(&config).await?;
+            let (store, key) = open_store(&config, true).await?;
             let rows = all_rows(store.as_ref()).await?;
             let report = vtop_state::verify_chain(&rows, &key);
             if json {
@@ -392,6 +393,8 @@ async fn run_inner(command: AuditCommand, json: bool) -> Result<i32, VtopError> 
                         "last_seq": report.last_seq,
                         "last_hash": report.last_hash,
                         "problems": report.problems,
+                        "unverifiable_rows": report.unverifiable_rows,
+                        "unverifiable": report.unverifiable,
                     })
                 );
             } else {
@@ -406,6 +409,14 @@ async fn run_inner(command: AuditCommand, json: bool) -> Result<i32, VtopError> 
                 );
                 for problem in &report.problems {
                     println!("BROKEN: {problem}");
+                }
+                if report.unverifiable_rows > 0 {
+                    println!(
+                        "NOT CHECKED: the MACs of {} keyed row(s) cannot be checked here (their \
+                         links to the rows around them were): {}",
+                        report.unverifiable_rows,
+                        report.unverifiable.join("; ")
+                    );
                 }
                 println!(
                     "{}",
@@ -422,13 +433,38 @@ async fn run_inner(command: AuditCommand, json: bool) -> Result<i32, VtopError> 
     }
 }
 
-async fn open_store(config: &Path) -> Result<(Box<dyn StateStore>, ManifestKeyring), VtopError> {
+/// The state store a config names, and, for `audit verify`, its keyring.
+/// `audit list` reads without the key (review of #705): reading the trail
+/// must not need the secret that keys it.
+async fn open_store(
+    config: &Path,
+    with_keyring: bool,
+) -> Result<(Box<dyn StateStore>, ManifestKeyring), VtopError> {
     let cfg = vtop_core::config::VtopConfig::from_path(config)?;
     cfg.validate()?;
-    let key = cfg.resolve_manifest_keyring()?;
+    let keyring = if with_keyring {
+        cfg.resolve_manifest_keyring()?
+    } else {
+        ManifestKeyring::default()
+    };
     let state_store = cfg.engine.state_store.resolve()?;
     let store = crate::engine::connect_configured_store(&cfg.engine, &state_store).await?;
-    Ok((store, key))
+    Ok((store, keyring))
+}
+
+/// The keyring a ledger command keys its audit rows with, its error saying
+/// why the command needs it.
+pub fn ledger_keyring(
+    cfg: &vtop_core::config::VtopConfig,
+    command: &str,
+) -> Result<ManifestKeyring, VtopError> {
+    cfg.resolve_manifest_keyring().map_err(|e| {
+        VtopError::Config(format!(
+            "{command} keys its audit records with the configured manifest MAC key (#694), \
+             and it cannot be resolved: {e}. Nothing was run. Give this command the same key \
+             environment as the engine"
+        ))
+    })
 }
 
 async fn all_rows(store: &dyn StateStore) -> Result<Vec<vtop_state::AuditRow>, VtopError> {

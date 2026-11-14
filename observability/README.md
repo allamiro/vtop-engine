@@ -321,7 +321,7 @@ With JSON logs, the records in Loki (the lab's Alloy labels lines by
 `service`):
 
 ```logql
-{service=~"vtop.*"} | json | target="vtop::audit" | line_format "{{.fields_record}}"
+{service=~"vtop.*"} | json | target="vtop::audit" | fields_record != "" | line_format "{{.fields_record}}"
 ```
 
 Each line's `fields_record` is the full record; `fields_summary`,

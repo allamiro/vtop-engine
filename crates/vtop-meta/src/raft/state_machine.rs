@@ -45,8 +45,11 @@ impl MetaRaftStateMachine {
 impl MetaRaftStateMachine {
     /// The applied record of an audited command (#694): every replica writes
     /// one, with the request id and the log index, so the record comes from
-    /// the applied command and not only from the client. At least once: a
-    /// reader dedupes on the log index.
+    /// the applied command and not only from the client. Written after
+    /// `apply_through` has saved the applied frontier: a crash in between
+    /// loses this replica's record of the entry (the others keep theirs),
+    /// and an entry a snapshot brought gets none. Readers dedupe on the
+    /// log index.
     fn applied_record(
         &self,
         entry: &Entry<MetaRaftTypeConfig>,

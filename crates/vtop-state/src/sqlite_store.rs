@@ -857,25 +857,18 @@ impl StateStore for SqliteStateStore {
         // the action it records runs. BEGIN IMMEDIATE takes the write lock
         // before the last link is read, so two writers (two vtopctl runs)
         // cannot both chain to the same row.
-        let mut conn = self.durable.acquire().await.map_err(map_sqlx)?;
-        sqlx::raw_sql("BEGIN IMMEDIATE")
-            .execute(&mut *conn)
+        //
+        // A transaction sqlx tracks (review of #705): dropped before COMMIT -
+        // a deadline that expired, a COMMIT that failed - it rolls back, so
+        // the pooled connection never goes back holding the write lock.
+        let mut tx = self
+            .durable
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(map_sqlx)?;
-        let appended = append_audit_in(&mut conn, row, keyring).await;
-        match appended {
-            Ok(stored) => {
-                sqlx::raw_sql("COMMIT")
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(map_sqlx)?;
-                Ok(stored)
-            }
-            Err(e) => {
-                let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
-                Err(e)
-            }
-        }
+        let stored = append_audit_in(&mut tx, row, keyring).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(stored)
     }
 
     async fn list_audit(&self, after_seq: i64, limit: u32) -> Result<Vec<AuditRow>, VtopError> {

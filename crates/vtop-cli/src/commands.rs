@@ -574,7 +574,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             let engine_name = cfg.engine.name.clone();
             let audit = crate::audit::LedgerAudit {
                 command: "replay",
-                keyring: cfg.resolve_manifest_keyring()?,
+                keyring: crate::audit::ledger_keyring(&cfg, "replay")?,
             };
             let mut engine = Engine::new_exclusive(cfg, streams).await?;
             let span = tracing::info_span!("replay");
@@ -592,10 +592,10 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 }
                 // Recorded before recovery moves a single row, and recovery is
                 // refused when the record cannot be written (#694).
-                let target = match batch_id {
-                    Some(id) => vtop_observe::audit::Target::new("batch", Some(id.clone())),
-                    None => vtop_observe::audit::Target::new("ledger", None),
-                };
+                // The ledger, whatever --batch-id names: recovery covers every
+                // incomplete batch, and --batch-id only prints that one's
+                // state (review of #705).
+                let target = vtop_observe::audit::Target::new("ledger", None);
                 let mut attempt = crate::audit::ledger_attempt(
                     vtop_observe::audit::Action::LedgerReplay,
                     target,
@@ -810,7 +810,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             };
             let audit = crate::audit::LedgerAudit {
                 command: "migrate",
-                keyring: cfg.resolve_manifest_keyring()?,
+                keyring: crate::audit::ledger_keyring(&cfg, "migrate")?,
             };
             let span = tracing::info_span!("migrate");
             async {
@@ -1114,7 +1114,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             let state_store = cfg.engine.state_store.resolve()?;
             let audit = crate::audit::LedgerAudit {
                 command: "prune-ledger",
-                keyring: cfg.resolve_manifest_keyring()?,
+                keyring: crate::audit::ledger_keyring(&cfg, "prune-ledger")?,
             };
             // The configured bound, as the engine uses (review of #568).
             let store = crate::engine::connect_configured_store(&cfg.engine, &state_store).await?;

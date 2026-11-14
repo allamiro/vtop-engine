@@ -22,8 +22,10 @@
 //!   certificate identity, the authorization decision and the outcome;
 //! * **applied**, by every replica's state-machine wrapper as it applies the
 //!   committed entry, with the log index (never from the pure `apply`, which
-//!   also runs when a log is replayed at open). Applied records are written
-//!   at least once; a reader dedupes on the log index.
+//!   also runs when a log is replayed at open). Each replica writes one
+//!   after the entry is applied and its frontier saved, so a crash between
+//!   the two, or catching up by snapshot, leaves that replica without the
+//!   record; a reader dedupes on the log index and joins on the request id.
 //!
 //! The actor is in the edge record only: making it durable in the
 //! replicated log is a format change of its own (a later issue).

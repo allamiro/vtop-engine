@@ -455,7 +455,8 @@ pub struct Correlation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span_id: Option<String>,
     /// The metadata log index of an applied (or edge-committed) command.
-    /// Applied records are written at least once: dedupe on it.
+    /// Dedupe applied records on it (one per replica that applied the entry
+    /// through its state machine; none for entries a snapshot brought).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_index: Option<u64>,
 }
@@ -783,6 +784,7 @@ impl AuditSink {
                 self.count_failure(Sink::File);
                 tracing::error!(
                     target: "vtop::audit",
+                    audit_sink_error = true,
                     audit_id = %event.audit_id,
                     action = event.action.as_str(),
                     path = %path.display(),
@@ -1248,6 +1250,16 @@ mod tests {
         assert!(
             text.contains("could not be appended to the audit file"),
             "{text}"
+        );
+        // Marked, so a query for records (they carry `record`) can tell the
+        // sink's own error line apart (review of #705).
+        let error_line = text
+            .lines()
+            .find(|l| l.contains("could not be appended"))
+            .unwrap();
+        assert!(
+            error_line.contains("\"audit_sink_error\":true"),
+            "{error_line}"
         );
     }
 

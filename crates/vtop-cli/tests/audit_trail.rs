@@ -85,7 +85,7 @@ fn logged(stderr: &[u8]) -> Vec<serde_json::Value> {
     text(stderr)
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|l| l["target"] == "vtop::audit")
+        .filter(|l| l["target"] == "vtop::audit" && l["fields"]["record"].is_string())
         .collect()
 }
 
@@ -359,8 +359,10 @@ async fn replay_records_what_recovery_did() {
     assert_eq!(file.len(), 2, "{file:#?}");
     assert_eq!(file[0]["action"], "ledger.replay");
     assert_eq!(file[0]["outcome"], "attempt");
-    assert_eq!(file[0]["target"]["kind"], "batch");
-    assert_eq!(file[0]["target"]["id"], "stuck-1");
+    // Recovery covers every incomplete batch, whatever --batch-id names
+    // (it only prints that batch's state): the target is the ledger
+    // (review of #705).
+    assert_eq!(file[0]["target"]["kind"], "ledger");
     assert_eq!(file[0]["params"]["batch_id"], "stuck-1");
     assert_eq!(file[1]["outcome"], "success");
     let after = &file[1]["after"];
@@ -524,4 +526,44 @@ async fn node_commands_record_the_local_actor_and_a_failure() {
     assert_eq!(file[1]["action"], "node.reconfigure_range");
     assert_eq!(file[1]["outcome"], "failure");
     assert_eq!(file[1]["params"]["max_segment_bytes"], "1048576");
+}
+
+/// Review of #705: a config that names a manifest MAC key keys the chain, so
+/// `prune-ledger` needs the key and says why when it is missing; reading the
+/// trail does not need it.
+#[tokio::test]
+async fn reading_the_trail_needs_no_key_and_a_keyed_prune_names_the_missing_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path());
+    let yaml = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        format!("manifest_mac_key_env: VTOP_AUDIT_TEST_KEY_NOT_SET\n{yaml}"),
+    )
+    .unwrap();
+    seed_committed(dir.path()).await;
+    let out = vtopctl(
+        &["audit", "list", "--config", config.to_str().unwrap()],
+        None,
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = vtopctl(
+        &[
+            "prune-ledger",
+            "--config",
+            config.to_str().unwrap(),
+            "--older-than-days",
+            "0",
+            "--digest-dir",
+            dir.path().join("digests").to_str().unwrap(),
+        ],
+        None,
+    );
+    let stderr = text(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("VTOP_AUDIT_TEST_KEY_NOT_SET") && stderr.contains("audit"),
+        "{stderr}"
+    );
+    assert_eq!(batch_count(dir.path()).await, 3);
 }

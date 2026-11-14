@@ -117,6 +117,12 @@ pub struct ChainReport {
     pub last_seq: Option<i64>,
     /// Each break, naming the row.
     pub problems: Vec<String>,
+    /// Keyed rows whose MAC cannot be checked here: their key is retired,
+    /// or not configured in this configuration. Their links to the rows
+    /// around them are still checked; these do not fail the verdict.
+    pub unverifiable_rows: u64,
+    /// Why, per key, once.
+    pub unverifiable: Vec<String>,
 }
 
 impl ChainReport {
@@ -130,9 +136,13 @@ impl ChainReport {
 /// A row breaks the chain when its `prev_hash` is not the previous row's
 /// link (a row deleted or reordered), or its link does not match its record
 /// (a row edited). A keyed row is checked with the keyring key its chain
-/// names (#685), and reported when that key is not configured here; an
-/// unkeyed row after a keyed one is reported too: a writer without the key
-/// could otherwise rewrite the rest of the table as an unkeyed chain.
+/// names (#685). A row keyed with a key this configuration does not hold (a
+/// retired key, or none configured) is counted as not checkable rather than
+/// failed, since its link to the next row is still checked: retiring a key
+/// must not make every later verify fail. An unkeyed row after a keyed one
+/// is a break: a writer without the key could otherwise rewrite the rest of
+/// the table as an unkeyed chain; and with a signing key configured, a
+/// table with no keyed row at all is one (review of #705).
 pub fn verify_chain(rows: &[AuditRow], keyring: &ManifestKeyring) -> ChainReport {
     let mut report = ChainReport::default();
     let mut previous: Option<&str> = None;
@@ -167,11 +177,26 @@ pub fn verify_chain(rows: &[AuditRow], keyring: &ManifestKeyring) -> ChainReport
             Ok(_) => report.problems.push(format!(
                 "{at}: its link does not match its record: the row was edited"
             )),
+            Err(why) if keyed && !why.contains("is not one this build reads") => {
+                report.unverifiable_rows += 1;
+                let why = format!("rows {}", why);
+                if !report.unverifiable.contains(&why) {
+                    report.unverifiable.push(why);
+                }
+            }
             Err(why) => report.problems.push(format!("{at}: {why}")),
         }
         previous = Some(&row.hash);
         report.last_hash = Some(row.hash.clone());
         report.last_seq = Some(row.seq);
+    }
+    if report.rows > 0 && report.keyed_rows == 0 && keyring.signing_key().is_some() {
+        report.problems.push(format!(
+            "no keyed row in {} row(s) although a manifest MAC key is configured: the table \
+             was rewritten without the key, or no ledger command has written to it since the \
+             key was configured (run one, then verify again)",
+            report.rows
+        ));
     }
     report
 }
@@ -307,10 +332,11 @@ mod tests {
             "{:?}",
             report.problems
         );
-        // And without the key at all, a keyed row is not passed as checked.
+        // And without the key at all, a keyed row is not passed as checked:
+        // it is counted and named as not checkable here.
         let report = verify_chain(&chain(2, &key()), &none());
-        assert_eq!(report.problems.len(), 2);
-        assert!(report.problems[0].contains("manifest_mac_key_env"));
+        assert_eq!(report.unverifiable_rows, 2);
+        assert!(report.unverifiable[0].contains("manifest_mac_key_env"));
     }
 
     /// #685: a chain written under one keyring key verifies after rotation,
@@ -351,13 +377,42 @@ mod tests {
         });
         assert_eq!(rows[2].chain, "blake3-keyed:q4");
         assert!(verify_chain(&rows, &rotated).passed());
+        // Review of #705: retiring q3 must not fail every later verify. Its
+        // rows' links are still checked (no key is needed for that); their
+        // MACs are counted as not checkable here, and named.
         let retired = ring("q4", &[("q4", "bb")], &["q3"]);
         let report = verify_chain(&rows, &retired);
-        assert_eq!(report.problems.len(), 2, "{:?}", report.problems);
+        assert!(report.passed(), "{:?}", report.problems);
+        assert_eq!(report.unverifiable_rows, 2);
         assert!(
-            report.problems[0].contains("\"q3\""),
+            report.unverifiable[0].contains("\"q3\""),
+            "{:?}",
+            report.unverifiable
+        );
+        // An edit of a row under the retired key still breaks the link to the
+        // row after it.
+        let mut edited = rows.clone();
+        edited[0].hash = "0".repeat(64);
+        assert!(!verify_chain(&edited, &retired).passed());
+    }
+
+    /// Review of #705: with a key configured, a table holding no keyed row
+    /// at all is a table someone rewrote without the key (or one no keyed
+    /// command has written to yet): never PASSED as if keyed.
+    #[test]
+    fn a_whole_table_rewritten_unkeyed_fails_when_a_key_is_configured() {
+        let rewritten = chain(4, &none());
+        assert!(verify_chain(&rewritten, &none()).passed());
+        let report = verify_chain(&rewritten, &key());
+        assert!(!report.passed());
+        assert!(
+            report.problems.iter().any(|p| p.contains("no keyed row")),
             "{:?}",
             report.problems
+        );
+        assert!(
+            verify_chain(&[], &key()).passed(),
+            "an empty table is not a rewrite"
         );
     }
 
