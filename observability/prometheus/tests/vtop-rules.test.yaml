@@ -198,10 +198,33 @@ tests:
     exp_alerts:
     - exp_labels:
         severity: ticket
+        job: kafka-exporter
+        instance: kafka-exporter:9308
         consumergroup: vtop-engine
         topic: telemetry
       exp_annotations:
-        summary: Kafka lag of consumer group vtop-engine on telemetry has risen for 30 minutes
+        summary: Kafka lag of consumer group vtop-engine on telemetry (kafka-exporter:9308) has risen for 30 minutes
+        description: The engine is reading this topic more slowly than it is written. If the lag reaches the topic's retention, records are deleted before they are archived (VtopRetentionLoss). Check upload throughput and throttling, then scale the engine or raise the topic's retention.
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopsourcelaggrowing
+- name: 'VtopSourceLagGrowing: fires per Kafka cluster, so a falling lag elsewhere does not cancel a rising one'
+  interval: 1m
+  input_series:
+  - series: kafka_consumergroup_lag{job="kafka-exporter",instance="cluster-a-exporter:9308",consumergroup="vtop-engine",topic="telemetry",partition="0"}
+    values: 0+10x60
+  - series: kafka_consumergroup_lag{job="kafka-exporter",instance="cluster-b-exporter:9308",consumergroup="vtop-engine",topic="telemetry",partition="0"}
+    values: 1000-10x60
+  alert_rule_test:
+  - eval_time: 35m
+    alertname: VtopSourceLagGrowing
+    exp_alerts:
+    - exp_labels:
+        severity: ticket
+        job: kafka-exporter
+        instance: cluster-a-exporter:9308
+        consumergroup: vtop-engine
+        topic: telemetry
+      exp_annotations:
+        summary: Kafka lag of consumer group vtop-engine on telemetry (cluster-a-exporter:9308) has risen for 30 minutes
         description: The engine is reading this topic more slowly than it is written. If the lag reaches the topic's retention, records are deleted before they are archived (VtopRetentionLoss). Check upload throughput and throttling, then scale the engine or raise the topic's retention.
         runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopsourcelaggrowing
 - name: 'VtopSourceLagGrowing: quiet for lag that is high but not rising'

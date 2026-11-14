@@ -115,7 +115,9 @@ store is healthy.
 **What it means.** The Kafka consumer-group lag of the engine's group
 (`consumergroup="vtop-engine"`, the default `sources.kafka.consumer_group`)
 has risen on a topic for 30 minutes: the engine reads more slowly than the
-topic is written.
+topic is written. Partitions are summed per exporter, so the alert's
+`instance` (the kafka-exporter) names the Kafka cluster, and a cluster whose
+lag falls does not hide one whose lag rises.
 
 The engine has no lag metric of its own. This alert reads
 `kafka_consumergroup_lag` from

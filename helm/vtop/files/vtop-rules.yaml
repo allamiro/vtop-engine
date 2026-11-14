@@ -108,15 +108,18 @@ groups:
       # kafka_consumergroup_lag from kafka-exporter (the lab runs
       # danielqsj/kafka-exporter, docker-compose.observability.yml), and is
       # silent without it. Set the consumergroup matcher to your
-      # sources.kafka.consumer_group (default vtop-engine).
+      # sources.kafka.consumer_group (default vtop-engine). Partitions are
+      # summed per exporter (job, instance), which is per Kafka cluster: a
+      # cluster whose lag falls must not cancel one whose lag rises, and the
+      # alert has to say which cluster it is about.
       - alert: VtopSourceLagGrowing
         expr: |
-          sum by (consumergroup, topic) (deriv(kafka_consumergroup_lag{consumergroup="vtop-engine"}[15m])) > 0
+          sum by (job, instance, consumergroup, topic) (deriv(kafka_consumergroup_lag{consumergroup="vtop-engine"}[15m])) > 0
         for: 30m
         labels:
           severity: ticket
         annotations:
-          summary: "Kafka lag of consumer group {{ $labels.consumergroup }} on {{ $labels.topic }} has risen for 30 minutes"
+          summary: "Kafka lag of consumer group {{ $labels.consumergroup }} on {{ $labels.topic }} ({{ $labels.instance }}) has risen for 30 minutes"
           description: "The engine is reading this topic more slowly than it is written. If the lag reaches the topic's retention, records are deleted before they are archived (VtopRetentionLoss). Check upload throughput and throttling, then scale the engine or raise the topic's retention."
           runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopsourcelaggrowing"
 
