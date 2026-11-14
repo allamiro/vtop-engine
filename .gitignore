@@ -27,3 +27,7 @@ mutants.out.old/
 
 # mkdocs build output (`mkdocs build` writes site/ by default)
 /site/
+
+# Python bytecode (mkdocs hooks import scripts/docs_hooks.py)
+__pycache__/
+*.pyc
