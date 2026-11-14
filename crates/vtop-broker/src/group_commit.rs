@@ -627,4 +627,200 @@ mod tests {
             Message::ProduceResponse(_)
         ));
     }
+
+    fn answer(batch: &[QueuedProduce]) -> Vec<WireFrame> {
+        batch
+            .iter()
+            .map(|item| WireFrame {
+                request_id: item.request_id,
+                stream_id: item.stream_id,
+                message: Message::ProduceResponse(ProduceResponse {
+                    outcomes: Vec::new(),
+                    committed_next_offset: 0,
+                }),
+            })
+            .collect()
+    }
+
+    fn zero_delay() -> GroupCommitConfig {
+        GroupCommitConfig {
+            max_delay: Duration::ZERO,
+            ..GroupCommitConfig::default()
+        }
+    }
+
+    /// D1 (#752), a guard: a request alone in the queue is flushed at once
+    /// when the window is zero (natural batching), where the 5 ms default
+    /// holds every solo request for the whole window. The best of five, so
+    /// one preempted run cannot fail it.
+    #[test]
+    fn a_lone_request_is_not_delayed_by_the_window() {
+        let lone = |config: GroupCommitConfig| {
+            let coord = GroupCommitCoordinator::new(config).unwrap();
+            (0..5u64)
+                .map(|index| {
+                    let started = Instant::now();
+                    coord.enqueue_and_wait(QueuedProduce::new(index, 1, sample_request(index)), answer);
+                    started.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let windowed = lone(GroupCommitConfig::default());
+        assert!(
+            windowed >= Duration::from_millis(5),
+            "the 5 ms default holds a lone request for its window: {windowed:?}"
+        );
+        let natural = lone(zero_delay());
+        assert!(
+            natural < Duration::from_millis(5),
+            "with no window a lone request must not wait: {natural:?}"
+        );
+    }
+
+    /// Defect 1 (#752, D7): the thread that leads a group is answered as
+    /// soon as ITS group is flushed, not after it has gone on to flush every
+    /// group that queued behind it. Six producers keep the queue busy for
+    /// 600 ms, each re-joining 5 ms after its answer, so the queue is never
+    /// empty when a group ends. Before the fix the first leader kept
+    /// leading until a lull, which here never comes before the producers
+    /// stop: its own append, flushed in the first 20 ms, was answered after
+    /// about 600 ms, and in a node after up to the gateway's 30 s produce
+    /// timeout. Groups hold three requests, so the six producers form two
+    /// cohorts that keep each other's groups queued.
+    #[test]
+    fn the_leader_is_answered_before_it_starts_another_group() {
+        const GROUP: Duration = Duration::from_millis(20);
+        // Three requests a group: six producers form two cohorts, and the
+        // one answered at the end of a group re-joins while the other's
+        // group runs, so the queue is never empty when a group ends.
+        let coord = Arc::new(
+            GroupCommitCoordinator::new(GroupCommitConfig {
+                max_records: 3,
+                ..zero_delay()
+            })
+            .unwrap(),
+        );
+        let first_flush_started = Arc::new(std::sync::Barrier::new(2));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flushes = Arc::new(AtomicU64::new(0));
+
+        let leader = {
+            let coord = Arc::clone(&coord);
+            let first_flush_started = Arc::clone(&first_flush_started);
+            let flushes = Arc::clone(&flushes);
+            thread::spawn(move || {
+                let started = Instant::now();
+                coord.enqueue_and_wait(QueuedProduce::new(1, 1, sample_request(1)), |batch| {
+                    if flushes.fetch_add(1, Ordering::SeqCst) == 0 {
+                        first_flush_started.wait();
+                    }
+                    thread::sleep(GROUP);
+                    answer(batch)
+                });
+                started.elapsed()
+            })
+        };
+        first_flush_started.wait();
+        let producers: Vec<_> = (0..6u64)
+            .map(|index| {
+                let coord = Arc::clone(&coord);
+                let stop = Arc::clone(&stop);
+                let flushes = Arc::clone(&flushes);
+                thread::spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        coord.enqueue_and_wait(
+                            QueuedProduce::new(100 + index, 1, sample_request(100 + index)),
+                            |batch| {
+                                flushes.fetch_add(1, Ordering::SeqCst);
+                                thread::sleep(GROUP);
+                                answer(batch)
+                            },
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                })
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(600));
+        stop.store(true, Ordering::SeqCst);
+        let leader_latency = leader.join().unwrap();
+        for producer in producers {
+            producer.join().unwrap();
+        }
+        assert!(
+            flushes.load(Ordering::SeqCst) >= 10,
+            "the producers must have kept the queue busy for the test to mean anything: {} \
+             flushes",
+            flushes.load(Ordering::SeqCst)
+        );
+        assert!(
+            leader_latency < GROUP * 2 + Duration::from_millis(60),
+            "the first leader's own append was flushed in its first {GROUP:?} group, and it \
+             was answered after {leader_latency:?}: it kept leading the groups queued behind \
+             it instead of answering itself"
+        );
+    }
+
+    /// D8 (#752): a group is homogeneous in durability. A member whose
+    /// durability differs from the group's first seals the group before it
+    /// and starts its own, in queue order, so no member is acknowledged at
+    /// a durability weaker than it asked for. Before the fix a group took
+    /// `batch[0]`'s durability for every member.
+    #[test]
+    fn a_group_never_mixes_durabilities() {
+        let coord = Arc::new(GroupCommitCoordinator::new(zero_delay()).unwrap());
+        let hold = Arc::new(Mutex::new(()));
+        let held = hold.lock().unwrap();
+        let groups: Arc<Mutex<Vec<Vec<(u64, Durability)>>>> = Arc::default();
+        let flush = {
+            let hold = Arc::clone(&hold);
+            let groups = Arc::clone(&groups);
+            move |batch: &[QueuedProduce]| {
+                let _hold = hold.lock().unwrap();
+                groups.lock().unwrap().push(
+                    batch
+                        .iter()
+                        .map(|item| (item.request_id, item.request.durability))
+                        .collect(),
+                );
+                answer(batch)
+            }
+        };
+        let durable = |request_id: u64, durability: Durability| {
+            let mut request = sample_request(request_id);
+            request.durability = durability;
+            QueuedProduce::new(request_id, 1, request)
+        };
+        let mut threads = Vec::new();
+        // The first holds the flush; the next three queue behind it.
+        for (request_id, durability) in [
+            (1, Durability::Quorum),
+            (2, Durability::Quorum),
+            (3, Durability::LocalFsync),
+            (4, Durability::Quorum),
+        ] {
+            let coord = Arc::clone(&coord);
+            let flush = flush.clone();
+            let item = durable(request_id, durability);
+            threads.push(thread::spawn(move || coord.enqueue_and_wait(item, flush)));
+            thread::sleep(Duration::from_millis(30));
+        }
+        drop(held);
+        for thread in threads {
+            assert!(matches!(
+                thread.join().unwrap().message,
+                Message::ProduceResponse(_)
+            ));
+        }
+        let groups = groups.lock().unwrap();
+        for group in groups.iter() {
+            assert!(
+                group.iter().all(|(_, durability)| *durability == group[0].1),
+                "a group mixed durabilities: {group:?} (all groups: {groups:?})"
+            );
+        }
+        let order: Vec<u64> = groups.iter().flatten().map(|(id, _)| *id).collect();
+        assert_eq!(order, [1, 2, 3, 4], "queue order is kept across the split");
+    }
 }
