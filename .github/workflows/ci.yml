@@ -2053,7 +2053,10 @@ jobs:
       # that skipped here for want of matplotlib or Pillow fails the job.
       - name: Report and drift-check tests, with matplotlib
         working-directory: benchmarks
+        # A step with no `shell:` runs as `bash -e {0}`, without pipefail:
+        # without this line the pipe into tee would hide a failing test.
         run: |
+          set -o pipefail
           python -m pytest -rs tests/test_kafka_compare_report.py tests/test_kafka_compare_regenerate.py tests/test_kafka_compare_failover.py tests/test_readme_charts.py tests/test_benchmark_charts_job.py | tee "$RUNNER_TEMP/chart-tests.log"
           if grep -E "SKIPPED.*(matplotlib|PIL)" "$RUNNER_TEMP/chart-tests.log"; then
             echo "::error::A chart test skipped for want of matplotlib or Pillow, in the one job that installs them."

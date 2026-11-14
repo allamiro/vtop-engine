@@ -145,3 +145,16 @@ def test_the_test_tools_lock_agrees_with_the_plotting_stack():
     assert not clash, f"the two locks pin these packages differently: {clash}"
 
 
+
+
+def test_a_piped_test_step_keeps_pytest_s_exit_status():
+    # GitHub runs a step with no `shell:` as `bash -e {0}`, without pipefail, so `pytest ... | tee log`
+    # takes tee's status and a failing test passes the step (Codex review of #745). A step that pipes
+    # pytest must set pipefail or ask for `shell: bash` (`bash --noprofile --norc -eo pipefail {0}`).
+    block = job_block("benchmark-charts")
+    steps = re.split(r"\n      - ", block)
+    piped = [step for step in steps if re.search(r"python -m pytest [^\n]*\|", step)]
+    assert piped, "the chart job pipes no pytest run; this test checks nothing"
+    for step in piped:
+        assert "set -o pipefail" in step or re.search(r"^\s*shell: bash\s*$", step, re.M), (
+            f"a step pipes pytest without pipefail, so a failing test passes it:\n{step}")
