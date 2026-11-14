@@ -18,7 +18,7 @@ STRUCTS = [
     "VtopConfig", "EngineConfig", "BatchingConfig", "AdaptiveWidthConfig",
     "CompressionConfig", "ChecksumConfig", "SourcesConfig", "KafkaSourceConfig",
     "FileSourceConfig", "SyslogSpoolConfig", "UploadConfig", "EgressTuning",
-    "PartitioningConfig",
+    "PartitioningConfig", "ManifestConfig",
 ]
 
 
