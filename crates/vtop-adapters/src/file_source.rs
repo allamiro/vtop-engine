@@ -3823,6 +3823,8 @@ mod tests {
             "leftover_archived",
             "opened_at_unlink",
             "metadata_changed",
+            "deleted_unchecked",
+            "links_changed",
         ];
         for outcome in kept.iter().map(Kept::outcome).chain(named) {
             assert!(
@@ -7688,6 +7690,308 @@ mod tests {
         assert_eq!(next[0].records, vec![b"late".to_vec()]);
     }
 
+    // ---- #619, v0.10.0: the opt-in, and opens that arrive late -----------
+
+    /// O1 (#619): with `delete_without_open_check` and no lease to be had,
+    /// the delete is made on the quiet period alone. It used to be logged
+    /// "deleted P: ... and open in no process" and counted `deleted`, which
+    /// is false here: nothing checked. A writer holding the file open and
+    /// silent for longer than the quiet period is exactly the case the
+    /// opt-in gives up, and its next line goes into the unlinked inode; the
+    /// message has to say so, and the count has to let an alert see it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unchecked_delete_says_so_and_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"one\ntwo\n").unwrap();
+        let quiet = Duration::from_millis(50);
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(quiet)
+            .with_delete_without_open_check(true);
+        fs.no_open_check = true;
+        let unchecked_before = decisions("deleted_unchecked");
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        pass_after(&mut fs, &path, quiet).await;
+        assert!(
+            !Path::new(&path).exists(),
+            "kept although the operator chose the quiet period alone: {:?}",
+            fs.notices
+        );
+        // The opt-in's documented loss: the writer's next line goes into a
+        // file no path names.
+        writer.write_all(b"three\n").unwrap();
+        assert!(!Path::new(&path).exists());
+        assert!(
+            !fs.notices.iter().any(|n| n.contains("open in no process")),
+            "an unchecked delete claimed the file was open in no process: {:?}",
+            fs.notices
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "deleted {path} without proof that no process had it open: \
+                     sources.file.delete_without_open_check is set and no lease can be taken \
+                     here (the test turned the open-file check off)"
+                )
+            ) && notice(&fs, "so the engine unlinked it")
+                && notice(&fs, "loses every line it writes from now on")
+                && notice(&fs, "unset delete_without_open_check"),
+            "the unchecked delete did not say what happened, what the engine did and what to \
+             do: {:?}",
+            fs.notices
+        );
+        assert!(
+            decisions("deleted_unchecked") > unchecked_before,
+            "the unchecked delete was not counted as deleted_unchecked"
+        );
+    }
+
+    /// O2 (#619): "where the check is possible it is always made, and an
+    /// open file is kept whatever the key says" (the docs of
+    /// `delete_without_open_check`). True in `DeleteJob::run`, which matches
+    /// `Sole::Open` before it looks at the opt-in; nothing tested it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_writer_that_holds_the_file_keeps_it_even_with_the_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"one\ntwo\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO)
+            .with_delete_without_open_check(true);
+        let open_before = decisions("open");
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        writer.write_all(b"three\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("one\ntwo\nthree\n"),
+            "deleted under the opt-in although the lease showed a writer holding it open"
+        );
+        assert!(
+            notice(&fs, &format!("not deleting {path}: it is open elsewhere")),
+            "kept without saying why: {:?}",
+            fs.notices
+        );
+        assert!(decisions("open") > open_before, "the keep was not counted");
+        let next = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(next[0].records, vec![b"three".to_vec()]);
+    }
+
+    /// A descriptor that has resolved `path` to its file without opening it
+    /// (`O_PATH`): opened later through `/proc/self/fd/N`, it is an open of
+    /// that file wherever its name has gone - an open that resolved the path
+    /// early and reaches the file late (see `write_lease`'s spike test).
+    #[cfg(target_os = "linux")]
+    fn resolved(path: &str) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(path)
+            .unwrap()
+    }
+
+    /// Open the file `resolved` resolved to, for appending, as the late
+    /// opener would.
+    #[cfg(target_os = "linux")]
+    fn open_resolved(resolved: &std::fs::File) -> std::fs::File {
+        use std::os::fd::AsRawFd;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(format!("/proc/self/fd/{}", resolved.as_raw_fd()))
+            .unwrap()
+    }
+
+    /// S1 (#619, condition 12 of #689, which had no test): an open of the
+    /// path that resolved it to the file before the delete's rename, and
+    /// reaches the lease after it, inside the grace. The grace exists for
+    /// this open: it breaks the lease, the file is put back under its name,
+    /// and the opener writes into a file that still has one.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_open_that_resolved_the_path_before_the_rename_and_lands_in_the_grace_keeps_the_file(
+    ) {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let opener: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+        let (seam_opener, seam_path) = (opener.clone(), path.clone());
+        fs.after_lease = Some(Arc::new(move |_| {
+            let mut slot = seam_opener.lock().unwrap();
+            if slot.is_some() {
+                return;
+            }
+            // Under the lease, before the rename: the lookup finds the file.
+            let early = resolved(&seam_path);
+            let inode = early.metadata().unwrap().ino();
+            let path = seam_path.clone();
+            *slot = Some(std::thread::spawn(move || {
+                // The open itself lands once the rename has moved the file
+                // away from its name: in the grace.
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while std::fs::metadata(&path).is_ok_and(|md| md.ino() == inode) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the delete never moved the file aside"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                open_resolved(&early).write_all(b"late\n").unwrap();
+            }));
+        }));
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        let opener = opener.lock().unwrap().take().expect(
+            "the seam never ran, so the delete never got that far and this test proves nothing",
+        );
+        opener.join().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("one\ntwo\nlate\n"),
+            "an open that resolved the path before the rename landed in the grace, and \"late\" \
+             went into the unlinked inode"
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "not deleting {path}: a process opened it while it was being deleted; it \
+                     was put back under its name"
+                )
+            ),
+            "kept without saying why: {:?}",
+            fs.notices
+        );
+        let next = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(next[0].records, vec![b"late".to_vec()]);
+    }
+
+    /// S2 (#619): an open that resolved the path before the rename and
+    /// reaches the file after the final check, just before the unlink -
+    /// longer than the grace. The unlink cannot be undone, so the file is
+    /// deleted and what the opener writes is lost: the limit the grace
+    /// bounds. The engine sees the broken lease after the unlink, and must
+    /// say so as an error, count it, and let the test read it back. It
+    /// logged the error from the delete thread, outside `notify`, and no
+    /// test asserted it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_open_between_the_final_check_and_the_unlink_is_logged_and_counted() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let early: Arc<Mutex<Option<std::fs::File>>> = Arc::default();
+        let opener: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+        let (seam_early, seam_path) = (early.clone(), path.clone());
+        fs.after_lease = Some(Arc::new(move |_| {
+            let mut slot = seam_early.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(resolved(&seam_path));
+            }
+        }));
+        let (seam_early, seam_opener) = (early.clone(), opener.clone());
+        fs.before_unlink = Some(Arc::new(move |_| {
+            let Some(early) = seam_early.lock().unwrap().take() else {
+                return;
+            };
+            let inode = early.metadata().unwrap().ino();
+            let (opened, has_opened) = std::sync::mpsc::channel::<()>();
+            *seam_opener.lock().unwrap() = Some(std::thread::spawn(move || {
+                let mut w = open_resolved(&early);
+                let _ = opened.send(());
+                w.write_all(b"late\n").unwrap();
+            }));
+            // Until the open has reached the file: /proc/locks shows the
+            // lease breaking for this inode.
+            let breaking = format!(":{inode} ");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if has_opened.try_recv().is_ok() {
+                    return;
+                }
+                let locks = std::fs::read_to_string("/proc/locks").unwrap_or_default();
+                if locks
+                    .lines()
+                    .any(|l| l.contains("LEASE") && l.contains("BREAKING") && l.contains(&breaking))
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            panic!("the late open never reached the file");
+        }));
+        let at_unlink_before = decisions("opened_at_unlink");
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        opener
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam never ran, so the delete never got that far")
+            .join()
+            .unwrap();
+        assert!(
+            !Path::new(&path).exists(),
+            "the unlink had already been decided; the file should be gone"
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "deleted {path} after a process opened it between the final check and the \
+                     unlink"
+                )
+            ) && notice(&fs, "is not archived")
+                && notice(&fs, "Find the writer that opens this path by name"),
+            "an open that reached the file at the unlink was not said: {:?}",
+            fs.notices
+        );
+        assert!(
+            decisions("opened_at_unlink") > at_unlink_before,
+            "an open that reached the file at the unlink was not counted"
+        );
+    }
+
     /// #619: where the engine cannot check whether another process holds the
     /// file open - a platform without write leases, a filesystem that does
     /// not support them (NFS, FUSE), or a file owned by another user without
@@ -8280,6 +8584,148 @@ mod tests {
         assert!(Path::new(&path).exists());
         assert!(
             notice(&fs, &format!("not deleting {path}: its 8 bytes look archived, but its mtime or ctime changed")),
+            "{:?}",
+            fs.notices
+        );
+    }
+
+    // ---- #619, v0.10.0: hard links -----------------------------------------
+
+    /// `a.log` and its hard link `b.log`, both holding "one\ntwo\n".
+    #[cfg(unix)]
+    fn hard_linked(dir: &Path) -> (String, String) {
+        let a = dir.join("a.log").to_string_lossy().into_owned();
+        let b = dir.join("b.log").to_string_lossy().into_owned();
+        std::fs::write(&a, "one\ntwo\n").unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        (a, b)
+    }
+
+    /// A source that deletes, with the opt-in off Linux, where it is the
+    /// only way a delete happens: these tests are about links, not leases.
+    #[cfg(unix)]
+    fn deleting(paths: &[&str], quiet: Duration) -> FileSource {
+        FileSource::new(
+            paths.iter().map(|p| p.to_string()).collect(),
+            TelemetryFormat::Raw,
+            true,
+        )
+        .with_delete_quiet_period(quiet)
+        .with_delete_without_open_check(!cfg!(target_os = "linux"))
+    }
+
+    /// H1 (#619): two names of one file, both sources (#378), both covered
+    /// by a commit before either is deleted. Deleting the first changes the
+    /// file's link count, and its ctime with it, so the second is kept - its
+    /// own copy is archived, so nothing is lost. The message used to list
+    /// four possible causes ("a touch, a chmod, a rewrite ... or another
+    /// name of the same file being deleted"); the link count says which.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deleting_one_name_keeps_the_other_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = hard_linked(dir.path());
+        let quiet = Duration::from_millis(50);
+        let mut fs = deleting(&[&a, &b], quiet);
+        for p in [&a, &b] {
+            let read = fs
+                .read_batch_candidates(&src(p), 100, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            fs.commit_progress(&read[0].progress_end).await.unwrap();
+        }
+        let links_before = decisions("links_changed");
+        pass_after(&mut fs, &a, quiet).await;
+        assert!(
+            !Path::new(&a).exists(),
+            "the first name was not deleted: {:?}",
+            fs.notices
+        );
+        pass_after(&mut fs, &b, Duration::ZERO).await;
+        assert_eq!(
+            std::fs::read_to_string(&b).ok().as_deref(),
+            Some("one\ntwo\n"),
+            "the second name was deleted on a candidate recorded before the first's delete"
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "not deleting {b}: its link count changed since it was archived (from 2 to \
+                     1)"
+                )
+            ) && notice(&fs, "remove this name by hand"),
+            "kept without saying it was the link count: {:?}",
+            fs.notices
+        );
+        assert!(
+            decisions("links_changed") > links_before,
+            "the keep was not counted as links_changed"
+        );
+    }
+
+    /// H2 (#619): a hard link made after the commit that covered the file.
+    /// The file is unchanged, but it now has another name, which the
+    /// engine did not archive under; kept, and said.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hard_link_made_after_the_commit_keeps_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let quiet = Duration::from_millis(50);
+        let mut fs = deleting(&[&path], quiet);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        std::fs::hard_link(&path, dir.path().join("copy")).unwrap();
+        let links_before = decisions("links_changed");
+        pass_after(&mut fs, &path, quiet).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("one\ntwo\n"),
+            "deleted although a hard link was made after the commit"
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "not deleting {path}: its link count changed since it was archived (from 1 \
+                     to 2)"
+                )
+            ),
+            "kept without saying it was the link count: {:?}",
+            fs.notices
+        );
+        assert!(decisions("links_changed") > links_before);
+    }
+
+    /// H3 (#619), the boundary: with no quiet period the first name is
+    /// deleted at its commit, and a name read and committed after that sees
+    /// the file as it is then - one name - so it is deleted too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn names_committed_after_the_others_delete_are_deleted_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = hard_linked(dir.path());
+        let mut fs = deleting(&[&a, &b], Duration::ZERO);
+        for p in [&a, &b] {
+            let read = fs
+                .read_batch_candidates(&src(p), 100, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            assert_eq!(read[0].records.len(), 2, "{p}");
+            fs.commit_progress(&read[0].progress_end).await.unwrap();
+            assert!(
+                !Path::new(p).exists(),
+                "{p} was not deleted: {:?}",
+                fs.notices
+            );
+        }
+        assert!(
+            !fs.notices.iter().any(|n| n.contains("link count")),
             "{:?}",
             fs.notices
         );
