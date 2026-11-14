@@ -58,6 +58,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 | Engine ↔ state store | The database is trusted for ledger correctness, progress durability, and availability, but not for telemetry-object integrity. Remote PostgreSQL requires hostname-verified TLS; its URL is resolved from an env/file secret reference and never serialized. |
 | Engine ↔ external CLI backends | Version-pinned tools executing outside the Rust dependency graph; stored objects are downloaded and hashed. |
 | Engine ↔ operator/logs | Secret redaction; manifests carry no secrets. |
+| Engine/node ↔ OTLP collector (#683) | Off unless an OTLP endpoint is set. Spans carry identifiers, counts, sizes, method names, outcomes and redacted error messages; metrics are the bounded `/metrics` series. No record content, credentials, keys, MACs, URLs with a path or query, or header values (§2). |
 | Native client ↔ broker | TLS 1.3 with mandatory client certificates, explicit certificate/principal/role authorization, bounded frames/sessions/windows, and range/producer fencing checks. |
 | Build ↔ runtime | Supply-chain auditing; container hardening. |
 
@@ -80,6 +81,78 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 - PostgreSQL over a Unix socket or loopback address **MAY** use plaintext for local development and CI.
 - Every non-loopback PostgreSQL connection **MUST** use `sslmode=verify-full`, which verifies both the issuing CA and the database hostname.
 - A private database CA **MUST** be supplied with `sslrootcert` when it is not in the bundled public trust roots. `sslmode=require` and `verify-ca` are rejected for remote databases because they do not provide the required hostname verification.
+
+### OpenTelemetry export (#683)
+
+OpenTelemetry export is the one network egress the processes open for their
+own telemetry rather than for the data. It is compiled into every `vtopctl`
+and `vtop-node` binary and the image, and **off until configured**: it starts
+only when `OTEL_EXPORTER_OTLP_ENDPOINT` or a per-signal endpoint
+(`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `..._METRICS_ENDPOINT`) is set. Unset,
+no exporter, thread or task exists (`crates/vtop-cli/tests/otel_off.rs`), and
+startup logs one INFO line saying so. `OTEL_SDK_DISABLED=true` turns it off
+with an endpoint set.
+
+- **Destination and transport.** OTLP over HTTP with protobuf bodies, `POST`
+  to the configured endpoints (`/v1/traces`, `/v1/metrics`). No gRPC, no
+  proxy, no compression. `https://` uses rustls with the `ring` provider and
+  the system's root certificates (`SSL_CERT_FILE` / `SSL_CERT_DIR` select
+  others); certificate verification cannot be turned off. An off-host
+  collector **SHOULD** be reached over `https://`; plain `http://` is for a
+  collector on the same host or pod network.
+- **What leaves.**
+  - Traces: spans of the processes' own targets (`vtop_*`) only, never a
+    library's, and never a log event. A batch span carries the batch id,
+    source type and name, tenant, format, record and byte counts, checksum
+    algorithm, verification method and result, the step that failed and the
+    outcome. Recovery and scrub spans carry the same identity plus their
+    decision.
+  - A failed batch's span status carries the error message, **redacted**
+    first (below).
+  - Metrics: the same series `/metrics` serves, whose labels are a bounded set
+    a test enforces (no batch id, no URI).
+  - Both signals carry the resource attributes `service.name`,
+    `service.version`, `service.instance.id` (the engine's name), `host.name`,
+    and any the operator adds through `OTEL_RESOURCE_ATTRIBUTES`.
+- **What never leaves, and is never logged.** Record content, credentials,
+  keys, MAC values, object and manifest URIs, URLs with a path or query string
+  (a presigned URL carries its signature there), and the values of the
+  `OTEL_EXPORTER_OTLP_*HEADERS` variables. The one URL that is printed is the
+  collector endpoint, as host and path (never user-info or query string), in
+  the startup line and `validate --print-effective`: a collector token
+  **MUST** go in a header, not in the endpoint's path or query.
+  - Before an error message becomes a span status or a log line, every URL in
+    it is cut to `scheme://host`, every run of 32 or more hex digits (a MAC, a
+    key, a digest) becomes `<hex>`, and every AWS access key id becomes
+    `<key-id>` (`vtop_observe::otel::redact`).
+  - The OTLP exporter's own debug logging, which quotes request URLs and
+    collector responses, is compiled out.
+  - Tests assert that no exported attribute holds record content or a `://`
+    URL, that no log line or `validate --print-effective` output holds a
+    header value, user-info or query string, and that the redaction above
+    holds.
+  - A source name is an identifier the operator configured (a file path or a
+    topic): a deployment that treats those as sensitive **SHOULD NOT** turn
+    export on.
+- **Credentials.** A collector that needs authentication takes it from
+  `OTEL_EXPORTER_OTLP_HEADERS` (or the per-signal variables). These **MUST** be
+  supplied as a secret like the storage keys (§3). They are never logged:
+  `validate --print-effective` prints "set (values not shown)", and a
+  malformed one is reported by variable name only. Credentials **MUST NOT** be
+  put in the endpoint URL itself, although the processes never print one
+  beyond its host and path.
+- **Failure isolation.**
+  - A setting that cannot be honoured stops the process at startup, naming
+    the variable.
+  - After startup, export never stalls the data path. A span's end appends to
+    a bounded queue (`OTEL_BSP_MAX_QUEUE_SIZE`, 2048) or drops the span when
+    the queue is full. One thread sends. A collector that is down or slow
+    costs spans and data points, which are counted on `/metrics` and warned
+    about at most once a minute.
+  - On a stop, the process flushes for 5 s after its own shutdown flush (6 s
+    at the outside: a 1 s backstop over the queue's own bound), or not at all
+    once another stop signal arrives, then exits whatever the collector is
+    doing.
 
 ### Authentication mechanisms
 
@@ -484,6 +557,7 @@ Resource exhaustion controls are part of the security boundary:
 
 - Any log path, error type, or diagnostic that could surface credentials **MUST** redact them.
 - Connection strings, headers, and configuration dumps **MUST** have secret fields masked before logging.
+- The OTLP endpoint is logged as host and path only, never with its user-info or query; the OTLP header values are never logged or printed (§2).
 - PostgreSQL parse/connect errors **MUST NOT** echo the supplied URL. VTOP connects from parsed options and applies URL redaction at the state-store error boundary as defense in depth.
 - The redaction layer **SHOULD** default to redacting unknown sensitive-looking fields rather than printing them.
 
@@ -552,6 +626,9 @@ the ignore list and the build re-audited.
 | Credentials printed in logs | **MUST NOT** |
 | Credentials via env vars / mounted secrets / external secret managers | **SHOULD** |
 | TLS for Kafka and S3-compatible endpoints | **SHOULD** |
+| TLS for an off-host OTLP collector (export is off unless configured) | **SHOULD** |
+| Record content, credentials, keys, MACs, URLs with a path or query (the collector endpoint aside, printed as host and path), or OTLP header values in exported telemetry or log lines | **MUST NOT** |
+| Error messages in span statuses redacted (URLs to host, hex runs, key ids) | **MUST** |
 | Hostname-verified TLS for remote PostgreSQL | **MUST** |
 | PostgreSQL URL supplied through an env/file reference | **MUST** |
 | Least-privilege object storage permissions | **SHOULD** |
@@ -605,6 +682,7 @@ flagged and collected below the tables.
 | Cluster-plane TLS (admin, Raft peer, replica, native client; each plane's transport is a node config knob defaulting to TLS; plaintext is selectable per plane, loopback-only unless named, and confidentiality holds only on the planes left at `tls`, §2) | rustls 0.23, **ring pinned at every construction site**, TLS 1.3 only, mutual; CN identity via `x509-parser` after chain validation on the admin, Raft-peer and replica planes — the native-client plane never parses the subject (Q3 below) | peer authentication, confidentiality; authorization input where the CN is read (CN is a Raft **safety** input on the peer plane) — native sessions match the declared hello principal against config, not the certificate | security function |
 | Kafka source transport | librdkafka (vendored C, cmake) + **system OpenSSL** (`ssl`) + **system Cyrus SASL** (`sasl`) | broker TLS + SASL auth; plaintext unless configured (SHOULD-level, §2); missing password env is a hard startup error, never a silent downgrade | security function |
 | S3 upload transport + signing | AWS SDK: hyper 1 + hyper-rustls + rustls 0.23 with the SDK's **aws-lc-rs** provider, system roots; SigV4 HMAC-SHA-256 (SigV4a/P-256 available, never explicitly invoked) | endpoint TLS (scheme floor via `verify_tls`; cert verification not disableable) and per-request authentication | security function |
+| OpenTelemetry export (off until configured, #683) | opentelemetry-otlp (traces) and opentelemetry-proto (metrics), HTTP/protobuf over the hyper 1 + hyper-rustls client already in the tree; rustls 0.23 with **ring pinned** at its one construction site (`crates/vtop-observe/src/otel/http.rs`), system roots | collector TLS for `https://` endpoints (verification not disableable); authentication only as the operator's `OTEL_EXPORTER_OTLP_HEADERS` | security function |
 | Postgres state store (`--features postgres`) | sqlx with `tls-rustls-ring-webpki` (the one place the workspace picks the stack); SCRAM-SHA-256 auth with ChaCha CSPRNG nonces — but the **server** chooses the method: sqlx also answers legacy `md5` (and cleartext) password requests, with no client-side way to refuse | verify-full floor for remote hosts (§2, MUST); database authentication | security function |
 | Release supply chain | cosign keyless (Sigstore), SPDX SBOM, provenance, SHA256SUMS | image + artifact authenticity; SHA256SUMS alone is integrity only, and the release notes say so | security function |
 | Test-only material | `rcgen` (dev-deps), ECDSA P-256 + SHA-256 cert minting in `gen-certs.sh` / `k8s-smoke.sh`, PEM key loading (`TlsMaterial::from_pem_files`) as the production ingestion boundary | throwaway harness PKI; production operators bring their own PEM | security function (test scope) |

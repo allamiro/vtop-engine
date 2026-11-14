@@ -301,6 +301,18 @@ codes into a container's captured stderr corrupts every downstream parser — a
 `level=~"WARN"` filter then matches nothing because the field names are wrapped
 in escape sequences.
 
+## OpenTelemetry
+
+`vtop-node` carries the same OpenTelemetry export as the engine (#683), built
+in and idle until `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Then its registry,
+every metric in the catalogue above, is also sent over OTLP/HTTP every
+`OTEL_METRIC_EXPORT_INTERVAL`, with `service.name=vtop-node`. The node opens
+no spans of its own yet, so it sends no traces. The exporter's own counters
+(`vtop_otel_*`) are on every node's `/metrics` and read 0 with export off. The
+variables, the messages and the guarantees (a bounded queue, a 5 s flush at
+shutdown, startup refusing an unsupported setting) are in
+[observability/README.md](../observability/README.md#opentelemetry).
+
 ## What is not here yet
 
 * Proof-verification and evidence-gate counters cover segment recovery today;

@@ -185,7 +185,12 @@ stages: compress=0ms checksum=0ms put_obj=0ms put_manifest=0ms verify=0ms commit
 
 `vtopctl process-once --json` includes the full metrics object per batch.
 Prometheus metrics are exported by the engine at `/metrics` when
-`VTOP_METRICS_ADDR` is set. See [observability/](../../observability/) for the
-optional Grafana LGTM stack (Alloy + Mimir/Loki/Tempo) and dashboards, and
+`VTOP_METRICS_ADDR` is set. OpenTelemetry export is built in and idle until
+`OTEL_EXPORTER_OTLP_ENDPOINT` is set: then each batch is a trace (a `batch`
+span with a child per step), the same metrics go over OTLP, and the JSON log
+lines carry the trace id; the
+[OpenTelemetry section](../../observability/README.md#opentelemetry) lists every
+variable, message and guarantee. See [observability/](../../observability/) for
+the optional Grafana LGTM stack (Alloy + Mimir/Loki/Tempo) and dashboards, and
 [`crates/vtop-core/src/metrics.rs`](../../crates/vtop-core/src/metrics.rs) for
 the implementation.

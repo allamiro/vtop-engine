@@ -30,12 +30,29 @@
 #   * The VTOP engine exposes its OWN Prometheus metrics (issue #46) at
 #     VTOP_METRICS_ADDR, so it is scraped directly. Logs remain the place for the
 #     high-cardinality detail (batch_id, object URIs) that must never be a label.
+#   * The engine exports OTLP traces (#683) to Alloy, which forwards them to
+#     Tempo; the vtop-engine entry below sets the endpoint.
 #   * MinIO exposes Prometheus natively (auth disabled below - LAB ONLY).
 #   * Kafka exposes no Prometheus endpoint, hence the exporter sidecar.
 #   * Every backend here is single-node with filesystem storage and lab
 #     credentials. This is NOT a production topology.
 
 services:
+  # --- Engine traces -> Alloy -> Tempo (#683) ---------------------------------
+  # Merged into the base file's vtop-engine. Export is off unless an OTLP
+  # endpoint is set; this overlay sets one, on the storage network the engine
+  # and Alloy share, so the lab's traces land in Tempo with no other step.
+  # OTEL_SDK_DISABLED=true in .env runs the lab without exporting.
+  vtop-engine:
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://alloy:4318}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-vtop-engine}
+      OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-false}
+      # Traces only: Alloy already scrapes the engine's /metrics into Mimir,
+      # and the same series sent again over OTLP would be counted twice by
+      # every dashboard that sums them.
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-none}
+
   # --- MinIO: enable public metrics scraping (LAB ONLY) ---------------------
   # MinIO metrics are made public in the BASE docker-compose.yml (so the
   # endpoint is scrapeable regardless of how the lab is started), not here.
