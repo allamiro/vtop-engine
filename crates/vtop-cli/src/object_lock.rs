@@ -87,6 +87,17 @@ pub(crate) fn bucket_refusal(bucket: &str, did: &str) -> String {
     )
 }
 
+/// The refusal for a store that does not implement Object Lock at all
+/// (#722): HTTP 501 `NotImplemented` to `GetObjectLockConfiguration`. No
+/// bucket setting can change that, so the message says so.
+pub(crate) fn store_unsupported(bucket: &str, did: &str) -> String {
+    format!(
+        "the store does not implement S3 Object Lock (it answered GetObjectLockConfiguration \
+         for bucket {bucket} with \"not implemented\"); {did}. No bucket setting can change \
+         that: use a store that implements S3 Object Lock, or remove upload.object_lock"
+    )
+}
+
 /// The message for a bucket whose Object Lock configuration could not be
 /// read at all.
 pub(crate) fn bucket_unreadable(bucket: &str, did: &str, error: &VtopError) -> String {
@@ -173,16 +184,21 @@ pub(crate) async fn preflight(
     let checked = if bucket_is_templated(bucket) {
         "(each bucket the template names is checked at its first upload)"
     } else {
-        let answer = match backend.bucket_object_lock(bucket).await {
-            Ok(BucketFeature::NotSupported) => Err(VtopError::Upload("not implemented".into())),
-            other => other,
-        };
-        match answer {
+        match backend.bucket_object_lock(bucket).await {
             Ok(BucketFeature::Enabled) => {
                 locked_buckets.lock().unwrap().insert(bucket.to_owned());
                 "(checked)"
             }
-            Ok(_) => {
+            // The store does not implement Object Lock (#722). Before, this
+            // was taken for a check that could not be made: the engine
+            // started, and every batch failed later.
+            Ok(BucketFeature::NotSupported) => {
+                return Err(VtopError::Config(store_unsupported(
+                    bucket,
+                    "the engine did not start",
+                )))
+            }
+            Ok(BucketFeature::NotEnabled) => {
                 return Err(VtopError::Config(bucket_refusal(
                     bucket,
                     "the engine did not start",

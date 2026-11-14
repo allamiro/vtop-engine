@@ -957,6 +957,25 @@ impl S3NativeBackend {
 /// exactly the signal a concurrency controller wants and a same-rate retry
 /// would only worsen. Classified on the wire facts the SDK keeps: the HTTP
 /// status (429, or 503 as S3 spells `SlowDown`) and the error code.
+/// A store's definite "I do not implement this operation" (#722): HTTP 501,
+/// or the `NotImplemented` / `XNotImplemented` error code under any status
+/// (some stores send it with a 400). Told apart from a check that could not
+/// be made (a 403, a 503, a timeout), which proves nothing either way: the
+/// SDK does not retry a 501, so this is the store's first and only answer.
+fn not_implemented<E>(error: &SdkError<E, HttpResponse>) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    let (status, code) = match error {
+        SdkError::ServiceError(context) => {
+            (Some(context.raw().status().as_u16()), context.err().code())
+        }
+        SdkError::ResponseError(context) => (Some(context.raw().status().as_u16()), None),
+        _ => (None, None),
+    };
+    status == Some(501) || matches!(code, Some("NotImplemented" | "XNotImplemented"))
+}
+
 fn sdk_failure<E>(operation: &str, target: &str, error: SdkError<E, HttpResponse>) -> VtopError
 where
     E: std::error::Error + ProvideErrorMetadata + Send + Sync + 'static,
@@ -1117,13 +1136,17 @@ impl UploadBackend for S3NativeBackend {
     }
 
     async fn bucket_versioning(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
-        let out = self
+        let out = match self
             .client
             .get_bucket_versioning()
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| sdk_failure("get_bucket_versioning", bucket, e))?;
+        {
+            Ok(out) => out,
+            Err(e) if not_implemented(&e) => return Ok(BucketFeature::NotSupported),
+            Err(e) => return Err(sdk_failure("get_bucket_versioning", bucket, e)),
+        };
         // Suspended, or no status at all (a bucket versioning was never
         // turned on for): either way overwritten versions are not kept.
         Ok(match out.status() {
@@ -1162,6 +1185,10 @@ impl UploadBackend for S3NativeBackend {
             {
                 Ok(BucketFeature::NotEnabled)
             }
+            // The store does not implement Object Lock at all (#722; Garage
+            // documents every Object Lock call as missing). No bucket setting
+            // changes that, so it is an answer, not a check that failed.
+            Err(e) if not_implemented(&e) => Ok(BucketFeature::NotSupported),
             Err(e) => Err(sdk_failure("get_object_lock_configuration", bucket, e)),
         }
     }

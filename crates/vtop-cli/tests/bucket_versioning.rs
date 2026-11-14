@@ -70,7 +70,7 @@ async fn a_literal_bucket_without_versioning_refuses_startup_naming_it_and_the_f
             // What the engine did.
             "the engine did not start",
             // What to do.
-            "enable versioning on the bucket",
+            "Enable versioning on the bucket",
             "or set upload.require_object_versioning: false",
         ],
     );
@@ -124,7 +124,7 @@ async fn a_backend_without_object_versions_refuses_startup() {
             "upload.require_object_versioning is set",
             "the localfs upload backend cannot address object versions",
             "the engine did not start",
-            "use the s3_native backend, or set upload.require_object_versioning: false",
+            "Use the s3_native backend, or set upload.require_object_versioning: false",
         ],
     );
 }
@@ -188,7 +188,7 @@ async fn a_templated_bucket_without_versioning_fails_its_first_batch_in_three_pa
         &[
             "bucket telemetry-raw does not have versioning enabled",
             "the batch was not uploaded and will be replayed",
-            "enable versioning on the bucket",
+            "Enable versioning on the bucket",
         ],
     );
 }

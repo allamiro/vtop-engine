@@ -27,8 +27,8 @@ use vtop_meta::command::CommandEnvelope;
 use vtop_meta::MetadataCommand;
 use vtop_upload::base::parse_s3_uri;
 use vtop_upload::{
-    cleanup_abandoned, upload_resumable, BucketFeature, MultipartFence, MultipartUploadConfig,
-    ObjectChecksum, UploadBackend,
+    cleanup_abandoned, upload_resumable, MultipartFence, MultipartUploadConfig, ObjectChecksum,
+    UploadBackend,
 };
 
 #[derive(Subcommand, Debug)]
@@ -286,18 +286,13 @@ pub async fn run_tier_copy(
     if request.require_versioning {
         let (bucket, _key) = parse_s3_uri(&request.object_uri)
             .map_err(|error| refuse("versioning preflight", error))?;
-        match backend.bucket_versioning(&bucket).await {
-            Ok(BucketFeature::Enabled) => {}
-            Ok(other) => {
-                return Err(refuse(
-                    "versioning preflight",
-                    format!(
-                        "bucket {bucket} does not have versioning enabled (status: {other:?}); \
-                         the hardened manifest profile requires it"
-                    ),
-                ))
-            }
-            Err(error) => return Err(refuse("versioning preflight", error)),
+        let did = "nothing was copied";
+        let refusal = match backend.bucket_versioning(&bucket).await {
+            Ok(answer) => crate::bucket_versioning::refusal(answer, &bucket, did),
+            Err(error) => Some(crate::bucket_versioning::unreadable(&bucket, did, &error)),
+        };
+        if let Some(message) = refusal {
+            return Err(refuse("versioning preflight", message));
         }
     }
 
@@ -811,8 +806,11 @@ mod tests {
         async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError> {
             self.0.delete_object(object_uri).await
         }
-        async fn bucket_versioning(&self, _bucket: &str) -> Result<BucketFeature, VtopError> {
-            Ok(BucketFeature::Enabled)
+        async fn bucket_versioning(
+            &self,
+            _bucket: &str,
+        ) -> Result<vtop_upload::BucketFeature, VtopError> {
+            Ok(vtop_upload::BucketFeature::Enabled)
         }
         fn backend_name(&self) -> &'static str {
             "mock-unversioned"
