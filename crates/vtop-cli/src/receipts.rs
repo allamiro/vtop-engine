@@ -249,8 +249,9 @@ pub(crate) fn engine_failure_message(batch_id: &str, why: &str) -> String {
         "the verification receipt for batch {batch_id} could not be written: {why}; the batch \
          is verified and is committed regardless; batches are unaffected. recovery writes the \
          receipt if the batch is still VERIFIED at the next start, and once it is committed \
-         vtopctl scrub reports it missing. Nothing to do unless it repeats; then check the \
-         store's health and the engine's permission to write beside the manifests"
+         vtopctl scrub reports it missing, or, if it was stored without its lock, vtopctl \
+         scrub --check-retention reports its retention. Nothing to do unless it repeats; then \
+         check the store's health and the engine's permission to write beside the manifests"
     )
 }
 
