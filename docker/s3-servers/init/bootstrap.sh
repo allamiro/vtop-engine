@@ -71,11 +71,15 @@ true)
         echo "bootstrap: created $locked with Object Lock"
     fi
     # A store may need versioning turned on explicitly even with the lock
-    # (SeaweedFS documents both steps); S3 turns it on with the lock, and
-    # enabling it again is a no-op.
-    s3api put-bucket-versioning --bucket "$locked" \
-        --versioning-configuration Status=Enabled
+    # (SeaweedFS documents both steps). S3 turns it on with the lock, and
+    # another store (CloudServer) refuses any versioning change on a locked
+    # bucket, so it is asked for only when it is not already on.
     status=$(s3api get-bucket-versioning --bucket "$locked" --query Status --output text)
+    if [ "$status" != "Enabled" ]; then
+        s3api put-bucket-versioning --bucket "$locked" \
+            --versioning-configuration Status=Enabled
+        status=$(s3api get-bucket-versioning --bucket "$locked" --query Status --output text)
+    fi
     if [ "$status" != "Enabled" ]; then
         echo "bootstrap: $locked has versioning '$status' after enabling it" >&2
         exit 1
