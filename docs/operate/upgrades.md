@@ -12,7 +12,9 @@ every upgrade.
   directory, or a verified backup taken before the upgrade.
 
 The source for this page is the release notes in the [roadmap](../ROADMAP.md);
-read the section for the release you are moving to.
+read the section for the release you are moving to. Which releases get fixes,
+what a minor may break and how removals are announced are in
+[Versioning and support](../SUPPORT.md).
 
 ## Upgrading from v0.7.0 to v0.8.0
 

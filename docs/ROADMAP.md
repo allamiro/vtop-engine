@@ -1086,3 +1086,7 @@ after a restart; newly published tags join that matrix automatically.
 artifacts an older release cannot interpret, and nothing tests that path;
 going back means a fresh directory or a verified backup taken before the
 upgrade.
+
+What each release line is supported for, how a removal is announced, and the
+rules a minor release keeps are in [SUPPORT.md](SUPPORT.md); deprecated items
+are listed in [DEPRECATIONS.md](DEPRECATIONS.md).
