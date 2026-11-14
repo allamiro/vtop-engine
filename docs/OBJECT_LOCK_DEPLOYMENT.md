@@ -183,7 +183,12 @@ the manifest at its pinned version, and expects the configured mode. It
 reports `locked`, `elapsed` (the retention has ended), `missing` and
 `mode_mismatch`. The last two are findings: an object that can now be
 deleted or overwritten. Use it after enabling the profile on an existing
-fleet, to find objects an older engine wrote unlocked. See
+fleet, to find objects an older engine wrote unlocked. When the scrub also
+checks verification receipts (`manifest.verification_receipts`, or
+`--require-receipts`), it reads each existing receipt's retention at its
+current key too (one more request per receipt, under the same
+`s3:GetObjectRetention` permission), and reports it apart, in
+`vtop_scrub_receipt_retention_total` (#710). See
 [Scrub and coverage audit](operate/scrub-and-audit.md).
 
 ## Storage cost
@@ -209,9 +214,13 @@ still reclaim them.
   a downgraded engine writes unlocked objects.
 - **The cluster plane's tier copies** (`vtopctl tier copy` refuses the
   profile).
-- **Stores other than MinIO** have not been measured. The live tests run
-  against the lab's MinIO, RELEASE.2025-09-07. It accepts locked writes for
-  both checksum paths and for multipart, returns the lock headers on
-  `HeadObject`, refuses to delete a locked version, and still reports an
-  ended retention's mode and date. Behaviour on AWS S3 comes from its
-  documentation.
+- **Stores the matrix has not run.** The live tests run against the S3
+  compatibility matrix's servers (#722). On the lab's MinIO
+  (RELEASE.2025-09-07), RustFS 1.0.5 and SeaweedFS 4.53 they accept locked
+  writes for both checksum paths and for multipart, return the lock headers
+  on `HeadObject`, refuse to delete a locked version, and still report an
+  ended retention's mode and date. Garage v2.5.0 implements no Object Lock
+  (`GetObjectLockConfiguration` answers 501), and the engine refuses it at
+  startup. The [S3 compatibility](reference/s3-compatibility.md) table is
+  generated from the committed results. Behaviour on AWS S3 comes from its
+  documentation until the opt-in AWS workflow has run.

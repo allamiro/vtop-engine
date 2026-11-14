@@ -1001,8 +1001,18 @@ known limitations:
   different statement. Recovery writes one only for a batch still VERIFIED.
 - **Object Lock.** A receipt is written and its retention read back like a
   manifest's, and recovery never adds a second version beside one.
-  `vtopctl scrub --check-retention` does not read receipts' retention yet
-  ([#710](https://github.com/allamiro/vtop-engine/issues/710)).
+  When receipts are checked, `vtopctl scrub --check-retention` reads each
+  existing receipt's retention again, at its current key (#710), counted
+  apart from the batch's in `vtop_scrub_receipt_retention_total{result}`: no
+  retention and another mode are findings, an ended retention is not, and a
+  missing receipt is not a retention finding.
+- **A scheduled `scrub --check-retention` can now fail on receipts.** On an
+  archive that has receipts, a receipt written before `upload.object_lock`
+  was set, one the engine's read-back found unlocked (it logged
+  `verification_receipt_failed`), or one whose lock was removed carries no
+  lock and is a finding: the run exits non-zero and
+  `vtop_scrub_last_finding_timestamp_seconds` moves, as for an unlocked
+  object. Each read is one more request per receipt.
 - **Going back.** Set `verification_receipts: false`. Receipts already written
   stay readable; drop `--require-receipts` from scheduled scrubs.
 
@@ -1068,10 +1078,14 @@ mode_mismatch. The deployment profile is
   nobody can remove them before the date: storage cost, said at startup.
 - **`vtopctl tier copy` refuses the block;** locking cold-tier copies is a
   separate decision.
-- **Proven against MinIO only** (RELEASE.2025-09-07, the lab's build). AWS S3
-  behaviour is taken from its documentation (the integrity header a locked
-  write needs, the permissions a HEAD needs to return the lock headers), not
-  measured.
+- **Proven against the S3 compatibility matrix's servers** (#722): the lab's
+  MinIO (RELEASE.2025-09-07), RustFS 1.0.5 and SeaweedFS 4.53 keep the lock;
+  Garage v2.5.0 implements no Object Lock and is refused at startup. Which
+  server did what is the generated
+  [S3 compatibility](reference/s3-compatibility.md) table. AWS S3 behaviour
+  is still taken from its documentation (the integrity header a locked write
+  needs, the permissions a HEAD needs to return the lock headers) until the
+  opt-in AWS workflow has run.
 
 ---
 
