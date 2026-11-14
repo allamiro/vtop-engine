@@ -37,7 +37,7 @@ a failed upload or a failed check leads to a replay, not a gap.
 
 ```mermaid
 stateDiagram-v2
-    direction LR
+    direction TB
     [*] --> DISCOVERED
     DISCOVERED --> BATCHING
     BATCHING --> SEALED
@@ -52,7 +52,7 @@ stateDiagram-v2
     REPLAY_REQUIRED --> BATCHING : replay from the uncommitted position
     FAILED --> SUPERSEDED
     REPLAY_REQUIRED --> SUPERSEDED
-    note right of FAILED
+    note left of FAILED
         Every state except SOURCE_COMMITTED
         and SUPERSEDED can move to FAILED.
     end note
@@ -175,19 +175,18 @@ cargo build --release --locked
 
 ```mermaid
 flowchart LR
-    S["Source<br/>Kafka · file · syslog spool"]
-    B["Batch<br/>seal · compress · checksum"]
-    U["Upload<br/>object, then manifest"]
-    V{"Verify<br/>stored bytes"}
-    C(["Commit<br/>source position"])
-    L[("State store<br/>batch ledger")]
-    R["Replay<br/>from the last<br/>committed position"]
+    S["Source<br/>Kafka, file,<br/>syslog spool"]
+    B["Batch<br/>seal, compress,<br/>checksum"]
+    U["Upload<br/>object, then<br/>manifest"]
+    V{"Verify<br/>stored<br/>bytes"}
+    C(["Commit<br/>source<br/>position"])
+    R["Replay from<br/>the last committed<br/>position"]
+    L[("State store")]
 
     S --> B --> U --> V
-    V ==>|"verified"| C
-    V -->|"mismatch, timeout, crash"| R
+    V ==>|verified| C
+    V -->|"mismatch,<br/>timeout, crash"| R
     R --> B
-    B -.-> L
     V -.-> L
     C -.-> L
 ```
