@@ -20,6 +20,7 @@ Ground truth: `.github/workflows/release.yml` (a push of a `v*` tag publishes), 
 
 - `git fetch origin --tags`; list what the release carries: `git log --first-parent --oneline vPREV..origin/main` and `./scripts/release-notes.sh <tag> <previous-tag>` once a tag exists (it groups by the squash subject's `area:` prefix and uses the API to tell PRs from issues).
 - The milestone is empty of open issues and PRs, or each remaining one is moved on deliberately.
+- **Data-safety register and quiet period.** Run `scripts/check-data-safety-register.py --quiet-days` (it reads the `data-safety` label with `gh`). It must pass: every labelled issue has a row in `docs/reference/data-safety-register.md` and every row's state matches its issue. Record the quiet-period line it prints (days since the most recent `data-safety` issue was opened) in the bump PR's body. It is a measurement, not a gate yet (#741); a bug labelled during the release still gets its row before the bump.
 - `main` is green at the commit you will bump from (`gh api repos/allamiro/vtop-engine/commits/<sha>/check-runs`). The v0.8.0 bump rested on "the `upgrade compat` and `live chaos` jobs, both green on main at 2ad1d68".
 - **Did `.github/workflows/release.yml`, `docker/` or `.cargo/config.toml` change since the last tag?** Then dry-run the pipeline before tagging: Actions, Release, Run workflow, with `tag` set to the previous tag (and the branch if the fix is not on `main`). A dispatch builds and tests everything but publishes nothing (the image-manifest and release jobs are skipped for `workflow_dispatch`). This is how #608 and #609 were checked.
 
@@ -49,7 +50,7 @@ Also retire a stale "Next release" block at the top of the file if what it descr
 
 ### The PR body
 
-Mirror #676: the four files and what changed in each, the chart version and why, that CI runs the upgrade checks, and "After merge, tag `vX.Y.Z` on the merge commit; `release.yml` triggers on `v*` tags and publishes". Link no AI tool and add no trailer (`vtop-contributing`).
+Mirror #676: the four files and what changed in each, the data-safety quiet period from section 0, the chart version and why, that CI runs the upgrade checks, and "After merge, tag `vX.Y.Z` on the merge commit; `release.yml` triggers on `v*` tags and publishes". Link no AI tool and add no trailer (`vtop-contributing`).
 
 ## 2. CI green, then the squash merge pinned to the head
 
@@ -121,6 +122,7 @@ Also: the image's `latest` tag moved (only for a non-pre-release), `helm/vtop/Ch
 ## Checklist
 
 - [ ] Milestone empty or deliberately moved; the bug-only rule respected.
+- [ ] `scripts/check-data-safety-register.py --quiet-days` passes; the quiet-period days are in the bump PR body.
 - [ ] Bump PR touches only Cargo.toml (11 edits), Cargo.lock (12 `vtop-*` entries), Chart.yaml, ROADMAP.md, CITATION.cff.
 - [ ] Chart version bump matches whether templates or values changed.
 - [ ] ROADMAP: upgrade order, one-way changes with reasons, silently ignored keys, known open, no downgrade.
