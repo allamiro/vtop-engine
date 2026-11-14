@@ -57,7 +57,7 @@ docker run -d --name vtop-engine \
 
 Credentials come from the environment or mounted secrets, never from the
 config file. The variables the engine reads are listed in
-[Configure](../configure/index.md#environment-variables).
+[Config basics](../configure/basics.md#environment-variables).
 
 `docker stop` sends SIGTERM, which is an orderly stop: the engine finishes the
 current source pass and flushes what it has buffered. Give it enough time with

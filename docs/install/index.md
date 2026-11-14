@@ -1,8 +1,10 @@
 # Install
 
 Every release ships the same two binaries, `vtopctl` (the archive engine and
-operator CLI) and `vtop-node` (the cluster-plane node), in four forms. Pick the
-one that matches where you will run it.
+operator CLI) and `vtop-node` (the cluster-plane node), signed and with an
+SBOM. Pick the form that matches where you will run them.
+
+## Which install?
 
 | You want to | Use | Notes |
 |---|---|---|
@@ -11,13 +13,48 @@ one that matches where you will run it.
 | Run the cluster plane on Kubernetes | [Helm chart](helm.md) | Deploys `vtop-node`, not the archive engine. |
 | Use PostgreSQL, Kerberos, or change the build | [Build from source](from-source.md) | The published binaries and image do not include the `postgres` feature. |
 
-Every artifact is signed with keyless Sigstore and ships with an SPDX SBOM.
-[Verify a release](../RELEASE_VERIFICATION.md) before you run it.
-
 !!! warning "PostgreSQL needs a source build"
 
     The release binaries and the container image are built with the default
     features only, and a `postgres://` state store fails at startup with
     `postgres:// state store requires a build with --features postgres`. Build
-    `vtopctl` with `--features postgres` for a PostgreSQL ledger; see
-    [PostgreSQL deployment](../POSTGRES_DEPLOYMENT.md).
+    `vtopctl` with `--features postgres` for a PostgreSQL ledger.
+
+<div class="grid cards" markdown>
+
+-   **Release binaries**
+
+    ---
+
+    Download, verify, and run on Linux or macOS.
+
+    [:octicons-arrow-right-24: Binaries](binaries.md)
+
+-   **Container image**
+
+    ---
+
+    Tags, volumes, and running any `vtopctl` command.
+
+    [:octicons-arrow-right-24: Container](container.md)
+
+-   **Helm chart**
+
+    ---
+
+    The cluster plane on Kubernetes.
+
+    [:octicons-arrow-right-24: Helm](helm.md)
+
+-   **Build from source**
+
+    ---
+
+    Per-OS prerequisites, optional features, troubleshooting.
+
+    [:octicons-arrow-right-24: From source](from-source.md)
+
+</div>
+
+Whichever you choose, [verify the release](../RELEASE_VERIFICATION.md) before
+you run it.

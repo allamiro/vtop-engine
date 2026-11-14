@@ -76,7 +76,7 @@ data.
 
 After the first install, bootstrap the metadata Raft group once. The steps are
 printed by the chart's post-install notes and described in
-[Kubernetes with Helm](../deploy/kubernetes.md#bootstrap-the-metadata-group).
+[Kubernetes with Helm](../deploy/kubernetes.md#steps).
 
 Every value, its default and its meaning is in the
 [chart README](../../helm/vtop/README.md#values).
