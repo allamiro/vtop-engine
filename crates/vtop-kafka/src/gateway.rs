@@ -2084,7 +2084,22 @@ impl Gateway {
         let (batches, used) = if any_compressed(records) {
             let owned = records.to_vec();
             let left = *budget;
-            match tokio::task::spawn_blocking(move || split_batches(&owned, left)).await {
+            // Tracked, so the drain waits for it, and bounded by the
+            // request's deadline (review): a saturated blocking pool must not
+            // hold the request past its timeout. A decode that outlives the
+            // deadline runs on, counted by the drain; its result is dropped
+            // and nothing is appended.
+            let decode = self.jobs.blocking(move || split_batches(&owned, left));
+            let Ok(joined) = tokio::time::timeout_at(deadline, decode).await else {
+                *budget = 0;
+                return Err((
+                    ErrorCode::RequestTimedOut,
+                    "the request's deadline passed while this partition's batches were being \
+                     decompressed; nothing was appended"
+                        .to_owned(),
+                ));
+            };
+            match joined {
                 // A refused compressed field may have decompressed up to
                 // what was left before it failed, and how much is not
                 // returned. The rest of the request gets no more (review):
@@ -7106,6 +7121,41 @@ mod tests {
         }
         let too_large = ErrorCode::MessageTooLarge.as_i16();
         assert_eq!(codes, vec![too_large, too_large, too_large]);
+    }
+
+    /// The decompression wait is bounded by the request's deadline (review):
+    /// a compressed field whose decode cannot finish in time is answered
+    /// REQUEST_TIMED_OUT, and nothing is appended.
+    #[tokio::test]
+    async fn a_decode_past_the_deadline_is_a_timeout() {
+        let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        // timeout_ms 20: the deadline passes while many gzip batches, 15 MiB
+        // in all, are still decompressing (a debug build takes far longer).
+        let big = "\0".repeat(1536 * 1024);
+        let one = compressed_batch_bytes(crate::codec::GZIP, &batch_bytes(&[big.as_str()], false));
+        let set: Vec<u8> = std::iter::repeat_n(one, 10).flatten().collect();
+        let mut body = Encoder::new();
+        body.nullable_string(None);
+        body.i16(-1);
+        body.i32(20);
+        body.array_len(1);
+        body.string("events");
+        body.array_len(1);
+        body.i32(0);
+        body.nullable_bytes(Some(&set));
+        let reply = call(addr, 0, 8, 1, body.as_slice()).await.unwrap();
+        let (error, _, message) = read_produce(&reply, 8);
+        assert_eq!(error, ErrorCode::RequestTimedOut.as_i16(), "{message:?}");
+        assert!(
+            message
+                .unwrap_or_default()
+                .contains("while this partition's batches were being decompressed"),
+            "the wait on the decoder is what timed out"
+        );
+        let reply = call(addr, 1, 4, 2, &fetch_body(4, "events", 0, 0, 0))
+            .await
+            .unwrap();
+        assert_eq!(read_fetch(&reply, 4).1, 0, "nothing appended");
     }
 
     #[tokio::test]
