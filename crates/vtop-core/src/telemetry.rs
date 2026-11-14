@@ -88,6 +88,12 @@ pub struct Metrics {
     /// Non-zero means an engine is older than a writer sharing its ledger,
     /// which the upgrade order rules out: upgrade this engine.
     pub recovery_unsupported_manifest_total: IntCounterVec,
+    /// VERIFIED batches recovery re-checked against storage, by the class the
+    /// ledger recorded they were verified with and what the re-check found
+    /// (#664). `verification_class="strong", result="size_only"` is the one
+    /// to alert on: content verified strongly that the store can no longer
+    /// confirm.
+    pub recovery_rechecks_total: IntCounterVec,
 
     /// Volume. Rates are derived from these in PromQL, never exported directly.
     pub records_total: IntCounterVec,
@@ -253,6 +259,11 @@ impl Metrics {
             "VERIFIED batches whose manifest recovery found to be from a newer release than this engine reads (#671); upgrade the engine",
             labels3(),
         )?;
+        let recovery_rechecks_total = cv(
+            "recovery_rechecks_total",
+            "VERIFIED batches recovery re-checked against storage, by the class they were verified with (strong, size_only; unknown for a row from before #664 or with a newer release's class) and the re-check's result (strong, size_only, failed, unsupported_version). verification_class=strong with result=size_only: the store can no longer confirm content verified strongly; restore checksum support on the backend, then run vtopctl scrub",
+            vec!["tenant", "source_type", "format", "verification_class", "result"],
+        )?;
         let failed_total = cv(
             "failed_total",
             "Batches that reached the FAILED state",
@@ -375,6 +386,7 @@ impl Metrics {
             replay_required_total,
             failed_total,
             recovery_unsupported_manifest_total,
+            recovery_rechecks_total,
             records_total,
             bytes_in_total,
             bytes_out_total,

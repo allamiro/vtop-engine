@@ -257,10 +257,16 @@ there is no strict or production profile for it to refuse in. Every
 size-only verification logs a WARN with its batch id, and
 `vtop_verification_backend_limited_total` counts it where
 `vtop_verified_total` counts verifications: when the running engine marks the
-batch VERIFIED, and when recovery commits a VERIFIED row whose storage
-re-check confirmed only size. A row recovery re-checks but holds back under
-a lower incomplete range is logged, not counted, so a restart does not count
-it again. Under the strong default, the re-check logs the size-only result it
+batch VERIFIED, and when recovery commits a VERIFIED row that was verified
+on size alone. The ledger records which class each row was verified with,
+`strong` or `size_only`, in the same write as its VERIFIED transition (#664),
+and recovery counts a commit by that class - including a row a later pass
+settles - not by what its own storage re-check finds after the restart: a
+strong row whose re-check confirms only size is not counted, and a size-only
+row whose re-check finds a digest is. A row verified by a release before
+#664 has no class and is counted as before, by its re-check. A row recovery
+re-checks but holds back under a lower incomplete range is logged, not
+counted, so a restart does not count it again. Under the strong default, the re-check logs the size-only result it
 refuses. The per-batch WARN
 is not rate-limited: it replaces that batch's INFO `verification_passed`
 line, so it is no more frequent than the batch log itself.

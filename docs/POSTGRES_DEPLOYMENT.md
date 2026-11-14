@@ -81,7 +81,8 @@ reference keeps credentials out of config serialization and command arguments.
 
 ## Failure behavior
 
-If the table, required columns, or invariant trigger are absent, the
+If the table, required columns (`verification_class` since #664), or
+invariant trigger are absent, the
 trigger is disabled or its function lacks a current schema version marker,
 or the `state_enum` CHECK does not admit every state the engine writes
 (`superseded` since #567), engine startup fails with instructions to run
@@ -117,6 +118,32 @@ migration job per database; engine replicas should start only after it succeeds.
   restart. Upgrade every
   engine on a ledger together, or drain the older ones first. Rolling back
   past this release means restoring a ledger backup taken before the upgrade.
+- **`verification_class` (#664) needs the migration.** The release that
+  records which class of verification a row passed adds a nullable
+  `verification_class` column (`ADD COLUMN IF NOT EXISTS`, no default, no
+  rewrite of existing rows). Engines of that release name the column at
+  startup and refuse a schema without it, asking for `vtopctl migrate`; run
+  it before rolling them out, as above. **Restart every older engine right
+  after the migration** (or drain them before it). Engines before #664 read
+  whole rows with `SELECT *` and `RETURNING *` through statements each
+  connection caches, and once the column exists PostgreSQL refuses a cached
+  one with `cached plan must not change result type` until the connection is
+  replaced. A running engine reads whole rows in its startup recovery and
+  when a later pass settles a VERIFIED row whose source commit failed
+  (#659): that settle read fails and is retried, and the row waits for the
+  next restart's recovery. Its batch writes (insert, transitions) name their
+  columns and are unaffected; a v0.8.0 engine running through this
+  migration archived and committed its next batch normally. The commit rule
+  is not affected either way. Restarted, an older
+  engine runs on the migrated schema, before and after an upgraded engine
+  has written a class: it never names the column, a row it verifies keeps
+  NULL, and NULL is read as unknown and counted as before. The class decides
+  only which counter a recovered commit is counted in, never whether a row
+  commits, so an older engine ignoring it misreads nothing. Engines of this
+  release name every column they read, so a column a later migration adds
+  does not affect them while they run. The schema marker is not bumped (see
+  below). A rollback may keep the column; do not drop it while any engine of
+  that release can reach the database.
 - Changes to the JSON inside ledger rows need no migration step. The content
   fingerprint added to file and spool markers (#578) is such a change: no
   DDL, older rows keep being read and judged as before. See the ledger format
@@ -141,9 +168,33 @@ migration job per database; engine replicas should start only after it succeeds.
   `vtopctl migrate` is run against an upgraded database, its
   `CREATE OR REPLACE` installs the older, unmarked body, and this release's
   engines refuse to start until this release's migration runs again.
-  **Any future change to the trigger, its function, or the schema the
-  migration leaves must bump this marker** in the migration together with
-  `MIN_SCHEMA_VERSION` in `pg_store.rs`.
+  **Any future change to the trigger or its function, or to the schema the
+  migration leaves that an engine could misread or an older release's
+  migration would undo, must bump this marker** in the migration together
+  with `MIN_SCHEMA_VERSION` and `SCHEMA_VERSION` in `pg_store.rs`. A new
+  nullable column that startup names and older engines never name does not:
+  startup already refuses a schema without it, and an older release's
+  migration never drops it. The `verification_class` column (#664) is such a
+  change, and leaves the marker at 3.
+- **A newer schema is refused (since #664).** Engines and `vtopctl migrate`
+  from #664 on read markers from `MIN_SCHEMA_VERSION` to `SCHEMA_VERSION`
+  (both 3 today). A higher marker means a newer release migrated the
+  database for a change this one could misread, so startup refuses it, and
+  so does this release's `vtopctl migrate`, which would otherwise install its
+  older trigger body over the newer one. The migration SQL carries the same
+  guard itself, in its own transaction under an advisory lock that every
+  migration from #664 on takes, so it holds for SQL applied by an external
+  migration system and for two migrations run at once. Startup checks the
+  marker before the columns, so a newer schema that dropped or renamed a
+  column is refused as newer, not sent to `vtopctl migrate`. The refusal names the marker it
+  found and the versions this release reads: `schema marker 4 (-- vtop-state-schema 4 ...)
+  is newer than this release supports (minimum 3, newest 3): a newer release
+  has migrated this database. Nothing was started or changed. ...`. Releases
+  before #664 accept every marker at or above their minimum and cannot be
+  made to refuse; they are covered by the rule that the marker is bumped
+  only for changes they would misread. When a later release bumps the
+  marker, engines of this release keep running until restarted, and refuse
+  to start after: upgrade them before restarting them.
 - Restoring the ledger from a backup. Stop every engine first, and **always
   finish with `vtopctl migrate`**. A schema restored from an older archive
   (`pg_restore`, or `--schema-only`) carries that release's trigger

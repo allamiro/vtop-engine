@@ -28,6 +28,20 @@ pub struct BatchRecord {
     /// Size in bytes of the uploaded (compressed) object. Lets recovery's
     /// storage re-check compare size even when no digest is available (#125).
     pub object_size_bytes: Option<i64>,
+    /// Which class of verification the batch passed on its way to VERIFIED
+    /// (#664), recorded with that transition. `None` for a row verified by
+    /// a release before #664, or by one that wrote a class this build does
+    /// not know: unknown, never assumed to be either class.
+    ///
+    /// Omitted from the serialized record when unknown, so a prune digest of
+    /// a legacy row is byte-for-byte what an older release wrote; an older
+    /// reader ignores the key when present.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_verification_class"
+    )]
+    pub verification_class: Option<VerificationClass>,
     pub record_count: Option<i64>,
     pub error_message: Option<String>,
     /// Engine instance that owns this in-flight batch (#93). `None` on rows
@@ -39,6 +53,93 @@ pub struct BatchRecord {
     pub lease_expires_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Which class of verification a batch passed when it became VERIFIED
+/// (#664).
+///
+/// The recovery re-check of a VERIFIED row runs after a restart, against the
+/// store as it is then, and can reach a different answer from the
+/// verification that put the row in VERIFIED: a backend-limited result at
+/// one and a digest match at the other. What the row passed is the
+/// verification that admitted it, so it is recorded with the transition and
+/// read back, not re-derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationClass {
+    /// The stored content matched a digest: a checksum the store computed,
+    /// or a read-back of the stored bytes.
+    Strong,
+    /// The store confirmed only size and existence (`backend_limited`),
+    /// accepted under `upload.require_strong_verification: false`.
+    SizeOnly,
+}
+
+impl VerificationClass {
+    /// The text stored in the ledger's `verification_class` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strong => "strong",
+            Self::SizeOnly => "size_only",
+        }
+    }
+
+    /// The class a stored value names. NULL, and a value this build does not
+    /// know (written by a newer release), are both `None`: unknown. An
+    /// unknown class is decided the way a row from before #664 is, so a
+    /// newer value can never be misread as one of these two.
+    pub fn from_stored(stored: Option<&str>) -> Option<Self> {
+        match stored? {
+            "strong" => Some(Self::Strong),
+            "size_only" => Some(Self::SizeOnly),
+            _ => None,
+        }
+    }
+}
+
+/// Tells the operator that a migration added the verification class column
+/// to a table that already held rows (#664): what happened, what it means for
+/// those rows, and that nothing needs doing. Says nothing for an empty table:
+/// no row is left without a class.
+pub(crate) fn log_class_column_added(backend: &str, existing_rows: i64) {
+    if existing_rows == 0 {
+        return;
+    }
+    tracing::info!(
+        backend,
+        existing_rows,
+        column = "verification_class",
+        "state store: added the verification_class column; {existing_rows} existing rows left \
+         NULL (verification class unknown). A VERIFIED row among them is counted, when recovery \
+         commits it, by recovery's re-check of the stored object, as before this release. \
+         Nothing to do"
+    );
+}
+
+/// [`log_class_column_added`] when the rows could not be counted: the column
+/// is there either way, so this is not a failure of the migration.
+pub(crate) fn log_class_column_added_uncounted(backend: &str, error: &str) {
+    tracing::warn!(
+        backend,
+        column = "verification_class",
+        error,
+        "state store: added the verification_class column, but could not count the existing \
+         rows it left NULL (verification class unknown). The migration is complete; those rows' \
+         recovered commits are counted by recovery's re-check, as before this release. Nothing \
+         to do"
+    );
+}
+
+/// Reads a serialized `verification_class` leniently: a value this build does
+/// not know is unknown (`None`), never an error. A prune digest is read whole
+/// or refused, so a strict enum would make one row from a newer release fail
+/// the coverage audit of every row in its file.
+fn deserialize_verification_class<'de, D>(d: D) -> Result<Option<VerificationClass>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored = Option::<String>::deserialize(d)?;
+    Ok(VerificationClass::from_stored(stored.as_deref()))
 }
 
 impl BatchRecord {
@@ -149,6 +250,9 @@ pub struct BatchPatch {
     pub object_size_bytes: Option<i64>,
     pub record_count: Option<i64>,
     pub error_message: Option<String>,
+    /// The class of verification the batch passed (#664). Written only with
+    /// the transition to VERIFIED; a store refuses it on any other.
+    pub verification_class: Option<VerificationClass>,
 }
 
 impl BatchPatch {
@@ -166,6 +270,7 @@ impl BatchPatch {
             object_size_bytes: Some(m.object.size_bytes as i64),
             record_count: Some(m.record_count as i64),
             error_message: None,
+            verification_class: None,
         }
     }
 }
@@ -173,6 +278,46 @@ impl BatchPatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #664: a serialized record (a prune digest row) carries the class only
+    /// when it is known, so a legacy row serializes as an older release wrote
+    /// it, and a value this build does not know reads as unknown rather than
+    /// failing the whole digest.
+    #[test]
+    fn a_serialized_verification_class_is_optional_and_read_leniently() {
+        let mut rec = crate::test_battery::sample_record("serde-664");
+        let legacy = serde_json::to_value(&rec).unwrap();
+        assert!(
+            legacy.get("verification_class").is_none(),
+            "an unknown class must not be written: {legacy}"
+        );
+        assert_eq!(
+            serde_json::from_value::<BatchRecord>(legacy.clone())
+                .unwrap()
+                .verification_class,
+            None
+        );
+        rec.verification_class = Some(VerificationClass::SizeOnly);
+        let known = serde_json::to_value(&rec).unwrap();
+        assert_eq!(known["verification_class"], "size_only");
+        assert_eq!(
+            serde_json::from_value::<BatchRecord>(known)
+                .unwrap()
+                .verification_class,
+            Some(VerificationClass::SizeOnly)
+        );
+        for stored in [serde_json::json!("quantum"), serde_json::Value::Null] {
+            let mut newer = legacy.clone();
+            newer["verification_class"] = stored.clone();
+            assert_eq!(
+                serde_json::from_value::<BatchRecord>(newer)
+                    .unwrap_or_else(|e| panic!("{stored}: {e}"))
+                    .verification_class,
+                None,
+                "{stored}"
+            );
+        }
+    }
 
     /// Review of #578: a stored fingerprint no reader could have written is
     /// unknown, never a fingerprint - `len: 0` would match every file.

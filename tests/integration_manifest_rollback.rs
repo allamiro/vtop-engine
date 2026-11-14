@@ -194,6 +194,7 @@ async fn seed_version(
         manifest_sha256: Some(manifest.manifest.sha256.clone()),
         manifest_version_id: None,
         object_size_bytes: Some(object_bytes.len() as i64),
+        verification_class: None,
         record_count: Some(1),
         error_message: None,
         owner: None,

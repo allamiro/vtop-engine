@@ -11,7 +11,9 @@
 //! engine holds a `Box<dyn StateStore>`. Postgres arrives in Phase 3 behind a
 //! Cargo feature and implements the exact same trait.
 
-use crate::models::{BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset};
+use crate::models::{
+    BatchPatch, BatchRecord, CommittedCursor, CommittedKafkaOffset, VerificationClass,
+};
 use crate::sqlite_store::SqliteStateStore;
 use async_trait::async_trait;
 use vtop_core::errors::VtopError;
@@ -147,6 +149,25 @@ pub(crate) fn require_batching_insert(rec: &BatchRecord) -> Result<(), VtopError
     })
 }
 
+/// Refuse a verification class on any transition but the one to VERIFIED,
+/// before any SQL runs (#664). The class describes the verification that
+/// admitted the row to VERIFIED; written at another transition it would
+/// describe nothing, and a later commit would be counted by it.
+pub(crate) fn require_class_only_at_verified(
+    batch_id: &str,
+    to: BatchState,
+    patch: &BatchPatch,
+) -> Result<(), VtopError> {
+    match patch.verification_class {
+        Some(class) if to != BatchState::Verified => Err(VtopError::State(format!(
+            "batch {batch_id}: a verification class ({}) is recorded only with the transition \
+             to verified, not to {to}",
+            class.as_str()
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// A durable, replay-safe ledger of batch state transitions.
 ///
 /// The method set is deliberately small and matches exactly what the engine
@@ -163,6 +184,10 @@ pub trait StateStore: Send + Sync {
     /// against [`vtop_core::state_machine::transition`] so an illegal move
     /// (notably any non-VERIFIED → SOURCE_COMMITTED) is rejected and the store
     /// is left unchanged.
+    ///
+    /// The transition to VERIFIED writes `patch.verification_class` as the
+    /// row's class, `None` included (#664); every other transition leaves the
+    /// class as it is, and one whose patch carries a class is refused.
     async fn update_batch_state(
         &self,
         batch_id: &str,
@@ -289,8 +314,15 @@ pub trait StateStore: Send + Sync {
     /// Mark a batch `FAILED` with an error message (legal from any state).
     async fn mark_failed(&self, batch_id: &str, message: &str) -> Result<(), VtopError>;
 
-    /// Mark a batch `VERIFIED` (legal only from `MANIFEST_UPLOADED`).
-    async fn mark_verified(&self, batch_id: &str) -> Result<(), VtopError>;
+    /// Mark a batch `VERIFIED` (legal only from `MANIFEST_UPLOADED`), recording
+    /// in the same write which class of verification it passed (#664), so a
+    /// recovery after a restart counts its commit by that class rather than
+    /// by what its own re-check finds.
+    async fn mark_verified(
+        &self,
+        batch_id: &str,
+        class: VerificationClass,
+    ) -> Result<(), VtopError>;
 
     /// Commit source progress (legal only from `VERIFIED`).
     async fn mark_source_committed(&self, batch_id: &str) -> Result<(), VtopError>;
