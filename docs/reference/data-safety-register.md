@@ -56,7 +56,7 @@ When an issue is labelled `data-safety`, add a row in issue-number order:
   release that carried it, read from `git log -S` and `git tag --contains`.
   "Never released" when it was fixed before a release shipped it. Where the
   origin cannot be traced, say so; do not guess.
-- **Found**: the date the issue was opened.
+- **Found**: the date the issue was opened (UTC), which the check compares.
 - **Fixed**: the PR, the first release that carries it and the merge date;
   `open` while the issue is open.
 - **Found by**: review, soak or chaos run, user, CI, or other.

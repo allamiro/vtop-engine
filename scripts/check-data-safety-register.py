@@ -11,6 +11,8 @@ labelled issues from GitHub and the register's main table, and fails when:
   - a row's Fixed cell says "open" for a closed issue, or names a fix for an
     open one;
   - a closed issue's Fixed cell is empty;
+  - a row's Found date is not the date its issue was opened (UTC), which is
+    the date the quiet period is counted from;
   - an issue has two rows, or the rows are out of issue order;
   - an issue in the "considered and not labelled" table carries the label.
 
@@ -62,6 +64,7 @@ class Row:
     number: int
     fixed: str
     line: int
+    found: str = ""
 
 
 @dataclass
@@ -114,11 +117,12 @@ def parse_register(text: str) -> Register:
     if not body:
         raise RegisterError("the register's table has no rows")
     fixed_at = COLUMNS.index("Fixed")
+    found_at = COLUMNS.index("Found")
     reg = Register()
     for line, cells in body:
         if len(cells) != len(COLUMNS):
             raise RegisterError(f"line {line}: {len(cells)} cells, expected {len(COLUMNS)}")
-        reg.rows.append(Row(_issue_number(cells[0], line), cells[fixed_at], line))
+        reg.rows.append(Row(_issue_number(cells[0], line), cells[fixed_at], line, cells[found_at]))
     _, considered = _table(lines, _section(lines, CONSIDERED_HEADING))
     reg.considered = [_issue_number(cells[0], line) for line, cells in considered]
     return reg
@@ -147,6 +151,9 @@ def check(reg: Register, issues: list[dict]) -> list[str]:
                 f"label it, or move it to the considered table with the reason"
             )
             continue
+        opened = issue["createdAt"][:10]
+        if r.found != opened:
+            problems.append(f"#{r.number} was opened on {opened}, but its Found cell says {r.found!r} (line {r.line})")
         is_open = issue["state"].upper() == "OPEN"
         if is_open and not _says_open(r.fixed):
             problems.append(f'#{r.number} is open, but its Fixed cell says {r.fixed!r}: write "open" (line {r.line})')

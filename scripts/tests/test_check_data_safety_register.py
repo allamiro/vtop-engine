@@ -38,9 +38,9 @@ HEADER = (
 )
 
 
-def row(n: int, fixed: str = "#1 · v0.1.0 · 2026-01-02") -> str:
+def row(n: int, fixed: str = "#1 · v0.1.0 · 2026-01-02", found: str = "2026-01-01") -> str:
     url = f"https://github.com/allamiro/vtop-engine/issues/{n}"
-    return f"| [#{n}]({url}) | lost range | engine | abc1234 | 2026-01-01 | {fixed} | review | x |\n"
+    return f"| [#{n}]({url}) | lost range | engine | abc1234 | {found} | {fixed} | review | x |\n"
 
 
 def register(rows: str, considered: str = "") -> str:
@@ -99,6 +99,14 @@ class CheckTests(unittest.TestCase):
                 self.assertIn("#10", problems[0])
                 self.assertIn("empty", problems[0])
 
+    def test_a_found_date_that_is_not_the_issue_opening_date_fails(self):
+        # The quiet period is computed from the issues' opening dates, so the
+        # register's Found column must agree with them (review of #759).
+        problems = self.problems(register(row(10, found="2026-01-02")), [issue(10)])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("#10", problems[0])
+        self.assertIn("2026-01-01", problems[0])
+
     def test_a_duplicate_row_fails(self):
         problems = self.problems(register(row(10) + row(10)), [issue(10)])
         self.assertTrue(any("#10" in p and "more than one row" in p for p in problems), problems)
@@ -154,7 +162,7 @@ class CommandLineTests(unittest.TestCase):
 
     def test_exit_zero_and_quiet_days_on_a_consistent_register(self):
         code, out = self.run_main(
-            register(row(10)), [issue(10, created="2026-11-11T00:00:00Z")],
+            register(row(10, found="2026-11-11")), [issue(10, created="2026-11-11T00:00:00Z")],
             "--quiet-days", "--today", "2026-11-14",
         )
         self.assertEqual(code, 0, out)
