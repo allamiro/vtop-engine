@@ -2438,6 +2438,10 @@ impl FileSource {
                 line.pop();
             }
             records.push(line);
+            #[cfg(test)]
+            if records.len() == 1 {
+                run_read_hook(path);
+            }
         }
         // fstat on the descriptor we READ from — the same file even if the
         // path was rotated away mid-read (#65).
@@ -2773,6 +2777,27 @@ fn dev_ino(_md: &std::fs::Metadata) -> Option<(u64, u64)> {
 /// How many files are read concurrently in one pass. Bounded so a glob that
 /// matches thousands of files does not open them all at once.
 const FILE_READ_CONCURRENCY: usize = 8;
+
+/// Per path, something a test runs once inside a line read of that path,
+/// right after its first record (#619): a write that lands while the read is
+/// under way, between the descriptor's first fstat and its last.
+#[cfg(test)]
+type ReadHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+static READ_HOOKS: std::sync::Mutex<Option<HashMap<String, ReadHook>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_read_hook(path: &str) {
+    let hook = READ_HOOKS
+        .lock()
+        .unwrap()
+        .as_mut()
+        .and_then(|hooks| hooks.remove(path));
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 /// One file's fate in a read pass: skipped because the stat proved the
 /// cursor already caught up (#100), carrying the identity the stat saw so
@@ -7458,6 +7483,250 @@ mod tests {
             );
             assert!(std::fs::read_to_string(&path).unwrap() == rewrite);
         }
+    }
+
+    // ---- #619 in v0.10.0: the ctime the read recorded ---------------------
+
+    /// A long file read to its end, committed with the default quiet period
+    /// (so kept), and the marker that committed it.
+    async fn archived_long_file(path: &str) -> ProgressMarker {
+        std::fs::write(path, long_file("old")).unwrap();
+        let mut fs = FileSource::new(vec![path.to_owned()], TelemetryFormat::Raw, true);
+        let read = fs
+            .read_batch_candidates(&src(path), 10_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert!(Path::new(path).exists(), "kept: not quiet yet");
+        read[0].progress_end.clone()
+    }
+
+    /// Rewrite lines 50-59 of a `long_file` in place - between its first
+    /// page and the page below its end, so neither fingerprint sees it - and
+    /// set the mtime back to `mtime`. Only the ctime records it. A later
+    /// second first, so a coarse ctime still moves.
+    fn rewrite_between_the_pages_setting_the_mtime_back(path: &str, mtime: std::time::SystemTime) {
+        std::thread::sleep(Duration::from_millis(1100));
+        let mut file = std::fs::File::options().write(true).open(path).unwrap();
+        file.write_all(long_file("NEW").as_bytes()).unwrap();
+        file.set_modified(mtime).unwrap();
+        drop(file);
+        assert_eq!(
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+            mtime,
+            "the mtime is back where the read saw it"
+        );
+    }
+
+    /// #619 (C1): a same-length rewrite between the two pages while the
+    /// engine is down, with the mtime set back. Everything the seed records
+    /// agrees - inode, first page, page below the end, length, mtime - and
+    /// the restart took the file's ctime NOW for the candidate, so the
+    /// rewrite became the baseline and the file was deleted a quiet period
+    /// later, unread. The marker records the ctime the read saw, and the
+    /// seed arms the delete only on that one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rewrite_that_sets_the_mtime_back_while_the_engine_is_down_is_never_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let marker = archived_long_file(&path).await;
+        let archived_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let ProgressMarker::File {
+            inode,
+            end_byte,
+            file_size,
+            mtime,
+            content_fingerprint,
+            tail_fingerprint,
+            ..
+        } = marker.clone()
+        else {
+            panic!("expected a file marker");
+        };
+        rewrite_between_the_pages_setting_the_mtime_back(&path, archived_mtime);
+
+        // The restart.
+        let metadata_changed = decisions("metadata_changed");
+        let mut after = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO)
+            .with_delete_without_open_check(!cfg!(target_os = "linux"));
+        after.seed_committed_from(
+            &path,
+            end_byte,
+            inode,
+            Some(file_size),
+            content_fingerprint,
+            tail_fingerprint,
+        );
+        after.arm_delete_from_seed(&path, Some(&mtime));
+        let _ = after
+            .read_batch_candidates(&src(&path), 10_000, 1 << 20, Duration::ZERO)
+            .await;
+        assert!(
+            std::fs::read_to_string(&path).ok() == Some(long_file("NEW")),
+            "rewritten between the pages while the engine was down, mtime set back, and \
+             deleted after the restart with the rewrite unread"
+        );
+        assert!(
+            notice(
+                &after,
+                &format!(
+                    "not deleting {path}: its {end_byte} bytes were archived before the \
+                     restart, but its mtime or ctime is not the one the archiving batch recorded"
+                )
+            ) && notice(&after, "it is KEPT")
+                && notice(
+                    &after,
+                    "remove it by hand once you know it holds nothing new"
+                ),
+            "kept without saying what happened, what the engine did and what to do: {:?}",
+            after.notices
+        );
+        assert!(decisions("metadata_changed") > metadata_changed);
+    }
+
+    /// #619 (C2): the same rewrite, mtime set back, between the batch's READ
+    /// and its COMMIT - the upload and verify, or the downtime before
+    /// recovery commits it. The commit compares the file with the marker's
+    /// mtime (review of #689), which agrees, and took the ctime at the
+    /// commit for the candidate's, so the rewrite was deleted unread. The
+    /// marker's ctime is the one the read saw.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rewrite_between_the_read_and_the_commit_that_sets_the_mtime_back_is_never_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, long_file("old")).unwrap();
+        let quiet = Duration::from_millis(50);
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(quiet)
+            .with_delete_without_open_check(!cfg!(target_os = "linux"));
+        let read = fs
+            .read_batch_candidates(&src(&path), 10_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let read_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        rewrite_between_the_pages_setting_the_mtime_back(&path, read_mtime);
+        let metadata_changed = decisions("metadata_changed");
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        for _ in 0..3 {
+            pass_after(&mut fs, &path, quiet).await;
+        }
+        assert!(
+            std::fs::read_to_string(&path).ok() == Some(long_file("NEW")),
+            "rewritten between the read and the commit, mtime set back, and deleted with \
+             the rewrite unread"
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "not deleting {path}: its 12000 bytes were archived, but its mtime or \
+                     ctime is not the one the archiving batch recorded when it read the file"
+                )
+            ) && notice(&fs, "it is KEPT")
+                && notice(&fs, "remove it by hand once you know it holds nothing new"),
+            "kept without saying what happened, what the engine did and what to do: {:?}",
+            fs.notices
+        );
+        assert!(decisions("metadata_changed") > metadata_changed);
+    }
+
+    /// #619 (C3): a ledger row written before the marker recorded a ctime
+    /// arms the delete after a restart exactly as it did: the candidate
+    /// takes the file's ctime at the restart. Refusing such rows would strand
+    /// every file archived within the last quiet period at the upgrade; the
+    /// rewrite C1 catches stays the documented limit for those rows only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_row_without_a_ctime_arms_the_delete_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let ProgressMarker::File {
+            inode,
+            end_byte,
+            file_size,
+            mtime,
+            content_fingerprint,
+            tail_fingerprint,
+            ..
+        } = archived_long_file(&path).await
+        else {
+            panic!("expected a file marker");
+        };
+        let quiet = Duration::from_millis(50);
+        let mut after = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(quiet)
+            .with_delete_without_open_check(!cfg!(target_os = "linux"));
+        after.seed_committed_from(
+            &path,
+            end_byte,
+            inode,
+            Some(file_size),
+            content_fingerprint,
+            tail_fingerprint,
+        );
+        after.arm_delete_from_seed(&path, Some(&mtime));
+        assert!(
+            after.cursors[&path].delete_candidate.is_some(),
+            "a row with no ctime arms the delete, as before"
+        );
+        pass_after(&mut after, &path, quiet).await;
+        assert!(
+            !Path::new(&path).exists(),
+            "fully archived, unwritten for the quiet period since the restart, so deleted"
+        );
+    }
+
+    /// #619 (C4): the marker's ctime comes from the fstat AFTER the read,
+    /// with its mtime and length. A file that a writer appends to while the
+    /// read is under way - and then leaves alone - ends where the read
+    /// ended, and is deleted once covered. A ctime from the fstat BEFORE the
+    /// read would never match the file again, and the file would never be
+    /// deleted. The seam appends between the two.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_that_stops_growing_during_the_read_is_still_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let writer_path = path.clone();
+        READ_HOOKS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                path.clone(),
+                Box::new(move || {
+                    // A later second, so a coarse ctime still moves.
+                    std::thread::sleep(Duration::from_millis(1100));
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&writer_path)
+                        .unwrap()
+                        .write_all(b"three\n")
+                        .unwrap();
+                }),
+            );
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO)
+            .with_delete_without_open_check(!cfg!(target_os = "linux"));
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            read[0].records,
+            vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()],
+            "the seam did not append during the read, so this test proves nothing"
+        );
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert!(
+            !Path::new(&path).exists(),
+            "fully archived and left alone after the read, yet kept: {:?}",
+            fs.notices
+        );
     }
 
     /// Review of #631 (P1): moving a file aside must never replace a file
