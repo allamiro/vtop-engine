@@ -107,6 +107,11 @@ struct DeleteCandidate {
     /// The file's ctime when the candidate was recorded: unchanged, with the
     /// mtime and the length, nothing wrote to the file since.
     ctime: Option<(i64, i64)>,
+    /// The file's link count when the candidate was recorded (#619, in
+    /// memory only). Another name of the file deleted, or a hard link made,
+    /// moves the ctime too; the link count says which, so the file kept for
+    /// it is said to be kept for that.
+    nlink: Option<u64>,
     /// When the candidate was recorded, on the engine's monotonic clock.
     since: Instant,
     /// Whether a delete kept back for a reason that repeats (a process has
@@ -124,6 +129,18 @@ fn ctime_of(md: &std::fs::Metadata) -> Option<(i64, i64)> {
 
 #[cfg(not(unix))]
 fn ctime_of(_md: &std::fs::Metadata) -> Option<(i64, i64)> {
+    None
+}
+
+/// How many names (hard links) a file has; `None` without that notion.
+#[cfg(unix)]
+fn nlink_of(md: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(md.nlink())
+}
+
+#[cfg(not(unix))]
+fn nlink_of(_md: &std::fs::Metadata) -> Option<u64> {
     None
 }
 
@@ -147,6 +164,10 @@ enum Kept {
     /// Same inode, length and pages, but the mtime or ctime moved: a touch,
     /// a chmod, or a rewrite between the two pages - not told apart.
     MetadataMoved,
+    /// Same inode, length, pages and mtime, but the link count changed
+    /// (#619): another name of the file was deleted - most likely by this
+    /// engine, as a source of its own (#378) - or a hard link was made.
+    LinksChanged { then: u64, now: u64 },
     /// The path is gone.
     Gone,
     /// The path is a symbolic link.
@@ -163,6 +184,7 @@ impl Kept {
             Kept::Rewritten => "rewritten",
             Kept::Unprovable => "unprovable",
             Kept::MetadataMoved => "metadata_changed",
+            Kept::LinksChanged { .. } => "links_changed",
             Kept::Gone => "gone",
             Kept::Symlink => "symlink",
         }
@@ -221,11 +243,21 @@ impl Kept {
                 Level::WARN,
                 format!(
                     "not deleting {path}: its {archived} bytes look archived, but its mtime or \
-                     ctime changed since they were read (a touch, a chmod, a rewrite between the \
-                     first page and the last - which cannot be told apart - or another name of \
-                     the same file being deleted); it is KEPT, and deleted only if a later commit \
-                     covers it unchanged - otherwise remove it by hand once you know it holds \
-                     nothing new"
+                     ctime changed since they were read (a touch, a chmod, or a rewrite between \
+                     the first page and the last, which cannot be told apart); it is KEPT, and \
+                     deleted only if a later commit covers it unchanged - otherwise remove it by \
+                     hand once you know it holds nothing new"
+                ),
+            ),
+            Kept::LinksChanged { then, now } => (
+                Level::WARN,
+                format!(
+                    "not deleting {path}: its link count changed since it was archived (from \
+                     {then} to {now}) - most likely another path this engine archived was \
+                     deleted, or a hard link was made; its {archived} bytes are archived under \
+                     this name, so nothing is lost, and it is KEPT: remove this name by hand once \
+                     you know the other name's delete was the only change, or narrow the \
+                     patterns to one spelling so the file is archived once (#378)"
                 ),
             ),
             Kept::Gone => (
@@ -316,7 +348,15 @@ impl DeleteCandidate {
         if !self.proves(file) {
             return Compared::Kept(Kept::Rewritten);
         }
-        if md.modified().ok() != self.mtime || (with_ctime && ctime_of(&md) != self.ctime) {
+        let mtime_moved = md.modified().ok() != self.mtime;
+        // Before the ctime, which a link change moves as well. A moved mtime
+        // is a write, whatever happened to the links.
+        if let (false, Some(then), Some(now)) = (mtime_moved, self.nlink, nlink_of(&md)) {
+            if then != now {
+                return Compared::Kept(Kept::LinksChanged { then, now });
+            }
+        }
+        if mtime_moved || (with_ctime && ctime_of(&md) != self.ctime) {
             return Compared::Kept(Kept::MetadataMoved);
         }
         Compared::Unchanged
@@ -325,7 +365,15 @@ impl DeleteCandidate {
 
 /// What became of one attempt to delete a candidate.
 enum DeleteAttempt {
-    Deleted,
+    /// Unlinked. `unchecked`: made under `delete_without_open_check`, with
+    /// no lease to be had, and why none could be (#619): nothing proved that
+    /// no process had the file open. `opened_at_unlink`: a process broke
+    /// the lease between the final check and the unlink, so it may have the
+    /// unlinked file open; the hidden name the file had.
+    Deleted {
+        unchecked: Option<String>,
+        opened_at_unlink: Option<PathBuf>,
+    },
     /// Kept, and the candidate dropped: see [`Kept`].
     Kept(Kept),
     /// Kept because a process has it open (`during`: opened it while it was
@@ -527,6 +575,7 @@ impl DeleteJob {
             }
             _ => &opened,
         };
+        let mut unchecked = None;
         let lease = match self.open_check(file) {
             write_lease::Sole::Proven(lease) => Some(lease),
             write_lease::Sole::Open => {
@@ -535,7 +584,10 @@ impl DeleteJob {
                     ctime: None,
                 }
             }
-            write_lease::Sole::Unknown(_) if self.without_open_check => None,
+            write_lease::Sole::Unknown(why) if self.without_open_check => {
+                unchecked = Some(why);
+                None
+            }
             write_lease::Sole::Unknown(why) => return DeleteAttempt::Refused(why),
             write_lease::Sole::Failed(error) => {
                 return DeleteAttempt::Failed {
@@ -624,23 +676,15 @@ impl DeleteJob {
                     hook(&aside);
                 }
                 match std::fs::remove_file(&aside) {
-                    Ok(()) => {
-                        if lease.as_ref().is_some_and(|lease| !lease.intact()) {
-                            tracing::error!(
-                                path = %path.display(),
-                                aside = %aside.display(),
-                                inode = candidate.inode,
-                                archived_bytes = candidate.end_byte,
-                                "deleted {} after a process opened it in the instant before the \
-                                 unlink (by its hidden name, or an open of the path that stalled \
-                                 for longer than the grace); anything that process writes to it \
-                                 is not archived - check what opened it",
-                                path.display()
-                            );
-                            count_delete_decision("opened_at_unlink");
-                        }
-                        DeleteAttempt::Deleted
-                    }
+                    // Said by `settle_delete`, through `notify`, with the
+                    // rest of the delete's decisions.
+                    Ok(()) => DeleteAttempt::Deleted {
+                        unchecked,
+                        opened_at_unlink: lease
+                            .as_ref()
+                            .is_some_and(|lease| !lease.intact())
+                            .then(|| aside.clone()),
+                    },
                     Err(error) => DeleteAttempt::Failed {
                         what: format!("the file was moved aside but could not be deleted: {error}"),
                         ctime: restore(&lease),
@@ -662,6 +706,18 @@ impl DeleteJob {
 /// new file. With writers opening, appending and closing in a tight loop, 20
 /// and 50 ms both lost nothing where no grace lost lines.
 const DELETE_GRACE: Duration = Duration::from_millis(50);
+
+/// The level of a `deleted_unchecked` message (#619): WARN the first time
+/// in a process, INFO after, so a directory of thousands of files under the
+/// opt-in does not log thousands of warnings. Each is counted.
+fn unchecked_delete_level() -> tracing::Level {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::Level::INFO
+    } else {
+        tracing::Level::WARN
+    }
+}
 
 /// Count one `delete_after_commit` decision (#619) in
 /// `vtop_file_delete_decisions_total{outcome}`, when metrics are on.
@@ -1030,6 +1086,7 @@ impl FileSource {
             end_byte: committed_byte,
             mtime: md.modified().ok(),
             ctime: ctime_of(&md),
+            nlink: nlink_of(&md),
             since: Instant::now(),
             told: false,
         });
@@ -1128,7 +1185,10 @@ impl FileSource {
             }
         };
         match attempt {
-            DeleteAttempt::Deleted => {
+            DeleteAttempt::Deleted {
+                unchecked,
+                opened_at_unlink,
+            } => {
                 // The file this cursor described is gone. A new file at the
                 // path may be handed the freed inode number, and an inode
                 // check cannot tell it from the one it replaced, so the cursor
@@ -1144,17 +1204,61 @@ impl FileSource {
                 // this path is a different file and stays.
                 self.cursors.remove(path);
                 self.held.remove(path);
-                self.notify(
-                    "deleted",
-                    tracing::Level::INFO,
-                    path,
-                    inode,
-                    archived,
-                    format!(
-                        "deleted {path}: all {archived} bytes archived, unwritten for the quiet \
-                         period ({quiet} s), and open in no process"
-                    ),
-                );
+                if let Some(aside) = opened_at_unlink {
+                    // The limit the grace bounds (#619): an open of the path
+                    // that resolved it before the rename and reached the
+                    // file only after the final check - or an open of the
+                    // hidden name. Counted under both outcomes: the file
+                    // was deleted, and something may have it open.
+                    count_delete_decision("deleted");
+                    self.notify(
+                        "opened_at_unlink",
+                        tracing::Level::ERROR,
+                        path,
+                        inode,
+                        archived,
+                        format!(
+                            "deleted {path} after a process opened it between the final check \
+                             and the unlink (it was under its hidden name {}); it was unlinked \
+                             anyway: the open could not be undone. What that process writes to \
+                             it is not archived. Find the writer that opens this path by name, \
+                             and have it hold the file open or stay off it until the quiet \
+                             period has passed",
+                            aside.display()
+                        ),
+                    );
+                } else if let Some(why) = unchecked {
+                    // Not "open in no process": nothing checked (#619).
+                    self.notify(
+                        "deleted_unchecked",
+                        unchecked_delete_level(),
+                        path,
+                        inode,
+                        archived,
+                        format!(
+                            "deleted {path} without proof that no process had it open: \
+                             sources.file.delete_without_open_check is set and no lease can be \
+                             taken here ({why}). All {archived} bytes were archived and unwritten \
+                             for the quiet period ({quiet} s), so the engine unlinked it. A \
+                             writer that still held it open loses every line it writes from now \
+                             on, and nothing archives them: nothing to do if none did; otherwise \
+                             unset delete_without_open_check and run the engine on Linux, on a \
+                             local filesystem, as the files' owner or with CAP_LEASE effective"
+                        ),
+                    );
+                } else {
+                    self.notify(
+                        "deleted",
+                        tracing::Level::INFO,
+                        path,
+                        inode,
+                        archived,
+                        format!(
+                            "deleted {path}: all {archived} bytes archived, unwritten for the \
+                             quiet period ({quiet} s), and open in no process"
+                        ),
+                    );
+                }
                 true
             }
             DeleteAttempt::Kept(why) => {
@@ -3403,6 +3507,7 @@ impl SourceAdapter for FileSource {
                 end_byte: *end_byte,
                 mtime: None,
                 ctime: None,
+                nlink: None,
                 since: Instant::now(),
                 told: false,
             };
@@ -3421,6 +3526,7 @@ impl SourceAdapter for FileSource {
                         let md = file.metadata().ok();
                         candidate.mtime = md.as_ref().and_then(|md| md.modified().ok());
                         candidate.ctime = md.as_ref().and_then(ctime_of);
+                        candidate.nlink = md.as_ref().and_then(nlink_of);
                         match candidate.compare(&file, true) {
                             // THE BASELINE IS THE READ, not this commit (review
                             // of #689): a same-length rewrite between the two
@@ -3810,6 +3916,7 @@ mod tests {
             Kept::Rewritten,
             Kept::Unprovable,
             Kept::MetadataMoved,
+            Kept::LinksChanged { then: 2, now: 1 },
             Kept::Gone,
             Kept::Symlink,
         ];
@@ -3824,7 +3931,6 @@ mod tests {
             "opened_at_unlink",
             "metadata_changed",
             "deleted_unchecked",
-            "links_changed",
         ];
         for outcome in kept.iter().map(Kept::outcome).chain(named) {
             assert!(
@@ -8589,6 +8695,124 @@ mod tests {
         );
     }
 
+    /// S3 (#619): the race #689's grace was measured against, kept as a
+    /// test. Writers open the path, append one line and close it, in a
+    /// tight loop, while the engine reads, commits and deletes with no
+    /// quiet period. Every line written must be archived, or still be on
+    /// disk (at the path, or under a delete's hidden name that a put-back
+    /// left). An open that stalls in the kernel past the 50 ms grace is the
+    /// one way to lose a line, and the engine then counts
+    /// `opened_at_unlink`; the summary line reports that count.
+    ///
+    /// Not a CI gate: it runs for `VTOP_DELETE_STRESS_SECS` (default 20)
+    /// seconds, and a lease behaves by filesystem. Run it by hand before a
+    /// release, once each on tmpfs, ext4 and overlay (see the vtop-release
+    /// checklist):
+    ///
+    /// `TMPDIR=<dir> cargo test -p vtop-adapters --lib --locked --
+    /// --ignored delete_race_stress --nocapture`
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "stress test: run by hand before a release on tmpfs, ext4 and overlay"]
+    async fn delete_race_stress() {
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        const WRITERS: usize = 4;
+        let secs: u64 = std::env::var("VTOP_DELETE_STRESS_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let (stop, path) = (stop.clone(), path.clone());
+                std::thread::spawn(move || {
+                    let mut written = Vec::new();
+                    let mut i = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let line = format!("w{w}-{i}");
+                        let mut f = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                            .unwrap();
+                        f.write_all(format!("{line}\n").as_bytes()).unwrap();
+                        drop(f);
+                        written.push(line);
+                        i += 1;
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    written
+                })
+            })
+            .collect();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let (opened_before, deleted_before) = (decisions("opened_at_unlink"), decisions("deleted"));
+        let mut archived: HashSet<String> = HashSet::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        let mut idle = 0;
+        loop {
+            let draining = std::time::Instant::now() >= deadline;
+            if draining && !stop.swap(true, Ordering::Relaxed) {
+                idle = 0;
+            }
+            let reads = fs
+                .read_batch_candidates(&src(&path), 10_000, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap_or_default();
+            let mut any = false;
+            for read in &reads {
+                for record in &read.records {
+                    any = true;
+                    archived.insert(String::from_utf8_lossy(record).into_owned());
+                }
+                fs.commit_progress(&read.progress_end).await.unwrap();
+            }
+            if draining {
+                idle = if any { 0 } else { idle + 1 };
+                if idle >= 3 {
+                    break;
+                }
+            }
+        }
+        let written: Vec<String> = writers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect();
+        let mut on_disk: HashSet<String> = HashSet::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let content = std::fs::read_to_string(entry.unwrap().path()).unwrap_or_default();
+            on_disk.extend(content.lines().map(str::to_owned));
+        }
+        let lost: Vec<&String> = written
+            .iter()
+            .filter(|l| !archived.contains(*l) && !on_disk.contains(*l))
+            .collect();
+        let opened = decisions("opened_at_unlink") - opened_before;
+        eprintln!(
+            "delete_race_stress: {} lines by {WRITERS} writers in {secs} s on {}; {} archived, \
+             {} still on disk, {} deletes, opened_at_unlink {opened}, lost {}",
+            written.len(),
+            dir.path().display(),
+            written.iter().filter(|l| archived.contains(*l)).count(),
+            on_disk.len(),
+            decisions("deleted") - deleted_before,
+            lost.len()
+        );
+        assert!(
+            lost.is_empty(),
+            "{} of {} lines were neither archived nor left on disk (opened_at_unlink counted \
+             {opened} times); the first: {:?}",
+            lost.len(),
+            written.len(),
+            &lost[..lost.len().min(5)]
+        );
+    }
+
     // ---- #619, v0.10.0: hard links -----------------------------------------
 
     /// `a.log` and its hard link `b.log`, both holding "one\ntwo\n".
@@ -9200,6 +9424,7 @@ mod tests {
                 end_byte: end,
                 mtime: None,
                 ctime: None,
+                nlink: None,
                 since: Instant::now(),
                 told: false,
             }
