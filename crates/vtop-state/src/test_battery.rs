@@ -937,6 +937,7 @@ async fn superseded_rows_are_pruned_like_committed_history(store: &dyn StateStor
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let row = |id: &str, start: u64, end: u64, created: &str| {
         let mut rec = sample_record(id);
@@ -1301,6 +1302,7 @@ async fn max_committed_end_bytes_aggregates_in_store(store: &dyn StateStore) {
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let mk = |id: &str, path: &str, end: u64| {
         let mut r = sample_record(id);
@@ -1372,6 +1374,10 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
         // A row that records a first page records the bytes below its end
         // too, as the adapter writes them.
         tail_fingerprint: content.as_ref().and(tail(end)),
+        // And the ctime its read saw (#619), as the adapter writes it.
+        ctime: content
+            .as_ref()
+            .map(|_| format!("2026-01-01T00:00:01.{end:09}+00:00")),
         content_fingerprint: content,
     };
     let spool = |end: u64, content: Option<ContentFingerprint>| ProgressMarker::SyslogSpool {
@@ -1423,6 +1429,7 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
             content_fingerprint: new.clone(),
             observed_mtime: Some("2026-01-01T00:00:00.000005000+00:00".into()),
             tail_fingerprint: tail(5000),
+            observed_ctime: Some("2026-01-01T00:00:01.000005000+00:00".into()),
         })
     );
     let spools = store
@@ -1439,6 +1446,7 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
             content_fingerprint: None,
             observed_mtime: None,
             tail_fingerprint: None,
+            observed_ctime: None,
         }),
         "the newest row predates the fields: unknown, not an older row's values"
     );
@@ -1463,17 +1471,20 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
     );
 
     // #620: a newest file row from before the tail field answers "unknown"
-    // for it, never the older row's tail.
+    // for it, never the older row's tail. #619: the same for the ctime.
     let mut r = sample_record("fp-4");
     r.source_type = SourceType::File;
     r.progress_start = file(6000, new.clone());
     r.progress_end = {
         let mut legacy = file(6000, new.clone());
         if let ProgressMarker::File {
-            tail_fingerprint, ..
+            tail_fingerprint,
+            ctime,
+            ..
         } = &mut legacy
         {
             *tail_fingerprint = None;
+            *ctime = None;
         }
         legacy
     };
@@ -1487,10 +1498,46 @@ async fn committed_cursors_carry_the_newest_rows_content_fingerprint(store: &dyn
         (
             got.end_byte,
             got.content_fingerprint.clone(),
-            got.tail_fingerprint.clone()
+            got.tail_fingerprint.clone(),
+            got.observed_ctime.clone()
         ),
-        (6000, new, None)
+        (6000, new.clone(), None, None)
     );
+
+    // #619: a stored ctime no writer produces answers "unknown", never a
+    // value to compare a file against - from either query.
+    for (id, bad) in [("fp-5", "yesterday"), ("fp-6", "2026-01-01 00:00:01")] {
+        let mut marker = file(7000, new.clone());
+        if let ProgressMarker::File { ctime, .. } = &mut marker {
+            *ctime = Some(bad.into());
+        }
+        let mut r = sample_record(id);
+        r.source_type = SourceType::File;
+        r.progress_start = marker.clone();
+        r.progress_end = marker;
+        store.save_batch_state(&r).await.unwrap();
+        for st in LEGAL_WALK {
+            store.update_batch_state(id, st, &p).await.unwrap();
+        }
+        let files = store.committed_cursors(SourceType::File).await.unwrap();
+        let got = files.iter().find(|c| c.path == "/fp.log").unwrap();
+        assert_eq!(
+            (got.end_byte, got.observed_ctime.clone()),
+            (7000, None),
+            "{bad}"
+        );
+        let by_file = store
+            .committed_cursors_by_file(SourceType::File)
+            .await
+            .unwrap();
+        let got = by_file.iter().find(|c| c.path == "/fp.log").unwrap();
+        assert_eq!(
+            (got.end_byte, got.observed_ctime.clone()),
+            (7000, None),
+            "{bad}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }
 
 /// #621: the restart seed must find the row of the file now at a path, and a
@@ -1510,6 +1557,7 @@ async fn committed_cursors_by_file_answer_each_file_that_lived_at_a_path(store: 
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let p = BatchPatch::default();
     for (id, path, inode, end, commit) in [
@@ -1615,6 +1663,7 @@ async fn committed_cursors_by_file_answer_each_file_that_lived_at_a_path(store: 
         // These markers record no mtime: the empty string reads as unknown.
         observed_mtime: None,
         tail_fingerprint: None,
+        observed_ctime: None,
     };
     assert_eq!(
         got,
@@ -1668,6 +1717,7 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let mk = |id: &str, path: &str, inode: Option<u64>, end: u64| {
         let mut r = sample_record(id);
@@ -1773,6 +1823,7 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
         content_fingerprint: None,
         observed_mtime: None,
         tail_fingerprint: None,
+        observed_ctime: None,
     };
     assert_eq!(
         got,
@@ -1834,6 +1885,7 @@ async fn committed_cursors_never_mix_the_offsets_of_two_files(store: &dyn StateS
             content_fingerprint: None,
             observed_mtime: None,
             tail_fingerprint: None,
+            observed_ctime: None,
         }],
         "the spool answers with the newest inode and that inode's maximum"
     );
@@ -1954,6 +2006,7 @@ async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let kafka_marker = |partition: i32, group: &str| ProgressMarker::Kafka {
         topic: "app_events".into(),
@@ -2162,6 +2215,7 @@ async fn listed_prune_deletes_only_what_was_listed(store: &dyn StateStore) {
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     for (id, end) in [("lp-10", 10), ("lp-20", 20), ("lp-30", 30), ("lp-40", 40)] {
         let mut rec = sample_record(id);

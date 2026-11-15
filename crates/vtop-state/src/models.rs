@@ -332,6 +332,15 @@ pub struct CommittedCursor {
     /// byte 0, and every spool row. Read out of the stored JSON - the
     /// column already holds it, so no migration.
     pub tail_fingerprint: Option<ContentFingerprint>,
+    /// The file's ctime as the same row's batch read it (the marker's
+    /// `ctime`, #619): the file source re-arms a deferred
+    /// `delete_after_commit` after a restart only while the file still has
+    /// it, which catches a same-length rewrite between the first page and the
+    /// page below `end_byte` that also set the mtime back. `None` for a row
+    /// written before the marker recorded it (armed as before), a stored
+    /// value that is not a timestamp, and every spool row. Read out of the
+    /// stored JSON, like the fields above: no migration.
+    pub observed_ctime: Option<String>,
 }
 
 /// Where the ledger says a Kafka partition resumes, for one consumer group

@@ -4674,9 +4674,15 @@ impl Engine {
                         c.tail_fingerprint.clone(),
                     );
                     // A file archived but not yet deleted before the restart
-                    // (#619): re-armed only if it still has the mtime the
-                    // committed batch saw.
-                    fs.arm_delete_from_seed(&c.path, c.observed_mtime.as_deref());
+                    // (#619): re-armed only if it still has the mtime and
+                    // the ctime the committed batch saw (a row from before
+                    // the ctime was recorded has none, and arms on the
+                    // mtime alone, as before).
+                    fs.arm_delete_from_seed(
+                        &c.path,
+                        c.observed_mtime.as_deref(),
+                        c.observed_ctime.as_deref(),
+                    );
                 }
             }
         }
@@ -5925,6 +5931,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         assert_eq!(buffer_key(&file, &fm).1, "/a.log");
     }
@@ -6149,6 +6156,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         let read = ReadResult {
             records: vec![b"one".to_vec()],
@@ -8315,6 +8323,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         let inodes = |plan: &RewindPlan| -> Vec<Option<u64>> {
             plan.markers().iter().map(marker_inode).collect()
@@ -8349,6 +8358,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         let kafka = |partition: i32, start: i64| ProgressMarker::Kafka {
             topic: "t".into(),
@@ -8409,6 +8419,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         let mut plan = RewindPlan::default();
         plan.add(&file(0, 100));
@@ -8444,6 +8455,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         let mut plan = RewindPlan::default();
         plan.add(&file("/a", 1, 100, 150));
@@ -8540,6 +8552,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: content,
             tail_fingerprint: None,
+            ctime: None,
         };
         let spool = |start: u64, content: Option<ContentFingerprint>| ProgressMarker::SyslogSpool {
             spool_id: "s".into(),
@@ -8593,6 +8606,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: content,
             tail_fingerprint: None,
+            ctime: None,
         };
         let mut plan = RewindPlan::default();
         plan.add(&file(0, ContentFingerprint::of(&text[..100])));
@@ -8637,6 +8651,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: content,
             tail_fingerprint: None,
+            ctime: None,
         };
         let mut plan = RewindPlan::default();
         plan.add(&file(0, page(b'A')));
@@ -9269,6 +9284,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         let limits = BatchLimits::default();
         let src = DiscoveredSource {
@@ -9964,6 +9980,7 @@ mod tests {
                 mtime: String::new(),
                 content_fingerprint: content,
                 tail_fingerprint: None,
+                ctime: None,
             };
         let mut plan = RewindPlan::default();
         plan.hold(&file(1, 0, page(b'A')));

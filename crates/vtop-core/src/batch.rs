@@ -397,6 +397,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         assert_ne!(
             name("e", "/var/log/app.log", &file(Some(1)), &digest),

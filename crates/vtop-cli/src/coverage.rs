@@ -1436,6 +1436,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         }
     }
 
@@ -1458,6 +1459,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         row(id, state, marker(start), marker(end))
     }
@@ -1571,6 +1573,7 @@ mod tests {
                 mtime: String::new(),
                 content_fingerprint: None,
                 tail_fingerprint: None,
+                ctime: None,
             };
             row(id, Committed, marker(start), marker(start))
         };
@@ -2340,6 +2343,7 @@ mod tests {
                     mtime: String::new(),
                     content_fingerprint: content.clone(),
                     tail_fingerprint: None,
+                    ctime: None,
                 }
             }
         };

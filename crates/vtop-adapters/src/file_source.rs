@@ -132,6 +132,22 @@ fn ctime_of(_md: &std::fs::Metadata) -> Option<(i64, i64)> {
     None
 }
 
+/// A ctime as a marker records it (#619): RFC 3339 in UTC, up to nanosecond
+/// precision, the form `mtime` takes. `None` without one.
+fn ctime_text(md: &std::fs::Metadata) -> Option<String> {
+    let (secs, nanos) = ctime_of(md)?;
+    let at = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, u32::try_from(nanos).ok()?)?;
+    Some(at.to_rfc3339())
+}
+
+/// A marker's ctime as `(seconds, nanoseconds)`, to compare with
+/// [`ctime_of`]: compared as an instant, not as text. `None` when it does
+/// not parse.
+fn parse_ctime(text: &str) -> Option<(i64, i64)> {
+    let at = chrono::DateTime::parse_from_rfc3339(text).ok()?;
+    Some((at.timestamp(), i64::from(at.timestamp_subsec_nanos())))
+}
+
 /// How many names (hard links) a file has; `None` without that notion.
 #[cfg(unix)]
 fn nlink_of(md: &std::fs::Metadata) -> Option<u64> {
@@ -1032,6 +1048,7 @@ impl FileSource {
                 inode,
                 file_size: observed_size.unwrap_or(0),
                 mtime: String::new(),
+                ctime: None,
                 content,
                 tail: continuity::Tail::at(committed_byte, tail),
             });
@@ -1094,12 +1111,12 @@ impl FileSource {
 
     /// Re-arm the deferred delete of a file the engine had fully archived but
     /// not yet deleted before a restart (#619), from the seed just given to
-    /// [`Self::seed_committed_from`] and the mtime the same committed batch
-    /// recorded (`archived_mtime`, the marker's `mtime`). The wait was in
-    /// memory; without this the file would stay forever, since nothing new
-    /// is ever committed for it. The quiet period starts again here, and the
-    /// delete itself checks the file against this identity as it would a
-    /// commit's.
+    /// [`Self::seed_committed_from`] and the mtime and ctime the same
+    /// committed batch recorded (`archived_mtime` and `archived_ctime`, the
+    /// marker's `mtime` and `ctime`). The wait was in memory; without this
+    /// the file would stay forever, since nothing new is ever committed for
+    /// it. The quiet period starts again here, and the delete itself checks
+    /// the file against this identity as it would a commit's.
     ///
     /// Armed only on evidence that the file is still the one archived:
     /// - the seed names both the inode and the first page - a legacy row
@@ -1118,17 +1135,32 @@ impl FileSource {
     ///   page below the committed end, but a rewrite confined between that
     ///   page and the first is not seen by either (#619, see
     ///   [`DeleteCandidate`]). `None` or an empty mtime (unknown) leaves it
-    ///   unarmed too.
+    ///   unarmed too;
+    /// - and the ctime that batch saw, where its row records one (#619, v0.10.0):
+    ///   that same rewrite with the mtime set back agrees on everything
+    ///   else, and the candidate took the file's ctime at the restart, so
+    ///   the rewrite became the baseline and was deleted unread. The
+    ///   candidate records the batch's ctime.
     ///
-    /// The ledger records no ctime, so the candidate takes the file's ctime
-    /// now: a rewrite while the engine was down that also set the mtime back
-    /// is the one change this cannot see.
-    pub fn arm_delete_from_seed(&mut self, path: &str, archived_mtime: Option<&str>) {
+    /// A row written before the marker recorded a ctime has none, and arms
+    /// as it always did: the candidate takes the file's ctime now. For those
+    /// rows a rewrite while the engine was down that also set the mtime back
+    /// is still the one change this cannot see; refusing them instead would
+    /// keep every file archived within the last quiet period before the
+    /// upgrade until someone removed it by hand.
+    pub fn arm_delete_from_seed(
+        &mut self,
+        path: &str,
+        archived_mtime: Option<&str>,
+        archived_ctime: Option<&str>,
+    ) {
         if !self.delete_after_commit {
             return;
         }
         let archived_mtime = archived_mtime.filter(|m| !m.is_empty());
-        let Some(cursor) = self.cursors.get_mut(path) else {
+        // A value that does not parse is unknown, as for a row without one.
+        let archived_ctime = archived_ctime.and_then(parse_ctime);
+        let Some(cursor) = self.cursors.get(path) else {
             return;
         };
         let committed_byte = cursor.committed_byte;
@@ -1147,30 +1179,42 @@ impl FileSource {
             .as_ref()
             .filter(|tail| tail.end == committed_byte)
             .map(|tail| tail.fingerprint.clone());
+        let (inode, content) = (seen.inode, seen.content.clone());
         let now = Self::identity_of(&md);
         let same_mtime = archived_mtime.is_some_and(|archived| now.mtime == archived);
-        if now.inode != seen.inode || now.file_size != committed_byte || !same_mtime {
-            if now.inode == seen.inode && now.file_size == committed_byte {
-                tracing::warn!(
-                    path,
-                    inode = seen.inode,
-                    archived_bytes = committed_byte,
-                    "not deleting {path}: its {committed_byte} bytes were archived before the \
-                     restart, but its mtime is not the one the archiving batch recorded (a touch, \
-                     or a rewrite while the engine was down); it is KEPT - remove it by hand once \
-                     you know it holds nothing new"
-                );
-                count_delete_decision("metadata_changed");
-            }
+        let same_ctime = archived_ctime.is_none_or(|archived| ctime_of(&md) == Some(archived));
+        if now.inode != inode || now.file_size != committed_byte {
             return;
         }
+        if !same_mtime || !same_ctime {
+            self.notify(
+                "metadata_changed",
+                tracing::Level::WARN,
+                path,
+                inode,
+                committed_byte,
+                format!(
+                    "not deleting {path}: its {committed_byte} bytes were archived before the \
+                     restart, but its mtime or ctime is not the one the archiving batch recorded \
+                     (a touch, a chmod, a hard link made or removed, a rewrite while the engine \
+                     was down, or an earlier delete attempt of this engine that moved it aside \
+                     and put it back - which cannot be told apart); it is KEPT, and deleted only \
+                     if a later commit covers it unchanged - otherwise remove it by hand once you \
+                     know it holds nothing new"
+                ),
+            );
+            return;
+        }
+        let Some(cursor) = self.cursors.get_mut(path) else {
+            return;
+        };
         cursor.delete_candidate = Some(DeleteCandidate {
-            inode: seen.inode,
-            content: seen.content.clone(),
+            inode,
+            content,
             tail,
             end_byte: committed_byte,
             mtime: md.modified().ok(),
-            ctime: ctime_of(&md),
+            ctime: archived_ctime.or_else(|| ctime_of(&md)),
             nlink: nlink_of(&md),
             since: Instant::now(),
             told: false,
@@ -1634,6 +1678,7 @@ impl FileSource {
                     dt.to_rfc3339()
                 })
                 .unwrap_or_default(),
+            ctime: ctime_text(md),
             content: None,
             tail: None,
         }
@@ -1688,6 +1733,7 @@ impl FileSource {
             tail_fingerprint: tail
                 .filter(|tail| tail.end == end)
                 .map(|tail| tail.fingerprint.clone()),
+            ctime: id.ctime.clone(),
         }
     }
 
@@ -2849,6 +2895,10 @@ impl FileSource {
                 line.pop();
             }
             records.push(line);
+            #[cfg(test)]
+            if records.len() == 1 {
+                run_read_hook(path);
+            }
         }
         // fstat on the descriptor we READ from — the same file even if the
         // path was rotated away mid-read (#65).
@@ -2922,6 +2972,11 @@ struct FileIdentity {
     inode: Option<u64>,
     file_size: u64,
     mtime: String,
+    /// The ctime from the same fstat as `mtime` (#619): for a read, the one
+    /// AFTER it, so a file that stopped growing during the read still
+    /// matches it. `None` without one, and for a cursor seeded from the
+    /// ledger, which compares the marker's instead.
+    ctime: Option<String>,
     /// `None` from a stat (which reads no content), for an empty file, and
     /// for a cursor seeded from a row that recorded none.
     content: Option<ContentFingerprint>,
@@ -3219,6 +3274,27 @@ fn source_naming_the_same_file(
 /// How many files are read concurrently in one pass. Bounded so a glob that
 /// matches thousands of files does not open them all at once.
 const FILE_READ_CONCURRENCY: usize = 8;
+
+/// Per path, something a test runs once inside a line read of that path,
+/// right after its first record (#619): a write that lands while the read is
+/// under way, between the descriptor's first fstat and its last.
+#[cfg(test)]
+type ReadHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+static READ_HOOKS: std::sync::Mutex<Option<HashMap<String, ReadHook>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_read_hook(path: &str) {
+    let hook = READ_HOOKS
+        .lock()
+        .unwrap()
+        .as_mut()
+        .and_then(|hooks| hooks.remove(path));
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 /// One file's fate in a read pass: skipped because the stat proved the
 /// cursor already caught up (#100), carrying the identity the stat saw so
@@ -3693,6 +3769,7 @@ impl SourceAdapter for FileSource {
             mtime: marker_mtime,
             content_fingerprint: marker_content,
             tail_fingerprint: marker_tail,
+            ctime: marker_ctime,
             ..
         } = marker
         else {
@@ -3831,6 +3908,7 @@ impl SourceAdapter for FileSource {
                     inode,
                     file_size: *marker_file_size,
                     mtime: String::new(),
+                    ctime: None,
                     content: marker_content
                         .clone()
                         .or_else(|| kept.and_then(|seen| seen.content.clone())),
@@ -3879,6 +3957,9 @@ impl SourceAdapter for FileSource {
             let archived = *end_byte;
             let is_symlink = std::fs::symlink_metadata(Path::new(path))
                 .is_ok_and(|md| md.file_type().is_symlink());
+            // Whether the file's mtime or ctime is not the one the batch
+            // READ (see below): said in its own words.
+            let mut moved_since_read = false;
             // Closed again before the delete below: a descriptor of ours
             // still open would make the file look held by a writer.
             let verdict = if !still_current {
@@ -3901,12 +3982,24 @@ impl SourceAdapter for FileSource {
                             // "unchanged" and be deleted unread. The marker's
                             // mtime came from the descriptor the batch read;
                             // an empty one (unknown) proves nothing either.
+                            // So did its ctime (#619, v0.10.0), which catches
+                            // the same rewrite with the mtime set back; a
+                            // marker from before the field has none, and is
+                            // judged by the mtime alone, as before.
                             Compared::Unchanged
                                 if marker_mtime.is_empty()
                                     || md.as_ref().is_none_or(|md| {
                                         Self::identity_of(md).mtime != *marker_mtime
+                                            || marker_ctime
+                                                .as_deref()
+                                                .and_then(parse_ctime)
+                                                .is_some_and(|read| ctime_of(md) != Some(read))
                                     }) =>
                             {
+                                // An empty mtime recorded nothing to differ
+                                // from: the generic message, not "is not the
+                                // one the batch recorded".
+                                moved_since_read = !marker_mtime.is_empty();
                                 Compared::Kept(Kept::MetadataMoved)
                             }
                             verdict => verdict,
@@ -3947,6 +4040,21 @@ impl SourceAdapter for FileSource {
                     file_bytes = len,
                     "not deleting {path} yet: {} bytes beyond this commit are still to be archived",
                     len - archived
+                ),
+                Some(Compared::Kept(Kept::MetadataMoved)) if moved_since_read => self.notify(
+                    "metadata_changed",
+                    tracing::Level::WARN,
+                    path,
+                    *marker_inode,
+                    archived,
+                    format!(
+                        "not deleting {path}: its {archived} bytes were archived, but its mtime \
+                         or ctime is not the one the archiving batch recorded when it read the \
+                         file (a touch, a chmod, a hard link made or removed, or a rewrite since \
+                         the read - which cannot be told apart); it is KEPT, and deleted only if \
+                         a later commit covers it unchanged - otherwise remove it by hand once \
+                         you know it holds nothing new"
+                    ),
                 ),
                 Some(Compared::Kept(why)) => {
                     let (level, message) = why.message(path, archived);
@@ -4934,6 +5042,7 @@ mod tests {
                 inode: Some(inode),
                 file_size: 0,
                 mtime: String::new(),
+                ctime: None,
                 content: None,
                 tail: None,
             }),
@@ -4973,6 +5082,7 @@ mod tests {
             inode: Some(42),
             file_size: 7,
             mtime: String::new(),
+            ctime: None,
             content: None,
             tail: None,
         };
@@ -5166,6 +5276,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: first_page,
             tail_fingerprint: None,
+            ctime: None,
         };
         assert_eq!(
             fs.committed_through(&replacement),
@@ -5204,6 +5315,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: content,
             tail_fingerprint: tail,
+            ctime: None,
         };
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
         let whole = fp(&bytes);
@@ -5326,6 +5438,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: content.clone(),
             tail_fingerprint: None,
+            ctime: None,
         };
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
         fs.seed_committed_from(&path, 40, Some(inode), Some(100), content, None);
@@ -5471,6 +5584,7 @@ mod tests {
             end_byte: end,
             file_size: end,
             mtime: String::new(),
+            ctime: None,
             content_fingerprint: None,
             tail_fingerprint: None,
         };
@@ -5633,6 +5747,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         fs.commit_progress(&marker).await.unwrap();
         assert!(
@@ -5857,6 +5972,7 @@ mod tests {
             mtime: mtime.clone(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         std::fs::write(&path, "z\n").unwrap();
         let err = fs
@@ -6194,6 +6310,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         fs.commit_progress(&recovered).await.unwrap();
 
@@ -6235,6 +6352,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         fs.commit_progress(&recovered).await.unwrap();
 
@@ -6322,6 +6440,7 @@ mod tests {
             mtime: String::new(),
             content_fingerprint: None,
             tail_fingerprint: None,
+            ctime: None,
         };
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
         // Nothing replayed or read yet: no identity, so nothing to report for a
@@ -6584,6 +6703,7 @@ mod tests {
                 mtime: String::new(),
                 content_fingerprint: ContentFingerprint::of(b.as_bytes()),
                 tail_fingerprint: None,
+                ctime: None,
             };
             fs.commit_progress(&recovered).await.unwrap();
             std::fs::OpenOptions::new()
@@ -6642,6 +6762,7 @@ mod tests {
                 mtime: String::new(),
                 content_fingerprint: None,
                 tail_fingerprint: None,
+                ctime: None,
             };
             fs.commit_progress(&recovered).await.unwrap();
 
@@ -6977,11 +7098,13 @@ mod tests {
     /// ever close the descriptor: it pinned the deleted file's space, and a
     /// slot of the limit, for the life of the process.
     ///
-    /// The append and the cut move the mtime, and since review of #689 a
-    /// commit keeps a file whose mtime is not the one its batch read. So the
-    /// cut sets the mtime back to what the first read saw: the one change a
-    /// commit cannot see (the marker records no ctime), and the way to reach
-    /// a delete with the descriptor still held, which is what is under test.
+    /// The append and the cut move the mtime and the ctime, and a commit
+    /// keeps a file whose mtime (review of #689) or ctime (#619) is not the
+    /// one its batch read. So the cut sets the mtime back to what the first
+    /// read saw, and the first window commits with a marker that records no
+    /// ctime, as a ledger row from before the field does: the one commit that
+    /// cannot see the cut, and the way to reach a delete with the descriptor
+    /// still held, which is what is under test.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_delete_closes_a_descriptor_the_adapter_still_held_for_that_path() {
@@ -7011,7 +7134,12 @@ mod tests {
         cut.set_modified(first_mtime).unwrap();
         drop(cut);
 
-        fs.commit_progress(&first[0].progress_end).await.unwrap();
+        let mut first_end = first[0].progress_end.clone();
+        if let ProgressMarker::File { ctime, .. } = &mut first_end {
+            assert!(ctime.is_some(), "a read records the file's ctime");
+            *ctime = None;
+        }
+        fs.commit_progress(&first_end).await.unwrap();
         assert!(
             !Path::new(&path).exists(),
             "the first window covers the whole file now, so it is deleted"
@@ -7685,7 +7813,7 @@ mod tests {
         let mut legacy = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
             .with_delete_quiet_period(quiet);
         legacy.seed_committed_from(&path, end_byte, inode, Some(file_size), None, None);
-        legacy.arm_delete_from_seed(&path, Some(&mtime));
+        legacy.arm_delete_from_seed(&path, Some(&mtime), read[0].progress_end.ctime());
         let mut after = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
             .with_delete_quiet_period(quiet);
         after.seed_committed_from(
@@ -7696,7 +7824,7 @@ mod tests {
             content_fingerprint,
             tail_fingerprint,
         );
-        after.arm_delete_from_seed(&path, Some(&mtime));
+        after.arm_delete_from_seed(&path, Some(&mtime), read[0].progress_end.ctime());
         std::thread::sleep(quiet * 2);
 
         legacy
@@ -7821,7 +7949,7 @@ mod tests {
         // No tail (a row from before #620): the observed-size guard alone is
         // under test here, and a tail would also catch this rewrite.
         after.seed_committed_from(&path, committed, Some(inode), Some(16_400), content, None);
-        after.arm_delete_from_seed(&path, Some(&mtime));
+        after.arm_delete_from_seed(&path, Some(&mtime), read[0].progress_end.ctime());
         let reads = after
             .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
             .await
@@ -8123,7 +8251,7 @@ mod tests {
                 content_fingerprint.clone(),
                 tail,
             );
-            after.arm_delete_from_seed(&path, Some(&mtime));
+            after.arm_delete_from_seed(&path, Some(&mtime), read[0].progress_end.ctime());
             let _ = after
                 .read_batch_candidates(&src(&path), 1_000, 1 << 20, Duration::ZERO)
                 .await;
@@ -8134,6 +8262,286 @@ mod tests {
             );
             assert!(std::fs::read_to_string(&path).unwrap() == rewrite);
         }
+    }
+
+    // ---- #619 in v0.10.0: the ctime the read recorded ---------------------
+
+    /// A long file read to its end, committed with the default quiet period
+    /// (so kept), and the marker that committed it.
+    async fn archived_long_file(path: &str) -> ProgressMarker {
+        std::fs::write(path, long_file("old")).unwrap();
+        let mut fs = FileSource::new(vec![path.to_owned()], TelemetryFormat::Raw, true);
+        let read = fs
+            .read_batch_candidates(&src(path), 10_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert!(Path::new(path).exists(), "kept: not quiet yet");
+        read[0].progress_end.clone()
+    }
+
+    /// Rewrite lines 50-59 of a `long_file` in place - between its first
+    /// page and the page below its end, so neither fingerprint sees it - and
+    /// set the mtime back to `mtime`. Only the ctime records it. A later
+    /// second first, so a coarse ctime still moves.
+    fn rewrite_between_the_pages_setting_the_mtime_back(path: &str, mtime: std::time::SystemTime) {
+        std::thread::sleep(Duration::from_millis(1100));
+        let mut file = std::fs::File::options().write(true).open(path).unwrap();
+        file.write_all(long_file("NEW").as_bytes()).unwrap();
+        file.set_modified(mtime).unwrap();
+        drop(file);
+        assert_eq!(
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+            mtime,
+            "the mtime is back where the read saw it"
+        );
+    }
+
+    /// #619 (C1): a same-length rewrite between the two pages while the
+    /// engine is down, with the mtime set back. Everything the seed records
+    /// agrees - inode, first page, page below the end, length, mtime - and
+    /// the restart took the file's ctime NOW for the candidate, so the
+    /// rewrite became the baseline and the file was deleted a quiet period
+    /// later, unread. The marker records the ctime the read saw, and the
+    /// seed arms the delete only on that one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rewrite_that_sets_the_mtime_back_while_the_engine_is_down_is_never_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let marker = archived_long_file(&path).await;
+        let archived_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let ProgressMarker::File {
+            inode,
+            end_byte,
+            file_size,
+            mtime,
+            content_fingerprint,
+            tail_fingerprint,
+            ..
+        } = marker.clone()
+        else {
+            panic!("expected a file marker");
+        };
+        rewrite_between_the_pages_setting_the_mtime_back(&path, archived_mtime);
+
+        // The restart.
+        let metadata_changed = decisions("metadata_changed");
+        let mut after = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO)
+            .with_delete_without_open_check(!cfg!(target_os = "linux"));
+        after.seed_committed_from(
+            &path,
+            end_byte,
+            inode,
+            Some(file_size),
+            content_fingerprint,
+            tail_fingerprint,
+        );
+        after.arm_delete_from_seed(&path, Some(&mtime), marker.ctime());
+        let _ = after
+            .read_batch_candidates(&src(&path), 10_000, 1 << 20, Duration::ZERO)
+            .await;
+        assert!(
+            std::fs::read_to_string(&path).ok() == Some(long_file("NEW")),
+            "rewritten between the pages while the engine was down, mtime set back, and \
+             deleted after the restart with the rewrite unread"
+        );
+        assert!(
+            notice(
+                &after,
+                &format!(
+                    "not deleting {path}: its {end_byte} bytes were archived before the \
+                     restart, but its mtime or ctime is not the one the archiving batch recorded"
+                )
+            ) && notice(&after, "it is KEPT")
+                && notice(
+                    &after,
+                    "remove it by hand once you know it holds nothing new"
+                ),
+            "kept without saying what happened, what the engine did and what to do: {:?}",
+            after.notices
+        );
+        assert!(decisions("metadata_changed") > metadata_changed);
+    }
+
+    /// #619 (C2): the same rewrite, mtime set back, between the batch's READ
+    /// and its COMMIT - the upload and verify, or the downtime before
+    /// recovery commits it. The commit compares the file with the marker's
+    /// mtime (review of #689), which agrees, and took the ctime at the
+    /// commit for the candidate's, so the rewrite was deleted unread. The
+    /// marker's ctime is the one the read saw.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rewrite_between_the_read_and_the_commit_that_sets_the_mtime_back_is_never_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, long_file("old")).unwrap();
+        let quiet = Duration::from_millis(50);
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(quiet)
+            .with_delete_without_open_check(!cfg!(target_os = "linux"));
+        let read = fs
+            .read_batch_candidates(&src(&path), 10_000, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let read_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        rewrite_between_the_pages_setting_the_mtime_back(&path, read_mtime);
+        let metadata_changed = decisions("metadata_changed");
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        for _ in 0..3 {
+            pass_after(&mut fs, &path, quiet).await;
+        }
+        assert!(
+            std::fs::read_to_string(&path).ok() == Some(long_file("NEW")),
+            "rewritten between the read and the commit, mtime set back, and deleted with \
+             the rewrite unread"
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "not deleting {path}: its 12000 bytes were archived, but its mtime or \
+                     ctime is not the one the archiving batch recorded when it read the file"
+                )
+            ) && notice(&fs, "it is KEPT")
+                && notice(&fs, "remove it by hand once you know it holds nothing new"),
+            "kept without saying what happened, what the engine did and what to do: {:?}",
+            fs.notices
+        );
+        assert!(decisions("metadata_changed") > metadata_changed);
+    }
+
+    /// Review of #713: a marker whose mtime is empty recorded none, so the
+    /// file is kept - nothing proves it unchanged - with the general
+    /// message, not one that says the file's mtime "is not the one the
+    /// archiving batch recorded".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_marker_with_no_mtime_is_kept_without_claiming_one_was_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO)
+            .with_delete_without_open_check(!cfg!(target_os = "linux"));
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let mut end = read[0].progress_end.clone();
+        if let ProgressMarker::File { mtime, .. } = &mut end {
+            mtime.clear();
+        }
+        fs.commit_progress(&end).await.unwrap();
+        assert!(
+            Path::new(&path).exists(),
+            "deleted on a marker that recorded no mtime"
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!("not deleting {path}: its 8 bytes look archived")
+            ) && !notice(&fs, "is not the one the archiving batch recorded"),
+            "{:?}",
+            fs.notices
+        );
+    }
+
+    /// #619 (C3): a ledger row written before the marker recorded a ctime
+    /// arms the delete after a restart exactly as it did: the candidate
+    /// takes the file's ctime at the restart. Refusing such rows would strand
+    /// every file archived within the last quiet period at the upgrade; the
+    /// rewrite C1 catches stays the documented limit for those rows only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_row_without_a_ctime_arms_the_delete_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let ProgressMarker::File {
+            inode,
+            end_byte,
+            file_size,
+            mtime,
+            content_fingerprint,
+            tail_fingerprint,
+            ..
+        } = archived_long_file(&path).await
+        else {
+            panic!("expected a file marker");
+        };
+        let quiet = Duration::from_millis(50);
+        let mut after = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(quiet)
+            .with_delete_without_open_check(!cfg!(target_os = "linux"));
+        after.seed_committed_from(
+            &path,
+            end_byte,
+            inode,
+            Some(file_size),
+            content_fingerprint,
+            tail_fingerprint,
+        );
+        after.arm_delete_from_seed(&path, Some(&mtime), None);
+        assert!(
+            after.cursors[&path].delete_candidate.is_some(),
+            "a row with no ctime arms the delete, as before"
+        );
+        pass_after(&mut after, &path, quiet).await;
+        assert!(
+            !Path::new(&path).exists(),
+            "fully archived, unwritten for the quiet period since the restart, so deleted"
+        );
+    }
+
+    /// #619 (C4): the marker's ctime comes from the fstat AFTER the read,
+    /// with its mtime and length. A file that a writer appends to while the
+    /// read is under way - and then leaves alone - ends where the read
+    /// ended, and is deleted once covered. A ctime from the fstat BEFORE the
+    /// read would never match the file again, and the file would never be
+    /// deleted. The seam appends between the two.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_that_stops_growing_during_the_read_is_still_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let writer_path = path.clone();
+        READ_HOOKS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                path.clone(),
+                Box::new(move || {
+                    // A later second, so a coarse ctime still moves.
+                    std::thread::sleep(Duration::from_millis(1100));
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&writer_path)
+                        .unwrap()
+                        .write_all(b"three\n")
+                        .unwrap();
+                }),
+            );
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO)
+            .with_delete_without_open_check(!cfg!(target_os = "linux"));
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            read[0].records,
+            vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()],
+            "the seam did not append during the read, so this test proves nothing"
+        );
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        assert!(
+            !Path::new(&path).exists(),
+            "fully archived and left alone after the read, yet kept: {:?}",
+            fs.notices
+        );
     }
 
     /// Review of #631 (P1): moving a file aside must never replace a file
@@ -9113,7 +9521,7 @@ mod tests {
             "rewritten between the read and the commit, and deleted with the rewrite unread"
         );
         assert!(
-            notice(&fs, &format!("not deleting {path}: its 12000 bytes look archived, but its mtime or ctime changed")),
+            notice(&fs, &format!("not deleting {path}: its 12000 bytes were archived, but its mtime or ctime is not the one the archiving batch recorded when it read the file")),
             "{:?}",
             fs.notices
         );
