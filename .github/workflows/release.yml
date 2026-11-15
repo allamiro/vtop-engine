@@ -48,6 +48,7 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
+      latest: ${{ steps.meta.outputs.latest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -125,7 +126,24 @@ jobs:
           fi
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Releasing $version (prerelease=$prerelease)"
+          # `latest` (the image tag, and GitHub's "Latest release") names the
+          # NEWEST final release, not the one tagged most recently: a 0.9.1
+          # fix cut after 0.10.0 must not pull `latest` back to the older
+          # line. Compare against every final v* tag on the remote (this tag
+          # included); only a version no other final tag outranks is latest.
+          latest=false
+          if [ "$prerelease" = false ]; then
+            newest="$(git ls-remote --tags --refs origin 'v*' \
+              | sed 's|.*refs/tags/v||' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | { cat; echo "$version"; } \
+              | sort -V | tail -n1)"
+            if [ "$newest" = "$version" ]; then
+              latest=true
+            fi
+          fi
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version (prerelease=$prerelease, latest=$latest)"
 
   # ---------------------------------------------------------------------------
   # Binaries. Each target builds on its native runner: librdkafka is compiled
@@ -414,13 +432,14 @@ jobs:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: index
         with:
           images: ${{ env.IMAGE_NAME }}
-          # `latest` follows the current recommended release, which now
-          # includes 0.x (see the prerelease classification above). Only a
-          # pre-release SUFFIX withholds it: an -rc must never become what a
-          # bare `docker pull` resolves to.
+          # `latest` follows the newest final release, which includes 0.x
+          # (see the prerelease classification above). A pre-release SUFFIX
+          # withholds it (an -rc must never become what a bare `docker pull`
+          # resolves to), and so does a fix for an older line (the verify
+          # job's `latest` output).
           tags: |
             type=semver,pattern={{version}},value=v${{ needs.verify.outputs.version }}
-            type=raw,value=latest,enable=${{ needs.verify.outputs.prerelease == 'false' }}
+            type=raw,value=latest,enable=${{ needs.verify.outputs.latest == 'true' }}
 
       - name: Create multi-arch manifest
         working-directory: /tmp/digests
@@ -482,6 +501,22 @@ jobs:
           set -euo pipefail
           digest="$(docker buildx imagetools inspect "$IMAGE_NAME:${{ needs.verify.outputs.version }}" --format '{{ .Manifest.Digest }}')"
           cosign sign --yes "${IMAGE_NAME}@${digest}"
+
+      - name: latest names this release
+        if: needs.verify.outputs.latest == 'true'
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The registry, not the tag list we asked for, is what `docker pull
+          # :latest` resolves; fail the release if the two differ.
+          want="$(docker buildx imagetools inspect "$IMAGE_NAME:$VERSION" --format '{{ .Manifest.Digest }}')"
+          got="$(docker buildx imagetools inspect "$IMAGE_NAME:latest" --format '{{ .Manifest.Digest }}')"
+          if [ "$want" != "$got" ]; then
+            echo "::error::$IMAGE_NAME:latest is $got, but $VERSION is $want"
+            exit 1
+          fi
+          echo "$IMAGE_NAME:latest = $VERSION ($want)"
 
   # ---------------------------------------------------------------------------
   # Source SBOM (SPDX) attached to the release.
@@ -600,6 +635,10 @@ jobs:
           name: v${{ needs.verify.outputs.version }}
           tag_name: ${{ github.ref_name }}
           prerelease: ${{ needs.verify.outputs.prerelease == 'true' }}
+          # GitHub's "Latest release" badge follows the same rule as the
+          # image's `latest` tag: the newest final release, never an older
+          # line's fix.
+          make_latest: ${{ needs.verify.outputs.latest == 'true' }}
           files: artifacts/*
           # PROSE PARAGRAPHS MUST BE ONE LINE EACH.
           #

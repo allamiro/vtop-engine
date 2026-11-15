@@ -27,6 +27,10 @@ on:
       - "scripts/check-config-reference.py"
       - "scripts/check-security-policy.py"
       - "scripts/tests/test_check_security_policy.py"
+      - "scripts/check-release-versions.py"
+      - "scripts/tests/test_check_release_versions.py"
+      - "CITATION.cff"
+      - "helm/vtop/Chart.yaml"
       - "crates/vtop-core/src/config.rs"
       - ".github/workflows/docs.yml"
   push:
@@ -44,6 +48,10 @@ on:
       - "scripts/check-config-reference.py"
       - "scripts/check-security-policy.py"
       - "scripts/tests/test_check_security_policy.py"
+      - "scripts/check-release-versions.py"
+      - "scripts/tests/test_check_release_versions.py"
+      - "CITATION.cff"
+      - "helm/vtop/Chart.yaml"
       - "crates/vtop-core/src/config.rs"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
@@ -80,6 +88,11 @@ jobs:
         run: |
           python -m unittest discover -s scripts/tests -p 'test_check_security_policy.py' -v
           python scripts/check-security-policy.py
+
+      - name: Every copied release version names the workspace version
+        run: |
+          python -m unittest discover -s scripts/tests -p 'test_check_release_versions.py' -v
+          python scripts/check-release-versions.py
 
       - name: mkdocs build --strict
         env:
