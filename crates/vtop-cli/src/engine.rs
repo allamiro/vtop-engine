@@ -3576,9 +3576,17 @@ impl Engine {
         if let Some(kafka) = adapter.as_any_mut().downcast_mut::<KafkaSource>() {
             refused.extend(kafka.take_refused_cuts());
         }
-        let mut gone: Vec<(String, u64, u64, String)> = refused
+        let mut gone: Vec<(String, Option<i32>, u64, u64, String)> = refused
             .into_iter()
-            .map(|cut| (cut.path, cut.start, cut.end, cut.reason.to_owned()))
+            .map(|cut| {
+                (
+                    cut.path,
+                    cut.partition,
+                    cut.start,
+                    cut.end,
+                    cut.reason.to_owned(),
+                )
+            })
             .collect();
         for (start, end) in overshot {
             let source = match &start {
@@ -3591,18 +3599,28 @@ impl Engine {
             let to = u64::try_from(end).unwrap_or_default();
             gone.push((
                 source,
+                crate::rebuild::partition_of(&start),
                 from,
                 to,
                 "the source read past the recorded end".to_owned(),
             ));
         }
-        for (source, start, end, why) in gone {
+        for (source, partition, start, end, why) in gone {
             for buf in self.pending.values_mut() {
-                if buf.source.source_name == source && buf.rebuild_end == Some(i128::from(end)) {
+                // A topic's partitions are buffered apart and can rebuild
+                // windows over the same offsets: release only this one's.
+                let unit = buf
+                    .latest_end
+                    .as_ref()
+                    .and_then(crate::rebuild::partition_of);
+                if buf.source.source_name == source
+                    && unit == partition
+                    && buf.rebuild_end == Some(i128::from(end))
+                {
                     buf.rebuild_end = None;
                 }
             }
-            if let Some(window) = self.recorded.unbind(&source, start, end) {
+            if let Some(window) = self.recorded.unbind(&source, partition, start, end) {
                 let (tenant, format) = self.replay_labels(source_type, &source);
                 let suppressed = self.key_notices.admit("replay_bound_refused", &source);
                 crate::rebuild::note_refused(

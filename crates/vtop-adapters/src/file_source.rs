@@ -788,7 +788,10 @@ const MAX_CUTS_PER_PATH: usize = 1024;
 /// A window a read could not rebuild as cut (#626).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusedCut {
+    /// The file or spool path, or the Kafka topic.
     pub path: String,
+    /// The Kafka partition the range is in; `None` for a file or spool.
+    pub partition: Option<i32>,
     pub start: u64,
     pub end: u64,
     /// Why, for the operator.
@@ -2132,6 +2135,7 @@ impl FileSource {
                 if let Some(cut) = take(end) {
                     self.refused_cuts.push(RefusedCut {
                         path: path.to_string(),
+                        partition: None,
                         start: cut.start,
                         end,
                         reason,

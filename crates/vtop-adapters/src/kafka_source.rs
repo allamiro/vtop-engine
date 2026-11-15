@@ -2017,15 +2017,15 @@ impl KafkaSource {
         self.include.is_match(topic) && !self.exclude.is_match(topic)
     }
 
-    /// Drop per-topic state for topics that no longer exist, so a broker that
-    /// churns through many short-lived topics does not grow the caches
-    /// without bound.
     /// The windows a read could not rebuild as cut since the last call
     /// (#626): the engine counts each and reads on as before.
     pub fn take_refused_cuts(&mut self) -> Vec<crate::file_source::RefusedCut> {
         std::mem::take(&mut self.refused_cuts)
     }
 
+    /// Drop per-topic state for topics that no longer exist, so a broker that
+    /// churns through many short-lived topics does not grow the caches
+    /// without bound.
     pub fn prune_partition_cache(&mut self, live_topics: &[String]) {
         let live: std::collections::HashSet<&str> =
             live_topics.iter().map(|s| s.as_str()).collect();
@@ -3195,6 +3195,7 @@ impl SourceAdapter for KafkaSource {
             if let Some(start) = self.cuts.get_mut(&key).and_then(|c| c.remove(&until)) {
                 self.refused_cuts.push(crate::file_source::RefusedCut {
                     path: key.0.clone(),
+                    partition: Some(p),
                     start: u64::try_from(start).unwrap_or_default(),
                     end: u64::try_from(until + 1).unwrap_or_default(),
                     reason: "the partition's log no longer holds the range (retention or compaction moved past it)",
