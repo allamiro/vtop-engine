@@ -4,7 +4,7 @@ name: fuzz nightly
 # that persists from one night to the next, and a report-only mutation run
 # over the verify, recovery and file-continuity code (#729).
 #
-# The PR job in ci.yml runs each target for 60 seconds from the committed
+# The PR job in ci.yml runs each target for 30 seconds from the committed
 # seeds. That catches a regression on the way in; it does not find the bug
 # that needs an hour of coverage-guided search, or the one that needs a
 # corpus grown over many nights. This workflow does both.
@@ -296,8 +296,9 @@ jobs:
 
   # Report only. The verify, recovery and file-continuity code has no
   # measured mutation score yet, so a gate on it now would be a number
-  # picked from nothing. This records the score every night; the gate in
-  # ci.yml is extended once two weeks of scores exist (#729).
+  # picked from nothing. This records the score every night; once scores
+  # exist, each file is gated at its measured score minus 5 points, never
+  # below 0.80 (the maintainer's rule on #729).
   mutants:
     name: mutation (report only) ${{ matrix.package }}
     runs-on: ubuntu-latest

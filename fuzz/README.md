@@ -95,7 +95,7 @@ the writer and commit the result.
 
 **Every PR** (`fuzz smoke (every target)` in `ci.yml`, when the fuzz crate or
 any crate it fuzzes changes): builds every target, replays every committed
-seed once (`-runs=0`), then runs each target for 60 s. A crash fails the
+seed once (`-runs=0`), then runs each target for 30 s. A crash fails the
 build and uploads `fuzz/artifacts/`.
 
 **Every night** (`.github/workflows/fuzz-nightly.yml`, 02:37 UTC): the
@@ -143,6 +143,12 @@ the tests missed, and fails below `MUTANTS_MIN_SCORE`, set in the job.
 also runs a report-only mutation job over the verify, recovery and
 file-continuity code in `vtop-upload`, `vtop-adapters` and `vtop-state`; that
 scope joins the gate once it has a measured score.
+
+Thresholds (the maintainer's rule on #729): each gate is the file's measured
+score minus 5 points, and never below 0.80. `state_machine.rs` and
+`replay.rs` measured 22 of 22 caught (1.00) but are gated at 0.90 until the
+nightly runs show no flaky timeouts, since a mutant that times out on a
+loaded runner counts as not caught; then their gate goes to 1.00.
 
 Run the gate locally after a mutation run:
 
