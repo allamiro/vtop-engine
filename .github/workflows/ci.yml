@@ -2009,7 +2009,7 @@ jobs:
       # outcomes (pass, fail, unviable excluded, timeouts counted, empty and
       # failed-baseline runs refused) before trusting it with a real one.
       - name: Test the gate script
-        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+        run: python3 -m unittest discover -s scripts/tests -p 'test_mutants_gate.py' -v
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable

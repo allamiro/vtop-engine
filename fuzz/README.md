@@ -150,5 +150,5 @@ Run the gate locally after a mutation run:
 cargo mutants --package vtop-core \
   --file crates/vtop-core/src/state_machine.rs --file crates/vtop-core/src/replay.rs
 python3 scripts/mutants-gate.py --outcomes mutants.out/outcomes.json --min-score 0.90
-python3 -m unittest discover -s scripts/tests -p 'test_*.py'   # the gate's own tests
+python3 -m unittest discover -s scripts/tests -p 'test_mutants_gate.py'   # the gate's own tests
 ```

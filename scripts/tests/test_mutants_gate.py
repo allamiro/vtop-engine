@@ -2,7 +2,7 @@
 
 Run from the repository root:
 
-    python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+    python3 -m unittest discover -s scripts/tests -p 'test_mutants_gate.py'
 
 Each case writes a crafted `outcomes.json` in the shape cargo-mutants
 writes it (a `Baseline` scenario, then one `{"Mutant": {...}}` scenario per
