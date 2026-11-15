@@ -32,12 +32,14 @@ pub mod fencing_epochs;
 pub mod group_commit;
 pub mod kept_dispute;
 pub mod memory_budget;
+pub mod produce_phases;
 pub mod replication;
 pub mod retention_stats;
 pub mod server_metrics;
 
 use crate::group_commit::{GroupCommitConfig, GroupCommitCoordinator, QueuedProduce};
 use crate::memory_budget::{reject_message, BudgetReservation, ConnectionBudget};
+use crate::produce_phases::ProducePhase;
 use crate::replication::network::PlaintextExposure;
 use crate::replication::{ClusterCommittedOffset, ReplicaSet};
 
@@ -672,6 +674,8 @@ pub struct LocalBroker {
     group_checkpoints: Option<GroupCheckpointStore>,
     /// Optional adaptive cross-session group-commit coordinator.
     group_commit: Option<Arc<GroupCommitCoordinator>>,
+    /// Where produce time goes, by phase (#752).
+    produce_phases: crate::produce_phases::ProducePhaseMetrics,
     /// Shared memory budgets for produce / fetch / replication admission.
     memory: Arc<MemoryBudgetPool>,
     state: Mutex<BrokerState>,
@@ -798,6 +802,7 @@ impl LocalBroker {
             node_id,
             group_checkpoints: None,
             group_commit: None,
+            produce_phases: Default::default(),
             memory: MemoryBudgetPool::new(MemoryBudgetConfig::default())
                 .expect("default memory budget config is valid"),
             state: Mutex::new(BrokerState {
@@ -885,6 +890,12 @@ impl LocalBroker {
     /// Group-commit coordinator, when configured.
     pub fn group_commit(&self) -> Option<&Arc<GroupCommitCoordinator>> {
         self.group_commit.as_ref()
+    }
+
+    /// Time spent in each phase of the produce path since this broker was
+    /// built (#752): local fsync, replication, commit.
+    pub fn produce_phases(&self) -> &crate::produce_phases::ProducePhaseMetrics {
+        &self.produce_phases
     }
 
     /// Shared memory-budget pool.
@@ -2128,10 +2139,13 @@ impl LocalBroker {
             // the bound sees an ack, not `SegmentByteLimit` — that error now
             // reaches a client only for a group larger than a whole segment,
             // which is a configuration problem no roll can fix.
-            match state
+            let fsync_started = std::time::Instant::now();
+            let appended = state
                 .segment
-                .append_group_minting(&records, Durability::Fsync)
-            {
+                .append_group_minting(&records, Durability::Fsync);
+            self.produce_phases
+                .record(ProducePhase::LocalFsync, fsync_started.elapsed());
+            match appended {
                 Ok(outcomes) => {
                     // Reclaim AFTER the append that may have rolled, under
                     // the same lock, so the sealed prefix never outlives the
@@ -2268,7 +2282,13 @@ impl LocalBroker {
             offset_cursor = member_end.max(offset_cursor);
         }
 
+        let replicate_started = std::time::Instant::now();
         let quorum = replicas.replicate_append_batch(&replica_requests, leader_committed);
+        let commit_started = std::time::Instant::now();
+        self.produce_phases.record(
+            ProducePhase::Replicate,
+            commit_started.duration_since(replicate_started),
+        );
         if !quorum.has_quorum() {
             let message = format!(
                 "quorum not reached: {} follower ack(s), need majority of {}",
@@ -2298,6 +2318,8 @@ impl LocalBroker {
                 if let Err((code, message)) =
                     self.check_range(&meta, &item.request.range, item.request.fencing_epoch)
                 {
+                    self.produce_phases
+                        .record(ProducePhase::Commit, commit_started.elapsed());
                     return batch
                         .iter()
                         .zip(wire_by_member)
@@ -2339,6 +2361,8 @@ impl LocalBroker {
             fencing_epoch: hwm_epoch,
             committed_high_watermark: committed,
         });
+        self.produce_phases
+            .record(ProducePhase::Commit, commit_started.elapsed());
         batch
             .iter()
             .zip(wire_by_member)
