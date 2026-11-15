@@ -130,6 +130,7 @@ Also: the image's `latest` tag moved (only for a non-pre-release), `helm/vtop/Ch
 - [ ] Bump PR touches only Cargo.toml (11 edits), Cargo.lock (12 `vtop-*` entries), Chart.yaml, ROADMAP.md, CITATION.cff.
 - [ ] Chart version bump matches whether templates or values changed.
 - [ ] ROADMAP: upgrade order, one-way changes with reasons, silently ignored keys, known open, no downgrade.
+- [ ] Before the bump PR, on Linux, the ignored delete stress test run by hand on tmpfs, ext4 and overlay, once each (`TMPDIR=<dir on that filesystem> cargo test -p vtop-adapters --lib --locked -- --ignored delete_race_stress --nocapture`; in Docker, `/dev/shm` is tmpfs, the container's `/tmp` is overlay, a named volume is ext4). It must report 0 lines lost; record its summary line (lines written, archived, kept on disk unarchived, deletes, `opened_at_unlink`) in the bump PR. Not a CI gate: a lease behaves by filesystem, and the run is a few minutes of writers racing deletes (#619).
 - [ ] CI green on the exact head; head contains current `main`; merged by REST with `sha` pinned.
 - [ ] Tag is annotated, on the merge commit, and matches `Cargo.toml`.
 - [ ] `release.yml` green; ten assets; `SHA256SUMS`, every Sigstore bundle and the image signature verified; macOS `otool` clean and `minos 11.0`.
