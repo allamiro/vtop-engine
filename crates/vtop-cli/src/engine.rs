@@ -314,6 +314,38 @@ enum EarlierFallback {
     Unusable(String),
     /// The store could not answer: the batch fails with this message.
     Failed(String),
+    /// The store throttled a request: the batch fails as a throttled probe.
+    Throttled(String),
+}
+
+impl EarlierFallback {
+    /// What a probe of the earlier fallback key says, short of a verified
+    /// object (review of #757). Absent, or a 403 (S3's answer for a missing
+    /// key to a caller without list permission, read the same way as the
+    /// derived key's `fallback_unchecked` notice): the upload never landed,
+    /// so writing one now is not an extra object. An object that differs or
+    /// verifies only by size: there and not usable. A probe the store did
+    /// not answer, or an object that could not be read: the store said
+    /// nothing, so the batch fails rather than writing on an error.
+    fn from_probe(uri: &str, probe: KeyProbe) -> Self {
+        match probe {
+            KeyProbe::Free => Self::Absent,
+            KeyProbe::Unchecked(why) if why.contains("403") => Self::Absent,
+            KeyProbe::Differs(why) | KeyProbe::SizeOnly(why) => {
+                Self::Unusable(multipart::redact_urls(&why))
+            }
+            KeyProbe::Unchecked(why) | KeyProbe::Unreadable(why) => Self::Failed(format!(
+                "the check of {uri}, the object an earlier replay of this range wrote, failed \
+                 ({}); nothing was written: the batch was marked failed and will be replayed; \
+                 check the store's health",
+                multipart::redact_urls(&why)
+            )),
+            // A verified object is judged by its lock, not here.
+            KeyProbe::Holds | KeyProbe::NotLocked { .. } => {
+                Self::Unusable(multipart::redact_urls(probe.reason()))
+            }
+        }
+    }
 }
 
 impl<'a> Pipeline<'a> {
@@ -359,14 +391,18 @@ impl<'a> Pipeline<'a> {
                 Ok(true) => {}
                 Ok(false) => {
                     read = Err(VtopError::Upload(format!(
-                        "a HEAD of it reported no {part:?}, but {} reports one",
+                        "a HEAD of it reported no {}, but the request {} governs reports one",
+                        part.describe(),
                         part.permission()
                     )))
                 }
+                // Kept as it is, so the caller handles it as a throttle.
+                Err(e) if e.is_upload_throttle() => read = Err(e),
                 Err(e) => {
                     read = Err(VtopError::Upload(format!(
-                        "a HEAD of it reported no {part:?}, and confirming that was refused or \
+                        "a HEAD of it reported no {}, and confirming that was refused or \
                          failed: {e}; without {} a store answers a HEAD with no lock at all",
+                        part.describe(),
                         part.permission()
                     )))
                 }
@@ -377,7 +413,10 @@ impl<'a> Pipeline<'a> {
 
     /// What the attempt key written earlier for this range holds now (#709):
     /// probed and verified like a derived key, then its retention judged.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the probe's own inputs, the lock, and the batch's identifiers for its messages"
+    )]
     async fn judge_earlier_fallback(
         &self,
         uri: &str,
@@ -408,11 +447,17 @@ impl<'a> Pipeline<'a> {
                     crate::object_lock::Reuse::Unanswered(message) => {
                         EarlierFallback::Failed(message)
                     }
+                    crate::object_lock::Reuse::Throttled(message) => {
+                        EarlierFallback::Throttled(message)
+                    }
                 }
             }
-            Ok(KeyProbe::Free) => EarlierFallback::Absent,
-            Ok(probe) => EarlierFallback::Unusable(probe.reason().to_owned()),
-            Err(e) => EarlierFallback::Failed(format!("object key probe of {uri} failed: {e}")),
+            Ok(probe) => EarlierFallback::from_probe(uri, probe),
+            // `probe_object_key` returns an error only for a throttle.
+            Err(e) => EarlierFallback::Throttled(format!(
+                "object key probe of {uri} was throttled: {}",
+                multipart::redact_urls(&e.to_string())
+            )),
         }
     }
 
@@ -1143,6 +1188,21 @@ impl<'a> Pipeline<'a> {
                         Ok(KeyProbe::NotLocked { decision, why })
                     }
                     crate::object_lock::Reuse::Unanswered(message) => fail!(message),
+                    crate::object_lock::Reuse::Throttled(message) => {
+                        decided("probe_throttled");
+                        tracing::warn!(
+                            event = "object_key_probe_throttled",
+                            batch_id,
+                            source = source_name,
+                            range,
+                            key = %derived,
+                            "the store throttled the retention read of {derived}; nothing was \
+                             written, the batch fails and range {range} of {source_name} is \
+                             handed back for retry; nothing to do unless it persists, then \
+                             reduce upload concurrency"
+                        );
+                        fail!(message)
+                    }
                 },
                 (probe, _) => probe,
             } {
@@ -1214,6 +1274,22 @@ impl<'a> Pipeline<'a> {
                     let cooldown = self.lock_fallbacks.cooldown();
                     match earlier {
                         Some((EarlierFallback::Failed(message), _, _)) => fail!(message),
+                        Some((EarlierFallback::Throttled(message), earlier_key, _)) => {
+                            decided("probe_throttled");
+                            tracing::warn!(
+                                event = "object_key_probe_throttled",
+                                batch_id,
+                                source = source_name,
+                                range,
+                                key = %earlier_key,
+                                "the store throttled the check of {earlier_key}, the object an \
+                                 earlier replay of range {range} of {source_name} wrote; nothing \
+                                 was written, the batch fails and the range is handed back for \
+                                 retry; nothing to do unless it persists, then reduce upload \
+                                 concurrency"
+                            );
+                            fail!(message)
+                        }
                         Some((EarlierFallback::Usable, earlier_key, _)) => {
                             decided("reused");
                             tracing::info!(
@@ -10266,8 +10342,6 @@ mod tests {
         assert_eq!(throttles.load(Ordering::Relaxed), 1);
     }
 
-    /// #626: a notice a setting repeats on every batch is logged once, then at
-    /// most once per interval, saying how many were suppressed in between.
     /// #709: the fallback memory stays bounded. Entries older than an hour
     /// are dropped when one is recorded, and at most 4096 are kept, the
     /// oldest going first.
@@ -10298,6 +10372,48 @@ mod tests {
         assert_eq!(memory.cooldown(), Duration::from_secs(300));
     }
 
+    /// Review of #757: what a probe of the earlier fallback key decides. An
+    /// absent key, or a 403 (absent to a caller without list permission),
+    /// lets a new object be written; an object that differs is there and
+    /// not usable; a probe the store did not answer, or an object it could
+    /// not read, fails the batch rather than writing on an error.
+    #[test]
+    fn an_earlier_fallback_probe_writes_only_when_the_key_is_absent() {
+        let uri = "s3://b/k.raw";
+        let absent = |p| matches!(EarlierFallback::from_probe(uri, p), EarlierFallback::Absent);
+        assert!(absent(KeyProbe::Free));
+        assert!(absent(KeyProbe::Unchecked(
+            "the probe failed: AccessDenied (http 403)".into()
+        )));
+        assert!(matches!(
+            EarlierFallback::from_probe(uri, KeyProbe::Differs("other bytes".into())),
+            EarlierFallback::Unusable(_)
+        ));
+        assert!(matches!(
+            EarlierFallback::from_probe(uri, KeyProbe::SizeOnly("size only".into())),
+            EarlierFallback::Unusable(_)
+        ));
+        for probe in [
+            KeyProbe::Unchecked(
+                "the probe failed: https://s/k?X-Amz-Signature=deadbeef: InternalError (http 500)"
+                    .into(),
+            ),
+            KeyProbe::Unreadable("an object is there and could not be verified: timeout".into()),
+        ] {
+            match EarlierFallback::from_probe(uri, probe) {
+                EarlierFallback::Failed(message) => {
+                    for part in [uri, "nothing was written", "will be replayed"] {
+                        assert!(message.contains(part), "{message:?} should say {part:?}");
+                    }
+                    assert!(!message.contains("deadbeef"), "{message}");
+                }
+                other => panic!("a store that did not answer is no reason to write: {other:?}"),
+            }
+        }
+    }
+
+    /// #626: a notice a setting repeats on every batch is logged once, then at
+    /// most once per interval, saying how many were suppressed in between.
     #[test]
     fn key_notices_admit_the_first_then_one_per_interval_with_the_suppressed_count() {
         let notices = KeyNotices::every(Duration::from_secs(60));

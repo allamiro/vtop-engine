@@ -189,6 +189,14 @@ pub enum LockPart {
 }
 
 impl LockPart {
+    /// The part, for an operator message.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Retention => "retention",
+            Self::LegalHold => "legal hold",
+        }
+    }
+
     /// The permission a store checks before it answers for this part.
     pub fn permission(self) -> &'static str {
         match self {

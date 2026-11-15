@@ -245,6 +245,10 @@ pub(crate) enum Reuse {
     /// store outage every replay would write another object. The batch
     /// fails with this message and is replayed.
     Unanswered(String),
+    /// The store throttled the read. Handled like a throttled probe of the
+    /// key (review of #757): the batch fails and is retried, counted as
+    /// `probe_throttled`, never as a failed check.
+    Throttled(String),
 }
 
 /// The fallback decision and its reason for a retention found short of
@@ -303,6 +307,12 @@ pub(crate) fn judge_reuse(
     lock: &ObjectLockConfig,
 ) -> Reuse {
     let why = match read {
+        Err(e) if e.is_upload_throttle() => {
+            return Reuse::Throttled(format!(
+                "the retention read of {uri} was throttled: {}",
+                redact_urls(&e.to_string())
+            ))
+        }
         Ok(RetentionCheck::Ok { .. }) => return Reuse::Locked,
         Ok(found) => match fallback_decision(&found, lock) {
             Some((decision, why)) => return Reuse::Unlocked { decision, why },
@@ -459,8 +469,10 @@ pub(crate) async fn check(
             "{what} {uri}, reused from an earlier attempt, is not under the requested \
              retention ({describe}), though it was when this batch chose to reuse it; the batch \
              was marked failed and will be replayed, and the replay writes the batch as a fresh \
-             locked object under its attempt key, leaving this one as it is; nothing to do \
-             unless it repeats, then check who changes the retention of archived objects"
+             locked object under its attempt key, leaving this one as it is (or, if the lock \
+             cannot be read, fails without writing); nothing to do unless it repeats, then check \
+             who changes the retention of archived objects and the credentials' \
+             s3:GetObjectRetention permission"
         )
     } else {
         let hold = if legal_hold_configured {
@@ -689,6 +701,30 @@ mod tests {
                 other => panic!("a failed read must not decide reuse or fallback: {other:?}"),
             }
         }
+    }
+
+    /// Review of #757: a throttled read at the reuse decision is a throttle,
+    /// like the probe one request earlier, not a failed check that pages.
+    #[test]
+    fn a_throttled_read_is_neither_a_verdict_nor_a_failed_check() {
+        let mx = telemetry::init().unwrap();
+        let errors = || {
+            mx.object_lock_checks_total
+                .with_label_values(&["t-throttled", "error"])
+                .get()
+        };
+        let before = errors();
+        let read = Err(VtopError::UploadThrottled(
+            "head_object https://s/x?X-Amz-Signature=deadbeef: SlowDown (http 503)".into(),
+        ));
+        match judge_reuse(read, "b", "t-throttled", "s3://b/k", &governance(false)) {
+            Reuse::Throttled(message) => {
+                assert!(message.contains("throttled"), "{message}");
+                assert!(!message.contains("deadbeef"), "{message}");
+            }
+            other => panic!("a throttle is not a verdict: {other:?}"),
+        }
+        assert_eq!(errors(), before, "not counted as a failed check");
     }
 
     /// A reused object that passed the check before reuse and fails the one

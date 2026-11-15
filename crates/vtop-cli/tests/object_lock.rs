@@ -619,6 +619,48 @@ async fn a_retention_read_that_fails_at_the_reuse_decision_writes_nothing_and_do
     assert_eq!(Snapshot::of(&backend, &derived).await, old);
 }
 
+/// Review of #757: a fallback whose upload never landed is not an extra
+/// object. The next replay, inside the cooldown, finds the attempt key
+/// absent and writes a fresh object at once instead of withholding.
+#[tokio::test]
+async fn a_fallback_whose_upload_failed_is_retried_at_once_not_withheld() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 3);
+    let tenant = "lock-fallback-put-failed";
+    let lock = governance();
+    let (mut engine, backend, derived) = first_attempt_leaves_the_derived_object(
+        dir.path(),
+        tenant,
+        &input,
+        &lock,
+        locked_mock(&lock).with_throttled_manifest_puts(1),
+    )
+    .await;
+    backend.set_stored_retention(&derived, None, StoredRetention::default());
+    let old = Snapshot::of(&backend, &derived).await;
+    // Every object put fails; the derived key is never put again.
+    let ext = derived
+        .rsplit_once('/')
+        .unwrap()
+        .1
+        .split_once('.')
+        .unwrap()
+        .1;
+    backend.set_failing_put_suffix(Some(&format!(".{ext}")));
+
+    let second = engine.process_once(SourceType::File).await.unwrap();
+    assert!(!second[0].committed, "{second:?}");
+    assert_eq!(decisions(tenant, "fallback_unlocked"), 1);
+
+    backend.set_failing_put_suffix(None);
+    let third = engine.process_once(SourceType::File).await.unwrap();
+    assert!(third[0].committed, "{third:?}");
+    assert_eq!(decisions(tenant, "lock_withheld"), 0, "not withheld");
+    assert_eq!(decisions(tenant, "fallback_unlocked"), 2);
+    assert_fell_back(&engine, &backend, &third[0], &derived, &old).await;
+}
+
 /// Review of #757: credentials that lost s3:GetObjectRetention get a HEAD
 /// with no lock headers, which reads as an unlocked object. That must not
 /// authorize a fresh object: the absence is confirmed with a request the
