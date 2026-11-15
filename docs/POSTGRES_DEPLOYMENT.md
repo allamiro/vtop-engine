@@ -98,7 +98,8 @@ reference keeps credentials out of config serialization and command arguments.
 
 ## Failure behavior
 
-If the table, required columns (`verification_class` since #664), or
+If the table, required columns (`verification_class` since #664,
+`sealed_at` since #626), or
 invariant trigger are absent, the
 trigger is disabled or its function lacks a current schema version marker,
 or the `state_enum` CHECK does not admit every state the engine writes
@@ -161,6 +162,20 @@ migration job per database; engine replicas should start only after it succeeds.
   does not affect them while they run. The schema marker is not bumped (see
   below). A rollback may keep the column; do not drop it while any engine of
   that release can reach the database.
+- **`sealed_at` (#626) needs the migration.** v0.10.0 records, with each
+  row's first write, the instant the batch's contents were fixed, in a
+  nullable `sealed_at` column (`ADD COLUMN IF NOT EXISTS`, no default, no
+  rewrite of existing rows); a replay reads it back to file its object under
+  the same hour, so it names the same key. Engines of that release name the
+  column at startup and refuse a schema without it, asking for `vtopctl
+  migrate`; run it before rolling them out. Engines of the release before
+  (v0.9.0) keep running on the migrated schema with no restart: they name
+  their columns, so a connection open during the migration is unaffected,
+  and they never write this one, so a row they insert keeps NULL and its
+  replay is filed under the hour it runs in, as in v0.9.0
+  (`scripts/ledger-compat.sh` runs this). The marker is not bumped (see
+  below). A rollback to v0.9.0 may keep the column; do not drop it while any
+  engine of v0.10.0 or later can reach the database.
 - Changes to the JSON inside ledger rows need no migration step. The content
   fingerprint added to file and spool markers (#578) is such a change: no
   DDL, older rows keep being read and judged as before. See the ledger format
@@ -191,8 +206,8 @@ migration job per database; engine replicas should start only after it succeeds.
   with `MIN_SCHEMA_VERSION` and `SCHEMA_VERSION` in `pg_store.rs`. A new
   nullable column that startup names and older engines never name does not:
   startup already refuses a schema without it, and an older release's
-  migration never drops it. The `verification_class` column (#664) is such a
-  change, and leaves the marker at 3.
+  migration never drops it. The `verification_class` column (#664) and the
+  `sealed_at` column (#626) are such changes, and leave the marker at 3.
 - **A newer schema is refused (since #664).** Engines and `vtopctl migrate`
   from #664 on read markers from `MIN_SCHEMA_VERSION` to `SCHEMA_VERSION`
   (both 3 today). A higher marker means a newer release migrated the

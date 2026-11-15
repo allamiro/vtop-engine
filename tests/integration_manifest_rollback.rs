@@ -195,6 +195,7 @@ async fn seed_version(
         manifest_version_id: None,
         object_size_bytes: Some(object_bytes.len() as i64),
         verification_class: None,
+        sealed_at: None,
         record_count: Some(1),
         error_message: None,
         owner: None,

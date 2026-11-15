@@ -425,3 +425,63 @@ async fn a_complete_the_store_keeps_refusing_is_not_kept_for_the_replay() {
     let second = engine.process_once(SourceType::File).await.unwrap();
     assert!(second.iter().all(|o| o.committed), "{second:?}");
 }
+
+/// An instant, for a seal clock.
+fn at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
+/// #626: the failed upload is sealed at 05:59:59 and its replay runs at
+/// 06:00:30, with keys that carry the hour. The replay is sealed at the first
+/// attempt's instant, so it names the same key and resumes the session the
+/// failed upload kept, sending only the part that failed. Before, it named a
+/// key under hour 06, started a second session and sent every part again,
+/// and the first session waited for the abandoned-session sweep.
+#[tokio::test]
+async fn a_replay_in_a_later_hour_resumes_the_session_the_failed_upload_kept() {
+    let _serial = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_records(&input, "hourly");
+    let backend = Arc::new(MockBackend::new().with_part_fault(2, PartFault::Reset, 2));
+    let mut cfg = with_part_attempts(config(dir.path(), &input), 2);
+    cfg.partitioning.template = vtop_core::partitioning::DEFAULT_TEMPLATE.into();
+    let mut engine = engine(cfg, &backend).await;
+    let (logs, _guard) = Logs::capture();
+
+    engine.set_seal_clock(|| at("2026-03-04T05:59:59.900Z"));
+    let first = engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(first[0].final_state, BatchState::Failed, "{first:?}");
+    let kept = sessions(dir.path());
+    assert_eq!(kept.len(), 1, "the failed upload's session is kept");
+    let (_, session) = &kept[0];
+    assert!(
+        session.object_uri.contains("hour=05"),
+        "{}",
+        session.object_uri
+    );
+
+    engine.set_seal_clock(|| at("2026-03-04T06:00:30Z"));
+    let second = engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(second[0].committed, "{second:?}");
+    assert_eq!(
+        second[0].object_uri.as_deref(),
+        Some(session.object_uri.as_str()),
+        "the replay in hour 06 names the session's hour-05 key"
+    );
+    assert_eq!(
+        sends(&backend),
+        [1, 3, 1, 1],
+        "the replay sent part 2 once more and nothing else"
+    );
+    assert!(sessions(dir.path()).is_empty(), "no second session is left");
+    assert_eq!(
+        backend.pending_multipart_count(),
+        0,
+        "none waits for the sweep"
+    );
+    logs.one("multipart_session_resumed");
+}
