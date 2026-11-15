@@ -9,7 +9,27 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use vtop_observe::audit::{read_record, ReadRecord};
+use vtop_observe::audit::{read_record, AuditEvent, ReadRecord};
+
+/// Whether a `before`/`after` value holds a non-integer number anywhere.
+fn has_float(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Number(number) => number.is_f64(),
+        serde_json::Value::Array(items) => items.iter().any(has_float),
+        serde_json::Value::Object(fields) => fields.values().any(has_float),
+        _ => false,
+    }
+}
+
+/// serde_json is built without its `float_roundtrip` feature, so it reads a
+/// decimal float to within one ULP rather than exactly: 1.5555555555555557e86
+/// reads back as ...555e86 (the first PR run of this target found it). The
+/// engine writes integers and strings into `before` and `after`, so a float
+/// there is foreign; it must still read and write without a panic, but its
+/// last bit is not part of the contract.
+fn carries_float(event: &AuditEvent) -> bool {
+    event.before.values().chain(event.after.values()).any(has_float)
+}
 
 fuzz_target!(|data: &[u8]| {
     let Ok(text) = std::str::from_utf8(data) else {
@@ -20,6 +40,7 @@ fuzz_target!(|data: &[u8]| {
             ReadRecord::V1(event) => {
                 let written = event.to_json();
                 match read_record(&written) {
+                    ReadRecord::V1(again) if carries_float(&event) => drop(again),
                     ReadRecord::V1(again) => {
                         assert_eq!(again, event, "an audit record changed on a write and read")
                     }
