@@ -5580,6 +5580,7 @@ mod tests {
             end_byte: end,
             file_size: end,
             mtime: String::new(),
+            ctime: None,
             content_fingerprint: None,
             tail_fingerprint: None,
         };
