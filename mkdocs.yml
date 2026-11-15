@@ -196,6 +196,7 @@ nav:
       - CLI (vtopctl): reference/cli.md
       - Archive path: reference/archive-path.md
       - Known limitations: reference/limitations.md
+      - Compatibility and upgrade policy: reference/compatibility.md
       - Data-safety register: reference/data-safety-register.md
       - Protocol (normative draft): VTOP_PROTOCOL_DRAFT.md
       - Design documents:
@@ -217,6 +218,5 @@ nav:
   - Roadmap and releases:
       - Roadmap: ROADMAP.md
       - Versioning and support: SUPPORT.md
-      - Deprecations: DEPRECATIONS.md
       - Releases: https://github.com/allamiro/vtop-engine/releases
   - Contributing: contributing.md
