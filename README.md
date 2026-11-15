@@ -270,6 +270,10 @@ The limits that matter most when evaluating it:
 - **Not built yet:** public-key manifest signatures and a million-file
   benchmark.
 
+Data-safety bugs were still being found as late as November 2026; each one is
+in the [data-safety register](docs/reference/data-safety-register.md). Keep the
+source data until a scrub of the archive passes.
+
 The full table, with what is done and what is planned, is in
 [limitations.md](docs/reference/limitations.md). Per-release limits are in
 [ROADMAP.md](docs/ROADMAP.md), and the engine's HA status is in
@@ -287,6 +291,7 @@ The full table, with what is done and what is planned, is in
 | [Archive path reference](docs/reference/archive-path.md) | sources, formats, the manifest, verification, recovery, metrics |
 | [PRODUCTION_HA.md](docs/PRODUCTION_HA.md) | engine HA: status, design and phased roadmap |
 | [ROADMAP.md](docs/ROADMAP.md) | cluster-plane releases and per-release limitations |
+| [Compatibility policy](docs/reference/compatibility.md) | what each format promises, upgrade and downgrade rules, deprecation |
 | [SECURITY_MODEL.md](docs/SECURITY_MODEL.md) | the security model and its normative rules |
 | [RELEASE_VERIFICATION.md](docs/RELEASE_VERIFICATION.md) | checking a release's signatures, SBOM and provenance |
 | [LIVE_CHAOS_VALIDATION.md](docs/LIVE_CHAOS_VALIDATION.md) | the live-chaos suite: real processes, real TLS, injected faults |
