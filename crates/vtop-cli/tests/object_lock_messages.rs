@@ -18,11 +18,16 @@
 //!   `object_key_fallback` WARN naming the batch, the old key and the new
 //!   key, in three parts, with no query string;
 //! - a replay that cannot read that object's retention: an ERROR, and no
-//!   fallback.
+//!   fallback;
+//! - a verification receipt the scrub found without its retention (#710):
+//!   `scrub_receipt_retention_finding`, a WARN with the batch id, the
+//!   receipt's URI and result, and a detail saying what happened, that the
+//!   scrub changed nothing, and what to do.
 #![cfg(unix)]
 
 use std::sync::Arc;
 
+use vtop_cli::scrub::{self, ScrubOptions};
 use vtop_core::config::ObjectLockMode;
 use vtop_core::types::SourceType;
 use vtop_upload::{LockFault, StoredRetention};
@@ -380,6 +385,63 @@ async fn the_object_lock_events_carry_what_an_operator_needs() {
                 "is not usable either",
                 "nothing was written: the batch was marked failed and will be replayed",
                 "check the bucket's Object Lock configuration",
+            ],
+        );
+    }
+
+    // ---- a receipt the scrub found without its retention (#710)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("app.log");
+        write_lines(&input, "app", 2);
+        let lock = governance();
+        let backend = Arc::new(locked_mock(&lock));
+        let mut cfg = config(dir.path(), "msg-receipt-retention", "telemetry-raw", &input);
+        cfg.manifest.verification_receipts = true;
+        let mut engine = engine(cfg, Some(lock), &backend).await;
+        let out = engine.process_once(SourceType::File).await.unwrap();
+        assert!(out[0].committed, "{out:?}");
+        let committed = row(&engine, &out[0].batch_id).await;
+        let ruri = vtop_core::partitioning::receipt_uri(committed.manifest_uri.as_deref().unwrap())
+            .unwrap();
+        backend.set_stored_retention(&ruri, None, StoredRetention::default());
+        let all = scrub::committed_rows(engine.store.list_batches().await.unwrap(), Vec::new());
+        let (logs, _guard) = Logs::capture();
+        let report = engine
+            .scrub(
+                all,
+                &ScrubOptions {
+                    check_retention: Some(ObjectLockMode::Governance),
+                    check_receipts: true,
+                    ..ScrubOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!report.passed, "{report:#?}");
+        let event = logs.events("scrub_receipt_retention_finding");
+        assert_eq!(event.len(), 1, "{}", logs.raw());
+        assert_eq!(text(&event[0], "batch_id"), out[0].batch_id);
+        assert_eq!(text(&event[0], "receipt_uri"), ruri);
+        assert_eq!(text(&event[0], "receipt_retention"), "missing");
+        let line = logs
+            .raw()
+            .lines()
+            .find(|l| l.contains("scrub_receipt_retention_finding"))
+            .map(str::to_owned)
+            .unwrap();
+        let line: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(line["level"], "WARN", "{line}");
+        assert_eq!(
+            text(&event[0], "message"),
+            "scrub receipt retention finding"
+        );
+        assert_says(
+            &text(&event[0], "detail"),
+            &[
+                "carries no retention",
+                "the scrub reported it and changed nothing",
+                "re-apply the retention with PutObjectRetention",
             ],
         );
     }

@@ -168,15 +168,19 @@ pub enum Command {
         /// pinned manifest) and expect the mode `upload.object_lock` sets.
         /// Reports locked, elapsed (an ended retention, not a finding),
         /// missing and mode_mismatch (findings). Needs `upload.object_lock`
-        /// in the config, and `s3:GetObjectRetention` on the bucket.
+        /// in the config, and `s3:GetObjectRetention` on the bucket. When
+        /// receipts are checked, also reads each existing verification
+        /// receipt's retention at its key (one more request per receipt),
+        /// reported apart from the batch's.
         #[arg(long)]
         check_retention: bool,
         /// Check each batch's verification receipt (#671), and report a
         /// missing one as a finding. Receipts are checked without this flag
         /// when the config sets `manifest.verification_receipts`, and then a
         /// missing one (such as a batch archived before receipts were
-        /// enabled) is counted, not a finding. Read-only: the scrub writes no
-        /// receipt.
+        /// enabled) is counted, not a finding. With --check-retention, each
+        /// existing receipt's retention is read too. Read-only: the scrub
+        /// writes no receipt.
         #[arg(long)]
         require_receipts: bool,
     },

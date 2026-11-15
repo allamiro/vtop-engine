@@ -61,7 +61,7 @@ pinned version.
 | `--sample` | - | Check this many batches chosen at random. Not with `--limit` or `--cursor-file`. |
 | `--seed` | random | The sample's seed; printed either way. Needs `--sample`. |
 | `--metrics-file` | - | Write the results as a Prometheus text file. Totals carry forward from the file it replaces. |
-| `--check-retention` | off | Also read each batch's S3 Object Lock retention and expect the mode `upload.object_lock` sets. Refused when the config has no `upload.object_lock`. See below. |
+| `--check-retention` | off | Also read each batch's S3 Object Lock retention, and each verification receipt's when receipts are checked, and expect the mode `upload.object_lock` sets. Refused when the config has no `upload.object_lock`. See below. |
 | `--require-receipts` | off | Check each batch's verification receipt, and report a missing one as a finding. Receipts are checked without it when the config sets `manifest.verification_receipts`; a missing one is then counted, not a finding. See below. |
 
 Each batch gets one result:
@@ -116,6 +116,31 @@ names, and bound to the ledger row. Counted in
 | `unauthenticated` | It names a key this config does not hold, or a retired one. Not proven bad. | Yes |
 | `mismatched` | Another batch's receipt, or one naming another manifest digest or version, another object, or another verification class than the ledger's. | Yes |
 | `unreadable` | The store answered with an error other than absence. | Yes |
+
+With both `--check-retention` and receipts checked (#710), the scrub also
+reads the retention of every receipt it found (including one that is
+`invalid`, `unauthenticated` or `mismatched`), at its current key, since
+receipts are not pinned in the ledger, and expects the same mode. That is one
+more request per receipt. It is counted in its own series,
+`vtop_scrub_receipt_retention_total{result}`, and printed as a `receipt
+retention:` line, so a receipt without a lock is never counted as an object
+without one; a finding prints as `FAIL receipt retention missing <batch>`:
+
+| Receipt retention | Meaning | Finding |
+|---|---|---|
+| `locked` | Under the configured mode until a date still ahead. | No |
+| `elapsed` | Under the configured mode until a date that has passed. | No |
+| `missing` | No retention: written before the profile was set, found unlocked by the engine's read-back after the write (it logged `verification_receipt_failed`), or removed by a principal allowed to bypass governance. The receipt can be deleted or overwritten. A scrub without `s3:GetObjectRetention` reads every lock as missing. | Yes |
+| `mode_mismatch` | Under another mode than the configured one. | Yes |
+
+A receipt finding is about the evidence, not the data: the batch's object and
+manifest are checked on their own, and a tampered receipt that is also
+unlocked gets both findings. A missing receipt is not read and is not a
+retention finding: it stays `missing` in `vtop_scrub_receipts_total`. A
+receipt whose retention cannot be read is an `unreadable` receipt, not an
+unreadable batch. Without `--check-retention`, or when receipts are not
+checked, no receipt's retention is read, and the metrics file carries the
+series' totals forward unchanged.
 
 The scrub writes no receipt. What a receipt proves is in
 [Verification receipts](verification-receipts.md).

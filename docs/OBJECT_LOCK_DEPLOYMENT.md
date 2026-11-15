@@ -229,7 +229,12 @@ the manifest at its pinned version, and expects the configured mode. It
 reports `locked`, `elapsed` (the retention has ended), `missing` and
 `mode_mismatch`. The last two are findings: an object that can now be
 deleted or overwritten. Use it after enabling the profile on an existing
-fleet, to find objects an older engine wrote unlocked. See
+fleet, to find objects an older engine wrote unlocked. When the scrub also
+checks verification receipts (`manifest.verification_receipts`, or
+`--require-receipts`), it reads each existing receipt's retention at its
+current key too (one more request per receipt, under the same
+`s3:GetObjectRetention` permission), and reports it apart, in
+`vtop_scrub_receipt_retention_total` (#710). See
 [Scrub and coverage audit](operate/scrub-and-audit.md).
 
 ## Storage cost

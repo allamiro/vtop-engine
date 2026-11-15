@@ -140,8 +140,16 @@ pub struct MockBackend {
     /// the key WITHOUT a lock (#684): the current version is then not the
     /// one this backend wrote.
     shadow_writes: bool,
-    /// When set, every `verify_retention` fails with this message.
-    retention_error: Option<String>,
+    /// When set, every `verify_retention` fails with this message. Settable
+    /// on a shared mock (#710), so the engine can commit before the scrub's
+    /// reads fail.
+    retention_error: Mutex<Option<String>>,
+    /// The URI of every `verify_retention` call, in order (#710), so a test
+    /// can pin which keys a scrub read the retention of, and which it did not.
+    retention_reads: Mutex<Vec<String>>,
+    /// When set, `retention_error` applies only to keys ending with this
+    /// suffix (#710), so a test can fail the receipts' reads alone.
+    retention_error_suffix: Mutex<Option<String>>,
     /// The engine's credentials lack `s3:GetObjectRetention` and
     /// `s3:GetObjectLegalHold` (#709): a HEAD answers with no lock headers,
     /// and `confirm_lock_absent` is refused, as S3 does.
@@ -267,9 +275,25 @@ impl MockBackend {
     }
 
     /// Every retention read fails with `message`.
-    pub fn with_retention_error(mut self, message: impl Into<String>) -> Self {
-        self.retention_error = Some(message.into());
+    pub fn with_retention_error(self, message: impl Into<String>) -> Self {
+        self.set_retention_error(Some(message.into()));
         self
+    }
+
+    /// Every retention read from now on fails with `message`, or none does.
+    pub fn set_retention_error(&self, message: Option<String>) {
+        *self.retention_error.lock().unwrap() = message;
+    }
+
+    /// Apply `retention_error` only to keys ending with `suffix`; `None`
+    /// applies it to every key, as before.
+    pub fn set_retention_error_only_for(&self, suffix: Option<&str>) {
+        *self.retention_error_suffix.lock().unwrap() = suffix.map(str::to_owned);
+    }
+
+    /// The URIs whose retention was read, in order (#710).
+    pub fn retention_reads(&self) -> Vec<String> {
+        self.retention_reads.lock().unwrap().clone()
     }
 
     /// Replace what the store keeps for one version, `None` for the current
@@ -430,7 +454,9 @@ impl MockBackend {
             object_lock: None,
             lock_fault: Mutex::new(None),
             shadow_writes: false,
-            retention_error: None,
+            retention_error: Mutex::new(None),
+            retention_reads: Mutex::new(Vec::new()),
+            retention_error_suffix: Mutex::new(None),
             lock_read_denied: false,
             bucket_object_lock: true,
             lock_config_calls: AtomicUsize::new(0),
@@ -1056,8 +1082,20 @@ impl UploadBackend for MockBackend {
         version_id: Option<&str>,
         expected: &RetentionExpectation,
     ) -> Result<RetentionCheck, VtopError> {
-        if let Some(message) = &self.retention_error {
-            return Err(VtopError::Upload(message.clone()));
+        self.retention_reads
+            .lock()
+            .unwrap()
+            .push(object_uri.to_owned());
+        let applies = self
+            .retention_error_suffix
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_none_or(|suffix| object_uri.ends_with(suffix));
+        if let Some(message) = self.retention_error.lock().unwrap().clone() {
+            if applies {
+                return Err(VtopError::Upload(message));
+            }
         }
         let version = match version_id {
             Some(version) => version.to_owned(),
