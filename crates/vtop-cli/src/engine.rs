@@ -2872,6 +2872,27 @@ impl Engine {
                 end_position(&rec.progress_end),
             )
         {
+            // Said, not silent (#782): with rewinds above a held range
+            // lowered to it, a row can wait here for as long as the source takes
+            // to be read again from its committed point.
+            if let Some(suppressed) = self.key_notices.admit("held_row_waiting", &rec.source_name) {
+                let (start, end) = (
+                    start_position(&rec.progress_start),
+                    end_position(&rec.progress_end),
+                );
+                tracing::warn!(
+                    batch_id = %rec.batch_id,
+                    source_type = %rec.source_type,
+                    source_name = %rec.source_name,
+                    start,
+                    end,
+                    suppressed,
+                    "a VERIFIED range {start}..{end} of {} is waiting for the source to commit past it; \
+                     a range below it is still being read again. It is committed automatically once that \
+                     has happened; nothing to do unless this repeats for hours",
+                    rec.source_name,
+                );
+            }
             return false;
         }
         // Renew the claim, fenced, BEFORE the source is touched (review of
@@ -3993,7 +4014,27 @@ impl Engine {
                         }
                         // Held (#639) otherwise: its range is not committed,
                         // so a VERIFIED range of the same unit above it must
-                        // not commit past it.
+                        // not commit past it, and a rewind above it starts at
+                        // it instead (#782).
+                        count_held(&rec, "newer_manifest");
+                        let (start, end) = (
+                            start_position(&rec.progress_start),
+                            end_position(&rec.progress_end),
+                        );
+                        tracing::warn!(
+                            batch_id = %rec.batch_id,
+                            source_type = %rec.source_type,
+                            source_name = %rec.source_name,
+                            start,
+                            end,
+                            "recovery holds batch {} (range {start}..{end} of {}): a newer release wrote it, \
+                             and this one cannot read its manifest. The engine left it VERIFIED and did not \
+                             hand it back on its own, and will not commit any range of the same source above it; \
+                             a rewind of a range above it starts at it instead. The row waits until an \
+                             upgraded engine commits it or the source has committed past it. Upgrade this engine",
+                            rec.batch_id,
+                            rec.source_name,
+                        );
                         rewinds.hold(&rec.progress_start);
                         summary.still_pending += 1;
                         spans::decide(&row, "held_unsupported_version");
@@ -4025,7 +4066,7 @@ impl Engine {
                             )
                             .await
                         {
-                            tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist re-check failure");
+                            self.report_lost_decision(&rec, BatchState::Failed, &e);
                             rewinds.hold(&rec.progress_start);
                             summary.still_pending += 1;
                             spans::decide_error(&row, "held_ledger_write_failed");
@@ -4040,13 +4081,13 @@ impl Engine {
                             )
                             .await
                         {
-                            tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist REPLAY_REQUIRED");
+                            self.report_lost_decision(&rec, BatchState::ReplayRequired, &e);
                             rewinds.hold(&rec.progress_start);
                             summary.still_pending += 1;
                             spans::decide_error(&row, "held_ledger_write_failed");
                             continue;
                         }
-                        rewinds.add(&rec.progress_start);
+                        rewinds.add_row(&rec);
                         scanned.push(RecordedWindow::from_row(&rec));
                         self.recorded.remember(RecordedWindow::from_row(&rec));
                         // Dashboards must see this refusal path like any other
@@ -4149,7 +4190,7 @@ impl Engine {
                         .mark_failed(&rec.batch_id, "recovered: replay required")
                         .await
                     {
-                        tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist the replay decision; not rewinding");
+                        self.report_lost_decision(&rec, BatchState::Failed, &e);
                         rewinds.hold(&rec.progress_start);
                         summary.still_pending += 1;
                         spans::decide_error(&row, "held_ledger_write_failed");
@@ -4164,13 +4205,13 @@ impl Engine {
                         )
                         .await
                     {
-                        tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist REPLAY_REQUIRED; not rewinding");
+                        self.report_lost_decision(&rec, BatchState::ReplayRequired, &e);
                         rewinds.hold(&rec.progress_start);
                         summary.still_pending += 1;
                         spans::decide_error(&row, "held_ledger_write_failed");
                         continue;
                     }
-                    rewinds.add(&rec.progress_start);
+                    rewinds.add_row(&rec);
                     // What the range was, read back from its row (#626): its
                     // re-read is sealed at the instant this row recorded.
                     scanned.push(RecordedWindow::from_row(&rec));
@@ -4203,6 +4244,30 @@ impl Engine {
         // Group by source type so each adapter rewinds its whole batch in one
         // call (see `SourceAdapter::replay_from_markers`).
         let mut by_source: Vec<(SourceType, Vec<ProgressMarker>)> = Vec::new();
+        // A rewind above a held range is applied at the held start instead
+        // (#782): see `RewindPlan::held_below`. Each is said and counted here.
+        for (rewind, held_start) in rewinds.lowered() {
+            let source_type = rewind.marker.source_type();
+            let source_name = marker_source_name(&rewind.marker);
+            let rewind_start = start_position(&rewind.marker);
+            if let Some(mx) = telemetry::metrics() {
+                mx.recovery_rewinds_lowered_total
+                    .with_label_values(&[rewind.tenant.as_str(), source_type.as_str()])
+                    .inc();
+            }
+            tracing::warn!(
+                source_type = %source_type,
+                source_name = %source_name,
+                rewind_start,
+                held_start,
+                "recovery is rewinding {source_name} to {held_start}, not {rewind_start}: a range below \
+                 it, starting at {held_start}, is held (its replay decision could not be recorded, or a \
+                 newer release wrote it; see the line logged for it above). The engine reads both ranges \
+                 again from the held start (some ranges may be archived twice; none is skipped), and no \
+                 VERIFIED range above the held one is committed. Fix what that line names; a later start \
+                 resolves the old rows"
+            );
+        }
         for marker in rewinds.markers() {
             match by_source
                 .iter_mut()
@@ -4255,8 +4320,10 @@ impl Engine {
                 spans::decide(&commit_span, "held_back");
                 tracing::warn!(
                     batch_id = %rec.batch_id,
-                    "recovery: not committing a VERIFIED range above an incomplete one of the same source; \
-                     it stays VERIFIED until the lower range has been re-read"
+                    "recovery: not committing a VERIFIED range above a range of the same source that is \
+                     being read again or is held (its replay decision could not be recorded, or a newer \
+                     release wrote it); it stays VERIFIED, and is committed once the source has committed \
+                     past it; nothing to do"
                 );
                 summary.still_pending += 1;
                 let at_hold = self
@@ -4375,13 +4442,36 @@ impl Engine {
     /// A source refused to hand a failed range back (#621): counted under the
     /// tenant the range's source is charged to, like a read error.
     fn count_refused_replay(&self, source_type: &SourceType, marker: &ProgressMarker) {
-        let source_name = match marker {
-            ProgressMarker::Kafka { topic, .. } => topic.as_str(),
-            ProgressMarker::File { path, .. } | ProgressMarker::SyslogSpool { path, .. } => {
-                path.as_str()
-            }
-        };
-        self.count_refused_replay_of(source_type, source_name);
+        self.count_refused_replay_of(source_type, marker_source_name(marker));
+    }
+
+    /// Recovery could not record `rec`'s replay decision - the `write` to
+    /// that state was refused - so the range is held, not rewound (#639).
+    /// Said in full and counted (#782): the hold now also lowers every
+    /// rewind above it to its start, which the operator sees as ranges
+    /// archived twice.
+    fn report_lost_decision(&self, rec: &BatchRecord, write: BatchState, error: &VtopError) {
+        count_held(rec, "ledger_write_failed");
+        let (start, end) = (
+            start_position(&rec.progress_start),
+            end_position(&rec.progress_end),
+        );
+        tracing::error!(
+            batch_id = %rec.batch_id,
+            source_type = %rec.source_type,
+            source_name = %rec.source_name,
+            start,
+            end,
+            write = %write,
+            error = %error,
+            "recovery could not record the replay decision for batch {} (range {start}..{end} of {}): \
+             {error}. The engine did not hand it back on its own, and will not commit any range of the \
+             same source above it until it has been read again; a rewind of a range above it starts at \
+             it instead, so it is read again with that range. Check the state store (disk space, permissions, connectivity); no data is at risk, and the \
+             next start records the decision",
+            rec.batch_id,
+            rec.source_name,
+        );
     }
 
     fn count_refused_replay_of(&self, source_type: &SourceType, source_name: &str) {
@@ -5144,6 +5234,9 @@ struct Rewind {
     /// resumes, and that must be the most recent file, not whichever inode
     /// sorts last as text (review of #563).
     recency: u64,
+    /// The tenant of the row whose start this is, for counting the rewind
+    /// when it is lowered to a held start (#782).
+    tenant: String,
 }
 
 impl Rewind {
@@ -5151,6 +5244,21 @@ impl Rewind {
         self.contents
             .iter()
             .any(|mine| proven_other(Some(mine), content))
+    }
+
+    /// Whether `content` is proven other than EVERY content this
+    /// generation's ranges carried (#782): the test for a held range below
+    /// it, biased towards lowering the rewind. "Any" is the wrong test there: a file
+    /// under one page fingerprints a different length at each read, so one
+    /// generation can carry several fingerprints, and a held range proven
+    /// other than one of them may still be the same file as another. A
+    /// generation that carried none is proven other than nothing.
+    fn proven_other_than_all(&self, content: Option<&ContentFingerprint>) -> bool {
+        !self.contents.is_empty()
+            && self
+                .contents
+                .iter()
+                .all(|mine| proven_other(Some(mine), content))
     }
 }
 
@@ -5208,10 +5316,42 @@ fn note_pending(groups: &mut HashMap<String, Vec<PendingGroup>>, start: &Progres
     }
 }
 
+/// The lowest start among `pending`'s groups for `marker`'s source that lies
+/// below `from` and may be the file `marker` was read from: the same inode,
+/// or either side has none, and content `other` does not prove to be another
+/// file's. The one test behind [`RewindPlan::holds_back`] and
+/// [`RewindPlan::held_below`].
+fn lowest_pending_below(
+    pending: &HashMap<String, Vec<PendingGroup>>,
+    marker: &ProgressMarker,
+    from: i128,
+    other: impl Fn(&PendingGroup) -> bool,
+) -> Option<i128> {
+    let inode = marker_inode(marker);
+    pending
+        .get(&source_key(marker))?
+        .iter()
+        .filter(|group| inode.is_none() || group.inode.is_none() || group.inode == inode)
+        .filter(|group| !other(group))
+        .map(|group| group.lowest)
+        .filter(|&lowest| lowest < from)
+        .min()
+}
+
 impl RewindPlan {
+    /// Record that `rec`'s range is being handed back to its source.
+    fn add_row(&mut self, rec: &BatchRecord) {
+        self.add_start(&rec.progress_start, &rec.tenant);
+    }
+
+    #[cfg(test)]
+    fn add(&mut self, start: &ProgressMarker) {
+        self.add_start(start, "");
+    }
+
     /// Record that the range starting at `start` is being handed back to its
     /// source. (Only where it starts matters: see [`RewindPlan::holds_back`].)
-    fn add(&mut self, start: &ProgressMarker) {
+    fn add_start(&mut self, start: &ProgressMarker, tenant: &str) {
         let position = start_position(start);
         note_pending(&mut self.by_source, start);
         self.added += 1;
@@ -5230,12 +5370,14 @@ impl RewindPlan {
                 }
                 if position < start_position(&generation.marker) {
                     generation.marker = start.clone();
+                    tenant.clone_into(&mut generation.tenant);
                 }
             }
             None => generations.push(Rewind {
                 marker: start.clone(),
                 contents: content.into_iter().cloned().collect(),
                 recency: self.added,
+                tenant: tenant.to_owned(),
             }),
         }
     }
@@ -5254,6 +5396,9 @@ impl RewindPlan {
     /// It produces no rewind ([`RewindPlan::markers`]), and [`RewindPlan::rebase`]
     /// does not move it: no rewind lands for it, so a landing at its file
     /// (another range's) says nothing about whether its bytes are archived.
+    ///
+    /// And it lowers every rewind above it in its unit to its start (#782):
+    /// see [`RewindPlan::held_below`].
     fn hold(&mut self, start: &ProgressMarker) {
         note_pending(&mut self.held, start);
     }
@@ -5326,21 +5471,67 @@ impl RewindPlan {
     /// re-read, with the same inode and content rules.
     fn holds_back(&self, start: &ProgressMarker) -> bool {
         let from = start_position(start);
-        let inode = marker_inode(start);
         let content = start.content_fingerprint();
         [&self.by_source, &self.held].into_iter().any(|pending| {
-            pending.get(&source_key(start)).is_some_and(|groups| {
-                groups
-                    .iter()
-                    .filter(|group| {
-                        inode.is_none() || group.inode.is_none() || group.inode == inode
-                    })
-                    .filter(|group| !group.proven_other(content))
-                    .any(|group| group.lowest < from)
-            })
+            lowest_pending_below(pending, start, from, |group| group.proven_other(content))
+                .is_some()
         })
     }
 
+    /// The lowest HELD start of `rewind`'s unit below the rewind's own, if
+    /// there is one: the rewind is then applied at that start instead of its
+    /// own (#782).
+    ///
+    /// A rewind moves the read head FORWARD when its start is above the
+    /// committed point (the adapters set it to `max(start, committed)`). With
+    /// a held range below it, the head passed the held range, and the
+    /// running pipeline's commit of the rewound range moved the committed
+    /// point past it as well: nothing read it again, and with
+    /// `delete_after_commit` its file could be deleted. Lowered to the held
+    /// start, the rewind lands at or below the held range, and the pipeline
+    /// reads it and everything above it again in order. Reads are
+    /// contiguous, so no batch commits past the held range without covering
+    /// it. The cost is that the ranges above it are archived twice.
+    ///
+    /// Lowered, not left out (review of #785): leaving it out relied on the
+    /// read head starting at the committed point, and two heads do not. A
+    /// file rotated away while the engine was down is read only through a
+    /// rewind (#621), so without one neither range was read again; and a
+    /// Kafka partition whose group never committed follows
+    /// `auto.offset.reset`. The rewind does hand the held range back without
+    /// its decision recorded, which costs at most a duplicate, for the
+    /// reason the running engine's rewind is unconditional (#627).
+    ///
+    /// The same inode rules as [`RewindPlan::holds_back`]; a held range is
+    /// set aside only when its content is proven other than every content
+    /// the rewind's generation carried. A held start equal to the rewind's
+    /// leaves it as it is. Decided when the plan is read, after the scan:
+    /// rows come oldest first, so a rewind can be added before the hold
+    /// below it.
+    fn held_below(&self, rewind: &Rewind) -> Option<i128> {
+        lowest_pending_below(
+            &self.held,
+            &rewind.marker,
+            start_position(&rewind.marker),
+            |group| rewind.proven_other_than_all(group.content.as_ref()),
+        )
+    }
+
+    /// The rewinds [`RewindPlan::markers`] lowers to a held start, each with
+    /// that start, in a fixed order for the log.
+    fn lowered(&self) -> Vec<(&Rewind, i128)> {
+        let mut lowered: Vec<(&Rewind, i128)> = self
+            .lowest
+            .values()
+            .flatten()
+            .filter_map(|rewind| self.held_below(rewind).map(|held| (rewind, held)))
+            .collect();
+        lowered.sort_by_cached_key(|(rewind, _)| rewind_key(&rewind.marker));
+        lowered
+    }
+
+    /// The rewinds to apply, each lowered to the held start below it where
+    /// there is one ([`RewindPlan::held_below`]).
     fn markers(&self) -> Vec<ProgressMarker> {
         let mut rewinds: Vec<&Rewind> = self.lowest.values().flatten().collect();
         // Grouped by source, and within a source oldest file first so the most
@@ -5355,7 +5546,10 @@ impl RewindPlan {
         });
         rewinds
             .into_iter()
-            .map(|rewind| rewind.marker.clone())
+            .map(|rewind| match self.held_below(rewind) {
+                Some(held) => starting_at(&rewind.marker, held),
+                None => rewind.marker.clone(),
+            })
             .collect()
     }
 }
@@ -5372,6 +5566,44 @@ fn source_key(marker: &ProgressMarker) -> String {
         } => format!("kafka|{consumer_group}|{topic}#p{partition}"),
         ProgressMarker::File { path, .. } => format!("file|{path}"),
         ProgressMarker::SyslogSpool { spool_id, path, .. } => format!("spool|{spool_id}|{path}"),
+    }
+}
+
+/// `marker` with its start moved to `position` within its unit (#782): the
+/// same file or partition and identity, read again from there.
+fn starting_at(marker: &ProgressMarker, position: i128) -> ProgressMarker {
+    let mut marker = marker.clone();
+    match &mut marker {
+        ProgressMarker::Kafka { start_offset, .. } => {
+            if let Ok(position) = i64::try_from(position) {
+                *start_offset = position;
+            }
+        }
+        ProgressMarker::File { start_byte, .. }
+        | ProgressMarker::SyslogSpool { start_byte, .. } => {
+            if let Ok(position) = u64::try_from(position) {
+                *start_byte = position;
+            }
+        }
+    }
+    marker
+}
+
+/// The name a marker's source goes by in logs: a path, or a Kafka topic.
+fn marker_source_name(marker: &ProgressMarker) -> &str {
+    match marker {
+        ProgressMarker::Kafka { topic, .. } => topic,
+        ProgressMarker::File { path, .. } | ProgressMarker::SyslogSpool { path, .. } => path,
+    }
+}
+
+/// Count a range recovery held instead of rewinding (#782), by one of
+/// `telemetry::RECOVERY_HOLD_REASONS`.
+fn count_held(rec: &BatchRecord, reason: &'static str) {
+    if let Some(mx) = telemetry::metrics() {
+        mx.recovery_held_total
+            .with_label_values(&[rec.tenant.as_str(), rec.source_type.as_str(), reason])
+            .inc();
     }
 }
 
@@ -10563,6 +10795,855 @@ mod tests {
             row_at(&fourth, 1).await.state,
             BatchState::SourceCommitted,
             "the hold on offset 1 is released once offset 0 is archived"
+        );
+    }
+
+    /// #782: a rewind that starts above a HELD start of the same unit is
+    /// applied at the held start instead, whichever of the two the scan met
+    /// first. Applied at its own start, it moved the read head past the held
+    /// range; the running pipeline's commit of the higher range then moved
+    /// the committed point past it too, and the held range was never
+    /// archived. The same inode, content and partition rules as
+    /// [`RewindPlan::holds_back`] decide which held ranges count, biased
+    /// towards lowering the rewind.
+    #[test]
+    fn a_rewind_above_a_held_range_of_its_unit_starts_at_the_held_range() {
+        let page = |tag: u8| ContentFingerprint::of(&[tag; 5_000]);
+        let file =
+            |path: &str, inode: Option<u64>, start: u64, content: Option<ContentFingerprint>| {
+                ProgressMarker::File {
+                    path: path.into(),
+                    inode,
+                    start_byte: start,
+                    end_byte: 21,
+                    file_size: 8_192,
+                    mtime: String::new(),
+                    ctime: None,
+                    content_fingerprint: content,
+                    tail_fingerprint: None,
+                }
+            };
+        // The same marker, read again from `start`.
+        let from = |marker: &ProgressMarker, start: u64| {
+            let mut marker = marker.clone();
+            match &mut marker {
+                ProgressMarker::File { start_byte, .. }
+                | ProgressMarker::SyslogSpool { start_byte, .. } => *start_byte = start,
+                ProgressMarker::Kafka { start_offset, .. } => {
+                    *start_offset = i64::try_from(start).unwrap();
+                }
+            }
+            marker
+        };
+        let a = || file("/a", Some(1), 0, page(b'A'));
+        let c = || file("/a", Some(1), 14, page(b'A'));
+        let rewinds = |held: &ProgressMarker, rewound: &ProgressMarker| {
+            let mut plan = RewindPlan::default();
+            plan.hold(held);
+            plan.add(rewound);
+            plan.markers()
+        };
+
+        assert_eq!(
+            rewinds(&a(), &c()),
+            vec![from(&c(), 0)],
+            "C [14, 21) is rewound past the held A [0, 7)"
+        );
+        // The scan meets rows oldest first, so a higher range's rewind can be
+        // in the plan before the hold below it is.
+        let mut plan = RewindPlan::default();
+        plan.add(&c());
+        plan.hold(&a());
+        assert_eq!(
+            plan.markers(),
+            vec![from(&c(), 0)],
+            "the rewind was added first"
+        );
+        // Several held ranges below: the lowest.
+        let mut plan = RewindPlan::default();
+        plan.hold(&file("/a", Some(1), 7, page(b'A')));
+        plan.hold(&a());
+        plan.add(&c());
+        assert_eq!(plan.markers(), vec![from(&c(), 0)], "two held ranges");
+
+        // Biased towards lowering: what cannot be told apart counts.
+        for (case, held) in [
+            (
+                "content that cannot be compared",
+                file("/a", Some(1), 0, None),
+            ),
+            (
+                "a held range with no inode",
+                file("/a", None, 0, page(b'A')),
+            ),
+        ] {
+            assert_eq!(rewinds(&held, &c()), vec![from(&c(), 0)], "{case}");
+        }
+        let legacy = file("/a", None, 14, page(b'A'));
+        assert_eq!(
+            rewinds(&a(), &legacy),
+            vec![from(&legacy, 0)],
+            "a rewind with no inode"
+        );
+
+        // What leaves the rewind as it is.
+        for (case, held, rewound) in [
+            (
+                "a held start above the rewind",
+                c(),
+                file("/a", Some(1), 0, page(b'A')),
+            ),
+            ("a held start equal to the rewind's", c(), c()),
+            ("another inode", file("/a", Some(2), 0, page(b'A')), c()),
+            (
+                "content proven to be another file's",
+                file("/a", Some(1), 0, page(b'B')),
+                c(),
+            ),
+            ("another path", file("/b", Some(1), 0, page(b'A')), c()),
+        ] {
+            assert_eq!(rewinds(&held, &rewound), vec![rewound.clone()], "{case}");
+        }
+
+        // A generation whose ranges carried two fingerprints (a file under one
+        // page fingerprints a different length at each read) is lowered
+        // unless the held range is proven other than BOTH. Proven other than
+        // the shorter one alone says nothing about the longer.
+        let text = [b'x'; 300];
+        let other = ContentFingerprint::of(&[b'y'; 100]);
+        let one = file("/a", Some(1), 100, ContentFingerprint::of(&text[..100]));
+        let mut plan = RewindPlan::default();
+        plan.add(&one);
+        plan.add(&file(
+            "/a",
+            Some(1),
+            150,
+            ContentFingerprint::of(&text[..200]),
+        ));
+        plan.hold(&file("/a", Some(1), 0, other.clone()));
+        assert_eq!(
+            plan.markers(),
+            vec![from(&one, 0)],
+            "held content proven other than one fingerprint of two"
+        );
+        assert_eq!(
+            rewinds(&file("/a", Some(1), 0, other), &one),
+            vec![one.clone()],
+            "held content proven other than the generation's only fingerprint"
+        );
+
+        let kafka = |group: &str, partition: i32, start: i64| ProgressMarker::Kafka {
+            topic: "t".into(),
+            partition,
+            start_offset: start,
+            end_offset: 2,
+            consumer_group: group.into(),
+        };
+        assert_eq!(
+            rewinds(&kafka("g", 0, 0), &kafka("g", 0, 2)),
+            vec![kafka("g", 0, 0)]
+        );
+        for (case, held) in [
+            ("another partition", kafka("g", 1, 0)),
+            ("another group", kafka("h", 0, 0)),
+        ] {
+            assert_eq!(
+                rewinds(&held, &kafka("g", 0, 2)),
+                vec![kafka("g", 0, 2)],
+                "{case}"
+            );
+        }
+
+        let spool = |path: &str, start: u64| ProgressMarker::SyslogSpool {
+            spool_id: "s".into(),
+            path: path.into(),
+            inode: Some(7),
+            start_byte: start,
+            end_byte: 21,
+            received_time_start: None,
+            received_time_end: None,
+            file_size: None,
+            content_fingerprint: None,
+        };
+        assert_eq!(
+            rewinds(&spool("/spool", 0), &spool("/spool", 14)),
+            vec![spool("/spool", 0)]
+        );
+        assert_eq!(
+            rewinds(&spool("/other", 0), &spool("/spool", 14)),
+            vec![spool("/spool", 14)],
+            "another spool file"
+        );
+    }
+
+    /// The ledger #782 starts from, left by a first engine, `first`, whose
+    /// `source` reads A, then (after `grow_b`) B, then (after `grow_c`) C:
+    /// - A, the lowest range: left mid-pipeline when `a_row` is set (as
+    ///   [`leave_a_lower_range_and_a_verified_one_above_it`] leaves it), or
+    ///   read and dropped with no row at all, for a test to write its own;
+    /// - B: VERIFIED, its commit refused;
+    /// - C: left mid-pipeline, its seal refused.
+    async fn leave_three_ranges(
+        first: &mut Engine,
+        source: SourceType,
+        a_row: bool,
+        grow_b: impl FnOnce(),
+        grow_c: impl FnOnce(),
+    ) {
+        use BatchState::*;
+        use LedgerWrite::To;
+        if a_row {
+            leave_a_lower_range_and_a_verified_one_above_it(
+                first,
+                source.clone(),
+                LostDecision::DecisionFailed,
+                grow_b,
+            )
+            .await;
+        } else {
+            read_and_drop(first.adapters.get_mut(&source).unwrap().as_mut()).await;
+            grow_b();
+            FaultyLedger::install(first, &[To(SourceCommitted)]).await;
+            assert!(
+                first.process_once(source.clone()).await.is_err(),
+                "B verifies and its commit write fails"
+            );
+        }
+        // B's commit is retried after C's pass (#624); refused again, the
+        // ledger keeps B VERIFIED, as the crash left it.
+        FaultyLedger::install(first, &[To(Sealed), To(SourceCommitted)]).await;
+        grow_c();
+        assert!(
+            first.process_once(source).await.is_err(),
+            "C's seal write fails"
+        );
+    }
+
+    /// The state the ledger holds for `batch_id`.
+    async fn state_of(engine: &Engine, batch_id: &str) -> BatchState {
+        engine
+            .store
+            .get_batch(batch_id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("the ledger has no row {batch_id}"))
+            .state
+    }
+
+    /// One file of three lines, A [0, 7), B [7, 14) and C [14, 21), left by a
+    /// crash as [`leave_three_ranges`] leaves them (#782), and the engines
+    /// that restart on it: each one the same ledger and object store, a
+    /// fresh process seeded from the ledger alone.
+    struct ThreeLines {
+        dir: tempfile::TempDir,
+        input: std::path::PathBuf,
+        url: String,
+        backend: Arc<vtop_upload::MockBackend>,
+        tenant: &'static str,
+    }
+
+    impl ThreeLines {
+        async fn left_by_a_crash(tenant: &'static str, a_row: bool) -> Self {
+            use BatchState::*;
+            let dir = tempfile::tempdir().unwrap();
+            let input = dir.path().join("in.log");
+            std::fs::write(&input, "line 1\n").unwrap(); // A: [0, 7)
+            let url = format!("sqlite://{}", dir.path().join("state.db").display());
+            let fixture = Self {
+                dir,
+                input,
+                url,
+                backend: Arc::new(vtop_upload::MockBackend::new()),
+                tenant,
+            };
+            let append = |line: &str| {
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&fixture.input)
+                    .unwrap();
+                writeln!(f, "{line}").unwrap();
+            };
+            let mut first = fixture.engine("work-1", |_| {}).await;
+            leave_three_ranges(
+                &mut first,
+                SourceType::File,
+                a_row,
+                || append("line 2"), // B: [7, 14)
+                || append("line 3"), // C: [14, 21)
+            )
+            .await;
+            if a_row {
+                assert_eq!(row_at(&first, 0).await.state, Batching);
+            }
+            let b = row_at(&first, 7).await;
+            assert_eq!((unit_range(&b), b.state), ((7, 14), Verified));
+            let c = row_at(&first, 14).await;
+            assert_eq!((unit_range(&c), c.state), ((14, 21), Batching));
+            drop(first);
+            fixture
+        }
+
+        async fn engine(&self, work: &str, tweak: impl FnOnce(&mut VtopConfig)) -> Engine {
+            let mut cfg = file_config(
+                self.dir.path().join(work).to_str().unwrap(),
+                &self.url,
+                vec![self.input.to_string_lossy().into_owned()],
+                "mock",
+            );
+            cfg.engine.tenant = self.tenant.into();
+            cfg.batching.max_batch_age_seconds = 3_600;
+            tweak(&mut cfg);
+            let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+                .await
+                .unwrap();
+            engine.backend = self.backend.clone();
+            engine
+        }
+
+        /// A restart whose store refuses A's replay decision: recovery visits
+        /// rows oldest first, so the first FAILED write it makes is A's, and
+        /// C's lands.
+        async fn restart_refusing_a(
+            &self,
+            work: &str,
+            tweak: impl FnOnce(&mut VtopConfig),
+        ) -> (Engine, RecoverySummary) {
+            let mut engine = self.engine(work, tweak).await;
+            FaultyLedger::install(&mut engine, &[LedgerWrite::To(BatchState::Failed)]).await;
+            let summary = engine.recover().await.unwrap();
+            assert_ne!(
+                row_at(&engine, 0).await.state,
+                BatchState::ReplayRequired,
+                "the refused write kept A's replay decision out of the ledger"
+            );
+            assert_eq!(
+                row_at(&engine, 7).await.state,
+                BatchState::Verified,
+                "B is held back above A: {summary:?}"
+            );
+            assert_eq!(
+                row_at(&engine, 14).await.state,
+                BatchState::ReplayRequired,
+                "C's replay decision is recorded: {summary:?}"
+            );
+            (engine, summary)
+        }
+
+        /// Where the file's read head stands for C's range after recovery.
+        async fn head_at_c(&self, engine: &Engine) -> Option<i128> {
+            let c = row_at(engine, 14).await;
+            engine
+                .adapters
+                .get(&SourceType::File)
+                .unwrap()
+                .read_position(&c.progress_start)
+        }
+    }
+
+    /// The sum of the counter `name`'s series that carry every label of
+    /// `labels`.
+    fn counter_value(name: &str, labels: &[(&str, &str)]) -> u64 {
+        let mx = telemetry::init().unwrap();
+        mx.registry
+            .gather()
+            .iter()
+            .filter(|f| f.name() == name)
+            .flat_map(|f| f.get_metric().iter())
+            .filter(|m| {
+                labels.iter().all(|(name, value)| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == *name && l.value() == *value)
+                })
+            })
+            .map(|m| m.get_counter().get_value() as u64)
+            .sum()
+    }
+
+    /// Log lines a test reads back: the fmt layer's text, without colour.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        /// Capture WARN and above on this thread until the guard drops (a
+        /// `#[tokio::test]` runs its tasks on the one thread).
+        fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+            let logs = Self::default();
+            let writer = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            (logs, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8_lossy(&self.0.lock().unwrap())
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// The one line that contains `phrase`.
+        fn line(&self, phrase: &str) -> String {
+            let lines: Vec<_> = self
+                .lines()
+                .into_iter()
+                .filter(|line| line.contains(phrase))
+                .collect();
+            assert_eq!(
+                lines.len(),
+                1,
+                "one line saying {phrase:?}; the log was:\n{}",
+                self.lines().join("\n")
+            );
+            lines.into_iter().next().unwrap()
+        }
+    }
+
+    /// #782, the issue's sequence: A [0, 7) is held because its replay
+    /// decision cannot be recorded, B [7, 14) is VERIFIED and held back, C
+    /// [14, 21) is replayed. C's rewind moved the read head to 14, the
+    /// running pipeline archived and committed [14, 21), and A was never
+    /// archived. C's rewind starts at A instead, and the pipeline reads A, B
+    /// and C again in order.
+    #[tokio::test]
+    async fn a_range_held_by_recovery_is_not_passed_by_the_running_pipeline() {
+        let fixture = ThreeLines::left_by_a_crash("held-782-file", true).await;
+        let (mut second, _) = fixture.restart_refusing_a("work-2", |_| {}).await;
+        let head = fixture.head_at_c(&second).await;
+        second.process_once(SourceType::File).await.unwrap();
+        assert_committed_without_a_gap("a held A below a replayed C", &second, 21).await;
+        assert_ne!(
+            head,
+            Some(14),
+            "C's rewind moved the read head past the held A [0, 7)"
+        );
+        assert_eq!(
+            row_at(&second, 7).await.state,
+            BatchState::SourceCommitted,
+            "B settles once the source has committed past it"
+        );
+    }
+
+    /// #782 for a Kafka partition, which resumes from the ledger's frontier
+    /// (#614): C's rewind put the partition's next offset at C, and the
+    /// commit of C moved the frontier past A.
+    #[tokio::test]
+    async fn a_kafka_range_held_by_recovery_is_not_passed_by_the_running_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("state.db").display());
+        let backend = Arc::new(vtop_upload::MockBackend::new());
+        let log_end = Arc::new(std::sync::atomic::AtomicI64::new(1)); // A: offset 0
+        let engine = |work: &str| {
+            let cfg = {
+                let mut cfg = file_config(
+                    dir.path().join(work).to_str().unwrap(),
+                    &url,
+                    Vec::new(),
+                    "mock",
+                );
+                cfg.batching.max_batch_age_seconds = 3_600;
+                cfg.sources.file = None;
+                cfg
+            };
+            let backend = backend.clone();
+            let log_end = log_end.clone();
+            async move {
+                let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+                    .await
+                    .unwrap();
+                engine.backend = backend;
+                let partition =
+                    LedgerFrontierPartition::seeded(engine.store.as_ref(), log_end).await;
+                engine
+                    .adapters
+                    .insert(SourceType::Kafka, Box::new(partition));
+                engine
+            }
+        };
+
+        let mut first = engine("work-1").await;
+        leave_three_ranges(
+            &mut first,
+            SourceType::Kafka,
+            true,
+            || log_end.store(2, std::sync::atomic::Ordering::SeqCst), // B: offset 1
+            || log_end.store(3, std::sync::atomic::Ordering::SeqCst), // C: offset 2
+        )
+        .await;
+        assert_eq!(row_at(&first, 0).await.state, BatchState::Batching);
+        assert_eq!(row_at(&first, 1).await.state, BatchState::Verified);
+        assert_eq!(row_at(&first, 2).await.state, BatchState::Batching);
+        drop(first);
+
+        let mut second = engine("work-2").await;
+        FaultyLedger::install(&mut second, &[LedgerWrite::To(BatchState::Failed)]).await;
+        let summary = second.recover().await.unwrap();
+        assert_eq!(
+            row_at(&second, 2).await.state,
+            BatchState::ReplayRequired,
+            "{summary:?}"
+        );
+        assert_eq!(
+            row_at(&second, 1).await.state,
+            BatchState::Verified,
+            "{summary:?}"
+        );
+        second.process_once(SourceType::Kafka).await.unwrap();
+        assert_committed_without_a_gap("kafka: a held offset 0 below a replayed 2", &second, 3)
+            .await;
+        drop(second);
+
+        // The partition's frontier is past offset 1 now, so B commits.
+        let mut third = engine("work-3").await;
+        third.recover().await.unwrap();
+        assert_eq!(row_at(&third, 1).await.state, BatchState::SourceCommitted);
+        assert_committed_without_a_gap("kafka, after a restart", &third, 3).await;
+    }
+
+    /// #782: the store refuses A's decision at one start and records it at
+    /// the next, before any pass ran. The second start replays A and C from
+    /// A, holds B back, and the pass that follows archives everything.
+    #[tokio::test]
+    async fn a_held_range_whose_decision_lands_at_the_next_start_is_read_from_its_start() {
+        use BatchState::*;
+        let fixture = ThreeLines::left_by_a_crash("held-782-later", true).await;
+        let (second, _) = fixture.restart_refusing_a("work-2", |_| {}).await;
+        drop(second);
+
+        let mut third = fixture.engine("work-3", |_| {}).await;
+        let summary = third.recover().await.unwrap();
+        assert_eq!(row_at(&third, 0).await.state, ReplayRequired, "{summary:?}");
+        assert_eq!(row_at(&third, 7).await.state, Verified, "{summary:?}");
+        assert_eq!(
+            row_at(&third, 14).await.state,
+            ReplayRequired,
+            "{summary:?}"
+        );
+        let a = row_at(&third, 0).await;
+        assert_eq!(
+            third
+                .adapters
+                .get(&SourceType::File)
+                .unwrap()
+                .read_position(&a.progress_start),
+            Some(0),
+            "A is read again from its start"
+        );
+        third.process_once(SourceType::File).await.unwrap();
+        assert_committed_without_a_gap("A's decision recorded late", &third, 21).await;
+        drop(third);
+
+        let mut fourth = fixture.engine("work-4", |_| {}).await;
+        fourth.recover().await.unwrap();
+        assert_eq!(row_at(&fourth, 7).await.state, SourceCommitted);
+        assert_committed_without_a_gap("A's decision recorded late, restarted", &fourth, 21).await;
+    }
+
+    /// #782: nothing of the hold outlives the process but the ledger rows.
+    /// A restart after the pass that read A, B and C again retires A's and
+    /// C's old rows, rewinds nothing, and leaves no gap.
+    #[tokio::test]
+    async fn a_restart_after_the_held_range_was_read_again_retires_its_old_rows() {
+        let fixture = ThreeLines::left_by_a_crash("held-782-retire", true).await;
+        let (mut second, _) = fixture.restart_refusing_a("work-2", |_| {}).await;
+        second.process_once(SourceType::File).await.unwrap();
+        drop(second);
+
+        let mut third = fixture.engine("work-3", |_| {}).await;
+        let summary = third.recover().await.unwrap();
+        assert_committed_without_a_gap("restarted after the re-read", &third, 21).await;
+        assert_eq!(summary.superseded, 2, "A's and C's old rows: {summary:?}");
+        assert_eq!(summary.replay_required, 0, "{summary:?}");
+        assert_eq!(summary.still_pending, 0, "{summary:?}");
+    }
+
+    /// #782: the store refuses A's decision at two starts in a row. The hold
+    /// is derived again from the ledger alone at the second, C's rewind is
+    /// lowered to A again, and the pass leaves no gap.
+    #[tokio::test]
+    async fn a_hold_is_derived_again_at_a_restart_whose_store_still_refuses() {
+        let fixture = ThreeLines::left_by_a_crash("held-782-again", true).await;
+        let (second, _) = fixture.restart_refusing_a("work-2", |_| {}).await;
+        drop(second);
+        let (mut third, _) = fixture.restart_refusing_a("work-3", |_| {}).await;
+        let head = fixture.head_at_c(&third).await;
+        third.process_once(SourceType::File).await.unwrap();
+        assert_committed_without_a_gap("refused at two starts", &third, 21).await;
+        assert_ne!(head, Some(14), "C's rewind moved the read head past A");
+    }
+
+    /// #782 with `delete_after_commit`: the commit of C reached the end of
+    /// the file and the file was deleted with A's bytes unarchived, so they
+    /// could not even be read again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_held_range_is_archived_before_its_file_is_deleted() {
+        let fixture = ThreeLines::left_by_a_crash("held-782-delete", true).await;
+        let deleting = |cfg: &mut VtopConfig| {
+            let file = cfg.sources.file.as_mut().unwrap();
+            file.delete_after_commit = true;
+            file.delete_quiet_seconds = 0;
+            file.delete_without_open_check = true;
+        };
+        let (mut second, _) = fixture.restart_refusing_a("work-2", deleting).await;
+        let text = std::fs::read_to_string(&fixture.input).unwrap();
+        assert!(
+            text.starts_with("line 1\n"),
+            "A's bytes are in the file after recovery: {text:?}"
+        );
+        second.process_once(SourceType::File).await.unwrap();
+        let deleted = !fixture.input.exists();
+        assert_committed_without_a_gap(
+            &format!("delete_after_commit, file deleted: {deleted}"),
+            &second,
+            21,
+        )
+        .await;
+    }
+
+    /// #782 for a file rotated away while the engine was down (review of
+    /// #785): its ranges are read again only through a rewind (#621), which
+    /// finds the file under its new name. Leaving C's rewind out left both A
+    /// and C unread; lowered to A, the rewind reads them both again from
+    /// the rotated file.
+    #[tokio::test]
+    async fn a_held_range_of_a_file_rotated_away_is_read_again_with_the_range_above_it() {
+        let fixture = ThreeLines::left_by_a_crash("held-782-rotated", true).await;
+        std::fs::rename(&fixture.input, fixture.dir.path().join("in.log.1")).unwrap();
+        std::fs::write(&fixture.input, "").unwrap();
+        let (mut second, summary) = fixture.restart_refusing_a("work-2", |_| {}).await;
+        for _ in 0..3 {
+            second.process_once(SourceType::File).await.unwrap();
+        }
+        assert_committed_without_a_gap(
+            &format!("a held A in a rotated file: {summary:?}"),
+            &second,
+            21,
+        )
+        .await;
+    }
+
+    /// #782 for a range held because a newer release wrote it (#671): A is
+    /// VERIFIED with a manifest this engine cannot read, B VERIFIED above
+    /// it, C left mid-pipeline. C's rewind starts at A, the pass archives
+    /// A's bytes again, and the next start retires A as SUPERSEDED.
+    #[tokio::test]
+    async fn a_range_held_for_a_newer_manifest_is_not_passed_by_the_running_pipeline() {
+        use BatchState::*;
+        let tenant = "held-782-newer";
+        let fixture = ThreeLines::left_by_a_crash(tenant, false).await;
+        // A: the bytes a newer release's engine read and verified, its
+        // manifest pinned and carrying the self-hash the ledger recorded.
+        let writer = fixture.engine("work-newer", |_| {}).await;
+        let b = row_at(&writer, 7).await;
+        let at = |marker: &ProgressMarker, start: u64, end: u64| match marker.clone() {
+            ProgressMarker::File {
+                path,
+                inode,
+                file_size,
+                mtime,
+                ctime,
+                content_fingerprint,
+                ..
+            } => ProgressMarker::File {
+                path,
+                inode,
+                start_byte: start,
+                end_byte: end,
+                file_size,
+                mtime,
+                ctime,
+                content_fingerprint,
+                tail_fingerprint: None,
+            },
+            other => panic!("not a file marker: {other:?}"),
+        };
+        let newer_uri = "s3://telemetry-data/newer-782.manifest.json";
+        let newer_hash = "cd".repeat(32);
+        let staged = fixture.dir.path().join("newer-782.json");
+        std::fs::write(
+            &staged,
+            serde_json::to_vec(&serde_json::json!({
+                "protocol": "VTOP",
+                "version": "0.9",
+                "batch_id": "newer-782",
+                "manifest": {"uri": newer_uri, "sha256": newer_hash},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let stored = fixture
+            .backend
+            .put_manifest(&staged, newer_uri, None)
+            .await
+            .unwrap();
+        let newer = BatchRecord {
+            batch_id: "newer-782".into(),
+            state: Batching,
+            progress_start: at(&b.progress_start, 0, 0),
+            progress_end: at(&b.progress_end, 0, 7),
+            manifest_uri: Some(newer_uri.into()),
+            manifest_sha256: Some(newer_hash.clone()),
+            manifest_version_id: stored.version_id,
+            owner: None,
+            lease_expires_at: None,
+            ..b.clone()
+        };
+        writer.store.save_batch_state(&newer).await.unwrap();
+        for state in [
+            Sealed,
+            Compressed,
+            Checksummed,
+            ObjectUploaded,
+            ManifestUploaded,
+            Verified,
+        ] {
+            writer
+                .store
+                .update_batch_state(&newer.batch_id, state, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+        drop(writer);
+
+        let held_before = counter_value(
+            "vtop_recovery_held_total",
+            &[("tenant", tenant), ("reason", "newer_manifest")],
+        );
+        let lowered_before = counter_value(
+            "vtop_recovery_rewinds_lowered_total",
+            &[("tenant", tenant), ("source_type", "file")],
+        );
+        let mut second = fixture.engine("work-2", |_| {}).await;
+        let summary = second.recover().await.unwrap();
+        assert_eq!(
+            state_of(&second, "newer-782").await,
+            Verified,
+            "{summary:?}"
+        );
+        assert_eq!(row_at(&second, 7).await.state, Verified, "{summary:?}");
+        assert_eq!(
+            row_at(&second, 14).await.state,
+            ReplayRequired,
+            "{summary:?}"
+        );
+        let head = fixture.head_at_c(&second).await;
+        second.process_once(SourceType::File).await.unwrap();
+        assert_committed_without_a_gap("a newer release's A below a replayed C", &second, 21).await;
+        assert_ne!(head, Some(14), "C's rewind moved the read head past A");
+        assert_eq!(
+            counter_value(
+                "vtop_recovery_held_total",
+                &[("tenant", tenant), ("reason", "newer_manifest")],
+            ) - held_before,
+            1,
+            "the hold is counted by its reason"
+        );
+        assert_eq!(
+            counter_value(
+                "vtop_recovery_rewinds_lowered_total",
+                &[("tenant", tenant), ("source_type", "file")],
+            ) - lowered_before,
+            1,
+            "C's lowered rewind is counted"
+        );
+        drop(second);
+
+        let mut third = fixture.engine("work-3", |_| {}).await;
+        let summary = third.recover().await.unwrap();
+        assert_eq!(
+            state_of(&third, "newer-782").await,
+            Superseded,
+            "{summary:?}"
+        );
+        assert_committed_without_a_gap("a newer release's A, restarted", &third, 21).await;
+    }
+
+    /// #782: the hold and the lowered rewind each say what happened, what
+    /// the engine did and what to do, with their identifiers as fields, and
+    /// each is counted.
+    #[tokio::test]
+    async fn a_hold_and_a_lowered_rewind_are_logged_and_counted() {
+        let tenant = "held-782-messages";
+        let fixture = ThreeLines::left_by_a_crash(tenant, true).await;
+        let held_before = counter_value(
+            "vtop_recovery_held_total",
+            &[
+                ("tenant", tenant),
+                ("source_type", "file"),
+                ("reason", "ledger_write_failed"),
+            ],
+        );
+        let lowered_before = counter_value(
+            "vtop_recovery_rewinds_lowered_total",
+            &[("tenant", tenant), ("source_type", "file")],
+        );
+        let (logs, guard) = CapturedLogs::start();
+        let (second, _) = fixture.restart_refusing_a("work-2", |_| {}).await;
+        drop(guard);
+        let a = row_at(&second, 0).await;
+        let path = fixture.input.to_string_lossy().into_owned();
+
+        let held = logs.line("recovery could not record the replay decision");
+        for part in [
+            "ERROR".to_owned(),
+            format!("batch_id={}", a.batch_id),
+            "source_type=file".to_owned(),
+            format!("source_name={path}"),
+            "start=0".to_owned(),
+            "end=7".to_owned(),
+            "error=".to_owned(),
+            "did not hand it back on its own".to_owned(),
+            "will not commit any range of the same source above it".to_owned(),
+            "a rewind of a range above it starts at it instead".to_owned(),
+            "Check the state store".to_owned(),
+        ] {
+            assert!(held.contains(&part), "{part:?} is missing from: {held}");
+        }
+        let lowered = logs.line("recovery is rewinding");
+        for part in [
+            "WARN".to_owned(),
+            "source_type=file".to_owned(),
+            format!("source_name={path}"),
+            "rewind_start=14".to_owned(),
+            "held_start=0".to_owned(),
+            "none is skipped".to_owned(),
+        ] {
+            assert!(
+                lowered.contains(&part),
+                "{part:?} is missing from: {lowered}"
+            );
+        }
+        assert_eq!(
+            counter_value(
+                "vtop_recovery_held_total",
+                &[
+                    ("tenant", tenant),
+                    ("source_type", "file"),
+                    ("reason", "ledger_write_failed"),
+                ],
+            ) - held_before,
+            1
+        );
+        assert_eq!(
+            counter_value(
+                "vtop_recovery_rewinds_lowered_total",
+                &[("tenant", tenant), ("source_type", "file")],
+            ) - lowered_before,
+            1
         );
     }
 

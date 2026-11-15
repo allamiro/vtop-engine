@@ -813,6 +813,15 @@ test that failed first.
   - #668: resuming a failed multipart upload.
   - #671 release B.
 
+- **[#782](https://github.com/allamiro/vtop-engine/issues/782)** — a range
+  recovery holds because its replay decision could not be recorded, or
+  because a newer release wrote it, is no longer passed by the running
+  pipeline: recovery applies every rewind above it in its source unit at the
+  held start, so the held range is read again with the ranges above it and
+  archived before anything above it commits. The ranges above it are
+  archived twice. New metrics: `vtop_recovery_held_total{reason}`,
+  `vtop_recovery_rewinds_lowered_total`. No format or ledger change.
+
 ## v0.9.0 — bug fixes: deletes that wait for proof, Kafka partitions that are never left unread, portable builds
 
 A bug-fix release: only issues labelled `bug`, and the PRs that fix them. Features wait for v0.10.0.

@@ -70,6 +70,14 @@ fn populated() -> String {
         .with_label_values(&[l[0], l[1], l[2], "strong", "size_only"])
         .inc_by(0);
     m.replay_required_total.with_label_values(&l).inc_by(0);
+    for reason in telemetry::RECOVERY_HOLD_REASONS {
+        m.recovery_held_total
+            .with_label_values(&[l[0], l[1], reason])
+            .inc_by(0);
+    }
+    m.recovery_rewinds_lowered_total
+        .with_label_values(&[l[0], l[1]])
+        .inc_by(0);
     m.failed_total.with_label_values(&l).inc_by(0);
     m.records_total.with_label_values(&l).inc_by(10);
     m.bytes_in_total.with_label_values(&l).inc_by(100);
@@ -419,6 +427,27 @@ fn the_recovery_recheck_counter_is_exported() {
                 && line.contains(r#"result="size_only""#)),
         "vtop_recovery_rechecks_total{{verification_class, result}} is missing:\n{text}"
     );
+}
+
+/// #782: the counters of a range recovery held and of a rewind it lowered
+/// above one are exported under their names, labelled by tenant, source type
+/// and, for the hold, its reason from a closed set: an alert on a state store
+/// refusing recovery's writes reads `reason="ledger_write_failed"`.
+#[test]
+fn the_recovery_hold_counters_are_exported() {
+    let text = populated();
+    assert_eq!(
+        telemetry::RECOVERY_HOLD_REASONS,
+        ["ledger_write_failed", "newer_manifest"]
+    );
+    for reason in telemetry::RECOVERY_HOLD_REASONS {
+        let series = format!(
+            r#"vtop_recovery_held_total{{reason="{reason}",source_type="kafka",tenant="default"}}"#
+        );
+        assert!(text.contains(&series), "missing {series}:\n{text}");
+    }
+    let series = r#"vtop_recovery_rewinds_lowered_total{source_type="kafka",tenant="default"}"#;
+    assert!(text.contains(series), "missing {series}:\n{text}");
 }
 
 /// The invariant, expressed in metrics: a commit is only ever recorded after a
