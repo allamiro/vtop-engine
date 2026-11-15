@@ -265,6 +265,58 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
     let newer = admin.get_batch("pre-664").await.unwrap().unwrap();
     assert_eq!(newer.verification_class, None);
 
+    // #626: a schema from before the seal instant (v0.9.0's) lacks its
+    // column. Startup refuses it with the migrate guidance, naming the
+    // column; `vtopctl migrate` adds it, says how many rows it left without
+    // one, and every row reads back as it was, with none. The marker is not
+    // raised: a v0.9.0 engine keeps running against the migrated schema.
+    admin
+        .execute_raw("ALTER TABLE batches DROP COLUMN sealed_at;")
+        .await
+        .unwrap();
+    let err = match PgStateStore::connect(&migrator_conn).await {
+        Ok(_) => panic!("runtime connect must reject a schema without sealed_at"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("vtopctl migrate") && err.contains("sealed_at"),
+        "a pre-#626 schema must give migration guidance naming the column: {err}"
+    );
+    let logs = Captured::default();
+    PgStateStore::migrate(&migrator_conn)
+        .with_subscriber(logs.subscriber())
+        .await
+        .unwrap();
+    assert!(
+        logs.text()
+            .contains("added the sealed_at column; 4 existing rows left NULL"),
+        "the migration must say what it did to the existing rows: {}",
+        logs.text()
+    );
+    assert!(
+        !logs.text().contains("added the verification_class column"),
+        "only the column that was missing is reported: {}",
+        logs.text()
+    );
+    let admin = PgStateStore::connect(&migrator_conn)
+        .await
+        .expect("migrate adds the sealed_at column");
+    for id in [
+        "pre-664",
+        "pre-664-committed",
+        "pre-664-failed",
+        "pre-664-batching",
+    ] {
+        let legacy = admin.get_batch(id).await.unwrap().unwrap();
+        assert_eq!(legacy.sealed_at, None, "{id}: no seal instant was recorded");
+    }
+    let logs = Captured::default();
+    PgStateStore::migrate(&migrator_conn)
+        .with_subscriber(logs.subscriber())
+        .await
+        .unwrap();
+    assert!(!logs.text().contains("added the sealed_at column"));
+
     // #664: a schema a NEWER release migrated - its marker above the newest
     // this release reads - is refused, by startup and by this release's
     // migrate (which would install its older trigger over it), with the

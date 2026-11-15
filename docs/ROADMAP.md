@@ -50,8 +50,8 @@ first live-chaos scenarios on real processes.
 
 The release pipeline ships `vtop-node` alongside `vtopctl`, publishes a
 multi-arch GHCR image, and attaches an SBOM, cosign signatures and
-`SHA256SUMS`. Tagged as a pre-release: the 0.x series makes no compatibility
-promise across minor versions.
+`SHA256SUMS`. The 0.x series makes no compatibility promise across minor
+versions.
 
 **Not in it:** replicated-range failover without harness-style follower
 restarts, and any form of replica replacement.
@@ -907,11 +907,61 @@ New metrics: `vtop_audit_events_total{action,outcome}` and
 - **`vtopctl meta`, `node` and `tier` now log** to stderr at WARN (audit
   records always), where they logged nothing before.
 
+**A replay resolves to the object already archived (#626, remainder).**
+v0.9.0 made a replay of the same bytes reuse the stored object. A replay in a
+later hour still named another key, because the time partition came from the
+instant the replay was sealed. Each ledger row now records the instant its
+window was sealed (`sealed_at`), and a window that covers exactly a range an
+earlier attempt sealed and handed back is sealed at that instant again, from
+memory while the engine runs and from the row after a restart. It is filed
+under the same hour and names the same key, so the object, or a multipart
+session the failed upload kept (#668), is reused. What each such replay came
+to is counted in `vtop_replay_rebuilds_total{result}` (`exact`,
+`bytes_differ`, `fallback`) and logged (`replay_rebuilt`,
+`replay_bytes_differ`, `replay_key_fallback`). Upgrade
+notes:
+
+- **PostgreSQL: run `vtopctl migrate` before starting engines of this
+  release.** It adds the nullable `sealed_at` column; engines of this
+  release refuse a schema without it, naming it. The schema marker stays 3.
+- **SQLite adds the column when an engine of this release opens the file;**
+  the schema version stays 1, so this is no one-way step.
+- **A v0.9.0 engine ignores `sealed_at` and writes NULL**, on either backend,
+  and reads prune digests whose rows carry it. Only N-1 may share a ledger
+  with this release.
+- **Rows written before this release** carry no seal instant. A replay of one
+  of them is filed under the hour it is replayed in, as before, so it may
+  still write a second object once.
+- **Not changed:** a replay over a source that grew since the failed attempt
+  still reads to the current end and writes a second object; a range whose
+  row a power loss rolled back has nothing to rebuild from.
+
 The theme is **the gateway at the speed its durability allows**: wire the
 broker's group commit into the gateway path and close the compatibility
 gaps the Kafka comparison found (#596), measure failover and crash
 durability against Kafka (#597, #599), serve split children as Kafka
 partitions (#473), and ship the egress ceiling once measured (#481).
+
+**Kafka gateway: an OffsetCommit it cannot keep says so (#596).** A node
+without a metadata plane (a static leader or a standalone node) has no
+durable offset store and still refuses OffsetCommit, but now answers
+`INVALID_REQUEST` (42) instead of `UNSUPPORTED_FOR_MESSAGE_FORMAT` (43).
+OffsetCommit carries no error message, so a client shows only the code's
+own text: 43's sent the first Kafka comparison looking at record versions,
+and 42's ends "See the broker logs for more details", where the gateway's
+WARN now says what happened, that produce and fetch are unaffected, and to
+run a leased leader on a metadata plane or set `enable.auto.commit=false`.
+A request for an api the gateway does not serve (CreateTopics,
+DescribeConfigs and four other admin keys) is logged by name with the
+operator path (`vtopctl meta create-topic`), at most at each power of two
+per key. Both are counted in a new node metric,
+`vtop_kafka_requests_refused_total{api,reason}`, on every node that runs
+a gateway. A consumer with auto-commit on logs the failed commit and keeps
+reading; an explicit commit fails, as it did with 43. Live-chaos scenario
+19 asserts the refusal for a librdkafka group consumer that reads every
+record and exits cleanly, and scenario 21 runs two such consumers under it.
+Other refusals (a metadata plane that predates head cursors, a version
+outside a served range) are not counted yet.
 
 **Manifest format evolution (#671).** v0.8.0's readers check a
 manifest's `version` first, read `0.1`-`0.4`, verify `0.4` over the stored
@@ -1116,12 +1166,15 @@ readers verify (ARCHITECTURE.md, "Ledger format note: ctime").
 
 ## Versioning
 
-0.x. Minor versions may break compatibility, and releases are published as
-GitHub pre-releases to say so. **Upgrades are tested** (#291): CI proves a
-data directory written by the newest patch of each released minor series
-(v0.2+) opens under the current build, serves byte-exactly, and still serves
-after a restart; newly published tags join that matrix automatically.
-**Downgrades are not supported** — a newer release's directory may hold
-artifacts an older release cannot interpret, and nothing tests that path;
-going back means a fresh directory or a verified backup taken before the
-upgrade.
+0.x. Minor versions may break compatibility. Every release so far is published
+as a full GitHub release; only a hyphenated version such as `1.0.0-rc.1` would
+be published as a pre-release. What each format promises, the rules for
+changing one, the deprecation notice and the path to 1.0 are in the
+[compatibility policy](reference/compatibility.md) (#743). **Upgrades are
+tested** (#291): CI proves a data directory written by the newest patch of
+each released minor series (v0.2+) opens under the current build, serves
+byte-exactly, and still serves after a restart; newly published tags join that
+matrix automatically. **Downgrades are not supported** — a newer release's
+directory may hold artifacts an older release cannot interpret, and nothing
+tests that path; going back means a fresh directory or a verified backup
+taken before the upgrade.

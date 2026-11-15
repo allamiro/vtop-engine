@@ -66,7 +66,9 @@ NATIVE_PORT="${CHAOS_NATIVE_PORT:-9400}"
 # The Kafka gateway listeners (#225): kafka-0 for the standalone of scenario
 # 16, kafka-1 for the leader of scenario 17, kafka-2 for the leader of
 # scenario 18, kafka-3 for the leader of scenarios 19 and 20, kafka-4 and
-# kafka-5 for the two partitions of scenario 21. Above the candidate natives
+# kafka-5 for the two partitions of scenarios 21 and 24 (24 also takes
+# replica-4, replica-5 and data-metrics 4 and 5 for its second range's
+# followers, and checks its own bound). Above the candidate natives
 # (NATIVE_PORT + 11..13) so the default layout has no overlap.
 KAFKA_BASE_PORT="${CHAOS_KAFKA_BASE_PORT:-$((NATIVE_PORT + 20))}"
 # Observability endpoints (#224). Every node gets one so scenarios can gate on

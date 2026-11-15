@@ -86,6 +86,11 @@ fn populated() -> String {
             .with_label_values(&["default", "kafka", "cef", d])
             .inc_by(0);
     }
+    for r in telemetry::REPLAY_REBUILD_RESULTS {
+        m.replay_rebuilds_total
+            .with_label_values(&["default", "file", "raw", r])
+            .inc_by(0);
+    }
     for e in KAFKA_PARTITION_EVENTS {
         m.kafka_partition_events_total
             .with_label_values(&[e])
@@ -158,6 +163,7 @@ fn the_object_lock_metrics_are_exported() {
         "legal_hold_missing",
         "error",
         "bucket_not_locked",
+        "store_unsupported",
     ] {
         let series =
             format!(r#"vtop_object_lock_checks_total{{result="{result}",tenant="default"}}"#);
@@ -296,7 +302,8 @@ fn every_exported_label_is_from_a_bounded_set() {
     // "outcome" those of FILE_DELETE_OUTCOMES (#619), never the path,
     // "event" the seven of KAFKA_PARTITION_EVENTS (#675), and
     // `verification_class` (strong, size_only, unknown) and `result` (strong,
-    // size_only, failed, unsupported_version) are closed sets (#664), and
+    // size_only, failed, unsupported_version) are closed sets (#664), as is
+    // `result` on vtop_replay_rebuilds_total (REPLAY_REBUILD_RESULTS, #626), and
     // "version" is the manifest version, "0.3" or "0.4", the values
     // `manifest.write_version` accepts (#671 release B).
     // "reason" and "signal" label the OpenTelemetry exporter's own counters
@@ -621,6 +628,25 @@ fn object_key_decisions_are_exported_by_bounded_decision() {
     }
 }
 
+/// #626: what each replay of a recorded window came to is exported by
+/// `result`, from its bounded set, so an alert can see replays writing
+/// second objects (`bytes_differ`) without parsing logs. No range, key or
+/// path is a label.
+#[test]
+fn replay_rebuilds_are_exported_by_bounded_result() {
+    let text = populated();
+    assert!(text.contains("vtop_replay_rebuilds_total"), "{text}");
+    for r in vtop_core::telemetry::REPLAY_REBUILD_RESULTS {
+        let label = format!(r#"result="{r}""#);
+        assert!(
+            text.lines().any(
+                |line| line.starts_with("vtop_replay_rebuilds_total{") && line.contains(&label)
+            ),
+            "missing vtop_replay_rebuilds_total with {label}"
+        );
+    }
+}
+
 /// #619: every `delete_after_commit` decision is exported by `outcome`, a
 /// fixed set, so a rising `no_open_check` or `rename_refused` - files kept
 /// until the operator acts - can be alerted on without parsing logs.
@@ -632,6 +658,42 @@ fn file_delete_decisions_are_exported_by_bounded_outcome() {
         let label = format!(r#"outcome="{o}""#);
         assert!(text.contains(&label), "missing {label}");
     }
+}
+
+/// #619, v0.10.0: the outcome set is pinned by name. It is the union of the
+/// sixteen values v0.9.0 exported and the two v0.10.0 adds:
+/// `deleted_unchecked` (a delete under `delete_without_open_check` with no
+/// lease, the signal an operator is living with the opt-in's windows) and
+/// `links_changed` (a file kept because its link count changed). A value
+/// dropped or renamed breaks an alert, so a change here is deliberate.
+/// (`file_delete_decisions_are_exported_by_bounded_outcome` checks that
+/// /metrics exports each of them.)
+#[test]
+fn file_delete_outcomes_are_the_released_set_and_the_two_v0_10_0_adds() {
+    let released = [
+        "deleted",
+        "appended",
+        "shorter",
+        "other_file",
+        "rewritten",
+        "unprovable",
+        "metadata_changed",
+        "gone",
+        "symlink",
+        "open",
+        "no_open_check",
+        "rename_refused",
+        "failed",
+        "stale_commit",
+        "leftover_archived",
+        "opened_at_unlink",
+    ];
+    let added = ["deleted_unchecked", "links_changed"];
+    let mut expected: Vec<&str> = released.iter().chain(&added).copied().collect();
+    expected.sort_unstable();
+    let mut got: Vec<&str> = vtop_core::telemetry::FILE_DELETE_OUTCOMES.to_vec();
+    got.sort_unstable();
+    assert_eq!(got, expected, "telemetry::FILE_DELETE_OUTCOMES");
 }
 
 /// #675: Kafka partition-list changes are exported by `event`, a fixed set,

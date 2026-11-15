@@ -154,6 +154,8 @@ Each refusal says what happened, what the engine did, and what to do:
 |---|---|---|
 | Startup, literal bucket without Object Lock | `bucket X does not have Object Lock enabled; the engine did not start. Object Lock can only be enabled when a bucket is created: create a new bucket with it and point upload.bucket at it` | As it says. |
 | First batch for a templated bucket without Object Lock (`object_lock_bucket_refused`, `result="bucket_not_locked"`) | the same, with `the batch was not uploaded and will be replayed` | As it says. Nothing was written to the bucket. |
+| Startup, a store that does not implement Object Lock (it answers `GetObjectLockConfiguration` with HTTP 501 `NotImplemented`) | `the store does not implement S3 Object Lock (it answered GetObjectLockConfiguration for bucket X with "not implemented"); the engine did not start. No bucket setting can change that: use a store that implements S3 Object Lock, or remove upload.object_lock` | As it says. A templated bucket on such a store fails its first batch with the same words (`result="store_unsupported"`). |
+| Startup, a literal bucket without versioning (the profile requires `upload.require_object_versioning`) | `bucket X does not have versioning enabled, so the store would not keep the manifest versions the hardened profile pins; the engine did not start. Enable versioning on the bucket (PutBucketVersioning with Status=Enabled; if the store cannot enable it, use a store that keeps object versions), or set upload.require_object_versioning: false` | A bucket created with Object Lock has versioning on, so this names a different bucket or a store that does not keep it. A store that answers `GetBucketVersioning` with 501 is refused with `the store does not implement S3 bucket versioning`. The Object Lock check runs first, so a store without either is refused for Object Lock. A versioning check the store could not answer is a WARN at startup (`the versioning of bucket X could not be read ...; the engine started anyway`), and an ERROR `bucket_versioning_refused` at a batch. |
 | Bucket check could not be made | WARN at startup: `the Object Lock configuration of bucket X could not be read (...); the engine started anyway, and the bucket is checked again before the first upload to it`; at a batch, the same with `the batch was not uploaded and will be replayed` (`result="error"`) | Grant `s3:GetBucketObjectLockConfiguration`, or check the store's health. |
 | Startup, a backend that does not apply the lock | `upload.object_lock is set, but the X upload backend does not apply it ...` | Use `s3_native`. |
 | Written object or manifest without the lock (`object_lock_check_failed`, `result` = `missing`, `mode_mismatch`, `too_short` or `legal_hold_missing`) | `object X (version V) is not under the requested retention (expected governance until at least D, found ...); the batch was marked failed and will be replayed; check the bucket's Object Lock configuration and the credentials' s3:PutObjectRetention permission, and s3:GetObjectRetention, without which the store answers a HEAD with no lock at all` | Fix the store or the credentials. The replay writes the batch again. |
@@ -197,9 +199,16 @@ An object from an attempt that failed after its upload (a manifest upload
 that failed, say) is locked like any other. It cannot be removed until its
 retention ends, and under `compliance` nobody can remove it. Content-derived
 keys (#626) make this rarer, because a replay of the same bytes reuses the
-object rather than writing a second one, but a replay with other batch
-boundaries still writes a new object. Budget for these objects. The startup
-WARN under `compliance` says so.
+object rather than writing a second one, and since v0.10.0 a replay in a
+later hour is sealed at the failed attempt's recorded instant, so it names
+the same key and reuses the locked object too. What still writes a second
+locked object: a replay with other batch boundaries, a replay whose bytes
+differ (compression or checksum settings changed between the attempts), a
+replay of a row written before v0.10.0, and a range whose ledger row a power
+loss rolled back. Budget for these objects, and size them with
+`vtop_replay_rebuilds_total{result=~"bytes_differ|fallback"}`
+([observability/README.md](../observability/README.md)). The startup WARN
+under `compliance` says so.
 
 Incomplete multipart uploads are not objects and are not locked. The
 abandoned-session sweep and an `AbortIncompleteMultipartUpload` lifecycle rule

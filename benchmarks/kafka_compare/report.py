@@ -28,23 +28,23 @@ from typing import Any
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from kafka_compare import schema, stats  # noqa: E402
+from kafka_compare import colours, footer, schema, stats  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(HERE))
 DEFAULT_IMG_DIR = os.path.join(REPO, "docs", "benchmarks", "img")
 DEFAULT_DOC = os.path.join(REPO, "docs", "benchmarks", "kafka-comparison.md")
 DEFAULT_FAILOVER_DOC = os.path.join(REPO, "docs", "benchmarks", "kafka-failover.md")
 
-# One colour per system in every chart: categorical slots 1 and 2 of the
-# reference palette, validated for CVD separation (protan dE 24.7) and
-# contrast on the light surface. Blue vs orange, never red vs green. The
-# images carry their own light surface, so the hue is the same wherever the
-# page puts them (light or dark mode).
+# One colour per system in every chart, from the registry in colours.py
+# (categorical slots 1 and 2, blue and orange, validated for CVD separation
+# and contrast; never red vs green). The images carry their own light
+# surface, so the hue is the same wherever the page puts them (light or dark
+# mode).
 SYSTEM_STYLE = {
-    "kafka": {"label": "Apache Kafka", "color": "#2a78d6", "marker": "o", "hatch": ""},
-    "vtop": {"label": "VTOP (Kafka gateway)", "color": "#eb6834", "marker": "s", "hatch": ""},
+    "kafka": {"label": "Apache Kafka", "color": colours.colour("kafka", "light"), "marker": "o", "hatch": ""},
+    "vtop": {"label": "VTOP (Kafka gateway)", "color": colours.colour("vtop", "light"), "marker": "s", "hatch": ""},
 }
-SURFACE = "#fcfcfb"
+SURFACE = colours.SURFACES["docs"]
 INK = "#0b0b0b"
 INK_2 = "#52514e"
 GRID = "#e2e1dc"
@@ -130,30 +130,7 @@ def compact(value: float) -> str:
     return f"{value:.2f}"
 
 
-def gib(value: Any) -> str:
-    """Bytes as whole GiB, or `unknown` when the run could not read them
-    (e.g. `host_memory_bytes` is empty on a host without the macOS sysctl)."""
-    try:
-        size = int(value)
-    except (TypeError, ValueError):
-        return "unknown"
-    return f"{size / 2**30:.0f} GiB" if size > 0 else "unknown"
-
-
-def footer_text(env: dict[str, Any], run_id: str) -> str:
-    c = env["comparable"]
-    limits = c["node_limits"]
-    return (
-        f"{c['host_cpu']} ({c['host_logical_cpus']} logical CPUs, {gib(c.get('host_memory_bytes'))}), "
-        f"{c['host_os']} | "
-        f"{c['docker_platform']}, VM {c['docker_vm_cpus']} CPUs / {gib(c.get('docker_vm_memory_bytes'))}, "
-        f"kernel {c['docker_vm_kernel']}, "
-        f"volumes {c['volume_filesystem']}\n"
-        f"per node: {limits['cpus']} CPUs, {limits['mem_limit']} RAM | Kafka {c['kafka_image'].split('@')[0]} "
-        f"(KRaft, 3 brokers) | VTOP {c['vtop_commit'][:12]} | client {c['client']} | "
-        f"profile {c['profile']} | {env['matrix']['repetitions']} repetitions | run {run_id} "
-        f"({env['started_at'][:10]}) | single host, indicative, not a production benchmark"
-    )
+gib = footer.gib
 
 
 # --------------------------------------------------------------------------- charts
@@ -190,11 +167,12 @@ def _setup_matplotlib():
     return plt
 
 
-def _save(fig, img_dir: str, name: str) -> list[str]:
+def _save(fig, img_dir: str, name: str, footer_text: str) -> list[str]:
+    """PNG and SVG, each with the footer in its metadata (the drawn glyphs are paths)."""
     paths = []
-    for ext, metadata in (("png", {"Software": None}), ("svg", {"Date": None, "Creator": None})):
+    for ext in ("png", "svg"):
         path = os.path.join(img_dir, f"{name}.{ext}")
-        fig.savefig(path, dpi=150, metadata=metadata)
+        fig.savefig(path, dpi=150, metadata=footer.metadata(footer_text, ext))
         paths.append(path)
     return paths
 
@@ -212,7 +190,7 @@ def _header(fig, height_in: float, title: str, subtitle: str) -> None:
 
 
 def _footer(fig, text: str, width_chars: int) -> None:
-    fig.text(0.012, 0.012, _wrap(text, width_chars), fontsize=6.5, color=INK_2, ha="left", va="bottom",
+    fig.text(0.012, 0.012, footer.wrap(text, width_chars), fontsize=6.5, color=INK_2, ha="left", va="bottom",
              linespacing=1.45)
 
 
@@ -285,8 +263,9 @@ def throughput_chart(plt, rows, env, run_id, mode: str, title: str, subtitle: st
     fig.legend(handles=handles, loc="upper left", ncol=2, fontsize=8.5,
                bbox_to_anchor=(0.07, 1 - 0.88 / height_in), handlelength=1.2, columnspacing=1.6)
     _header(fig, height_in, title, subtitle)
-    _footer(fig, footer_text(env, run_id), 190)
-    paths = _save(fig, img_dir, name)
+    text = footer.footer_text(env)
+    _footer(fig, text, 190)
+    paths = _save(fig, img_dir, name, text)
     plt.close(fig)
     return paths
 
@@ -369,8 +348,9 @@ def latency_chart(plt, rows, env, run_id, img_dir: str) -> list[str]:
             _wrap("x axis: % of KAFKA's median saturation for the cell (records/s beneath), offered to both systems. "
                   "Marker: median of repetitions; whiskers: min-max. Latency is send() to acknowledgement as the "
                   "JVM perf tool measures it, in whole ms (a 0 is drawn at 0.5).", 200))
-    _footer(fig, footer_text(env, run_id), 230)
-    paths = _save(fig, img_dir, "kafka-compare-produce-latency")
+    text = footer.footer_text(env)
+    _footer(fig, text, 230)
+    paths = _save(fig, img_dir, "kafka-compare-produce-latency", text)
     plt.close(fig)
     return paths
 
@@ -574,7 +554,7 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
             "(`environment.json`, `other_containers_at_start_count`). Both systems shared the VM with them, one "
             "system at a time; they are noise neither system chose, and part of why these are laptop numbers.")
     add("")
-    with open(doc_path, "w") as handle:
+    with open(doc_path, "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines))
 
 

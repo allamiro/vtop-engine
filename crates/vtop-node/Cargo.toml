@@ -36,3 +36,6 @@ tempfile = { workspace = true }
 rcgen = { workspace = true }
 # Captures the audit records the node writes to its log (#694).
 tracing-subscriber = { workspace = true }
+# `test-util` enables tokio::time::pause(): the replica-stream wait (#750) is
+# tested on a paused clock.
+tokio = { workspace = true, features = ["test-util"] }

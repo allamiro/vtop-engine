@@ -1491,6 +1491,7 @@ mod tests {
             manifest_version_id: None,
             object_size_bytes: Some(10),
             verification_class: None,
+            sealed_at: None,
             record_count: Some(1),
             error_message: None,
             owner: None,
