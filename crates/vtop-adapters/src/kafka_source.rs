@@ -436,6 +436,9 @@ struct PartitionLiveness {
     /// Wall-clock time (ms since the epoch) of the last assign(), for finding
     /// where a partition assigned at the end of the log started.
     assigned_at_ms: i64,
+    /// `STALL_AFTER` unless a live test set another (#792, see
+    /// `KafkaSource::hold_off_stall_check_for`). Never set outside tests.
+    stall_after: Option<Duration>,
 }
 
 impl PartitionLiveness {
@@ -555,7 +558,8 @@ impl PartitionLiveness {
             .iter()
             .filter(|(_, run)| {
                 run.passes >= STALL_PASSES
-                    && now.saturating_duration_since(run.since) >= STALL_AFTER
+                    && now.saturating_duration_since(run.since)
+                        >= self.stall_after.unwrap_or(STALL_AFTER)
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -1852,6 +1856,17 @@ impl KafkaSource {
     #[doc(hidden)]
     pub fn stall_recoveries(&self) -> u64 {
         self.stall_reassigns
+    }
+
+    /// TEST SEAM (#792): a partition must deliver nothing for `after`, in
+    /// place of `STALL_AFTER`, before the stall check looks at it. A live
+    /// test that proves a partition is read WITHOUT the stall check sets it
+    /// past the test's own length, so a slow broker or runner cannot let the
+    /// check get there first; whether the records arrive is then up to the
+    /// path under test alone. The engine never calls this.
+    #[doc(hidden)]
+    pub fn hold_off_stall_check_for(&mut self, after: Duration) {
+        self.liveness.stall_after = Some(after);
     }
 
     /// TEST SEAM (#623): stop one partition's fetcher on the underlying
@@ -3458,6 +3473,34 @@ mod tests {
         );
         // Records wait for it: it is stalled, with the lag the log reports.
         assert_eq!(live.stalled_lag(&dead, Some(100), 140), Some(40));
+    }
+
+    /// #792: the window a live test sets in place of STALL_AFTER is the one
+    /// the check uses. A partition silent for longer than STALL_AFTER is not
+    /// due inside the wider window, and is due once it has passed.
+    #[test]
+    fn a_wider_stall_window_holds_off_the_check_until_it_has_passed() {
+        let assigned = vec![tp("a", 0)];
+        let mut live = PartitionLiveness {
+            stall_after: Some(STALL_AFTER * 6),
+            ..PartitionLiveness::default()
+        };
+        live.on_assign(&assigned);
+        let start = Instant::now();
+        let mut due_at = None;
+        for pass in 1..=(STALL_AFTER * 7).as_millis() as u32 / PASS.as_millis() as u32 {
+            let now = start + PASS * pass;
+            live.record_pass(&assigned, |_| false, now);
+            if !live.due(now).is_empty() {
+                due_at = Some(PASS * (pass - 1));
+                break;
+            }
+        }
+        let due_at = due_at.expect("due once the wider window has passed");
+        assert!(
+            due_at >= STALL_AFTER * 6,
+            "due after {due_at:?} of silence, inside the window"
+        );
     }
 
     /// Review of #644: two partitions of ONE topic, one busy enough to fill
