@@ -57,14 +57,14 @@ of source bytes that were not archived.
 ## Supported versions
 
 VTOP is in its 0.x series. Only the latest minor release receives security
-fixes: today that is v0.9.x. A report against an older minor is answered with
+fixes: today that is v0.10.x. A report against an older minor is answered with
 the release that fixes it, and the advice to upgrade. Downgrades are not
 supported; see [Versioning](docs/ROADMAP.md#versioning) in the roadmap.
 
 | Version | Security fixes |
 |---|---|
-| 0.9.x | yes |
-| older than 0.9 | no: upgrade to 0.9.x |
+| 0.10.x | yes |
+| older than 0.10 | no: upgrade to 0.10.x |
 
 ## Coordinated disclosure
 
