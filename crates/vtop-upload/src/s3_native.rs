@@ -14,9 +14,9 @@
 //! (backend-limited).
 
 use crate::base::{
-    judge_retention, parse_s3_uri, read_bounded, CreatedUpload, ObjectChecksum, ObjectHead,
-    ObjectLockPolicy, RequestedRetention, RetentionCheck, RetentionExpectation, StoredManifest,
-    StoredObject, StoredRetention, UploadBackend, UploadedPart, VerificationResult,
+    judge_retention, parse_s3_uri, read_bounded, BucketFeature, CreatedUpload, ObjectChecksum,
+    ObjectHead, ObjectLockPolicy, RequestedRetention, RetentionCheck, RetentionExpectation,
+    StoredManifest, StoredObject, StoredRetention, UploadBackend, UploadedPart, VerificationResult,
 };
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -950,6 +950,26 @@ impl S3NativeBackend {
     }
 }
 
+/// A store's definite "I do not implement this operation" (#722): HTTP 501,
+/// or S3's `NotImplemented` error code under whatever status it came with.
+/// Told apart from a check that could not be made (a 403, a 503, a timeout),
+/// which proves nothing either way: the SDK does not retry a 501, so this is
+/// the store's first and only answer. Other codes a store may use for the
+/// same answer are added when a live run shows one, each with a wire test.
+fn not_implemented<E>(error: &SdkError<E, HttpResponse>) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    let (status, code) = match error {
+        SdkError::ServiceError(context) => {
+            (Some(context.raw().status().as_u16()), context.err().code())
+        }
+        SdkError::ResponseError(context) => (Some(context.raw().status().as_u16()), None),
+        _ => (None, None),
+    };
+    status == Some(501) || code == Some("NotImplemented")
+}
+
 /// The engine's error for a failed SDK call, telling a throttle apart (#102).
 ///
 /// The SDK has already retried a throttle with its own backoff by the time
@@ -1116,28 +1136,31 @@ impl UploadBackend for S3NativeBackend {
         true
     }
 
-    async fn verify_bucket_versioning(&self, bucket: &str) -> Result<(), VtopError> {
-        let out = self
+    async fn bucket_versioning(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
+        let out = match self
             .client
             .get_bucket_versioning()
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| sdk_failure("get_bucket_versioning", bucket, e))?;
-        match out.status() {
-            Some(BucketVersioningStatus::Enabled) => Ok(()),
-            other => Err(VtopError::Upload(format!(
-                "bucket {bucket} does not have versioning enabled (status: {other:?}); \
-                 the hardened manifest profile requires it"
-            ))),
-        }
+        {
+            Ok(out) => out,
+            Err(e) if not_implemented(&e) => return Ok(BucketFeature::NotSupported),
+            Err(e) => return Err(sdk_failure("get_bucket_versioning", bucket, e)),
+        };
+        // Suspended, or no status at all (a bucket versioning was never
+        // turned on for): either way overwritten versions are not kept.
+        Ok(match out.status() {
+            Some(BucketVersioningStatus::Enabled) => BucketFeature::Enabled,
+            _ => BucketFeature::NotEnabled,
+        })
     }
 
     fn object_lock(&self) -> Option<ObjectLockPolicy> {
         self.object_lock
     }
 
-    async fn bucket_object_lock_enabled(&self, bucket: &str) -> Result<bool, VtopError> {
+    async fn bucket_object_lock(&self, bucket: &str) -> Result<BucketFeature, VtopError> {
         match self
             .client
             .get_object_lock_configuration()
@@ -1145,17 +1168,28 @@ impl UploadBackend for S3NativeBackend {
             .send()
             .await
         {
-            Ok(out) => Ok(out
-                .object_lock_configuration()
-                .and_then(|c| c.object_lock_enabled())
-                .is_some_and(|e| *e == ObjectLockEnabled::Enabled)),
+            Ok(out) => Ok(
+                if out
+                    .object_lock_configuration()
+                    .and_then(|c| c.object_lock_enabled())
+                    .is_some_and(|e| *e == ObjectLockEnabled::Enabled)
+                {
+                    BucketFeature::Enabled
+                } else {
+                    BucketFeature::NotEnabled
+                },
+            ),
             // S3's answer for a bucket that has no Object Lock configuration
             // at all: a definite "not enabled", not a failed check.
             Err(SdkError::ServiceError(context))
                 if context.err().code() == Some("ObjectLockConfigurationNotFoundError") =>
             {
-                Ok(false)
+                Ok(BucketFeature::NotEnabled)
             }
+            // The store does not implement Object Lock at all (#722; Garage
+            // documents every Object Lock call as missing). No bucket setting
+            // changes that, so it is an answer, not a check that failed.
+            Err(e) if not_implemented(&e) => Ok(BucketFeature::NotSupported),
             Err(e) => Err(sdk_failure("get_object_lock_configuration", bucket, e)),
         }
     }
