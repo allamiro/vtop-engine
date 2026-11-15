@@ -103,7 +103,7 @@ def append_rows(path: str, rows: list[dict[str, Any]], columns: tuple[str, ...] 
 def _read(path: str, columns: tuple[str, ...], allow_empty: bool = False) -> list[dict[str, str]]:
     if not os.path.isfile(path):
         raise schema.ReportRefused(f"no {os.path.basename(path)} at {path}")
-    with open(path, newline="") as handle:
+    with open(path, newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         if tuple(reader.fieldnames or ()) != columns:
             raise schema.ReportRefused(f"{path} has columns {reader.fieldnames}, expected {list(columns)}")
@@ -230,7 +230,7 @@ def load_failover_run(run_dir: str) -> FailoverRun:
     env_path = os.path.join(run_dir, "environment.json")
     if not os.path.isfile(env_path):
         raise schema.ReportRefused(f"no environment.json in {run_dir}")
-    with open(env_path) as handle:
+    with open(env_path, encoding="utf-8") as handle:
         try:
             environment = json.load(handle)
         except json.JSONDecodeError as exc:

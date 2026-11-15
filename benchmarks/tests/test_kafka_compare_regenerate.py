@@ -4,10 +4,12 @@ The check is only worth something if it can fail: each refusal below is one
 way the committed charts could stop being what the committed CSVs produce
 while a drift check over them still passed.
 """
+import glob
 import io
 import os
 import shlex
 import subprocess
+import sys
 
 import pytest
 
@@ -55,7 +57,34 @@ def test_an_empty_pin_file_is_refused(tmp_path):
 
 
 PLOTTING_STACK = {"matplotlib", "contourpy", "cycler", "fonttools", "kiwisolver", "numpy", "packaging", "pillow",
-                  "pyparsing", "python-dateutil", "tzdata"}
+                  "pyparsing", "python-dateutil", "six", "tzdata"}
+
+
+def test_pins_are_read_from_a_hash_locked_file(tmp_path):
+    # The lock's own layout: a continuation backslash, --hash lines, `# via` comments.
+    pins = tmp_path / "pins.txt"
+    pins.write_text("# header\n\nmatplotlib==3.10.3 \\\n    --hash=sha256:" + "a" * 64 + " \\\n"
+                    "    --hash=sha256:" + "b" * 64 + "\n    # via -r requirements-report.in\n"
+                    "Six==1.17.0 \\\n    --hash=sha256:" + "c" * 64 + "\n")
+    assert regenerate.read_pins(str(pins)) == {"matplotlib": "3.10.3", "six": "1.17.0"}
+
+
+def test_a_pin_with_a_marker_or_an_inline_hash_reads_as_its_version(tmp_path):
+    pins = tmp_path / "pins.txt"
+    pins.write_text('numpy==2.4.6 ; python_version >= "3.11"\npillow==13.0.0 --hash=sha256:' + "d" * 64 + "\n")
+    assert regenerate.read_pins(str(pins)) == {"numpy": "2.4.6", "pillow": "13.0.0"}
+
+
+def test_the_refusal_names_the_hash_checked_install():
+    with pytest.raises(regenerate.Refused, match="--require-hashes -r"):
+        regenerate.check_stack({"matplotlib": "3.10.3"}, {}.get)
+
+
+def test_a_hash_line_without_a_pin_is_refused(tmp_path):
+    pins = tmp_path / "pins.txt"
+    pins.write_text("    --hash=sha256:" + "a" * 64 + "\n")
+    with pytest.raises(regenerate.Refused, match="no pins"):
+        regenerate.read_pins(str(pins))
 
 
 def test_the_committed_pins_are_exactly_the_plotting_stack():
@@ -276,3 +305,118 @@ def test_a_new_png_is_left_for_git_status(repo):
     commit(repo)
     path = put(repo, "docs/benchmarks/img/new.png", _png({}, level=9))
     assert regenerate.keep_committed_pngs([path], str(repo)) == []
+
+
+# ---------------------------------------------------------------- determinism
+
+
+COMMITTED_SVGS = sorted(
+    glob.glob(os.path.join(regenerate.REPO, "docs", "benchmarks", "img", "*.svg"))
+    + glob.glob(os.path.join(regenerate.REPO, "docs", "assets", "readme", "*.svg")))
+
+
+def test_there_are_committed_svgs_to_check():
+    assert len(COMMITTED_SVGS) >= 8
+
+
+@pytest.mark.parametrize("path", COMMITTED_SVGS, ids=os.path.basename)
+def test_no_committed_svg_carries_a_date_or_a_local_path(path):
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    assert "<dc:date>" not in text, f"{path} carries a date, so every regeneration would drift"
+    assert "<dc:creator>" not in text, f"{path} names the software that drew it, which moves with a bump"
+    for local in ("/Users/", "/home/", "/private/", "/tmp/", regenerate.REPO):
+        assert local not in text, f"{path} carries the local path {local!r}"
+
+
+@pytest.mark.parametrize("path", COMMITTED_SVGS, ids=os.path.basename)
+def test_committed_svgs_draw_text_as_paths(path):
+    # A <text> element is laid out by the viewer's font, not the pinned one, and an SVG with
+    # glyphs as text would move with whichever DejaVu Sans the drawing host had.
+    with open(path, encoding="utf-8") as handle:
+        assert "<text" not in handle.read(), f"{path} has a <text> element"
+
+
+# Variations a developer's shell or a CI runner could bring, none of which may reach the output.
+# The first is a plain C locale with Python's UTF-8 mode and locale coercion
+# off, so the default text encoding is ASCII wherever the C locale is ASCII
+# (Linux): a generator that writes non-ASCII text without naming an encoding
+# fails there, and only there.
+ENVIRONMENTS = (
+    {"PYTHONHASHSEED": "1", "TZ": "UTC", "LC_ALL": "C", "LANG": "C", "PYTHONUTF8": "0",
+     "PYTHONCOERCECLOCALE": "0"},
+    {"PYTHONHASHSEED": "4242", "TZ": "Pacific/Kiritimati", "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8",
+     "PYTHONUTF8": "1", "SOURCE_DATE_EPOCH": "1"},
+)
+VARIED = ("PYTHONHASHSEED", "TZ", "LC_ALL", "LANG", "PYTHONUTF8", "PYTHONCOERCECLOCALE", "SOURCE_DATE_EPOCH")
+
+
+def _env(extra):
+    env = {key: value for key, value in os.environ.items() if key not in VARIED}
+    env.update(extra)
+    return env
+
+
+def _same_output(first, second):
+    """The names each run wrote, then the names whose bytes differ: a file only one run writes
+    is a difference too, not something to skip."""
+    assert first, "nothing was written"
+    assert set(first) == set(second), f"the two runs wrote different files: {sorted(set(first) ^ set(second))}"
+    return sorted(name for name in first if first[name] != second[name])
+
+
+def _read_all(directory):
+    out = {}
+    for root, _dirs, files in os.walk(directory):
+        for name in files:
+            if name.endswith((".svg", ".md")):
+                path = os.path.join(root, name)
+                with open(path, "rb") as handle:
+                    out[os.path.relpath(path, directory)] = handle.read()
+    return out
+
+
+def _render_report_twice(tmp_path, run):
+    outputs = []
+    for index, extra in enumerate(ENVIRONMENTS):
+        # One output directory per run, at the same depth (the page's relative links depend on
+        # it): a shared one would let the second run pass on files only the first wrote.
+        out = tmp_path / f"out{index}"
+        cwd = tmp_path / f"cwd{index}"
+        cwd.mkdir()
+        run_dir = os.path.join(regenerate.REPO, regenerate.RESULTS, run)
+        proc = subprocess.run([sys.executable, regenerate.REPORT, run_dir, "--img-dir", str(out / "img"),
+                               "--doc", str(out / "page.md")],
+                              cwd=cwd, env=_env(extra), capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        outputs.append(_read_all(out))
+    return outputs
+
+
+def _committed_run_ids():
+    return sorted(os.path.basename(path) for path in regenerate.committed_runs())
+
+
+@pytest.mark.parametrize("run", _committed_run_ids())
+def test_report_output_does_not_depend_on_the_environment(tmp_path, run):
+    pytest.importorskip("matplotlib")
+    changed = _same_output(*_render_report_twice(tmp_path, run))
+    assert not changed, f"the same run drew different bytes under a different hash seed, zone, locale or cwd: {changed}"
+
+
+def test_readme_chart_output_does_not_depend_on_the_environment(tmp_path):
+    pytest.importorskip("matplotlib")
+    outputs = []
+    for index, extra in enumerate(ENVIRONMENTS):
+        repo = tmp_path / f"repo{index}"
+        repo.mkdir()
+        (repo / "benchmarks").symlink_to(os.path.join(regenerate.REPO, "benchmarks"))
+        cwd = tmp_path / f"cwd{index}"
+        cwd.mkdir()
+        code = "import sys; sys.path.insert(0, sys.argv[1]); import readme_charts; readme_charts.render(sys.argv[2])"
+        proc = subprocess.run([sys.executable, "-c", code, os.path.join(regenerate.REPO, "benchmarks"), str(repo)],
+                              cwd=cwd, env=_env(extra), capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        outputs.append(_read_all(repo / "docs"))
+    changed = _same_output(*outputs)
+    assert not changed, f"the README charts differ under a different hash seed, zone, locale or cwd: {changed}"

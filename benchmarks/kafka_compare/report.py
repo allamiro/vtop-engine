@@ -574,7 +574,7 @@ def write_markdown(rows, env, run_id, csv_rel: str, env_rel: str, images: dict[s
             "(`environment.json`, `other_containers_at_start_count`). Both systems shared the VM with them, one "
             "system at a time; they are noise neither system chose, and part of why these are laptop numbers.")
     add("")
-    with open(doc_path, "w") as handle:
+    with open(doc_path, "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines))
 
 
