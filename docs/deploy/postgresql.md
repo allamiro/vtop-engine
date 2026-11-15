@@ -11,6 +11,7 @@ changes. The full rollout, grants and schema rules are in
 
 | Item | Notes |
 |---|---|
+| A supported PostgreSQL major | 14 to 18; 14 left upstream support on 2026-11-12 and is dropped at the next minor release. The list, and what CI runs on each, is in [Supported PostgreSQL versions](../POSTGRES_DEPLOYMENT.md#supported-postgresql-versions). |
 | `vtopctl` with PostgreSQL support | The release binaries and the image do not include it. Build with `cargo build --release --locked -p vtop-cli --features postgres` ([Build from source](../install/from-source.md)). |
 | PostgreSQL over TLS | Every connection that is not loopback or a Unix socket must use `sslmode=verify-full`, with `sslrootcert` for a private CA. |
 | Three database identities | A **migration** identity that owns the schema, a **runtime** identity for the engine (`SELECT, INSERT, UPDATE` on `batches`), and a **maintenance** identity for pruning (`SELECT, DELETE`). |
