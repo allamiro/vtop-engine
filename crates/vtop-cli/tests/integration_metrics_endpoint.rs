@@ -660,6 +660,42 @@ fn file_delete_decisions_are_exported_by_bounded_outcome() {
     }
 }
 
+/// #619, v0.10.0: the outcome set is pinned by name. It is the union of the
+/// sixteen values v0.9.0 exported and the two v0.10.0 adds:
+/// `deleted_unchecked` (a delete under `delete_without_open_check` with no
+/// lease, the signal an operator is living with the opt-in's windows) and
+/// `links_changed` (a file kept because its link count changed). A value
+/// dropped or renamed breaks an alert, so a change here is deliberate.
+/// (`file_delete_decisions_are_exported_by_bounded_outcome` checks that
+/// /metrics exports each of them.)
+#[test]
+fn file_delete_outcomes_are_the_released_set_and_the_two_v0_10_0_adds() {
+    let released = [
+        "deleted",
+        "appended",
+        "shorter",
+        "other_file",
+        "rewritten",
+        "unprovable",
+        "metadata_changed",
+        "gone",
+        "symlink",
+        "open",
+        "no_open_check",
+        "rename_refused",
+        "failed",
+        "stale_commit",
+        "leftover_archived",
+        "opened_at_unlink",
+    ];
+    let added = ["deleted_unchecked", "links_changed"];
+    let mut expected: Vec<&str> = released.iter().chain(&added).copied().collect();
+    expected.sort_unstable();
+    let mut got: Vec<&str> = vtop_core::telemetry::FILE_DELETE_OUTCOMES.to_vec();
+    got.sort_unstable();
+    assert_eq!(got, expected, "telemetry::FILE_DELETE_OUTCOMES");
+}
+
 /// #675: Kafka partition-list changes are exported by `event`, a fixed set,
 /// so `recreated_or_truncated` can be alerted on.
 #[test]

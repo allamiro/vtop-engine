@@ -572,9 +572,25 @@ What follows from that, in the engine:
   holds between a batch's read and its commit, for the same reason: the
   marker records the mtime the batch read, not the ctime.
 - **Hard links.** Deleting one name of a file moves the ctime of the
-  others (#378 makes each its own source), so another name's delete then
-  finds the ctime moved and keeps its file, saying so. Nothing is lost; the
-  remaining name is removed by hand.
+  others (#378 makes each its own source) and lowers the link count. The
+  candidate records the link count (in memory), so another name's delete
+  then keeps its file as `links_changed`, with a warning that names the
+  change ("its link count changed since it was archived (from 2 to 1) -
+  most likely another path this engine archived was deleted, or a hard link
+  was made"). A hard link made after the commit keeps the file the same
+  way. Nothing is lost: each name's copy is archived. The remaining names
+  are removed by hand, or the patterns narrowed to one spelling. A name
+  read and committed after the other's delete sees the file as it is then,
+  and is deleted. Deletes are not serialised per inode in a pass, by
+  choice: that would save disk on a configuration discovery already warns
+  about. So names committed in one pass fall due together and their
+  deletes run side by side: each holds the file open while it checks it,
+  and moves its ctime when it moves it aside and back, so a name can be
+  kept as `open` or `metadata_changed` because of another, and tried again
+  a quiet period later. Those messages then add that the file had N names
+  when it was archived and that another name's delete also causes this.
+  In tests, one name was deleted and the rest kept as `links_changed`
+  within five quiet periods. Nothing is lost on any path.
 - With `delete_without_open_check` and no lease, a delete whose unlink fails
   after the move aside puts the file back, which moves its ctime; the next
   attempt then keeps the file and says so, rather than trusting a ctime it
@@ -591,6 +607,16 @@ Limits, stated plainly:
   - after that same silence, its write lands between the delete's final
     check of the renamed file and the unlink.
 
+  Each such delete is counted as `deleted_unchecked`, not `deleted`, and
+  logged as "deleted P without proof that no process had it open", with
+  the reason no lease could be taken and what a writer still holding it
+  loses: a warning the first time in a process, then at info, so a
+  directory of thousands of files does not log thousands of warnings. Any
+  increase of `vtop_file_delete_decisions_total{outcome="deleted_unchecked"}`
+  means an operator is living with these two windows. The opt-in is the
+  only way a file is deleted on macOS, on NFS or FUSE, and for another
+  user's file when the engine lacks `CAP_LEASE`.
+
   Scanning `/proc/*/fd` was considered and rejected as the check: it is
   Linux-only like the lease, it needs privileges to see other users'
   descriptors, and it cannot see writers in other containers' PID
@@ -603,10 +629,34 @@ Limits, stated plainly:
     (`.vtop-delete.<nanos>.<n>`) between the final check and the unlink,
     which nothing has reason to do.
 
-  Either open gets the unlinked file once the lease is released; if it
-  broke the lease before then, the engine logs an error. A process that
-  reaches the file through another hard link is not in this window: the
-  file keeps that name, and the link is its own source (#378).
+  Either open gets the unlinked file once the lease is released. If it
+  broke the lease by the time the unlink returns (the engine checks the
+  lease right after it), the engine logs an error ("deleted P after a
+  process opened it between the final check and the unlink ... what that
+  process writes to it is not archived") and counts `opened_at_unlink`;
+  one that breaks it after that check, before the lease is dropped, is not
+  seen. A process that reaches the file through another hard link writes
+  into a file that keeps that name, so its lines are not gone; they are
+  archived only if that name is a source this engine reads (#378). If such
+  an open breaks the lease at the unlink, the engine says which: a warning
+  naming the other source ("the file is still named Q, a source this
+  engine reads ... nothing to do"), or, when no source this engine reads
+  names the file, an error that the lines are NOT archived and that the
+  other name needs a pattern. Either is counted `opened_at_unlink`.
+
+  **The 50 ms grace is a bound, not a proof.** An open of the path that
+  began before the rename and spends more than 50 ms in the kernel before
+  it reaches the file can still land after the unlink; what it writes is
+  not archived. The engine counts `opened_at_unlink` and logs the error
+  only for an open that has broken the lease when the unlink returns (see
+  above). Two tests make the late open deterministic, with an `O_PATH`
+  descriptor taken before the rename and opened through `/proc/self/fd`
+  later, each waiting for `/proc/locks` to show the lease breaking: one
+  that lands in the grace keeps the file, and one that lands between the
+  final check and the unlink is logged and counted. With writers that open, append and close
+  in a loop, 20 and 50 ms lost nothing in the #689 harness; the ignored
+  test `delete_race_stress` repeats that run, and is run by hand on tmpfs,
+  ext4 and overlay before a release.
 - **A file left under a delete's hidden name is archived as a source of
   its own.** A crash between the rename and the unlink leaves the file
   under its hidden name, never deleted unchecked; a put-back that finds a
@@ -1166,7 +1216,7 @@ On startup, the `replay` module inspects `vtop-state` and maps each incomplete b
    **What stays per attempt, and why.** The `batch_id` keeps its stamp and random suffix: it names the ledger row and the manifest (`{batch_id}.manifest.json`). A ledger row is one attempt: a FAILED or `REPLAY_REQUIRED` row and the row of the replay that succeeded are both kept, and a unique id per attempt keeps their transitions and claims apart (`batch_id` is the primary key of both stores). A manifest is per attempt for the same reason: it carries the `batch_id`, its own `created_at` and the self-hash and version id its row pinned (#135), so one attempt's manifest written over another's would break the pinned row's binding. Several manifests can therefore name one object, and they are always attempts at one unit's range with the same bytes, so a reader can dedupe them by the object URI. Batches of different units never share an object.
 
    **Where a replay still writes a second object.**
-   - The batch boundaries differ, where the replay could not rebuild the window as first cut. Since #626 a file, spool or Kafka range handed back (by the running engine from memory, by recovery from its row) is re-read up to its recorded end and no further: the adapter stops the read there (`SourceAdapter::bound_replays`; for Kafka, the partition's offsets above the window's last are rejected without counting against the topic's budget, and the partition is paused for the rest of the pass), file and spool sources read on from it in the same pass as the next window (Kafka in the next pass), and the engine seals the rebuilt window exactly at its end, not by a threshold, its age or a forced flush (`process-once`, the shutdown flush). So a replay over a file that has grown since rebuilds the bytes the failed attempt uploaded and names its object. What still reads to the current end, as before: a range whose re-read cannot stop at its end (`refused`: a line crosses the recorded end, the file under the range was replaced, a rotated file re-read through its kept descriptor, whole-file mode, a Kafka partition whose log no longer holds the range because retention or compaction moved past it); a Kafka range read under another consumer group; a range over 4x the current `batching.max_records` or `max_bytes` (`too_large`, so the window it would hold stays bounded); and a range whose row a power loss rolled back, which leaves nothing to rebuild from. A power loss still archives again at most what was in flight (§12, `ledger_power_loss.rs`). A stop inside a rebuild drops the partial window (`dropped_at_stop`): flushing it would name another object, and its range, never committed, is read again at the next start. A rebuilt window and the bytes after it can be two windows of one unit in the same cycle; when the rebuilt one fails again and the later one verifies, the later one is held VERIFIED (`commit_held_back`, WARN) rather than committed, since its commit would move the committed point past the failed range and clamp that range's rewind. It settles once the failed range has been read again and committed.
+   - The batch boundaries differ, where the replay could not rebuild the window as first cut. Since #626 a file, spool or Kafka range handed back (by the running engine from memory, by recovery from its row) is re-read up to its recorded end and no further: the adapter stops the read there (`SourceAdapter::bound_replays`; for Kafka, the partition's offsets above the window's last are rejected without counting against the topic's budget, and the partition is paused for the rest of the pass), file and spool sources read on from it in the same pass as the next window (Kafka in the next pass), and the engine seals the rebuilt window exactly at its end, not by a threshold, its age or a forced flush (`process-once`, the shutdown flush). So a replay over a file that has grown since rebuilds the bytes the failed attempt uploaded and names its object. What still reads to the current end, as before: a range whose re-read cannot stop at its end (`refused`: a line crosses the recorded end, the file under the range was replaced, a rotated file re-read through its kept descriptor, whole-file mode, a Kafka partition whose log no longer holds the range because retention or compaction moved past it); a Kafka range read under another consumer group; a range over 4x the current `batching.max_records` or `max_bytes` (`too_large`, so the window it would hold stays bounded); and a range whose row a power loss rolled back, which leaves nothing to rebuild from. A power loss still archives again at most what was in flight (§12, `ledger_power_loss.rs`). A stop inside a rebuild drops the partial window (`dropped_at_stop`): flushing it would name another object, and its range, never committed, is read again at the next start. A rebuilt window and the bytes after it can be two windows of one unit in the same cycle; when the rebuilt one fails again and the later one verifies, the later one is held VERIFIED (`commit_held_back`, WARN) rather than committed, since its commit would move the committed point past the failed range and clamp that range's rewind. It settles once the failed range has been read again and committed. A window buffered above a range handed back (the bytes read on after a rebuilt window that then fails again) is dropped at the rewind, since the source reads it again, so it cannot be flushed and committed on its own while that range is rebuilt over several passes.
    - The partition prefix differs, for a row that recorded no seal instant. Under `partitioning.time_source = seal` (the default) the time partition comes from the instant the window was sealed. Since #626 a window that covers exactly a range an earlier attempt sealed and handed back is sealed at that attempt's instant, read from memory while the engine runs and from the row's `sealed_at` after a restart, so a replay in a later hour names the same key. What is left: a row written before v0.10.0 (no `sealed_at`), a range whose row a power loss rolled back (no row at all), and a window that does not cover exactly the recorded range (the item above). `event` keeps the original hour for Kafka in every case.
    - No digest names the object: with `checksum.algorithm = none`, or on a backend whose HEAD cannot tell an absent key from a refused request (the command backends: `awscli`, `minio`, `s3cmd`; native S3 answers `NotFound` only for a 404, and a 403 from a caller without list permission falls back), every attempt uses its attempt key, as before.
    - An archive written before #626 used attempt keys only; a replay of one of its ranges does not find that object by name and writes a derived one beside it. Recovery, scrub and the coverage audit read object locations from the ledger and the manifests, never from the shape of a key, so archives with either kind of key, or both, are recovered, scrubbed and audited as before.
