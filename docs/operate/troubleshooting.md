@@ -41,7 +41,7 @@ entrypoint or the chart prints. Build and library-loading errors are on
 | `vtop_source_read_errors_total` rising | A source cannot be read. |
 | `vtop_retention_lost_records_total` rising | Kafka retention deleted records before the engine read them. They cannot be archived. Raise the topic's retention above the engine's worst-case lag. |
 | `vtop_source_replay_refused_total` rising | A failed range could not be re-read from its source, for example a file rotated away and removed. The path is in the ERROR line beside it. |
-| `vtop_recovery_held_total{reason="ledger_write_failed"}` above zero | At startup the state store refused recovery's replay decision for a range. The range was held, not lost: the source is read again from its committed point, and the ranges above it are archived twice. Fix the state store (disk, permissions, connectivity); the next start resolves the old rows. The batch id is in the ERROR line beside it. |
+| `vtop_recovery_held_total{reason="ledger_write_failed"}` above zero | At startup the state store refused recovery's replay decision for a range. The range was held, not lost: it is read again with the ranges above it, which are archived twice. Fix the state store (disk, permissions, connectivity); the next start resolves the old rows. The batch id is in the ERROR line beside it. |
 | `vtop_upload_throttled_total` rising | The object store is throttling. Consider `batching.adaptive_width.enabled`. |
 | `vtopctl audit-coverage` exits non-zero | A hole in the archive. See [Scrub and coverage audit](scrub-and-audit.md). |
 

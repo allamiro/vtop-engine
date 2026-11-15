@@ -185,14 +185,15 @@ pub struct Metrics {
     pub recovery_unsupported_manifest_total: IntCounterVec,
     /// Ranges recovery held instead of rewinding (#639, #782), by tenant,
     /// source type and [`RECOVERY_HOLD_REASONS`]. A held range holds back
-    /// every VERIFIED range and every rewind above it in its source unit.
+    /// every VERIFIED range above it in its source unit, and lowers every
+    /// rewind above it to its start.
     /// `ledger_write_failed` above zero means the state store is refusing
     /// writes.
     pub recovery_held_total: IntCounterVec,
-    /// Rewinds recovery left out because a held range of the same source
-    /// unit lies below them (#782): applied, they moved the read head past
-    /// the held range. Each means the ranges above it are archived twice.
-    pub recovery_rewinds_withheld_total: IntCounterVec,
+    /// Rewinds recovery applied at a held start below them instead of their
+    /// own (#782): applied at their own, they moved the read head past the
+    /// held range. Each means the ranges above it are archived twice.
+    pub recovery_rewinds_lowered_total: IntCounterVec,
     /// VERIFIED batches recovery re-checked against storage, by the class the
     /// ledger recorded they were verified with and what the re-check found
     /// (#664). `verification_class="strong", result="size_only"` is the one
@@ -450,12 +451,12 @@ impl Metrics {
         )?;
         let recovery_held_total = cv(
             "recovery_held_total",
-            "Ranges recovery held instead of rewinding, by reason (ledger_write_failed: the state store refused the replay decision; newer_manifest: a newer release wrote the batch); a held range holds back every VERIFIED range and rewind above it in its source unit, so the source is read again from its committed point (#782)",
+            "Ranges recovery held instead of rewinding, by reason (ledger_write_failed: the state store refused the replay decision; newer_manifest: a newer release wrote the batch); a held range holds back every VERIFIED range above it in its source unit, and a rewind above it starts at it instead (#782)",
             vec!["tenant", "source_type", "reason"],
         )?;
-        let recovery_rewinds_withheld_total = cv(
-            "recovery_rewinds_withheld_total",
-            "Rewinds recovery did not apply because a held range of the same source unit lies below them; the ranges above the held one are read again from the committed point and archived twice (#782)",
+        let recovery_rewinds_lowered_total = cv(
+            "recovery_rewinds_lowered_total",
+            "Rewinds recovery applied at the start of a held range of the same source unit below them instead of their own, so the held range is read again with them; the ranges above it are archived twice (#782)",
             vec!["tenant", "source_type"],
         )?;
         let recovery_rechecks_total = cv(
@@ -633,7 +634,7 @@ impl Metrics {
             failed_total,
             recovery_unsupported_manifest_total,
             recovery_held_total,
-            recovery_rewinds_withheld_total,
+            recovery_rewinds_lowered_total,
             recovery_rechecks_total,
             manifests_written_total,
             verification_receipts_total,

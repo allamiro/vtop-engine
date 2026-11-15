@@ -816,11 +816,11 @@ test that failed first.
 - **[#782](https://github.com/allamiro/vtop-engine/issues/782)** — a range
   recovery holds because its replay decision could not be recorded, or
   because a newer release wrote it, is no longer passed by the running
-  pipeline: recovery withholds every rewind above it in its source unit, so
-  the source is read again from its committed point and the held range is
+  pipeline: recovery applies every rewind above it in its source unit at the
+  held start, so the held range is read again with the ranges above it and
   archived before anything above it commits. The ranges above it are
   archived twice. New metrics: `vtop_recovery_held_total{reason}`,
-  `vtop_recovery_rewinds_withheld_total`. No format or ledger change.
+  `vtop_recovery_rewinds_lowered_total`. No format or ledger change.
 
 ## v0.9.0 — bug fixes: deletes that wait for proof, Kafka partitions that are never left unread, portable builds
 

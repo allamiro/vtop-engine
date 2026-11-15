@@ -75,7 +75,7 @@ fn populated() -> String {
             .with_label_values(&[l[0], l[1], reason])
             .inc_by(0);
     }
-    m.recovery_rewinds_withheld_total
+    m.recovery_rewinds_lowered_total
         .with_label_values(&[l[0], l[1]])
         .inc_by(0);
     m.failed_total.with_label_values(&l).inc_by(0);
@@ -423,7 +423,7 @@ fn the_recovery_recheck_counter_is_exported() {
     );
 }
 
-/// #782: the counters of a range recovery held and of a rewind it withheld
+/// #782: the counters of a range recovery held and of a rewind it lowered
 /// above one are exported under their names, labelled by tenant, source type
 /// and, for the hold, its reason from a closed set: an alert on a state store
 /// refusing recovery's writes reads `reason="ledger_write_failed"`.
@@ -440,7 +440,7 @@ fn the_recovery_hold_counters_are_exported() {
         );
         assert!(text.contains(&series), "missing {series}:\n{text}");
     }
-    let series = r#"vtop_recovery_rewinds_withheld_total{source_type="kafka",tenant="default"}"#;
+    let series = r#"vtop_recovery_rewinds_lowered_total{source_type="kafka",tenant="default"}"#;
     assert!(text.contains(series), "missing {series}:\n{text}");
 }
 

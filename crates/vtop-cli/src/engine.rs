@@ -2761,7 +2761,7 @@ impl Engine {
             )
         {
             // Said, not silent (#782): with rewinds above a held range
-            // withheld, a row can wait here for as long as the source takes
+            // lowered to it, a row can wait here for as long as the source takes
             // to be read again from its committed point.
             if let Some(suppressed) = self.key_notices.admit("held_row_waiting", &rec.source_name) {
                 let (start, end) = (
@@ -3573,8 +3573,8 @@ impl Engine {
                         }
                         // Held (#639) otherwise: its range is not committed,
                         // so a VERIFIED range of the same unit above it must
-                        // not commit past it, and no rewind above it may move
-                        // the read head past it (#782).
+                        // not commit past it, and a rewind above it starts at
+                        // it instead (#782).
                         count_held(&rec, "newer_manifest");
                         let (start, end) = (
                             start_position(&rec.progress_start),
@@ -3588,10 +3588,9 @@ impl Engine {
                             end,
                             "recovery holds batch {} (range {start}..{end} of {}): a newer release wrote it, \
                              and this one cannot read its manifest. The engine left it VERIFIED and did not \
-                             rewind it, and will not commit or rewind any range of the same source above it: \
-                             the source is read again from its committed point, this range included, and the \
-                             row waits until an upgraded engine commits it or the source has committed past it. \
-                             Upgrade this engine",
+                             hand it back on its own, and will not commit any range of the same source above it; \
+                             a rewind of a range above it starts at it instead. The row waits until an \
+                             upgraded engine commits it or the source has committed past it. Upgrade this engine",
                             rec.batch_id,
                             rec.source_name,
                         );
@@ -3798,14 +3797,14 @@ impl Engine {
         // Group by source type so each adapter rewinds its whole batch in one
         // call (see `SourceAdapter::replay_from_markers`).
         let mut by_source: Vec<(SourceType, Vec<ProgressMarker>)> = Vec::new();
-        // A rewind above a held range is not applied (#782): see
-        // `RewindPlan::held_below`. Each is said and counted here.
-        for (rewind, held_start) in rewinds.withheld() {
+        // A rewind above a held range is applied at the held start instead
+        // (#782): see `RewindPlan::held_below`. Each is said and counted here.
+        for (rewind, held_start) in rewinds.lowered() {
             let source_type = rewind.marker.source_type();
             let source_name = marker_source_name(&rewind.marker);
             let rewind_start = start_position(&rewind.marker);
             if let Some(mx) = telemetry::metrics() {
-                mx.recovery_rewinds_withheld_total
+                mx.recovery_rewinds_lowered_total
                     .with_label_values(&[rewind.tenant.as_str(), source_type.as_str()])
                     .inc();
             }
@@ -3814,12 +3813,12 @@ impl Engine {
                 source_name = %source_name,
                 rewind_start,
                 held_start,
-                "recovery is not rewinding {source_name} to {rewind_start}: a range below it, starting at \
-                 {held_start}, is held (its replay decision could not be recorded, or a newer release \
-                 wrote it; see the line logged for it above). The engine left the read position at the \
-                 committed point, so both ranges are read again from there (some ranges may be archived \
-                 twice; none is skipped), and no VERIFIED range above the held one is committed. Fix what \
-                 that line names; a later start resolves the old rows"
+                "recovery is rewinding {source_name} to {held_start}, not {rewind_start}: a range below \
+                 it, starting at {held_start}, is held (its replay decision could not be recorded, or a \
+                 newer release wrote it; see the line logged for it above). The engine reads both ranges \
+                 again from the held start (some ranges may be archived twice; none is skipped), and no \
+                 VERIFIED range above the held one is committed. Fix what that line names; a later start \
+                 resolves the old rows"
             );
         }
         for marker in rewinds.markers() {
@@ -3982,8 +3981,9 @@ impl Engine {
 
     /// Recovery could not record `rec`'s replay decision - the `write` to
     /// that state was refused - so the range is held, not rewound (#639).
-    /// Said in full and counted (#782): the hold now also withholds every
-    /// rewind above it, which the operator sees as ranges archived twice.
+    /// Said in full and counted (#782): the hold now also lowers every
+    /// rewind above it to its start, which the operator sees as ranges
+    /// archived twice.
     fn report_lost_decision(&self, rec: &BatchRecord, write: BatchState, error: &VtopError) {
         count_held(rec, "ledger_write_failed");
         let (start, end) = (
@@ -3999,10 +3999,9 @@ impl Engine {
             write = %write,
             error = %error,
             "recovery could not record the replay decision for batch {} (range {start}..{end} of {}): \
-             {error}. The engine did not rewind it, and will not commit or rewind any range of the same \
-             source above it until it has been read again: the source is read again from its committed \
-             point, this range included (a range of a file rotated away since waits for the next start). \
-             Check the state store (disk space, permissions, connectivity); no data is at risk, and the \
+             {error}. The engine did not hand it back on its own, and will not commit any range of the \
+             same source above it until it has been read again; a rewind of a range above it starts at \
+             it instead, so it is read again with that range. Check the state store (disk space, permissions, connectivity); no data is at risk, and the \
              next start records the decision",
             rec.batch_id,
             rec.source_name,
@@ -4763,7 +4762,7 @@ struct Rewind {
     /// sorts last as text (review of #563).
     recency: u64,
     /// The tenant of the row whose start this is, for counting the rewind
-    /// when it is withheld (#782).
+    /// when it is lowered to a held start (#782).
     tenant: String,
 }
 
@@ -4776,7 +4775,7 @@ impl Rewind {
 
     /// Whether `content` is proven other than EVERY content this
     /// generation's ranges carried (#782): the test for a held range below
-    /// it, biased towards withholding. "Any" is the wrong test there: a file
+    /// it, biased towards lowering the rewind. "Any" is the wrong test there: a file
     /// under one page fingerprints a different length at each read, so one
     /// generation can carry several fingerprints, and a held range proven
     /// other than one of them may still be the same file as another. A
@@ -4925,8 +4924,8 @@ impl RewindPlan {
     /// does not move it: no rewind lands for it, so a landing at its file
     /// (another range's) says nothing about whether its bytes are archived.
     ///
-    /// And it withholds every rewind above it in its unit (#782): see
-    /// [`RewindPlan::held_below`].
+    /// And it lowers every rewind above it in its unit to its start (#782):
+    /// see [`RewindPlan::held_below`].
     fn hold(&mut self, start: &ProgressMarker) {
         note_pending(&mut self.held, start);
     }
@@ -5007,26 +5006,35 @@ impl RewindPlan {
     }
 
     /// The lowest HELD start of `rewind`'s unit below the rewind's own, if
-    /// there is one: the rewind is then withheld (#782).
+    /// there is one: the rewind is then applied at that start instead of its
+    /// own (#782).
     ///
     /// A rewind moves the read head FORWARD when its start is above the
     /// committed point (the adapters set it to `max(start, committed)`). With
     /// a held range below it, the head passed the held range, and the
     /// running pipeline's commit of the rewound range moved the committed
     /// point past it as well: nothing read it again, and with
-    /// `delete_after_commit` its file could be deleted. Left out, the head
-    /// stays at the restart seed - the committed point, at or below every
-    /// range still to be read - and the pipeline reads the held range and
-    /// everything above it again in order. Reads are contiguous, so no batch
-    /// commits past the held range without covering it. The cost is that the
-    /// ranges above it are archived twice.
+    /// `delete_after_commit` its file could be deleted. Lowered to the held
+    /// start, the rewind lands at or below the held range, and the pipeline
+    /// reads it and everything above it again in order. Reads are
+    /// contiguous, so no batch commits past the held range without covering
+    /// it. The cost is that the ranges above it are archived twice.
+    ///
+    /// Lowered, not left out (review of #785): leaving it out relied on the
+    /// read head starting at the committed point, and two heads do not. A
+    /// file rotated away while the engine was down is read only through a
+    /// rewind (#621), so without one neither range was read again; and a
+    /// Kafka partition whose group never committed follows
+    /// `auto.offset.reset`. The rewind does hand the held range back without
+    /// its decision recorded, which costs at most a duplicate, for the
+    /// reason the running engine's rewind is unconditional (#627).
     ///
     /// The same inode rules as [`RewindPlan::holds_back`]; a held range is
     /// set aside only when its content is proven other than every content
     /// the rewind's generation carried. A held start equal to the rewind's
-    /// does not withhold it: the rewind lands at or below the held range.
-    /// Decided when the plan is read, after the scan: rows come oldest
-    /// first, so a rewind can be added before the hold below it.
+    /// leaves it as it is. Decided when the plan is read, after the scan:
+    /// rows come oldest first, so a rewind can be added before the hold
+    /// below it.
     fn held_below(&self, rewind: &Rewind) -> Option<i128> {
         lowest_pending_below(
             &self.held,
@@ -5036,28 +5044,23 @@ impl RewindPlan {
         )
     }
 
-    /// The rewinds [`RewindPlan::markers`] leaves out, each with the held
-    /// start below it, in a fixed order for the log.
-    fn withheld(&self) -> Vec<(&Rewind, i128)> {
-        let mut withheld: Vec<(&Rewind, i128)> = self
+    /// The rewinds [`RewindPlan::markers`] lowers to a held start, each with
+    /// that start, in a fixed order for the log.
+    fn lowered(&self) -> Vec<(&Rewind, i128)> {
+        let mut lowered: Vec<(&Rewind, i128)> = self
             .lowest
             .values()
             .flatten()
             .filter_map(|rewind| self.held_below(rewind).map(|held| (rewind, held)))
             .collect();
-        withheld.sort_by_cached_key(|(rewind, _)| rewind_key(&rewind.marker));
-        withheld
+        lowered.sort_by_cached_key(|(rewind, _)| rewind_key(&rewind.marker));
+        lowered
     }
 
-    /// The rewinds to apply, except those a held range below withholds
-    /// ([`RewindPlan::held_below`]).
+    /// The rewinds to apply, each lowered to the held start below it where
+    /// there is one ([`RewindPlan::held_below`]).
     fn markers(&self) -> Vec<ProgressMarker> {
-        let mut rewinds: Vec<&Rewind> = self
-            .lowest
-            .values()
-            .flatten()
-            .filter(|rewind| self.held_below(rewind).is_none())
-            .collect();
+        let mut rewinds: Vec<&Rewind> = self.lowest.values().flatten().collect();
         // Grouped by source, and within a source oldest file first so the most
         // recent file's rewind is applied last. The rewind key breaks ties, so
         // the log and the tests do not depend on hash order.
@@ -5070,7 +5073,10 @@ impl RewindPlan {
         });
         rewinds
             .into_iter()
-            .map(|rewind| rewind.marker.clone())
+            .map(|rewind| match self.held_below(rewind) {
+                Some(held) => starting_at(&rewind.marker, held),
+                None => rewind.marker.clone(),
+            })
             .collect()
     }
 }
@@ -5088,6 +5094,26 @@ fn source_key(marker: &ProgressMarker) -> String {
         ProgressMarker::File { path, .. } => format!("file|{path}"),
         ProgressMarker::SyslogSpool { spool_id, path, .. } => format!("spool|{spool_id}|{path}"),
     }
+}
+
+/// `marker` with its start moved to `position` within its unit (#782): the
+/// same file or partition and identity, read again from there.
+fn starting_at(marker: &ProgressMarker, position: i128) -> ProgressMarker {
+    let mut marker = marker.clone();
+    match &mut marker {
+        ProgressMarker::Kafka { start_offset, .. } => {
+            if let Ok(position) = i64::try_from(position) {
+                *start_offset = position;
+            }
+        }
+        ProgressMarker::File { start_byte, .. }
+        | ProgressMarker::SyslogSpool { start_byte, .. } => {
+            if let Ok(position) = u64::try_from(position) {
+                *start_byte = position;
+            }
+        }
+    }
+    marker
 }
 
 /// The name a marker's source goes by in logs: a path, or a Kafka topic.
@@ -9259,18 +9285,14 @@ mod tests {
             !plan.holds_back(&file(1, 100, page(b'B'))),
             "content proven to be another file's"
         );
-        // A rewind of the same file above the held range is withheld (#782),
-        // and a landing ABOVE the verified range does not release the hold
-        // either: it says nothing about the held range's bytes.
+        // A rewind of the same file that lands ABOVE the verified range does
+        // not release the hold: it says nothing about the held range's bytes.
         plan.add(&file(1, 300, page(b'A')));
         plan.rebase(&HashMap::from([(
             rewind_key(&file(1, 300, page(b'A'))),
             300,
         )]));
-        assert!(
-            plan.markers().is_empty(),
-            "a rewind above the held range is withheld (#782)"
-        );
+        assert_eq!(plan.markers().len(), 1, "only the added range rewinds");
         assert!(
             plan.holds_back(&file(1, 100, page(b'A'))),
             "the held [0,100) still holds back [100,200) after the rebase"
@@ -9916,14 +9938,15 @@ mod tests {
     }
 
     /// #782: a rewind that starts above a HELD start of the same unit is
-    /// withheld from the plan, whichever of the two the scan met first.
-    /// Applied, it moved the read head past the held range; the running
-    /// pipeline's commit of the higher range then moved the committed point
-    /// past it too, and the held range was never archived. The same inode,
-    /// content and partition rules as [`RewindPlan::holds_back`] decide which
-    /// held ranges count, biased towards withholding.
+    /// applied at the held start instead, whichever of the two the scan met
+    /// first. Applied at its own start, it moved the read head past the held
+    /// range; the running pipeline's commit of the higher range then moved
+    /// the committed point past it too, and the held range was never
+    /// archived. The same inode, content and partition rules as
+    /// [`RewindPlan::holds_back`] decide which held ranges count, biased
+    /// towards lowering the rewind.
     #[test]
-    fn a_rewind_above_a_held_range_of_its_unit_is_withheld() {
+    fn a_rewind_above_a_held_range_of_its_unit_starts_at_the_held_range() {
         let page = |tag: u8| ContentFingerprint::of(&[tag; 5_000]);
         let file =
             |path: &str, inode: Option<u64>, start: u64, content: Option<ContentFingerprint>| {
@@ -9931,13 +9954,25 @@ mod tests {
                     path: path.into(),
                     inode,
                     start_byte: start,
-                    end_byte: start + 7,
+                    end_byte: 21,
                     file_size: 8_192,
                     mtime: String::new(),
                     content_fingerprint: content,
                     tail_fingerprint: None,
                 }
             };
+        // The same marker, read again from `start`.
+        let from = |marker: &ProgressMarker, start: u64| {
+            let mut marker = marker.clone();
+            match &mut marker {
+                ProgressMarker::File { start_byte, .. }
+                | ProgressMarker::SyslogSpool { start_byte, .. } => *start_byte = start,
+                ProgressMarker::Kafka { start_offset, .. } => {
+                    *start_offset = i64::try_from(start).unwrap();
+                }
+            }
+            marker
+        };
         let a = || file("/a", Some(1), 0, page(b'A'));
         let c = || file("/a", Some(1), 14, page(b'A'));
         let rewinds = |held: &ProgressMarker, rewound: &ProgressMarker| {
@@ -9947,8 +9982,9 @@ mod tests {
             plan.markers()
         };
 
-        assert!(
-            rewinds(&a(), &c()).is_empty(),
+        assert_eq!(
+            rewinds(&a(), &c()),
+            vec![from(&c(), 0)],
             "C [14, 21) is rewound past the held A [0, 7)"
         );
         // The scan meets rows oldest first, so a higher range's rewind can be
@@ -9956,9 +9992,19 @@ mod tests {
         let mut plan = RewindPlan::default();
         plan.add(&c());
         plan.hold(&a());
-        assert!(plan.markers().is_empty(), "the rewind was added first");
+        assert_eq!(
+            plan.markers(),
+            vec![from(&c(), 0)],
+            "the rewind was added first"
+        );
+        // Several held ranges below: the lowest.
+        let mut plan = RewindPlan::default();
+        plan.hold(&file("/a", Some(1), 7, page(b'A')));
+        plan.hold(&a());
+        plan.add(&c());
+        assert_eq!(plan.markers(), vec![from(&c(), 0)], "two held ranges");
 
-        // Biased towards withholding: what cannot be told apart counts.
+        // Biased towards lowering: what cannot be told apart counts.
         for (case, held) in [
             (
                 "content that cannot be compared",
@@ -9969,14 +10015,16 @@ mod tests {
                 file("/a", None, 0, page(b'A')),
             ),
         ] {
-            assert!(rewinds(&held, &c()).is_empty(), "{case}");
+            assert_eq!(rewinds(&held, &c()), vec![from(&c(), 0)], "{case}");
         }
-        assert!(
-            rewinds(&a(), &file("/a", None, 14, page(b'A'))).is_empty(),
+        let legacy = file("/a", None, 14, page(b'A'));
+        assert_eq!(
+            rewinds(&a(), &legacy),
+            vec![from(&legacy, 0)],
             "a rewind with no inode"
         );
 
-        // What withholds nothing.
+        // What leaves the rewind as it is.
         for (case, held, rewound) in [
             (
                 "a held start above the rewind",
@@ -9996,18 +10044,14 @@ mod tests {
         }
 
         // A generation whose ranges carried two fingerprints (a file under one
-        // page fingerprints a different length at each read) is withheld
+        // page fingerprints a different length at each read) is lowered
         // unless the held range is proven other than BOTH. Proven other than
         // the shorter one alone says nothing about the longer.
         let text = [b'x'; 300];
         let other = ContentFingerprint::of(&[b'y'; 100]);
+        let one = file("/a", Some(1), 100, ContentFingerprint::of(&text[..100]));
         let mut plan = RewindPlan::default();
-        plan.add(&file(
-            "/a",
-            Some(1),
-            100,
-            ContentFingerprint::of(&text[..100]),
-        ));
+        plan.add(&one);
         plan.add(&file(
             "/a",
             Some(1),
@@ -10015,11 +10059,11 @@ mod tests {
             ContentFingerprint::of(&text[..200]),
         ));
         plan.hold(&file("/a", Some(1), 0, other.clone()));
-        assert!(
-            plan.markers().is_empty(),
+        assert_eq!(
+            plan.markers(),
+            vec![from(&one, 0)],
             "held content proven other than one fingerprint of two"
         );
-        let one = file("/a", Some(1), 100, ContentFingerprint::of(&text[..100]));
         assert_eq!(
             rewinds(&file("/a", Some(1), 0, other), &one),
             vec![one.clone()],
@@ -10030,10 +10074,13 @@ mod tests {
             topic: "t".into(),
             partition,
             start_offset: start,
-            end_offset: start,
+            end_offset: 2,
             consumer_group: group.into(),
         };
-        assert!(rewinds(&kafka("g", 0, 0), &kafka("g", 0, 2)).is_empty());
+        assert_eq!(
+            rewinds(&kafka("g", 0, 0), &kafka("g", 0, 2)),
+            vec![kafka("g", 0, 0)]
+        );
         for (case, held) in [
             ("another partition", kafka("g", 1, 0)),
             ("another group", kafka("h", 0, 0)),
@@ -10050,13 +10097,16 @@ mod tests {
             path: path.into(),
             inode: Some(7),
             start_byte: start,
-            end_byte: start + 7,
+            end_byte: 21,
             received_time_start: None,
             received_time_end: None,
             file_size: None,
             content_fingerprint: None,
         };
-        assert!(rewinds(&spool("/spool", 0), &spool("/spool", 14)).is_empty());
+        assert_eq!(
+            rewinds(&spool("/spool", 0), &spool("/spool", 14)),
+            vec![spool("/spool", 0)]
+        );
         assert_eq!(
             rewinds(&spool("/other", 0), &spool("/spool", 14)),
             vec![spool("/spool", 14)],
@@ -10304,8 +10354,8 @@ mod tests {
     /// decision cannot be recorded, B [7, 14) is VERIFIED and held back, C
     /// [14, 21) is replayed. C's rewind moved the read head to 14, the
     /// running pipeline archived and committed [14, 21), and A was never
-    /// archived. C's rewind is withheld instead: the head stays at the
-    /// committed point, and the pipeline reads A, B and C again in order.
+    /// archived. C's rewind starts at A instead, and the pipeline reads A, B
+    /// and C again in order.
     #[tokio::test]
     async fn a_range_held_by_recovery_is_not_passed_by_the_running_pipeline() {
         let fixture = ThreeLines::left_by_a_crash("held-782-file", true).await;
@@ -10460,7 +10510,7 @@ mod tests {
 
     /// #782: the store refuses A's decision at two starts in a row. The hold
     /// is derived again from the ledger alone at the second, C's rewind is
-    /// withheld again, and the pass leaves no gap.
+    /// lowered to A again, and the pass leaves no gap.
     #[tokio::test]
     async fn a_hold_is_derived_again_at_a_restart_whose_store_still_refuses() {
         let fixture = ThreeLines::left_by_a_crash("held-782-again", true).await;
@@ -10502,9 +10552,31 @@ mod tests {
         .await;
     }
 
+    /// #782 for a file rotated away while the engine was down (review of
+    /// #785): its ranges are read again only through a rewind (#621), which
+    /// finds the file under its new name. Leaving C's rewind out left both A
+    /// and C unread; lowered to A, the rewind reads them both again from
+    /// the rotated file.
+    #[tokio::test]
+    async fn a_held_range_of_a_file_rotated_away_is_read_again_with_the_range_above_it() {
+        let fixture = ThreeLines::left_by_a_crash("held-782-rotated", true).await;
+        std::fs::rename(&fixture.input, fixture.dir.path().join("in.log.1")).unwrap();
+        std::fs::write(&fixture.input, "").unwrap();
+        let (mut second, summary) = fixture.restart_refusing_a("work-2", |_| {}).await;
+        for _ in 0..3 {
+            second.process_once(SourceType::File).await.unwrap();
+        }
+        assert_committed_without_a_gap(
+            &format!("a held A in a rotated file: {summary:?}"),
+            &second,
+            21,
+        )
+        .await;
+    }
+
     /// #782 for a range held because a newer release wrote it (#671): A is
     /// VERIFIED with a manifest this engine cannot read, B VERIFIED above
-    /// it, C left mid-pipeline. C's rewind is withheld, the pass archives
+    /// it, C left mid-pipeline. C's rewind starts at A, the pass archives
     /// A's bytes again, and the next start retires A as SUPERSEDED.
     #[tokio::test]
     async fn a_range_held_for_a_newer_manifest_is_not_passed_by_the_running_pipeline() {
@@ -10587,8 +10659,8 @@ mod tests {
             "vtop_recovery_held_total",
             &[("tenant", tenant), ("reason", "newer_manifest")],
         );
-        let withheld_before = counter_value(
-            "vtop_recovery_rewinds_withheld_total",
+        let lowered_before = counter_value(
+            "vtop_recovery_rewinds_lowered_total",
             &[("tenant", tenant), ("source_type", "file")],
         );
         let mut second = fixture.engine("work-2", |_| {}).await;
@@ -10618,11 +10690,11 @@ mod tests {
         );
         assert_eq!(
             counter_value(
-                "vtop_recovery_rewinds_withheld_total",
+                "vtop_recovery_rewinds_lowered_total",
                 &[("tenant", tenant), ("source_type", "file")],
-            ) - withheld_before,
+            ) - lowered_before,
             1,
-            "C's withheld rewind is counted"
+            "C's lowered rewind is counted"
         );
         drop(second);
 
@@ -10636,11 +10708,11 @@ mod tests {
         assert_committed_without_a_gap("a newer release's A, restarted", &third, 21).await;
     }
 
-    /// #782: the hold and the withheld rewind each say what happened, what
+    /// #782: the hold and the lowered rewind each say what happened, what
     /// the engine did and what to do, with their identifiers as fields, and
     /// each is counted.
     #[tokio::test]
-    async fn a_hold_and_a_withheld_rewind_are_logged_and_counted() {
+    async fn a_hold_and_a_lowered_rewind_are_logged_and_counted() {
         let tenant = "held-782-messages";
         let fixture = ThreeLines::left_by_a_crash(tenant, true).await;
         let held_before = counter_value(
@@ -10651,8 +10723,8 @@ mod tests {
                 ("reason", "ledger_write_failed"),
             ],
         );
-        let withheld_before = counter_value(
-            "vtop_recovery_rewinds_withheld_total",
+        let lowered_before = counter_value(
+            "vtop_recovery_rewinds_lowered_total",
             &[("tenant", tenant), ("source_type", "file")],
         );
         let (logs, guard) = CapturedLogs::start();
@@ -10670,13 +10742,14 @@ mod tests {
             "start=0".to_owned(),
             "end=7".to_owned(),
             "error=".to_owned(),
-            "did not rewind it".to_owned(),
-            "will not commit or rewind any range of the same source above it".to_owned(),
+            "did not hand it back on its own".to_owned(),
+            "will not commit any range of the same source above it".to_owned(),
+            "a rewind of a range above it starts at it instead".to_owned(),
             "Check the state store".to_owned(),
         ] {
             assert!(held.contains(&part), "{part:?} is missing from: {held}");
         }
-        let withheld = logs.line("recovery is not rewinding");
+        let lowered = logs.line("recovery is rewinding");
         for part in [
             "WARN".to_owned(),
             "source_type=file".to_owned(),
@@ -10686,8 +10759,8 @@ mod tests {
             "none is skipped".to_owned(),
         ] {
             assert!(
-                withheld.contains(&part),
-                "{part:?} is missing from: {withheld}"
+                lowered.contains(&part),
+                "{part:?} is missing from: {lowered}"
             );
         }
         assert_eq!(
@@ -10703,9 +10776,9 @@ mod tests {
         );
         assert_eq!(
             counter_value(
-                "vtop_recovery_rewinds_withheld_total",
+                "vtop_recovery_rewinds_lowered_total",
                 &[("tenant", tenant), ("source_type", "file")],
-            ) - withheld_before,
+            ) - lowered_before,
             1
         );
     }
