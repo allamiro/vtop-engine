@@ -33,6 +33,11 @@ use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 /// version; this is the refusal path for the releases from here on. Raise it,
 /// and the `PRAGMA user_version = 1` in `migrate`, together
 /// (`sqlite_refuses_a_file_a_newer_release_opened` checks they agree).
+///
+/// The `sealed_at` column (#626) does not raise it: a nullable column that
+/// older releases never name is nothing they could misread (v0.9.0 names its
+/// columns and never writes this one), and raising the version would make a
+/// first open an automatic one-way step that PostgreSQL does not have.
 const SQLITE_SCHEMA_VERSION: i64 = 1;
 
 /// How many times a write that lost a race to another writer is re-validated
@@ -62,7 +67,8 @@ CREATE TABLE IF NOT EXISTS batches (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     claim_gen INTEGER NOT NULL DEFAULT 0,
-    verification_class TEXT
+    verification_class TEXT,
+    sealed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
 CREATE INDEX IF NOT EXISTS idx_batches_source ON batches(source_type, source_name);
@@ -377,8 +383,9 @@ impl StateStore for SqliteStateStore {
                (batch_id, tenant, source_type, source_name, format, state,
                 progress_start_json, progress_end_json, object_uri, manifest_uri,
                 object_sha256, manifest_sha256, manifest_version_id, object_size_bytes,
-                record_count, error_message, owner, lease_expires_at, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+                record_count, error_message, owner, lease_expires_at, created_at, updated_at,
+                sealed_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
         )
         .bind(&rec.batch_id)
         .bind(&rec.tenant)
@@ -400,6 +407,7 @@ impl StateStore for SqliteStateStore {
         .bind(&rec.lease_expires_at)
         .bind(crate::store::canonical_created_at(&rec.created_at))
         .bind(&rec.updated_at)
+        .bind(&rec.sealed_at)
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -976,24 +984,43 @@ async fn migrate(conn: &mut sqlx::SqliteConnection) -> Result<(), VtopError> {
         .execute(&mut *conn)
         .await
         .map_err(map_sqlx)?;
-    if added {
-        // Counted after the commit, and best effort: the column is there
+    if added.verification_class || added.sealed_at {
+        // Counted after the commit, and best effort: the columns are there
         // either way, and a failed count must not fail the open.
-        match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM batches")
+        let rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM batches")
             .fetch_one(&mut *conn)
             .await
-        {
-            Ok(rows) => crate::models::log_class_column_added("SQLite", rows),
-            Err(e) => crate::models::log_class_column_added_uncounted("SQLite", &e.to_string()),
+            .map_err(|e| e.to_string());
+        if added.verification_class {
+            match &rows {
+                Ok(rows) => crate::models::log_class_column_added("SQLite", *rows),
+                Err(e) => crate::models::log_class_column_added_uncounted("SQLite", e),
+            }
+        }
+        if added.sealed_at {
+            match &rows {
+                Ok(rows) => crate::models::log_sealed_at_column_added("SQLite", *rows),
+                Err(e) => crate::models::log_sealed_at_column_added_uncounted("SQLite", e),
+            }
         }
     }
     Ok(())
 }
 
-/// [`migrate`]'s statements, in its transaction. `true` when this run added
-/// the verification class column to a table that already existed.
-async fn migrate_in_transaction(conn: &mut sqlx::SqliteConnection) -> Result<bool, VtopError> {
-    let mut added = false;
+/// The columns a run of [`migrate`] added to a `batches` table that already
+/// existed: a new table is created with them, and the operator is told only
+/// about rows left without a value.
+#[derive(Default)]
+struct AddedColumns {
+    verification_class: bool,
+    sealed_at: bool,
+}
+
+/// [`migrate`]'s statements, in its transaction.
+async fn migrate_in_transaction(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<AddedColumns, VtopError> {
+    let mut added = AddedColumns::default();
     // A file a newer release has opened is left alone (#664): see
     // SQLITE_SCHEMA_VERSION.
     let version: i64 = sqlx::query_scalar("PRAGMA user_version")
@@ -1036,6 +1063,11 @@ async fn migrate_in_transaction(conn: &mut sqlx::SqliteConnection) -> Result<boo
         // were. An older binary opening this file ignores the column: it
         // reads rows by column name and never writes it.
         "ALTER TABLE batches ADD COLUMN verification_class TEXT",
+        // The instant the batch's contents were fixed (#626), recorded with
+        // the row's first write; a replay reads it back to file its object
+        // under the same hour. NULL on every row from before it: such a
+        // replay is filed under the hour it runs in, as it always was.
+        "ALTER TABLE batches ADD COLUMN sealed_at TEXT",
     ] {
         match sqlx::raw_sql(stmt).execute(&mut *conn).await {
             Err(e) if !e.to_string().contains("duplicate column name") => {
@@ -1044,7 +1076,8 @@ async fn migrate_in_transaction(conn: &mut sqlx::SqliteConnection) -> Result<boo
             Err(_) => {}
             // Added to a table that already existed: a new table is created
             // with the column, and this ALTER finds it there.
-            Ok(_) if stmt.contains("verification_class") => added = true,
+            Ok(_) if stmt.contains("verification_class") => added.verification_class = true,
+            Ok(_) if stmt.contains("sealed_at") => added.sealed_at = true,
             Ok(_) => {}
         }
     }
@@ -1124,6 +1157,8 @@ fn parse_sqlite_opts(conn_str: &str) -> Result<SqliteConnectOptions, VtopError> 
 }
 
 fn row_to_record(row: sqlx::sqlite::SqliteRow) -> Result<BatchRecord, VtopError> {
+    let batch_id: String = row.get("batch_id");
+    let sealed_at = crate::models::sealed_at_column(row.get("sealed_at"), &batch_id);
     let source_type_s: String = row.get("source_type");
     let format_s: String = row.get("format");
     let state_s: String = row.get("state");
@@ -1131,7 +1166,7 @@ fn row_to_record(row: sqlx::sqlite::SqliteRow) -> Result<BatchRecord, VtopError>
     let pe: String = row.get("progress_end_json");
 
     Ok(BatchRecord {
-        batch_id: row.get("batch_id"),
+        batch_id,
         tenant: row.get("tenant"),
         source_type: SourceType::from_str(&source_type_s).map_err(VtopError::State)?,
         source_name: row.get("source_name"),
@@ -1153,6 +1188,7 @@ fn row_to_record(row: sqlx::sqlite::SqliteRow) -> Result<BatchRecord, VtopError>
         error_message: row.get("error_message"),
         owner: row.get("owner"),
         lease_expires_at: row.get("lease_expires_at"),
+        sealed_at,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
@@ -1622,6 +1658,40 @@ mod tests {
             .unwrap();
         let got = store.get_batch("newer-class").await.unwrap().unwrap();
         assert_eq!(got.verification_class, None);
+    }
+
+    /// #626: a `sealed_at` that is not an RFC 3339 instant - corrupted in
+    /// storage, or written by hand - reads as unknown on every read path,
+    /// recovery's claim included, and never fails the row.
+    #[tokio::test]
+    async fn sqlite_reads_a_seal_instant_that_is_not_one_as_unknown() {
+        let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
+        store
+            .save_batch_state(&test_battery::sample_record("odd-sealed-at"))
+            .await
+            .unwrap();
+        for stored in ["yesterday", "", "2026-13-45T99:00:00Z"] {
+            sqlx::query("UPDATE batches SET sealed_at = ? WHERE batch_id = ?")
+                .bind(stored)
+                .bind("odd-sealed-at")
+                .execute(&store.pool)
+                .await
+                .unwrap();
+            let got = store.get_batch("odd-sealed-at").await.unwrap().unwrap();
+            assert_eq!(got.sealed_at, None, "{stored:?}");
+            let all = store.list_batches().await.unwrap();
+            assert_eq!(all[0].sealed_at, None, "{stored:?}");
+        }
+        let claimed = store
+            .claim_incomplete_batches(
+                "engine-odd",
+                "2070-01-01T00:00:00+00:00",
+                "2070-01-01T00:05:00+00:00",
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].sealed_at, None);
     }
 
     /// #625, in the database: a write that skips `save_batch_state` (a tool

@@ -86,6 +86,11 @@ fn populated() -> String {
             .with_label_values(&["default", "kafka", "cef", d])
             .inc_by(0);
     }
+    for r in telemetry::REPLAY_REBUILD_RESULTS {
+        m.replay_rebuilds_total
+            .with_label_values(&["default", "file", "raw", r])
+            .inc_by(0);
+    }
     for e in KAFKA_PARTITION_EVENTS {
         m.kafka_partition_events_total
             .with_label_values(&[e])
@@ -297,7 +302,8 @@ fn every_exported_label_is_from_a_bounded_set() {
     // "outcome" those of FILE_DELETE_OUTCOMES (#619), never the path,
     // "event" the seven of KAFKA_PARTITION_EVENTS (#675), and
     // `verification_class` (strong, size_only, unknown) and `result` (strong,
-    // size_only, failed, unsupported_version) are closed sets (#664), and
+    // size_only, failed, unsupported_version) are closed sets (#664), as is
+    // `result` on vtop_replay_rebuilds_total (REPLAY_REBUILD_RESULTS, #626), and
     // "version" is the manifest version, "0.3" or "0.4", the values
     // `manifest.write_version` accepts (#671 release B).
     // "reason" and "signal" label the OpenTelemetry exporter's own counters
@@ -619,6 +625,25 @@ fn object_key_decisions_are_exported_by_bounded_decision() {
     for d in vtop_core::telemetry::OBJECT_KEY_DECISIONS {
         let label = format!(r#"decision="{d}""#);
         assert!(text.contains(&label), "missing {label}");
+    }
+}
+
+/// #626: what each replay of a recorded window came to is exported by
+/// `result`, from its bounded set, so an alert can see replays writing
+/// second objects (`bytes_differ`) without parsing logs. No range, key or
+/// path is a label.
+#[test]
+fn replay_rebuilds_are_exported_by_bounded_result() {
+    let text = populated();
+    assert!(text.contains("vtop_replay_rebuilds_total"), "{text}");
+    for r in vtop_core::telemetry::REPLAY_REBUILD_RESULTS {
+        let label = format!(r#"result="{r}""#);
+        assert!(
+            text.lines().any(
+                |line| line.starts_with("vtop_replay_rebuilds_total{") && line.contains(&label)
+            ),
+            "missing vtop_replay_rebuilds_total with {label}"
+        );
     }
 }
 
