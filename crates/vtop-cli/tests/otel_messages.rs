@@ -297,7 +297,12 @@ async fn export_on_sends_traces_and_metrics_and_says_so() {
     // run together, and a line filed under the other's trace would pass a
     // check for "has a trace id" (review of #693).
     let traced = batch_traces(&traces);
-    assert_eq!(traced.len(), 2, "two batch spans expected: {traced:?}");
+    assert_eq!(
+        traced.len(),
+        2,
+        "two batch spans expected: {traced:?}, in {} trace requests; vtopctl said: {log}",
+        traces.len()
+    );
     let mut sealed = 0;
     for line in log.lines().filter(|l| l.contains("batch_sealed")) {
         let value: serde_json::Value =
