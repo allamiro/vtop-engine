@@ -18,8 +18,8 @@ import os
 from typing import Any
 
 from kafka_compare import failover_schema as fschema
+from kafka_compare import footer, stats
 from kafka_compare import report as base
-from kafka_compare import stats
 from kafka_compare.failover_stats import FAULT_LABELS, classify_vtop_reason
 
 SYSTEMS = ("kafka", "vtop")
@@ -174,24 +174,6 @@ def fmt_summary(s: stats.Summary | None, n_all: int, unit=fmt_ms) -> str:
     return text
 
 
-def footer_text(env: dict[str, Any]) -> str:
-    c = env["comparable"]
-    m = env["matrix"]
-    limits = c["node_limits"]
-    return (
-        f"{c['host_cpu']} ({c['host_logical_cpus']} logical CPUs, {base.gib(c.get('host_memory_bytes'))}), "
-        f"{c['host_os']} | "
-        f"{c['docker_platform']}, VM {c['docker_vm_cpus']} CPUs / {base.gib(c.get('docker_vm_memory_bytes'))}, "
-        f"kernel {c['docker_vm_kernel']}, "
-        f"volumes {c['volume_filesystem']}\n"
-        f"per node: {limits['cpus']} CPUs, {limits['mem_limit']} RAM | Kafka {c['kafka_image'].split('@')[0]} "
-        f"(KRaft, 3 combined nodes) | VTOP {c['vtop_commit'][:12]} (3 co-located candidates) | clients: "
-        f"{c['client_kafka']} vs {c['client_vtop']} | profile {c['profile']} (shipped timeouts) | "
-        f"{m['offered_rate']:,} records/s offered | {m['repetitions']} repetitions | run {env['run_id']} "
-        f"({env['started_at'][:10]}) | single host, indicative, not a production benchmark"
-    )
-
-
 # --------------------------------------------------------------------------- charts
 
 
@@ -258,8 +240,9 @@ def timeline_chart(plt, run: fschema.FailoverRun, img_dir: str) -> list[str]:
                             f"{env['matrix']['offered_rate']:,} records/s. A flat zero is the outage; the spike after "
                             "it is the backlog the outage held back. The two systems are driven by DIFFERENT "
                             "clients (a Kafka client cannot follow a VTOP failover).", 210))
-    base._footer(fig, footer_text(env), 230)
-    paths = base._save(fig, img_dir, "kafka-failover-timeline")
+    text = footer.footer_text(env)
+    base._footer(fig, text, 230)
+    paths = base._save(fig, img_dir, "kafka-failover-timeline", text)
     plt.close(fig)
     return paths
 
@@ -328,8 +311,9 @@ def box_chart(plt, run: fschema.FailoverRun, img_dir: str) -> list[str]:
                  base._wrap("Box: quartiles; line: median; whiskers: min-max; dots: each repetition (label: median). "
                             "Both systems at their shipped timeouts (Kafka broker.session.timeout.ms 9 s, VTOP lease "
                             "15 s). DIFFERENT clients: the JVM Kafka producer vs VTOP's native producer.", 210))
-    base._footer(fig, footer_text(env), 230)
-    paths = base._save(fig, img_dir, "kafka-failover-unavailability")
+    text = footer.footer_text(env)
+    base._footer(fig, text, 230)
+    paths = base._save(fig, img_dir, "kafka-failover-unavailability", text)
     plt.close(fig)
     return paths
 

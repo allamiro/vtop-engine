@@ -1,0 +1,16 @@
+name: Security contact request
+description: Ask for a private channel to report a vulnerability, only when private vulnerability reporting is unavailable. Write nothing about the problem.
+title: "Security contact request"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this only if the [private reporting form](https://github.com/allamiro/vtop-engine/security/advisories/new) is unavailable (SECURITY.md, "Reporting a vulnerability"). This issue is public: do not name the component, the symptom or the version. The maintainer replies here with a private channel.
+
+  - type: checkboxes
+    id: no-detail
+    attributes:
+      label: Before you file
+      options:
+        - label: This issue contains no detail about the vulnerability.
+          required: true
