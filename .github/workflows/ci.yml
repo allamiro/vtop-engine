@@ -1668,8 +1668,9 @@ jobs:
           done
       # The previous release (N-1, the only one that may share a ledger with
       # HEAD, #743) on a SQLite ledger HEAD opened, wrote and pruned (#626):
-      # it must keep archiving and auditing, and ignore the sealed_at column
-      # and the digests' sealed_at. The release binaries have no `postgres`
+      # it must keep archiving and auditing. A release before v0.10.0 ignores
+      # the sealed_at column and the digests' sealed_at; one from v0.10.0 on
+      # writes it too (#755). The release binaries have no `postgres`
       # feature, so the PostgreSQL half runs where one is built from the tag.
       - name: The previous release keeps working on a ledger HEAD opened
         run: |
