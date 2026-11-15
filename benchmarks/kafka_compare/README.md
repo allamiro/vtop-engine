@@ -77,23 +77,30 @@ properties passed, the client's resolved `ProducerConfig` per system, selected s
 configuration as Kafka reports it (`kafka-configs --describe --all`, filtered to the flush, replication,
 timeout, thread, socket, fetch, segment and group settings `run.py` names) and the topic layout, the derived
 offered rates, the two Compose files and three VTOP node configs verbatim, and the COUNT of other containers
-running on the Docker host at start (not their names). The `comparable` block is hashed into `env_fingerprint`; `run_state` is `complete`
-only when the run finished.
+running on the Docker host at start (not their names). From `schema_version` 2 it also records
+`comparable.host_disk`, the host disk behind Docker's data (model, SSD or HDD on macOS, the kernel's rotational
+flag on Linux, bus, filesystem), which every image's footer names; `run.py` and `failover.py` refuse to start,
+before pulling or building anything, when the disk cannot be named, and say what the probe saw. A file without
+`schema_version` is schema 1 (the runs committed before #600). The `comparable` block is hashed into
+`env_fingerprint`; `run_state` is `complete` only when the run finished.
 
 `logs/`: every perf tool's output and each cluster's node-1 log.
 
 ## Report
 
 `report.py` refuses (exit 2, the reason on stderr, nothing written) when the CSV or `environment.json` is
-missing, the run did not finish, a row is malformed or a `failed`/`refused` row gives no reason, any expected
+missing, `schema_version` is malformed or newer than the report reads, a schema-2 run records no
+`host_disk`, the run did not finish, a row is malformed or a `failed`/`refused` row gives no reason, any expected
 row is missing or duplicated, rows come from more than one environment, commit, image, client or profile,
 the CSV's run id, commit, image, client, profile or `acks` differ from what `environment.json` records, or
 the CSV's fingerprint does not match `environment.json` (rule 9). A cell that did not run is a row with
 status `refused` (or `failed`, if it ran and gave no usable result); the report accepts such a row, does not
 refuse the run over it, and the chart shows "no result" in its place.
 
-Charts use one colour per system everywhere (Kafka blue `#2a78d6`, VTOP orange `#eb6834`; validated for
-colour-vision-deficiency separation, never red vs green), marker shape as a second channel, and a footer with
+Charts use one colour per system everywhere, from the registry in [`colours.py`](colours.py) (Kafka blue
+`#2a78d6`, VTOP orange `#eb6834`, with a dark step of each hue for the README; validated for
+colour-vision-deficiency separation and contrast, never red vs green), marker shape as a second channel, and a
+footer from [`footer.py`](footer.py), also written into each image's metadata, with
 the environment, profile, repetitions and run date. Measured numbers come from the CSV; the conditions,
 run id, dates and matrix come from `environment.json`. Output is deterministic for a given CSV,
 `environment.json` and matplotlib version (3.10.3, with the rest of the plotting stack pinned beside it in
