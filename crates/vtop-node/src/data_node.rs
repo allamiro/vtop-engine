@@ -1832,6 +1832,11 @@ async fn run_leader(
                     )),
                 None => gateway,
             };
+            // What the gateway refuses is counted (#596): its log lines
+            // repeat only at powers of two.
+            observability.register(Box::new(crate::observe::KafkaRefusalCollector::new(
+                gateway.refusals(),
+            )?))?;
             let kafka_shutdown = shutdown.clone();
             // Kept, to be joined before the range is handed back (review):
             // `serve` returns only once every session has answered its
