@@ -70,9 +70,11 @@ pub const MULTIPART_SESSION_OUTCOMES: [&str; 5] = [
 /// The values of `result` on `vtop_object_lock_checks_total` (#684): what a
 /// written object's or manifest's retention check found (`ok`, `missing`,
 /// `mode_mismatch`, `too_short`, `legal_hold_missing`, `error` for a check
-/// that could not be made), and `bucket_not_locked` for a batch refused
-/// because its bucket does not have Object Lock enabled.
-pub const OBJECT_LOCK_CHECK_RESULTS: [&str; 7] = [
+/// that could not be made), `bucket_not_locked` for a batch refused
+/// because its bucket does not have Object Lock enabled, and
+/// `store_unsupported` for one refused because the store does not implement
+/// Object Lock at all (#722).
+pub const OBJECT_LOCK_CHECK_RESULTS: [&str; 8] = [
     "ok",
     "missing",
     "mode_mismatch",
@@ -80,6 +82,7 @@ pub const OBJECT_LOCK_CHECK_RESULTS: [&str; 7] = [
     "legal_hold_missing",
     "error",
     "bucket_not_locked",
+    "store_unsupported",
 ];
 
 /// The values of `result` on `vtop_verification_receipts_total` (#671
@@ -164,7 +167,8 @@ pub struct Metrics {
     /// Object Lock checks by `result` (#684), the bounded set
     /// [`OBJECT_LOCK_CHECK_RESULTS`]: one per object and per manifest a
     /// batch wrote or reused under the profile, plus `bucket_not_locked`
-    /// for a batch refused at its bucket's preflight. Anything but `ok` is a
+    /// and `store_unsupported` for a batch refused at its bucket's
+    /// preflight. Anything but `ok` is a
     /// batch that failed and will be replayed.
     pub object_lock_checks_total: IntCounterVec,
 
@@ -431,7 +435,7 @@ impl Metrics {
         registry.register(Box::new(object_lock_mode.clone()))?;
         let object_lock_checks_total = cv(
             "object_lock_checks_total",
-            "S3 Object Lock checks of written or reused objects and manifests, by result (ok, missing, mode_mismatch, too_short, legal_hold_missing, error) and bucket_not_locked for a batch refused at its bucket's preflight; anything but ok failed the batch, which is replayed",
+            "S3 Object Lock checks of written or reused objects and manifests, by result (ok, missing, mode_mismatch, too_short, legal_hold_missing, error) and bucket_not_locked or store_unsupported for a batch refused at its bucket's preflight; anything but ok failed the batch, which is replayed",
             vec!["tenant", "result"],
         )?;
         let replay_required_total = cv(

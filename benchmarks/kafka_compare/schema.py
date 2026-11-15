@@ -68,6 +68,32 @@ class ReportRefused(Exception):
     """The data cannot honestly be charted; the message says exactly why."""
 
 
+# environment.json's layout. A run without the key is schema 1 (both runs
+# committed before #600). Schema 2 adds `comparable.host_disk`: the disk
+# behind Docker's volumes, which every image's footer names (#600).
+SCHEMA_VERSION = 2
+
+
+def check_schema_version(environment: dict[str, Any], env_path: str) -> None:
+    """Refuse a run this reader does not know, and a schema-2 run that did not record its disk."""
+    if "schema_version" not in environment:
+        version = 1
+    else:
+        version = environment["schema_version"]
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            raise ReportRefused(f"{env_path} has schema_version {version!r}, which is not a version number "
+                                "(a positive whole number): the file is malformed")
+    if version > SCHEMA_VERSION:
+        raise ReportRefused(f"{env_path} has schema_version {version}; this report reads 1 to {SCHEMA_VERSION}, "
+                            "so the run was written by a newer harness: update the report first")
+    if version >= 2:
+        comparable = environment.get("comparable") or {}
+        disk = comparable.get("host_disk")
+        if not isinstance(disk, str) or not disk.strip():
+            raise ReportRefused(f"{env_path} is schema_version {version} but records no comparable.host_disk "
+                                f"({disk!r}): the footer of every image must name the disk")
+
+
 class Cell(NamedTuple):
     record_size: int
     partitions: int
@@ -327,6 +353,7 @@ def load_run(run_dir: str) -> Run:
             raise ReportRefused(f"{env_path} is not JSON: {exc}") from exc
     if not isinstance(environment, dict):
         raise ReportRefused(f"{env_path} holds a JSON {type(environment).__name__}, not an object")
+    check_schema_version(environment, env_path)
     if environment.get("run_state") != "complete":
         raise ReportRefused(
             f"{env_path} says run_state={environment.get('run_state')!r}: the run did not finish"
