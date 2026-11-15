@@ -8,7 +8,7 @@
 //! `DeleteCandidate`).
 
 use crate::base::{
-    AdapterReadReport, DiscoveredSource, ReadResult, SourceAdapter, SourceReadOutcome,
+    AdapterReadReport, DiscoveredSource, ReadResult, ReplayRange, SourceAdapter, SourceReadOutcome,
 };
 use crate::continuity::{self, Discontinuity, Observed};
 use crate::rotated::{self, HeldFile, Replay, RotatedFile};
@@ -107,6 +107,11 @@ struct DeleteCandidate {
     /// The file's ctime when the candidate was recorded: unchanged, with the
     /// mtime and the length, nothing wrote to the file since.
     ctime: Option<(i64, i64)>,
+    /// The file's link count when the candidate was recorded (#619, in
+    /// memory only). Another name of the file deleted, or a hard link made,
+    /// moves the ctime too; the link count says which, so the file kept for
+    /// it is said to be kept for that.
+    nlink: Option<u64>,
     /// When the candidate was recorded, on the engine's monotonic clock.
     since: Instant,
     /// Whether a delete kept back for a reason that repeats (a process has
@@ -124,6 +129,18 @@ fn ctime_of(md: &std::fs::Metadata) -> Option<(i64, i64)> {
 
 #[cfg(not(unix))]
 fn ctime_of(_md: &std::fs::Metadata) -> Option<(i64, i64)> {
+    None
+}
+
+/// How many names (hard links) a file has; `None` without that notion.
+#[cfg(unix)]
+fn nlink_of(md: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(md.nlink())
+}
+
+#[cfg(not(unix))]
+fn nlink_of(_md: &std::fs::Metadata) -> Option<u64> {
     None
 }
 
@@ -147,6 +164,10 @@ enum Kept {
     /// Same inode, length and pages, but the mtime or ctime moved: a touch,
     /// a chmod, or a rewrite between the two pages - not told apart.
     MetadataMoved,
+    /// Same inode, length, pages and mtime, but the link count changed
+    /// (#619): another name of the file was deleted - most likely by this
+    /// engine, as a source of its own (#378) - or a hard link was made.
+    LinksChanged { then: u64, now: u64 },
     /// The path is gone.
     Gone,
     /// The path is a symbolic link.
@@ -163,6 +184,7 @@ impl Kept {
             Kept::Rewritten => "rewritten",
             Kept::Unprovable => "unprovable",
             Kept::MetadataMoved => "metadata_changed",
+            Kept::LinksChanged { .. } => "links_changed",
             Kept::Gone => "gone",
             Kept::Symlink => "symlink",
         }
@@ -221,11 +243,21 @@ impl Kept {
                 Level::WARN,
                 format!(
                     "not deleting {path}: its {archived} bytes look archived, but its mtime or \
-                     ctime changed since they were read (a touch, a chmod, a rewrite between the \
-                     first page and the last - which cannot be told apart - or another name of \
-                     the same file being deleted); it is KEPT, and deleted only if a later commit \
-                     covers it unchanged - otherwise remove it by hand once you know it holds \
-                     nothing new"
+                     ctime changed since they were read (a touch, a chmod, or a rewrite between \
+                     the first page and the last, which cannot be told apart); it is KEPT, and \
+                     deleted only if a later commit covers it unchanged - otherwise remove it by \
+                     hand once you know it holds nothing new"
+                ),
+            ),
+            Kept::LinksChanged { then, now } => (
+                Level::WARN,
+                format!(
+                    "not deleting {path}: its link count changed since it was archived (from \
+                     {then} to {now}) - most likely another path this engine archived was \
+                     deleted, or a hard link was made; its {archived} bytes are archived under \
+                     this name, so nothing is lost, and it is KEPT: remove this name by hand once \
+                     you know the other name's delete was the only change, or narrow the \
+                     patterns to one spelling so the file is archived once (#378)"
                 ),
             ),
             Kept::Gone => (
@@ -316,16 +348,43 @@ impl DeleteCandidate {
         if !self.proves(file) {
             return Compared::Kept(Kept::Rewritten);
         }
-        if md.modified().ok() != self.mtime || (with_ctime && ctime_of(&md) != self.ctime) {
+        let mtime_moved = md.modified().ok() != self.mtime;
+        // Before the ctime, which a link change moves as well. A moved mtime
+        // is a write, whatever happened to the links.
+        if let (false, Some(then), Some(now)) = (mtime_moved, self.nlink, nlink_of(&md)) {
+            if then != now {
+                return Compared::Kept(Kept::LinksChanged { then, now });
+            }
+        }
+        if mtime_moved || (with_ctime && ctime_of(&md) != self.ctime) {
             return Compared::Kept(Kept::MetadataMoved);
         }
         Compared::Unchanged
     }
 }
 
+/// See [`DeleteAttempt::Deleted`]'s `opened_at_unlink`.
+struct OpenedAtUnlink {
+    aside: PathBuf,
+    names: u64,
+    identity: Option<(u64, u64)>,
+}
+
 /// What became of one attempt to delete a candidate.
 enum DeleteAttempt {
-    Deleted,
+    /// Unlinked. `unchecked`: made under `delete_without_open_check`, with
+    /// no lease to be had, and why none could be (#619): nothing proved that
+    /// no process had the file open. `opened_at_unlink`: a process broke
+    /// the lease between the final check and the unlink, so it may have the
+    /// unlinked file open; the hidden name the file had, how many names
+    /// the file still has after the unlink (another hard link keeps it, and
+    /// what the opener writes, reachable), and its (device, inode) identity
+    /// from the leased descriptor, which is what another name must match to
+    /// be the same file (an inode number alone is unique only per device).
+    Deleted {
+        unchecked: Option<String>,
+        opened_at_unlink: Option<OpenedAtUnlink>,
+    },
     /// Kept, and the candidate dropped: see [`Kept`].
     Kept(Kept),
     /// Kept because a process has it open (`during`: opened it while it was
@@ -378,6 +437,8 @@ struct DeleteJob {
     first_aside: Option<PathBuf>,
     #[cfg(test)]
     after_lease: Option<DeleteHook>,
+    #[cfg(test)]
+    after_aside: Option<DeleteHook>,
     #[cfg(test)]
     before_unlink: Option<DeleteHook>,
 }
@@ -527,6 +588,7 @@ impl DeleteJob {
             }
             _ => &opened,
         };
+        let mut unchecked = None;
         let lease = match self.open_check(file) {
             write_lease::Sole::Proven(lease) => Some(lease),
             write_lease::Sole::Open => {
@@ -535,7 +597,10 @@ impl DeleteJob {
                     ctime: None,
                 }
             }
-            write_lease::Sole::Unknown(_) if self.without_open_check => None,
+            write_lease::Sole::Unknown(why) if self.without_open_check => {
+                unchecked = Some(why);
+                None
+            }
             write_lease::Sole::Unknown(why) => return DeleteAttempt::Refused(why),
             write_lease::Sole::Failed(error) => {
                 return DeleteAttempt::Failed {
@@ -576,6 +641,10 @@ impl DeleteJob {
                 };
             }
         };
+        #[cfg(test)]
+        if let Some(hook) = &self.after_aside {
+            hook(&aside);
+        }
         // Put the file back and, if it is leased, say what its ctime is now:
         // the rename and the put-back moved it. Under the lease nothing can
         // have changed the content meanwhile - an opener waits on it, even
@@ -624,23 +693,25 @@ impl DeleteJob {
                     hook(&aside);
                 }
                 match std::fs::remove_file(&aside) {
-                    Ok(()) => {
-                        if lease.as_ref().is_some_and(|lease| !lease.intact()) {
-                            tracing::error!(
-                                path = %path.display(),
-                                aside = %aside.display(),
-                                inode = candidate.inode,
-                                archived_bytes = candidate.end_byte,
-                                "deleted {} after a process opened it in the instant before the \
-                                 unlink (by its hidden name, or an open of the path that stalled \
-                                 for longer than the grace); anything that process writes to it \
-                                 is not archived - check what opened it",
-                                path.display()
-                            );
-                            count_delete_decision("opened_at_unlink");
-                        }
-                        DeleteAttempt::Deleted
-                    }
+                    // Said by `settle_delete`, through `notify`, with the
+                    // rest of the delete's decisions.
+                    Ok(()) => DeleteAttempt::Deleted {
+                        unchecked,
+                        opened_at_unlink: lease.as_ref().is_some_and(|lease| !lease.intact()).then(
+                            || {
+                                // Through the leased descriptor: the file's
+                                // link count after the unlink, and its
+                                // (device, inode) identity.
+                                let md = file.metadata().ok();
+                                let names = md.as_ref().and_then(nlink_of).unwrap_or(0);
+                                OpenedAtUnlink {
+                                    aside: aside.clone(),
+                                    names,
+                                    identity: md.as_ref().and_then(dev_ino),
+                                }
+                            },
+                        ),
+                    },
                     Err(error) => DeleteAttempt::Failed {
                         what: format!("the file was moved aside but could not be deleted: {error}"),
                         ctime: restore(&lease),
@@ -662,6 +733,23 @@ impl DeleteJob {
 /// new file. With writers opening, appending and closing in a tight loop, 20
 /// and 50 ms both lost nothing where no grace lost lines.
 const DELETE_GRACE: Duration = Duration::from_millis(50);
+
+/// The level of a `deleted_unchecked` message (#619): WARN the first time
+/// in a process, INFO after, so a directory of thousands of files under the
+/// opt-in does not log thousands of warnings. Each is counted.
+fn unchecked_delete_level() -> tracing::Level {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    warn_once(&WARNED)
+}
+
+/// WARN the first time `warned` is consulted, INFO after.
+fn warn_once(warned: &std::sync::atomic::AtomicBool) -> tracing::Level {
+    if warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::Level::INFO
+    } else {
+        tracing::Level::WARN
+    }
+}
 
 /// Count one `delete_after_commit` decision (#619) in
 /// `vtop_file_delete_decisions_total{outcome}`, when metrics are on.
@@ -726,6 +814,9 @@ pub struct FileSource {
     /// file open, before the file is moved aside (#619).
     #[cfg(test)]
     after_lease: Option<DeleteHook>,
+    /// Runs once the file is moved aside, before the grace (#619).
+    #[cfg(test)]
+    after_aside: Option<DeleteHook>,
     /// Runs after the final check of the file moved aside, just before the
     /// unlink (#619).
     #[cfg(test)]
@@ -760,6 +851,39 @@ pub struct FileSource {
     /// descriptor had to refuse, for the engine to count
     /// ([`Self::take_refused_rereads`]).
     refused_rereads: Vec<String>,
+    /// Per path, the ends of the windows handed back to be rebuilt exactly
+    /// (#626, [`SourceAdapter::bound_replays`]): a read stops at the next one
+    /// above its start, so the window it rebuilds ends where the failed
+    /// attempt's did. Keyed by the end, with the inode and start the window
+    /// was read at.
+    cuts: HashMap<String, std::collections::BTreeMap<u64, Cut>>,
+    /// Paths whose read this pass stopped at a cut, to be read on in the same
+    /// pass from the cut (the next window).
+    reached_cut: Vec<String>,
+    /// Windows a read could not rebuild as cut (a line crossed the recorded
+    /// end, or the file was found replaced), for the engine to count
+    /// ([`Self::take_refused_cuts`]).
+    refused_cuts: Vec<RefusedCut>,
+}
+
+/// A recorded window's end that reads stop at (#626).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cut {
+    start: u64,
+    inode: Option<u64>,
+}
+
+/// How many cuts one path keeps; the lowest is dropped beyond it.
+const MAX_CUTS_PER_PATH: usize = 1024;
+
+/// A window a read could not rebuild as cut (#626).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedCut {
+    pub path: String,
+    pub start: u64,
+    pub end: u64,
+    /// Why, for the operator.
+    pub reason: &'static str,
 }
 
 /// What recovery knows is already archived of one file at a path (#621): the
@@ -801,6 +925,9 @@ impl FileSource {
             max_held: rotated::MAX_HELD_FILES,
             hold_for: rotated::HOLD_FOR,
             refused_rereads: Vec::new(),
+            cuts: HashMap::new(),
+            reached_cut: Vec::new(),
+            refused_cuts: Vec::new(),
             delete_quiet: DEFAULT_DELETE_QUIET,
             #[cfg(test)]
             before_delete: None,
@@ -808,6 +935,8 @@ impl FileSource {
             first_aside: None,
             #[cfg(test)]
             after_lease: None,
+            #[cfg(test)]
+            after_aside: None,
             #[cfg(test)]
             before_unlink: None,
             #[cfg(test)]
@@ -1039,6 +1168,7 @@ impl FileSource {
             end_byte: committed_byte,
             mtime: md.modified().ok(),
             ctime: ctime_of(&md),
+            nlink: nlink_of(&md),
             since: Instant::now(),
             told: false,
         });
@@ -1075,6 +1205,8 @@ impl FileSource {
             first_aside: self.first_aside.clone(),
             #[cfg(test)]
             after_lease: self.after_lease.clone(),
+            #[cfg(test)]
+            after_aside: self.after_aside.clone(),
             #[cfg(test)]
             before_unlink: self.before_unlink.clone(),
         })
@@ -1122,6 +1254,20 @@ impl FileSource {
         };
         let (inode, archived) = (candidate.inode, candidate.end_byte);
         let quiet = self.delete_quiet.as_secs();
+        // A file archived under several names (#378): its other names'
+        // deletes, by this engine and in the same pass, run beside this one.
+        // They hold the file open while they check it, and move its ctime
+        // when they rename it aside and back, so this delete can be kept as
+        // `open` or `metadata_changed` for them rather than `links_changed`.
+        let names_hint = candidate
+            .nlink
+            .filter(|n| *n > 1)
+            .map_or_else(String::new, |n| {
+                format!(
+                    " It had {n} names (hard links) when it was archived: a delete of another of \
+                 them, by this engine in the same pass, also causes this (#378)."
+                )
+            });
         // For an outcome that repeats while its cause lasts: the first time
         // at `level`, then at debug.
         let once = |fs: &mut Self, level: tracing::Level| {
@@ -1137,7 +1283,10 @@ impl FileSource {
             }
         };
         match attempt {
-            DeleteAttempt::Deleted => {
+            DeleteAttempt::Deleted {
+                unchecked,
+                opened_at_unlink,
+            } => {
                 // The file this cursor described is gone. A new file at the
                 // path may be handed the freed inode number, and an inode
                 // check cannot tell it from the one it replaced, so the cursor
@@ -1153,17 +1302,108 @@ impl FileSource {
                 // this path is a different file and stays.
                 self.cursors.remove(path);
                 self.held.remove(path);
-                self.notify(
-                    "deleted",
-                    tracing::Level::INFO,
-                    path,
-                    inode,
-                    archived,
-                    format!(
-                        "deleted {path}: all {archived} bytes archived, unwritten for the quiet \
-                         period ({quiet} s), and open in no process"
-                    ),
-                );
+                if let Some(OpenedAtUnlink {
+                    aside,
+                    names,
+                    identity,
+                }) = opened_at_unlink.as_ref().filter(|o| o.names > 0)
+                {
+                    // The file keeps another name (a hard link, #378), so
+                    // what the opener writes is not gone. Whether it is
+                    // ARCHIVED depends on whether this engine reads that
+                    // name as a source of its own (review of #753): a
+                    // cursor of another path on this inode, still naming
+                    // it, says so; a link outside the patterns does not.
+                    count_delete_decision("deleted");
+                    let read_as = source_naming_the_same_file(
+                        &self.cursors,
+                        path,
+                        inode,
+                        *identity,
+                        |other| std::fs::metadata(other).ok().and_then(|md| dev_ino(&md)),
+                    );
+                    let (level, message) = match read_as {
+                        Some(other) => (
+                            tracing::Level::WARN,
+                            format!(
+                                "deleted the name {path} after a process opened the file between \
+                                 the final check and the unlink (it was under its hidden name \
+                                 {}); the file is still named {other}, a source this engine reads, \
+                                 so what that process writes is archived from there (#378); \
+                                 nothing to do",
+                                aside.display()
+                            ),
+                        ),
+                        None => (
+                            tracing::Level::ERROR,
+                            format!(
+                                "deleted the name {path} after a process opened the file between \
+                                 the final check and the unlink (it was under its hidden name \
+                                 {}); the file still has {names} other name(s), none of them a \
+                                 source this engine reads, so what that process writes stays in \
+                                 the file but is NOT archived. Add a pattern for the file's other \
+                                 name, or find the writer that opens it and have it stay off it \
+                                 until the quiet period has passed",
+                                aside.display()
+                            ),
+                        ),
+                    };
+                    self.notify("opened_at_unlink", level, path, inode, archived, message);
+                } else if let Some(OpenedAtUnlink { aside, .. }) = opened_at_unlink {
+                    // The limit the grace bounds (#619): an open of the path
+                    // that resolved it before the rename and reached the
+                    // file only after the final check - or an open of the
+                    // hidden name. Counted under both outcomes: the file
+                    // was deleted, and something may have it open.
+                    count_delete_decision("deleted");
+                    self.notify(
+                        "opened_at_unlink",
+                        tracing::Level::ERROR,
+                        path,
+                        inode,
+                        archived,
+                        format!(
+                            "deleted {path} after a process opened it between the final check \
+                             and the unlink (it was under its hidden name {}); it was unlinked \
+                             anyway: the open could not be undone. What that process writes to \
+                             it is not archived. Find the writer that opens this path by name, \
+                             and have it hold the file open or stay off it until the quiet \
+                             period has passed",
+                            aside.display()
+                        ),
+                    );
+                } else if let Some(why) = unchecked {
+                    // Not "open in no process": nothing checked (#619).
+                    self.notify(
+                        "deleted_unchecked",
+                        unchecked_delete_level(),
+                        path,
+                        inode,
+                        archived,
+                        format!(
+                            "deleted {path} without proof that no process had it open: \
+                             sources.file.delete_without_open_check is set and no lease can be \
+                             taken here ({why}). All {archived} bytes were archived and unwritten \
+                             for the quiet period ({quiet} s), so the engine unlinked it. A \
+                             writer that still held it open loses every line it writes from now \
+                             on, and nothing archives them: nothing to do if none did; otherwise \
+                             unset delete_without_open_check and run the engine on Linux, on a \
+                             local filesystem, as the files' owner or with CAP_LEASE effective"
+                        ),
+                    );
+                } else {
+                    self.notify(
+                        "deleted",
+                        tracing::Level::INFO,
+                        path,
+                        inode,
+                        archived,
+                        format!(
+                            "deleted {path}: all {archived} bytes archived, unwritten for the \
+                             quiet period ({quiet} s), and open in no process"
+                        ),
+                    );
+                }
                 true
             }
             DeleteAttempt::Kept(why) => {
@@ -1174,7 +1414,10 @@ impl FileSource {
                 if let Some(c) = self.cursors.get_mut(path) {
                     c.delete_candidate = None;
                 }
-                let (level, message) = why.message(path, archived);
+                let (level, mut message) = why.message(path, archived);
+                if why == Kept::MetadataMoved {
+                    message.push_str(&names_hint);
+                }
                 self.notify(why.outcome(), level, path, inode, archived, message);
                 false
             }
@@ -1211,7 +1454,8 @@ impl FileSource {
                     format!(
                         "not deleting {path}: {what}; all {archived} bytes are archived and it \
                          is KEPT, and tried again after the quiet period ({quiet} s). Nothing to \
-                         do if a writer still uses it; otherwise find what holds it open"
+                         do if a writer still uses it; otherwise find what holds it \
+                         open.{names_hint}"
                     ),
                 );
                 false
@@ -1460,7 +1704,9 @@ impl FileSource {
             discontinuity,
             descriptor,
             start_tail,
+            cut,
         } = slice;
+        self.settle_cut(path, cut);
         let cursor = self.cursors.entry(path.to_string()).or_default();
         let read_byte_before = cursor.read_byte;
         if let Some(why) = discontinuity {
@@ -1877,6 +2123,9 @@ impl FileSource {
             whole_file,
             identity.file_size,
             None,
+            // A rotated file's re-read is not stopped at a recorded end: it
+            // reads what is left of the old file, as before (#626).
+            None,
         )
         .await?;
         slice.identity.content = content;
@@ -2049,6 +2298,105 @@ impl FileSource {
         std::mem::take(&mut self.refused_rereads)
     }
 
+    /// The windows a read could not rebuild as cut since the last call
+    /// (#626): the engine counts each and reads on as before.
+    pub fn take_refused_cuts(&mut self) -> Vec<RefusedCut> {
+        std::mem::take(&mut self.refused_cuts)
+    }
+
+    /// The recorded end the next read of `path` from `start` stops at, and
+    /// the inode it was recorded for. Cuts at or below `start` are behind the
+    /// read and are forgotten.
+    fn next_cut(&mut self, path: &str, start: u64) -> Option<(u64, Option<u64>)> {
+        let cuts = self.cuts.get_mut(path)?;
+        while cuts.first_key_value().is_some_and(|(end, _)| *end <= start) {
+            cuts.pop_first();
+        }
+        let next = cuts.first_key_value().map(|(end, cut)| (*end, cut.inode));
+        if cuts.is_empty() {
+            self.cuts.remove(path);
+        }
+        next
+    }
+
+    /// Fold what became of a read's cut into the adapter (#626).
+    fn settle_cut(&mut self, path: &str, cut: CutOutcome) {
+        let mut take = |end: u64| {
+            let cuts = self.cuts.get_mut(path)?;
+            let taken = cuts.remove(&end);
+            if cuts.is_empty() {
+                self.cuts.remove(path);
+            }
+            taken
+        };
+        match cut {
+            CutOutcome::None => {}
+            CutOutcome::Reached(end) => {
+                if take(end).is_some() {
+                    self.reached_cut.push(path.to_string());
+                }
+            }
+            CutOutcome::Refused(end, reason) => {
+                if let Some(cut) = take(end) {
+                    self.refused_cuts.push(RefusedCut {
+                        path: path.to_string(),
+                        start: cut.start,
+                        end,
+                        reason,
+                    });
+                }
+            }
+        }
+    }
+
+    /// After a read of `path` stopped at a cut, read on from it in the same
+    /// pass, within what is left of the budgets (#626): the bytes after a
+    /// rebuilt window are the next window, and leaving them to the next pass
+    /// would slow every replay by a pass.
+    async fn read_on_after_cuts(
+        &mut self,
+        path: &str,
+        reads: &mut Vec<ReadResult>,
+        max_records: usize,
+        max_bytes: usize,
+    ) {
+        // A bound on the extra reads of one pass: each stops at a cut or at
+        // the budget, and the cuts of one path are bounded too.
+        for _ in 0..16 {
+            let Some(i) = self.reached_cut.iter().position(|p| p == path) else {
+                return;
+            };
+            self.reached_cut.swap_remove(i);
+            let records: usize = reads.iter().map(|r| r.records.len()).sum();
+            let bytes: usize = reads
+                .iter()
+                .flat_map(|r| r.records.iter())
+                .map(|r| r.len() + 1)
+                .sum();
+            if records >= max_records || bytes >= max_bytes {
+                return;
+            }
+            let job = self.read_job(path);
+            let start = job.start;
+            let (outcome, drained) = Self::run_job(
+                job,
+                max_records - records,
+                max_bytes - bytes,
+                self.whole_file,
+            )
+            .await;
+            match self.apply_outcome(path, start, outcome, drained) {
+                Ok(more) => reads.extend(more.into_iter().filter(|r| !r.is_empty())),
+                Err(error) => {
+                    // The window before the cut is already read; this read is
+                    // the next pass's to retry.
+                    tracing::debug!(path, error = %error, "read after a cut failed; retried next pass");
+                    return;
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     fn with_hold_limits(mut self, max_held: usize, hold_for: Duration) -> Self {
         self.max_held = max_held;
@@ -2092,6 +2440,7 @@ impl FileSource {
                 start: start.max(held.committed),
             })
         });
+        let cut = self.next_cut(path, start);
         let held = self.held.get(path);
         ReadJob {
             path: path.to_string(),
@@ -2100,6 +2449,7 @@ impl FileSource {
             held_inode: held.map(|held| held.inode),
             rotated,
             rewound,
+            cut,
         }
     }
 
@@ -2157,6 +2507,7 @@ impl FileSource {
                         whole_file,
                         last_seen,
                         job.held_inode,
+                        job.cut,
                     )
                     .await,
                 )
@@ -2225,6 +2576,10 @@ impl FileSource {
     /// `held_inode` is the file the adapter already holds a descriptor on for
     /// this path (#621); a read of any other file hands back a duplicate of
     /// its own descriptor for the adapter to keep.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the read is pure over the cursor snapshot; each argument is a part of it"
+    )]
     async fn read_slice(
         path: String,
         start: u64,
@@ -2233,6 +2588,7 @@ impl FileSource {
         whole_file: bool,
         last_seen: Option<Observed>,
         held_inode: Option<u64>,
+        cut: Option<(u64, Option<u64>)>,
     ) -> Result<SliceRead, SliceError> {
         // Read AND fingerprint through one open descriptor: a rotation between
         // "read the bytes" and "stat the path" would otherwise mix the old
@@ -2311,6 +2667,14 @@ impl FileSource {
                 }
             },
         };
+        // A cut applies only to the file the window was read from, at the
+        // position the cursor holds (#626): a read that restarted on another
+        // file, or a file at another inode, reads as before, and the window is
+        // reported as one that cannot be rebuilt as cut.
+        let cut_refused = cut.filter(|(_, inode)| {
+            discontinuity.is_some() || (inode.is_some() && *inode != opened.inode)
+        });
+        let cut = cut.filter(|_| cut_refused.is_none()).map(|(end, _)| end);
         Self::read_opened(
             file,
             &path,
@@ -2320,8 +2684,15 @@ impl FileSource {
             whole_file,
             opened.file_size,
             discontinuity,
+            cut,
         )
         .await
+        .map(|mut slice| {
+            if let Some((end, _)) = cut_refused {
+                slice.cut = CutOutcome::Refused(end, "the file under the range was replaced");
+            }
+            slice
+        })
         .map(|mut slice| {
             // The size and mtime are the descriptor's after the read; the
             // content is what it held at open, which an append cannot change.
@@ -2350,6 +2721,7 @@ impl FileSource {
         whole_file: bool,
         fsize: u64,
         discontinuity: Option<Discontinuity>,
+        cut: Option<u64>,
     ) -> Result<SliceRead, VtopError> {
         // Whole-file mode: read the entire remaining file as one opaque record.
         // Used for binary / already-compressed source files with no line
@@ -2381,6 +2753,15 @@ impl FileSource {
                 vec![data]
             };
             let identity = Self::identity_of(&file.metadata().await?);
+            // A whole file is one record: it cannot stop inside a file, so a
+            // recorded window of it is not rebuilt as cut (#626).
+            let cut = match cut {
+                Some(c) if c != end => {
+                    CutOutcome::Refused(c, "a whole-file record cannot stop at the recorded end")
+                }
+                Some(c) => CutOutcome::Reached(c),
+                None => CutOutcome::None,
+            };
             return Ok(SliceRead {
                 records,
                 start,
@@ -2390,6 +2771,7 @@ impl FileSource {
                 discontinuity,
                 descriptor: None,
                 start_tail: None,
+                cut,
             });
         }
 
@@ -2406,8 +2788,16 @@ impl FileSource {
         let mut records = Vec::new();
         let mut bytes_read: u64 = 0;
         let mut pos = start;
+        let mut cut_outcome = CutOutcome::None;
 
         loop {
+            // A window handed back to be rebuilt exactly ends where the
+            // failed attempt's did (#626); the bytes after it are the next
+            // window's.
+            if let Some(c) = cut.filter(|c| pos >= *c) {
+                cut_outcome = CutOutcome::Reached(c);
+                break;
+            }
             if records.len() >= max_records || bytes_read as usize >= max_bytes {
                 break;
             }
@@ -2440,6 +2830,14 @@ impl FileSource {
             if !line.ends_with(b"\n") {
                 break;
             }
+            // A line that crosses the recorded end: the bytes are not the
+            // ones the window was cut from. The line is left for the next
+            // read, which reads on as before.
+            if let Some(c) = cut.filter(|c| pos + n as u64 > *c) {
+                cut_outcome =
+                    CutOutcome::Refused(c, "a line crosses the recorded end of the range");
+                break;
+            }
             pos += n as u64;
             bytes_read += n as u64;
             // Strip trailing newline for the stored record.
@@ -2451,6 +2849,11 @@ impl FileSource {
         // fstat on the descriptor we READ from — the same file even if the
         // path was rotated away mid-read (#65).
         let identity = Self::identity_of(&reader.get_ref().get_ref().metadata().await?);
+        if let (CutOutcome::None, Some(c)) = (&cut_outcome, cut) {
+            if pos == c {
+                cut_outcome = CutOutcome::Reached(c);
+            }
+        }
         Ok(SliceRead {
             records,
             start,
@@ -2460,6 +2863,7 @@ impl FileSource {
             discontinuity,
             descriptor: None,
             start_tail: None,
+            cut: cut_outcome,
         })
     }
 }
@@ -2779,6 +3183,35 @@ fn dev_ino(_md: &std::fs::Metadata) -> Option<(u64, u64)> {
     None
 }
 
+/// Another configured source that names the file a delete unlinked, if one
+/// does (#378, review of #753): a cursor of another path that last saw this
+/// inode, and whose path still stats to the deleted file's full (device,
+/// inode) identity, taken from the leased descriptor. The device matters
+/// because sources may span filesystems and an inode number is unique only
+/// within one: an unrelated file elsewhere with the same number is not a
+/// surviving link. With no identity (no descriptor metadata, or a platform
+/// without device numbers) nothing is claimed. The least path wins, so the
+/// message is stable.
+fn source_naming_the_same_file(
+    cursors: &HashMap<String, FileCursor>,
+    path: &str,
+    inode: Option<u64>,
+    identity: Option<(u64, u64)>,
+    stat: impl Fn(&str) -> Option<(u64, u64)>,
+) -> Option<String> {
+    let identity = identity?;
+    inode?;
+    cursors
+        .iter()
+        .filter(|(other, c)| {
+            other.as_str() != path
+                && c.seen.as_ref().and_then(|seen| seen.inode) == inode
+                && stat(other.as_str()) == Some(identity)
+        })
+        .map(|(other, _)| other.clone())
+        .min()
+}
+
 /// How many files are read concurrently in one pass. Bounded so a glob that
 /// matches thousands of files does not open them all at once.
 const FILE_READ_CONCURRENCY: usize = 8;
@@ -2807,8 +3240,20 @@ impl SliceError {
     }
 }
 
+/// What became of the cut a read was given (#626).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CutOutcome {
+    None,
+    /// The read stopped exactly at this recorded end.
+    Reached(u64),
+    /// The read could not stop at this recorded end, for this reason.
+    Refused(u64, &'static str),
+}
+
 /// What a completed read hands back.
 struct SliceRead {
+    /// What became of the cut the read was given.
+    cut: CutOutcome,
     records: Vec<Vec<u8>>,
     /// The byte the read STARTED at. Normally the cursor's read position; byte
     /// 0 when the file under the cursor was rotated or truncated (#558), so
@@ -2856,6 +3301,8 @@ struct ReadJob {
     /// The descriptor held on the file the cursor was rewound into: if that
     /// file has left the path, the rewound range is read from it (#621).
     rewound: Option<RotatedRead>,
+    /// The recorded end the read stops at (#626), and the inode it belongs to.
+    cut: Option<(u64, Option<u64>)>,
 }
 
 enum PassOutcome {
@@ -3074,10 +3521,14 @@ impl SourceAdapter for FileSource {
         // skipped without an open (see `run_job`). The marker still reports
         // the cursor where it stands, so a skipped file is indistinguishable
         // from one that was read and had nothing to give — which is what it is.
+        self.reached_cut.clear();
         let job = self.read_job(&path);
         let start = job.start;
         let (outcome, drained) = Self::run_job(job, max_records, max_bytes, self.whole_file).await;
-        self.apply_outcome(&path, start, outcome, drained)
+        let mut reads = self.apply_outcome(&path, start, outcome, drained)?;
+        self.read_on_after_cuts(&path, &mut reads, max_records, max_bytes)
+            .await;
+        Ok(reads)
     }
 
     /// Read every file CONCURRENTLY (#96 B2). Each file's read is independent
@@ -3140,6 +3591,7 @@ impl SourceAdapter for FileSource {
                 deleted.insert(i);
             }
         }
+        self.reached_cut.clear();
         let jobs: Vec<(usize, ReadJob)> = sources
             .iter()
             .enumerate()
@@ -3198,7 +3650,11 @@ impl SourceAdapter for FileSource {
         // holds, so the caller sees one outcome per source however the cycle
         // got there.
         for (source_index, path, start, outcome, drained) in results {
-            let result = self.apply_outcome(&path, start, outcome, drained);
+            let mut result = self.apply_outcome(&path, start, outcome, drained);
+            if let Ok(reads) = &mut result {
+                self.read_on_after_cuts(&path, reads, max_records, max_bytes)
+                    .await;
+            }
             match &result {
                 Ok(reads) => any_records |= reads.iter().any(|read| !read.is_empty()),
                 Err(_) => any_failed = true,
@@ -3412,6 +3868,7 @@ impl SourceAdapter for FileSource {
                 end_byte: *end_byte,
                 mtime: None,
                 ctime: None,
+                nlink: None,
                 since: Instant::now(),
                 told: false,
             };
@@ -3430,6 +3887,7 @@ impl SourceAdapter for FileSource {
                         let md = file.metadata().ok();
                         candidate.mtime = md.as_ref().and_then(|md| md.modified().ok());
                         candidate.ctime = md.as_ref().and_then(ctime_of);
+                        candidate.nlink = md.as_ref().and_then(nlink_of);
                         match candidate.compare(&file, true) {
                             // THE BASELINE IS THE READ, not this commit (review
                             // of #689): a same-length rewrite between the two
@@ -3763,6 +4221,48 @@ impl SourceAdapter for FileSource {
         proven.then(|| i128::from(c.committed_byte))
     }
 
+    /// Record each range's end as a cut its re-read stops at (#626). Not in
+    /// whole-file mode, where a record is a whole file and cannot stop
+    /// inside one.
+    fn bound_replays(&mut self, ranges: &[ReplayRange]) -> Vec<bool> {
+        ranges
+            .iter()
+            .map(|range| {
+                let (
+                    ProgressMarker::File {
+                        path,
+                        inode,
+                        start_byte,
+                        ..
+                    },
+                    ProgressMarker::File {
+                        path: end_path,
+                        end_byte,
+                        ..
+                    },
+                ) = (&range.start, &range.end)
+                else {
+                    return false;
+                };
+                if self.whole_file || path != end_path || end_byte <= start_byte {
+                    return false;
+                }
+                let cuts = self.cuts.entry(path.clone()).or_default();
+                cuts.insert(
+                    *end_byte,
+                    Cut {
+                        start: *start_byte,
+                        inode: *inode,
+                    },
+                );
+                if cuts.len() > MAX_CUTS_PER_PATH {
+                    cuts.pop_first();
+                }
+                true
+            })
+            .collect()
+    }
+
     fn source_type(&self) -> SourceType {
         SourceType::File
     }
@@ -3819,6 +4319,7 @@ mod tests {
             Kept::Rewritten,
             Kept::Unprovable,
             Kept::MetadataMoved,
+            Kept::LinksChanged { then: 2, now: 1 },
             Kept::Gone,
             Kept::Symlink,
         ];
@@ -3832,6 +4333,7 @@ mod tests {
             "leftover_archived",
             "opened_at_unlink",
             "metadata_changed",
+            "deleted_unchecked",
         ];
         for outcome in kept.iter().map(Kept::outcome).chain(named) {
             assert!(
@@ -3839,6 +4341,17 @@ mod tests {
                 "{outcome} is counted but not in telemetry::FILE_DELETE_OUTCOMES"
             );
         }
+    }
+
+    /// `deleted_unchecked` is a warning the first time in a process and
+    /// information after (#619): a directory of thousands of files under
+    /// the opt-in must not log thousands of warnings.
+    #[test]
+    fn the_unchecked_delete_warns_once_then_informs() {
+        let warned = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(warn_once(&warned), tracing::Level::WARN);
+        assert_eq!(warn_once(&warned), tracing::Level::INFO);
+        assert_eq!(warn_once(&warned), tracing::Level::INFO);
     }
 
     /// Whether a delete decision said `needle` to the operator (#619).
@@ -4405,6 +4918,51 @@ mod tests {
     /// match "" would skip an in-place rewrite that preserved inode and
     /// size — indefinitely, on exactly the filesystems that give the check
     /// the least to work with. Unknown must fall through to a real read.
+    /// Review of #753: sources may span filesystems, and an inode number is
+    /// unique only within one. A source on another device that happens to
+    /// carry the deleted file's inode number is not a surviving link, so the
+    /// "archived from there; nothing to do" assurance must not name it. The
+    /// same number on the same device is.
+    #[test]
+    fn a_source_on_another_device_with_the_same_inode_is_not_a_surviving_link() {
+        let seen = |inode| FileCursor {
+            seen: Some(FileIdentity {
+                inode: Some(inode),
+                file_size: 0,
+                mtime: String::new(),
+                content: None,
+                tail: None,
+            }),
+            ..FileCursor::default()
+        };
+        let mut cursors = HashMap::new();
+        cursors.insert("/a/deleted.log".to_string(), seen(42));
+        cursors.insert("/b/other-device.log".to_string(), seen(42));
+        // The deleted file is (device 1, inode 42); the other source stats
+        // to inode 42 on device 2.
+        let stat = |p: &str| match p {
+            "/b/other-device.log" => Some((2, 42)),
+            "/c/link.log" => Some((1, 42)),
+            _ => None,
+        };
+        assert_eq!(
+            source_naming_the_same_file(&cursors, "/a/deleted.log", Some(42), Some((1, 42)), stat),
+            None,
+            "an inode number on another device is another file"
+        );
+        cursors.insert("/c/link.log".to_string(), seen(42));
+        assert_eq!(
+            source_naming_the_same_file(&cursors, "/a/deleted.log", Some(42), Some((1, 42)), stat),
+            Some("/c/link.log".to_string()),
+            "the same (device, inode) is a surviving link"
+        );
+        assert_eq!(
+            source_naming_the_same_file(&cursors, "/a/deleted.log", Some(42), None, stat),
+            None,
+            "with no identity from the descriptor, nothing is claimed"
+        );
+    }
+
     #[test]
     fn a_file_whose_mtime_cannot_be_read_is_never_skipped() {
         let identity = FileIdentity {
@@ -4812,6 +5370,111 @@ mod tests {
             "a marker of another source type is refused"
         );
         assert!(results[2].is_ok(), "and does not stop the one after it");
+    }
+
+    /// #626: a re-read bounded to a recorded range stops at its end, and
+    /// what follows is read on in the same pass as its own read: the window
+    /// the engine rebuilds ends where the failed one did, and the bytes after
+    /// it are the next window.
+    #[tokio::test]
+    async fn a_bounded_re_read_stops_at_the_recorded_end_and_reads_on_after_it() {
+        let mut f = write_log(&["a1", "a2", "a3"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(lines(&first), ["a1", "a2", "a3"]);
+        writeln!(f, "b1").unwrap();
+        f.flush().unwrap();
+        fs.replay_from_marker(&first[0].progress_start)
+            .await
+            .unwrap();
+        let range = ReplayRange {
+            start: first[0].progress_start.clone(),
+            end: first[0].progress_end.clone(),
+        };
+        assert_eq!(fs.bound_replays(&[range]), [true]);
+        let again = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.len(),
+            2,
+            "the rebuilt window, then what follows: {again:?}"
+        );
+        assert_eq!(lines(&again[..1]), ["a1", "a2", "a3"]);
+        assert_eq!(lines(&again[1..]), ["b1"]);
+        let (ProgressMarker::File { end_byte: cut, .. }, ProgressMarker::File { start_byte, .. }) =
+            (&again[0].progress_end, &again[1].progress_start)
+        else {
+            panic!("file markers");
+        };
+        assert_eq!((*cut, *start_byte), (9, 9));
+        assert!(fs.take_refused_cuts().is_empty());
+    }
+
+    /// #626: a line that crosses the recorded end means the bytes are not the
+    /// ones the window was cut from. The read stops before that line, the
+    /// bound is reported refused, and the next read reads on as before.
+    #[tokio::test]
+    async fn a_line_crossing_the_recorded_end_refuses_the_bound() {
+        let f = write_log(&["first", "second"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+        let first = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.replay_from_marker(&first[0].progress_start)
+            .await
+            .unwrap();
+        let mut end = first[0].progress_end.clone();
+        if let ProgressMarker::File { end_byte, .. } = &mut end {
+            *end_byte = 8; // inside "second\n"
+        }
+        let range = ReplayRange {
+            start: first[0].progress_start.clone(),
+            end,
+        };
+        assert_eq!(fs.bound_replays(&[range]), [true]);
+        let short = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(lines(&short), ["first"], "stopped before the crossing line");
+        let refused = fs.take_refused_cuts();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!((refused[0].start, refused[0].end), (0, 8));
+        assert!(refused[0].reason.contains("crosses the recorded end"));
+        let rest = fs
+            .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(lines(&rest), ["second"], "read on as before");
+    }
+
+    /// #626: whole-file mode cannot stop inside a file, so it bounds nothing.
+    #[test]
+    fn whole_file_mode_bounds_no_replay() {
+        let mut fs = FileSource::with_mode(vec![], TelemetryFormat::Raw, false, true);
+        let marker = |start: u64, end: u64| ProgressMarker::File {
+            path: "/x".into(),
+            inode: None,
+            start_byte: start,
+            end_byte: end,
+            file_size: end,
+            mtime: String::new(),
+            content_fingerprint: None,
+            tail_fingerprint: None,
+        };
+        let range = ReplayRange {
+            start: marker(0, 0),
+            end: marker(0, 10),
+        };
+        assert_eq!(fs.bound_replays(&[range]), [false]);
     }
 
     #[tokio::test]
@@ -7700,6 +8363,319 @@ mod tests {
         assert_eq!(next[0].records, vec![b"late".to_vec()]);
     }
 
+    // ---- #619, v0.10.0: the opt-in, and opens that arrive late -----------
+
+    /// O1 (#619): with `delete_without_open_check` and no lease to be had,
+    /// the delete is made on the quiet period alone. It used to be logged
+    /// "deleted P: ... and open in no process" and counted `deleted`, which
+    /// is false here: nothing checked. A writer holding the file open and
+    /// silent for longer than the quiet period is exactly the case the
+    /// opt-in gives up, and its next line goes into the unlinked inode; the
+    /// message has to say so, and the count has to let an alert see it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unchecked_delete_says_so_and_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"one\ntwo\n").unwrap();
+        let quiet = Duration::from_millis(50);
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(quiet)
+            .with_delete_without_open_check(true);
+        fs.no_open_check = true;
+        let unchecked_before = decisions("deleted_unchecked");
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        pass_after(&mut fs, &path, quiet).await;
+        assert!(
+            !Path::new(&path).exists(),
+            "kept although the operator chose the quiet period alone: {:?}",
+            fs.notices
+        );
+        // The opt-in's documented loss: the writer's next line goes into a
+        // file no path names.
+        writer.write_all(b"three\n").unwrap();
+        assert!(!Path::new(&path).exists());
+        assert!(
+            !fs.notices.iter().any(|n| n.contains("open in no process")),
+            "an unchecked delete claimed the file was open in no process: {:?}",
+            fs.notices
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "deleted {path} without proof that no process had it open: \
+                     sources.file.delete_without_open_check is set and no lease can be taken \
+                     here (the test turned the open-file check off)"
+                )
+            ) && notice(&fs, "so the engine unlinked it")
+                && notice(&fs, "loses every line it writes from now on")
+                && notice(&fs, "unset delete_without_open_check"),
+            "the unchecked delete did not say what happened, what the engine did and what to \
+             do: {:?}",
+            fs.notices
+        );
+        assert!(
+            decisions("deleted_unchecked") > unchecked_before,
+            "the unchecked delete was not counted as deleted_unchecked"
+        );
+    }
+
+    /// O2 (#619): "where the check is possible it is always made, and an
+    /// open file is kept whatever the key says" (the docs of
+    /// `delete_without_open_check`). True in `DeleteJob::run`, which matches
+    /// `Sole::Open` before it looks at the opt-in; nothing tested it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_writer_that_holds_the_file_keeps_it_even_with_the_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"one\ntwo\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO)
+            .with_delete_without_open_check(true);
+        let open_before = decisions("open");
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        writer.write_all(b"three\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("one\ntwo\nthree\n"),
+            "deleted under the opt-in although the lease showed a writer holding it open"
+        );
+        assert!(
+            notice(&fs, &format!("not deleting {path}: it is open elsewhere")),
+            "kept without saying why: {:?}",
+            fs.notices
+        );
+        assert!(decisions("open") > open_before, "the keep was not counted");
+        let next = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(next[0].records, vec![b"three".to_vec()]);
+    }
+
+    /// A descriptor that has resolved `path` to its file without opening it
+    /// (`O_PATH`): opened later through `/proc/self/fd/N`, it is an open of
+    /// that file wherever its name has gone - an open that resolved the path
+    /// early and reaches the file late (see `write_lease`'s spike test).
+    #[cfg(target_os = "linux")]
+    fn resolved(path: &str) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(path)
+            .unwrap()
+    }
+
+    /// Open the file `resolved` resolved to, for appending, as the late
+    /// opener would.
+    #[cfg(target_os = "linux")]
+    fn open_resolved(resolved: &std::fs::File) -> std::fs::File {
+        use std::os::fd::AsRawFd;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(format!("/proc/self/fd/{}", resolved.as_raw_fd()))
+            .unwrap()
+    }
+
+    /// S1 (#619, condition 12 of #689, which had no test): an open of the
+    /// path that resolved it to the file before the delete's rename, and
+    /// reaches the lease after it, inside the grace. The grace exists for
+    /// this open: it breaks the lease, the file is put back under its name,
+    /// and the opener writes into a file that still has one.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_open_that_resolved_the_path_before_the_rename_and_lands_in_the_grace_keeps_the_file(
+    ) {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let early: Arc<Mutex<Option<std::fs::File>>> = Arc::default();
+        let opener: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+        let (seam_early, seam_path) = (early.clone(), path.clone());
+        // Under the lease, before the rename: the lookup finds the file.
+        fs.after_lease = Some(Arc::new(move |_| {
+            let mut slot = seam_early.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(resolved(&seam_path));
+            }
+        }));
+        // Moved aside, the grace not yet begun: the open lands now, and the
+        // seam waits until it has reached the file - /proc/locks shows the
+        // lease breaking - so the grace, not a race, is what is tested.
+        let (seam_early, seam_opener) = (early.clone(), opener.clone());
+        fs.after_aside = Some(Arc::new(move |_| {
+            let Some(early) = seam_early.lock().unwrap().take() else {
+                return;
+            };
+            let inode = early.metadata().unwrap().ino();
+            *seam_opener.lock().unwrap() = Some(std::thread::spawn(move || {
+                open_resolved(&early).write_all(b"late\n").unwrap();
+            }));
+            let breaking = format!(":{inode} ");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                let locks = std::fs::read_to_string("/proc/locks").unwrap_or_default();
+                if locks
+                    .lines()
+                    .any(|l| l.contains("LEASE") && l.contains("BREAKING") && l.contains(&breaking))
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            panic!("the late open never reached the file");
+        }));
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        let opener = opener.lock().unwrap().take().expect(
+            "the seam never ran, so the delete never got that far and this test proves nothing",
+        );
+        opener.join().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("one\ntwo\nlate\n"),
+            "an open that resolved the path before the rename landed in the grace, and \"late\" \
+             went into the unlinked inode"
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "not deleting {path}: a process opened it while it was being deleted; it \
+                     was put back under its name"
+                )
+            ),
+            "kept without saying why: {:?}",
+            fs.notices
+        );
+        let next = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(next[0].records, vec![b"late".to_vec()]);
+    }
+
+    /// S2 (#619): an open that resolved the path before the rename and
+    /// reaches the file after the final check, just before the unlink -
+    /// longer than the grace. The unlink cannot be undone, so the file is
+    /// deleted and what the opener writes is lost: the limit the grace
+    /// bounds. The engine sees the broken lease after the unlink, and must
+    /// say so as an error, count it, and let the test read it back. It
+    /// logged the error from the delete thread, outside `notify`, and no
+    /// test asserted it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_open_between_the_final_check_and_the_unlink_is_logged_and_counted() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let early: Arc<Mutex<Option<std::fs::File>>> = Arc::default();
+        let opener: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+        let (seam_early, seam_path) = (early.clone(), path.clone());
+        fs.after_lease = Some(Arc::new(move |_| {
+            let mut slot = seam_early.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(resolved(&seam_path));
+            }
+        }));
+        let (seam_early, seam_opener) = (early.clone(), opener.clone());
+        fs.before_unlink = Some(Arc::new(move |_| {
+            let Some(early) = seam_early.lock().unwrap().take() else {
+                return;
+            };
+            let inode = early.metadata().unwrap().ino();
+            let (opened, has_opened) = std::sync::mpsc::channel::<()>();
+            *seam_opener.lock().unwrap() = Some(std::thread::spawn(move || {
+                let mut w = open_resolved(&early);
+                let _ = opened.send(());
+                w.write_all(b"late\n").unwrap();
+            }));
+            // Until the open has reached the file: /proc/locks shows the
+            // lease breaking for this inode.
+            let breaking = format!(":{inode} ");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if has_opened.try_recv().is_ok() {
+                    return;
+                }
+                let locks = std::fs::read_to_string("/proc/locks").unwrap_or_default();
+                if locks
+                    .lines()
+                    .any(|l| l.contains("LEASE") && l.contains("BREAKING") && l.contains(&breaking))
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            panic!("the late open never reached the file");
+        }));
+        let at_unlink_before = decisions("opened_at_unlink");
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        opener
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam never ran, so the delete never got that far")
+            .join()
+            .unwrap();
+        assert!(
+            !Path::new(&path).exists(),
+            "the unlink had already been decided; the file should be gone"
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "deleted {path} after a process opened it between the final check and the \
+                     unlink"
+                )
+            ) && notice(&fs, "is not archived")
+                && notice(&fs, "Find the writer that opens this path by name"),
+            "an open that reached the file at the unlink was not said: {:?}",
+            fs.notices
+        );
+        assert!(
+            decisions("opened_at_unlink") > at_unlink_before,
+            "an open that reached the file at the unlink was not counted"
+        );
+    }
+
     /// #619: where the engine cannot check whether another process holds the
     /// file open - a platform without write leases, a filesystem that does
     /// not support them (NFS, FUSE), or a file owned by another user without
@@ -8374,6 +9350,482 @@ mod tests {
         );
     }
 
+    /// S3 (#619): the race #689's grace was measured against, kept as a
+    /// test. Writers open the path, append one line and close it, in a
+    /// tight loop, while the engine reads, commits and deletes with no
+    /// quiet period. Every line written must be archived, or still be on
+    /// disk (at the path, or under a delete's hidden name that a put-back
+    /// left). An open that stalls in the kernel past the 50 ms grace is the
+    /// one way to lose a line, and the engine then counts
+    /// `opened_at_unlink`; the summary line reports that count.
+    ///
+    /// Not a CI gate: it runs for `VTOP_DELETE_STRESS_SECS` (default 20)
+    /// seconds, and a lease behaves by filesystem. Run it by hand before a
+    /// release, once each on tmpfs, ext4 and overlay (see the vtop-release
+    /// checklist):
+    ///
+    /// `TMPDIR=<dir> cargo test -p vtop-adapters --lib --locked --
+    /// --ignored delete_race_stress --nocapture`
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "stress test: run by hand before a release on tmpfs, ext4 and overlay"]
+    async fn delete_race_stress() {
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        const WRITERS: usize = 4;
+        let secs: u64 = std::env::var("VTOP_DELETE_STRESS_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let (stop, path) = (stop.clone(), path.clone());
+                std::thread::spawn(move || {
+                    let mut written = Vec::new();
+                    let mut i = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let line = format!("w{w}-{i}");
+                        let mut f = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                            .unwrap();
+                        f.write_all(format!("{line}\n").as_bytes()).unwrap();
+                        drop(f);
+                        written.push(line);
+                        i += 1;
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    written
+                })
+            })
+            .collect();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let (opened_before, deleted_before) = (decisions("opened_at_unlink"), decisions("deleted"));
+        let mut archived: HashSet<String> = HashSet::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        let mut idle = 0;
+        loop {
+            let draining = std::time::Instant::now() >= deadline;
+            if draining && !stop.swap(true, Ordering::Relaxed) {
+                idle = 0;
+            }
+            let reads = fs
+                .read_batch_candidates(&src(&path), 10_000, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap_or_default();
+            let mut any = false;
+            for read in &reads {
+                for record in &read.records {
+                    any = true;
+                    archived.insert(String::from_utf8_lossy(record).into_owned());
+                }
+                fs.commit_progress(&read.progress_end).await.unwrap();
+            }
+            if draining {
+                idle = if any { 0 } else { idle + 1 };
+                if idle >= 3 {
+                    break;
+                }
+            }
+        }
+        let written: Vec<String> = writers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect();
+        let mut on_disk: HashSet<String> = HashSet::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let content = std::fs::read_to_string(entry.unwrap().path()).unwrap_or_default();
+            on_disk.extend(content.lines().map(str::to_owned));
+        }
+        let lost: Vec<&String> = written
+            .iter()
+            .filter(|l| !archived.contains(*l) && !on_disk.contains(*l))
+            .collect();
+        let opened = decisions("opened_at_unlink") - opened_before;
+        eprintln!(
+            "delete_race_stress: {} lines by {WRITERS} writers in {secs} s on {}; {} archived, \
+             {} kept on disk unarchived, {} deletes, opened_at_unlink {opened}, lost {}",
+            written.len(),
+            dir.path().display(),
+            written.iter().filter(|l| archived.contains(*l)).count(),
+            written
+                .iter()
+                .filter(|l| !archived.contains(*l) && on_disk.contains(*l))
+                .count(),
+            decisions("deleted") - deleted_before,
+            lost.len()
+        );
+        assert!(
+            lost.is_empty(),
+            "{} of {} lines were neither archived nor left on disk (opened_at_unlink counted \
+             {opened} times); the first: {:?}",
+            lost.len(),
+            written.len(),
+            &lost[..lost.len().min(5)]
+        );
+    }
+
+    // ---- #619, v0.10.0: hard links -----------------------------------------
+
+    /// `a.log` and its hard link `b.log`, both holding "one\ntwo\n".
+    #[cfg(unix)]
+    fn hard_linked(dir: &Path) -> (String, String) {
+        let a = dir.join("a.log").to_string_lossy().into_owned();
+        let b = dir.join("b.log").to_string_lossy().into_owned();
+        std::fs::write(&a, "one\ntwo\n").unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        (a, b)
+    }
+
+    /// A source that deletes, with the opt-in off Linux, where it is the
+    /// only way a delete happens: these tests are about links, not leases.
+    #[cfg(unix)]
+    fn deleting(paths: &[&str], quiet: Duration) -> FileSource {
+        FileSource::new(
+            paths.iter().map(|p| p.to_string()).collect(),
+            TelemetryFormat::Raw,
+            true,
+        )
+        .with_delete_quiet_period(quiet)
+        .with_delete_without_open_check(!cfg!(target_os = "linux"))
+    }
+
+    /// H1 (#619): two names of one file, both sources (#378), both covered
+    /// by a commit before either is deleted. Deleting the first changes the
+    /// file's link count, and its ctime with it, so the second is kept - its
+    /// own copy is archived, so nothing is lost. The message used to list
+    /// four possible causes ("a touch, a chmod, a rewrite ... or another
+    /// name of the same file being deleted"); the link count says which.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deleting_one_name_keeps_the_other_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = hard_linked(dir.path());
+        let quiet = Duration::from_millis(50);
+        let mut fs = deleting(&[&a, &b], quiet);
+        for p in [&a, &b] {
+            let read = fs
+                .read_batch_candidates(&src(p), 100, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            fs.commit_progress(&read[0].progress_end).await.unwrap();
+        }
+        let links_before = decisions("links_changed");
+        pass_after(&mut fs, &a, quiet).await;
+        assert!(
+            !Path::new(&a).exists(),
+            "the first name was not deleted: {:?}",
+            fs.notices
+        );
+        pass_after(&mut fs, &b, Duration::ZERO).await;
+        assert_eq!(
+            std::fs::read_to_string(&b).ok().as_deref(),
+            Some("one\ntwo\n"),
+            "the second name was deleted on a candidate recorded before the first's delete"
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "not deleting {b}: its link count changed since it was archived (from 2 to \
+                     1)"
+                )
+            ) && notice(&fs, "remove this name by hand"),
+            "kept without saying it was the link count: {:?}",
+            fs.notices
+        );
+        assert!(
+            decisions("links_changed") > links_before,
+            "the keep was not counted as links_changed"
+        );
+    }
+
+    /// H2 (#619): a hard link made after the commit that covered the file.
+    /// The file is unchanged, but it now has another name, which the
+    /// engine did not archive under; kept, and said.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hard_link_made_after_the_commit_keeps_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let quiet = Duration::from_millis(50);
+        let mut fs = deleting(&[&path], quiet);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        std::fs::hard_link(&path, dir.path().join("copy")).unwrap();
+        let links_before = decisions("links_changed");
+        pass_after(&mut fs, &path, quiet).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("one\ntwo\n"),
+            "deleted although a hard link was made after the commit"
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "not deleting {path}: its link count changed since it was archived (from 1 \
+                     to 2)"
+                )
+            ),
+            "kept without saying it was the link count: {:?}",
+            fs.notices
+        );
+        assert!(decisions("links_changed") > links_before);
+    }
+
+    /// Review of #753: the engine's own path. Both names are read and
+    /// committed in one pass, so both deletes fall due in one later pass and
+    /// run side by side (`read_all_batch_candidates`). Each holds the file
+    /// open while it checks it, and moves its ctime when it renames it
+    /// aside and back, so either can keep the other: as `open`, as
+    /// `metadata_changed`, or - when one finishes first - as
+    /// `links_changed`. Deletes are not serialised per inode, by decision.
+    /// What must hold whatever the interleaving: nothing is lost, at least
+    /// one name keeps the file, and every name kept says the other name may
+    /// be why.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn hard_links_due_in_the_same_pass_lose_nothing_and_say_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = hard_linked(dir.path());
+        let quiet = Duration::from_millis(50);
+        let mut fs = deleting(&[&a, &b], quiet);
+        let sources = [src(&a), src(&b)];
+        let pass = fs
+            .read_all_batch_candidates(&sources, 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        for outcome in &pass.outcomes {
+            for read in outcome.result.as_ref().unwrap() {
+                fs.commit_progress(&read.progress_end).await.unwrap();
+            }
+        }
+        std::thread::sleep(quiet * 2);
+        fs.read_all_batch_candidates(&sources, 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let left: Vec<&String> = [&a, &b]
+            .into_iter()
+            .filter(|p| Path::new(p).exists())
+            .collect();
+        assert!(!left.is_empty(), "both names deleted: {:?}", fs.notices);
+        for p in &left {
+            assert_eq!(std::fs::read_to_string(p).unwrap(), "one\ntwo\n", "{p}");
+        }
+        let kept: Vec<&String> = fs
+            .notices
+            .iter()
+            .filter(|n| n.starts_with("not deleting"))
+            .collect();
+        assert!(!kept.is_empty(), "{:?}", fs.notices);
+        for n in kept {
+            assert!(
+                n.contains("names (hard links)") || n.contains("link count"),
+                "a name kept beside another name's delete, without saying the other name may \
+                 be why: {n}"
+            );
+        }
+    }
+
+    /// The open from another hard link that reaches the file between the
+    /// final check and the unlink of `path` (review of #753): a seam that
+    /// opens `other` for appending from a thread, writes "late", and waits
+    /// until the open has reached the file (/proc/locks shows the lease
+    /// breaking). Returns the opener's handle slot.
+    #[cfg(target_os = "linux")]
+    fn open_through_at_unlink(
+        fs: &mut FileSource,
+        other: &str,
+    ) -> std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{Arc, Mutex};
+        let opener: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+        let (seam_opener, seam_other) = (opener.clone(), other.to_owned());
+        fs.before_unlink = Some(Arc::new(move |_| {
+            let mut slot = seam_opener.lock().unwrap();
+            if slot.is_some() {
+                return;
+            }
+            let inode = std::fs::metadata(&seam_other).unwrap().ino();
+            let (opened, has_opened) = std::sync::mpsc::channel::<()>();
+            let other = seam_other.clone();
+            *slot = Some(std::thread::spawn(move || {
+                let mut w = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&other)
+                    .unwrap();
+                let _ = opened.send(());
+                w.write_all(b"late\n").unwrap();
+            }));
+            let breaking = format!(":{inode} ");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if has_opened.try_recv().is_ok() {
+                    return;
+                }
+                let locks = std::fs::read_to_string("/proc/locks").unwrap_or_default();
+                if locks
+                    .lines()
+                    .any(|l| l.contains("LEASE") && l.contains("BREAKING") && l.contains(&breaking))
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            panic!("the open through the other name never reached the file");
+        }));
+        opener
+    }
+
+    /// Review of #753: an open that reaches the file between the final check
+    /// and the unlink, through ANOTHER hard link that no configured pattern
+    /// names. The file keeps that name, so the opener's lines are not gone -
+    /// but nothing archives them either (review of #753 by Codex: the engine
+    /// said they were "archived under that name; nothing to do"). The
+    /// operator has to act: an error that says so.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_open_through_an_unread_hard_link_at_the_unlink_says_it_is_not_archived() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let other = dir.path().join("other.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        std::fs::hard_link(&path, &other).unwrap();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, true)
+            .with_delete_quiet_period(Duration::ZERO);
+        let opener = open_through_at_unlink(&mut fs, &other);
+        let read = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        fs.commit_progress(&read[0].progress_end).await.unwrap();
+        opener
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam never ran")
+            .join()
+            .unwrap();
+        assert!(!Path::new(&path).exists());
+        assert_eq!(
+            std::fs::read_to_string(&other).ok().as_deref(),
+            Some("one\ntwo\nlate\n")
+        );
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "deleted the name {path} after a process opened the file between the final \
+                     check and the unlink"
+                )
+            ) && notice(&fs, "none of them a source this engine reads")
+                && notice(&fs, "is NOT archived")
+                && !notice(&fs, "nothing to do"),
+            "{:?}",
+            fs.notices
+        );
+    }
+
+    /// Review of #753: the same open, through a hard link this engine reads
+    /// as a source of its own (#378). The opener's lines stay in the file
+    /// under that name and are archived from it: nothing to do.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_open_through_a_hard_link_this_engine_reads_at_the_unlink_says_nothing_is_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log").to_string_lossy().into_owned();
+        let other = dir.path().join("other.log").to_string_lossy().into_owned();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        std::fs::hard_link(&path, &other).unwrap();
+        let quiet = Duration::from_millis(50);
+        let mut fs = FileSource::new(
+            vec![path.clone(), other.clone()],
+            TelemetryFormat::Raw,
+            true,
+        )
+        .with_delete_quiet_period(quiet);
+        for p in [&path, &other] {
+            let read = fs
+                .read_batch_candidates(&src(p), 100, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            fs.commit_progress(&read[0].progress_end).await.unwrap();
+        }
+        let opener = open_through_at_unlink(&mut fs, &other);
+        pass_after(&mut fs, &path, quiet).await;
+        opener
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam never ran")
+            .join()
+            .unwrap();
+        assert!(!Path::new(&path).exists());
+        assert!(
+            notice(
+                &fs,
+                &format!(
+                    "deleted the name {path} after a process opened the file between the final \
+                     check and the unlink"
+                )
+            ) && notice(
+                &fs,
+                &format!("the file is still named {other}, a source this engine reads")
+            ) && notice(&fs, "nothing to do"),
+            "{:?}",
+            fs.notices
+        );
+        let next = fs
+            .read_batch_candidates(&src(&other), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            next[0].records,
+            vec![b"late".to_vec()],
+            "archived from the other name"
+        );
+    }
+
+    /// H3 (#619), the boundary: with no quiet period the first name is
+    /// deleted at its commit, and a name read and committed after that sees
+    /// the file as it is then - one name - so it is deleted too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn names_committed_after_the_others_delete_are_deleted_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = hard_linked(dir.path());
+        let mut fs = deleting(&[&a, &b], Duration::ZERO);
+        for p in [&a, &b] {
+            let read = fs
+                .read_batch_candidates(&src(p), 100, 1 << 20, Duration::ZERO)
+                .await
+                .unwrap();
+            assert_eq!(read[0].records.len(), 2, "{p}");
+            fs.commit_progress(&read[0].progress_end).await.unwrap();
+            assert!(
+                !Path::new(p).exists(),
+                "{p} was not deleted: {:?}",
+                fs.notices
+            );
+        }
+        assert!(
+            !fs.notices.iter().any(|n| n.contains("link count")),
+            "{:?}",
+            fs.notices
+        );
+    }
+
     /// `delete_after_commit` beside #647's re-read of a rotated file, when
     /// the rotated name is a source too. While a failed range of `app.log`
     /// is being re-read through a descriptor on `app.log.1`, that file -
@@ -8843,6 +10295,7 @@ mod tests {
                 end_byte: end,
                 mtime: None,
                 ctime: None,
+                nlink: None,
                 since: Instant::now(),
                 told: false,
             }

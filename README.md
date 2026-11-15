@@ -256,9 +256,11 @@ The limits that matter most when evaluating it:
 
 - **A replay reuses the stored object only when it produces the same bytes.**
   Objects are named by source, range and content digest (#626), so a replay of
-  the same bytes reuses what is stored and never overwrites anything. A replay
-  over a source that grew, in a later hour under seal-time partitioning, with
-  no checksum, or on a command backend still writes a second object (no data
+  the same bytes reuses what is stored and never overwrites anything, and a
+  file or spool replay is rebuilt as first cut. A Kafka replay over a
+  partition that grew, a replay of a row from before v0.10.0 in a later hour under
+  seal-time partitioning, with no checksum, or on a command backend still
+  writes a second object (no data
   is lost), so the protocol's deterministic naming rule
   ([§15.1](docs/VTOP_PROTOCOL_DRAFT.md#151-object-key)) is narrowed, not met.
 - **Size-only verification is an opt-out, and it accepts same-size

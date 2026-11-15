@@ -340,35 +340,44 @@ impl PgStateStore {
         if let Some(refusal) = newer_schema_refusal(body.as_deref()) {
             return Err(refusal);
         }
-        // Whether this run adds the verification class column (#664) to a
-        // table that already holds rows: those rows keep no class, and the
-        // operator is told how many.
-        let adds_class_column: bool = sqlx::query_scalar(
-            "SELECT to_regclass('batches') IS NOT NULL AND NOT EXISTS ( \
-                SELECT 1 FROM pg_catalog.pg_attribute \
-                WHERE attrelid = to_regclass('batches') \
-                  AND attname = 'verification_class' AND NOT attisdropped)",
-        )
-        .fetch_one(&pool)
-        .await
-        .map_err(map_sqlx)?;
+        // Whether this run adds the verification class column (#664), or the
+        // seal instant (#626), to a table that already holds rows: those rows
+        // keep no value, and the operator is told how many.
+        let adds_column = |column: &'static str| {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT to_regclass('batches') IS NOT NULL AND NOT EXISTS ( \
+                    SELECT 1 FROM pg_catalog.pg_attribute \
+                    WHERE attrelid = to_regclass('batches') \
+                      AND attname = $1 AND NOT attisdropped)",
+            )
+            .bind(column)
+            .fetch_one(&pool)
+        };
+        let adds_class_column = adds_column("verification_class").await.map_err(map_sqlx)?;
+        let adds_sealed_at_column = adds_column("sealed_at").await.map_err(map_sqlx)?;
         sqlx::raw_sql(MIGRATION)
             .execute(&pool)
             .await
             .map_err(map_sqlx)?;
-        if adds_class_column {
+        if adds_class_column || adds_sealed_at_column {
             // Best effort (review of #664): the migration has committed, and
             // a failed count must not report it as failed. An exact count, as
             // the message promises a number; migrate is a one-off step.
-            match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM batches")
+            let rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM batches")
                 .fetch_one(&pool)
                 .await
-            {
-                Ok(rows) => crate::models::log_class_column_added("PostgreSQL", rows),
-                Err(e) => crate::models::log_class_column_added_uncounted(
-                    "PostgreSQL",
-                    &redact_postgres_urls(&e.to_string()),
-                ),
+                .map_err(|e| redact_postgres_urls(&e.to_string()));
+            if adds_class_column {
+                match &rows {
+                    Ok(rows) => crate::models::log_class_column_added("PostgreSQL", *rows),
+                    Err(e) => crate::models::log_class_column_added_uncounted("PostgreSQL", e),
+                }
+            }
+            if adds_sealed_at_column {
+                match &rows {
+                    Ok(rows) => crate::models::log_sealed_at_column_added("PostgreSQL", *rows),
+                    Err(e) => crate::models::log_sealed_at_column_added_uncounted("PostgreSQL", e),
+                }
             }
         }
         Self {
@@ -511,8 +520,10 @@ impl StateStore for PgStateStore {
                    (batch_id, tenant, source_type, source_name, format, state,
                     progress_start_json, progress_end_json, object_uri, manifest_uri,
                     object_sha256, manifest_sha256, manifest_version_id, object_size_bytes,
-                    record_count, error_message, owner, lease_expires_at, created_at, updated_at)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)"#,
+                    record_count, error_message, owner, lease_expires_at, created_at, updated_at,
+                    sealed_at)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                    $21)"#,
             )
             .bind(&rec.batch_id)
             .bind(&rec.tenant)
@@ -534,6 +545,7 @@ impl StateStore for PgStateStore {
             .bind(&rec.lease_expires_at)
             .bind(crate::store::canonical_created_at(&rec.created_at))
             .bind(&rec.updated_at)
+            .bind(&rec.sealed_at)
             .execute(&self.pool)
         })
         .await?;
@@ -1095,6 +1107,8 @@ impl StateStore for PgStateStore {
 }
 
 fn row_to_record(row: sqlx::postgres::PgRow) -> Result<BatchRecord, VtopError> {
+    let batch_id: String = row.get("batch_id");
+    let sealed_at = crate::models::sealed_at_column(row.get("sealed_at"), &batch_id);
     let source_type_s: String = row.get("source_type");
     let format_s: String = row.get("format");
     let state_s: String = row.get("state");
@@ -1102,7 +1116,7 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> Result<BatchRecord, VtopError> {
     let pe: String = row.get("progress_end_json");
 
     Ok(BatchRecord {
-        batch_id: row.get("batch_id"),
+        batch_id,
         tenant: row.get("tenant"),
         source_type: SourceType::from_str(&source_type_s).map_err(VtopError::State)?,
         source_name: row.get("source_name"),
@@ -1124,6 +1138,7 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> Result<BatchRecord, VtopError> {
         error_message: row.get("error_message"),
         owner: row.get("owner"),
         lease_expires_at: row.get("lease_expires_at"),
+        sealed_at,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })

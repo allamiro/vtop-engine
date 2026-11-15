@@ -117,7 +117,11 @@ impl Logs {
             .unwrap()
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter_map(|v| v.get("fields").cloned())
+            .filter_map(|v| {
+                let mut fields = v.get("fields").cloned()?;
+                fields["level"] = v["level"].clone();
+                Some(fields)
+            })
             .filter(|f| f.get("event").and_then(Value::as_str) == Some(event))
             .collect()
     }
@@ -550,6 +554,7 @@ async fn an_archive_with_per_attempt_keys_still_recovers_scrubs_and_audits() {
         // A row written before #664 recorded no verification class.
         verification_class: None,
         object_size_bytes: Some(bytes.len() as i64),
+        sealed_at: None,
         record_count: Some(4),
         error_message: None,
         owner: None,
@@ -658,22 +663,25 @@ async fn a_replay_compressed_differently_is_another_object() {
     );
 }
 
-/// Different bytes from a different batching boundary: the failed attempt
-/// uploaded `[0, n)`, the file grew before the re-read, and the replay reads
-/// `[0, m)`. That is another object (the documented limit); the failed
-/// attempt's object is not touched.
+/// #626: the failed attempt uploaded `[0, n)`, the manifest put was
+/// throttled, and the file grew before the re-read. The re-read stops at `n`
+/// (the cut the failed window recorded), so it rebuilds exactly the bytes the
+/// failed attempt uploaded and resolves to that object; the appended lines
+/// are the next window. Before, the replay read `[0, m)`, named another
+/// object, and the failed attempt's object stayed as an orphan.
 #[tokio::test]
-async fn a_replay_over_a_grown_source_is_another_object_and_overwrites_nothing() {
+async fn a_replay_over_a_grown_source_resolves_to_the_archived_object() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("app.log");
     write_lines(&input, "app", 4);
+    let n = std::fs::metadata(&input).unwrap().len();
     let backend = Arc::new(MockBackend::new().with_throttled_manifest_puts(1));
-    let mut e = engine(
-        config(dir.path(), "state.db", std::slice::from_ref(&input)),
-        &backend,
-    )
-    .await;
+    let tenant = "grown-626";
+    let mut cfg = config(dir.path(), "state.db", std::slice::from_ref(&input));
+    cfg.engine.tenant = tenant.into();
+    let mut e = engine(cfg, &backend).await;
     let (logs, _guard) = Logs::capture();
+    let exact_before = rebuilds(tenant, "exact");
     let first = e.process_once(SourceType::File).await.unwrap();
     assert!(!first[0].committed);
     let orphan = e
@@ -687,16 +695,47 @@ async fn a_replay_over_a_grown_source_is_another_object_and_overwrites_nothing()
 
     write_lines(&input, "more", 3);
     let second = e.process_once(SourceType::File).await.unwrap();
-    assert_eq!(second.len(), 1, "{second:?}");
-    assert!(second[0].committed, "{second:?}");
-    let replayed = second[0].object_uri.clone().unwrap();
-    assert_ne!(replayed, orphan, "another range, another key");
-    assert!(backend.contains(&orphan) && !put_twice(&backend, &orphan).await);
+    assert_eq!(
+        second.len(),
+        2,
+        "the rebuilt window, then the new one: {second:?}"
+    );
+    assert!(second.iter().all(|o| o.committed), "{second:?}");
+    assert_eq!(
+        second[0].object_uri.as_deref(),
+        Some(orphan.as_str()),
+        "the replay resolves to the object the failed attempt uploaded"
+    );
+    assert!(
+        !put_twice(&backend, &orphan).await,
+        "and does not put it again"
+    );
+    assert_ne!(second[1].object_uri.as_deref(), Some(orphan.as_str()));
+    assert_eq!(rebuilds(tenant, "exact"), exact_before + 1);
+    let len = std::fs::metadata(&input).unwrap().len();
+    let mut ranges: Vec<String> = committed(&e)
+        .await
+        .iter()
+        .map(|r| {
+            vtop_core::types::ProgressMarker::spanning(&r.progress_start, &r.progress_end)
+                .range_token()
+        })
+        .collect();
+    ranges.sort();
+    assert_eq!(
+        ranges,
+        vec![format!("b0-{n}"), format!("b{n}-{len}")],
+        "the ranges tile"
+    );
+    let rebuilt = logs.one("replay_rebuilt", &second[0].batch_id);
     assert_event(
-        &logs.one("object_key_derived", &second[0].batch_id),
-        &replayed,
-        &file_range(&input),
-        &["uploading it under its derived key"],
+        &rebuilt,
+        &orphan,
+        &format!("b0-{n}"),
+        &[
+            "rebuilt exactly as first cut (4 records)",
+            "names the object the earlier attempt uploaded",
+        ],
     );
 }
 
@@ -1133,4 +1172,627 @@ async fn two_engines_sharing_a_ledger_keep_their_own_file_objects() {
         rows.iter().any(|r| r.batch_id == first[0].batch_id),
         "one ledger"
     );
+}
+
+// ---- A replay rebuilds the window an earlier attempt sealed (#626) --------
+
+/// The count of `result` on `vtop_replay_rebuilds_total` for file batches of
+/// `tenant`; a test reading it uses a tenant of its own, as for `decisions`.
+fn rebuilds(tenant: &str, result: &str) -> u64 {
+    vtop_core::telemetry::init()
+        .unwrap()
+        .replay_rebuilds_total
+        .with_label_values(&[tenant, "file", "raw", result])
+        .get()
+}
+
+/// An instant, for a seal clock.
+fn at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
+/// The first attempt is sealed in this hour; its replay in the next.
+const SEALED: &str = "2026-03-04T05:59:59.900+00:00";
+const REPLAYED: &str = "2026-03-04T06:00:30+00:00";
+
+/// A config whose object keys carry the hour the batch was sealed in.
+fn hourly_config(dir: &Path, db: &str, input: &Path, tenant: &str) -> VtopConfig {
+    let mut cfg = config(dir, db, &[input.to_path_buf()]);
+    cfg.partitioning.template = vtop_core::partitioning::DEFAULT_TEMPLATE.into();
+    cfg.engine.tenant = tenant.into();
+    cfg
+}
+
+/// #626: the object put lands at 05:59:59, the manifest put is throttled,
+/// the batch fails, and its range is read again at 06:00:30. The replay is
+/// sealed at the instant the first attempt was, so it is filed under hour 05
+/// and names the key the failed attempt wrote: the object is reused, not
+/// written again under hour 06. The replay says so, and is counted `exact`.
+#[tokio::test]
+async fn a_replay_sealed_in_a_later_hour_resolves_to_the_recorded_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 4);
+    let backend = Arc::new(MockBackend::new().with_throttled_manifest_puts(1));
+    let tenant = "later-hour-626";
+    let mut engine = engine(
+        hourly_config(dir.path(), "state.db", &input, tenant),
+        &backend,
+    )
+    .await;
+    let (logs, _guard) = Logs::capture();
+    let (reused_before, exact_before) = (decisions(tenant, "reused"), rebuilds(tenant, "exact"));
+
+    engine.set_seal_clock(|| at(SEALED));
+    let first = engine.process_once(SourceType::File).await.unwrap();
+    assert!(!first[0].committed, "{first:?}");
+    let failed = engine
+        .store
+        .get_batch(&first[0].batch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let orphan = failed.object_uri.clone().unwrap();
+    assert!(orphan.contains("hour=05"), "{orphan}");
+    assert_eq!(
+        failed.sealed_at.as_deref(),
+        Some(at(SEALED).to_rfc3339().as_str()),
+        "the row records the instant the window was sealed"
+    );
+
+    engine.set_seal_clock(|| at(REPLAYED));
+    let second = engine.process_once(SourceType::File).await.unwrap();
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(second[0].committed, "{second:?}");
+    assert_eq!(
+        second[0].object_uri.as_deref(),
+        Some(orphan.as_str()),
+        "the replay in hour 06 names the key the failed attempt wrote in hour 05"
+    );
+    assert!(
+        !put_twice(&backend, &orphan).await,
+        "and does not put it again"
+    );
+    assert_eq!(decisions(tenant, "reused"), reused_before + 1);
+    assert_eq!(rebuilds(tenant, "exact"), exact_before + 1);
+    let replay = engine
+        .store
+        .get_batch(&second[0].batch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        replay.sealed_at, failed.sealed_at,
+        "the replay's own row keeps the first attempt's instant"
+    );
+
+    let rebuilt = logs.one("replay_rebuilt", &second[0].batch_id);
+    assert_eq!(text(&rebuilt, "level"), "INFO");
+    assert_eq!(text(&rebuilt, "earlier_batch_id"), first[0].batch_id);
+    assert_event(
+        &rebuilt,
+        &orphan,
+        &file_range(&input),
+        &[
+            &format!("failed earlier (batch {})", first[0].batch_id),
+            "rebuilt exactly as first cut (4 records)",
+            "sealed at the instant first recorded",
+            "filed under the same hour",
+            "names the object the earlier attempt uploaded, with the same bytes",
+            "nothing to do",
+        ],
+    );
+}
+
+/// #626, after a restart: the window's seal instant is read back from its
+/// ledger row, so the replay a restarted engine makes in a later hour also
+/// names the key the failed attempt wrote.
+#[tokio::test]
+async fn a_replay_after_a_restart_in_a_later_hour_resolves_to_the_recorded_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 4);
+    let backend = Arc::new(MockBackend::new().with_throttled_manifest_puts(1));
+    let tenant = "later-hour-restart-626";
+    let cfg = hourly_config(dir.path(), "state.db", &input, tenant);
+    let orphan = {
+        let mut first = engine(cfg.clone(), &backend).await;
+        first.set_seal_clock(|| at(SEALED));
+        let out = first.process_once(SourceType::File).await.unwrap();
+        assert!(!out[0].committed, "{out:?}");
+        first
+            .store
+            .get_batch(&out[0].batch_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .object_uri
+            .unwrap()
+    };
+    let exact_before = rebuilds(tenant, "exact");
+
+    let mut restarted = engine(cfg, &backend).await;
+    restarted.set_seal_clock(|| at(REPLAYED));
+    restarted.recover().await.unwrap();
+    let out = restarted.process_once(SourceType::File).await.unwrap();
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(out[0].committed, "{out:?}");
+    assert_eq!(
+        out[0].object_uri.as_deref(),
+        Some(orphan.as_str()),
+        "the restarted engine's replay in hour 06 names the hour-05 key"
+    );
+    assert!(!put_twice(&backend, &orphan).await);
+    assert_eq!(rebuilds(tenant, "exact"), exact_before + 1);
+}
+
+/// #626 (D5): the range is rebuilt as first cut, but compression changed
+/// between the attempts, so its bytes differ from the object the failed
+/// attempt uploaded. The replay is written under its own key, the earlier
+/// object is left as it is, and the operator is told what happened, what was
+/// done and what to do; it is counted `bytes_differ`.
+#[tokio::test]
+async fn a_replay_whose_bytes_differ_from_the_uploaded_object_says_so_and_overwrites_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 50);
+    let backend = Arc::new(MockBackend::new().with_throttled_manifest_puts(1));
+    let tenant = "bytes-differ-626";
+    let mut a_cfg = hourly_config(dir.path(), "state.db", &input, tenant);
+    a_cfg.compression.kind = CompressionType::Gzip;
+    a_cfg.compression.level = 1;
+    let (first_id, orphan, recorded) = {
+        let mut first = engine(a_cfg.clone(), &backend).await;
+        let out = first.process_once(SourceType::File).await.unwrap();
+        assert!(!out[0].committed, "{out:?}");
+        let row = first
+            .store
+            .get_batch(&out[0].batch_id)
+            .await
+            .unwrap()
+            .unwrap();
+        (
+            out[0].batch_id.clone(),
+            row.object_uri.unwrap(),
+            row.object_sha256.unwrap(),
+        )
+    };
+    let differ_before = rebuilds(tenant, "bytes_differ");
+
+    let mut b_cfg = a_cfg;
+    b_cfg.compression.kind = CompressionType::Zstd;
+    b_cfg.compression.level = 19;
+    let (logs, _guard) = Logs::capture();
+    let mut restarted = engine(b_cfg, &backend).await;
+    restarted.recover().await.unwrap();
+    let out = restarted.process_once(SourceType::File).await.unwrap();
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(out[0].committed, "{out:?}");
+    let written = out[0].object_uri.clone().unwrap();
+    assert_ne!(written, orphan, "other bytes, another key");
+    assert!(
+        backend.contains(&orphan),
+        "the earlier object is left as it is"
+    );
+    assert!(!put_twice(&backend, &orphan).await, "and not written over");
+    assert_eq!(rebuilds(tenant, "bytes_differ"), differ_before + 1);
+
+    let differs = logs.one("replay_bytes_differ", &out[0].batch_id);
+    assert_eq!(text(&differs, "level"), "WARN");
+    assert_eq!(text(&differs, "earlier_batch_id"), first_id);
+    assert_eq!(text(&differs, "recorded_digest"), recorded);
+    assert_ne!(text(&differs, "digest"), recorded);
+    assert_event(
+        &differs,
+        &written,
+        &file_range(&input),
+        &[
+            "was rebuilt as first cut, but its bytes differ from the object the earlier attempt",
+            "the earlier object is left untouched",
+            "nothing is lost",
+            "if compression, format or checksum settings changed since, nothing to do",
+            "run `vtopctl scrub`",
+        ],
+    );
+    assert!(
+        logs.events("replay_rebuilt").is_empty(),
+        "a rebuild whose bytes differ is not reported as exact"
+    );
+}
+
+/// #626: the window is rebuilt exactly and sealed in its first hour, so it
+/// names the failed attempt's key, but the object there no longer verifies
+/// (damaged while the batch waited). The key decision falls back to the
+/// attempt key, as it always has. The rebuild must say that, and be counted
+/// `fallback`: reporting it `exact`, "names the same key", would claim a reuse
+/// that did not happen.
+#[tokio::test]
+async fn a_rebuilt_window_whose_key_falls_back_is_counted_as_a_fallback_not_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 4);
+    let backend = Arc::new(MockBackend::new().with_throttled_manifest_puts(1));
+    let tenant = "rebuilt-fallback-626";
+    let mut engine = engine(
+        hourly_config(dir.path(), "state.db", &input, tenant),
+        &backend,
+    )
+    .await;
+    let (logs, _guard) = Logs::capture();
+    let (exact_before, fallback_before) = (rebuilds(tenant, "exact"), rebuilds(tenant, "fallback"));
+
+    let first = engine.process_once(SourceType::File).await.unwrap();
+    assert!(!first[0].committed, "{first:?}");
+    let orphan = engine
+        .store
+        .get_batch(&first[0].batch_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .object_uri
+        .unwrap();
+    backend.corrupt(&orphan);
+
+    let second = engine.process_once(SourceType::File).await.unwrap();
+    assert!(second[0].committed, "{second:?}");
+    let written = second[0].object_uri.clone().unwrap();
+    assert_ne!(written, orphan, "the damaged object is not reused");
+    assert!(
+        written.contains(&second[0].batch_id),
+        "the attempt key: {written}"
+    );
+    assert_eq!(
+        rebuilds(tenant, "exact"),
+        exact_before,
+        "not an exact rebuild"
+    );
+    assert_eq!(rebuilds(tenant, "fallback"), fallback_before + 1);
+    assert!(
+        logs.events("replay_rebuilt").is_empty(),
+        "no claim that the same key was named"
+    );
+    let fallback = logs.one("replay_key_fallback", &second[0].batch_id);
+    assert_eq!(text(&fallback, "level"), "INFO");
+    assert_event(
+        &fallback,
+        &written,
+        &file_range(&input),
+        &[
+            "was rebuilt exactly as first cut",
+            "its derived key could not be used",
+            &format!("written under {written}"),
+            "object_key_fallback",
+            "nothing is lost",
+        ],
+    );
+}
+
+// ---- Bounded replay for file sources (#626) --------------------------------
+
+/// The committed ranges of a file source, as `(start, end)`, in file order.
+async fn committed_ranges(engine: &Engine) -> Vec<(u64, u64)> {
+    let mut ranges: Vec<(u64, u64)> = committed(engine)
+        .await
+        .iter()
+        .map(|r| match (&r.progress_start, &r.progress_end) {
+            (ProgressMarker::File { start_byte, .. }, ProgressMarker::File { end_byte, .. }) => {
+                (*start_byte, *end_byte)
+            }
+            other => panic!("file markers: {other:?}"),
+        })
+        .collect();
+    ranges.sort_unstable();
+    ranges
+}
+
+/// #626, after a restart: two adjacent windows failed after their objects
+/// landed, and the file grew while the engine was down. Recovery hands both
+/// back and each re-read stops at its window's recorded end, so both are
+/// rebuilt exactly and reuse their objects; only the appended lines are new.
+#[tokio::test]
+async fn two_failed_windows_are_each_rebuilt_after_a_restart_and_reuse_their_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 4);
+    // Three manifest puts fail: window A, A's rebuild, and window B.
+    let backend = Arc::new(MockBackend::new().with_throttled_manifest_puts(3));
+    let tenant = "two-windows-626";
+    let mut cfg = config(dir.path(), "state.db", std::slice::from_ref(&input));
+    cfg.engine.tenant = tenant.into();
+    cfg.batching.max_records = 2;
+    let orphans: Vec<String> = {
+        let mut first = engine(cfg.clone(), &backend).await;
+        // A: two lines (the pass budget), fails.
+        let a = first.process_once(SourceType::File).await.unwrap();
+        assert_eq!(a.len(), 1, "{a:?}");
+        // A pass of four lines rebuilds A up to its cut and reads B on after
+        // it, as its own window; both fail.
+        first.config.batching.max_records = 4;
+        let out = first.process_once(SourceType::File).await.unwrap();
+        assert_eq!(out.len(), 2, "A rebuilt, then B: {out:?}");
+        assert!(out.iter().all(|o| !o.committed), "{out:?}");
+        let mut uris = Vec::new();
+        for o in &out {
+            let row = first.store.get_batch(&o.batch_id).await.unwrap().unwrap();
+            uris.push(row.object_uri.unwrap());
+        }
+        uris
+    };
+    cfg.batching.max_records = 4;
+    write_lines(&input, "more", 1);
+    let exact_before = rebuilds(tenant, "exact");
+
+    let mut restarted = engine(cfg, &backend).await;
+    let summary = restarted.recover().await.unwrap();
+    assert_eq!(
+        summary.replay_required, 3,
+        "A, its rebuild, and B: {summary:?}"
+    );
+    let mut out = restarted.process_once(SourceType::File).await.unwrap();
+    out.extend(restarted.process_once(SourceType::File).await.unwrap());
+    assert!(out.iter().all(|o| o.committed), "{out:?}");
+    let reused: Vec<_> = out.iter().filter_map(|o| o.object_uri.clone()).collect();
+    for orphan in &orphans {
+        assert!(reused.contains(orphan), "{orphan} reused: {reused:?}");
+        assert!(!put_twice(&backend, orphan).await, "{orphan} not put again");
+    }
+    assert_eq!(rebuilds(tenant, "exact"), exact_before + 2);
+    let ranges = committed_ranges(&restarted).await;
+    let len = std::fs::metadata(&input).unwrap().len();
+    let mut next = 0;
+    for (start, end) in &ranges {
+        assert_eq!(*start, next, "a gap or a repeat: {ranges:?}");
+        next = *end;
+    }
+    assert_eq!(next, len, "{ranges:?}");
+    assert_eq!(
+        ranges.len(),
+        3,
+        "the two rebuilt windows and the new line: {ranges:?}"
+    );
+}
+
+/// #626: the file was rewritten under the failed range at the same inode, so
+/// the re-read cannot be cut where the failed window ended. It is read as
+/// before, the bound is reported refused (three parts, counted), nothing is
+/// overwritten, and the archive has no gap.
+#[tokio::test]
+async fn a_range_rewritten_in_place_is_refused_as_a_bound_and_read_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 4);
+    let backend = Arc::new(MockBackend::new().with_throttled_manifest_puts(1));
+    let tenant = "rewritten-626";
+    let mut cfg = config(dir.path(), "state.db", std::slice::from_ref(&input));
+    cfg.engine.tenant = tenant.into();
+    let mut e = engine(cfg, &backend).await;
+    let (logs, _guard) = Logs::capture();
+    let refused_before = rebuilds(tenant, "refused");
+    let first = e.process_once(SourceType::File).await.unwrap();
+    assert!(!first[0].committed);
+    let orphan = e
+        .store
+        .get_batch(&first[0].batch_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .object_uri
+        .unwrap();
+
+    // Same inode, other bytes, longer: a writer that rewrote the file.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&input)
+        .unwrap();
+    for i in 0..6 {
+        writeln!(f, "REWRITTEN line {i}").unwrap();
+    }
+    drop(f);
+    let second = e.process_once(SourceType::File).await.unwrap();
+    assert!(second.iter().all(|o| o.committed), "{second:?}");
+    assert!(
+        !put_twice(&backend, &orphan).await,
+        "nothing is overwritten"
+    );
+    assert_eq!(rebuilds(tenant, "refused"), refused_before + 1);
+    let refused = logs.events("replay_bound_refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    let message = text(&refused[0], "message");
+    for part in [
+        "cannot be rebuilt as first cut",
+        "it is read from its start to the current end as before",
+        "nothing is lost",
+        "run `vtopctl audit-coverage`",
+    ] {
+        assert!(message.contains(part), "{message:?} should say {part:?}");
+    }
+    assert_eq!(text(&refused[0], "level"), "WARN");
+    assert_eq!(text(&refused[0], "earlier_batch_id"), first[0].batch_id);
+}
+
+/// #626: the limits were lowered while the engine was down, so the window
+/// recovery hands back is over 4x them. It is not held whole (`too_large`,
+/// three parts), and its re-read runs as before, with no gap.
+#[tokio::test]
+async fn a_window_over_four_times_the_limits_is_not_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 50);
+    let backend = Arc::new(MockBackend::new().with_throttled_manifest_puts(1));
+    let tenant = "too-large-626";
+    let mut cfg = config(dir.path(), "state.db", std::slice::from_ref(&input));
+    cfg.engine.tenant = tenant.into();
+    cfg.batching.max_records = 100;
+    {
+        let mut first = engine(cfg.clone(), &backend).await;
+        let out = first.process_once(SourceType::File).await.unwrap();
+        assert!(!out[0].committed);
+    }
+    let before = rebuilds(tenant, "too_large");
+    cfg.batching.max_records = 10;
+    let (logs, _guard) = Logs::capture();
+    let mut e = engine(cfg, &backend).await;
+    e.recover().await.unwrap();
+    assert_eq!(rebuilds(tenant, "too_large"), before + 1);
+    let event = logs.events("replay_bound_too_large");
+    assert_eq!(event.len(), 1, "{event:?}");
+    assert_eq!(text(&event[0], "level"), "WARN");
+    let message = text(&event[0], "message");
+    for part in [
+        "50 records",
+        "over 4x the current batching.max_records (10)",
+        "memory stays bounded",
+        "nothing is lost",
+        "raise the limits back",
+    ] {
+        assert!(message.contains(part), "{message:?} should say {part:?}");
+    }
+    for _ in 0..6 {
+        e.process_once(SourceType::File).await.unwrap();
+    }
+    let ranges = committed_ranges(&e).await;
+    let len = std::fs::metadata(&input).unwrap().len();
+    let mut next = 0;
+    for (start, end) in &ranges {
+        assert_eq!(*start, next, "{ranges:?}");
+        next = *end;
+    }
+    assert_eq!(next, len, "{ranges:?}");
+}
+
+/// #626: a window larger than one read pass's budget is rebuilt across two
+/// passes. A forced flush between them (`process_once`) must not seal it
+/// short of its recorded end, which would name another object: it is sealed
+/// once, at the end, and resolves to the failed attempt's object.
+#[tokio::test]
+async fn a_rebuild_that_takes_two_passes_is_sealed_once_at_its_recorded_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 20);
+    let backend = Arc::new(MockBackend::new().with_throttled_manifest_puts(1));
+    let tenant = "two-passes-626";
+    let mut cfg = config(dir.path(), "state.db", std::slice::from_ref(&input));
+    cfg.engine.tenant = tenant.into();
+    cfg.batching.max_records = 20;
+    let mut e = engine(cfg, &backend).await;
+    let first = e.process_once(SourceType::File).await.unwrap();
+    assert!(!first[0].committed);
+    let orphan = e
+        .store
+        .get_batch(&first[0].batch_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .object_uri
+        .unwrap();
+    // Each pass now reads ten lines: the rebuild needs two.
+    e.config.batching.max_records = 10;
+    let pass_1 = e.process_once(SourceType::File).await.unwrap();
+    assert!(
+        pass_1.is_empty(),
+        "half a window is held, not flushed: {pass_1:?}"
+    );
+    let pass_2 = e.process_once(SourceType::File).await.unwrap();
+    assert_eq!(pass_2.len(), 1, "{pass_2:?}");
+    assert!(pass_2[0].committed, "{pass_2:?}");
+    assert_eq!(pass_2[0].object_uri.as_deref(), Some(orphan.as_str()));
+    assert!(!put_twice(&backend, &orphan).await);
+    let len = std::fs::metadata(&input).unwrap().len();
+    assert_eq!(committed_ranges(&e).await, vec![(0, len)]);
+}
+
+/// Review of #755: a rebuild is reported once it is VERIFIED, not when its key
+/// is decided. During an outage every attempt decides a key and fails; counting
+/// each as a `fallback` made the alert on second objects fire although nothing
+/// was written.
+#[tokio::test]
+async fn a_rebuild_that_fails_before_verified_is_not_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 4);
+    // The probe is refused (fallback to the attempt key), and the first two
+    // puts are throttled: the first attempt and the first rebuild fail.
+    let backend = Arc::new(
+        MockBackend::new()
+            .with_head_fault(HeadFault::Refused)
+            .with_throttled_puts(2),
+    );
+    let tenant = "rebuild-outage-626";
+    let mut cfg = config(dir.path(), "state.db", std::slice::from_ref(&input));
+    cfg.engine.tenant = tenant.into();
+    let mut e = engine(cfg, &backend).await;
+    let before = rebuilds(tenant, "fallback");
+    for attempt in 0..2 {
+        let out = e.process_once(SourceType::File).await.unwrap();
+        assert!(!out[0].committed, "attempt {attempt}: {out:?}");
+    }
+    assert_eq!(
+        rebuilds(tenant, "fallback"),
+        before,
+        "a rebuild that did not reach VERIFIED wrote nothing and is not counted"
+    );
+    let out = e.process_once(SourceType::File).await.unwrap();
+    assert!(out[0].committed, "{out:?}");
+    assert_eq!(rebuilds(tenant, "fallback"), before + 1);
+}
+
+/// Review of #755: a row that recorded no seal instant (one a v0.9.0 engine
+/// wrote) is replayed in the hour it is read again, as before, and is not
+/// reported as rebuilt in its first hour.
+#[tokio::test]
+async fn a_row_without_a_seal_instant_is_not_reported_as_rebuilt() {
+    use sqlx::ConnectOptions;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("app.log");
+    write_lines(&input, "app", 4);
+    let backend = Arc::new(MockBackend::new().with_throttled_manifest_puts(1));
+    let tenant = "no-instant-626";
+    let cfg = hourly_config(dir.path(), "state.db", &input, tenant);
+    let orphan = {
+        let mut first = engine(cfg.clone(), &backend).await;
+        first.set_seal_clock(|| at(SEALED));
+        let out = first.process_once(SourceType::File).await.unwrap();
+        assert!(!out[0].committed, "{out:?}");
+        first
+            .store
+            .get_batch(&out[0].batch_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .object_uri
+            .unwrap()
+    };
+    {
+        let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(dir.path().join("state.db"))
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query("UPDATE batches SET sealed_at = NULL")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    let (logs, _guard) = Logs::capture();
+    let exact_before = rebuilds(tenant, "exact");
+    let mut restarted = engine(cfg, &backend).await;
+    restarted.set_seal_clock(|| at(REPLAYED));
+    restarted.recover().await.unwrap();
+    let out = restarted.process_once(SourceType::File).await.unwrap();
+    assert!(out[0].committed, "{out:?}");
+    let written = out[0].object_uri.clone().unwrap();
+    assert!(
+        written.contains("hour=06"),
+        "filed in the hour it is replayed in: {written}"
+    );
+    assert_ne!(written, orphan);
+    assert_eq!(
+        rebuilds(tenant, "exact"),
+        exact_before,
+        "no instant, no claim"
+    );
+    assert!(logs.events("replay_rebuilt").is_empty());
 }

@@ -744,9 +744,20 @@ async fn a_locked_blake3_write_carries_a_checksum_value_even_when_calculation_is
         .await
         .unwrap();
     let request = store.seen().pop().unwrap();
-    assert!(
-        request.header("x-amz-checksum-crc32").is_some()
-            || request.header("x-amz-trailer").is_some(),
+    // The value is the whole body's SHA-256, sent as a header by the backend
+    // itself (#778), never left to an SDK trailer.
+    assert_eq!(
+        request.header("x-amz-checksum-sha256"),
+        Some(
+            aws_smithy_types::base64::encode(
+                hex::decode(vtop_core::checksum::sha256_bytes(b"hello")).unwrap()
+            )
+            .as_str()
+        ),
         "a locked write carries a checksum value, not only an algorithm name: {request:#?}"
+    );
+    assert_eq!(
+        request.header("x-amz-sdk-checksum-algorithm"),
+        Some("SHA256")
     );
 }

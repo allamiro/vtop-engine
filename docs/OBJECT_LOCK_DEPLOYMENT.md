@@ -199,9 +199,18 @@ An object from an attempt that failed after its upload (a manifest upload
 that failed, say) is locked like any other. It cannot be removed until its
 retention ends, and under `compliance` nobody can remove it. Content-derived
 keys (#626) make this rarer, because a replay of the same bytes reuses the
-object rather than writing a second one, but a replay with other batch
-boundaries still writes a new object. Budget for these objects. The startup
-WARN under `compliance` says so.
+object rather than writing a second one, and since v0.10.0 a replay in a
+later hour is sealed at the failed attempt's recorded instant, so it names
+the same key and reuses the locked object too, as does a replay over a file
+or spool that grew (it is rebuilt as first cut). What still writes a second
+locked object: a Kafka replay over a partition that grew, a replay that
+could not be rebuilt as first cut (`refused`, `too_large`), a replay whose bytes
+differ (compression or checksum settings changed between the attempts), a
+replay of a row written before v0.10.0, and a range whose ledger row a power
+loss rolled back. Budget for these objects, and size them with
+`vtop_replay_rebuilds_total{result=~"bytes_differ|fallback|refused|too_large"}`
+([observability/README.md](../observability/README.md)). The startup WARN
+under `compliance` says so.
 
 Incomplete multipart uploads are not objects and are not locked. The
 abandoned-session sweep and an `AbortIncompleteMultipartUpload` lifecycle rule
