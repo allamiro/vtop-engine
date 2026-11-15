@@ -723,6 +723,13 @@ impl MockBackend {
         self.bucket_ensures.load(Ordering::SeqCst)
     }
 
+    /// Every key the mock store holds an object or manifest at, sorted.
+    pub fn object_uris(&self) -> Vec<String> {
+        let mut uris: Vec<String> = self.objects.lock().unwrap().keys().cloned().collect();
+        uris.sort();
+        uris
+    }
+
     /// True if the object exists in the mock store.
     pub fn contains(&self, uri: &str) -> bool {
         self.objects.lock().unwrap().contains_key(uri)

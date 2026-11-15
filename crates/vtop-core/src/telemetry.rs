@@ -52,6 +52,19 @@ pub const OBJECT_KEY_DECISIONS: [&str; 8] = [
     "per_attempt",
 ];
 
+/// The values of `result` on `vtop_replay_rebuilds_total` (#626): what a
+/// replay of a window an earlier attempt sealed came to. `exact`: the window
+/// was rebuilt over exactly the recorded range, filed under the hour it was
+/// first sealed in, with the bytes the earlier attempt uploaded where the
+/// ledger recorded them. `bytes_differ`: rebuilt over exactly the recorded
+/// range, but its digest differs from the object the earlier attempt
+/// uploaded, so a second object is written and the earlier one is left as
+/// it is. `fallback`: rebuilt over exactly the recorded range with the same
+/// bytes, but the key decision fell back to the per-attempt key
+/// (`vtop_object_key_decisions_total` says which fallback), so a second
+/// object is written.
+pub const REPLAY_REBUILD_RESULTS: [&str; 3] = ["exact", "bytes_differ", "fallback"];
+
 /// The values of `result` on `vtop_multipart_parts_total` (#668): a part
 /// sent in this upload call, a part an earlier call left in the session and
 /// this one did not send again, an extra attempt at a part, and a part whose
@@ -267,6 +280,11 @@ pub struct Metrics {
     /// bounded set [`OBJECT_KEY_DECISIONS`]: a rising `fallback_*` or
     /// `per_attempt` rate means replays are writing second objects.
     pub object_key_decisions_total: IntCounterVec,
+    /// What each replay of a window an earlier attempt sealed came to (#626),
+    /// by the bounded set [`REPLAY_REBUILD_RESULTS`]. Any result but `exact`
+    /// means a second object is likely: an alert on it sizes what replays
+    /// cost in storage, and under Object Lock in retained storage.
+    pub replay_rebuilds_total: IntCounterVec,
 
     /// Request-body bytes admitted through the egress shaper (#481) — VTOP's
     /// own account of what it handed the wire under
@@ -482,6 +500,11 @@ impl Metrics {
             "How each batch's object key was decided (#626): derived (uploaded under its content-derived key), reused (the verified object was already stored, no upload), fallback_differs / fallback_size_only / fallback_unreadable (an object is at the derived key and does not verify, verifies by size only, or could not be read) and fallback_unchecked (the store refused or failed the check of the key): the batch was written under its per-attempt key instead of overwriting anything, probe_throttled (the batch failed and was handed back), per_attempt (no checksum, or a backend that cannot report an absent key)",
             vec!["tenant", "source_type", "format", "decision"],
         )?;
+        let replay_rebuilds_total = cv(
+            "replay_rebuilds_total",
+            "What each replay of a window an earlier attempt sealed came to (#626): exact (rebuilt over exactly the recorded range, filed under the hour it was first sealed in, with the bytes the earlier attempt uploaded where the ledger recorded them, under the derived key), bytes_differ (rebuilt over exactly the recorded range, but its bytes differ from the object the earlier attempt uploaded: a second object is written and the earlier one is left as it is) or fallback (the same bytes, but the key decision fell back to the per-attempt key, see vtop_object_key_decisions_total: a second object is written)",
+            vec!["tenant", "source_type", "format", "result"],
+        )?;
         let upload_throttled_total = cv(
             "upload_throttled_total",
             "Uploads the object store answered with a throttle (HTTP 429/503 or an S3 SlowDown/Throttling code) after the backend's own retries; a sustained rate means the store wants less concurrency, not more retries",
@@ -625,6 +648,7 @@ impl Metrics {
             upload_egress_bytes_total,
             file_delete_decisions_total,
             object_key_decisions_total,
+            replay_rebuilds_total,
             kafka_partition_events_total,
             audit_events_total,
             audit_write_failures_total,

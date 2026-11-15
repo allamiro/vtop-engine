@@ -907,6 +907,35 @@ New metrics: `vtop_audit_events_total{action,outcome}` and
 - **`vtopctl meta`, `node` and `tier` now log** to stderr at WARN (audit
   records always), where they logged nothing before.
 
+**A replay resolves to the object already archived (#626, remainder).**
+v0.9.0 made a replay of the same bytes reuse the stored object. A replay in a
+later hour still named another key, because the time partition came from the
+instant the replay was sealed. Each ledger row now records the instant its
+window was sealed (`sealed_at`), and a window that covers exactly a range an
+earlier attempt sealed and handed back is sealed at that instant again, from
+memory while the engine runs and from the row after a restart. It is filed
+under the same hour and names the same key, so the object, or a multipart
+session the failed upload kept (#668), is reused. What each such replay came
+to is counted in `vtop_replay_rebuilds_total{result}` (`exact`,
+`bytes_differ`, `fallback`) and logged (`replay_rebuilt`,
+`replay_bytes_differ`, `replay_key_fallback`). Upgrade
+notes:
+
+- **PostgreSQL: run `vtopctl migrate` before starting engines of this
+  release.** It adds the nullable `sealed_at` column; engines of this
+  release refuse a schema without it, naming it. The schema marker stays 3.
+- **SQLite adds the column when an engine of this release opens the file;**
+  the schema version stays 1, so this is no one-way step.
+- **A v0.9.0 engine ignores `sealed_at` and writes NULL**, on either backend,
+  and reads prune digests whose rows carry it. Only N-1 may share a ledger
+  with this release.
+- **Rows written before this release** carry no seal instant. A replay of one
+  of them is filed under the hour it is replayed in, as before, so it may
+  still write a second object once.
+- **Not changed:** a replay over a source that grew since the failed attempt
+  still reads to the current end and writes a second object; a range whose
+  row a power loss rolled back has nothing to rebuild from.
+
 The theme is **the gateway at the speed its durability allows**: wire the
 broker's group commit into the gateway path and close the compatibility
 gaps the Kafka comparison found (#596), measure failover and crash
