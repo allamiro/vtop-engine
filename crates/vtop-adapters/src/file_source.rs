@@ -363,18 +363,27 @@ impl DeleteCandidate {
     }
 }
 
+/// See [`DeleteAttempt::Deleted`]'s `opened_at_unlink`.
+struct OpenedAtUnlink {
+    aside: PathBuf,
+    names: u64,
+    identity: Option<(u64, u64)>,
+}
+
 /// What became of one attempt to delete a candidate.
 enum DeleteAttempt {
     /// Unlinked. `unchecked`: made under `delete_without_open_check`, with
     /// no lease to be had, and why none could be (#619): nothing proved that
     /// no process had the file open. `opened_at_unlink`: a process broke
     /// the lease between the final check and the unlink, so it may have the
-    /// unlinked file open; the hidden name the file had, and how many
-    /// names the file still has after the unlink (another hard link keeps
-    /// it, and what the opener writes, reachable).
+    /// unlinked file open; the hidden name the file had, how many names
+    /// the file still has after the unlink (another hard link keeps it, and
+    /// what the opener writes, reachable), and its (device, inode) identity
+    /// from the leased descriptor, which is what another name must match to
+    /// be the same file (an inode number alone is unique only per device).
     Deleted {
         unchecked: Option<String>,
-        opened_at_unlink: Option<(PathBuf, u64)>,
+        opened_at_unlink: Option<OpenedAtUnlink>,
     },
     /// Kept, and the candidate dropped: see [`Kept`].
     Kept(Kept),
@@ -691,13 +700,15 @@ impl DeleteJob {
                         opened_at_unlink: lease.as_ref().is_some_and(|lease| !lease.intact()).then(
                             || {
                                 // Through the leased descriptor: the file's
-                                // link count after the unlink.
-                                let names = file
-                                    .metadata()
-                                    .ok()
-                                    .and_then(|md| nlink_of(&md))
-                                    .unwrap_or(0);
-                                (aside.clone(), names)
+                                // link count after the unlink, and its
+                                // (device, inode) identity.
+                                let md = file.metadata().ok();
+                                let names = md.as_ref().and_then(nlink_of).unwrap_or(0);
+                                OpenedAtUnlink {
+                                    aside: aside.clone(),
+                                    names,
+                                    identity: md.as_ref().and_then(dev_ino),
+                                }
                             },
                         ),
                     },
@@ -1255,7 +1266,12 @@ impl FileSource {
                 // this path is a different file and stays.
                 self.cursors.remove(path);
                 self.held.remove(path);
-                if let Some((aside, names)) = opened_at_unlink.as_ref().filter(|(_, n)| *n > 0) {
+                if let Some(OpenedAtUnlink {
+                    aside,
+                    names,
+                    identity,
+                }) = opened_at_unlink.as_ref().filter(|o| o.names > 0)
+                {
                     // The file keeps another name (a hard link, #378), so
                     // what the opener writes is not gone. Whether it is
                     // ARCHIVED depends on whether this engine reads that
@@ -1263,20 +1279,13 @@ impl FileSource {
                     // cursor of another path on this inode, still naming
                     // it, says so; a link outside the patterns does not.
                     count_delete_decision("deleted");
-                    let read_as = self
-                        .cursors
-                        .iter()
-                        .filter(|(other, c)| {
-                            other.as_str() != path
-                                && inode.is_some()
-                                && c.seen.as_ref().and_then(|seen| seen.inode) == inode
-                                && std::fs::metadata(other.as_str())
-                                    .ok()
-                                    .and_then(|md| inode_of(&md))
-                                    == inode
-                        })
-                        .map(|(other, _)| other.clone())
-                        .min();
+                    let read_as = source_naming_the_same_file(
+                        &self.cursors,
+                        path,
+                        inode,
+                        *identity,
+                        |other| std::fs::metadata(other).ok().and_then(|md| dev_ino(&md)),
+                    );
                     let (level, message) = match read_as {
                         Some(other) => (
                             tracing::Level::WARN,
@@ -1304,7 +1313,7 @@ impl FileSource {
                         ),
                     };
                     self.notify("opened_at_unlink", level, path, inode, archived, message);
-                } else if let Some((aside, _)) = opened_at_unlink {
+                } else if let Some(OpenedAtUnlink { aside, .. }) = opened_at_unlink {
                     // The limit the grace bounds (#619): an open of the path
                     // that resolved it before the rename and reached the
                     // file only after the final check - or an open of the
@@ -2978,6 +2987,35 @@ fn dev_ino(_md: &std::fs::Metadata) -> Option<(u64, u64)> {
     None
 }
 
+/// Another configured source that names the file a delete unlinked, if one
+/// does (#378, review of #753): a cursor of another path that last saw this
+/// inode, and whose path still stats to the deleted file's full (device,
+/// inode) identity, taken from the leased descriptor. The device matters
+/// because sources may span filesystems and an inode number is unique only
+/// within one: an unrelated file elsewhere with the same number is not a
+/// surviving link. With no identity (no descriptor metadata, or a platform
+/// without device numbers) nothing is claimed. The least path wins, so the
+/// message is stable.
+fn source_naming_the_same_file(
+    cursors: &HashMap<String, FileCursor>,
+    path: &str,
+    inode: Option<u64>,
+    identity: Option<(u64, u64)>,
+    stat: impl Fn(&str) -> Option<(u64, u64)>,
+) -> Option<String> {
+    let identity = identity?;
+    inode?;
+    cursors
+        .iter()
+        .filter(|(other, c)| {
+            other.as_str() != path
+                && c.seen.as_ref().and_then(|seen| seen.inode) == inode
+                && stat(other.as_str()) == Some(identity)
+        })
+        .map(|(other, _)| other.clone())
+        .min()
+}
+
 /// How many files are read concurrently in one pass. Bounded so a glob that
 /// matches thousands of files does not open them all at once.
 const FILE_READ_CONCURRENCY: usize = 8;
@@ -4619,6 +4657,51 @@ mod tests {
     /// match "" would skip an in-place rewrite that preserved inode and
     /// size — indefinitely, on exactly the filesystems that give the check
     /// the least to work with. Unknown must fall through to a real read.
+    /// Review of #753: sources may span filesystems, and an inode number is
+    /// unique only within one. A source on another device that happens to
+    /// carry the deleted file's inode number is not a surviving link, so the
+    /// "archived from there; nothing to do" assurance must not name it. The
+    /// same number on the same device is.
+    #[test]
+    fn a_source_on_another_device_with_the_same_inode_is_not_a_surviving_link() {
+        let seen = |inode| FileCursor {
+            seen: Some(FileIdentity {
+                inode: Some(inode),
+                file_size: 0,
+                mtime: String::new(),
+                content: None,
+                tail: None,
+            }),
+            ..FileCursor::default()
+        };
+        let mut cursors = HashMap::new();
+        cursors.insert("/a/deleted.log".to_string(), seen(42));
+        cursors.insert("/b/other-device.log".to_string(), seen(42));
+        // The deleted file is (device 1, inode 42); the other source stats
+        // to inode 42 on device 2.
+        let stat = |p: &str| match p {
+            "/b/other-device.log" => Some((2, 42)),
+            "/c/link.log" => Some((1, 42)),
+            _ => None,
+        };
+        assert_eq!(
+            source_naming_the_same_file(&cursors, "/a/deleted.log", Some(42), Some((1, 42)), stat),
+            None,
+            "an inode number on another device is another file"
+        );
+        cursors.insert("/c/link.log".to_string(), seen(42));
+        assert_eq!(
+            source_naming_the_same_file(&cursors, "/a/deleted.log", Some(42), Some((1, 42)), stat),
+            Some("/c/link.log".to_string()),
+            "the same (device, inode) is a surviving link"
+        );
+        assert_eq!(
+            source_naming_the_same_file(&cursors, "/a/deleted.log", Some(42), None, stat),
+            None,
+            "with no identity from the descriptor, nothing is claimed"
+        );
+    }
+
     #[test]
     fn a_file_whose_mtime_cannot_be_read_is_never_skipped() {
         let identity = FileIdentity {
