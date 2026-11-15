@@ -10818,6 +10818,7 @@ mod tests {
                     end_byte: 21,
                     file_size: 8_192,
                     mtime: String::new(),
+                    ctime: None,
                     content_fingerprint: content,
                     tail_fingerprint: None,
                 }
@@ -11454,6 +11455,7 @@ mod tests {
                 inode,
                 file_size,
                 mtime,
+                ctime,
                 content_fingerprint,
                 ..
             } => ProgressMarker::File {
@@ -11463,6 +11465,7 @@ mod tests {
                 end_byte: end,
                 file_size,
                 mtime,
+                ctime,
                 content_fingerprint,
                 tail_fingerprint: None,
             },
