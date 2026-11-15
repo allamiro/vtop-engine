@@ -493,15 +493,18 @@ pub fn sqlite_ledger_file(conn: &str) -> Option<std::path::PathBuf> {
     };
     let uri = uri.split('#').next().unwrap_or_default();
     let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
-    // SQLite takes the LAST `mode` parameter (review), with key and value
-    // percent-decoded and compared exactly; anything but `memory` is a file.
-    let mode = query
+    // In memory only when every `mode` parameter says `memory` (review):
+    // SQLite takes the last one, after percent-decoding each key and value
+    // and ending it at a NUL. Requiring all of them, rather than finding the
+    // last, means a misread here can only check a file that is not there,
+    // never skip one that is.
+    let modes: Vec<Vec<u8>> = query
         .split('&')
         .filter_map(|parameter| parameter.split_once('='))
-        .filter(|(key, _)| percent_decode(key) == b"mode")
-        .map(|(_, value)| percent_decode(value))
-        .next_back();
-    if mode.as_deref() == Some(b"memory".as_slice()) {
+        .filter(|(key, _)| c_decode(key) == b"mode")
+        .map(|(_, value)| c_decode(value))
+        .collect();
+    if !modes.is_empty() && modes.iter().all(|mode| mode == b"memory") {
         return None;
     }
     // `file:///abs` and `file://localhost/abs` name `/abs`; `file:rel` is
@@ -513,11 +516,7 @@ pub fn sqlite_ledger_file(conn: &str) -> Option<std::path::PathBuf> {
         }
         None => path,
     };
-    let mut path = percent_decode(path);
-    // SQLite reads the decoded name as a C string: `%00` ends it (review).
-    if let Some(nul) = path.iter().position(|&b| b == 0) {
-        path.truncate(nul);
-    }
+    let path = c_decode(path);
     if path.is_empty() || path == b":memory:" {
         return None;
     }
@@ -532,6 +531,16 @@ pub fn sqlite_ledger_file(conn: &str) -> Option<std::path::PathBuf> {
     {
         String::from_utf8(path).ok().map(std::path::PathBuf::from)
     }
+}
+
+/// A URI component as SQLite reads it: percent-decoded, then ended at the
+/// first NUL, since SQLite keeps it as a C string (review: `%00`).
+fn c_decode(text: &str) -> Vec<u8> {
+    let mut bytes = percent_decode(text);
+    if let Some(nul) = bytes.iter().position(|&b| b == 0) {
+        bytes.truncate(nul);
+    }
+    bytes
 }
 
 /// `%XX` escapes as SQLite decodes them in a URI: the bytes, whatever their
@@ -3578,12 +3587,24 @@ upload:
             ("sqlite:file://localhost/data/x.db", some("/data/x.db")),
             ("sqlite:file:rel.db#frag", some("rel.db")),
             ("sqlite:file:state.db?cache=shared&mode=memory", None),
-            // SQLite takes the last `mode` (review).
+            // A file unless every `mode` is `memory` (review): SQLite takes
+            // the last, and a mixed list is checked as a file either way.
             (
                 "sqlite:file:/data/state.db?mode=memory&mode=rwc",
                 some("/data/state.db"),
             ),
-            ("sqlite:file:/data/state.db?mode=rwc&mode=memory", None),
+            (
+                "sqlite:file:/data/state.db?mode=rwc&mode=memory",
+                some("/data/state.db"),
+            ),
+            (
+                "sqlite:file:/data/state.db?mode=memory&mode%00ignored=rwc",
+                some("/data/state.db"),
+            ),
+            (
+                "sqlite:file:/data/state.db?mode=memory&mode=memory%00x",
+                None,
+            ),
             (
                 "sqlite:file:/data/state.db?mode=Memory",
                 some("/data/state.db"),
