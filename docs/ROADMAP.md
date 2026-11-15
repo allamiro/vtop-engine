@@ -50,8 +50,8 @@ first live-chaos scenarios on real processes.
 
 The release pipeline ships `vtop-node` alongside `vtopctl`, publishes a
 multi-arch GHCR image, and attaches an SBOM, cosign signatures and
-`SHA256SUMS`. Tagged as a pre-release: the 0.x series makes no compatibility
-promise across minor versions.
+`SHA256SUMS`. The 0.x series makes no compatibility promise across minor
+versions.
 
 **Not in it:** replicated-range failover without harness-style follower
 restarts, and any form of replica replacement.
@@ -1013,8 +1013,18 @@ known limitations:
   different statement. Recovery writes one only for a batch still VERIFIED.
 - **Object Lock.** A receipt is written and its retention read back like a
   manifest's, and recovery never adds a second version beside one.
-  `vtopctl scrub --check-retention` does not read receipts' retention yet
-  ([#710](https://github.com/allamiro/vtop-engine/issues/710)).
+  When receipts are checked, `vtopctl scrub --check-retention` reads each
+  existing receipt's retention again, at its current key (#710), counted
+  apart from the batch's in `vtop_scrub_receipt_retention_total{result}`: no
+  retention and another mode are findings, an ended retention is not, and a
+  missing receipt is not a retention finding.
+- **A scheduled `scrub --check-retention` can now fail on receipts.** On an
+  archive that has receipts, a receipt written before `upload.object_lock`
+  was set, one the engine's read-back found unlocked (it logged
+  `verification_receipt_failed`), or one whose lock was removed carries no
+  lock and is a finding: the run exits non-zero and
+  `vtop_scrub_last_finding_timestamp_seconds` moves, as for an unlocked
+  object. Each read is one more request per receipt.
 - **Going back.** Set `verification_receipts: false`. Receipts already written
   stay readable; drop `--require-receipts` from scheduled scrubs.
 
@@ -1089,12 +1099,15 @@ mode_mismatch. The deployment profile is
 
 ## Versioning
 
-0.x. Minor versions may break compatibility, and releases are published as
-GitHub pre-releases to say so. **Upgrades are tested** (#291): CI proves a
-data directory written by the newest patch of each released minor series
-(v0.2+) opens under the current build, serves byte-exactly, and still serves
-after a restart; newly published tags join that matrix automatically.
-**Downgrades are not supported** — a newer release's directory may hold
-artifacts an older release cannot interpret, and nothing tests that path;
-going back means a fresh directory or a verified backup taken before the
-upgrade.
+0.x. Minor versions may break compatibility. Every release so far is published
+as a full GitHub release; only a hyphenated version such as `1.0.0-rc.1` would
+be published as a pre-release. What each format promises, the rules for
+changing one, the deprecation notice and the path to 1.0 are in the
+[compatibility policy](reference/compatibility.md) (#743). **Upgrades are
+tested** (#291): CI proves a data directory written by the newest patch of
+each released minor series (v0.2+) opens under the current build, serves
+byte-exactly, and still serves after a restart; newly published tags join that
+matrix automatically. **Downgrades are not supported** — a newer release's
+directory may hold artifacts an older release cannot interpret, and nothing
+tests that path; going back means a fresh directory or a verified backup
+taken before the upgrade.
