@@ -320,17 +320,25 @@ enum EarlierFallback {
 
 impl EarlierFallback {
     /// What a probe of the earlier fallback key says, short of a verified
-    /// object (review of #757). Absent, or a 403 (S3's answer for a missing
-    /// key to a caller without list permission, read the same way as the
-    /// derived key's `fallback_unchecked` notice): the upload never landed,
-    /// so writing one now is not an extra object. An object that differs or
-    /// verifies only by size: there and not usable. A probe the store did
+    /// object (review of #757). Absent: the upload never landed, so writing
+    /// one now is not an extra object. An object that differs or verifies
+    /// only by size: there and not usable. A 403: S3 answers it both for a
+    /// missing key (to a caller without list permission) and for an object
+    /// the caller may not read, so it does not prove the upload never
+    /// landed; it is judged as not usable, under the cooldown, and a replay
+    /// within the cooldown writes nothing (second review of #757: read as
+    /// absent, credentials that may write but not read attempt keys wrote a
+    /// locked object and a manifest on every replay). A probe the store did
     /// not answer, or an object that could not be read: the store said
     /// nothing, so the batch fails rather than writing on an error.
     fn from_probe(uri: &str, probe: KeyProbe) -> Self {
         match probe {
             KeyProbe::Free => Self::Absent,
-            KeyProbe::Unchecked(why) if why.contains("403") => Self::Absent,
+            KeyProbe::Unchecked(why) if why.contains("403") => Self::Unusable(format!(
+                "the store refused to say whether it is there ({}), which S3 answers for an \
+                 object the credentials may not read as well as for a missing one",
+                multipart::redact_urls(&why)
+            )),
             KeyProbe::Differs(why) | KeyProbe::SizeOnly(why) => {
                 Self::Unusable(multipart::redact_urls(&why))
             }
@@ -10373,18 +10381,35 @@ mod tests {
     }
 
     /// Review of #757: what a probe of the earlier fallback key decides. An
-    /// absent key, or a 403 (absent to a caller without list permission),
-    /// lets a new object be written; an object that differs is there and
-    /// not usable; a probe the store did not answer, or an object it could
-    /// not read, fails the batch rather than writing on an error.
+    /// absent key lets a new object be written; an object that differs is
+    /// there and not usable; a 403 is not usable either (second review: it
+    /// does not prove the upload never landed, so it waits out the
+    /// cooldown instead of writing on every replay); a probe the store did
+    /// not answer, or an object it could not read, fails the batch rather
+    /// than writing on an error.
     #[test]
     fn an_earlier_fallback_probe_writes_only_when_the_key_is_absent() {
         let uri = "s3://b/k.raw";
         let absent = |p| matches!(EarlierFallback::from_probe(uri, p), EarlierFallback::Absent);
         assert!(absent(KeyProbe::Free));
-        assert!(absent(KeyProbe::Unchecked(
-            "the probe failed: AccessDenied (http 403)".into()
-        )));
+        match EarlierFallback::from_probe(
+            uri,
+            KeyProbe::Unchecked(
+                "the probe failed: https://s/k?X-Amz-Signature=deadbeef: AccessDenied (http 403)"
+                    .into(),
+            ),
+        ) {
+            EarlierFallback::Unusable(why) => {
+                for part in [
+                    "refused to say whether it is there",
+                    "AccessDenied (http 403)",
+                ] {
+                    assert!(why.contains(part), "{why:?} should say {part:?}");
+                }
+                assert!(!why.contains("deadbeef"), "{why}");
+            }
+            other => panic!("a 403 does not prove the earlier upload never landed: {other:?}"),
+        }
         assert!(matches!(
             EarlierFallback::from_probe(uri, KeyProbe::Differs("other bytes".into())),
             EarlierFallback::Unusable(_)
