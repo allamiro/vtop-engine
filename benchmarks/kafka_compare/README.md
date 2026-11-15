@@ -21,7 +21,7 @@ python3 benchmarks/kafka_compare/run.py
 
 # Charts (PNG + SVG in docs/benchmarks/img/) and docs/benchmarks/kafka-comparison.md, with the exact
 # plotting stack the committed output was drawn with.
-python3 -m pip install -r benchmarks/kafka_compare/requirements-report.txt
+python3 -m pip install --require-hashes -r benchmarks/kafka_compare/requirements-report.txt
 python3 benchmarks/kafka_compare/report.py benchmarks/kafka_compare/results/<run-id>
 
 # Every committed run at once, as CI's drift check does (then `git diff -- docs/benchmarks/` must be empty).
