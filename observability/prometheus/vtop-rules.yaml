@@ -176,6 +176,25 @@ groups:
           description: "A batch failed and its source refused to hand the range back (for a file: truncated, rewritten, or rotated away and removed). That range is missing from the archive. The path is in the ERROR line beside the count; recover the data from another copy if one exists."
           runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtopsourcereplayrefused"
 
+      # Recovery could not write its replay decision for a range to the state
+      # store, so it held the range instead of rewinding it (#639, #782).
+      # Nothing is lost (the range is read again with the ranges above it),
+      # but a state store refusing writes needs a person. The counter is not
+      # primed: its series appears with the first hold, at startup, and stays
+      # flat until the engine restarts, so increase() would never see it.
+      # Fire on the value; it clears at a restart that holds nothing.
+      # reason="newer_manifest" holds are VERIFIED batches a newer release
+      # wrote: an upgrade question, not this alert.
+      - alert: VtopRecoveryLedgerWriteFailed
+        expr: |
+          vtop_recovery_held_total{reason="ledger_write_failed"} > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "Recovery on {{ $labels.instance }} could not record its replay decision for {{ $labels.tenant }}/{{ $labels.source_type }} ranges"
+          description: "At startup the state store refused recovery's write of a replay decision, so recovery held those ranges instead of rewinding them. Nothing is lost: each held range is read again with the ranges above it, which are archived twice. Check the state store's disk, permissions and connectivity; the batch ids are in the ERROR lines beside the count. The alert clears when the engine restarts without a hold."
+          runbook_url: "https://allamiro.github.io/vtop-engine/operate/runbooks/#vtoprecoveryledgerwritefailed"
+
       # Sessions kept after failed uploads that the sweep should have
       # aborted by now, with none resumed and none swept: incomplete uploads
       # pile up in the bucket, where their parts are billed. The sweep aborts

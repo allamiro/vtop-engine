@@ -345,8 +345,9 @@ produces.
 [`prometheus/vtop-rules.yaml`](prometheus/vtop-rules.yaml) is the engine's
 Prometheus rule set (#720): verification failures, no commits while data is
 waiting, a replay-rate spike, Kafka lag growth (from kafka-exporter), size-only
-verification, failed Object Lock checks, retention loss, refused replays and
-piling multipart sessions. Each alert has a firing and a quiet promtool unit
+verification, failed Object Lock checks, retention loss, refused replays, a
+state store refusing recovery's replay decisions, and piling multipart
+sessions. Each alert has a firing and a quiet promtool unit
 test in [`prometheus/tests/`](prometheus/tests/vtop-rules.test.yaml) and a
 `runbook_url` to its section of
 [`docs/operate/runbooks.md`](../docs/operate/runbooks.md); the objectives they

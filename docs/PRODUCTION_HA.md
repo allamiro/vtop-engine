@@ -1248,7 +1248,8 @@ path needed by the distributed options is already implemented (§6.3).
   shipped as the chart's `PrometheusRule`: verification failures, no commits
   while data waits, replay-rate spike, Kafka lag growth (from kafka-exporter),
   size-only verification, failed Object Lock checks, retention loss, refused
-  replays and piling multipart sessions. Each has a promtool unit test and a
+  replays, a state store refusing recovery's replay decisions, and piling
+  multipart sessions. Each has a promtool unit test and a
   section in [Alert runbooks](operate/runbooks.md); the objectives are on
   [Service level objectives](operate/slos.md).
 
@@ -1751,7 +1752,7 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
   (Grafana, Loki, Mimir, Tempo, Alloy) with generated dashboards; OTLP trace
   export from the engine into that Tempo (#683).
 - **Done (#720):** Prometheus alert rules (verification failures, replay-rate
-  spike, lag growth, no commits in 30 minutes while data waits, and five more),
+  spike, lag growth, no commits in 30 minutes while data waits, and six more),
   each unit-tested with promtool in CI and linked to a runbook section;
   documented SLOs ([operate/slos.md](operate/slos.md)).
 - **Remaining:** a store-latency SLO and its alert; metric coverage review

@@ -79,11 +79,22 @@ test, a runbook section, and an objective on [Service level objectives](slos.md)
 | [VtopObjectLockCheckFailed](runbooks.md#vtopobjectlockcheckfailed) | page | Any increase of `vtop_object_lock_checks_total` with a result other than `ok` |
 | [VtopRetentionLoss](runbooks.md#vtopretentionloss) | page | Any increase of `vtop_retention_lost_records_total` |
 | [VtopSourceReplayRefused](runbooks.md#vtopsourcereplayrefused) | page | Any increase of `vtop_source_replay_refused_total` |
+| [VtopRecoveryLedgerWriteFailed](runbooks.md#vtoprecoveryledgerwritefailed) | page | `vtop_recovery_held_total{reason="ledger_write_failed"}` above zero: at startup the state store refused recovery's replay decision (the series appears with the first hold, so the rule fires on the value, until a restart that holds nothing) |
 | [VtopMultipartSessionsPiling](runbooks.md#vtopmultipartsessionspiling) | ticket | A session kept 30 to 36 hours ago (past the 24 h abandon window and the 6 h sweep interval), and none resumed or swept for 36 hours |
 
 The thresholds are defaults, listed at the top of the file. The rules route
 nowhere by themselves: point Prometheus at your Alertmanager and route on the
 `severity` label (`page` or `ticket`).
+
+Three pages show further rules that are examples, not part of the shipped
+file, with no unit test or runbook section here: `VtopManifestKeyUnknown` on
+[Manifest key rotation](manifest-key-rotation.md#metrics),
+`VtopVerificationReceiptsFailing` on
+[Verification receipts](verification-receipts.md), and the three
+`VtopArchiveScrub*` rules in the
+[observability README](../../observability/README.md#archive-scrub), which read
+the metrics file `vtopctl scrub` writes rather than the engine's endpoint. Add
+them to your own rule files if you use those features.
 
 **Provisioned in the lab.**
 [`observability/grafana/provisioning/alerting/vtop-alerts.yaml`](../../observability/grafana/provisioning/alerting/vtop-alerts.yaml)

@@ -386,6 +386,65 @@ tests:
   - eval_time: 20m
     alertname: VtopSourceReplayRefused
     exp_alerts: []
+# The counter is not primed: its series appears with the first hold, at
+# startup, and stays flat until the engine restarts. increase() would see
+# nothing, so the rule fires on the value (#785's example did the same).
+- name: 'VtopRecoveryLedgerWriteFailed: fires when the series first appears with a hold, and stays firing until a restart'
+  interval: 1m
+  input_series:
+  - series: vtop_recovery_held_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",reason="ledger_write_failed"}
+    values: _x5 2x25
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: VtopRecoveryLedgerWriteFailed
+    exp_alerts: []
+  - eval_time: 6m
+    alertname: VtopRecoveryLedgerWriteFailed
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        source_type: kafka
+        reason: ledger_write_failed
+      exp_annotations:
+        summary: Recovery on engine-1:9090 could not record its replay decision for default/kafka ranges
+        description: "At startup the state store refused recovery's write of a replay decision, so recovery held those ranges instead of rewinding them. Nothing is lost: each held range is read again with the ranges above it, which are archived twice. Check the state store's disk, permissions and connectivity; the batch ids are in the ERROR lines beside the count. The alert clears when the engine restarts without a hold."
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtoprecoveryledgerwritefailed
+  - eval_time: 29m
+    alertname: VtopRecoveryLedgerWriteFailed
+    exp_alerts:
+    - exp_labels:
+        severity: page
+        job: vtop-engine
+        instance: engine-1:9090
+        tenant: default
+        source_type: kafka
+        reason: ledger_write_failed
+      exp_annotations:
+        summary: Recovery on engine-1:9090 could not record its replay decision for default/kafka ranges
+        description: "At startup the state store refused recovery's write of a replay decision, so recovery held those ranges instead of rewinding them. Nothing is lost: each held range is read again with the ranges above it, which are archived twice. Check the state store's disk, permissions and connectivity; the batch ids are in the ERROR lines beside the count. The alert clears when the engine restarts without a hold."
+        runbook_url: https://allamiro.github.io/vtop-engine/operate/runbooks/#vtoprecoveryledgerwritefailed
+- name: 'VtopRecoveryLedgerWriteFailed: quiet for a range held because a newer release wrote its manifest'
+  interval: 1m
+  input_series:
+  - series: vtop_recovery_held_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",reason="newer_manifest"}
+    values: _x5 1x25
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: VtopRecoveryLedgerWriteFailed
+    exp_alerts: []
+- name: 'VtopRecoveryLedgerWriteFailed: quiet after a restart that held nothing'
+  interval: 1m
+  input_series:
+  # Held at the first start; after the restart at 10m the series is gone.
+  - series: vtop_recovery_held_total{job="vtop-engine",instance="engine-1:9090",tenant="default",source_type="kafka",reason="ledger_write_failed"}
+    values: 1x10 _x20
+  alert_rule_test:
+  - eval_time: 20m
+    alertname: VtopRecoveryLedgerWriteFailed
+    exp_alerts: []
 - name: 'VtopMultipartSessionsPiling: fires when kept sessions are neither resumed nor swept'
   interval: 30m
   input_series:

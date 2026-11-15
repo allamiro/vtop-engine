@@ -237,6 +237,34 @@ batch.
 
 **When it is safe to ignore.** Never: a range is missing from the archive.
 
+## VtopRecoveryLedgerWriteFailed
+
+**What it means.** At startup, recovery decided to re-read a range (a batch
+that failed, or one left unfinished by a crash) and the state store refused
+the write that records that decision. Recovery held the range instead of
+rewinding it. Nothing is lost: a held range holds back every `VERIFIED` range
+above it in its source unit, and a rewind above it starts at the held range,
+so the range is read again with the ranges above it. Those ranges are archived
+twice. The state store refusing writes is the problem to fix.
+
+**What the engine already did.** It counted the range in
+`vtop_recovery_held_total{reason="ledger_write_failed"}` and logged an ERROR
+with the batch id, the source, the range and the store's error. It left the
+row in the ledger as it was; the next start records the decision.
+
+**What to check.** The ERROR line for the batch id and the error. Then the
+state store: free space and inodes on the disk that holds the SQLite ledger
+and its file and directory permissions, or, for PostgreSQL, connectivity, the
+runtime role's grants and whether the server is read-only.
+
+**What to do.** Fix the state store, then restart the engine. Recovery reads
+the old rows again and retires them as `SUPERSEDED` or replays them. The
+series is not primed, so it exists only on an engine that held a range at its
+last start; the alert clears after a restart that holds nothing.
+
+**When it is safe to ignore.** Not while it fires: the next write the state
+store refuses may be a commit.
+
 ## VtopMultipartSessionsPiling
 
 **What it means.** Uploads failed and kept their multipart sessions so the
