@@ -167,6 +167,32 @@ class RegistryCheck(unittest.TestCase):
         self.assertNotIn("TEST_VERSION", joined)
         self.assertNotIn("VTOPELSE", joined)
 
+    def test_an_indented_test_module_inside_a_production_module_is_not_scanned(self):
+        # Review of #783: rustfmt indents the attribute of a test module
+        # nested in an inline module, and only a column-zero attribute was
+        # recognised, so its fixtures read as production formats.
+        nested = textwrap.dedent(
+            """\
+            mod inner {
+                pub fn f() {}
+
+                #[cfg(test)]
+                mod tests {
+                    const NESTED_TEST_VERSION: u32 = 9;
+                    const NESTED: &[u8; 8] = b"VTOPNEST";
+                }
+            }
+            """
+        )
+        self.source(SOURCE + nested)
+        joined = " ".join(self.problems())
+        self.assertNotIn("NESTED_TEST_VERSION", joined)
+        self.assertNotIn("VTOPNEST", joined)
+        self.assertEqual(self.problems(), [])
+        # The production module goes on after it, and is still scanned.
+        self.source(SOURCE + nested.replace("    }\n}\n", "    }\n\n    const INNER_VERSION: u8 = 1;\n}\n"))
+        self.assertIn("INNER_VERSION", " ".join(self.problems()))
+
     def test_a_hand_edited_inventory_table_fails_and_write_restores_it(self):
         page = self.root / "docs/reference/compatibility.md"
         page.write_text(page.read_text().replace("| evolving |", "| stable |"))

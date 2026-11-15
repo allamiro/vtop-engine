@@ -63,7 +63,8 @@ TOKENS = (
 # A raw string, also as a byte or C string (br"..", cr#".."#).
 RAW_STRING = re.compile(r'[bc]?r(#*)"')
 CHAR_LITERAL = re.compile(r"'(\\.|[^\\'])'")
-TEST_MODULE = re.compile(r"^#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*", re.M)
+# Indented too: rustfmt indents a test module nested in an inline module.
+TEST_MODULE = re.compile(r"^[ \t]*#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*", re.M)
 
 
 def _block_end(text: str, opening: int) -> int:
