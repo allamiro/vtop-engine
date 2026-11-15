@@ -49,6 +49,9 @@ forward_open() { # namespace pod localport remoteport
     forward_port_open "$3" && return 0
     pid="${FORWARDS##* }"
     if ! kill -0 "$pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; then
+      # At most one start a second: a pod that is not there yet must not turn
+      # this into a busy spin of API calls.
+      sleep 1
       # kubectl exited (the pod is not there yet, or the API stream dropped):
       # a forward that is gone will never start listening, so start another.
       starts=$((starts + 1))
