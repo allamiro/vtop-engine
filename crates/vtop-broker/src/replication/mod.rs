@@ -91,6 +91,18 @@ impl ClusterCommittedOffset {
     }
 }
 
+/// Followers whose durable acks, with the leader's own, make a write quorum
+/// of `replication_factor` replicas: a majority, less the leader.
+///
+/// One definition for the two places that must agree on it (#750): the
+/// fan-out stops waiting once this many followers have acked, and a newly
+/// built leader starts serving once this many replica streams are up.
+/// Waiting for more than this before serving is waiting for a stream a
+/// failover has, by definition, lost.
+pub fn write_quorum_followers(replication_factor: usize) -> usize {
+    (replication_factor / 2 + 1).saturating_sub(1)
+}
+
 /// Result of fanning a locally durable leader append out to followers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaQuorumResult {
@@ -108,6 +120,51 @@ impl ReplicaQuorumResult {
     /// Leader local durability counts as one ack.
     pub fn has_quorum(&self) -> bool {
         1 + self.follower_acks >= self.majority()
+    }
+}
+
+#[cfg(test)]
+mod write_quorum_tests {
+    use super::*;
+
+    /// The serving threshold and the ack threshold are the same number
+    /// (#750): exactly `write_quorum_followers(rf)` follower acks make a
+    /// quorum, and one fewer does not.
+    #[test]
+    fn the_write_quorum_is_the_number_of_acks_that_makes_a_quorum() {
+        for rf in 1..=7 {
+            let needed = write_quorum_followers(rf);
+            let at = ReplicaQuorumResult {
+                follower_acks: needed,
+                replication_factor: rf,
+            };
+            assert!(
+                at.has_quorum(),
+                "rf {rf}: {needed} follower acks must be a quorum"
+            );
+            if needed > 0 {
+                let below = ReplicaQuorumResult {
+                    follower_acks: needed - 1,
+                    replication_factor: rf,
+                };
+                assert!(
+                    !below.has_quorum(),
+                    "rf {rf}: {} acks must not be",
+                    needed - 1
+                );
+            }
+        }
+        assert_eq!(
+            write_quorum_followers(3),
+            1,
+            "three replicas: the leader and one peer"
+        );
+        assert_eq!(write_quorum_followers(5), 2);
+        assert_eq!(
+            write_quorum_followers(1),
+            0,
+            "a lone leader needs no stream"
+        );
     }
 }
 
