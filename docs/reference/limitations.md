@@ -2,7 +2,9 @@
 
 VTOP is a prototype. The limits below are known and intentional. Per-release
 limitations of the cluster plane are in [ROADMAP.md](../ROADMAP.md), and the
-engine's HA status is in [PRODUCTION_HA.md](../PRODUCTION_HA.md).
+engine's HA status is in [PRODUCTION_HA.md](../PRODUCTION_HA.md). Every
+data-safety bug found so far, with when it was introduced and fixed, is in the
+[data-safety register](data-safety-register.md).
 
 ## Known limitations
 
