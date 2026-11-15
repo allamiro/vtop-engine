@@ -116,3 +116,22 @@ forward_supervised_open() { # namespace pod localport remoteport
     sleep 0.5
   done
 }
+
+# Runs "$@" until it succeeds or <seconds> have passed since the first try,
+# pausing <pause> seconds after each failure. Returns 0 at the first success,
+# 1 once the window has passed. Bounded by elapsed time, not by a count,
+# because what one attempt costs varies: a forward that never opens takes
+# FORWARD_WAIT_SECONDS, while one that opens at once and meets a server still
+# starting fails in under a second (review of #789: a count of 90 meant six
+# minutes when every attempt began with a fixed 4 s sleep, and under one minute
+# without it).
+retry_for() { # seconds pause command...
+  local seconds="$1" pause="$2"
+  shift 2
+  local deadline=$((SECONDS + seconds))
+  while :; do
+    "$@" && return 0
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep "$pause"
+  done
+}

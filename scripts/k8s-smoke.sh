@@ -744,9 +744,11 @@ alloc_port() {
   r_port=$((r_port + 1))
 }
 
-# 90 attempts, not 30. Each costs the forward's readiness wait (bounded at 10s,
-# usually well under one; it was a fixed 4s sleep before #786) plus the attempt, so
-# with the old settle this was roughly six minutes of patience against two before.
+# Six minutes of attempts, bounded by elapsed time (`retry_for`), not by a
+# count. Each attempt costs the forward's readiness wait (bounded at 10s,
+# usually well under one) plus the attempt. Before #786 it also cost a fixed 4s
+# settle, so 90 attempts were six minutes; without the settle, an init that
+# fails at once would spend 90 attempts in under one (review of #789).
 #
 # The budget is not arbitrary and the earlier one was tuned to the wrong
 # cluster. A cold replicated install can restart while peer DNS settles — a
@@ -761,9 +763,9 @@ alloc_port() {
 #
 # So the loop is the wait. It re-establishes the forward every attempt and keeps
 # going until the process stays up long enough to answer, which is the actual
-# condition being waited for.
-r_init=""
-for _ in $(seq 1 90); do
+# condition being waited for. The 2s pause after a failed attempt keeps a server
+# that refuses at once from turning the window into a busy spin.
+r_init_attempt() {
   r_port=$((r_port + 1))
   cat > "$WORK/r-admin.yaml" <<EOF
 endpoint: localhost:${r_port}
@@ -772,13 +774,14 @@ ca_cert: $CERTS/ca.pem
 client_cert: $CERTS/r-operator.pem
 client_key: $CERTS/r-operator-key.pem
 EOF
-  # A forward that never opens is one failed attempt, not a failed run. The
-  # shorter wait keeps ninety attempts near the budget above.
-  FORWARD_WAIT_SECONDS=10 forward_open "$R_NS" "$(meta_pod 0)" "$r_port" 9200 || continue
-  if vtopctl meta init --members 1,2,3 --config "$WORK/r-admin.yaml" >/dev/null 2>&1; then
-    r_init="yes"; break
-  fi
-done
+  # A forward that never opens is one failed attempt, not a failed run.
+  FORWARD_WAIT_SECONDS=10 forward_open "$R_NS" "$(meta_pod 0)" "$r_port" 9200 || return 1
+  vtopctl meta init --members 1,2,3 --config "$WORK/r-admin.yaml" >/dev/null 2>&1
+}
+r_init=""
+if retry_for 360 2 r_init_attempt; then
+  r_init="yes"
+fi
 [ -n "$r_init" ] || {
   vtopctl meta init --members 1,2,3 --config "$WORK/r-admin.yaml" || true
   kubectl -n "$R_NS" get pods || true

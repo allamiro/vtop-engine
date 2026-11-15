@@ -119,3 +119,37 @@ starts() {
     [ "$status" -eq 0 ]
     forward_port_open "$PORT"
 }
+
+# Review of #789: the replicated `meta init` loop counted attempts, and each
+# attempt used to cost a fixed 4 s settle. With the settle replaced by the
+# readiness wait, an init that fails at once burned all its attempts in well
+# under a minute instead of the six the loop's comment budgets for a cold
+# kind install. `retry_for` bounds the loop by elapsed time instead.
+
+# Fails until it has been called $1 times, counting calls in $WORK/tries.
+fail_until() {
+    echo try >>"$WORK/tries"
+    [ "$(wc -l <"$WORK/tries")" -ge "$1" ]
+}
+
+tries() {
+    wc -l <"$WORK/tries" | tr -d ' '
+}
+
+@test "an attempt that fails at once is retried for the whole window, not a count" {
+    begin=$SECONDS
+    call retry_for 4 1 false
+    [ "$status" -eq 1 ]
+    [ $((SECONDS - begin)) -ge 4 ]
+    [ $((SECONDS - begin)) -lt 10 ]
+}
+
+@test "retry_for pauses after a failed attempt and stops at the first success" {
+    begin=$SECONDS
+    call retry_for 30 1 fail_until 3
+    [ "$status" -eq 0 ]
+    [ "$(tries)" -eq 3 ]
+    # Two pauses of one second: not a busy loop, and no wait after success.
+    [ $((SECONDS - begin)) -ge 2 ]
+    [ $((SECONDS - begin)) -lt 10 ]
+}
