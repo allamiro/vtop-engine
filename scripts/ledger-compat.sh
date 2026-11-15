@@ -20,7 +20,9 @@
 #      REPLAY_REQUIRED, with `sealed_at`), so the old release's recovery
 #      claims, replays and commits a row this build wrote.
 #   3. This build runs `process-once` and `audit-coverage` again over what the
-#      old one wrote. The old row's `sealed_at` is checked to be NULL (sqlite3
+#      old one wrote. The old row's `sealed_at` is checked to be NULL when the
+#      old release predates the column (before v0.10.0), and set when it
+#      writes it too (v0.10.0 on) (sqlite3
 #      must be on the PATH; LEDGER_COMPAT_NO_SQLITE3=1 skips this check
 #      explicitly), this build's rows to carry one, and `user_version` to be
 #      what the old release reads.
@@ -44,6 +46,12 @@ WORKDIR="${LEDGER_COMPAT_WORKDIR:-$(mktemp -d "${TMPDIR:-/tmp}/vtop-ledger-compa
 mkdir -p "$WORKDIR/logs"
 
 log() { echo "[ledger-compat/$OLD_LABEL] $*"; }
+# Whether a release label (vX.Y.Z, or X.Y.Z) names a release that writes
+# `sealed_at`: the column arrived in v0.10.0 (#755). Older releases ignore it.
+knows_sealed_at() {
+  local v="${1#v}"
+  [[ "$(printf '%s\n%s\n' "0.10.0" "${v%%-*}" | sort -V | head -n 1)" == "0.10.0" ]]
+}
 fail() { echo "[ledger-compat/$OLD_LABEL] FAIL: $*" >&2; exit 1; }
 
 # run <label> <binary> <args...>: run a vtopctl command, keep its log, fail
@@ -135,13 +143,20 @@ if command -v sqlite3 > /dev/null; then
   db="$sqlite_dir/state.db"
   version="$(sqlite3 "$db" 'PRAGMA user_version')"
   [[ "$version" == 1 ]] || fail "SQLite user_version is $version; $OLD_LABEL reads 1"
-  # Every row this build wrote carries the instant, so the rows without one
-  # are the old release's.
-  old_rows="$(sqlite3 "$db" "SELECT count(*) FROM batches WHERE sealed_at IS NULL")"
-  [[ "$old_rows" -ge 1 ]] || fail "no row of $OLD_LABEL's left sealed_at NULL"
-  new_rows="$(sqlite3 "$db" "SELECT count(*) FROM batches WHERE sealed_at IS NOT NULL")"
-  [[ "$new_rows" -ge 1 ]] || fail "no row of this build's carries sealed_at"
-  log "SQLite: user_version $version, $OLD_LABEL's row NULL, $new_rows rows of this build's with sealed_at"
+  null_rows="$(sqlite3 "$db" "SELECT count(*) FROM batches WHERE sealed_at IS NULL")"
+  set_rows="$(sqlite3 "$db" "SELECT count(*) FROM batches WHERE sealed_at IS NOT NULL")"
+  [[ "$set_rows" -ge 1 ]] || fail "no row of this build's carries sealed_at"
+  if knows_sealed_at "$OLD_LABEL"; then
+    # v0.10.0 added the column (#755), so a release from then on writes it
+    # too: every row, the old release's included, must carry the instant.
+    [[ "$null_rows" -eq 0 ]] || fail "$null_rows row(s) left sealed_at NULL, but $OLD_LABEL writes it"
+    log "SQLite: user_version $version, all $set_rows rows carry sealed_at ($OLD_LABEL writes it too)"
+  else
+    # Every row this build wrote carries the instant, so the rows without one
+    # are the old release's, which ignores the column.
+    [[ "$null_rows" -ge 1 ]] || fail "no row of $OLD_LABEL's left sealed_at NULL"
+    log "SQLite: user_version $version, $OLD_LABEL's row NULL, $set_rows rows of this build's with sealed_at"
+  fi
 else
   log "SQLite: LEDGER_COMPAT_NO_SQLITE3 is set; the column values were not inspected"
 fi
