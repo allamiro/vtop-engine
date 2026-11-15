@@ -425,8 +425,8 @@ def alts(facts: dict[str, Any]) -> dict[str, str]:
     chips = "; ".join(f"{item['name']} {item['version']} ({item['ran']})"
                       for item in tested["kafka"] + tested["clients"] + tested["s3"])
     out = {
-        "card-hero": f"{hero['pill']}. {hero['headline']} The rule: {hero['rule']} {hero['section']}, "
-                     f"{hero['caveat'][0].lower()}{hero['caveat'][1:]} {tiles}",
+        "card-hero": f"{hero['pill']}. {hero['headline']} The rule: {hero['rule']} {hero['section']} "
+                     f"({hero['caveat'][0].lower()}{hero['caveat'][1:].rstrip('.')}). {tiles}",
         "card-link-share": f"Bar list. {link['title']}. {link['subtitle']} {rows}. "
                            f"{link['default']['label']}: {link['default']['text']}, {link['default']['note']}, "
                            f"against {link['reference']['label']} at {link['reference']['value']:.1f}.",
