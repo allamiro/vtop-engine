@@ -1150,6 +1150,35 @@ mode_mismatch. The deployment profile is
   write needs, the permissions a HEAD needs to return the lock headers), not
   measured.
 
+**File source: the read's ctime is recorded in the ledger (#619).** A file
+marker now carries `ctime`, the file's ctime from the same fstat as its
+`mtime`, after the read. `delete_after_commit` deletes a file only while it
+still has that ctime: at the covering commit, and when a restart re-arms the
+delete (`CommittedCursor::observed_ctime`). Before, a same-length rewrite
+between a file's first page and the page below the archived end that also
+set the mtime back agreed with everything the ledger recorded, so after a
+restart, or between a batch's read and its commit, it was deleted unread. Now
+it is kept, with a `metadata_changed` warning. The field is ledger only: no
+DDL on either backend, so `vtopctl migrate` has nothing to apply, and the
+manifest never carries it, so manifests stay byte for byte what released
+readers verify (ARCHITECTURE.md, "Ledger format note: ctime").
+
+- **Upgrading: rows written before v0.10.0 have no ctime, and arm the delete
+  as before.** After the upgrade, a file archived before it is re-armed on the
+  mtime alone, with the file's ctime at the restart, so for those rows the
+  limit stands - a rewrite while the engine was down that set the mtime back
+  is not seen - until their quiet period ends and they are deleted or kept.
+  Refusing them instead would keep every file archived within the last
+  `delete_quiet_seconds` before the upgrade until someone removed it by hand.
+- **Older engines ignore the field** (serde skips unknown keys) and judge as
+  they always did. Downgrade is still not supported.
+- **Known, and on the side of keeping:** a restart after one of the engine's
+  own delete attempts moved a file aside and put it back (a process opened
+  it during the delete, or the unlink failed) finds the file's ctime moved
+  by the put-back, so the file is kept with a warning that lists that
+  attempt among the causes, and is removed by hand. A stored ctime that is
+  not a timestamp reads as absent, and arms as a pre-v0.10.0 row does.
+
 ---
 
 ## Versioning

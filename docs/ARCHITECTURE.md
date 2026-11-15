@@ -528,10 +528,12 @@ What follows from that, in the engine:
 - **"Unchanged" is one identity test**, `continuity::proves` (#647), the
   test every identity decision shares: the same inode, the first page
   (#578) and the page below the committed end (#620's tail fingerprint),
-  plus the exact length, the mtime the batch READ (the marker's, not the
-  file's at commit time - review of #689: a same-length rewrite between
-  the pages during the upload, or during the downtime before recovery
-  commits, became the baseline and was deleted unread) and the ctime. The
+  plus the exact length, and the mtime and ctime the batch READ (the
+  marker's, not the file's at commit time - review of #689: a same-length
+  rewrite between the pages during the upload, or during the downtime
+  before recovery commits, became the baseline and was deleted unread; and
+  #619: the same rewrite with the mtime set back agreed with the marker's
+  mtime, which is why the marker records the ctime too). The
   covering commit, the delete decision
   and the final check before the unlink all make it. Before #619 was
   finished, the delete had a test of its own, which passed a marker that
@@ -566,11 +568,17 @@ What follows from that, in the engine:
   fingerprint or not: a same-inode, same-length rewrite while the engine was
   down agrees with everything else the seed records. A row with no mtime,
   or a file whose mtime moved, leaves the delete unarmed, and the file is
-  kept with a warning. The ledger has no ctime, so the candidate takes the
-  file's ctime at the restart: a rewrite while the engine was down that
-  also set the mtime back is the one change a restart cannot see. The same
-  holds between a batch's read and its commit, for the same reason: the
-  marker records the mtime the batch read, not the ctime.
+  kept with a warning. So must the file's ctime equal the one the batch's
+  read recorded (`CommittedCursor::observed_ctime`, the marker's `ctime`,
+  #619): a rewrite that also sets the mtime back is caught by the ctime the
+  read recorded, and the candidate keeps that ctime, not the one read at
+  the restart. The covering commit makes the same check, so the same
+  rewrite between a batch's read and its commit is caught too, with its
+  own warning (`metadata_changed`). A row written before v0.10.0 has no
+  ctime and arms as before, on the mtime alone, with the file's ctime at
+  the restart: for those rows the limit stands until their quiet period
+  ends. Refusing them instead would keep every file archived within the
+  last quiet period before the upgrade until someone removed it by hand.
 - **Hard links.** Deleting one name of a file moves the ctime of the
   others (#378 makes each its own source) and lowers the link count. The
   candidate records the link count (in memory), so another name's delete
@@ -896,6 +904,48 @@ backend: the restart seed reads the new field out of the stored
 - The manifest's `source_progress` never carries it, for the reason above.
   The coverage audit does not use it.
 - An older binary ignores it, as above.
+
+#### Ledger format note: ctime (#619)
+
+The same kind of change as the two notes above, to file markers only, and no
+DDL on either backend: the restart seed reads the new field out of the stored
+`progress_end_json` (`CommittedCursor::observed_ctime`), so `vtopctl
+migrate` has nothing to apply.
+
+- New, optional and omitted when unknown: `ctime` on file markers, the
+  file's ctime from the same fstat as `mtime` - the one after the read, so a
+  file that stops growing during a read still matches it - and written the
+  same way (RFC 3339 in UTC, up to nanosecond precision; compared as an
+  instant). Absent on a platform without ctimes.
+- Taken after the read, it also takes in a change the file went through
+  DURING the read: a rewrite of bytes the read has already passed, landing
+  before that fstat, is in the marker's mtime and ctime, and the covering
+  commit agrees with it. The window is the length of one read. The
+  fingerprints still catch such a rewrite in the first page or the page
+  below the end; between them it is the documented limit, now narrowed to
+  the read itself.
+- Rows written before it decode with the field absent. The covering commit
+  then judges the file by the mtime alone, and the restart seed arms the
+  delete as before, with the file's ctime at the restart (see "The wait is
+  in memory" above). A marker without it
+  serializes byte for byte as the code before it wrote the same marker.
+- A stored value that is not an RFC 3339 timestamp - another string, a
+  number, an object - decodes as absent, in markers decoded whole and in the
+  restart seed alike: absent only forgoes the check, so such a row arms the
+  delete on the mtime alone, like a row from before the field. This is
+  unlike a missing fingerprint, which keeps the file: the fingerprints are
+  the identity test, while the ctime only narrows the window a rewrite with
+  the mtime set back can use.
+- A restart after one of the engine's own delete attempts moved the file
+  aside and put it back (an opener broke the lease, or the unlink failed)
+  finds the file's ctime moved by that put-back. In memory the candidate
+  took the new ctime; the ledger keeps the read's. So the seed keeps the
+  file, and the warning lists that attempt among the causes. It costs disk,
+  not data.
+- The manifest's `source_progress` never carries it (`for_manifest` clears
+  it), for the reason above, so a manifest is byte for byte what released
+  readers verify. The coverage audit does not use it.
+- An older binary ignores it, as above. Downgrade is still not supported.
 
 #### Ledger format note: verification class (#664)
 

@@ -173,6 +173,7 @@ async fn recovery_commits_verified_but_uncommitted_batch() {
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let object_uri = "s3://telemetry-data/x/b-verified.raw.gz";
     let manifest_uri = "s3://telemetry-data/x/b-verified.manifest.json";
@@ -305,6 +306,7 @@ async fn recovery_rejects_same_size_replacement_with_matching_metadata() {
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let (manifest, manifest_path) = write_recovery_manifest(
         &work,
@@ -424,6 +426,7 @@ async fn recovery_rejects_rehashed_manifest_not_bound_to_ledger() {
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let (original_manifest, _) = write_recovery_manifest(
         &work,
@@ -561,6 +564,7 @@ async fn recovery_refuses_to_commit_when_storage_no_longer_verifies() {
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let now = chrono::Utc::now().to_rfc3339();
     let rec = BatchRecord {
@@ -653,6 +657,7 @@ async fn recovery_rejects_unsigned_manifest_after_mac_cutover() {
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let now = chrono::Utc::now().to_rfc3339();
     let unsigned = ManifestBuilder {
@@ -791,6 +796,7 @@ async fn recovery_size_check_rejects_replaced_object_without_checksums() {
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let object_uri = "s3://telemetry-data/x/b-size.raw.gz";
     let manifest_uri = "s3://telemetry-data/x/b-size.manifest.json";
@@ -952,6 +958,7 @@ async fn recovery_resumes_from_the_lowest_incomplete_range_not_the_last_one_visi
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
 
     {
@@ -1049,6 +1056,7 @@ async fn recovery_does_not_commit_a_verified_range_above_a_failed_one() {
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
 
     let object_uri = "s3://telemetry-data/x/b-above.raw.gz";
@@ -1233,6 +1241,7 @@ async fn recovery_commits_a_verified_range_above_a_failed_row_that_a_retry_alrea
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
 
     let object_uri = "s3://telemetry-data/x/b-above.raw.gz";
@@ -1434,6 +1443,7 @@ async fn verified_ledger(
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let object_uri = &format!("s3://telemetry-data/x/{id}.raw.gz");
     let manifest_uri = &format!("s3://telemetry-data/x/{id}.manifest.json");
@@ -1793,6 +1803,7 @@ fn file_row(id: &str, path: &str, inode: Option<u64>, range: (u64, u64), at: &st
         mtime: String::new(),
         content_fingerprint: vtop_core::types::ContentFingerprint::of(&head[..28]),
         tail_fingerprint: None,
+        ctime: None,
     };
     BatchRecord {
         batch_id: id.into(),
@@ -2222,6 +2233,7 @@ async fn a_range_of_a_truncated_rewrite_is_not_retired_against_the_old_offset() 
         mtime: String::new(),
         content_fingerprint: first_page.clone(),
         tail_fingerprint: None,
+        ctime: None,
     };
     let row = |id: &str, m: ProgressMarker, at: &str| {
         let mut rec = file_row(id, &path, inode, (0, 0), at);
@@ -2477,6 +2489,7 @@ async fn held_back_row_settles(
         mtime: String::new(),
         content_fingerprint: vtop_core::types::ContentFingerprint::of(&head),
         tail_fingerprint: None,
+        ctime: None,
     };
     let object_uri = "s3://telemetry-data/x/b-held.raw.gz";
     let manifest_uri = "s3://telemetry-data/x/b-held.manifest.json";
@@ -2664,6 +2677,7 @@ async fn an_unfingerprinted_older_commit_never_suppresses_a_newer_generations() 
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     // The new generation's row: [0,21), read when the file was 21 bytes.
     let new = ProgressMarker::File {
@@ -2675,6 +2689,7 @@ async fn an_unfingerprinted_older_commit_never_suppresses_a_newer_generations() 
         mtime: String::new(),
         content_fingerprint: vtop_core::types::ContentFingerprint::of(&content.as_bytes()[..21]),
         tail_fingerprint: vtop_core::types::ContentFingerprint::of(&content.as_bytes()[..21]),
+        ctime: None,
     };
     let staged = dir.path().join("staged");
     std::fs::write(&staged, b"archived-bytes").unwrap();

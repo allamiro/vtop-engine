@@ -1,0 +1,1 @@
+{"source_type":"kafka","topic":"events","partition":3,"start_offset":1000,"end_offset":1999,"consumer_group":"vtop-archive"}

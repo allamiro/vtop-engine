@@ -497,6 +497,7 @@ async fn an_archive_with_per_attempt_keys_still_recovers_scrubs_and_audits() {
         mtime: String::new(),
         content_fingerprint: None,
         tail_fingerprint: None,
+        ctime: None,
     };
     let manifest = ManifestBuilder {
         batch_id: batch_id.clone(),
