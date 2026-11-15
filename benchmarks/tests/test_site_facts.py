@@ -229,3 +229,9 @@ def test_a_refusal_reaches_the_chart_command_as_a_refusal():
     # readme_charts.py's main() turns its own Refused into exit 2; the cards' refusals must be one.
     assert issubclass(site_facts.Refused, readme_charts.Refused)
     assert issubclass(readme_cards.Refused, readme_charts.Refused)
+
+
+def test_a_fractional_link_rate_is_not_truncated(data_tree):
+    root = data_tree({site_facts.EGRESS_ENV: lambda text: text.replace("tbf 10000 kbit/s", "tbf 1500 kbit/s")})
+    assert site_facts.link_conditions(root)["rate_mbit"] == "1.5"
+    assert site_facts.link_conditions()["rate_mbit"] == "10"

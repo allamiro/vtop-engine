@@ -124,10 +124,11 @@ def link_conditions(repo: str = REPO) -> dict[str, str]:
     """The lossy 100 ms link's round trip, rate and loss, from the #483 run's own description of its links."""
     links = json.loads(_read(EGRESS_ENV, repo)).get("links", {})
     clean, lossy = links.get("wan100", ""), links.get("wan100-loss1", "")
+    kbit = int(_one(r"tbf (\d+) kbit/s", clean, EGRESS_ENV, "tbf rate in links.wan100").group(1))
     return {
         "rtt_ms": _one(r"(\d+) ms round trip", clean, EGRESS_ENV, "round trip in links.wan100").group(1),
-        "rate_mbit": str(int(_one(r"tbf (\d+) kbit/s", clean, EGRESS_ENV, "tbf rate in links.wan100").group(1))
-                         // 1000),
+        # :g keeps a fractional rate (1500 kbit/s is 1.5 Mbit/s) and prints a whole one without ".0".
+        "rate_mbit": f"{kbit / 1000:g}",
         "loss_pct": _one(r"(\d+)% \w+ loss", lossy, EGRESS_ENV, "loss in links.wan100-loss1").group(1),
     }
 
