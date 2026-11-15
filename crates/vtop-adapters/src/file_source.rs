@@ -4777,6 +4777,7 @@ mod tests {
                 inode: Some(inode),
                 file_size: 0,
                 mtime: String::new(),
+                ctime: None,
                 content: None,
                 tail: None,
             }),

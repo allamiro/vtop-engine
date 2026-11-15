@@ -367,6 +367,7 @@ mod tests {
             end_byte: end,
             file_size: end,
             mtime: String::new(),
+            ctime: None,
             content_fingerprint: None,
             tail_fingerprint: None,
         }
@@ -447,6 +448,7 @@ mod tests {
             end_byte: 10,
             file_size: 10,
             mtime: String::new(),
+            ctime: None,
             content_fingerprint: None,
             tail_fingerprint: vtop_core::types::ContentFingerprint::of(bytes),
         };
@@ -474,6 +476,7 @@ mod tests {
                 end_byte: 0,
                 file_size: 0,
                 mtime: String::new(),
+                ctime: None,
                 content_fingerprint: None,
                 tail_fingerprint: None,
             };
