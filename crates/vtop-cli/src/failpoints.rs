@@ -83,6 +83,9 @@ pub const POINTS: &[&str] = &[
 /// for the states only a failure reaches (FAILED, REPLAY_REQUIRED,
 /// SUPERSEDED) and for the ones no transition writes: a sweep that armed
 /// one would never see it fire.
+// `allow`, not `expect`: without the feature only the unit tests call this,
+// so the lint fires in a plain build and not in a test build, and an
+// `expect` would be unfulfilled in the second.
 #[cfg_attr(not(feature = "failpoints"), allow(dead_code))]
 pub(crate) fn ledger_points(state: vtop_core::BatchState) -> Option<(&'static str, &'static str)> {
     use vtop_core::BatchState as S;

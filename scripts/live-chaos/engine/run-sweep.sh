@@ -56,8 +56,9 @@
 #   ENGINE_SWEEP_BUCKET       bucket (default telemetry-sweep; created by the
 #                             engine)
 #
-# Budget: about 30 s a point with a debug build on a GitHub runner; the
-# measured times are in docs/LIVE_CHAOS_VALIDATION.md.
+# Budget: 9 to 12 s a point with a debug build, measured locally (238 s for
+# all 21 points); the measurement is in docs/LIVE_CHAOS_VALIDATION.md. The
+# workflow's per-point wait is bounded by ENGINE_SWEEP_POINT_TIMEOUT_SECONDS.
 #
 # Not covered here (#725 PR 2): PostgreSQL, the file source, a store outage
 # before the kill, ENOSPC.
@@ -244,7 +245,7 @@ check_commit_rule() { # <point> <dir> <group> <when>
   committed="$(group_committed "$group")"
   ledger="$(python3 "$CHECKS" ledger "$dir/state.db" "$TOPIC" 0 "$group")"
   printf '%s %s committed=%s ledger=%s\n' "$when" "$point" "$committed" "$ledger" >> "$dir/commit-rule.log"
-  python3 "$CHECKS" commit-rule "$committed" "$ledger" "$point" "$when" >> "$dir/commit-rule.log" \
+  python3 "$CHECKS" commit-rule "$committed" "$ledger" "$point" "$when" >> "$dir/commit-rule.log" 2>&1 \
     || fail "$(tail -n 1 "$dir/commit-rule.log")"
 }
 

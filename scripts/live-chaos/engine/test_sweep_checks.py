@@ -100,8 +100,9 @@ class CommitRuleTest(unittest.TestCase):
         self.assertIn("ends at 39", msg)
 
     def test_a_commit_with_nothing_verified_is_a_violation(self):
-        ok, _ = sc.commit_rule("1", {"verified_end": None, "states": {}}, "p", "at kill")
+        ok, msg = sc.commit_rule("1", {"verified_end": None, "states": {}}, "p", "at kill")
         self.assertFalse(ok)
+        self.assertIn("no range is recorded as VERIFIED", msg)
 
 
 class ReadbackTest(unittest.TestCase):

@@ -250,7 +250,12 @@ commit-boundary points (`mid_object_put`, `after_object_put_before_ledger`,
 `after_source_commit_before_ledger`) on a pull request that changes the
 engine, the ledger, the upload path, the adapters or the harness.
 
-**Measured.** MEASURED_PLACEHOLDER
+**Measured.** A full local run (21 points, 50 records each, batches of 20, a
+debug build, `apache/kafka:4.3.1` and the lab's MinIO on one CPU each) took
+238 s, 9 to 12 s a point, with no duplicate at any point. With the source
+commit moved ahead of the VERIFIED write (a deliberate mutation), the sweep
+fails at `after_source_commit_before_ledger`, naming the committed offset and
+the ledger's states.
 
 **Not covered yet.** PostgreSQL as the ledger, the file source, a store
 outage before the kill and ENOSPC (the second part of #725); the syslog

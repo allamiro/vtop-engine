@@ -126,12 +126,16 @@ def commit_rule(committed: str, ledger: dict, point: str, when: str) -> tuple[bo
             f"{point} ({when}): committed offset {committed_at} <= {ceiling} "
             f"(highest VERIFIED range ends at {verified_end})"
         )
+    verified = (
+        "no range is recorded as VERIFIED or SOURCE_COMMITTED"
+        if verified_end is None
+        else f"the highest range recorded as VERIFIED or SOURCE_COMMITTED ends at {verified_end}"
+    )
     return False, (
         f"{point} ({when}): COMMIT RULE VIOLATED: the consumer group's committed offset "
-        f"is {committed_at}, but the highest range the ledger records as VERIFIED or "
-        f"SOURCE_COMMITTED ends at {verified_end}, so offsets {ceiling}..{committed_at - 1} "
-        f"were committed at the source before they were verified. Ledger: "
-        f"{json.dumps(ledger['states'])}"
+        f"is {committed_at}, but in the ledger {verified}, so offsets "
+        f"{ceiling}..{committed_at - 1} were committed at the source before they were "
+        f"verified. Ledger states: {json.dumps(ledger['states'])}"
     )
 
 
