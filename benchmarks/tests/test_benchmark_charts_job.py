@@ -158,3 +158,19 @@ def test_a_piped_test_step_keeps_pytest_s_exit_status():
     for step in piped:
         assert "set -o pipefail" in step or re.search(r"^\s*shell: bash\s*$", step, re.M), (
             f"a step pipes pytest without pipefail, so a failing test passes it:\n{step}")
+
+
+def test_every_input_of_the_readme_cards_starts_the_chart_job():
+    # The cards (#714) read more than the measurements: a new Kafka image in the lab, a librdkafka bump in
+    # Cargo.lock or a committed S3 matrix result changes card-tested, so each must run the drift check.
+    import site_facts
+
+    globs = filter_block("benchmark_charts")
+    inputs = ["benchmarks/readme_cards.py", "benchmarks/site_facts.py", "benchmarks/tests/conftest.py",
+              site_facts.README, site_facts.COMPOSE, site_facts.CI, site_facts.CARGO_TOML, site_facts.CARGO_LOCK,
+              site_facts.EGRESS_ENV, f"{site_facts.S3_RESULTS}/garage.json",
+              site_facts.readme_charts.EGRESS, site_facts.readme_charts.POLICED,
+              f"{site_facts.readme_charts.FAILOVER_RUN}/failover.csv",
+              f"{site_facts.readme_charts.THROUGHPUT_RUN}/results.csv"]
+    uncovered = sorted(path for path in inputs if not _covered(path, globs))
+    assert not uncovered, f"the benchmark_charts paths filter misses these inputs of the README cards: {uncovered}"

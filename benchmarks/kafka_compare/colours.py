@@ -32,8 +32,31 @@ SYSTEM_SLOT: dict[str, int] = {"kafka": 0, "vtop": 1}
 MAX_SYSTEMS = len(SLOTS)
 
 # Where the images are shown: the docs pages draw their own light surface;
-# the README's SVGs are transparent over GitHub's light or dark page.
-SURFACES = {"docs": "#fcfcfb", "light": "#ffffff", "dark": "#0d1117"}
+# the README's charts are transparent over GitHub's light or dark page; the
+# README's cards (readme_cards.py) draw their own fill, card-light or card-dark,
+# so their contrast does not depend on the page behind them.
+SURFACES = {"docs": "#fcfcfb", "light": "#ffffff", "dark": "#0d1117",
+            "card-light": "#ffffff", "card-dark": "#161b22"}
+
+
+def surface_mode(surface: str) -> str:
+    """Which step of each slot ("light" or "dark") is drawn on `surface`."""
+    return "dark" if surface.endswith("dark") else "light"
+
+
+# The greys every README image draws with, per mode: one table, so the charts,
+# the cards and the tests read the same values. Text wears `ink` or `ink2`;
+# `muted` is for non-text marks only (a "before" bar), being near 3.5:1.
+# `card` and `border` are a card's fill and outline, `tile` the fill of a stat
+# tile inside a card.
+NEUTRALS: dict[str, dict[str, str]] = {
+    "light": {"ink": "#0b0b0b", "ink2": "#52514e", "grid": "#e1e0d9", "axis": "#c3c2b7", "muted": "#898781",
+              "card": SURFACES["card-light"], "border": "#d0d7de", "tile": "#f6f8fa"},
+    "dark": {"ink": "#f0efec", "ink2": "#c3c2b7", "grid": "#30363d", "axis": "#484f58", "muted": "#898781",
+             "card": SURFACES["card-dark"], "border": "#30363d", "tile": "#0d1117"},
+}
+TEXT_TOKENS = ("ink", "ink2")
+FILL_TOKENS = ("card", "tile")
 
 LIGHTNESS_BAND = {"light": (0.43, 0.77), "dark": (0.48, 0.67)}  # OKLCH L
 CHROMA_FLOOR = 0.10  # OKLCH C
