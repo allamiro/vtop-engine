@@ -17,10 +17,17 @@ table DML only.
 | 15 | 15.20 | 2027-11-11 |
 | 14 | 14.25 | 2026-11-12 (ended, see below) |
 
-Each major is a leg of the CI job `postgres backend (battery)`, run against
-the official `postgres:<major>` image pinned by digest in
-`.github/workflows/ci.yml`. Every leg checks that the server reports its
-major, then runs:
+Each major is a leg of the job `postgres backend (battery)` in
+`.github/workflows/postgres-matrix.yml`, run against the official
+`postgres:<major>` image pinned by digest there, in one place. All five run
+every night (00:47 UTC) on `main`, and on a manual dispatch. A pull request
+whose change the `postgres` path filter in `.github/workflows/ci.yml` matches
+(the state store, `vtop-core`, the two test files, the build files and
+`ci.yml`) runs the oldest and the newest major, 14 and 18, as the checks
+`postgres / postgres backend (battery) (pg 14)` and `(pg 18)`; a pull request
+that changes `postgres-matrix.yml` itself, a pin for instance, runs all five.
+Every leg
+checks that the server reports its major, then runs:
 
 - the state-store battery (`crates/vtop-state/tests/pg_battery.rs`): the
   behaviour shared with SQLite, the commit-rule trigger and the
@@ -343,8 +350,8 @@ To turn it on:
    | `VTOP_MANAGED_POSTGRES_CA` | The service's CA bundle (PEM). RDS and Cloud SQL sign with a private CA, which `sslmode=verify-full` needs; the job writes it to the path the URLs name. |
 
 4. Add the repository variable `VTOP_MANAGED_POSTGRES_CLIENT_IMAGE`: the image
-   from the CI matrix whose major is the instance's, as pinned there
-   (`postgres:<major>@sha256:...`). `pg_dump` and `pg_restore` run from it;
+   whose major is the instance's, as pinned in
+   `.github/workflows/postgres-matrix.yml` (`postgres:<major>@sha256:...`). `pg_dump` and `pg_restore` run from it;
    the test refuses client tools of another major.
 
 With the URL secret set and either of the others missing, the job fails and
