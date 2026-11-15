@@ -1835,14 +1835,6 @@ async fn renewing_the_assignment_does_not_move_a_partition_that_started_at_the_e
     let mut cfg = kafka_cfg(&bootstrap(), &group);
     cfg.auto_offset_reset = "latest".into();
     let mut adapter = KafkaSource::new(cfg, TelemetryFormat::Cef).unwrap();
-    // #792: what reads quiet below must be the renewal, never the stall
-    // check. With the check's 10 s window, a broker slow to start quiet's
-    // renewed fetcher let the check re-assign it first, and the test failed
-    // on runner speed. Held off past the test's own length, the check cannot
-    // act on quiet here at all: a renewal that moved quiet to the new end
-    // leaves its records unread and fails the first assertion below, and a
-    // renewal that pinned it is read however slowly the broker starts it.
-    adapter.hold_off_stall_check_for(std::time::Duration::from_secs(600));
     let sources = vec![kafka_source(&busy), kafka_source(&quiet)];
 
     let mut busy_read = 0;
@@ -1855,6 +1847,15 @@ async fn renewing_the_assignment_does_not_move_a_partition_that_started_at_the_e
         produce(&busy, 2);
         busy_read += read_pass(&mut adapter, &sources).await[0];
     }
+    // #792: what reads quiet below must be the renewal, never the stall
+    // check. With the check's 10 s window, a broker slow to start quiet's
+    // renewed fetcher let the check re-assign it first, and the test failed
+    // on runner speed. Held off past the test's own length, the check cannot
+    // act on quiet here at all: a renewal that moved quiet to the new end
+    // leaves its records unread and fails the first assertion below, and a
+    // renewal that pinned it is read however slowly the broker starts it.
+    // Set after the warm-up, which keeps the check as before.
+    adapter.hold_off_stall_check_for(std::time::Duration::from_secs(600));
     // Quiet has delivered nothing; its fetcher stops before the records
     // arrive, so they are still waiting when the assignment is renewed.
     adapter
