@@ -7102,4 +7102,195 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(call(addr, 18, 0, 1, &[]).await.is_some(), "still serving");
     }
+    /// `fuzz/corpus/kafka_request`, where the fuzz target's committed seeds
+    /// live (#729).
+    fn fuzz_seed_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/kafka_request")
+    }
+
+    /// A request as `answer` receives it: the header, then the body, without
+    /// the length prefix the socket read strips.
+    fn unframed(key: i16, version: i16, body: &[u8]) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.i16(key);
+        e.i16(version);
+        e.i32(7);
+        e.nullable_string(Some("seed-client"));
+        e.raw(body);
+        e.into_vec()
+    }
+
+    /// The seeds: every served api at its lowest and highest served version,
+    /// with bodies the gateway's own tests send.
+    fn fuzz_seeds() -> Vec<(String, Vec<u8>)> {
+        let metadata = |version: i16| {
+            let mut e = Encoder::new();
+            e.array_len(1);
+            e.string("events");
+            if version >= 4 {
+                e.bool(false);
+            }
+            if version >= 8 {
+                e.bool(false);
+                e.bool(false);
+            }
+            e.into_vec()
+        };
+        let list_offsets = |version: i16| {
+            let mut e = Encoder::new();
+            e.i32(-1);
+            if version >= 2 {
+                e.i8(0);
+            }
+            e.array_len(1);
+            e.string("events");
+            e.array_len(1);
+            e.i32(0);
+            if version >= 4 {
+                e.i32(-1);
+            }
+            e.i64(-2);
+            e.into_vec()
+        };
+        let records = batch_bytes(&["one", "two"], true);
+        let sequenced = sequenced_batch_bytes(&["three"], 5, 1, 0);
+        let mut both = records.clone();
+        both.extend_from_slice(&sequenced);
+        let assignment = consumer_assignment("events", &[0, 1]);
+        let mut seeds = Vec::new();
+        for key in [
+            ApiKey::Produce,
+            ApiKey::Fetch,
+            ApiKey::ListOffsets,
+            ApiKey::Metadata,
+            ApiKey::ApiVersions,
+            ApiKey::InitProducerId,
+            ApiKey::FindCoordinator,
+            ApiKey::JoinGroup,
+            ApiKey::SyncGroup,
+            ApiKey::Heartbeat,
+            ApiKey::LeaveGroup,
+            ApiKey::OffsetCommit,
+            ApiKey::OffsetFetch,
+        ] {
+            let (low, high) = key.version_range();
+            for version in [low, high] {
+                let body = match key {
+                    ApiKey::Produce => produce_body("events", 0, -1, None, &both),
+                    ApiKey::Fetch => fetch_body(version, "events", 0, 0, 100),
+                    ApiKey::ListOffsets => list_offsets(version),
+                    ApiKey::Metadata => metadata(version),
+                    ApiKey::ApiVersions => Vec::new(),
+                    ApiKey::InitProducerId => init_producer_id_body(None),
+                    ApiKey::FindCoordinator => find_coordinator_body(version, "group-a", 0),
+                    ApiKey::JoinGroup => {
+                        join_body(version, "group-a", "", &[("range", &b"\x00\x01"[..])])
+                    }
+                    ApiKey::SyncGroup => sync_body(
+                        version,
+                        "group-a",
+                        1,
+                        "member-1",
+                        &[("member-1", assignment.as_slice())],
+                    ),
+                    ApiKey::Heartbeat => heartbeat_body(version, "group-a", 1, "member-1"),
+                    ApiKey::LeaveGroup => leave_body("group-a", "member-1"),
+                    ApiKey::OffsetCommit => offset_commit_body(
+                        version,
+                        "group-a",
+                        1,
+                        "member-1",
+                        "events",
+                        0,
+                        42,
+                        Some("seed"),
+                    ),
+                    ApiKey::OffsetFetch => {
+                        offset_fetch_body(version, "group-a", Some(&[("events", &[0, 1][..])]))
+                    }
+                };
+                seeds.push((
+                    format!("api-{:02}-v{version}", key.as_i16()),
+                    unframed(key.as_i16(), version, &body),
+                ));
+            }
+        }
+        // The RECORDS field on its own, which the target also decodes raw.
+        seeds.push(("records-two-batches".to_owned(), both));
+        seeds
+    }
+
+    /// Rewrites the committed seeds. Run on purpose after a format change:
+    /// `cargo test -p vtop-kafka -- --ignored write_fuzz_seeds`.
+    #[test]
+    #[ignore = "writes fuzz/corpus/kafka_request; run on purpose"]
+    fn write_fuzz_seeds() {
+        let dir = fuzz_seed_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes) in fuzz_seeds() {
+            std::fs::write(dir.join(format!("{name}.seed")), bytes).unwrap();
+        }
+    }
+
+    /// #729: every committed request seed decodes, header and whole body, as
+    /// the gateway dispatches it, so the fuzzer starts inside every decoder;
+    /// and every served api has one.
+    #[test]
+    fn the_committed_fuzz_seeds_decode() {
+        let mut served = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(fuzz_seed_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            // Only the committed seeds: a local fuzzing run leaves the inputs it
+            // found here too (git-ignored), and those may rightly not decode.
+            if path.extension().and_then(|e| e.to_str()) != Some("seed") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let name = path.display().to_string();
+            if name.contains("records-") {
+                assert!(!decode_all(&bytes).is_empty(), "{name}");
+                continue;
+            }
+            let mut d = Decoder::new(&bytes);
+            let Ok(HeaderVerdict::Serve(header)) = RequestHeader::decode(&mut d) else {
+                panic!("{name}: the header is not served");
+            };
+            let key = ApiKey::from_i16(header.api_key).unwrap();
+            let version = header.api_version;
+            let decoded = match key {
+                ApiKey::ApiVersions => Ok(()),
+                ApiKey::Metadata => consumed(decode_metadata(&mut d, version), &d, "m").map(drop),
+                ApiKey::Produce => consumed(decode_produce(&mut d, version), &d, "p").map(drop),
+                ApiKey::Fetch => consumed(decode_fetch(&mut d, version), &d, "f").map(drop),
+                ApiKey::ListOffsets => {
+                    consumed(decode_list_offsets(&mut d, version), &d, "l").map(drop)
+                }
+                ApiKey::InitProducerId => {
+                    consumed(decode_init_producer_id(&mut d, version), &d, "i").map(drop)
+                }
+                ApiKey::FindCoordinator => {
+                    consumed(decode_find_coordinator(&mut d, version), &d, "c").map(drop)
+                }
+                ApiKey::JoinGroup => {
+                    consumed(decode_join_group(&mut d, version), &d, "j").map(drop)
+                }
+                ApiKey::SyncGroup => {
+                    consumed(decode_sync_group(&mut d, version), &d, "s").map(drop)
+                }
+                ApiKey::Heartbeat => consumed(decode_heartbeat(&mut d, version), &d, "h").map(drop),
+                ApiKey::LeaveGroup => {
+                    consumed(decode_leave_group(&mut d, version), &d, "v").map(drop)
+                }
+                ApiKey::OffsetCommit => {
+                    consumed(decode_offset_commit(&mut d, version), &d, "o").map(drop)
+                }
+                ApiKey::OffsetFetch => {
+                    consumed(decode_offset_fetch(&mut d, version), &d, "e").map(drop)
+                }
+            };
+            decoded.unwrap_or_else(|error| panic!("{name}: {error}"));
+            served.insert(header.api_key);
+        }
+        assert_eq!(served.len(), 13, "a served api has no seed: {served:?}");
+    }
 }
