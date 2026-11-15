@@ -7,6 +7,23 @@ Every [release](https://github.com/allamiro/vtop-engine/releases) ships
 signature for each artifact. Windows is not built. To build the binaries
 yourself, see [from-source.md](from-source.md).
 
+## Supported platforms
+
+The Linux binaries need **glibc 2.28 or newer**. That covers Debian 10 and
+later, Ubuntu 20.04 and later, and RHEL, AlmaLinux and Rocky Linux 8 and
+later. Before publishing, the release workflow checks that neither binary
+asks for a glibc symbol version newer than 2.28, then runs both binaries from
+each Linux archive (x86_64 and aarch64) on Debian 12, Ubuntu 22.04 and
+AlmaLinux 8 (glibc 2.36, 2.35 and 2.28) with nothing installed. The other
+releases in that list are expected to work by the same symbol versions but
+are not run. Distributions built on musl instead of glibc, such as Alpine,
+are not supported; use the container image there.
+
+The Linux archives of v0.8.0 to v0.10.0 were built on glibc 2.39 hosts.
+Their `vtopctl` needs glibc 2.39 and stops with
+``version `GLIBC_2.38' not found`` on Debian 12, Ubuntu 22.04 and RHEL 8 or
+9; their `vtop-node` needs glibc 2.34. On those systems, use a later release.
+
 ## Verify the download
 
 Check both the checksum and the signature. `SHA256SUMS` detects a corrupted
