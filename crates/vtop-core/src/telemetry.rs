@@ -62,8 +62,20 @@ pub const OBJECT_KEY_DECISIONS: [&str; 8] = [
 /// it is. `fallback`: rebuilt over exactly the recorded range with the same
 /// bytes, but the key decision fell back to the per-attempt key
 /// (`vtop_object_key_decisions_total` says which fallback), so a second
-/// object is written.
-pub const REPLAY_REBUILD_RESULTS: [&str; 3] = ["exact", "bytes_differ", "fallback"];
+/// object is written. `refused`: the source could not stop the re-read at the
+/// recorded end (a line crosses it, the file under it was replaced, a rotated
+/// file's re-read, an adapter that cannot bound), so it is read to the
+/// current end as before. `too_large`: the window is over 4x the current
+/// batching limits and is not bounded. `dropped_at_stop`: the engine stopped
+/// inside a rebuild and dropped the partial window rather than flush it.
+pub const REPLAY_REBUILD_RESULTS: [&str; 6] = [
+    "exact",
+    "bytes_differ",
+    "fallback",
+    "refused",
+    "too_large",
+    "dropped_at_stop",
+];
 
 /// The values of `result` on `vtop_multipart_parts_total` (#668): a part
 /// sent in this upload call, a part an earlier call left in the session and
@@ -537,7 +549,7 @@ impl Metrics {
         )?;
         let replay_rebuilds_total = cv(
             "replay_rebuilds_total",
-            "What each replay of a window an earlier attempt sealed came to (#626): exact (rebuilt over exactly the recorded range, filed under the hour it was first sealed in, with the bytes the earlier attempt uploaded where the ledger recorded them, under the derived key), bytes_differ (rebuilt over exactly the recorded range, but its bytes differ from the object the earlier attempt uploaded: a second object is written and the earlier one is left as it is) or fallback (the same bytes, but the key decision fell back to the per-attempt key, see vtop_object_key_decisions_total: a second object is written)",
+            "What each replay of a window an earlier attempt sealed came to (#626): exact (rebuilt over exactly the recorded range, filed under the hour it was first sealed in, with the bytes the earlier attempt uploaded where the ledger recorded them, under the derived key), bytes_differ (rebuilt over exactly the recorded range, but its bytes differ from the object the earlier attempt uploaded: a second object is written and the earlier one is left as it is), fallback (the same bytes, but the key decision fell back to the per-attempt key, see vtop_object_key_decisions_total: a second object is written), refused (the source could not stop the re-read at the recorded end; read to the current end as before), too_large (over 4x the current batching limits; not bounded) or dropped_at_stop (the engine stopped inside a rebuild and dropped the partial window; the next start reads it again)",
             vec!["tenant", "source_type", "format", "result"],
         )?;
         let upload_throttled_total = cv(

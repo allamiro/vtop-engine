@@ -926,8 +926,9 @@ memory while the engine runs and from the row after a restart. It is filed
 under the same hour and names the same key, so the object, or a multipart
 session the failed upload kept (#668), is reused. What each such replay came
 to is counted in `vtop_replay_rebuilds_total{result}` (`exact`,
-`bytes_differ`, `fallback`) and logged (`replay_rebuilt`,
-`replay_bytes_differ`, `replay_key_fallback`). Upgrade
+`bytes_differ`, `fallback`, `refused`, `too_large`, `dropped_at_stop`) and
+logged (`replay_rebuilt`, `replay_bytes_differ`, `replay_key_fallback`,
+`replay_bound_refused`, `replay_bound_too_large`, `replay_window_dropped`). Upgrade
 notes:
 
 - **PostgreSQL: run `vtopctl migrate` before starting engines of this
@@ -941,9 +942,16 @@ notes:
 - **Rows written before this release** carry no seal instant. A replay of one
   of them is filed under the hour it is replayed in, as before, so it may
   still write a second object once.
-- **Not changed:** a replay over a source that grew since the failed attempt
-  still reads to the current end and writes a second object; a range whose
-  row a power loss rolled back has nothing to rebuild from.
+- **A replay over a file or spool that grew is rebuilt as first cut.** Its
+  re-read stops at the failed window's recorded end, the window is sealed
+  there (not by a threshold, its age or a forced flush), and the bytes after
+  it are the next window. A range over 4x the current batching limits is not
+  bounded (`too_large`); one whose re-read cannot stop at its end is read as
+  before (`refused`); a stop inside a rebuild drops the partial window, which
+  the next start reads again (`dropped_at_stop`). The new trait method
+  `SourceAdapter::bound_replays` defaults to bounding nothing.
+- **Not changed yet:** a Kafka replay over a partition that grew; a range
+  whose row a power loss rolled back has nothing to rebuild from.
 
 The theme is **the gateway at the speed its durability allows**: wire the
 broker's group commit into the gateway path and close the compatibility
