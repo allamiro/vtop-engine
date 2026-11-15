@@ -89,6 +89,12 @@ pub const OBJECT_LOCK_CHECK_RESULTS: [&str; 7] = [
 /// none.
 pub const RECEIPT_WRITE_RESULTS: [&str; 3] = ["written", "failed", "repaired"];
 
+/// The values of `reason` on `vtop_recovery_held_total` (#782): why recovery
+/// held a range instead of rewinding it. `ledger_write_failed`: the state
+/// store refused the write of its replay decision (#639). `newer_manifest`:
+/// a VERIFIED batch whose manifest a newer release wrote (#671).
+pub const RECOVERY_HOLD_REASONS: [&str; 2] = ["ledger_write_failed", "newer_manifest"];
+
 /// The values of `mode` on `vtop_object_lock_mode` (#684).
 pub const OBJECT_LOCK_MODES: [&str; 3] = ["off", "governance", "compliance"];
 
@@ -173,6 +179,16 @@ pub struct Metrics {
     /// Non-zero means an engine is older than a writer sharing its ledger,
     /// which the upgrade order rules out: upgrade this engine.
     pub recovery_unsupported_manifest_total: IntCounterVec,
+    /// Ranges recovery held instead of rewinding (#639, #782), by tenant,
+    /// source type and [`RECOVERY_HOLD_REASONS`]. A held range holds back
+    /// every VERIFIED range and every rewind above it in its source unit.
+    /// `ledger_write_failed` above zero means the state store is refusing
+    /// writes.
+    pub recovery_held_total: IntCounterVec,
+    /// Rewinds recovery left out because a held range of the same source
+    /// unit lies below them (#782): applied, they moved the read head past
+    /// the held range. Each means the ranges above it are archived twice.
+    pub recovery_rewinds_withheld_total: IntCounterVec,
     /// VERIFIED batches recovery re-checked against storage, by the class the
     /// ledger recorded they were verified with and what the re-check found
     /// (#664). `verification_class="strong", result="size_only"` is the one
@@ -428,6 +444,16 @@ impl Metrics {
             "VERIFIED batches whose manifest recovery found to be from a newer release than this engine reads (#671); upgrade the engine",
             labels3(),
         )?;
+        let recovery_held_total = cv(
+            "recovery_held_total",
+            "Ranges recovery held instead of rewinding, by reason (ledger_write_failed: the state store refused the replay decision; newer_manifest: a newer release wrote the batch); a held range holds back every VERIFIED range and rewind above it in its source unit, so the source is read again from its committed point (#782)",
+            vec!["tenant", "source_type", "reason"],
+        )?;
+        let recovery_rewinds_withheld_total = cv(
+            "recovery_rewinds_withheld_total",
+            "Rewinds recovery did not apply because a held range of the same source unit lies below them; the ranges above the held one are read again from the committed point and archived twice (#782)",
+            vec!["tenant", "source_type"],
+        )?;
         let recovery_rechecks_total = cv(
             "recovery_rechecks_total",
             "VERIFIED batches recovery re-checked against storage, by the class they were verified with (strong, size_only; unknown for a row from before #664 or with a newer release's class) and the re-check's result (strong, size_only, failed, unsupported_version). verification_class=strong with result=size_only: the store can no longer confirm content verified strongly; restore checksum support on the backend, then run vtopctl scrub",
@@ -602,6 +628,8 @@ impl Metrics {
             replay_required_total,
             failed_total,
             recovery_unsupported_manifest_total,
+            recovery_held_total,
+            recovery_rewinds_withheld_total,
             recovery_rechecks_total,
             manifests_written_total,
             verification_receipts_total,
