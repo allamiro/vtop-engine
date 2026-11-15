@@ -3545,11 +3545,14 @@ impl Engine {
             .zip(adapter.replay_from_markers(&rewinds).await)
         {
             match result {
-                Ok(()) => tracing::warn!(
-                    source_type = %source_type,
-                    start = ?marker,
-                    "batch did not reach VERIFIED; its range was handed back to the source and will be re-read"
-                ),
+                Ok(()) => {
+                    tracing::warn!(
+                        source_type = %source_type,
+                        start = ?marker,
+                        "batch did not reach VERIFIED; its range was handed back to the source and will be re-read"
+                    );
+                    self.drop_pending_above(marker);
+                }
                 Err(e) => {
                     // The adapter could not rewind (a spool file that was
                     // rotated away, say). The range is NOT being re-read, so
@@ -3576,6 +3579,36 @@ impl Engine {
             return Err(e);
         }
         Ok(outcomes)
+    }
+
+    /// Drop the buffered windows of `rewound`'s unit that start at or above
+    /// where it starts (second review of #626 PR 2): the source re-reads them
+    /// from the rewind, so nothing is lost, and kept they would be flushed on
+    /// their own while the range below them is still being rebuilt. Their
+    /// commit would move the source's committed point past that range, and a
+    /// second failure of it would be rewound only to that point. Today this
+    /// is the bytes a file or spool read on after a rebuilt window in the
+    /// same pass.
+    fn drop_pending_above(&mut self, rewound: &ProgressMarker) {
+        let (unit, from) = (unit_key(rewound), start_position(rewound));
+        self.pending.retain(|_, buf| {
+            let Some(first) = buf.batcher.first_marker() else {
+                return true;
+            };
+            let above = unit_key(first) == unit && start_position(first) >= from;
+            if above {
+                tracing::debug!(
+                    source = %buf.source.source_name,
+                    range = %buf
+                        .latest_end
+                        .as_ref()
+                        .map(|last| ProgressMarker::spanning(first, last).range_token())
+                        .unwrap_or_default(),
+                    "a buffered window above a range handed back is dropped; the source reads it again"
+                );
+            }
+            !above
+        });
     }
 
     /// The tenant and format a replay of `source_name` is counted under: the
@@ -7444,6 +7477,94 @@ mod tests {
             .filter(|b| b.state == BatchState::Verified)
             .collect();
         assert!(verified.is_empty(), "the held row settled: {verified:?}");
+    }
+
+    /// Second review of #626 PR 2: a rebuild that takes two passes, a
+    /// rebuilt window that fails again, and the bytes after it left buffered
+    /// across passes. The buffered tail must not survive the rewind: if it
+    /// did, the next pass's re-read would displace it into a flush of its
+    /// own while the prefix is still being rebuilt, it would commit, and a
+    /// second failure of the prefix would then be rewound only to the tail's
+    /// end, so the prefix would never be archived.
+    #[tokio::test]
+    async fn a_tail_buffered_across_passes_is_dropped_when_the_window_before_it_fails_again() {
+        let _serial = THROTTLE_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        let lines = |range: std::ops::Range<u32>| -> String {
+            range.map(|i| format!("line {i:02}\n")).collect()
+        };
+        std::fs::write(&input, lines(0..15)).unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 3_600;
+        cfg.batching.max_records = 15;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        // Every put of the 15-record window [0, 120) fails.
+        let mock = Arc::new(vtop_upload::MockBackend::new());
+        mock.set_failing_put_containing(Some("-b0-120-"));
+        engine.backend = mock.clone();
+        let first = engine.run_source(SourceType::File, false).await;
+        assert!(
+            first
+                .as_ref()
+                .map_or(true, |o| o.iter().all(|o| !o.committed)),
+            "{first:?}"
+        );
+
+        // The limits are lowered, so the rebuild takes two passes, and five
+        // lines are appended after the window.
+        engine.config.batching.max_records = 10;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&input)
+            .unwrap();
+        f.write_all(lines(15..20).as_bytes()).unwrap();
+        drop(f);
+        async fn committed_rows(engine: &Engine) -> Vec<(u64, u64)> {
+            let mut rows: Vec<(u64, u64)> = engine
+                .store
+                .list_batches()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|b| b.state == BatchState::SourceCommitted)
+                .map(file_range)
+                .collect();
+            rows.sort_unstable();
+            rows.dedup();
+            rows
+        }
+        // Pass 1 holds ten records of the window; pass 2 completes it, which
+        // fails again, and reads the tail on; passes 3 and 4 rebuild the
+        // window again, which fails again.
+        for pass in 1..=4 {
+            let _ = engine.run_source(SourceType::File, false).await;
+            assert_eq!(
+                committed_rows(&engine).await,
+                vec![],
+                "pass {pass}: nothing commits above the failed window"
+            );
+        }
+
+        // The store recovers.
+        mock.set_failing_put_containing(None);
+        for _ in 0..3 {
+            let _ = engine.run_source(SourceType::File, false).await;
+        }
+        let _ = engine.run_source(SourceType::File, true).await;
+        let len = std::fs::metadata(&input).unwrap().len();
+        assert_eq!(
+            committed_rows(&engine).await,
+            vec![(0, 120), (120, len)],
+            "the window is archived as first cut, then the tail; nothing skipped"
+        );
     }
 
     /// A seal instant for [`Engine::set_seal_clock`].
